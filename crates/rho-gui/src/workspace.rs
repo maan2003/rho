@@ -31,7 +31,7 @@ use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
@@ -46,6 +46,7 @@ use rho_agents_view::draft::DraftModel;
 use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
+    TranscriptView,
 };
 use rho_window::style::StyleClass;
 use settings::Settings as _;
@@ -244,6 +245,7 @@ pub struct Workspace {
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
+    activity_models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by host-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
     /// Artifact surfaces hold the strong references; when the last file
@@ -255,6 +257,7 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
+    activity_pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
     pub(crate) agents_client: rho_agents_client::model::AgentsClient,
@@ -428,10 +431,15 @@ impl Workspace {
     fn ensure_agent_model(
         &mut self,
         agent_id: AgentId,
+        view: TranscriptView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<AgentModel>, bool) {
-        let model = if let Some(model) = self.models.get(&agent_id).cloned() {
+        let existing = match view {
+            TranscriptView::Conversation => self.models.get(&agent_id),
+            TranscriptView::Activity => self.activity_models.get(&agent_id),
+        };
+        let model = if let Some(model) = existing.cloned() {
             model
         } else {
             let completions = crate::commands::WorkspaceCompletionProvider::new(
@@ -444,36 +452,67 @@ impl Workspace {
             let visualization_client = self
                 .agents_for(agent_id)
                 .unwrap_or_else(AgentsLink::detached);
-            let model = cx.new(|cx| AgentModel::new(completions, visualization_client, cx));
+            let model =
+                cx.new(|cx| AgentModel::with_view(view, completions, visualization_client, cx));
             // The screen says when its transcript is composed; what that
             // means for the rest of the shell is decided here.
             self.agent_model_subscriptions.push(cx.subscribe_in(
                 &model,
                 window,
-                |workspace, _, event, window, cx| match event {
-                    rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
-                        workspace.finish_initial_agent_load(*agent_id, cx);
-                    }
-                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
-                        workspace.finish_transcript_search(*agent_id, window, cx);
+                |workspace, loaded_model, event, window, cx| {
+                    match event {
+                        rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                            let view = loaded_model.read(cx).view();
+                            let current = match view {
+                                TranscriptView::Conversation => workspace.models.get(agent_id),
+                                TranscriptView::Activity => workspace.activity_models.get(agent_id),
+                            };
+                            if current == Some(loaded_model) {
+                                workspace.finish_initial_agent_load(*agent_id, view, cx);
+                            }
+                        }
+                        rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                            if workspace
+                                .active_transcript()
+                                .is_some_and(|(model, _)| model == *loaded_model)
+                            {
+                                workspace.finish_transcript_search(*agent_id, window, cx);
+                            }
+                        }
                     }
                 },
             ));
-            self.refresh_view_status(&agent_id, &model, cx);
-            self.models.insert(agent_id, model.clone());
+            if view == TranscriptView::Conversation {
+                self.refresh_view_status(&agent_id, &model, cx);
+                self.models.insert(agent_id, model.clone());
+            } else {
+                self.activity_models.insert(agent_id, model.clone());
+            }
             model
         };
         let started = self.start_initial_agent_load(agent_id, &model, cx);
-        model.update(cx, |model, cx| {
-            model.preview_editor(window, cx);
-        });
+        if view == TranscriptView::Conversation {
+            model.update(cx, |model, cx| {
+                model.preview_editor(window, cx);
+            });
+        }
         (model, started)
     }
 
-    pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        self.finish_agent_load(agent_id, cx);
-        if let Some(model) = self.models.get(&agent_id).cloned() {
+    pub(crate) fn finish_initial_agent_load(
+        &mut self,
+        agent_id: AgentId,
+        view: TranscriptView,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_agent_load(agent_id, view, cx);
+        if view == TranscriptView::Conversation
+            && let Some(model) = self.models.get(&agent_id).cloned()
+        {
             self.refresh_view_status(&agent_id, &model, cx);
+        }
+        if view == TranscriptView::Activity {
+            self.ensure_duration_timer(cx);
         }
         cx.notify();
     }
@@ -602,7 +641,11 @@ impl Workspace {
             return;
         }
         if !model.read(cx).initial_load_ready() {
-            self.pending_syncs
+            let pending = match model.read(cx).view() {
+                TranscriptView::Conversation => &mut self.pending_syncs,
+                TranscriptView::Activity => &mut self.activity_pending_syncs,
+            };
+            pending
                 .entry(agent_id)
                 .and_modify(|pending| *pending = pending.merge(summary))
                 .or_insert(summary);
@@ -619,11 +662,20 @@ impl Workspace {
         }
     }
 
-    fn finish_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let Some(model) = self.models.get(&agent_id).cloned() else {
+    fn finish_agent_load(
+        &mut self,
+        agent_id: AgentId,
+        view: TranscriptView,
+        cx: &mut Context<Self>,
+    ) {
+        let (models, pending) = match view {
+            TranscriptView::Conversation => (&self.models, &mut self.pending_syncs),
+            TranscriptView::Activity => (&self.activity_models, &mut self.activity_pending_syncs),
+        };
+        let Some(model) = models.get(&agent_id).cloned() else {
             return;
         };
-        if let Some(summary) = self.pending_syncs.remove(&agent_id)
+        if let Some(summary) = pending.remove(&agent_id)
             && let Some(state) = self.transcripts.state(&agent_id)
         {
             model.update(cx, |model, cx| {
@@ -848,8 +900,10 @@ impl Workspace {
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
+            activity_models: HashMap::new(),
             remote_projects: HashMap::new(),
             pending_syncs: HashMap::new(),
+            activity_pending_syncs: HashMap::new(),
             agents_client,
             desktop_streams,
             draft_model,
@@ -1055,10 +1109,13 @@ impl Workspace {
             // place that no longer exists: one call, and no context can
             // land on it again.
             self.forget_surface(&SurfaceKey::Transcript(agent_id));
+            self.forget_surface(&SurfaceKey::Activity(agent_id));
             self.active.remove(agent_id);
             self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
             self.pending_syncs.remove(&agent_id);
+            self.activity_models.remove(&agent_id);
+            self.activity_pending_syncs.remove(&agent_id);
         }
         self.note_followed();
         self.forget_contexts(|context| !contexts.contains(context));
@@ -1240,11 +1297,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Surface {
-        if let SurfaceKey::Transcript(agent_id) = surface.key
+        if let SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) = surface.key
             && !self.active.contains(agent_id)
         {
             self.activate_agent(agent_id, cx);
-            return self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
+            return self.make_surface(surface.key, window, cx);
         }
         surface
     }
@@ -1277,6 +1334,14 @@ impl Workspace {
     /// the thing behind it is gone. Every context forgets it, because a
     /// dead surface is dead everywhere.
     fn forget_surface(&mut self, key: &SurfaceKey) {
+        if let SurfaceKey::Activity(agent_id) = key {
+            self.activity_models.remove(agent_id);
+            self.activity_pending_syncs.remove(agent_id);
+            for surfaces in self.surfaces.values_mut() {
+                surfaces.retain(|surface| surface.key != *key);
+            }
+            self.phone.remove_key(key);
+        }
         if let Some(history) = self.history.as_mut() {
             history.forget(key);
         }
@@ -1348,7 +1413,12 @@ impl Workspace {
                         .get(&rho_dealer::NodeId::Agent(*agent_id))
                         .facts()
                         .put_away(now)
-                    && self.registry.agent_facts(*agent_id).turn_running
+                    && {
+                        let facts = self.registry.agent_facts(*agent_id);
+                        facts.notebook.map_or(facts.turn_running, |activity| {
+                            activity.responding || activity.running_tasks > 0
+                        })
+                    }
             })
             .collect::<Vec<_>>();
         // Sorted by what the row shows, or the order is of something the
@@ -1376,12 +1446,23 @@ impl Workspace {
                         .and_then(|path| path.rsplit('/').next())
                         .unwrap_or_default()
                         .to_owned(),
-                    elapsed: crate::home::running_elapsed_label(&facts, now_ms),
-                    last_line: self
-                        .registry
-                        .agent_activity(agent_id)
+                    elapsed: if facts.notebook.is_some() {
+                        String::new()
+                    } else {
+                        crate::home::running_elapsed_label(&facts, now_ms)
+                    },
+                    last_line: if facts.notebook.is_some() {
+                        crate::attention::agent_state_label(
+                            &facts,
+                            chrono::Local::now().fixed_offset(),
+                        )
                         .unwrap_or_default()
-                        .to_owned(),
+                    } else {
+                        self.registry
+                            .agent_activity(agent_id)
+                            .unwrap_or_default()
+                            .to_owned()
+                    },
                 }
             })
             .collect();
@@ -1664,6 +1745,10 @@ impl Workspace {
         });
         if let Some(history) = self.history.as_mut() {
             for key in gone {
+                if let SurfaceKey::Activity(agent_id) = key {
+                    self.activity_models.remove(&agent_id);
+                    self.activity_pending_syncs.remove(&agent_id);
+                }
                 history.forget(&key);
             }
         }
@@ -1821,8 +1906,12 @@ impl Workspace {
 
         for agent_id in order {
             let summary = changes[&agent_id].0;
-            let (view, started) = self.ensure_agent_model(agent_id, window, cx);
+            let (view, started) =
+                self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx);
             self.sync_agent_model(agent_id, &view, summary, started, cx);
+            if let Some(activity) = self.activity_models.get(&agent_id).cloned() {
+                self.sync_agent_model(agent_id, &activity, summary, false, cx);
+            }
         }
 
         self.ensure_duration_timer(cx);
@@ -2022,6 +2111,9 @@ impl Workspace {
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+            return;
+        }
         if let SurfaceView::Shell { model, .. } = &self.active_surface().view {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
@@ -2182,15 +2274,7 @@ impl Workspace {
                 .filter(|part| !matches!(part, ContentPart::Text { .. }))
                 .count() as u32,
         });
-        self.send_to_agent(
-            agent_id,
-            AgentCommand::Send {
-                agent_id,
-                content,
-                delivery: MessageDelivery::NextRequest,
-            },
-            cx,
-        );
+        self.send_to_agent(agent_id, AgentCommand::Send { agent_id, content }, cx);
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
@@ -2376,10 +2460,8 @@ impl Workspace {
             return;
         };
         let pane_prompt = matches!(
-            self.active_surface().view,
-            SurfaceView::Draft { .. }
-                | SurfaceView::Transcript { .. }
-                | SurfaceView::SlackConversation(_)
+            self.active_surface().key,
+            SurfaceKey::Draft | SurfaceKey::Transcript(_) | SurfaceKey::SlackConversation(_)
         );
         let images = item
             .entries
@@ -2424,7 +2506,9 @@ impl Workspace {
                     });
                     true
                 }
-                SurfaceView::Transcript { model, .. } => {
+                SurfaceView::Transcript { model, .. }
+                    if matches!(self.active_surface().key, SurfaceKey::Transcript(_)) =>
+                {
                     model.update(cx, |model, cx| {
                         model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
                     });
@@ -2445,7 +2529,9 @@ impl Workspace {
             SurfaceView::Draft { .. } => self
                 .draft_model
                 .update(cx, |model, cx| model.clear_attachments(cx)),
-            SurfaceView::Transcript { model, .. } => {
+            SurfaceView::Transcript { model, .. }
+                if matches!(self.active_surface().key, SurfaceKey::Transcript(_)) =>
+            {
                 model.update(cx, |model, cx| model.clear_attachments(cx))
             }
             _ => false,
@@ -2529,14 +2615,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(
-                agent_id,
-                AgentCommand::Compact {
-                    agent_id,
-                    delivery: rho_agent_types::MessageDelivery::NextRequest,
-                },
-                cx,
-            );
+            self.send_to_agent(agent_id, AgentCommand::Compact { agent_id }, cx);
             self.notice_on(
                 Some(&agent_id),
                 "compacting context",
@@ -3498,7 +3577,9 @@ impl Workspace {
             .as_ref()
             .map(|history| &history.current().surface.key)
         {
-            Some(SurfaceKey::Transcript(agent_id)) => HashSet::from([*agent_id]),
+            Some(SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id)) => {
+                HashSet::from([*agent_id])
+            }
             _ => HashSet::new(),
         };
         let evicted = self.active.evict(|agent_id| shown.contains(&agent_id));
@@ -3535,6 +3616,7 @@ impl Workspace {
         self.transcripts.forget(agent_id);
         self.note_followed();
         self.pending_syncs.remove(&agent_id);
+        self.activity_pending_syncs.remove(&agent_id);
         self.registry.mark_not_live(agent_id);
         if let Some(model) = self.models.get(&agent_id).cloned() {
             model.update(cx, |model, _| model.clear_preview_editor());
@@ -3545,17 +3627,44 @@ impl Workspace {
         // (`warm_surface`). What leaves history is what has gone, not what
         // has been let go of.
         let shown = self.history.as_ref().is_some_and(|history| {
-            history.current().surface.key == SurfaceKey::Transcript(agent_id)
+            matches!(history.current().surface.key, SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if id == agent_id)
         });
         if shown {
             return;
         }
 
         for surfaces in self.surfaces.values_mut() {
-            surfaces.retain(|surface| surface.key != SurfaceKey::Transcript(agent_id));
+            surfaces.retain(|surface| !matches!(surface.key, SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if id == agent_id));
         }
         self.phone.remove_key(&SurfaceKey::Transcript(agent_id));
+        self.phone.remove_key(&SurfaceKey::Activity(agent_id));
         self.models.remove(&agent_id);
+        self.activity_models.remove(&agent_id);
+    }
+
+    /// Switch between sibling transcript buffers without replacing the other
+    /// buffer's editor, cursor, or unsent conversation draft.
+    pub(crate) fn open_agent_view(
+        &mut self,
+        view: TranscriptView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.selection.selected_agent() else {
+            self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.activate_agent(agent_id, cx);
+        self.active_context = self.context_for_agent(agent_id);
+        let key = match view {
+            TranscriptView::Conversation => SurfaceKey::Transcript(agent_id),
+            TranscriptView::Activity => SurfaceKey::Activity(agent_id),
+        };
+        let surface = self.make_surface(key, window, cx);
+        self.display_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        self.ensure_duration_timer(cx);
+        cx.notify();
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -3857,7 +3966,7 @@ impl Workspace {
             self.activate_agent(agent_id, cx);
         }
         if let Some(agent_id) = &agent_id {
-            let view = self.materialize_model(agent_id, window, cx);
+            let view = self.materialize_model(agent_id, TranscriptView::Conversation, window, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         }
         let (context, key) = match agent_id {
@@ -3900,9 +4009,20 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
-            SurfaceKey::Transcript(agent_id) => self
-                .registry
-                .agent_name_with_labels(*agent_id, self.registry.agent_display_label(*agent_id)),
+            SurfaceKey::Transcript(agent_id) => format!(
+                "{} · conversation",
+                self.registry.agent_name_with_labels(
+                    *agent_id,
+                    self.registry.agent_display_label(*agent_id)
+                )
+            ),
+            SurfaceKey::Activity(agent_id) => format!(
+                "{} · activity",
+                self.registry.agent_name_with_labels(
+                    *agent_id,
+                    self.registry.agent_display_label(*agent_id)
+                )
+            ),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_display_label(*agent_id))
@@ -3937,7 +4057,8 @@ impl Workspace {
             SurfaceKey::Messages => "messages",
             SurfaceKey::Usage => "usage",
             SurfaceKey::Note(_) => "note",
-            SurfaceKey::Transcript(_) => "transcript",
+            SurfaceKey::Transcript(_) => "conversation",
+            SurfaceKey::Activity(_) => "activity",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Terminal { .. } => "terminal",
@@ -4073,9 +4194,11 @@ impl Workspace {
                 host: 0,
                 node_id: node.clone().into(),
             },
-            SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
-                agent_id: agent_id.into(),
-            },
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
+                SurfaceIdentity::Transcript {
+                    agent_id: agent_id.into(),
+                }
+            }
             SurfaceKey::File { agent_id, path } => SurfaceIdentity::File {
                 agent_id: agent_id.into(),
                 path: path.to_string(),
@@ -4307,7 +4430,9 @@ impl Workspace {
 
     fn ensure_surface_subscription(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
         let agent_id = match key {
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
+            SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Activity(agent_id)
+            | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
             _ => None,
         };
         if let Some(agent_id) = agent_id {
@@ -4539,27 +4664,30 @@ impl Workspace {
     fn materialize_model(
         &mut self,
         agent_id: &AgentId,
+        view: TranscriptView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
         // Every route to a transcript comes through here, so this is where
         // the story stands in until a frame arrives.
         let told = self.seed_transcript_from_mirror(*agent_id);
-        let (view, _) = self.ensure_agent_model(*agent_id, window, cx);
+        let (model, _) = self.ensure_agent_model(*agent_id, view, window, cx);
         // Seeding the store is not showing it: a view that already exists
         // (the agent host answers for every agent on connecting, with nothing
         // loaded) renders what it last synced, which was a blank page.
         if told {
-            self.sync_agent_model(*agent_id, &view, FrameSummary::everything(), false, cx);
+            self.sync_agent_model(*agent_id, &model, FrameSummary::everything(), false, cx);
         }
-        if view.read(cx).initial_load_ready()
-            && let (Some(summary), Some(state)) = (
-                self.pending_syncs.remove(agent_id),
-                self.transcripts.state(agent_id),
-            )
+        let pending = match view {
+            TranscriptView::Conversation => &mut self.pending_syncs,
+            TranscriptView::Activity => &mut self.activity_pending_syncs,
+        };
+        if model.read(cx).initial_load_ready()
+            && let (Some(summary), Some(state)) =
+                (pending.remove(agent_id), self.transcripts.state(agent_id))
         {
-            view.update(cx, |view, cx| {
-                view.sync(
+            model.update(cx, |model, cx| {
+                model.sync(
                     state,
                     summary,
                     now_ms(),
@@ -4568,7 +4696,7 @@ impl Workspace {
                 );
             });
         }
-        view
+        model
     }
 
     /// Recomputes the right-prompt status chips for one agent's view.
@@ -4821,6 +4949,8 @@ impl Workspace {
                 exec_timings: Default::default(),
                 blocks: Vec::new(),
                 status: rho_agents_client::state::UiAgentStatus::Idle,
+                notebook: None,
+                awaiting_human: None,
                 context_used: None,
                 usage: Default::default(),
             })
@@ -4834,6 +4964,9 @@ impl Workspace {
     }
 
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
+        if let SurfaceView::Transcript { model, .. } = &self.active_surface().view {
+            return Some(model.clone());
+        }
         self.selection
             .selected_agent()
             .and_then(|agent_id| self.models.get(&agent_id))
@@ -4919,6 +5052,7 @@ impl Workspace {
     pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = match &self.active_surface().key {
             SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Activity(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
@@ -4942,6 +5076,11 @@ impl Workspace {
             self.overlay_focus.set(handle);
         } else {
             window.focus(&handle, cx);
+        }
+        if let SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) =
+            self.active_surface().key
+        {
+            self.finish_transcript_search(agent_id, window, cx);
         }
     }
 
@@ -4973,9 +5112,14 @@ impl Workspace {
                 let node = node.clone();
                 SurfaceView::Note(self.note_view_for(&node, window, cx).editor().clone())
             }
-            SurfaceKey::Transcript(agent_id) => {
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
                 let agent_id = *agent_id;
-                let model = self.materialize_model(&agent_id, window, cx);
+                let view = if matches!(key, SurfaceKey::Activity(_)) {
+                    TranscriptView::Activity
+                } else {
+                    TranscriptView::Conversation
+                };
+                let model = self.materialize_model(&agent_id, view, window, cx);
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 // `/` is the buffer's search here as everywhere; nothing
                 // else in this app hosts one, so the surface does.
@@ -5034,7 +5178,9 @@ impl Workspace {
     /// visible surface, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         let selected = match self.active_surface().key.clone() {
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
+            SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Activity(agent_id)
+            | SurfaceKey::Shell(agent_id) => {
                 self.selection.select_agent(agent_id);
                 Some(agent_id)
             }
@@ -5583,6 +5729,10 @@ impl Workspace {
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
+            Command::AgentActivity => self.open_agent_view(TranscriptView::Activity, window, cx),
+            Command::AgentConversation => {
+                self.open_agent_view(TranscriptView::Conversation, window, cx)
+            }
             Command::PullCard => self.pull_card(window, cx),
             Command::CloseAndDeal => self.cmd_close_and_deal(window, cx),
             Command::OpenFile => self.prompt_open_file(window, cx),
@@ -6755,6 +6905,7 @@ impl Workspace {
         if model.read(cx).uncomposed_blocks() > 0 {
             self.search.wait_for(search::Pending {
                 agent: agent_id,
+                view: model.read(cx).view(),
                 query,
             });
             model.update(cx, |model, cx| {
@@ -6810,7 +6961,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(query) = self.search.take_waiting_for(agent_id) else {
+        let Some((model, _)) = self.active_transcript() else {
+            return;
+        };
+        if !model.read(cx).initial_load_ready() || model.read(cx).uncomposed_blocks() > 0 {
+            return;
+        }
+        let Some(query) = self
+            .search
+            .take_waiting_for(agent_id, model.read(cx).view())
+        else {
             return;
         };
         self.run_transcript_search(agent_id, query, window, cx);
@@ -7120,7 +7280,7 @@ impl Workspace {
         // that dealt it: the card says why the dealer raised the agent, and
         // a running agent has no card at all, which left the line blank.
         let agent_in_view = match &self.active_surface().key {
-            SurfaceKey::Transcript(agent_id) => Some(*agent_id),
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => Some(*agent_id),
             _ => None,
         };
         if let Some(card) = self.open_card_in_view(cx)
@@ -7131,12 +7291,20 @@ impl Workspace {
         }
         let path = {
             match &self.active_surface().key {
-                SurfaceKey::Transcript(agent_id) => {
+                SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
                     let leaf = self.registry.agent_display_label(*agent_id);
-                    match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
+                    let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
                         context if context.is_empty() => leaf,
                         context => format!("{context} / {leaf}"),
-                    }
+                    };
+                    format!(
+                        "{path} · {}",
+                        if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+                            "activity"
+                        } else {
+                            "conversation"
+                        }
+                    )
                 }
                 SurfaceKey::Browser(page) => {
                     rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())

@@ -8,6 +8,7 @@ pub mod exec;
 mod inference;
 pub use credentials::{CredentialSnapshot, CredentialState};
 mod responses;
+pub mod step;
 pub mod types;
 
 pub use accounts::{
@@ -16,8 +17,8 @@ pub use accounts::{
 pub use auth_cli::{AuthArgs, run_auth_cli};
 pub use inference::{Inference, InferenceConfig, InferenceHost};
 pub use responses::{
-    DialRoute, InferenceAuth, InferenceRouteProbe, InferenceSession, OpenAiResponsesProviderData,
-    PromptCacheKey, QuotaUpdate, ResolvedAuth, ResolvedOAuth, RouteSelection,
+    DialRoute, InferenceAuth, InferenceRouteProbe, OpenAiResponsesProviderData, PromptCacheKey,
+    QuotaUpdate, ResolvedAuth, ResolvedOAuth, RouteSelection,
 };
 
 /// Installs the TLS crypto provider if nothing has yet. Any HTTP client built

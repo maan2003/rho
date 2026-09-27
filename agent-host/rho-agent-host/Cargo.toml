@@ -35,7 +35,6 @@ rho-agents-client.workspace = true
 rho-db.workspace = true
 rho-ledger-server.workspace = true
 rho-inference.workspace = true
-rho-inference2.workspace = true
 rho-image.workspace = true
 rho-openai-realtime.workspace = true
 rho-iroh-auth.workspace = true

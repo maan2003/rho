@@ -40,3 +40,43 @@ fn a_turn_with_no_start_prints_no_duration() {
         "a row with no start has nothing to say about how long"
     );
 }
+
+#[test]
+fn notebook_status_does_not_treat_a_message_as_a_finished_turn() {
+    let now_ms = 1_757_000_000_000;
+    let now = chrono::DateTime::from_timestamp_millis(now_ms)
+        .unwrap()
+        .fixed_offset();
+    let mut facts = AgentFacts {
+        notebook: Some(rho_agents_client::state::UiNotebookActivity {
+            responding: false,
+            running_tasks: 2,
+            checkin_at: Some(UnixMs((now_ms + 60_000) as u64)),
+            archived: false,
+        }),
+        turn_running: true,
+        last_message_sent: Some(UnixMs((now_ms - 120_000) as u64)),
+        ..AgentFacts::default()
+    };
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("2 running tasks")
+    );
+    facts.awaiting_human = Some(UnixMs((now_ms - 60_000) as u64));
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("waiting on you · 1m · 2 running tasks")
+    );
+    facts.awaiting_human = None;
+    facts.notebook.as_mut().unwrap().running_tasks = 0;
+    facts.notebook.as_mut().unwrap().archived = true;
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("archived")
+    );
+    facts.notebook.as_mut().unwrap().archived = false;
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("next check-in in 1m")
+    );
+}

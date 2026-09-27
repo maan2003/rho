@@ -129,6 +129,15 @@ fn first_task_text(history: &[AgentEvent<'_>], current: &str) -> Option<String> 
     let input = history
         .iter()
         .find_map(|event| match event {
+            AgentEvent::Entry(crate::entry::Entry::Received { body, .. }) => Some(
+                body.iter()
+                    .filter_map(|block| match block {
+                        crate::entry::Block::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             AgentEvent::Accepted(QueuedInput {
                 kind: InputKind::Message { content },
                 ..

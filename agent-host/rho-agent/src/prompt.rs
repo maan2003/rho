@@ -56,10 +56,8 @@ For long waits, call set_max_wait(86400) before await human.reply() or await age
 
 notify(value: object, *, max_tokens: int = 2000) → None
 set_max_wait(seconds: int) → None
-suppress_tool_wakeups() → None
 
-suppress_tool_wakeups() suppresses task-completion and notify wakes, not messages or check-ins.
-None of these sleep or stop running work; no Python sleep is needed to wait.
+Neither function sleeps or stops running work; no Python sleep is needed to wait.
 
 ## The notebook
 
@@ -905,7 +903,20 @@ pub fn prompt(view: &crate::View, multi_agent: Option<&Team>, role: AgentRole) -
             render_skills_prompt(&skills).unwrap_or_default(),
         )
     };
-    let team_context = multi_agent.map_or_else(String::new, |tools| {
+    let team_context = team_context(multi_agent, role);
+    let workspace = render_workspace_prompt(&place);
+    let context = format!("{workspace}{agents_md}{skills}");
+    let user_owned = multi_agent
+        .filter(|tools| tools.spawned_by.user_owned())
+        .map_or("", |_| USER_OWNED_ENGINEERS);
+    match role {
+        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, user_owned, &context),
+        AgentRole::Advisor { .. } => advisor_prompt(&team_context, &context),
+    }
+}
+
+fn team_context(multi_agent: Option<&Team>, role: AgentRole) -> String {
+    multi_agent.map_or_else(String::new, |tools| {
         let agent_id = &tools.agent;
         let identity = match tools.parent.as_ref() {
             Some(parent) => format!(
@@ -964,293 +975,48 @@ Use `{message_tool}` for bidirectional communication with any known agent.
 
 "
         )
-    });
-    let workspace = render_workspace_prompt(&place);
-    let context = format!("{workspace}{agents_md}{skills}");
-    let user_owned = multi_agent
-        .filter(|tools| tools.spawned_by.user_owned())
-        .map_or("", |_| USER_OWNED_ENGINEERS);
-    match role {
-        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, user_owned, &context),
-        AgentRole::Advisor { .. } => advisor_prompt(&team_context, &context),
-    }
+    })
 }
 
-/// The `CLAUDE.md` an agent on the Claude runtime gets.
-/// All Claude roles use the Python notebook through MCP.
+/// The native Rho policy with Claude's concrete MCP transport noted.
 pub fn claude_prompt(
     view: Option<&crate::View>,
     multi_agent: Option<&Team>,
     role: AgentRole,
 ) -> Arc<str> {
-    let team = multi_agent.map_or_else(String::new, |tools| {
-        let identity = match tools.parent.as_ref() {
-            Some(parent) => format!(
-                "Your Rho agent id is {}; your parent agent is {}. Your final response is mailed \
-                 to your parent automatically.",
-                &tools.agent, parent,
-            ),
-            None => format!(
-                "You are the primary Rho agent. Your agent id is {}.",
-                &tools.agent
-            ),
-        };
-        match tools.started_by.as_deref() {
-            Some(by) => format!("{identity} {}\n\n", started_by_note(by)),
-            None => format!("{identity}\n\n"),
+    let common = match view {
+        Some(view) => prompt(view, multi_agent, role),
+        None => {
+            let team = team_context(multi_agent, role);
+            match role {
+                AgentRole::Engineer { .. } => main_agent_prompt(
+                    &team,
+                    multi_agent
+                        .filter(|tools| tools.spawned_by.user_owned())
+                        .map_or("", |_| USER_OWNED_ENGINEERS),
+                    "",
+                ),
+                AgentRole::Advisor { .. } => advisor_prompt(&team, ""),
+            }
         }
-    });
-    let workspace = view
-        .map(|view| render_workspace_prompt(&WorksetPrompt::of(view)))
-        .unwrap_or_default();
-    // This is a CLAUDE.md supplement to Claude Code's own system instructions,
-    // not a variant of either native agent's complete system prompt.
-    let mut out = String::from(
+    };
+    format!(
         r#"# Rho integration
 
-## Python execution
+## Claude Code transport
 
-Rho exposes its tools through mcp__py__exec, with one source string argument. Claude Code's built-in
-tools are disabled in this session. Make one call at a time. The call returns as soon as its code
-finishes, with everything the notebook has said since you last looked. Tasks it started may keep
-running; their later output arrives in a subsequent result, or as a message once you have ended
-your turn.
+The `exec` described below is the `mcp__py__exec` tool, with one Python source
+string. Claude Code built-in tools are disabled; make one notebook call per
+response. CLI Result prose is not a final answer and is not delivered to the
+human. If you write prose without a call, the host will ask you to use
+`human.send()`; repeated prose-only responses stop until the human writes.
+The notebook and its running tasks survive Claude CLI respawns. A Rho runtime
+restart loses them. An open MCP call can return early on a notebook wake;
+continue from the existing state rather than running its source again.
 
-An open call also returns early: 2 seconds after a user message arrives or notify() is called,
-20 seconds after a task fails without being awaited, and at the check-in, 120 seconds after the
-call by default. Successful tasks finishing on their own do not return it.
-
-The notebook supports top-level await and persistent globals. Each exec is a task;
-asyncio.create_task(coro) creates another with its own session ID and output, which does not hold
-the call open. Commands belong to the task that started them and are awaited implicitly when its
-code succeeds. Host calls start immediately, even without assignment or await. Start independent
-work in one cell; await only when later Python code needs completion or a returned value. Output
-arrives automatically; do not await or reprint it merely to show it.
-
-The handle for a live exec or created task, found by the session ID in its reports.
-Task.from_session_id(session_id: int) → Task
-
-Run a shell command. Returns a persistent handle immediately; output arrives automatically.
-command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
-
-Run independent inspections in one cell, without gather or await:
-
-    command("git diff --stat")
-    command("rg -n 'TODO' src")
-
-Wait for a command to finish. Returns completion metadata, not stdout. Failure to start or
-cancellation can raise an exception.
-await handle → {id: int, exit_code: int | None}
-
-Await only the dependency; the next command starts without awaiting its output:
-
-    check = await command("cargo check")
-    if check["exit_code"] == 0:
-        command("cargo test")
-
-Send input to a running command. Registers immediately and returns an awaitable for the write.
-Awaiting waits for stdin readiness, not for output. It never reads; more_output does that.
-write_stdin(handle: Command, chars: str) → Awaitable[None]
-
-Send stdin without blocking the notebook:
-
-    job = command("python3 -c 'print(input())'", max_tokens=100)
-    write_stdin(job, "hello\n")
-
-Show the next page of a command's output, in the same form the command reports itself. A page
-starts where the last report or page stopped, so it never repeats what you have already seen, and
-it says how many bytes are left when more remain. The page is the output; nothing is returned.
-handle.more_output(*, max_tokens: int = 2000) → Awaitable[None]
-
-A command's output reaches you on its own. Ask for more only when a report says it truncated:
-
-    job.more_output(max_tokens=6000)
-
-The handle for a live command whose handle was not kept, found by the session ID in its reports.
-Usable at once, like command().
-Command.from_session_id(session_id: int) → Command
-
-    job = Command.from_session_id(3835)
-
-Request cancellation. Awaiting this operation waits for the request to be handled; await the
-command handle to wait for termination.
-handle.cancel() → Awaitable[None]
-
-Keep a handle for work you may want to stop:
-
-    job = command("sleep 600")
-
-In a later cell, request cancellation. Await the handle only if subsequent code needs termination:
-
-    job.cancel()
-    await job
-
-The built-in print, with a cap on how much of one call is kept. Library output on stdout and
-stderr is captured the same way.
-print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000) → None
-
-Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
-notify(value: object, *, max_tokens: int = 2000) → None
-
-A monitoring task can keep running after the call returns:
-
-    progress = {"checks": 0}
-    async def watch():
-        while not Path("results.json").exists():
-            progress["checks"] += 1
-            await asyncio.sleep(5)
-        notify("Results are ready")
-    asyncio.create_task(watch())
-
-Inspect its globals from a later cell without stopping it:
-
-    print(progress)
-
-Set the check-in: how long an open call may wait with nothing new. The default is 120 seconds.
-set_max_wait(seconds: int) → None
-
-Suppress early returns from task completion and notify, but not user messages or the check-in.
-Buffered output arrives on the next return.
-suppress_tool_wakeups() → None
-
-A new exec call resets both to their defaults; the latest setting from any task wins.
-
-    command("cargo test")
-    set_max_wait(seconds=300)
-
-Neither function sleeps or stops running work. Results report through the MCP call; do not sleep
-in Python merely to wait for reporting.
-
-The standard library, PyYAML, and HTTPX are available. Python runs in-process, not in a security
-sandbox; cwd is notebook-local, other process-global APIs retain their normal effects, and native
-extensions are unsupported. A runtime restart loses globals and handles; do not automatically
-replay interrupted work.
-
-Output budgets are capped at 10000 tokens. Each command retains its first 4 MiB. Displayed session
-IDs are reusable labels, not handles.
-
-## Other Rho functions
-
-The web object is preloaded in Python; call web.run directly inside exec for
-web searches and reading web pages, using standard OpenAI web request fields.
-Results arrive automatically.
-web.run(**request) → Awaitable[str]
-
-    web.run(search_query=[{"q": "search terms"}])
-    web.run(open=[{"ref_id": "https://example.com"}])
-
-Show an image from the workset. high is the default detail; original preserves resolution within
-the safety limits. The image appears in this cell; there is nothing to await.
-view_image(path: str, *, detail: Literal['high', 'original'] = 'high') → None
-
-    view_image('/src/capture.png')
-
-Record a concrete Rho bug or workflow friction locally. It does not notify anyone or start work.
-papercut(*, description: str) → Awaitable[str]
-
-## Working with other agents
-
-"#,
-    );
-    out.push_str(&team);
-    match role {
-        AgentRole::Engineer { .. } => out.push_str(
-            r#"### Engineers
-
-```python
-agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
-```
-
-task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
-identity; its final response arrives automatically as agent mail.
-The child loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
-
-Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
-the task being non-trivial.
-
-When to use an Engineer:
-- When two or more independently specifiable workstreams can run concurrently without editing the same files or depending on each other's results.
-- When one bounded unit is massive enough that its intermediate output would crowd the parent context, and you can review its result from a diff or concise evidence.
-- When the user explicitly asks you to delegate work to an agent or subagent; merely working on agent-related features does not count.
-
-When NOT to use an Engineer:
-- When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files.
-- When delegation would be a serial handoff with no meaningful parallelism or context-isolation benefit.
-- For routine review or verification of your own work; inspect the diff and run the checks yourself.
-- When reading a single file, performing an exact text search, or making one localized edit; use direct tools instead.
-- When assigning implementation before you understand what changes are needed. Investigate and do the synthesis yourself first; bounded research assignments are still appropriate.
-
-Delegate a separately owned work unit, not the whole user request merely because you already wrote
-a plan. A new phase of the current task is not itself a reason to create another agent. Continue
-with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
-single-threaded unless write targets are clearly disjoint or isolated.
-
-Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
-why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
-prompts with scope, relevant files or evidence, constraints and non-goals, validation to run, and
-the expected return shape. Preserve the user's requirements, distinguish observations from
-proposed solutions, and leave implementation choices open unless the task requires them.
-
-Do the synthesis yourself before assigning implementation; don't delegate "investigate and fix
-whatever you find." Include the relevant file paths and what specifically to change or check.
-Make clear whether the assignment is coding, verification, or research.
-
-If the deliverable needs exact quotes, numbers, URLs, or file paths, require them explicitly.
-Ask for compact but complete results: outcome, requested evidence, files changed or inspected,
-validation results, and concerns or blockers. A compact summary is not a substitute for the data
-you need.
-
-Inspect returned evidence and changes, resolve conflicts, and run relevant combined validation.
-You remain responsible for integration and the final user-facing result; summarize the findings
-yourself rather than merely acknowledging delivery.
-
-Consult an independent Advisor when the user requests one. Otherwise consult only after your own
-investigation leaves a specific unresolved question that would change a high-impact decision—not
-for routine review, reassurance, or merely complex work. State the question or requested review
-scope, relevant files, intended behavior, what you checked, settled constraints, and desired output.
-Returns an awaitable identifying the Advisor, not its findings.
-agents.spawn_new_advisor(msg: str) → Awaitable[str]
-
-Interrupt an Engineer's current turn. It remains available for follow-up messages.
-agents.cancel(*, agent_id: str) → Awaitable[str]
-
-"#,
-        ),
-        AgentRole::Advisor { .. } => out.push_str(
-            r#"You are serving as an Advisor. Complete the requesting Engineer's analysis or review and return
-your findings through your final response. Investigate rather than implement: inspect files and
-run focused checks or scratch experiments when needed, but do not make product changes, commit,
-push, or modify shared infrastructure. You cannot spawn or interrupt agents.
-
-"#,
-        ),
-    }
-    if role.is_engineer() && multi_agent.is_some_and(|tools| tools.spawned_by.user_owned()) {
-        out.push_str(USER_OWNED_ENGINEERS);
-    }
-    out.push_str(
-        r#"Use agents.message to send findings, questions, or a scoped next action to an existing agent.
-For back-and-forth collaboration, answer the agent's question or assess its findings, then send
-the next scoped request and say whether another reply is needed. Stop exchanging messages when
-the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, use the waiting controls; do not repeatedly poll.
-
-Use the agent's role-prefixed handle.
-agents.message(*, agent_id: str, message: str) → Awaitable[str]
-
-Child final responses arrive automatically as agent mail. Do not also send the same completion
-report through agents.message.
-
-"#,
-    );
-    out.push_str(&workspace);
-    if let Some(view) = view {
-        let (_, skills) = discovered_context(view);
-        if let Some(catalogue) = render_skills_prompt(&skills) {
-            out.push_str(&catalogue);
-        }
-    }
-    out.into()
+{common}"#
+    )
+    .into()
 }
 
 /// An agent's place as the prompt renders it.
@@ -1584,7 +1350,7 @@ mod tests {
         assert!(prompt.contains("human.send(text)"));
         assert!(prompt.contains("await human.reply()"));
         assert!(prompt.contains("Task.from_session_id(session_id: int) → Task"));
-        assert!(prompt.contains("suppress_tool_wakeups() → None"));
+        assert!(!prompt.contains("suppress_tool_wakeups"));
         assert!(prompt.contains("await handle → {id: int, exit_code: int | None}"));
         assert!(prompt.contains("returns a persistent command handle"));
         let execution = prompt
@@ -1760,9 +1526,9 @@ mod tests {
         ];
         for prompt in native.iter().chain(&claude) {
             assert!(!prompt.contains("set_checkin"));
+            assert!(!prompt.contains("suppress_tool_wakeups"));
             for example in [
                 "set_max_wait(seconds: int) → None",
-                "suppress_tool_wakeups() → None",
                 "web.run(**request) → Awaitable[str]",
                 "preloaded in Python",
                 r#"web.run(search_query=[{"q": "search terms"}])"#,
@@ -1783,22 +1549,14 @@ mod tests {
             }
         }
         for prompt in &claude {
-            for example in [
-                "A new exec call resets both to their defaults",
-                "    write_stdin(job, \"hello\\n\")",
-                "    job.more_output(max_tokens=6000)",
-                "    job.cancel()\n    await job",
-                "        await asyncio.sleep(5)",
-                "    print(progress)",
-                "    set_max_wait(seconds=300)",
-            ] {
-                assert!(prompt.contains(example), "{example}");
-            }
+            assert!(prompt.contains("mcp__py__exec"));
+            assert!(prompt.contains("human.send(text)"));
+            assert!(prompt.contains("The check-in comes 120 seconds after your last response"));
         }
     }
 
     #[test]
-    fn claude_prompt_is_an_independent_integration_supplement_for_both_roles() {
+    fn claude_uses_shared_policy_with_mcp_transport_for_both_roles() {
         for role in [
             AgentRole::default(),
             AgentRole::Advisor {
@@ -1806,52 +1564,20 @@ mod tests {
             },
         ] {
             let team = Team {
-                agent: if role.is_engineer() {
-                    "eng-child"
-                } else {
-                    "adv-child"
-                }
-                .into(),
+                agent: "eng-child".into(),
                 parent: Some("eng-parent".into()),
                 spawned_by: AgentSpawnedBy::Engineer,
                 started_by: None,
             };
             let prompt = claude_prompt(None, Some(&team), role);
-            let collaboration = prompt
-                .split("## Working with other agents")
-                .nth(1)
-                .unwrap()
-                .split("\n## ")
-                .next()
-                .unwrap();
-            assert!(collaboration.contains(&team.agent));
-            assert!(collaboration.contains("eng-parent"));
-            assert!(!prompt.contains("## Rho Team Context"));
+            assert!(prompt.contains("eng-child"));
+            assert!(prompt.contains("eng-parent"));
             assert!(prompt.contains("mcp__py__exec"));
-            assert!(prompt.contains("Make one call at a time"));
-            assert!(prompt.contains("returns as soon as its code\nfinishes"));
-            assert!(!prompt.contains("Issue at most one exec call per response"));
-            assert!(prompt.starts_with("# Rho integration\n"));
-            assert!(!prompt.contains("transcript"));
-            for native_only in [
-                "You are Rho, an autonomous coding agent",
-                "You are the Advisor — an expert",
-                "## Autonomy And Persistence",
-                "## Engineering And Scope",
-                "## Working with the user",
-                "history: Sequence[HistoryItem]",
-                "end the model turn",
-            ] {
-                assert!(!prompt.contains(native_only), "{native_only}");
-            }
-            assert!(!collaboration.contains("share a checkout"));
+            assert!(prompt.contains("human.send(text)"));
+            assert!(prompt.contains("archive()"));
+            assert!(prompt.contains("CLI Result prose is not a final answer"));
             assert_eq!(
                 prompt.contains("agents.spawn_new_engineer(*"),
-                role.is_engineer()
-            );
-            assert_eq!(prompt.contains("agents.cancel(*"), role.is_engineer());
-            assert_eq!(
-                prompt.contains("agents.spawn_new_advisor(msg:"),
                 role.is_engineer()
             );
         }
@@ -1892,10 +1618,7 @@ mod tests {
         // but who can give it the context behind its brief.
         let note = " Engineer eng-starter started you for the user; ask it with agents.message \
                     if you need more context.";
-        assert_eq!(
-            claude_prompt(None, Some(&user_owned), AgentRole::default()).replacen(note, "", 1),
-            *claude_prompt(None, Some(&direct), AgentRole::default())
-        );
+        assert!(claude_prompt(None, Some(&user_owned), AgentRole::default()).contains(note.trim()));
 
         // The native prompt offers it after the Engineers it manages and
         // before briefing, which applies to both.

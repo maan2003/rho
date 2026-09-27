@@ -5,7 +5,7 @@
 
 use rho_agent::{AgentStateKind, InputKind, QueuedInput};
 use rho_agent_types::ContentPart;
-use rho_agents_client::protocol::transcript::{Item, Live, QueuedItem, TextPhase};
+use rho_agents_client::protocol::transcript::{Item, Live, QueuedItem};
 use rho_inference::types::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
 
 /// Remembers what was last told so the next tell is only the change.
@@ -14,6 +14,7 @@ use rho_inference::types::{AStr, Diff, StreamingContextItem, StreamingContextIte
 #[derive(Default)]
 pub struct Teller {
     phase: Option<Phase>,
+    writing: Option<rho_inference::step::Call>,
     /// Temporary failures already told this request.
     failures: u64,
     /// Per index, the item as last told; `None` where nothing was.
@@ -52,6 +53,38 @@ impl Teller {
     pub fn tell(&mut self, kind: &AgentStateKind) -> Vec<Live> {
         let mut out = Vec::new();
         match kind {
+            AgentStateKind::Writing { call } => {
+                if self.phase != Some(Phase::Requesting) {
+                    self.phase = Some(Phase::Requesting);
+                    self.items.clear();
+                    self.writing = None;
+                    out.push(Live::Requesting);
+                }
+                if self.writing.as_ref() != call.as_ref() {
+                    match (self.writing.as_ref(), call.as_ref()) {
+                        (Some(previous), Some(call))
+                            if previous.id == call.id && call.code.starts_with(&previous.code) =>
+                        {
+                            out.push(Live::Appended {
+                                index: 0,
+                                text: call.code[previous.code.len()..].to_owned(),
+                            })
+                        }
+                        (_, Some(call)) => out.push(Live::Item {
+                            index: 0,
+                            item: Item::ToolCall {
+                                id: call.id.as_str().to_owned(),
+                                name: "exec".to_owned(),
+                                arguments: call.code.clone(),
+                                format:
+                                    rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
+                            },
+                        }),
+                        (_, None) => out.push(Live::Requesting),
+                    }
+                    self.writing = call.clone();
+                }
+            }
             AgentStateKind::ApiStreaming {
                 pending_response,
                 previous_attempt,
@@ -94,6 +127,10 @@ impl Teller {
                         self.items.resize(index + 1, None);
                     }
                     let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+                    if matches!(item, StreamingContextItem::AssistantMessage { .. }) {
+                        self.items[index] = Some(item.clone());
+                        continue;
+                    }
                     match self.items[index].as_ref().map(|told| appended(told, item)) {
                         Some(Some(text)) => {
                             if !text.is_empty() {
@@ -140,10 +177,7 @@ impl Teller {
 /// face; their index is never told.
 pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
     Some(match item {
-        StreamingContextItem::AssistantMessage { content, phase, .. } => Item::Text {
-            text: content.iter().map(ToString::to_string).collect(),
-            phase: phase.map(text_phase),
-        },
+        StreamingContextItem::AssistantMessage { .. } => return None,
         StreamingContextItem::RawReasoning {
             content, summary, ..
         } => Item::Reasoning {
@@ -175,16 +209,6 @@ pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
     })
 }
 
-pub fn text_phase(phase: rho_agent_types::MessagePhase) -> TextPhase {
-    match phase {
-        rho_agent_types::MessagePhase::Commentary => TextPhase::Commentary,
-        rho_agent_types::MessagePhase::FinalAnswer => TextPhase::FinalAnswer,
-    }
-}
-
-/// What `new` shows past `old` when the only change is text growing at
-/// the end; `None` when anything else changed and the item must be told
-/// whole.
 fn appended(old: &StreamingContextItem, new: &StreamingContextItem) -> Option<String> {
     use StreamingContextItem as S;
     match (old, new) {
@@ -348,92 +372,60 @@ mod tests {
         }
     }
 
-    /// Claude starts a new message within one request once the last is
-    /// in the log: the tail told for the last one must go, or the client
-    /// shows it twice.
     #[test]
-    fn a_response_started_over_empties_the_tail_first() {
+    fn provider_prose_is_not_a_live_message_even_when_it_grows() {
         let mut teller = Teller::default();
-        let first = AppendString::from("first".to_owned());
+        let mut text = AppendString::from("private".to_owned());
         assert_eq!(
-            teller.tell(&streaming(vec![message(&[&first], None)])),
-            vec![
-                Live::Requesting,
-                Live::Item {
-                    index: 0,
-                    item: Item::Text {
-                        text: "first".to_owned(),
-                        phase: None
-                    }
-                }
-            ]
+            teller.tell(&streaming(vec![message(&[&text], None)])),
+            vec![Live::Requesting]
         );
-        assert_eq!(teller.tell(&streaming(vec![])), vec![Live::Requesting]);
-        let second = AppendString::from("second".to_owned());
+        text.push_str(" prose");
         assert_eq!(
-            teller.tell(&streaming(vec![message(&[&second], None)])),
-            vec![Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "second".to_owned(),
-                    phase: None
-                }
-            }]
-        );
-        // The same length told again is not a start-over.
-        assert_eq!(
-            teller.tell(&streaming(vec![message(&[&second], None)])),
-            Vec::<Live>::new()
+            teller.tell(&streaming(vec![message(
+                &[&text],
+                Some(MessagePhase::FinalAnswer)
+            )])),
+            vec![]
         );
     }
 
     #[test]
-    fn tells_first_sight_then_appends() {
+    fn native_source_streams_without_a_synthetic_assistant_response() {
+        use rho_inference::step::{Call, CallId};
         let mut teller = Teller::default();
-        assert_eq!(teller.tell(&streaming(vec![])), vec![Live::Requesting]);
-        let mut buffer = AppendString::from("hel".to_owned());
+        let writing = |code: &str| AgentStateKind::Writing {
+            call: Some(Call {
+                id: CallId::new("a"),
+                code: code.into(),
+            }),
+        };
         assert_eq!(
-            teller.tell(&streaming(vec![message(&[&buffer], None)])),
-            vec![Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "hel".to_owned(),
-                    phase: None
+            teller.tell(&writing("print(")),
+            vec![
+                Live::Requesting,
+                Live::Item {
+                    index: 0,
+                    item: Item::ToolCall {
+                        id: "a".into(),
+                        name: "exec".into(),
+                        arguments: "print(".into(),
+                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
+                    },
                 }
-            }]
+            ]
         );
-        buffer.push_str("lo");
         assert_eq!(
-            teller.tell(&streaming(vec![message(&[&buffer], None)])),
+            teller.tell(&writing("print(7)")),
             vec![Live::Appended {
                 index: 0,
-                text: "lo".to_owned()
+                text: "7)".into()
             }]
         );
+        assert_eq!(teller.tell(&AgentStateKind::Idle), vec![Live::Idle]);
         assert_eq!(
-            teller.tell(&streaming(vec![message(&[&buffer], None)])),
-            vec![]
-        );
-        let second = AppendString::from(" world".to_owned());
-        assert_eq!(
-            teller.tell(&streaming(vec![message(&[&buffer, &second], None)])),
-            vec![Live::Appended {
-                index: 0,
-                text: " world".to_owned()
-            }]
-        );
-        assert_eq!(
-            teller.tell(&streaming(vec![message(
-                &[&buffer, &second],
-                Some(MessagePhase::FinalAnswer)
-            )])),
-            vec![Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "hello world".to_owned(),
-                    phase: Some(TextPhase::FinalAnswer)
-                }
-            }]
+            teller.tell(&AgentStateKind::Writing { call: None }),
+            vec![Live::Requesting]
         );
     }
 
@@ -466,10 +458,10 @@ mod tests {
                 error: Arc::new("boom".to_owned()),
             }),
         };
-        assert!(matches!(
-            teller.tell(&again)[..],
-            [Live::Item { index: 0, .. }]
-        ));
+        assert!(
+            teller.tell(&again).is_empty(),
+            "private prose stays private after retry"
+        );
         assert_eq!(
             teller.tell(&AgentStateKind::ToolCalling {
                 previews: Default::default(),

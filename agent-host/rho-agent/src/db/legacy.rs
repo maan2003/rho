@@ -1,6 +1,4 @@
-//! Native conversation authority. Requests and responses commit ordered,
-//! grouped context entries directly. A response ID always belongs to its own
-//! response entry, never to the containing event. Provider input is disposable.
+//! Temporary decoder for pre-code-first native rows. No runtime writes these.
 use rho_agent_types::UnixMs;
 use rho_inference::types::{ContextBlock, PendingInferenceResponse};
 use senax_encoder::{Decode, Encode};
@@ -32,6 +30,7 @@ pub enum NativeEvent {
 }
 
 impl crate::AgentEvent<'_> {
+    #[cfg(test)]
     pub fn native_event(&self) -> Option<&NativeEvent> {
         match self {
             Self::Native(event) => Some(event),

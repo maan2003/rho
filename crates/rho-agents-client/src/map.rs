@@ -80,6 +80,9 @@ pub struct AgentFiling {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     pub turn_running: bool,
+    pub notebook: Option<crate::state::UiNotebookActivity>,
+    pub awaiting_human: Option<rho_agent_types::UnixMs>,
+    pub last_message_sent: Option<rho_agent_types::UnixMs>,
     /// When the running turn began, when the client saw it start.
     pub turn_started_at: Option<rho_agent_types::UnixMs>,
     pub last_turn_ended: Option<rho_agent_types::UnixMs>,
@@ -708,6 +711,9 @@ impl AgentMap {
         };
         AgentFacts {
             turn_running: digest.turn_running,
+            notebook: digest.notebook,
+            awaiting_human: digest.awaiting_human.map(|(_, since)| since),
+            last_message_sent: digest.message_sent.map(|(_, at)| at),
             turn_started_at: digest.turn_started_at,
             last_turn_ended: digest.last_turn_ended,
             last_user_message_at: digest.last_user_message_at,

@@ -102,11 +102,26 @@ impl Layered {
         self.state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
-        self.state.status = match self.tail.phase {
-            Phase::Requesting => UiAgentStatus::Streaming,
-            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
-            Phase::Idle | Phase::Unknown => self.fold.status,
+        self.state.status = if self.fold.notebook.is_some() {
+            if self
+                .fold
+                .notebook
+                .is_some_and(|activity| activity.responding)
+                && self.tail.phase == Phase::Requesting
+            {
+                UiAgentStatus::Streaming
+            } else {
+                self.fold.status
+            }
+        } else {
+            match self.tail.phase {
+                Phase::Requesting => UiAgentStatus::Streaming,
+                Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
+                Phase::Idle | Phase::Unknown => self.fold.status,
+            }
         };
+        self.state.notebook = self.fold.notebook;
+        self.state.awaiting_human = self.fold.awaiting_human;
         self.state.context_used = self.fold.context_used;
         self.state.usage = self.fold.usage.clone();
         self.state.exec_timings = self.fold.exec_timings.clone();
@@ -131,10 +146,20 @@ impl Layered {
         state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
-        state.status = match self.tail.phase {
-            Phase::Requesting => UiAgentStatus::Streaming,
-            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
-            Phase::Idle | Phase::Unknown => state.status,
+        state.status = if state.notebook.is_some() {
+            if state.notebook.is_some_and(|activity| activity.responding)
+                && self.tail.phase == Phase::Requesting
+            {
+                UiAgentStatus::Streaming
+            } else {
+                state.status
+            }
+        } else {
+            match self.tail.phase {
+                Phase::Requesting => UiAgentStatus::Streaming,
+                Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
+                Phase::Idle | Phase::Unknown => state.status,
+            }
         };
         self.state = state;
     }
@@ -283,6 +308,8 @@ impl AgentStore {
         layered.fold.blocks.truncate(from);
         layered.fold.blocks.extend(delta.blocks);
         layered.fold.status = delta.status;
+        layered.fold.notebook = delta.notebook;
+        layered.fold.awaiting_human = delta.awaiting_human;
         layered.fold.context_used = delta.context_used;
         layered.fold.usage = delta.usage;
         layered.fold.exec_timings = delta.exec_timings;
@@ -363,6 +390,8 @@ fn empty_state() -> UiAgentState {
         exec_timings: Default::default(),
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
+        notebook: None,
+        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }
@@ -422,6 +451,63 @@ mod tests {
                 .collect(),
             ..empty_state()
         }
+    }
+
+    #[test]
+    fn durable_activity_survives_stale_live_phases_and_delta_updates() {
+        use rho_agent_types::{AgentPos, UnixMs};
+
+        use crate::fold::TranscriptFold;
+        use crate::protocol::transcript::TranscriptEvent;
+        let mut store = AgentStore::default();
+        let mut transcript = TranscriptFold::default();
+        store.apply_live(agent(), Live::Requesting);
+        transcript.tell(
+            AgentPos(0),
+            &TranscriptEvent::NotebookActivity {
+                responding: false,
+                running_tasks: 2,
+                checkin_at: Some(UnixMs(100)),
+                archived: false,
+                at: UnixMs(1),
+            },
+        );
+        store.apply_fold_delta(
+            agent(),
+            transcript.delta().expect("activity must produce delta"),
+        );
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.notebook.unwrap().running_tasks, 2);
+        assert_eq!(
+            state.status,
+            UiAgentStatus::Idle,
+            "stale Requesting cannot override durable snapshot"
+        );
+        transcript.tell(
+            AgentPos(1),
+            &TranscriptEvent::AwaitingHuman {
+                since: Some(UnixMs(2)),
+                at: UnixMs(2),
+            },
+        );
+        store.apply_fold_delta(
+            agent(),
+            transcript.delta().expect("waiting must produce delta"),
+        );
+        store.apply_live(agent(), Live::Idle);
+        assert_eq!(store.get(&agent()).unwrap().awaiting_human, Some(UnixMs(2)));
+        transcript.tell(
+            AgentPos(2),
+            &TranscriptEvent::NotebookActivity {
+                responding: false,
+                running_tasks: 0,
+                checkin_at: None,
+                archived: true,
+                at: UnixMs(3),
+            },
+        );
+        store.apply_fold_delta(agent(), transcript.delta().unwrap());
+        assert!(store.get(&agent()).unwrap().notebook.unwrap().archived);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 9;
+pub(super) const VERSION: u32 = 10;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -25,13 +25,11 @@ pub(super) enum Control {
     Drain,
     User {
         content: Vec<rho_agent_types::ContentPart>,
-        delivery: rho_agent_types::MessageDelivery,
     },
     Mail {
         sender: rho_agent_types::AgentId,
         label: String,
         body: String,
-        delivery: rho_agent_types::MessageDelivery,
     },
     NoticeCarried,
     TellTail,
@@ -64,7 +62,7 @@ pub(super) enum Request<'a> {
     Team,
     SharedTool(SharedCall),
     Usage(AgentUsageBucket),
-    Completed(String),
+    MessageSent(String),
     Failed(String),
     Settled,
     Head,
@@ -408,10 +406,6 @@ impl Host {
         self.tell_tail();
     }
 
-    pub(crate) fn publish_queue(&self, queue: Vec<crate::QueuedInput>) {
-        *self.publication.queue.lock().expect("poison") = Some(queue);
-    }
-
     pub(crate) fn published(&self) {
         self.publication.changed.notify_one();
     }
@@ -505,8 +499,8 @@ impl Host {
     pub(crate) async fn record_usage(&self, usage: AgentUsageBucket) -> Result<(), StoreError> {
         self.change(Request::Usage(usage)).await
     }
-    pub(crate) async fn completed(&self, answer: String) -> Result<(), StoreError> {
-        self.change(Request::Completed(answer)).await
+    pub(crate) async fn message_sent(&self, answer: String) -> Result<(), StoreError> {
+        self.change(Request::MessageSent(answer)).await
     }
     pub(crate) async fn failed(&self, error: String) -> Result<(), StoreError> {
         self.change(Request::Failed(error)).await
@@ -597,6 +591,48 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_controls_have_no_interrupt_lane_and_cancel_stays_explicit() {
+        let user = Message::Control {
+            id: 1,
+            body: Control::User {
+                content: vec![rho_agent_types::ContentPart::Text {
+                    text: "queue this".into(),
+                }],
+            },
+        };
+        let decoded = decode(&encode(&user).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, Message::Control { id: 1, body: Control::User { content } }
+            if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this"))
+        );
+        let mail = Message::Control {
+            id: 2,
+            body: Control::Mail {
+                sender: rho_agent_types::AgentId::from_counter(
+                    1,
+                    &rho_agent_types::AgentIdDomain(1),
+                )
+                .unwrap(),
+                label: "engineer".into(),
+                body: "next check-in".into(),
+            },
+        };
+        assert!(matches!(decode(&encode(&mail).unwrap()).unwrap(),
+            Message::Control { id: 2, body: Control::Mail { body, .. } } if body == "next check-in"));
+        let cancel = Message::Control {
+            id: 3,
+            body: Control::Cancel,
+        };
+        assert!(matches!(
+            decode(&encode(&cancel).unwrap()).unwrap(),
+            Message::Control {
+                id: 3,
+                body: Control::Cancel
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn replies_are_routed_independently_and_eof_fails_pending_requests() {
@@ -727,7 +763,7 @@ mod tests {
                 .write(&Message::Request {
                     id: 19,
                     body: Request::Append(AgentEvent::Native(
-                        crate::native::NativeEvent::RequestStarted {
+                        crate::db::legacy::NativeEvent::RequestStarted {
                             input: vec![rho_inference::types::ContextBlock::UserMessage {
                                 sender: rho_inference::types::MessageSender::User,
                                 content: vec![rho_agent_types::ContentPart::Text {
@@ -747,7 +783,7 @@ mod tests {
         let Message::Request {
             id: 19,
             body:
-                Request::Append(AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                Request::Append(AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
                     input,
                     ..
                 })),

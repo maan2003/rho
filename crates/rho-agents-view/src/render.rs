@@ -13,6 +13,39 @@ use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
 
+/// Two projections of the same canonical blocks. Hidden blocks keep their
+/// indices so detail requests, lazy history, and cursor anchors still agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TranscriptView {
+    #[default]
+    Conversation,
+    Activity,
+}
+
+impl TranscriptView {
+    pub(crate) fn visible(self, block: &UiBlock) -> bool {
+        let belongs = match self {
+            Self::Conversation => !matches!(block, UiBlock::Tool(_) | UiBlock::Reasoning { .. }),
+            Self::Activity => matches!(block, UiBlock::Tool(_) | UiBlock::Notice { .. }),
+        };
+        belongs && block_visible(block)
+    }
+
+    pub(crate) fn render(
+        self,
+        block: &UiBlock,
+        previous: Option<BlockKind>,
+        now_ms: u64,
+        label: &impl Fn(AgentId) -> String,
+    ) -> RenderedBlock {
+        if self.visible(block) {
+            render_block_with_agent_labels(block, previous, now_ms, label)
+        } else {
+            invisible(block_kind(block))
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub text: String,
@@ -94,6 +127,7 @@ impl RenderedBlock {
 pub fn block_kind(block: &UiBlock) -> BlockKind {
     match block {
         UiBlock::UserMessage { .. } => BlockKind::User,
+        UiBlock::MessageSent { .. } => BlockKind::Response { working: false },
         UiBlock::AssistantMessage { phase, .. } => BlockKind::Response {
             working: *phase != Some(UiMessagePhase::FinalAnswer),
         },
@@ -119,6 +153,7 @@ pub fn block_visible(block: &UiBlock) -> bool {
         UiBlock::Tool(_) => true,
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
+        | UiBlock::MessageSent { text, .. }
         | UiBlock::Notice { text }
         | UiBlock::AgentMessage { text, .. }
         | UiBlock::QueuedMessage { text, .. } => !text.is_empty(),
@@ -285,6 +320,24 @@ pub fn render_block_with_agent_labels(
                 visualizations,
                 table_padding,
             };
+        }
+        UiBlock::MessageSent { to, text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            if let Some(to) = to {
+                spans.push(Span::new(
+                    format!("to {}\n", agent_label(*to)),
+                    StyleClass::AgentLabel,
+                ));
+            }
+            markdown = true;
+            let mut text = text.clone();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            spans.push(Span::new(text, StyleClass::Default));
         }
         UiBlock::Reasoning { .. } => return invisible(kind),
         UiBlock::Tool(tool) => {
@@ -567,6 +620,7 @@ fn tool_status_label(status: UiToolStatus) -> &'static str {
     match status {
         UiToolStatus::Running => "…",
         UiToolStatus::Success => "ok",
+        UiToolStatus::Reported => "reported",
         UiToolStatus::Error => "error",
         UiToolStatus::Cancelled => "cancelled",
     }
@@ -576,6 +630,7 @@ fn tool_status_class(status: UiToolStatus) -> StyleClass {
     match status {
         UiToolStatus::Running => StyleClass::StatusRunning,
         UiToolStatus::Success => StyleClass::StatusOk,
+        UiToolStatus::Reported => StyleClass::SystemInfo,
         UiToolStatus::Error => StyleClass::StatusError,
         UiToolStatus::Cancelled => StyleClass::StatusCancelled,
     }
@@ -932,6 +987,21 @@ mod tests {
             tool_label("Write", r#"{"file_p"#, ArgumentsFormat::Json),
             ("write".to_owned(), StyleClass::ToolName)
         );
+    }
+
+    #[test]
+    fn notebook_report_is_not_a_success_or_completion_duration() {
+        let mut reported = tool(UiToolStatus::Reported);
+        reported.started_at = Some(UnixMs(1_000));
+        let mut spans = Vec::new();
+        assert_eq!(push_tool_spans(&mut spans, &reported, 10_000), None);
+        assert_eq!(text_of(&spans), "$ echo ok reported\n");
+        let sent = UiBlock::MessageSent {
+            to: None,
+            text: "still working".into(),
+        };
+        assert_eq!(block_kind(&sent), BlockKind::Response { working: false });
+        assert!(block_visible(&sent));
     }
 
     #[test]

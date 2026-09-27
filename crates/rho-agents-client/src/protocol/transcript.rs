@@ -70,6 +70,8 @@ pub struct ToolOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ToolStatus {
     Success,
+    /// A notebook report was delivered; the underlying task may continue.
+    Reported,
     Error,
     Cancelled,
 }
@@ -117,6 +119,13 @@ pub enum TranscriptEvent {
         delivery: MessageDelivery,
         at: UnixMs,
     },
+    /// A code-first inbox message, identified for exact report delivery.
+    Received {
+        id: u64,
+        from: Option<AgentId>,
+        text: String,
+        at: UnixMs,
+    },
     /// The person asked for a compaction; queued like a message.
     CompactionRequested {
         at: UnixMs,
@@ -129,6 +138,35 @@ pub enum TranscriptEvent {
     Sent {
         results: Vec<ToolOutcome>,
         /// The request asked the model to compact.
+        compaction: bool,
+        at: UnixMs,
+    },
+    /// A delivered message written by this agent, not a final answer.
+    MessageSent {
+        to: Option<AgentId>,
+        text: String,
+        at: UnixMs,
+    },
+    /// The agent explicitly waits for the person; None clears the wait.
+    AwaitingHuman {
+        since: Option<UnixMs>,
+        at: UnixMs,
+    },
+    /// Durable notebook state, independent of whether it awaits the person.
+    NotebookActivity {
+        responding: bool,
+        running_tasks: u32,
+        checkin_at: Option<UnixMs>,
+        archived: bool,
+        at: UnixMs,
+    },
+    /// A notebook report answered provider calls, but completed no task.
+    /// Delivered IDs entered the request; acknowledged IDs were consumed
+    /// without entering it. Other inbox messages remain queued.
+    NotebookReport {
+        calls: Vec<String>,
+        delivered: Vec<u64>,
+        acknowledged: Vec<u64>,
         compaction: bool,
         at: UnixMs,
     },
@@ -200,9 +238,14 @@ impl TranscriptEvent {
             | Self::ModeChanged { at, .. }
             | Self::Notice { at, .. }
             | Self::Message { at, .. }
+            | Self::Received { at, .. }
             | Self::CompactionRequested { at }
             | Self::QueueCleared { at }
             | Self::Sent { at, .. }
+            | Self::MessageSent { at, .. }
+            | Self::AwaitingHuman { at, .. }
+            | Self::NotebookActivity { at, .. }
+            | Self::NotebookReport { at, .. }
             | Self::Results { at, .. }
             | Self::Replied { at, .. }
             | Self::Turn { at, .. }

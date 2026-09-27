@@ -1,26 +1,20 @@
-//! Where the caret may rest around an elided run of tool calls.
-//!
-//! A turn that is all working output is elided with its last rows kept on
-//! screen, and those rows are the ones a reader reaches for: they hold the
-//! calls. They are ordinary buffer rows below the elision's own row, so a
-//! caret moves along and down them like any other text.
+//! The caret moves normally through the code rows of Activity.
+//! No automatic working-output elision hides a call or inserts a placeholder.
 
 use editor::display_map::{DisplayPoint, DisplayRow};
 use gpui::{Focusable as _, TestAppContext};
 use rho_agents_client::state::{UiBlock, UiTool, UiToolStatus};
 
 use super::{
-    active_editor, agent, bind_test_keymaps, display_text, feed_frame, has_display_elision, state,
+    active_editor, agent, bind_test_keymaps, display_text, feed_frame, open_activity, state,
     test_workspace, user,
 };
 
 #[gpui::test]
-fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAppContext) {
+fn the_caret_moves_through_visible_activity_calls(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
     let mut history = vec![user("run tools")];
-    // No final answer: the turn is all working output, so the elision keeps
-    // its last rows visible rather than hiding the turn whole.
     history.extend((0..16).map(|ix| {
         UiBlock::Tool(UiTool {
             timing: Default::default(),
@@ -38,11 +32,11 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
         })
     }));
     feed_frame(&workspace, cx, agent(1), state(history, Vec::new()));
-    assert!(has_display_elision(&workspace, cx));
+    open_activity(&workspace, cx);
     let shown = display_text(&workspace, cx);
     assert!(
-        shown.contains("$ echo 15"),
-        "the elision should leave its last calls on screen: {shown:?}"
+        shown.contains("$ echo 0") && shown.contains("$ echo 15"),
+        "Activity keeps every call visible: {shown:?}"
     );
 
     let editor = active_editor(&workspace, cx);
@@ -57,18 +51,14 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
         .expect("focus editor");
     cx.simulate_keystrokes(*workspace, "escape");
 
-    // The elision draws on a row of its own and the calls it leaves on
-    // screen follow it, so the first row a caret can reach below the user's
-    // message is the first shown call.
+    // The first Activity row is a call; the caret can reach it directly.
     let first_call = DisplayRow(
         shown
             .lines()
             .position(|line| line.starts_with("$ echo"))
             .expect("a call is on screen") as u32,
     );
-    // The rows between are the blank line that separates the response and
-    // the elision's own row, and a caret steps down through what it can
-    // rest on until it reaches the calls without going past them.
+    // A caret steps down through visible call rows without skipping one.
     let mut landed = head(&editor, cx);
     for _ in 0..4 {
         if landed.row() >= first_call {
@@ -77,20 +67,15 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
         cx.simulate_keystrokes(*workspace, "j");
         landed = head(&editor, cx);
     }
-    assert_eq!(
-        landed.row(),
-        first_call,
-        "a caret stepping down reaches the first shown call"
-    );
+    assert_eq!(landed.row(), first_call, "a caret reaches the first call");
 
     // Those rows are ordinary text: the caret moves along and down them.
-    // The step is not one column, because a call's label is a code span
-    // whose delimiters are concealed.
+    // The step is not one column, because code-span delimiters are concealed.
     cx.simulate_keystrokes(*workspace, "l");
     let along = head(&editor, cx);
     assert!(
         along.row() == first_call && along.column() > landed.column(),
-        "the caret moves along a call the elision left on screen: {along:?}"
+        "the caret moves along a call: {along:?}"
     );
     cx.simulate_keystrokes(*workspace, "j");
     let down = head(&editor, cx);

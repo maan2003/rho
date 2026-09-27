@@ -1,13 +1,14 @@
-//! One agent model per agent: transcript projection and prompt draft — the
-//! buffer role. Editors are the window role:
+//! One model per agent projection: conversation with a prompt draft, or
+//! read-only activity — the buffer role. Editors are the window role:
 //! each surface showing the agent builds its editor over the shared
 //! multibuffer via [`AgentModel::build_editor`], with its own cursor,
 //! scroll, and folds. The model reconciles every attached editor when
 //! content or chrome changes, so the model persists for the session while
 //! editors come and go with surfaces.
 //!
-//! The multibuffer composes the transcript's per-turn buffers and the writable
-//! prompt draft.
+//! Each projection keeps its own cursor and scroll. Conversation composes
+//! message buffers with the writable prompt; activity composes execution
+//! records.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -29,6 +30,7 @@ use rho_agents_client::store::FrameSummary;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
+use crate::TranscriptView;
 use crate::transcript::{FillEdge, StorePoint, TranscriptModel};
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
@@ -94,6 +96,7 @@ impl HistoryWant {
 pub struct PromptGutter;
 
 pub struct AgentModel {
+    view: TranscriptView,
     transcript: TranscriptModel,
     prompt_buffer: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
@@ -152,17 +155,33 @@ impl AgentModel {
         visualization_client: rho_agents_client::remote::AgentsLink,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_view(
+            TranscriptView::Conversation,
+            completions,
+            visualization_client,
+            cx,
+        )
+    }
+
+    pub fn with_view(
+        view: TranscriptView,
+        completions: Rc<dyn editor::CompletionProvider>,
+        visualization_client: rho_agents_client::remote::AgentsLink,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let prompt_buffer = cx.new(|cx| Buffer::local("", cx));
         let prompt_end = prompt_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(u64::MAX),
-                prompt_buffer.clone(),
-                [Point::zero()..prompt_buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
+            if view == TranscriptView::Conversation {
+                multi_buffer.set_excerpts_for_path(
+                    PathKey::sorted(u64::MAX),
+                    prompt_buffer.clone(),
+                    [Point::zero()..prompt_buffer.read(cx).max_point()],
+                    0,
+                    cx,
+                );
+            }
             multi_buffer
         });
 
@@ -174,11 +193,13 @@ impl AgentModel {
 
         let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let transcript = TranscriptModel::new(
+            view,
             multi_buffer.clone(),
             document_multi_buffer.clone(),
             visualization_client,
         );
         Self {
+            view,
             transcript,
             prompt_buffer,
             multi_buffer,
@@ -201,6 +222,10 @@ impl AgentModel {
             editors: Vec::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn view(&self) -> TranscriptView {
+        self.view
     }
 
     pub fn initial_load_started(&self) -> bool {
@@ -226,10 +251,13 @@ impl AgentModel {
         }
         self.initial_load_started = true;
         self.agent_id = Some(agent_id);
+        let view = self.view;
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
-                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, agent_labels) })
+                .spawn(async move {
+                    TranscriptModel::prepare_initial(view, state, now_ms, agent_labels)
+                })
                 .await;
             let reservations = (0..prepared.buffer_count())
                 .map(|_| cx.reserve_entity::<Buffer>())
@@ -316,7 +344,12 @@ impl AgentModel {
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let completions = self.completions.clone();
-        let multi_buffer = self.multi_buffer.clone();
+        let activity = self.view == TranscriptView::Activity;
+        let multi_buffer = if activity {
+            self.document_multi_buffer.clone()
+        } else {
+            self.multi_buffer.clone()
+        };
         let prompt_id = self.prompt_buffer.read(cx).remote_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
@@ -333,7 +366,21 @@ impl AgentModel {
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(prompt_id, cx);
-            editor.set_completion_provider(Some(completions));
+            if activity {
+                editor.set_read_only(true);
+                editor.set_autoscroll_pin(
+                    multi_buffer::Anchor::Max,
+                    AutoscrollStrategy::Bottom,
+                    cx,
+                );
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_anchor_ranges([
+                        multi_buffer::Anchor::Max..multi_buffer::Anchor::Max
+                    ]);
+                });
+            } else {
+                editor.set_completion_provider(Some(completions));
+            }
             editor
         });
 
@@ -637,6 +684,9 @@ impl AgentModel {
 
     /// Takes the trimmed prompt draft, clearing it. Returns `None` when empty.
     pub fn take_prompt(&mut self, cx: &mut Context<Self>) -> Option<Vec<ContentPart>> {
+        if self.view == TranscriptView::Activity {
+            return None;
+        }
         let buffer = self.prompt_buffer.read(cx);
         let text = buffer
             .text_for_range(0..buffer.len())

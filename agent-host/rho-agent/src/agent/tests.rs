@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use rho_agent_types::{AgentRole, UnixMs};
 use rho_db::RhoDb;
-use rho_inference2::Item;
-use rho_inference2::scripted::Scripted;
+use rho_inference::step::Item;
+use rho_inference::step::scripted::Scripted;
 
 use super::*;
 use crate::db::{
@@ -136,16 +136,13 @@ impl Harness {
 
 async fn say(handle: &AgentHandle, text: &str) {
     handle
-        .send_user_content_accepted(
-            vec![ContentPart::Text { text: text.into() }],
-            MessageDelivery::Immediate,
-        )
+        .send_user_content_accepted(vec![ContentPart::Text { text: text.into() }])
         .await
         .unwrap();
 }
 
 /// Everything a request tells the model, besides replayed steps.
-fn told(request: &rho_inference2::Request) -> String {
+fn told(request: &rho_inference::step::Request) -> String {
     request
         .items
         .iter()
@@ -157,7 +154,7 @@ fn told(request: &rho_inference2::Request) -> String {
         .join("\n")
 }
 
-async fn requests(script: &Scripted, count: usize) -> Vec<rho_inference2::Request> {
+async fn requests(script: &Scripted, count: usize) -> Vec<rho_inference::step::Request> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let requests = script.requests();
@@ -359,7 +356,7 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "hi").await;
     harness
-        .until("three failures", |entries| {
+        .until("permanent failure", |entries| {
             entries
                 .iter()
                 .filter(|entry| {
@@ -372,7 +369,7 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
                     )
                 })
                 .count()
-                == MAX_FAILURES as usize
+                == 1
         })
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -385,10 +382,247 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(script.requests().len(), MAX_FAILURES as usize);
+    assert_eq!(script.requests().len(), 1);
 
     script.then("await human.reply()");
     handle.retry();
-    let requests = requests(&script, MAX_FAILURES as usize + 1).await;
+    let requests = requests(&script, 2).await;
     assert!(told(requests.last().unwrap()).contains("hi"));
+}
+
+#[tokio::test]
+async fn waiting_still_checks_in_and_archive_revival_has_a_fresh_notebook() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("remembered = 41\nset_max_wait(1)\nawait human.reply()")
+        .then("human.send('checking in')\narchive()")
+        .then(
+            "human.send(str('remembered' in globals()))\nset_max_wait(86400)\nawait human.reply()",
+        );
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "start").await;
+    let entries = harness.until("a live task waiting for the human", |entries| {
+        entries.iter().any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+            && entries.iter().any(|entry| matches!(entry,
+                Entry::Activity { responding: false, running_tasks, checkin_at: Some(_), archived: false, .. }
+                if *running_tasks > 0))
+    }).await;
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Sent { .. }))
+    );
+    let entries = harness
+        .until("archive after check-in", |entries| {
+            entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    Entry::Activity {
+                        archived: true,
+                        running_tasks: 0,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        Entry::Woken {
+            why: Wake::Checkin,
+            ..
+        }
+    )));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "checking in"))
+    );
+    say(&handle, "revive").await;
+    harness
+        .until("fresh globals", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "False"))
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn transient_failures_recover_beyond_three_attempts() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    for _ in 0..4 {
+        script.then_transient();
+    }
+    script.then("human.send('recovered')\nawait human.reply()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "original task").await;
+    harness
+        .until("recovered message", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "recovered"))
+        })
+        .await;
+    let attempts = script.requests();
+    assert_eq!(attempts.len(), 5);
+    assert!(told(&attempts[4]).contains("original task"));
+    assert!(!matches!(handle.status().kind, AgentStateKind::Error(_)));
+}
+
+#[tokio::test]
+async fn explicit_retry_after_restart_resumes_with_recovery_notice() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    let (handle, task) = harness.start(&script).await;
+    say(&handle, "original task").await;
+    harness
+        .until("failure", |entries| {
+            entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    Entry::Notice {
+                        notice: Notice::Error(_),
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    drop(handle);
+    task.await.unwrap();
+
+    let script = Arc::new(Scripted::new());
+    script.then("await human.reply()");
+    let (handle, _task) = harness.start(&script).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(script.requests().is_empty());
+    handle.retry();
+    let attempts = requests(&script, 1).await;
+    assert!(told(&attempts[0]).contains("rho restarted"));
+    assert!(told(&attempts[0]).contains("original task"));
+}
+
+#[tokio::test]
+async fn backoff_caps_delay_and_expires_at_eight_hours() {
+    let mut retry = Backoff::failed(None, "first".into());
+    let mut delays = vec![retry.delay];
+    for _ in 0..4 {
+        retry = Backoff::failed(Some(retry), "again".into());
+        delays.push(retry.delay);
+    }
+    assert_eq!(delays, [1, 1, 2, 3, 5]);
+    for _ in 0..40 {
+        retry = Backoff::failed(Some(retry), "again".into());
+    }
+    assert_eq!(retry.delay, 1800);
+    retry.since = tokio::time::Instant::now() - Backoff::WINDOW;
+    let before = UnixMs::now();
+    let retry = Backoff::failed(Some(retry), "again".into());
+    assert!(retry.at <= UnixMs::now());
+    assert!(retry.at >= before);
+    assert!(retry.since.elapsed() >= Backoff::WINDOW);
+}
+
+#[tokio::test]
+async fn cancel_and_messages_remain_responsive_during_long_backoff() {
+    for cancel in [false, true] {
+        let harness = Harness::new().await;
+        let script = Arc::new(Scripted::new());
+        script.then("human.send('fresh input seen')\nawait human.reply()");
+        let (handle, mut agent) = Agent::load(
+            harness.agent,
+            harness.host.clone(),
+            harness.inference.clone(),
+            harness.view.clone(),
+        )
+        .await
+        .unwrap();
+        agent.script(script.clone());
+        let mut retry = Backoff::failed(None, "temporary outage".into());
+        retry.at = UnixMs::now() + Duration::from_secs(1800);
+        agent.backoff = Some(retry);
+        let task = tokio::spawn(async move {
+            agent.run().await.unwrap();
+            agent.shutdown().await.unwrap();
+        });
+        if cancel {
+            handle.cancel();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(script.requests().is_empty(), "cancel must not retry");
+            assert!(
+                !handle.status().kind.is_working(),
+                "cancel must clear the pending retry"
+            );
+        }
+        // This acknowledgement must not wait for the 30-minute retry timer.
+        tokio::time::timeout(Duration::from_secs(2), say(&handle, "fresh steering"))
+            .await
+            .unwrap();
+        let attempts = requests(&script, 1).await;
+        assert!(told(&attempts[0]).contains("fresh steering"));
+        assert_eq!(attempts.len(), 1);
+        drop(handle);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn exhausted_retry_window_stops_without_another_request() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("human.send('must not run')");
+    let (handle, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    agent.script(script.clone());
+    let mut retry = Backoff::failed(None, "outage".into());
+    retry.since = tokio::time::Instant::now() - Backoff::WINDOW;
+    agent.backoff = Some(retry);
+    let task = tokio::spawn(async move {
+        agent.run().await.unwrap();
+        agent.shutdown().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(script.requests().is_empty());
+    match handle.status().kind {
+        AgentStateKind::Error(error) => assert!(error.error.contains("retry window exhausted")),
+        other => panic!("expected terminal error, got {other:?}"),
+    }
+    drop(handle);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then_cut("counter = globals().get('counter', 0) + 1\n");
+    script.then("human.send(str(counter))\nawait human.reply()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "count once").await;
+    harness
+        .until("counter message", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "1"))
+        })
+        .await;
+    let attempts = script.requests();
+    assert_eq!(attempts.len(), 2);
+    assert!(told(&attempts[1]).contains("cut off"));
+    assert!(
+        attempts[1]
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Step(carry) if !carry.call_ids().is_empty())),
+        "the next request must record admitted code, not replay the failed request"
+    );
 }

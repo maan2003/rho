@@ -75,6 +75,8 @@ pub(crate) enum Command {
     Quit,
     /// Home, from the verdict menu's own `tab` row.
     Home,
+    AgentActivity,
+    AgentConversation,
     // Slack.
     /// Put this emoji on the message under the point, or take the
     /// reader's own off if it is already there. Slack's shortcode without
@@ -568,6 +570,12 @@ pub(crate) fn status_menu() -> Menu {
 /// `space a`: driving the current conversation.
 pub(crate) fn agent_menu() -> Menu {
     Menu::new("agent")
+        .item("a", "activity", MenuAction::Command(Command::AgentActivity))
+        .item(
+            "m",
+            "conversation",
+            MenuAction::Command(Command::AgentConversation),
+        )
         .item(
             "c",
             "cancel turn",

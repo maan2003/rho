@@ -17,7 +17,6 @@ pub(crate) struct Facts {
     pub failure: Option<UnixMs>,
     pub checkin: Option<UnixMs>,
     pub response_finished: Option<UnixMs>,
-    pub wake_on_tools: bool,
     pub prose: bool,
     pub rewound: bool,
     pub compaction: bool,
@@ -62,13 +61,11 @@ pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
     if facts.prose {
         due.push((now, Wake::Prose));
     }
-    if facts.wake_on_tools {
-        if let Some(at) = facts.finished {
-            due.push((base(at), Wake::Returned));
-        }
-        if let Some(at) = facts.notified {
-            due.push((base(at) + Duration::from_secs(2), Wake::Notify));
-        }
+    if let Some(at) = facts.finished {
+        due.push((base(at), Wake::Returned));
+    }
+    if let Some(at) = facts.notified {
+        due.push((base(at) + Duration::from_secs(2), Wake::Notify));
     }
     if let Some(at) = facts.failure {
         due.push((base(at) + Duration::from_secs(20), Wake::Failure));
@@ -92,7 +89,6 @@ mod tests {
             decide(
                 &Facts {
                     response_finished: Some(UnixMs(10)),
-                    wake_on_tools: true,
                     ..Facts::default()
                 },
                 UnixMs(100_000)
@@ -138,7 +134,6 @@ mod tests {
     fn every_deadline_and_mid_response_anchor() {
         let base = Facts {
             response_finished: Some(UnixMs(10_000)),
-            wake_on_tools: true,
             ..Facts::default()
         };
         for (facts, deadline, why) in [

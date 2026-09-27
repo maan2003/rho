@@ -229,7 +229,11 @@ fn rank_into(
             continue;
         };
         let facts = agents.agent_facts(agent_id);
-        if facts.turn_running {
+        if facts
+            .notebook
+            .is_some_and(|activity| activity.responding || activity.running_tasks > 0)
+            || (facts.notebook.is_none() && facts.turn_running)
+        {
             running.insert(node.clone());
         }
         let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
@@ -238,13 +242,41 @@ fn rank_into(
             trace.input(&node, "digest newest", digest.newest.0.to_string());
             trace.input(&node, "seen through", seen.to_string());
         }
-        let quiet = if facts.turn_running {
+        let code_first = facts.notebook.is_some()
+            || digest.awaiting_human.is_some()
+            || digest.message_sent.is_some();
+        let attention_at = if code_first {
+            digest
+                .awaiting_human
+                .map(|(_, since)| since)
+                .or_else(|| digest.message_sent.map(|(_, at)| at))
+                .or_else(|| facts.errored.then_some(facts.last_turn_ended).flatten())
+        } else {
+            facts.last_turn_ended
+        };
+        let quiet = if code_first && attention_at.is_none() {
+            Some("no message or human wait")
+        } else if !code_first && facts.turn_running {
             Some("running")
-        } else if facts.last_turn_ended.is_none() {
+        } else if attention_at.is_none() {
             Some("no turn has ended")
-        } else if facts.last_turn_ended <= Some(facts.last_user_message_at) {
+        } else if attention_at <= Some(facts.last_user_message_at) {
             Some("the user wrote after its turn ended")
-        } else if digest.newest.0 <= seen {
+        } else if if code_first {
+            digest
+                .awaiting_human
+                .map(|(pos, _)| pos.0)
+                .or_else(|| digest.message_sent.map(|(pos, _)| pos.0))
+                .or_else(|| {
+                    facts
+                        .errored
+                        .then_some(digest.errored.map(|pos| pos.0))
+                        .flatten()
+                })
+                .is_some_and(|pos| pos < seen)
+        } else {
+            digest.newest.0 <= seen
+        } {
             Some("seen through its newest")
         } else {
             None
@@ -255,17 +287,23 @@ fn rank_into(
             }
             continue;
         }
-        let ended = facts.last_turn_ended.expect("checked above");
+        let ended = attention_at.expect("checked above");
         let ended = unix(ended.0 as i64);
-        let (curve, reason) = if facts.errored || facts.needs_you_hint {
+        let (curve, reason) = if digest.awaiting_human.is_some()
+            || facts.errored
+            || (!code_first && facts.needs_you_hint)
+        {
             (
                 Curve::Waiting {
                     head_start: curve::AGENT_BLOCKED_HEAD_START,
                     since: ended,
                 },
-                match facts.errored {
-                    true => "errored · {age} ago",
-                    false => "waiting on reply · {age}",
+                if facts.errored {
+                    "errored · {age} ago"
+                } else if code_first {
+                    "waiting on you · {age}"
+                } else {
+                    "waiting on reply · {age}"
                 },
             )
         } else {
@@ -275,7 +313,11 @@ fn rank_into(
                     since: ended,
                     gone_days: curve::AGENT_FINISHED_GONE_DAYS,
                 },
-                "finished · {age} ago",
+                if code_first {
+                    "message · {age} ago"
+                } else {
+                    "finished · {age} ago"
+                },
             )
         };
         let mut part = Part::source(curve, reason.to_owned(), digest.newest.0.to_string());

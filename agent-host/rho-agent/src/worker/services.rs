@@ -300,11 +300,11 @@ impl Services {
                 }
                 Reply::Done
             }
-            Request::Completed(final_answer) => {
+            Request::MessageSent(text) => {
                 if let Some(pool) = self.pool.upgrade() {
-                    pool.publish_completed_turn(crate::pool::AgentTurnCompleted {
+                    pool.publish_message(crate::pool::AgentMessage {
                         agent_id: self.agent,
-                        final_answer,
+                        text,
                     })
                     .await;
                 }
@@ -376,17 +376,6 @@ impl Services {
                 let mut write = self.db.write().await;
                 for event in &events {
                     write.append_agent_event(self.agent, event);
-                    if let Some(crate::native::NativeEvent::ResponseFinished {
-                        usage: Some(usage),
-                        at,
-                        ..
-                    }) = event.native_event()
-                    {
-                        let mut usage = usage.clone();
-                        usage.bucket_start_ms = at.0 / crate::db::AGENT_USAGE_BUCKET_MS
-                            * crate::db::AGENT_USAGE_BUCKET_MS;
-                        write.add_agent_usage(self.agent, &usage);
-                    }
                     if let crate::AgentEvent::Entry(crate::entry::Entry::Usage { usage, at }) =
                         event
                     {

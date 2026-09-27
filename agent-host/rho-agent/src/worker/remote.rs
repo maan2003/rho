@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use rho_agent_types::{AgentId, AgentRole, MessageDelivery};
+use rho_agent_types::{AgentId, AgentRole};
 use tokio::sync::{oneshot, watch};
 
 use super::ipc::{self, Bootstrap, Control, Message};
@@ -214,35 +214,23 @@ impl Remote {
     pub fn retry(&self) {
         self.send(Control::Retry);
     }
-    pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }], delivery);
+    pub fn send_user_message(&self, text: String) {
+        self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }]);
     }
-    pub fn send_user_content(
-        &self,
-        content: Vec<rho_agent_types::ContentPart>,
-        delivery: MessageDelivery,
-    ) {
-        self.send(Control::User { content, delivery });
+    pub fn send_user_content(&self, content: Vec<rho_agent_types::ContentPart>) {
+        self.send(Control::User { content });
     }
     pub async fn send_user_content_accepted(
         &self,
         content: Vec<rho_agent_types::ContentPart>,
-        delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
-        self.request(Control::User { content, delivery }).await
+        self.request(Control::User { content }).await
     }
-    pub fn send_agent_message(
-        &self,
-        sender: AgentId,
-        label: String,
-        body: String,
-        delivery: MessageDelivery,
-    ) {
+    pub fn send_agent_message(&self, sender: AgentId, label: String, body: String) {
         self.send(Control::Mail {
             sender,
             label,
             body,
-            delivery,
         });
     }
     pub async fn send_agent_message_accepted(
@@ -250,13 +238,11 @@ impl Remote {
         sender: AgentId,
         label: String,
         body: String,
-        delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         self.request(Control::Mail {
             sender,
             label,
             body,
-            delivery,
         })
         .await
     }

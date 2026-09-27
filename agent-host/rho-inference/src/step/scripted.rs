@@ -3,11 +3,12 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::{Call, CallId, Carry, Inner, Request, Step, Stream, Usage};
+use super::{Call, CallId, Carry, Inner, Request, Step, Stream, Usage};
 
 enum Scripting {
     Call(String),
     Prose,
+    Transient,
     Compaction,
     /// The call's code streams, then the response fails.
     Cut(String),
@@ -58,6 +59,12 @@ impl Scripted {
         self
     }
 
+    /// The next exchange fails before admitting any code.
+    pub fn then_transient(&self) -> &Self {
+        self.steps.lock().unwrap().push_back(Scripting::Transient);
+        self
+    }
+
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
@@ -80,6 +87,7 @@ impl Scripted {
             anyhow::bail!("the script has ended");
         };
         let (code, cut, compacted) = match next {
+            Scripting::Transient => return Err(super::Retryable("temporary outage".into()).into()),
             Scripting::Call(code) => (Some(code), false, false),
             Scripting::Prose => (None, false, false),
             Scripting::Compaction => (None, false, true),
@@ -102,7 +110,7 @@ impl Scripted {
             }
         }
         if cut {
-            anyhow::bail!("the connection dropped");
+            return Err(super::Retryable("the connection dropped".into()).into());
         }
         Ok(Step {
             prose: if call.is_none() && !compacted {
@@ -124,7 +132,7 @@ impl Scripted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Item;
+    use crate::step::Item;
 
     #[tokio::test]
     async fn scripted_compaction_marks_a_replay_boundary() {
@@ -133,7 +141,7 @@ mod tests {
         let request = Request {
             instructions: "hello".into(),
             items: vec![],
-            cache_key: crate::CacheKey::new(),
+            cache_key: crate::step::CacheKey::new(),
         };
         let first = model.step(&request, &mut |_| {}).await.unwrap();
         assert!(!first.carry.has_compaction());

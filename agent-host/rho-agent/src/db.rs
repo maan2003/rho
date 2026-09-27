@@ -21,7 +21,9 @@ use uuid::Uuid;
 use crate::AgentEvent;
 use crate::journal::{Feed, Journal, LogAppended};
 
+mod code_first_migration;
 mod entries_migration;
+pub(crate) mod legacy;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -58,7 +60,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "9990d22e";
+const CURRENT_AGENT_DB_FORMAT: &str = "e31bcf82";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -67,26 +69,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "b906d137",
-        to: "6bcd407c",
-        // The dev shell cache moved to its daemon's own database.
-        migrate: |write| {
-            write.delete_table("devshell_shells");
-        },
-    },
-    AgentDbMigration {
-        from: "6bcd407c",
-        to: "a7e43d91",
-        migrate: rebuild_agent_heads,
-    },
-    AgentDbMigration {
-        from: "a7e43d91",
-        to: "9990d22e",
-        migrate: entries_migration::migrate,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "a7e43d91",
+    to: "e31bcf82",
+    migrate: code_first_migration::migrate,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1564,11 +1551,12 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             TurnEdge::Started => head.turn_running = true,
             TurnEdge::Ended(_) => {
                 head.turn_running = false;
-                // The activity label describes work that just stopped.
-                head.activity = None;
                 head.last_turn_ended = Some(*at);
             }
         },
+        AgentEvent::Entry(crate::entry::Entry::Status { text, .. }) => {
+            head.activity = (!text.is_empty()).then(|| text.clone());
+        }
         event if carries_notice(event) => {
             head.user_interacted = true;
             head.pending_notice = None;
@@ -1780,43 +1768,6 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
     write.delete_persistent_savepoint(id);
     write.commit();
     Ok(hop)
-}
-
-/// Backfill the cheap read projection once. The log is still the source of
-/// truth, including branches hidden by rewinds when folding the head.
-fn rebuild_agent_heads(write: &mut WriteTxn) {
-    let heads = {
-        let log = write.open_table(AGENT_LOG);
-        let mut heads = Vec::new();
-        let mut current: Option<(AgentId, AgentHead)> = None;
-        for (key, value) in log.iter() {
-            let (id, position) = key.value();
-            let pos = AgentEventPos::new(position);
-            let event = value.value().into_owned();
-            if current.as_ref().is_none_or(|(previous, _)| *previous != id) {
-                if let Some(previous) = current.take() {
-                    heads.push(previous);
-                }
-                current = Some((
-                    id,
-                    fold_head(std::iter::once((pos, event)))
-                        .expect("agent log must start with creation"),
-                ));
-            } else {
-                let head = &mut current.as_mut().expect("current agent").1;
-                fold_agent_head(head, &event);
-                head.next = pos.next();
-            }
-        }
-        if let Some(last) = current {
-            heads.push(last);
-        }
-        heads
-    };
-    let mut table = write.open_table(AGENT_HEADS);
-    for (id, head) in heads {
-        table.insert(&id, SenValue::borrowed(&head));
-    }
 }
 
 fn migrate_agent_db_format(write: &mut WriteTxn) {

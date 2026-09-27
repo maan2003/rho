@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use rho_notebook2::Export;
+use rho_notebook::Export;
 use tokio::sync::mpsc;
 
 /// What the notebook hands the agent loop.

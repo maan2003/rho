@@ -1,9 +1,10 @@
 //! The agents' screens.
 //!
-//! Every screen here is a buffer: the transcript is a multibuffer of
-//! per-turn excerpts with the point in it, and the agent screen is that
-//! buffer with a prompt buffer under it. They draw what `rho-agents-client`
-//! holds, with `rho-window`'s primitives, and add none of their own.
+//! Every screen here is a buffer: conversation shows messages and a prompt,
+//! while activity shows read-only execution records. Both are projections
+//! of the same transcript, with independent cursors and scroll positions. They
+//! draw what `rho-agents-client` holds, with `rho-window`'s primitives, and add
+//! none of their own.
 
 pub mod agent_view;
 pub mod draft;
@@ -13,6 +14,7 @@ pub mod transcript;
 mod visualization;
 
 pub use agent_view::{AgentModel, AgentModelEvent};
+pub use render::TranscriptView;
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};
 
 // What the composer answers to. Declared here because the composer is

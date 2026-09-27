@@ -1,8 +1,7 @@
-//! The provider-neutral language of talking to a model: context blocks,
-//! requests, streamed events, tools and their results.
+//! Shared Claude stream/tool shapes and temporary native-history decoders.
+//! Native inference executes exclusively through [`crate::step`].
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use rho_agent_types::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -90,25 +89,6 @@ pub enum ContextBlock {
     ToolHistoryEvicted {
         call_ids: Vec<ToolCallId>,
     },
-}
-
-/// Interpret harness-authored rotation items in complete, append-only history.
-/// Earlier blocks remain available for tool identity lookup, not model replay.
-/// Panics for invalid forward references or a cutoff that reopens discarded
-/// history: these are caller contract violations, not provider input.
-pub fn context_window_start(history: &[Arc<ContextBlock>]) -> usize {
-    let mut start = 0;
-    for (index, block) in history.iter().enumerate() {
-        if let ContextBlock::ContextRotation { retain_from } = &**block {
-            let next = usize::try_from(*retain_from).expect("context index fits usize");
-            assert!(
-                next >= start && next <= index,
-                "invalid context rotation boundary"
-            );
-            start = next;
-        }
-    }
-    start
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -330,14 +310,6 @@ pub enum ToolFileStatus {
     Moved,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct InferenceRequest {
-    pub instructions: Arc<str>,
-    // arc is used to avoid cloning context blocks too much between requests
-    pub input: Vec<Arc<ContextBlock>>,
-    pub agent_id_labels: std::collections::BTreeMap<AgentId, Arc<str>>,
-}
-
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum StreamingContextItem {
     AssistantMessage {
@@ -497,45 +469,6 @@ pub enum ContextItemEvent {
     Finish,
 }
 
-#[derive(Debug, Clone)]
-pub enum InferenceEvent {
-    /// Provider argument generation ended; not item completion or Python EOF.
-    ExecArgumentsFinished { id: ExecId },
-    ContextItem {
-        index: usize,
-        event: ContextItemEvent,
-    },
-    Finished {
-        usage: Option<TokenUsage>,
-        provider_response_id: Option<ProviderResponseId>,
-    },
-    /// Recoverable failure. With agent-owned retries the attempt is over;
-    /// the caller must rebuild context and schedule another request.
-    /// Other sessions may retry internally at `retrying_at`.
-    TemporaryFailure {
-        error: Arc<anyhow::Error>,
-        retrying_at: Instant,
-    },
-    /// We have sent the request
-    RequestSent,
-    /// server has started sending tokens
-    StreamingStarted,
-    /// turn has failed due to some reason
-    /// Not automatically retryable.
-    Failed {
-        // TODO: specific error message if needed if future
-        error: Arc<anyhow::Error>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cache_write_input_tokens: u64,
-    pub output_tokens: u64,
-}
-
 /// Concatenate the text parts of a message.
 pub fn text_content(parts: &[ContentPart]) -> String {
     let mut output = String::new();
@@ -562,38 +495,6 @@ pub fn text_content(parts: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn context_rotation_is_an_append_only_window_boundary() {
-        let mut history = vec![
-            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
-            Arc::new(ContextBlock::DeveloperMessage {
-                text: "early marker".into(),
-            }),
-        ];
-        assert_eq!(context_window_start(&history), 0);
-        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
-        assert_eq!(context_window_start(&history), 1);
-        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
-        assert_eq!(context_window_start(&history), 2);
-        assert_eq!(history.len(), 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid context rotation boundary")]
-    fn rotation_rejects_forward_references() {
-        context_window_start(&[Arc::new(ContextBlock::ContextRotation { retain_from: 1 })]);
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid context rotation boundary")]
-    fn rotation_cannot_reopen_discarded_history() {
-        context_window_start(&[
-            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
-            Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
-            Arc::new(ContextBlock::ContextRotation { retain_from: 0 }),
-        ]);
-    }
 
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestProviderSpecificData {

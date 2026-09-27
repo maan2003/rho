@@ -38,8 +38,8 @@ impl Controller {
                 // of ours to flush.
                 Self::Claude(_) => {}
             },
-            Control::User { content, delivery } => match self {
-                Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await?,
+            Control::User { content } => match self {
+                Self::Rho(agent) => agent.send_user_content_accepted(content).await?,
                 Self::Claude(agent) => agent.send_user_content_accepted(content).await?,
             },
             Control::Mail {
@@ -51,9 +51,10 @@ impl Controller {
                 Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await?,
                 Self::Claude(agent) => {
                     agent
-                        .send_agent_message_accepted(format!(
-                            "Message Type: MESSAGE\nSender: {label}\nPayload:\n{body}"
-                        ))
+                        .send_agent_message_accepted(
+                            sender,
+                            format!("Message Type: MESSAGE\nSender: {label}\nPayload:\n{body}"),
+                        )
                         .await?
                 }
             },

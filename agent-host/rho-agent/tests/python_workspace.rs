@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_notebook2::Notebook;
+use rho_notebook::Notebook;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 use rho_tool_shell::ShellTools;

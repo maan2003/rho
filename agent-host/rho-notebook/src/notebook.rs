@@ -42,7 +42,7 @@ pub(crate) struct Shared {
     pub(crate) retention: Mutex<()>,
     /// Cell ids in the order they started, to tell old sources from new.
     cells: Mutex<Vec<SourceId>>,
-    checkin: Mutex<(std::time::Duration, bool)>,
+    checkin: Mutex<std::time::Duration>,
     pub(crate) shell: ShellTools,
     /// Woken on any change. `notify_one` stores a permit, so a change that
     /// lands while the owner is busy is not lost.
@@ -78,7 +78,7 @@ impl Notebook {
             sources: Mutex::default(),
             retention: Mutex::default(),
             cells: Mutex::default(),
-            checkin: Mutex::new((std::time::Duration::from_secs(120), true)),
+            checkin: Mutex::new(std::time::Duration::from_secs(120)),
             shell: shell.clone(),
             wake,
         });
@@ -144,12 +144,12 @@ impl Notebook {
         }
     }
 
-    pub fn checkin(&self) -> (std::time::Duration, bool) {
+    pub fn checkin(&self) -> std::time::Duration {
         *self.shared.checkin.lock().unwrap()
     }
 
     pub fn reset_checkin(&self) {
-        *self.shared.checkin.lock().unwrap() = (std::time::Duration::from_secs(120), true);
+        *self.shared.checkin.lock().unwrap() = std::time::Duration::from_secs(120);
     }
 
     /// Every source that still has something to say, or may yet: what the
@@ -543,11 +543,7 @@ impl Cell {
     }
 
     fn max_wait(&self, seconds: u64) {
-        self.shared.checkin.lock().unwrap().0 = std::time::Duration::from_secs(seconds);
-    }
-
-    fn suppress_tool_wakeups(&self) {
-        self.shared.checkin.lock().unwrap().1 = false;
+        *self.shared.checkin.lock().unwrap() = std::time::Duration::from_secs(seconds);
     }
 }
 

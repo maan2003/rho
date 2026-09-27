@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_agent_types::{
-    AgentId, AgentRole, EngineerIntelligence, MessageDelivery, Place, WorksetMode,
-};
+use rho_agent_types::{AgentId, AgentRole, EngineerIntelligence, Place, WorksetMode};
 use rho_db::RhoDb;
 use rho_fs_view::{Mode, Workset, Worksets};
 use rho_inference::Inference;
@@ -92,12 +90,11 @@ pub struct AgentCreated {
     pub parent: Option<AgentId>,
 }
 
-/// An agent completed a turn: its final answer is mailed to whoever
-/// subscribed to its responses.
+/// An explicit message, mailed to whoever subscribed to this agent.
 #[derive(Clone, Debug)]
-pub struct AgentTurnCompleted {
+pub struct AgentMessage {
     pub agent_id: AgentId,
-    pub final_answer: String,
+    pub text: String,
 }
 
 impl AgentPool {
@@ -146,7 +143,6 @@ impl AgentPool {
                             notification.sender,
                             recipient,
                             notification.body.clone(),
-                            MessageDelivery::NextRequest,
                         ),
                     )
                     .await
@@ -258,16 +254,9 @@ impl AgentPool {
         self.created.subscribe()
     }
 
-    pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
+    pub async fn publish_message(self: &Arc<Self>, completed: AgentMessage) {
         self.flush_agent_usage(Some(completed.agent_id)).await;
-        self.deliver_response(
-            completed.agent_id,
-            if completed.final_answer.is_empty() {
-                "(turn finished with no text response)".to_owned()
-            } else {
-                completed.final_answer.clone()
-            },
-        );
+        self.deliver_response(completed.agent_id, completed.text);
     }
 
     pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
@@ -718,12 +707,7 @@ impl AgentPool {
         }
         let spawner_label = self.agent_handle(spawner);
         agent
-            .send_agent_message_accepted(
-                spawner,
-                spawner_label,
-                prompt,
-                MessageDelivery::NextRequest,
-            )
+            .send_agent_message_accepted(spawner, spawner_label, prompt)
             .await
             .with_context(|| {
                 format!(
@@ -778,7 +762,6 @@ impl AgentPool {
         from: AgentId,
         to: AgentId,
         mut body: String,
-        delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         let sender_role = {
             let read = self.db.read();
@@ -794,7 +777,7 @@ impl AgentPool {
             ));
         }
         agent
-            .send_agent_message_accepted(from, sender_label, body, delivery)
+            .send_agent_message_accepted(from, sender_label, body)
             .await
     }
 
@@ -1430,9 +1413,9 @@ mod tests {
         let receiver_guard = receiver_lock.lock_owned().await;
         tokio::time::timeout(
             Duration::from_secs(3),
-            pool.publish_completed_turn(AgentTurnCompleted {
+            pool.publish_message(AgentMessage {
                 agent_id: first_id,
-                final_answer: "completed".into(),
+                text: "completed".into(),
             }),
         )
         .await
@@ -1447,17 +1430,17 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             Duration::from_secs(3),
-            pool.publish_completed_turn(AgentTurnCompleted {
+            pool.publish_message(AgentMessage {
                 agent_id: second_id,
-                final_answer: "saturated reverse notification".into(),
+                text: "saturated reverse notification".into(),
             }),
         )
         .await
         .expect("completion waited for notification capacity");
         drop(reserved);
-        pool.publish_completed_turn(AgentTurnCompleted {
+        pool.publish_message(AgentMessage {
             agent_id: first_id,
-            final_answer: "second".into(),
+            text: "second".into(),
         })
         .await;
         pool.set_response_subscription(first_id, second_id, false)

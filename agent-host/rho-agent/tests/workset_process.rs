@@ -350,7 +350,7 @@ async fn streaming_crash() {
         )
         .await
         .unwrap();
-    agent.send_user_message("run".into(), rho_agent_types::MessageDelivery::Immediate);
+    agent.send_user_message("run".into());
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("side-effect").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -367,12 +367,9 @@ async fn streaming_crash() {
         let agent = agent.clone();
         async move {
             agent
-                .send_user_content_accepted(
-                    vec![rho_agent_types::ContentPart::Text {
-                        text: "blocked".into(),
-                    }],
-                    rho_agent_types::MessageDelivery::NextRequest,
-                )
+                .send_user_content_accepted(vec![rho_agent_types::ContentPart::Text {
+                    text: "blocked".into(),
+                }])
                 .await
         }
     });
@@ -414,10 +411,7 @@ async fn streaming_crash() {
         1,
         "load replayed interrupted execution"
     );
-    replacement.send_user_message(
-        "inspect fresh globals".into(),
-        rho_agent_types::MessageDelivery::Immediate,
-    );
+    replacement.send_user_message("inspect fresh globals".into());
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("recovered").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;

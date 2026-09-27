@@ -1,4 +1,4 @@
-"""The notebook side of rho-notebook2's Python runtime.
+"""The notebook side of rho-notebook's Python runtime.
 
 Each notebook runs `Notebook.run` on its own thread and event loop, with its
 own globals. A cell is an `Owner` stored in the `CELL` context variable while
@@ -513,12 +513,6 @@ def set_max_wait(seconds):
         owner.cell.max_wait(seconds)
 
 
-def suppress_tool_wakeups():
-    owner = CELL.get()
-    if owner is not None:
-        owner.cell.suppress_tool_wakeups()
-
-
 def namespace(exports):
     """A notebook's globals, with the objects its host exports. Those are
     also importable, from the notebook's code only."""
@@ -535,7 +529,6 @@ def namespace(exports):
         'print': print,
         'notify': notify,
         'set_max_wait': set_max_wait,
-        'suppress_tool_wakeups': suppress_tool_wakeups,
         'asyncio': asyncio,
         'Task': Task,
         'Path': pathlib.Path,

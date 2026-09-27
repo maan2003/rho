@@ -13,7 +13,7 @@ use pyo3::types::PyDict;
 use rho_agent_types::{AgentId, AgentRole};
 use rho_inference::Inference;
 use rho_inference::types::{ImageDetail, ToolExecutionContext};
-use rho_notebook2::{Export, operation};
+use rho_notebook::{Export, operation};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
 
@@ -238,7 +238,7 @@ impl ViewImage {
                 .await
                 .map_err(|e| e.to_string())?;
             cx.report(&text);
-            cx.show_image(rho_notebook2::Image {
+            cx.show_image(rho_notebook::Image {
                 media_type: image.media_type,
                 data: image.data,
             });

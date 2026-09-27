@@ -7,13 +7,12 @@ use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::UnixMs;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
+use serde_json::json;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::ResolvedAuth;
-use super::session::{ResponsesConfig, ResponsesModel, ServiceTier};
-use super::wire::ResponsesRequest;
-use super::ws::{self, WsResponseCreate};
+use super::ws;
 use crate::accounts::SelectedAuth;
 use crate::inference::Inference;
 
@@ -142,12 +141,13 @@ impl RouteSelection {
         self.revision
     }
 
-    pub(crate) fn for_session(
+    pub(crate) fn for_model(
         &self,
-        config: &ResponsesConfig,
+        model: crate::config::InferenceModel,
+        fast: bool,
         selected: Option<&SelectedAuth>,
     ) -> DialRoute {
-        if config.model == ResponsesModel::Gpt6Luna && config.service_tier == ServiceTier::Normal {
+        if model == crate::config::InferenceModel::Gpt6Luna && !fast {
             let route = self;
             if route.route == DialRoute::Dns
                 || selected.is_some_and(|selected| {
@@ -305,7 +305,7 @@ async fn probe_route(
     route: DialRoute,
     prompt_cache_keys: &[uuid::Uuid; PROBES_PER_ROUTE],
 ) -> Result<RouteMeasurement> {
-    let request = ws::build_ws_request_for_base_url(base_url, None, auth)?;
+    let request = ws::request(base_url, None, auth)?;
     let (mut socket, response) =
         tokio::time::timeout(PROBE_TIMEOUT, ws::connect(request, route)).await??;
     let cloudflare_colo = response
@@ -320,10 +320,7 @@ async fn probe_route(
         .map(|colo| colo.to_ascii_uppercase());
     let mut samples = Vec::with_capacity(PROBES_PER_ROUTE);
     for prompt_cache_key in prompt_cache_keys {
-        let body = serde_json::to_string(&WsResponseCreate {
-            ty: "response.create",
-            body: ResponsesRequest::luna_default_probe(*prompt_cache_key),
-        })?;
+        let body = probe_body(*prompt_cache_key).to_string();
         let started = tokio::time::Instant::now();
         socket.send(WsMessage::Text(body.into())).await?;
         let admission_latency = tokio::time::timeout(PROBE_TIMEOUT, async {
@@ -364,6 +361,18 @@ async fn probe_route(
     Ok(RouteMeasurement {
         cloudflare_colo,
         samples,
+    })
+}
+
+fn probe_body(prompt_cache_key: uuid::Uuid) -> serde_json::Value {
+    json!({
+            "type": "response.create", "generate": false, "model": "gpt-6-luna",
+            "instructions": "", "input": [{"type":"additional_tools","role":"developer","tools":[]}],
+            "store": false, "parallel_tool_calls": false, "text": {"verbosity":"low"},
+            "reasoning": {"context":"all_turns","effort":"medium","summary":"auto"},
+            "service_tier": "default", "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": prompt_cache_key,
+            "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite":"true"}
     })
 }
 
@@ -440,19 +449,6 @@ fn choose_route(current: DialRoute, scores: &[(DialRoute, Duration)]) -> DialRou
 mod tests {
     use super::*;
     use crate::responses::InferenceAuth;
-    use crate::responses::session::{ReasoningContext, ResponsesEffort, TextVerbosity};
-
-    fn luna_config(service_tier: ServiceTier) -> ResponsesConfig {
-        ResponsesConfig {
-            model: ResponsesModel::Gpt6Luna,
-            auto_compaction: None,
-            context_rotation: false,
-            reasoning_context: ReasoningContext::AllTurns,
-            effort: ResponsesEffort::Medium,
-            text_verbosity: TextVerbosity::Low,
-            service_tier,
-        }
-    }
 
     fn selected(namespace: &str, account_id: &str) -> SelectedAuth {
         SelectedAuth {
@@ -464,11 +460,11 @@ mod tests {
 
     #[test]
     fn probe_is_luna_default_without_generation() {
-        let body =
-            serde_json::to_value(ResponsesRequest::luna_default_probe(uuid::Uuid::nil())).unwrap();
+        let body = probe_body(uuid::Uuid::nil());
         assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["service_tier"], "default");
         assert_eq!(body["generate"], false);
+        assert_eq!(body["input"][0]["tools"], json!([]));
     }
 
     #[test]
@@ -481,22 +477,25 @@ mod tests {
         });
 
         assert_eq!(
-            routes.selected.borrow().for_session(
-                &luna_config(ServiceTier::Normal),
+            routes.selected.borrow().for_model(
+                crate::config::InferenceModel::Gpt6Luna,
+                false,
                 Some(&selected("one", "account-1")),
             ),
             DialRoute::PinnedA
         );
         assert_eq!(
-            routes.selected.borrow().for_session(
-                &luna_config(ServiceTier::Normal),
+            routes.selected.borrow().for_model(
+                crate::config::InferenceModel::Gpt6Luna,
+                false,
                 Some(&selected("two", "account-2")),
             ),
             DialRoute::Dns
         );
         assert_eq!(
-            routes.selected.borrow().for_session(
-                &luna_config(ServiceTier::Priority),
+            routes.selected.borrow().for_model(
+                crate::config::InferenceModel::Gpt6Luna,
+                true,
                 Some(&selected("one", "account-1")),
             ),
             DialRoute::Dns

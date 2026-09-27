@@ -1,7 +1,6 @@
 //! Where a block ends, once nothing re-measures a rendered string to say so.
 //!
-//! A record's end anchor is where an elision stops hiding, so whatever
-//! decides it decides which rows a settled turn keeps. These are the two
+//! A record's end anchor bounds its rendered block. These are the two
 //! documents that put the decision under load: a block that grows with a
 //! later block already standing after it, and a block that grows at exactly
 //! the byte its own end anchor sits on.
@@ -9,8 +8,8 @@
 use gpui::TestAppContext;
 
 use super::{
-    UiBlock, UiToolStatus, agent, assistant, buffer_text, feed_edit, feed_frame, state,
-    stream_text, stream_tool_arguments, test_workspace, tool, user,
+    UiBlock, UiToolStatus, agent, assistant, buffer_text, feed_edit, feed_frame, open_activity,
+    state, stream_text, stream_tool_arguments, test_workspace, tool, user,
 };
 
 #[gpui::test]
@@ -30,6 +29,7 @@ fn a_tool_that_grows_under_a_later_tool_keeps_both_blocks_whole(cx: &mut TestApp
     );
     cx.run_until_parked();
 
+    open_activity(&workspace, cx);
     // The first tool's line grows. The second tool's block is unchanged and
     // sits directly after it, so this is an in-place edit of a block that is
     // not the last one.

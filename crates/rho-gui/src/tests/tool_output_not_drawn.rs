@@ -14,7 +14,8 @@
 use gpui::TestAppContext;
 
 use super::{
-    UiBlock, UiToolStatus, agent, display_text, feed_frame, state, test_workspace, tool, user,
+    UiBlock, UiToolStatus, agent, display_text, feed_frame, open_activity, state, test_workspace,
+    tool, user,
 };
 
 /// A call that has finished. Its output is in the agent host's log; nothing in
@@ -44,6 +45,7 @@ fn a_call_shows_what_was_run_and_never_what_it_said(cx: &mut TestAppContext) {
         ),
     );
 
+    open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert_eq!(
         text.matches("$ echo ok").count(),

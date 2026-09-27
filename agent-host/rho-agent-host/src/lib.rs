@@ -682,7 +682,6 @@ async fn resume_after_restart(services: Arc<Services>, path: Utf8PathBuf) {
                        while you were working, and has started again. Continue your task."
                     .to_owned(),
             }],
-            delivery: rho_agent_types::MessageDelivery::Immediate,
         };
         if let Err(error) = agents::handle_agent_command(&services, command).await {
             eprintln!("rho-agent-host: could not resume {id}: {error:#}");

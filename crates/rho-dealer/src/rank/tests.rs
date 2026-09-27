@@ -488,6 +488,74 @@ fn a4_an_agent_at_work_or_holding_the_users_message_has_no_card() {
 }
 
 #[test]
+fn code_first_permanent_failure_without_message_is_blocking() {
+    let mut w = world();
+    let a = w.agent("a");
+    let agent = World::id(&a);
+    w.log(
+        agent,
+        TranscriptEvent::NotebookActivity {
+            responding: false,
+            running_tasks: 0,
+            checkin_at: None,
+            archived: false,
+            at: UnixMs(w.ms()),
+        },
+    );
+    w.errors(&a);
+    assert_eq!(w.hand(), "a · errored · 0m ago");
+}
+
+#[test]
+fn code_first_message_and_human_wait_create_cards_during_background_tasks() {
+    let mut w = world();
+    let a = w.agent("a");
+    let agent = World::id(&a);
+    let at = UnixMs(w.ms());
+    w.log(
+        agent,
+        TranscriptEvent::NotebookActivity {
+            responding: false,
+            running_tasks: 2,
+            checkin_at: Some(at),
+            archived: false,
+            at,
+        },
+    );
+    assert_eq!(w.hand(), "", "tasks alone do not demand user attention");
+    w.log(
+        agent,
+        TranscriptEvent::MessageSent {
+            to: None,
+            text: "update".into(),
+            at,
+        },
+    );
+    assert_eq!(w.hand(), "a · message · 0m ago");
+    w.log(
+        agent,
+        TranscriptEvent::AwaitingHuman {
+            since: Some(at),
+            at,
+        },
+    );
+    assert_eq!(w.hand(), "a · waiting on you · 0m");
+    w.done(&a);
+    assert_eq!(w.hand(), "");
+    w.log(
+        agent,
+        TranscriptEvent::NotebookActivity {
+            responding: false,
+            running_tasks: 1,
+            checkin_at: Some(at),
+            archived: true,
+            at,
+        },
+    );
+    assert_eq!(w.hand(), "", "archiving does not fabricate a new message");
+}
+
+#[test]
 fn a5_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
     let mut w = world();
     let a = w.agent("a");
@@ -1049,7 +1117,11 @@ fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
     let (hand, trace) = w.traced();
     assert_eq!(hand, w.deal());
     let outcome = |node: &NodeId| trace.nodes[node].outcome.clone();
-    assert!(outcome(&asking).starts_with("card at "), "{}", outcome(&asking));
+    assert!(
+        outcome(&asking).starts_with("card at "),
+        "{}",
+        outcome(&asking)
+    );
     assert!(outcome(&snoozed).starts_with("no card: snoozed until"));
     assert_eq!(outcome(&quiet), "no card: seen through its newest");
     assert!(

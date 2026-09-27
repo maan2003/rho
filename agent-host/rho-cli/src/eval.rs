@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::entry::{Entry, Party};
 use rho_agent::{AgentEvent, StartPlace};
-use rho_agent_types::{AgentRole, EngineerIntelligence, MessageDelivery, TurnEdge, TurnOutcome};
+use rho_agent_types::{AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
 use rho_fs_view::{UserEnvironment, Worksets};
-use rho_inference::types::{ContextBlock, InferenceResponseItem};
 use serde_json::{Value, json};
 
 #[derive(Clone, clap::Args)]
@@ -153,7 +153,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         _ => None,
     };
     emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir}))?;
-    agent.send_user_message(prompt, MessageDelivery::Immediate);
+    agent.send_user_message(prompt);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let mut requests = 0;
     let mut calls = BTreeSet::new();
@@ -173,80 +173,43 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             continue;
         };
         match event {
-            AgentEvent::Native(rho_agent::native::NativeEvent::RequestStarted {
-                input: blocks,
-                ..
-            }) => {
-                requests += 1;
-                emit(json!({"type":"request", "number":requests}))?;
-                for block in blocks.iter() {
-                    match block {
-                        ContextBlock::ToolResults { results } => {
-                            for result in results {
-                                emit(
-                                    json!({"type":"tool_result","id":result.call_id.as_str(),"output":result.body.output,"status":result.body.status}),
-                                )?;
-                            }
-                        }
-                        ContextBlock::ToolUpdate(update) => emit(
-                            json!({"type":"tool_update","id":update.call_id.as_str(),"output":update.output}),
-                        )?,
-                        _ => {}
+            AgentEvent::Entry(entry) => match entry {
+                Entry::Woken { results, .. } => {
+                    requests += 1;
+                    emit(json!({"type":"request", "number":requests}))?;
+                    for result in results {
+                        emit(
+                            json!({"type":"notebook_report", "id":result.id.as_str(), "output":result.text}),
+                        )?;
                     }
                 }
-            }
-            AgentEvent::Native(rho_agent::native::NativeEvent::ResponseFinished {
-                output: blocks,
-                usage,
-                ..
-            }) => {
-                // The final response replaces earlier commentary for assertions.
-                final_answer.clear();
-                for block in blocks.iter() {
-                    if let ContextBlock::InferenceResponse { items, .. } = block {
-                        for item in items {
-                            match item {
-                                InferenceResponseItem::AssistantMessage {
-                                    content, phase, ..
-                                } => {
-                                    let text: String = rho_inference::types::text_content(content);
-                                    if *phase != Some(rho_agent_types::MessagePhase::Commentary) {
-                                        if !final_answer.is_empty() {
-                                            final_answer.push('\n');
-                                        }
-                                        final_answer.push_str(&text);
-                                    }
-                                    emit(
-                                        json!({"type":"assistant", "text":text,"phase":format!("{phase:?}")}),
-                                    )?;
-                                }
-                                InferenceResponseItem::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                    ..
-                                } => {
-                                    calls.insert(name.as_str().to_owned());
-                                    emit(
-                                        json!({"type":"tool_call","id":id.as_str(),"name":name.as_str(),"arguments":arguments}),
-                                    )?;
-                                }
-                                _ => {}
-                            }
-                        }
+                Entry::Step {
+                    calls: step_calls, ..
+                } => {
+                    for call in step_calls {
+                        calls.insert("exec".to_owned());
+                        emit(
+                            json!({"type":"tool_call", "id":call.id.as_str(), "name":"exec", "arguments":call.code}),
+                        )?;
                     }
                 }
-                if let Some(usage) = usage {
-                    emit(
-                        json!({"type":"usage","input_tokens":usage.input_tokens,"cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}),
-                    )?;
+                Entry::Sent {
+                    to: Party::Human,
+                    text,
+                    ..
+                } => {
+                    if !final_answer.is_empty() {
+                        final_answer.push('\n');
+                    }
+                    final_answer.push_str(&text);
+                    emit(json!({"type":"message", "text":text}))?;
                 }
-            }
-            AgentEvent::Native(rho_agent::native::NativeEvent::RequestFailed {
-                error,
-                retrying,
-                ..
-            }) => emit(json!({"type":"provider_error","error":error,"retrying":retrying}))?,
+                Entry::Usage { usage, .. } => {
+                    emit(json!({"type":"usage", "input_tokens":usage.input_tokens,
+                        "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}))?;
+                }
+                _ => {}
+            },
             AgentEvent::Turn {
                 edge: TurnEdge::Ended(outcome),
                 ..

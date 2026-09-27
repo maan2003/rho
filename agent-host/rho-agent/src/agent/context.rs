@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rho_inference2::{CacheKey, Item, Request};
+use rho_inference::step::{CacheKey, Item, Request};
 
 use crate::entry::{Block, Entry, MessageId, Party};
 

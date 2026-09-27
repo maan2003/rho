@@ -168,7 +168,6 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             let call = rho_agents_client::protocol::AgentCommand::Send {
                 agent_id,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
-                delivery: rho_agent_types::MessageDelivery::Immediate,
             };
             rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
             Ok(())
@@ -550,15 +549,15 @@ async fn print_context(
                 let mut context_used = None;
                 let mut responses = 0usize;
                 for event in &events {
-                    if let Some(native) = event.native_event()
-                        && let rho_agent::native::NativeEvent::ResponseFinished {
-                            context_used: response_context_used,
-                            ..
-                        } = native
+                    if let rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
+                        usage,
+                        ..
+                    }) = event
                     {
                         responses += 1;
-                        if response_context_used.is_some() {
-                            context_used = *response_context_used;
+                        if usage.input_tokens > 0 {
+                            context_used =
+                                Some(usage.input_tokens.saturating_add(usage.output_tokens));
                         }
                     }
                 }

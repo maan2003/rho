@@ -7,11 +7,10 @@
 //! gutters and folds survive untouched); everything after is re-rendered.
 //!
 //! The model is editor-agnostic (emacs: decoration is buffer state, not
-//! window state): records, styles, inlay content, and elision plans are
-//! all anchor-based data. Any number of editors attach; after each sync
-//! the model reconciles every attachment — highlights and gutters are
-//! reapplied for changed classes, inlays and display elisions diffed
-//! against the desired state — so every view over the transcript stays
+//! window state): records, styles, and inlay content are anchor-based
+//! data. Any number of editors attach; after each sync the model reconciles
+//! every attachment — highlights and gutters are reapplied for changed
+//! classes and inlays diffed against the desired state — so every view stays
 //! correct without owning any of it.
 //!
 //! A screen opens at the cost of what it draws, so history is lazy in
@@ -28,7 +27,6 @@
 //! the block list itself; moving it re-buckets highlights without touching
 //! the buffer.
 
-pub mod elisions;
 mod gap;
 mod inlays;
 
@@ -39,13 +37,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
-use elisions::{ElisionState, ElisionSync};
 use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agent_types::AgentId;
-use rho_agents_client::elision::ElisionPlan;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
@@ -53,9 +49,7 @@ use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::render::{
-    BlockKind, RenderedBlock, block_kind, block_visible, render_block_with_agent_labels,
-};
+use crate::render::{BlockKind, RenderedBlock, TranscriptView, block_kind};
 use crate::visualization::Visualization;
 
 mod store;
@@ -63,6 +57,7 @@ mod store;
 pub use store::{FrameChange, TranscriptFrame, Transcripts};
 
 pub struct TranscriptModel {
+    view: TranscriptView,
     multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript excerpt omits its rendering
     /// sentinel, then crops every trailing separator when the turn closes.
@@ -78,8 +73,8 @@ pub struct TranscriptModel {
     /// a clone copies pointers, never text. The model keeps them so the
     /// history a reader asks for is composed without asking for it again.
     blocks: Vec<Arc<UiBlock>>,
-    /// Whether each block renders to anything, kept beside `blocks` so an
-    /// elision refresh never re-renders history to find out.
+    /// Visibility in this projection, used to preserve separators when
+    /// composing history without rendering all the blocks before it.
     visible: Vec<bool>,
     /// How many blocks the gap still holds, read by the marker's own
     /// render so the count falls as the gap closes without the block being
@@ -102,7 +97,6 @@ pub struct TranscriptModel {
     /// in the live-turn region.
     turn_boundary: usize,
     buffers: Vec<TranscriptBuffer>,
-    elisions: ElisionSync,
     // Custom inlay ids share each editor's id space with the prompt
     // placeholder (id 0), so they start at 1. One counter serves every
     // attachment: ids only need uniqueness within an editor.
@@ -113,14 +107,13 @@ pub struct TranscriptModel {
 }
 
 /// One editor displaying this transcript, plus the per-editor state that
-/// lives in that editor's id spaces (inlay ids, display elision ids).
+/// lives in that editor's id spaces (inlays and visualization blocks).
 /// Attachments carry their own multibuffer: full-prompt editors and
 /// document previews compose the shared buffer differently, so anchor
 /// resolution is per-attachment.
 struct Attachment {
     editor: WeakEntity<Editor>,
     multi_buffer: Entity<MultiBuffer>,
-    elisions: ElisionState,
     inlays: Vec<PlacedInlay>,
     visualizations: Vec<PlacedVisualization>,
     /// The row that says the gap is still composing, and the block it sits
@@ -220,11 +213,13 @@ enum DocumentTail {
 
 impl TranscriptModel {
     pub fn new(
+        view: TranscriptView,
         multi_buffer: Entity<MultiBuffer>,
         document_multi_buffer: Entity<MultiBuffer>,
         visualization_client: AgentsLink,
     ) -> Self {
         Self {
+            view,
             multi_buffer,
             document_multi_buffer,
             document_tail: None,
@@ -238,7 +233,6 @@ impl TranscriptModel {
             records: Vec::new(),
             turn_boundary: 0,
             buffers: Vec::new(),
-            elisions: ElisionSync::default(),
             next_inlay_id: 1,
             visualization_client,
             visualization_cache: HashMap::new(),
@@ -254,6 +248,7 @@ impl TranscriptModel {
     /// draws, and history above the opening tail is rendered when the
     /// reader asks for it.
     pub(crate) fn prepare_initial(
+        view: TranscriptView,
         state: UiAgentState,
         now_ms: u64,
         agent_labels: HashMap<AgentId, String>,
@@ -262,9 +257,10 @@ impl TranscriptModel {
         let visible = state
             .blocks
             .iter()
-            .map(|b| block_visible(b))
+            .map(|b| view.visible(b))
             .collect::<Vec<_>>();
         let first_block = tail_start(
+            view,
             &state.blocks,
             state.blocks.len(),
             OPENING_ROWS,
@@ -272,6 +268,7 @@ impl TranscriptModel {
             &label,
         );
         let chunks = render_chunks(
+            view,
             &state.blocks,
             &visible,
             first_block..state.blocks.len(),
@@ -360,7 +357,6 @@ impl TranscriptModel {
         self.reset_full_excerpts(cx);
         self.document_tail = None;
         self.reset_document_excerpts(cx);
-        self.refresh_elision_plans(self.uncomposed);
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
         self.apply_to_attachments(now_ms, &history, &live, gutters_changed, None, cx);
@@ -420,7 +416,6 @@ impl TranscriptModel {
         self.attachments.push(Attachment {
             editor: editor.downgrade(),
             multi_buffer: editor.read(cx).buffer().clone(),
-            elisions: ElisionState::default(),
             inlays: Vec::new(),
             visualizations: Vec::new(),
             gap_marker: None,
@@ -479,7 +474,7 @@ impl TranscriptModel {
             .unwrap_or(&[])
             .iter()
             .map(|block| {
-                let block = render_block_with_agent_labels(block, prev_kind, now_ms, &label);
+                let block = self.view.render(block, prev_kind, now_ms, &label);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
@@ -529,7 +524,6 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
-        self.refresh_elision_plans(self.block_of(start));
         self.apply_to_attachments(
             now_ms,
             &changed_history,
@@ -807,8 +801,9 @@ impl TranscriptModel {
         let Some(block) = self.blocks.get(block_index) else {
             return false;
         };
-        let rendered =
-            render_block_with_agent_labels(block, prev_kind, now_ms, &|id| self.label(id));
+        let rendered = self
+            .view
+            .render(block, prev_kind, now_ms, &|id| self.label(id));
         let old_record = &self.records[index];
         if old_record.kind != rendered.kind || old_record.visible != rendered.visible() {
             return false;
@@ -876,7 +871,6 @@ impl TranscriptModel {
         } else {
             (&changed, &empty)
         };
-        self.refresh_elision_plans(block_index);
         self.apply_to_attachments(
             now_ms,
             changed_history,
@@ -906,32 +900,6 @@ impl TranscriptModel {
             .any(InlayRecord::ticks)
     }
 
-    fn refresh_elision_plans(&mut self, first_changed_block: usize) {
-        let Self {
-            records,
-            elisions,
-            blocks,
-            visible,
-            head,
-            uncomposed,
-            turn_open,
-            ..
-        } = self;
-        let (head, uncomposed) = (*head, *uncomposed);
-        let record_of = |block: usize| {
-            if block < head {
-                Some(block)
-            } else if block >= uncomposed {
-                Some(head + (block - uncomposed))
-            } else {
-                None
-            }
-        };
-        elisions.refresh(blocks, first_changed_block, visible, *turn_open, |plan| {
-            plan_anchor_range(records, &record_of, plan)
-        });
-    }
-
     /// The label another agent's messages are rendered under.
     fn label(&self, id: AgentId) -> String {
         self.agent_labels.get(&id).cloned().unwrap_or_default()
@@ -950,8 +918,11 @@ impl TranscriptModel {
         self.blocks.truncate(first_changed);
         self.visible.truncate(first_changed);
         for block in &state.blocks[first_changed..] {
-            self.visible.push(block_visible(block));
+            self.visible.push(self.view.visible(block));
             if let UiBlock::AgentMessage { sender, .. }
+            | UiBlock::MessageSent {
+                to: Some(sender), ..
+            }
             | UiBlock::QueuedMessage {
                 sender: Some(sender),
                 ..
@@ -1045,7 +1016,15 @@ impl TranscriptModel {
         }
         let from = {
             let label = |id| self.label(id);
-            tail_start(&self.blocks, self.uncomposed, rows, now_ms, &label).max(self.head)
+            tail_start(
+                self.view,
+                &self.blocks,
+                self.uncomposed,
+                rows,
+                now_ms,
+                &label,
+            )
+            .max(self.head)
         };
         self.compose_range(from..self.uncomposed, FillEdge::Tail, now_ms, cx);
         self.has_uncomposed()
@@ -1071,6 +1050,7 @@ impl TranscriptModel {
         let end = {
             let label = |id| self.label(id);
             head_end(
+                self.view,
                 &self.blocks,
                 self.head,
                 self.uncomposed,
@@ -1095,7 +1075,14 @@ impl TranscriptModel {
     ) {
         let chunks = {
             let label = |id| self.label(id);
-            render_chunks(&self.blocks, &self.visible, range.clone(), now_ms, &label)
+            render_chunks(
+                self.view,
+                &self.blocks,
+                &self.visible,
+                range.clone(),
+                now_ms,
+                &label,
+            )
         };
         let mut gutters_changed = false;
         let (new_buffers, new_records) = Self::build_chunks(chunks, &mut gutters_changed, cx);
@@ -1200,7 +1187,6 @@ impl TranscriptModel {
             .clamp(added_records.start, added_records.end);
         let changed_history = classes_in(&self.records[added_records.start..boundary]);
         let changed_live = classes_in(&self.records[boundary..added_records.end]);
-        self.refresh_elision_plans(range.start);
         self.apply_to_attachments(
             now_ms,
             &changed_history,
@@ -1225,7 +1211,6 @@ impl TranscriptModel {
         self.head = 0;
         self.uncomposed = self.blocks.len();
         self.turn_boundary = 0;
-        self.elisions = ElisionSync::default();
         self.document_tail = None;
         for multi_buffer in [
             self.multi_buffer.clone(),
@@ -1408,7 +1393,7 @@ impl TranscriptModel {
 
     /// Brings every attached editor up to date with the model: changed
     /// highlight classes reapplied per region, gutters when they moved,
-    /// inlays and display elisions reconciled. Dead attachments prune here.
+    /// inlays reconciled. Dead attachments prune here.
     /// A changed document range gets a full style re-apply, while concrete
     /// decorations are retained, removed, or updated by anchor reconciliation.
     fn apply_to_attachments<V: 'static>(
@@ -1487,7 +1472,6 @@ impl TranscriptModel {
             document_multi_buffer,
             next_inlay_id,
             attachments,
-            elisions,
             visualization_client,
             visualization_cache,
             gap_remaining,
@@ -1587,7 +1571,6 @@ impl TranscriptModel {
                 &editor,
                 cx,
             );
-            elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
             gap::reconcile_marker(
                 &mut attachment.gap_marker,
                 &attachment.multi_buffer,
@@ -1653,6 +1636,7 @@ pub struct StorePoint {
 /// than one block. Rendering a block to count its rows is cheap beside
 /// laying it out, and what this bounds is what gets laid out.
 fn tail_start(
+    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     end: usize,
     rows: usize,
@@ -1663,7 +1647,7 @@ fn tail_start(
     let mut start = end;
     while start > 0 && counted < rows {
         start -= 1;
-        let rendered = render_block_with_agent_labels(&blocks[start], None, now_ms, label);
+        let rendered = view.render(&blocks[start], None, now_ms, label);
         counted += rendered
             .spans
             .iter()
@@ -1679,6 +1663,7 @@ fn tail_start(
 /// and as cheap: rendering a block to count its rows costs nothing beside
 /// laying it out.
 fn head_end(
+    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     start: usize,
     end: usize,
@@ -1689,7 +1674,7 @@ fn head_end(
     let mut counted = 0;
     let mut at = start;
     while at < end && counted < rows {
-        let rendered = render_block_with_agent_labels(&blocks[at], None, now_ms, label);
+        let rendered = view.render(&blocks[at], None, now_ms, label);
         counted += rendered
             .spans
             .iter()
@@ -1705,6 +1690,7 @@ fn head_end(
 /// with all of history above it, so composing that history later leaves
 /// every chunk's text exactly as it is.
 fn render_chunks(
+    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     visible: &[bool],
     range: Range<usize>,
@@ -1719,7 +1705,7 @@ fn render_chunks(
     let mut rows = 0;
     let mut fence_open = false;
     for index in range {
-        let rendered = render_block_with_agent_labels(&blocks[index], prev, now_ms, label);
+        let rendered = view.render(&blocks[index], prev, now_ms, label);
         if rendered.visible() {
             prev = Some(rendered.kind);
         }
@@ -1863,16 +1849,6 @@ fn last_visible_kind(records: &[BlockRecord]) -> Option<BlockKind> {
         .map(|record| record.kind)
 }
 
-fn plan_anchor_range(
-    records: &[BlockRecord],
-    record_of: &impl Fn(usize) -> Option<usize>,
-    plan: &ElisionPlan,
-) -> Option<Range<Anchor>> {
-    let start = records.get(record_of(plan.start_block)?)?.range.start;
-    let end = records.get(record_of(plan.end_block)?)?.range.end;
-    Some(start..end)
-}
-
 fn transcript_path(start_block: usize) -> PathKey {
     PathKey::sorted(start_block as u64)
 }
@@ -1942,10 +1918,8 @@ fn block_record(
     }
 }
 
-/// A record's anchors name its own text, and nothing else. An elision's
-/// fold end is a record's end anchor, so a record whose end is a byte off
-/// hides the wrong rows; the assertion is here rather than in a test
-/// because the sites that can break it are the sites that build records.
+/// A record's anchors name its own text, and nothing else. The assertion
+/// lives at the sites that build records so every projection checks it.
 #[cfg(debug_assertions)]
 fn assert_record_names_its_text(record: &BlockRecord, buffer: &Buffer) {
     let start = record.range.start.to_offset(buffer);
@@ -2240,7 +2214,111 @@ fn visualization_key(
 
 #[cfg(test)]
 mod tests {
-    use super::rendered_text_edit;
+    use std::sync::Arc;
+
+    use rho_agents_client::protocol::transcript::ArgumentsFormat;
+    use rho_agents_client::state::{UiBlock, UiTool, UiToolStatus};
+
+    use super::{head_end, render_chunks, rendered_text_edit, tail_start};
+    use crate::TranscriptView;
+
+    fn call(source: &str) -> Arc<UiBlock> {
+        Arc::new(UiBlock::Tool(UiTool {
+            timing: Default::default(),
+            id: "call".into(),
+            name: "exec".into(),
+            arguments: source.into(),
+            format: ArgumentsFormat::Text,
+            preview: None,
+            status: UiToolStatus::Reported,
+            output: Some("not downloaded by these views".into()),
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        }))
+    }
+
+    #[test]
+    fn views_partition_content_without_renumbering_blocks() {
+        let blocks = vec![
+            Arc::new(UiBlock::UserMessage {
+                text: "please investigate".into(),
+            }),
+            call("print('checking')"),
+            Arc::new(UiBlock::MessageSent {
+                to: None,
+                text: "I found the cause".into(),
+            }),
+            Arc::new(UiBlock::Notice {
+                text: "connection lost".into(),
+            }),
+        ];
+        for (view, mask) in [
+            (TranscriptView::Conversation, vec![true, false, true, true]),
+            (TranscriptView::Activity, vec![false, true, false, true]),
+        ] {
+            let visible: Vec<_> = blocks.iter().map(|block| view.visible(block)).collect();
+            assert_eq!(visible, mask);
+            let chunks = render_chunks(view, &blocks, &visible, 0..blocks.len(), 0, &|_| {
+                String::new()
+            });
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.rendered.len())
+                    .sum::<usize>(),
+                4,
+                "invisible records must retain their canonical positions"
+            );
+            let text: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+            assert!(text.contains("connection lost"), "{text}");
+            assert_eq!(
+                text.contains("please investigate"),
+                view == TranscriptView::Conversation
+            );
+            assert_eq!(
+                text.contains("I found the cause"),
+                view == TranscriptView::Conversation
+            );
+            assert_eq!(
+                text.contains("print('checking') reported"),
+                view == TranscriptView::Activity
+            );
+            assert!(
+                !text.contains("not downloaded"),
+                "do not start rendering output bodies"
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_history_counts_only_rows_visible_in_its_view() {
+        let message = Arc::new(UiBlock::MessageSent {
+            to: None,
+            text: "older message".into(),
+        });
+        let source = call(&"print('noise')\n".repeat(100));
+        let label = |_| String::new();
+        let blocks = vec![message.clone(), source.clone()];
+        assert_eq!(
+            tail_start(TranscriptView::Conversation, &blocks, 2, 5, 0, &label),
+            0
+        );
+        assert_eq!(
+            tail_start(TranscriptView::Activity, &blocks, 2, 5, 0, &label),
+            1
+        );
+        let blocks = vec![source, message];
+        assert_eq!(
+            head_end(TranscriptView::Conversation, &blocks, 0, 2, 5, 0, &label),
+            2
+        );
+        assert_eq!(
+            head_end(TranscriptView::Activity, &blocks, 0, 2, 5, 0, &label),
+            1
+        );
+    }
 
     #[test]
     fn rendered_text_edit_appends_ascii_suffix() {

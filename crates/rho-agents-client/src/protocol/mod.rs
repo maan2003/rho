@@ -8,9 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, WorksetMode, WorkspaceInfo,
-};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq, WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -215,11 +213,9 @@ pub enum AgentCommand {
     Send {
         agent_id: AgentId,
         content: Vec<ContentPart>,
-        delivery: MessageDelivery,
     },
     Compact {
         agent_id: AgentId,
-        delivery: MessageDelivery,
     },
     ChangeRole {
         agent_id: AgentId,
@@ -427,9 +423,10 @@ mod tests {
                         data: vec![1, 2, 3],
                     },
                 ],
-                delivery: MessageDelivery::NextRequest,
             }
             .into(),
+            AgentCommand::Compact { agent_id }.into(),
+            AgentCommand::Cancel { agent_id }.into(),
         ] {
             round_trips(Open::Request(request));
         }

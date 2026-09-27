@@ -8,10 +8,7 @@
 //! call and speaks to the person only through `human.send`.
 
 pub(crate) mod context;
-pub(crate) mod mailroom;
 mod persistence;
-pub(crate) mod tools;
-pub(crate) mod wake;
 
 #[cfg(test)]
 mod tests;
@@ -22,30 +19,56 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rho_agent_types::{
-    AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, TurnEdge, TurnOutcome,
-    UnixMs,
+    AgentId, AgentRole, ContentPart, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMs,
 };
 use rho_inference::Inference;
-use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
+use rho_inference::config::{InferenceModel, InferenceProfile};
+use rho_inference::step::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
 use rho_inference::types::{PendingInferenceResponse, ToolCall, ToolName, ToolType};
-use rho_inference2::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
-use rho_notebook2::{CellHandle, Notebook};
+use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use self::mailroom::{Mailroom, Outbound};
-use self::wake::{Decision, Facts};
 use crate::db::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime, UnixMillis};
 use crate::entry::{Block, CallResult, Entry, MessageId, Notice, Party, ResponseUsage, Wake};
 use crate::lazy::Lazy;
+use crate::runtime::mailroom::{Mailroom, Outbound};
+use crate::runtime::wake::{Decision, Facts};
+use crate::runtime::{Progress, tools, wake};
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, ToolPreview, View, prompt,
 };
 
-/// Failed model requests in a row before the agent stops until someone
-/// writes or retries.
-const MAX_FAILURES: u32 = 3;
-/// Steps in a row without a call before the same.
-const MAX_PROSE: u32 = 3;
+/// Retries are volatile: restarting never resumes work without fresh input.
+struct Backoff {
+    since: tokio::time::Instant,
+    previous: u64,
+    delay: u64,
+    at: UnixMs,
+    error: String,
+}
+
+impl Backoff {
+    const WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
+
+    fn failed(previous: Option<Self>, error: String) -> Self {
+        let (since, previous, delay) =
+            previous.map_or((tokio::time::Instant::now(), 0, 1), |last| {
+                (
+                    last.since,
+                    last.delay,
+                    (last.previous + last.delay).min(30 * 60),
+                )
+            });
+        let remaining = Self::WINDOW.saturating_sub(since.elapsed());
+        Self {
+            since,
+            previous,
+            delay,
+            at: UnixMs::now() + Duration::from_secs(delay).min(remaining),
+            error,
+        }
+    }
+}
 /// Responses Lite's automatic provider-compaction threshold for the GPT-6
 /// models.
 const AUTO_COMPACT_TOKENS: u64 = 232_560;
@@ -89,11 +112,11 @@ impl AgentHandle {
         let _ = self.control.send(Control::TellTail);
     }
 
-    pub fn send_user_message(&self, text: impl Into<String>, delivery: MessageDelivery) {
-        self.send_user_content(vec![ContentPart::Text { text: text.into() }], delivery);
+    pub fn send_user_message(&self, text: impl Into<String>) {
+        self.send_user_content(vec![ContentPart::Text { text: text.into() }]);
     }
 
-    pub fn send_user_content(&self, content: Vec<ContentPart>, _delivery: MessageDelivery) {
+    pub fn send_user_content(&self, content: Vec<ContentPart>) {
         let _ = self.control.send(Control::Received {
             from: Party::Human,
             content,
@@ -105,7 +128,6 @@ impl AgentHandle {
     pub async fn send_user_content_accepted(
         &self,
         content: Vec<ContentPart>,
-        _delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         self.send(|done| Control::Received {
             from: Party::Human,
@@ -150,7 +172,7 @@ impl AgentHandle {
         let _ = self.control.send(Control::Cancel);
     }
 
-    /// Wake an agent that stopped after failing.
+    /// Explicitly resume after failure, cancellation, or restart.
     pub fn retry(&self) {
         let _ = self.control.send(Control::Retry);
     }
@@ -292,28 +314,28 @@ pub(crate) struct Agent {
     /// Whether the last published state counted as a running turn, so the
     /// turn's edges are told once each.
     working: bool,
+    activity: Option<crate::entry::Activity>,
 
     archived: bool,
     /// The next wake says the notebook is new.
     fresh: bool,
     responding: bool,
+    writing: Option<Call>,
     /// The latest cell and its call. Older ones live on in the notebook's
     /// sources.
     cell: Option<Latest>,
     /// The latest step was cut off part-way through its cell.
     interrupted: bool,
-    /// The model has been told the latest cell finished.
-    told_returned: bool,
     /// Messages the model has not seen, oldest first.
     unread: Vec<(MessageId, Party, UnixMs)>,
-    last_step: Option<UnixMs>,
+    progress: Progress,
     awaiting: bool,
-    prose: u32,
     /// The notebook went with a restart since the model's last wake: tell
     /// it at the next. Coming up is never itself a wake.
     restarted: bool,
     rewound: bool,
     retry: bool,
+    backoff: Option<Backoff>,
     stopped: Option<Stopped>,
     cache_key: CacheKey,
     context_used: Option<u64>,
@@ -370,19 +392,20 @@ impl Agent {
             head: Arc::clone(&head),
             draining: None,
             working: false,
+            activity: None,
             archived: false,
             fresh: false,
             responding: false,
+            writing: None,
             cell: None,
             interrupted: false,
-            told_returned: false,
             unread: Vec::new(),
-            last_step: None,
+            progress: Progress::default(),
             awaiting: false,
-            prose: 0,
             restarted: false,
             rewound: false,
             retry: false,
+            backoff: None,
             stopped: None,
             cache_key: cache_key(prompt_cache_key),
             context_used: None,
@@ -390,7 +413,7 @@ impl Agent {
             compaction_reply: false,
         };
         agent.resume().await?;
-        agent.publish_sync();
+        agent.publish(None).await?;
         Ok((
             AgentHandle {
                 control,
@@ -404,7 +427,7 @@ impl Agent {
 
     /// Answer from `script` instead of the role's provider.
     #[cfg(test)]
-    fn script(&mut self, script: Arc<rho_inference2::scripted::Scripted>) {
+    fn script(&mut self, script: Arc<rho_inference::step::scripted::Scripted>) {
         self.model = Arc::new(Model::Scripted(script));
     }
 
@@ -479,8 +502,23 @@ impl Agent {
             // A cell can archive itself as it completes. Apply what it sent
             // before deciding whether its completion warrants a wake.
             self.drain_outbox().await?;
+            if let Some(backoff) = &self.backoff
+                && backoff.since.elapsed() >= Backoff::WINDOW
+            {
+                self.fail(format!(
+                    "Provider retry window exhausted: {}",
+                    backoff.error
+                ))
+                .await?;
+            }
             let decision = if self.draining.is_some() {
                 Decision::Later(None)
+            } else if let Some(backoff) = &self.backoff {
+                if backoff.at <= UnixMs::now() {
+                    Decision::Now(Wake::Prose)
+                } else {
+                    Decision::Later(Some(backoff.at))
+                }
             } else {
                 wake::decide(&self.facts(), UnixMs::now())
             };
@@ -566,8 +604,12 @@ impl Agent {
             Control::Compact => self.compact().await?,
             Control::Cancel => self.interrupt(None).await?,
             Control::Retry => {
-                if matches!(self.stopped, Some(Stopped::Failed(_))) {
+                if !self.responding
+                    && !self.archived
+                    && (self.restarted || self.stopped.is_some() || self.backoff.is_some())
+                {
                     self.stopped = None;
+                    self.backoff = None;
                     self.retry = true;
                 }
             }
@@ -601,7 +643,16 @@ impl Agent {
 
     /// Nothing in motion, nothing waiting to be seen.
     fn settled(&self) -> bool {
-        !self.responding && self.unread.is_empty() && !self.cell_running()
+        !self.responding
+            && self.backoff.is_none()
+            && self.unread.is_empty()
+            && self.notebook.as_ref().is_none_or(|notebook| {
+                notebook
+                    .facts()
+                    .iter()
+                    .all(|source| source.finished.is_some())
+            })
+            && (self.archived || self.stopped.is_some() || self.progress.last_response.is_none())
     }
 
     fn cell_running(&self) -> bool {
@@ -708,12 +759,12 @@ impl Agent {
             })
             .collect();
         self.unread.clear();
-        self.last_step = None;
+        self.progress.last_response = None;
         self.cell = None;
-        self.told_returned = false;
+        self.progress.told_returned = false;
         self.interrupted = false;
         self.awaiting = false;
-        self.prose = 0;
+        self.progress.prose = 0;
         self.stopped = None;
         self.restarted = false;
         self.rewound = true;
@@ -792,6 +843,9 @@ impl Agent {
         } else {
             self.mailroom.agent_received();
         }
+        if let Some(backoff) = &mut self.backoff {
+            backoff.at = at;
+        }
         self.unread.push((id, from, at));
         self.append(Entry::Received { at, id, from, body }).await
     }
@@ -804,7 +858,7 @@ impl Agent {
         self.archived = false;
         self.fresh = true;
         self.cell = None;
-        self.told_returned = false;
+        self.progress = Progress::default();
         self.append(Entry::Notice {
             at,
             notice: Notice::FreshNotebook,
@@ -816,25 +870,36 @@ impl Agent {
         let at = UnixMs::now();
         match outbound {
             Outbound::Send(text) => {
+                let to = self
+                    .head
+                    .read()
+                    .expect("poison")
+                    .parent
+                    .map_or(Party::Human, Party::Agent);
                 self.append(Entry::Sent {
                     at,
                     id: MessageId::new(),
-                    to: Party::Human,
+                    to,
                     text: text.clone(),
                 })
                 .await?;
                 // Whoever is subscribed to this agent's answers gets it as
                 // mail, and the sidecar reads what it asks of the person.
                 self.flush().await?;
-                self.host.completed(text).await?;
+                self.host.message_sent(text).await?;
                 Ok(())
             }
             Outbound::Status(text) => self.append(Entry::Status { at, text }).await,
             Outbound::Archive => {
                 self.archived = true;
-                if let Some(notebook) = &self.notebook {
+                self.backoff = None;
+                if let Some(notebook) = self.notebook.take() {
                     notebook.cancel();
+                    notebook.shutdown().await.map_err(anyhow::Error::msg)?;
                 }
+                self.cell = None;
+                self.append(Entry::Awaiting { at, since: None }).await?;
+                self.awaiting = false;
                 self.append(Entry::Notice {
                     at,
                     notice: Notice::Archived,
@@ -861,25 +926,10 @@ impl Agent {
     }
 
     fn facts(&self) -> Facts {
-        let sources = self
-            .notebook
-            .as_ref()
-            .map(|notebook| notebook.facts())
-            .unwrap_or_default();
-        let latest = self.cell.as_ref().and_then(|latest| {
-            sources
-                .iter()
-                .find(|source| source.session_id == latest.cell.session_id())
-        });
-        let (wait, wake_on_tools) = self
-            .notebook
-            .as_ref()
-            .map(|notebook| notebook.checkin())
-            .unwrap_or((wake::DEFAULT_CHECKIN, true));
-        let finished = latest
-            .and_then(|facts| facts.finished)
-            .filter(|end| !end.failed && !self.told_returned)
-            .map(|end| end.at);
+        let notebook = self.progress.facts(
+            self.notebook.as_ref(),
+            self.cell.as_ref().map(|latest| &latest.cell),
+        );
         Facts {
             human: self
                 .unread
@@ -891,25 +941,13 @@ impl Agent {
                 .iter()
                 .find(|(_, from, _)| *from != Party::Human)
                 .map(|(_, _, at)| *at),
-            finished,
-            notified: sources
-                .iter()
-                .filter_map(|facts| facts.notified_at.into_iter().chain(facts.paged_at).min())
-                .min(),
-            failure: sources
-                .iter()
-                .filter(|facts| !facts.delivered && facts.finished.is_some_and(|end| end.failed))
-                .filter_map(|facts| facts.finished.map(|end| end.at))
-                .min(),
-            checkin: self.last_step.map(|at| at + wait),
-            response_finished: self.last_step,
-            wake_on_tools,
-            prose: self.prose > 0 || self.retry,
+            prose: self.progress.prose > 0 || self.retry,
             rewound: self.rewound,
             compaction: self.compaction_pending,
             compaction_reply: self.compaction_reply,
             archived: self.archived,
             prose_silenced: self.stopped.is_some(),
+            ..notebook
         }
     }
 
@@ -978,7 +1016,7 @@ impl Agent {
                  and side effects were not rewound. Check the current state before continuing."
                     .to_owned(),
             ),
-            Wake::Prose if self.prose > 0 => lines.push(
+            Wake::Prose if self.progress.prose > 0 => lines.push(
                 "Your last response had no exec call. Text outside a call reaches nobody: \
                  speak with human.send()."
                     .to_owned(),
@@ -1022,7 +1060,7 @@ impl Agent {
         images: Vec<Image>,
     ) -> anyhow::Result<()> {
         if self.cell.is_some() {
-            self.told_returned = true;
+            self.progress.told_returned = true;
         }
         let messages = std::mem::take(&mut self.unread);
         let humans = messages
@@ -1096,10 +1134,11 @@ impl Agent {
         }
         let request = context::request(instructions, &self.entries, self.cache_key);
 
+        let previous_backoff = self.backoff.take();
         self.responding = true;
+        self.writing = None;
         self.publish(None).await?;
-        let mut failures = 0;
-        let step = loop {
+        let step = {
             let model = Arc::clone(&self.model);
             // The call's code, as it arrives, runs as it arrives.
             let (code_tx, mut code_rx) = mpsc::unbounded_channel();
@@ -1136,8 +1175,9 @@ impl Agent {
                 self.stream(&mut streaming, piece);
             }
             match result {
-                Ok(step) => break Ok((step, streaming)),
+                Ok(step) => Ok((step, streaming)),
                 Err(error) => {
+                    let retryable = rho_inference::step::is_retryable(&error);
                     let error = format!("{error:#}");
                     self.append(Entry::Notice {
                         at: UnixMs::now(),
@@ -1149,28 +1189,33 @@ impl Agent {
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
                         && let Some(ran) = latest.cell.interrupt()
                     {
-                        break Err(Call {
+                        Err(Call {
                             id: streaming.id,
                             code: streaming.code[..ran.min(streaming.code.len())].to_owned(),
-                        });
-                    }
-                    failures += 1;
-                    if failures >= MAX_FAILURES {
+                        })
+                    } else {
                         self.responding = false;
+                        self.writing = None;
+                        if self.archived {
+                            return self.revive_if_written(UnixMs::now()).await;
+                        }
+                        if retryable {
+                            self.backoff = Some(Backoff::failed(previous_backoff, error));
+                            return Ok(());
+                        }
                         return self.fail(error).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(failures))).await;
                 }
             }
         };
         self.responding = false;
         let at = UnixMs::now();
-        self.last_step = Some(at);
+        self.progress.last_response = Some(at);
         let (step, streaming) = match step {
             Ok(step) => step,
             Err(call) => {
                 self.interrupted = true;
-                self.prose = 0;
+                self.progress.prose = 0;
                 self.append(Entry::Step {
                     at,
                     calls: vec![call.clone()],
@@ -1200,7 +1245,7 @@ impl Agent {
         self.refresh_compaction_state();
         match (step.call, streaming) {
             (Some(call), Some(streaming)) => {
-                self.prose = 0;
+                self.progress.prose = 0;
                 if let Some(latest) = &mut self.cell {
                     // Whatever the stream missed, then the end.
                     let rest = call.code.strip_prefix(&streaming.code).unwrap_or_default();
@@ -1209,18 +1254,18 @@ impl Agent {
                 }
             }
             (Some(call), None) => {
-                self.prose = 0;
+                self.progress.prose = 0;
                 let cell = self.notebook().await?.run(call.code.clone());
                 self.cell = Some(Latest {
                     cell,
                     call,
                     started_at: at,
                 });
-                self.told_returned = false;
+                self.progress.told_returned = false;
             }
             (None, streaming) => {
                 if compacted {
-                    self.prose = 0;
+                    self.progress.prose = 0;
                     return Ok(());
                 }
                 if streaming.is_some()
@@ -1228,9 +1273,9 @@ impl Agent {
                 {
                     latest.cell.stop();
                 }
-                self.prose += 1;
-                if self.prose >= MAX_PROSE {
-                    self.prose = 0;
+                self.progress.prose += 1;
+                if self.progress.prose >= Progress::MAX_PROSE {
+                    self.progress.prose = 0;
                     self.stopped = Some(Stopped::Quiet);
                 }
             }
@@ -1248,6 +1293,7 @@ impl Agent {
 
     /// Model requests kept failing: stop until someone writes or retries.
     async fn fail(&mut self, error: String) -> anyhow::Result<()> {
+        self.backoff = None;
         self.stopped = Some(Stopped::Failed(Arc::from(error.as_str())));
         self.flush().await?;
         self.host.failed(error).await?;
@@ -1255,6 +1301,7 @@ impl Agent {
     }
 
     async fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
+        self.backoff = None;
         if let Some(notebook) = &self.notebook {
             notebook.cancel();
         }
@@ -1293,7 +1340,7 @@ impl Agent {
                 },
                 started_at: UnixMs::now(),
             });
-            self.told_returned = false;
+            self.progress.told_returned = false;
             *streaming = Some(Streaming {
                 id,
                 code: String::new(),
@@ -1306,14 +1353,25 @@ impl Agent {
             latest.call.code.push_str(&code);
             let _ = latest.cell.feed(code, false);
         }
+        self.writing = streaming.as_ref().map(|stream| Call {
+            id: stream.id.clone(),
+            code: stream.code.clone(),
+        });
+        *self.status.write().expect("poison") = self.status();
+        self.host.published();
     }
 
     /// What a reader sees, built from the loop's own state.
     fn status(&self) -> AgentStatus {
-        let kind = if self.responding {
-            AgentStateKind::ApiStreaming {
-                pending_response: PendingInferenceResponse::default(),
-                previous_attempt: None,
+        let kind = if let Some(backoff) = &self.backoff {
+            AgentStateKind::ToolCalling {
+                previews: BTreeMap::new(),
+                results: Vec::new(),
+                waiting: Some(backoff.at),
+            }
+        } else if self.responding {
+            AgentStateKind::Writing {
+                call: self.writing.clone(),
             }
         } else if let Some(Stopped::Failed(error)) = &self.stopped {
             AgentStateKind::Error(FailedInferenceResponse {
@@ -1349,16 +1407,34 @@ impl Agent {
         }
     }
 
-    fn publish_sync(&mut self) {
-        let status = self.status();
-        self.working = status.kind.is_working();
-        *self.status.write().expect("poison") = status;
-        self.host.published();
-    }
-
     /// Publish, and tell the log when the turn's edge moved: started when
     /// the agent begins working, ended when it hands back.
     async fn publish(&mut self, _recheck: Option<UnixMs>) -> anyhow::Result<()> {
+        let activity = crate::entry::Activity {
+            responding: self.responding,
+            running_tasks: self.notebook.as_ref().map_or(0, |notebook| {
+                notebook
+                    .facts()
+                    .iter()
+                    .filter(|source| {
+                        matches!(
+                            source.kind,
+                            rho_notebook::Kind::Cell | rho_notebook::Kind::Task
+                        ) && source.finished.is_none()
+                    })
+                    .count() as u32
+            }),
+            checkin_at: if self.archived || self.stopped.is_some() {
+                None
+            } else {
+                self.facts().checkin
+            },
+            archived: self.archived,
+        };
+        if self.activity != Some(activity) {
+            self.append(activity.entry(UnixMs::now())).await?;
+            self.activity = Some(activity);
+        }
         let status = self.status();
         let working = status.kind.is_working();
         if working != self.working {
@@ -1397,42 +1473,12 @@ fn model(
     let model: InferenceModel = binding
         .deep_model()
         .ok_or_else(|| anyhow::anyhow!("Rho runtime stored without a model"))?;
-    let effort = match profile.effort {
-        ReasoningEffort::Low => rho_inference2::openai::Effort::Low,
-        ReasoningEffort::Medium => rho_inference2::openai::Effort::Medium,
-        ReasoningEffort::High => rho_inference2::openai::Effort::High,
-        ReasoningEffort::Xhigh => rho_inference2::openai::Effort::XHigh,
-    };
-    let accounts = inference.clone();
-    let resolve_auth: rho_inference2::openai::AuthResolver = Arc::new(move |_| {
-        let accounts = accounts.clone();
-        Box::pin(async move {
-            let auth = accounts.auth().await?;
-            let resolved = accounts.resolve_auth(auth).await?;
-            Ok(rho_inference::ResolvedOAuth {
-                bearer_token: resolved.bearer_token,
-                account_id: resolved.account_id,
-            })
-        })
-    });
     let billed = match model {
         InferenceModel::Gpt6Astra => crate::db::AgentUsageModel::ASTRA,
         InferenceModel::Gpt6Luna => crate::db::AgentUsageModel::LUNA,
         InferenceModel::Gpt6Sol => crate::db::AgentUsageModel::GPT,
     };
-    Ok((
-        Model::OpenAiWithAuth {
-            model: rho_inference2::openai::OpenAi {
-                base_url: inference.responses_base_url().to_owned(),
-                model: model.as_str().to_owned(),
-                effort,
-                fast: profile.fast_mode,
-                auth: String::new(),
-            },
-            resolve_auth,
-        },
-        billed.name().to_owned(),
-    ))
+    Ok((inference.model(profile, model), billed.name().to_owned()))
 }
 
 fn cache_key(key: rho_inference::PromptCacheKey) -> CacheKey {

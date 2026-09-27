@@ -11,7 +11,7 @@ pub enum ReasoningEffort {
     High,
 }
 
-/// Which Responses-API model a deep session talks to. Not part of
+/// Which Responses-API model a step talks to. Not part of
 /// [`InferenceProfile`]: agent modes carry it separately, so persisted configs
 /// stay unchanged.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

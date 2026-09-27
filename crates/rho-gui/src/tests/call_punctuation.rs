@@ -9,7 +9,8 @@
 use gpui::TestAppContext;
 
 use super::{
-    UiBlock, UiTool, UiToolStatus, agent, display_text, feed_frame, state, test_workspace, user,
+    UiBlock, UiTool, UiToolStatus, agent, display_text, feed_frame, open_activity, state,
+    test_workspace, user,
 };
 
 fn ran(command: &str) -> UiBlock {
@@ -43,6 +44,7 @@ fn a_command_with_backticks_is_drawn_whole(cx: &mut TestAppContext) {
             vec![user("go"), ran("echo `date` and ``x`` done")],
         ),
     );
+    open_activity(&workspace, cx);
     cx.run_until_parked();
 
     let text = display_text(&workspace, cx);
@@ -63,6 +65,7 @@ fn a_command_with_a_blank_line_keeps_its_own_buffer(cx: &mut TestAppContext) {
         agent(1),
         state(Vec::new(), vec![user("go"), ran("echo one\n\necho two")]),
     );
+    open_activity(&workspace, cx);
     cx.run_until_parked();
 
     let editor = super::active_editor(&workspace, cx);
@@ -108,6 +111,7 @@ fn exec_provider_phases_reach_the_editor_without_execution_duration(cx: &mut Tes
         agent(1),
         state(Vec::new(), vec![user("go"), UiBlock::Tool(tool)]),
     );
+    open_activity(&workspace, cx);
     cx.run_until_parked();
     let text = display_text(&workspace, cx);
     assert!(

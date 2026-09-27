@@ -576,55 +576,11 @@ async fn init_agent_tables_stamps_current_db_format() {
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
-#[tokio::test]
-async fn migration_backfills_heads_from_all_log_rows() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let first = create(&mut write, None, None);
-    let second = create(&mut write, None, None);
-    write.set_agent_mode(first, WorksetMode::Exposed);
-    write.append_agent_event(first, &user_event("hidden"));
-    write.rewind_agent(UnixMs(2), first, AgentEventPos::new(1));
-    write.append_agent_event(first, &user_event("visible"));
-    write.set_agent_role(second, AgentRole::default());
-    write.commit();
-    let expected = [first, second]
-        .into_iter()
-        .map(|id| {
-            let read = db.read();
-            let log = read.open_table(AGENT_LOG);
-            (id, fold_head(rows(log.range(agent_range(id)))).unwrap())
-        })
-        .collect::<Vec<_>>();
-    let mut expected = expected;
-    expected.sort_by_key(|(id, _)| *id);
-
-    // Recreate a pre-projection store: only the event log survives.
-    let mut write = db.write().await;
-    write.delete_table("agent_heads");
-    write.open_table(FORMAT).insert(&(), &"6bcd407c".to_owned());
-    write.commit();
-
-    prepare(&db).await;
-    assert_eq!(db.read().list_agents(), expected);
-    assert_eq!(
-        db.read().list_agent_ids(),
-        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>()
-    );
-
-    let mut write = db.write().await;
-    write.set_agent_mode(first, WorksetMode::View);
-    write.commit();
-    let read = db.read();
-    assert_eq!(read.get_agent(first).config.place.mode, WorksetMode::View);
-    assert_eq!(read.get_agent(first).next, AgentEventPos::new(6));
-    assert_eq!(
-        read.get_agent(second),
-        expected.iter().find(|(id, _)| *id == second).unwrap().1
-    );
+#[test]
+fn migration_accepts_only_the_live_source_format() {
+    assert_eq!(AGENT_DB_MIGRATIONS.len(), 1);
+    assert_eq!(AGENT_DB_MIGRATIONS[0].from, "a7e43d91");
+    assert_eq!(AGENT_DB_MIGRATIONS[0].to, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[tokio::test]
@@ -1072,7 +1028,7 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
     use rho_agent_types::ToolOutputStatus;
     use rho_inference::types::{ContextBlock, ExecOutput, ToolOutput};
 
-    use crate::native::NativeEvent;
+    use crate::db::legacy::NativeEvent;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("rho.redb");
     let first = ToolOutput {
@@ -1112,7 +1068,7 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
             write.append_agent_event(
                 id,
                 &AgentEvent::Native(NativeEvent::RequestStarted {
-                    input: vec![rho_inference::exec::output(&output)],
+                    input: vec![legacy_output(&output)],
                     context: None,
                     wake: None,
                     at: UnixMs(3),
@@ -1133,4 +1089,34 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
     };
     assert_eq!(update.images.as_ref(), &[image]);
     assert_eq!(update.output.as_str(), "later");
+}
+
+fn legacy_output(output: &rho_inference::types::ExecOutput) -> rho_inference::types::ContextBlock {
+    use rho_inference::types::{ContextBlock, ExecOutput, ToolResult, ToolType, ToolUpdate};
+    match output {
+        ExecOutput::Reply {
+            id,
+            body,
+            first_block_at,
+            at,
+        } => ContextBlock::ToolResults {
+            results: vec![ToolResult {
+                call_id: id.clone(),
+                tool_type: ToolType::Custom,
+                body: body.clone(),
+                started_at: *first_block_at,
+                finished_at: *at,
+                metadata: None,
+            }],
+        },
+        ExecOutput::Report { id, body, at } => ContextBlock::ToolUpdate(ToolUpdate {
+            status: Some(body.status),
+            call_id: id.clone(),
+            tool_type: ToolType::Custom,
+            output: body.output.clone(),
+            full_output: body.full_output.clone(),
+            images: body.images.clone(),
+            at: *at,
+        }),
+    }
 }

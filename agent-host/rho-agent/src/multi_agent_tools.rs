@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use rho_agent_types::{AgentId, AgentRole, MessageDelivery};
+use rho_agent_types::{AgentId, AgentRole};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::AgentReadTxnExt as _;
@@ -283,13 +283,8 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
     }
-    pool.deliver_mail(
-        tools.self_id,
-        recipient,
-        args.message,
-        MessageDelivery::NextRequest,
-    )
-    .await?;
+    pool.deliver_mail(tools.self_id, recipient, args.message)
+        .await?;
     Ok(format!("Message sent to {}.", pool.agent_handle(recipient)))
 }
 

@@ -38,6 +38,8 @@ pub enum SurfaceKey {
     /// A note, or a label and what carries it.
     Note(rho_dealer::NodeId),
     Transcript(AgentId),
+    /// Tool and event detail for the same canonical transcript.
+    Activity(AgentId),
     File {
         agent_id: AgentId,
         path: Utf8PathBuf,

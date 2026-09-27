@@ -1,8 +1,5 @@
-//! Temporary one-hop migration (6bcd407c -> 9990d22e): a Rho-runtime
-//! agent's native rows become the entries the loop now runs on. Rows are
-//! rewritten in place, one for one, so positions, the journal and
-//! `Rewound` targets stay valid. Remove once the developer's database has
-//! opened with this build.
+//! Converts a7e43d91 native rows as part of the direct e31bcf82 migration.
+//! Rows are rewritten in place, preserving positions, journal, and rewinds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -13,8 +10,8 @@ use rho_inference::types::{ContextBlock, InferenceResponseItem, MessageSender, T
 use serde_json::json;
 
 use super::{AGENT_HEADS, AGENT_LOG, AgentRuntime, agent_range, fold_head, rows};
+use crate::db::legacy::NativeEvent;
 use crate::entry::{Block, CallResult, Entry, MessageId, Notice, Party, Wake};
-use crate::native::NativeEvent;
 use crate::{AgentEvent, InputKind};
 
 pub(super) fn migrate(write: &mut WriteTxn) {
@@ -74,13 +71,16 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         .iter()
         .filter(|entry| matches!(entry, Entry::Received { id, .. } if !delivered.contains(id)))
         .count();
-    let request =
-        crate::agent::context::request("".into(), &entries, rho_inference2::CacheKey::from_u128(0));
+    let request = crate::agent::context::request(
+        "".into(),
+        &entries,
+        rho_inference::step::CacheKey::from_u128(0),
+    );
     let answered = request
         .items
         .iter()
         .filter_map(|item| match item {
-            rho_inference2::Item::Result { call_id, .. } => Some(call_id.clone()),
+            rho_inference::step::Item::Result { call_id, .. } => Some(call_id.clone()),
             _ => None,
         })
         .collect::<HashSet<_>>();
@@ -88,7 +88,7 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         .items
         .iter()
         .flat_map(|item| match item {
-            rho_inference2::Item::Step(carry) => carry.call_ids(),
+            rho_inference::step::Item::Step(carry) => carry.call_ids(),
             _ => Vec::new(),
         })
         .filter(|id| !answered.contains(id))
@@ -350,14 +350,16 @@ impl Convert {
                     at: *at,
                     calls,
                     prose,
-                    carry: rho_inference2::Carry::from_openai_items(if before {
+                    carry: rho_inference::step::Carry::from_openai_items(if before {
                         Vec::new()
                     } else {
                         carry
                     }),
                     usage: usage.as_ref().map_or_else(Default::default, |bucket| {
-                        rho_inference2::Usage {
-                            input_tokens: bucket.input_tokens,
+                        rho_inference::step::Usage {
+                            input_tokens: bucket
+                                .input_tokens
+                                .saturating_add(bucket.cache_read_tokens),
                             cached_tokens: bucket.cache_read_tokens,
                             output_tokens: bucket.output_tokens,
                         }
@@ -513,7 +515,7 @@ fn party(sender: MessageSender) -> Party {
 fn block_of(part: &ContentPart) -> Block {
     match part {
         ContentPart::Text { text } => Block::Text(text.clone()),
-        ContentPart::Image { media_type, data } => Block::Image(rho_inference2::Image {
+        ContentPart::Image { media_type, data } => Block::Image(rho_inference::step::Image {
             media_type: media_type.clone(),
             data: data.clone(),
         }),
@@ -522,13 +524,13 @@ fn block_of(part: &ContentPart) -> Block {
 
 fn call_result(result: &ToolResult) -> CallResult {
     CallResult {
-        id: rho_inference2::CallId::new(result.call_id.as_str()),
+        id: rho_inference::step::CallId::new(result.call_id.as_str()),
         text: (*result.body.output).clone(),
         images: result
             .body
             .images
             .iter()
-            .map(|image| rho_inference2::Image {
+            .map(|image| rho_inference::step::Image {
                 media_type: image.media_type.clone(),
                 data: image.data.clone(),
             })
@@ -567,7 +569,7 @@ fn response(
     output: &[ContextBlock],
     dropped: &dyn Fn(&str) -> bool,
     pos: u64,
-) -> (Vec<rho_inference2::Call>, Vec<String>, String) {
+) -> (Vec<rho_inference::step::Call>, Vec<String>, String) {
     let mut calls = Vec::new();
     let mut carry = Vec::new();
     let mut prose = String::new();
@@ -608,8 +610,8 @@ fn response(
                 arguments,
                 ..
             } => {
-                calls.push(rho_inference2::Call {
-                    id: rho_inference2::CallId::new(id.as_str()),
+                calls.push(rho_inference::step::Call {
+                    id: rho_inference::step::CallId::new(id.as_str()),
                     code: arguments.clone(),
                 });
                 if dropped(id.as_str()) {
@@ -625,7 +627,7 @@ fn response(
                     "type": "custom_tool_call",
                     "id": item_id,
                     "call_id": id.as_str(),
-                    "name": rho_inference2::EXEC,
+                    "name": rho_inference::step::EXEC,
                     "input": arguments,
                 })
             }
@@ -670,10 +672,10 @@ fn response(
 #[cfg(test)]
 mod tests {
     use rho_agent_types::MessageDelivery;
+    use rho_inference::step::Item;
     use rho_inference::types::{
         ProviderResponseItemId, ToolCallId, ToolName, ToolOutput, ToolType,
     };
-    use rho_inference2::Item;
 
     use super::super::tests::{test_agent_runtime, test_workspace};
     use super::super::{
@@ -839,8 +841,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(unread, vec![MessageId(rows[8].0.pos)]);
 
-        let request =
-            crate::agent::context::request("".into(), &entries, rho_inference2::CacheKey::new());
+        let request = crate::agent::context::request(
+            "".into(),
+            &entries,
+            rho_inference::step::CacheKey::new(),
+        );
         let shown = request
             .items
             .iter()

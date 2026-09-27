@@ -30,9 +30,9 @@ use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; an agent host with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v6");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v7");
 /// Which host an agent was heard from, so a host's rows can go together.
-const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v4");
+const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v5");
 /// One agent's mirror, ordered by position, agent first: a range read
 /// gives one agent's events and nothing else.
 /// The version in the name is the story's format, not redb's. A fold that
@@ -51,12 +51,14 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v5: ordered response items replace flattened text and calls.
 /// v6: nothing new in the fold; retired Gemini agents were deleted from
 /// the agent host, and rows naming their role no longer decode.
+/// v7: code-first explicit messages and notebook reports replace old
+/// projections.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
-    TableDefinition::new("gui_mirror_events_v6");
+    TableDefinition::new("gui_mirror_events_v7");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-    TableDefinition::new("gui_agent_digest_v4");
+    TableDefinition::new("gui_agent_digest_v5");
 /// What the user last said about an agent, so Home ranks the same way on
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
@@ -66,7 +68,13 @@ const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
 
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 19] = [
+const RETIRED_TABLES: [&str; 23] = [
+    // Code-first projection and host migration remap historical row positions.
+    // Drop the cursor together with the rows; preserve user verdicts.
+    "gui_mirror_host_v6",
+    "gui_mirror_events_v6",
+    "gui_agent_host_v4",
+    "gui_agent_digest_v4",
     "gui_agent_host_v2",
     "gui_agent_digest_v2",
     "gui_mirror_host_v4",
@@ -219,6 +227,9 @@ impl Mirror {
     /// kind of client state is in there too, under its own names; this
     /// touches the agent mirror's and nothing else.
     pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
+        // v6 projections used pre-migration host positions. Keep mute, but a
+        // handled-through cursor into rewritten history has no meaning.
+        let reset_verdict_positions = db.read().has_table("gui_mirror_host_v6");
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
@@ -226,7 +237,19 @@ impl Mirror {
             open_or_rebuild(&mut write, AGENT_HOSTS);
             open_or_rebuild(&mut write, EVENTS);
             open_or_rebuild(&mut write, DIGESTS);
-            write.open_table(VERDICTS);
+            if reset_verdict_positions {
+                let mut verdicts = write.open_table(VERDICTS);
+                let existing = verdicts
+                    .iter()
+                    .map(|(agent, value)| (agent.value(), value.value().into_owned()))
+                    .collect::<Vec<(AgentId, Verdict)>>();
+                for (agent, mut verdict) in existing {
+                    verdict.handled_through = AgentPos::ZERO;
+                    verdicts.insert(&agent, SenValue::borrowed(&verdict));
+                }
+            } else {
+                write.open_table(VERDICTS);
+            }
             for table in RETIRED_TABLES {
                 write.delete_table(table);
             }
@@ -744,8 +767,66 @@ mod tests {
         assert_eq!(mirror.read_events(agent), events(&told(agent, 1)));
     }
 
-    /// A host with another database leaves nothing behind, or Home would
-    /// rank work that does not exist.
+    /// Rewritten history cannot use verdict cursors into old positions.
+    #[test]
+    fn rewritten_positions_reset_seen_cursor_but_keep_mute() {
+        const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =
+            TableDefinition::new("gui_mirror_host_v6");
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("client.redb"));
+        let id = agent_id(4);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut write = db.write().await;
+                write.open_table(OLD_HOSTS).insert(
+                    "local",
+                    SenValue::borrowed(&StoredHost {
+                        machine_seed: 7,
+                        seq: Seq(55),
+                    }),
+                );
+                write.open_table(VERDICTS).insert(
+                    &id,
+                    SenValue::borrowed(&Verdict {
+                        handled_through: AgentPos(999),
+                        muted: true,
+                    }),
+                );
+                write.commit();
+            });
+        let mirror = Mirror::open_on(db.clone()).unwrap();
+        assert!(
+            mirror.load().hosts.is_empty(),
+            "old cursor cannot skip rewritten rows"
+        );
+        let verdict = db
+            .read()
+            .open_table(VERDICTS)
+            .get(&id)
+            .unwrap()
+            .value()
+            .into_owned();
+        assert_eq!(
+            verdict,
+            Verdict {
+                handled_through: AgentPos::ZERO,
+                muted: true
+            }
+        );
+        drop(mirror);
+        let _mirror = Mirror::open_on(db.clone()).unwrap();
+        let verdict = db
+            .read()
+            .open_table(VERDICTS)
+            .get(&id)
+            .unwrap()
+            .value()
+            .into_owned();
+        assert_eq!(verdict.handled_through, AgentPos::ZERO);
+    }
+
     #[test]
     fn resetting_a_host_takes_its_agents_with_it() {
         let dir = tempfile::tempdir().expect("tempdir");

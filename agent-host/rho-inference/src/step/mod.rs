@@ -16,6 +16,49 @@ use senax_encoder::{Decode, Encode};
 pub mod openai;
 pub mod scripted;
 
+/// A temporary provider failure. The runtime owns backoff and retry admission.
+#[derive(Debug)]
+pub struct Retryable(pub String);
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Retryable {}
+
+pub fn is_retryable(error: &anyhow::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    if error.is::<Retryable>() || error.is::<tokio::time::error::Elapsed>() {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<Error>() {
+        return match error {
+            Error::Io(_)
+            | Error::ConnectionClosed
+            | Error::AlreadyClosed
+            | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+            Error::Http(response) => {
+                response.status().is_server_error() || response.status().as_u16() == 408
+            }
+            _ => false,
+        };
+    }
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+        )
+    })
+}
+
 /// The name of the one tool.
 pub const EXEC: &str = "exec";
 
@@ -157,29 +200,27 @@ pub enum Stream<'a> {
 /// A model: one request in, one step out. The caller owns retries.
 pub enum Model {
     OpenAi(openai::OpenAi),
-    /// Credentials come from the host for a workset worker, not its filesystem.
-    OpenAiWithAuth {
-        model: openai::OpenAi,
-        resolve_auth: openai::AuthResolver,
-    },
     Scripted(Arc<scripted::Scripted>),
 }
 
 impl Model {
-    /// One response. `stream` sees the call's code as it arrives; the step
-    /// holds all of it, and is what to keep.
+    /// One response. The caller owns retries; never replay after tool
+    /// admission.
     pub async fn step(
         &self,
         request: &Request,
         stream: &mut (dyn FnMut(Stream<'_>) + Send),
     ) -> anyhow::Result<Step> {
         match self {
-            Model::OpenAi(model) => model.step(request, stream, None).await,
-            Model::OpenAiWithAuth {
-                model,
-                resolve_auth,
-            } => model.step(request, stream, Some(resolve_auth)).await,
-            Model::Scripted(model) => model.step(request, stream).await,
+            Self::OpenAi(model) => model.step(request, stream).await,
+            Self::Scripted(model) => model.step(request, stream).await,
+        }
+    }
+
+    pub async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
+        match self {
+            Self::OpenAi(model) => model.text(instructions, input).await,
+            Self::Scripted(_) => anyhow::bail!("scripted model has no text mode"),
         }
     }
 }
@@ -222,5 +263,38 @@ impl Carry {
     /// ran.
     pub fn bare(call: Call) -> Self {
         Self(Inner::Scripted { call: Some(call) })
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::http::Response;
+
+    use super::*;
+
+    #[test]
+    fn transient_transport_errors_are_distinct_from_auth_and_bad_requests() {
+        for status in [400, 401, 403, 404, 422] {
+            let error = anyhow::Error::from(Error::Http(Box::new(
+                Response::builder().status(status).body(None).unwrap(),
+            )))
+            .context("handshake");
+            assert!(!is_retryable(&error), "{status}");
+        }
+        for status in [408, 500, 502, 503, 504] {
+            let error = anyhow::Error::from(Error::Http(Box::new(
+                Response::builder().status(status).body(None).unwrap(),
+            )))
+            .context("handshake");
+            assert!(is_retryable(&error), "{status}");
+        }
+        assert!(is_retryable(
+            &anyhow::Error::from(Retryable("throttled".into())).context("provider")
+        ));
+        assert!(!is_retryable(&anyhow::anyhow!("invalid request")));
+        assert!(!is_retryable(&anyhow::Error::from(
+            serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
+        )));
     }
 }

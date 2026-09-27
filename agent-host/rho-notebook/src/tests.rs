@@ -305,3 +305,16 @@ async fn command_handle_and_await_result_use_scrambled_session_id() {
     assert!(text.contains(&format!("{command} {command}")), "{text}");
     assert!(!text.contains("2 2"), "raw internal ID leaked: {text}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checkin_remains_configurable_without_tool_suppression() {
+    let (notebook, wake) = notebook();
+    assert_eq!(notebook.checkin(), Duration::from_secs(120));
+    let cell =
+        notebook.run("print('suppress_tool_wakeups' in globals())\nset_max_wait(317)".into());
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().text, "False");
+    assert_eq!(notebook.checkin(), Duration::from_secs(317));
+    notebook.reset_checkin();
+    assert_eq!(notebook.checkin(), Duration::from_secs(120));
+}

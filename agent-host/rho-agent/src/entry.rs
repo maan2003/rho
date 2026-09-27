@@ -4,7 +4,7 @@
 //! appended.
 
 use rho_agent_types::{AgentId, UnixMs};
-use rho_inference2::{Call, CallId, Carry, Image, Usage};
+use rho_inference::step::{Call, CallId, Carry, Image, Usage};
 use senax_encoder::{Decode, Encode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
@@ -119,6 +119,14 @@ pub enum Entry {
         at: UnixMs,
         since: Option<UnixMs>,
     },
+    /// Snapshot of notebook activity, independent of messages and human waits.
+    Activity {
+        at: UnixMs,
+        responding: bool,
+        running_tasks: u32,
+        checkin_at: Option<UnixMs>,
+        archived: bool,
+    },
     Notice {
         at: UnixMs,
         notice: Notice,
@@ -175,8 +183,31 @@ impl Entry {
             | Entry::Sent { at, .. }
             | Entry::Status { at, .. }
             | Entry::Awaiting { at, .. }
+            | Entry::Activity { at, .. }
             | Entry::Notice { at, .. }
             | Entry::CompactionTrigger { at, .. } => *at,
+        }
+    }
+}
+
+/// Runtime activity is independent of the messages it sends and whether a task
+/// awaits the person. Kept separately so snapshots compare without timestamps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Activity {
+    pub responding: bool,
+    pub running_tasks: u32,
+    pub checkin_at: Option<UnixMs>,
+    pub archived: bool,
+}
+
+impl Activity {
+    pub fn entry(self, at: UnixMs) -> Entry {
+        Entry::Activity {
+            at,
+            responding: self.responding,
+            running_tasks: self.running_tasks,
+            checkin_at: self.checkin_at,
+            archived: self.archived,
         }
     }
 }

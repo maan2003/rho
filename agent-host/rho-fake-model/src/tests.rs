@@ -158,42 +158,50 @@ async fn rate_limit_scenario_uses_provider_http_errors_and_retry_after() {
 }
 
 #[tokio::test]
-async fn stream_cut_ends_during_text_once_and_retry_completes() {
-    let client = reqwest::Client::new();
+async fn stream_cut_before_python_admission_allows_retry() {
     let mut config = FakeModelConfig::seeded(8);
     config.scenario = Scenario::StreamCut;
     let server = FakeModel::start(config).await.unwrap();
-    let request = json!({
-        "model":"gpt-test",
-        "input":[],
-        "tools":[{"type":"custom","name":"exec"}]
-    });
-
-    let first = client
-        .post(format!("{}/codex/responses", server.openai_base_url()))
-        .json(&request)
-        .send()
-        .await;
-    if let Ok(response) = first {
-        assert!(response.text().await.is_err());
+    let url = server.openai_base_url().replace("http://", "ws://") + "/codex/responses";
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let request = json!({"type":"response.create","model":"gpt-test","input":[{
+        "type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]
+    }]});
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
+    let mut before_cut = Vec::new();
+    while let Some(Ok(Message::Text(text))) = socket.next().await {
+        before_cut.push(serde_json::from_str::<Value>(&text).unwrap());
     }
-    let observations = server.drain_observations();
+    assert!(!before_cut.is_empty());
     assert!(
-        observations
+        !before_cut
             .iter()
-            .any(|event| event.event_type == "response.output_text.delta")
+            .any(|event| event["item"]["type"] == "custom_tool_call"),
+        "no Python call may be admitted before a retry"
     );
+    let (mut socket, _) = tokio_tungstenite::connect_async(
+        server.openai_base_url().replace("http://", "ws://") + "/codex/responses",
+    )
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
+    let retry = read_turn(&mut socket).await;
     assert!(
-        !observations
-            .iter()
-            .any(|event| event.event_type == "response.completed")
-    );
-    let second = openai_events(&client, &server, request).await;
-    assert!(
-        second
+        retry
             .iter()
             .any(|event| event["type"] == "response.completed")
     );
+    assert!(retry.iter().any(|event| {
+        event["item"]["input"]
+            .as_str()
+            .is_some_and(|code| code.contains("human.send("))
+    }));
     server.shutdown().await.unwrap();
 }
 
@@ -216,12 +224,31 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| {
-                event["type"] == "response.output_item.added"
-                    && event["item"]["type"] == "custom_tool_call"
-            })
+            .filter(|event| event["item"]["type"] == "custom_tool_call"
+                && event["type"] == "response.output_item.done")
             .count(),
-        40
+        1
+    );
+    let code = events
+        .iter()
+        .find(|event| {
+            event["item"]["type"] == "custom_tool_call"
+                && event["type"] == "response.output_item.done"
+        })
+        .unwrap()["item"]["input"]
+        .as_str()
+        .unwrap();
+    assert!(code.contains("rho-fake-call-0"));
+    let next = openai_events(&client, &forty, json!({"model":"gpt-test","input":[
+        {"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},
+        {"type":"custom_tool_call_output","call_id":"call_fake_0_0","output":"rho-fake-call-0"}
+    ]})).await;
+    assert_eq!(
+        next.iter()
+            .filter(|event| event["item"]["type"] == "custom_tool_call"
+                && event["type"] == "response.output_item.done")
+            .count(),
+        1
     );
     forty.shutdown().await.unwrap();
 
@@ -250,22 +277,18 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
         json!({"model":"gpt-test","tools":[{"type":"custom","name":"exec"}]}),
     )
     .await;
-    assert!(!events.iter().any(|event| {
-        matches!(
-            event["item"]["type"].as_str(),
-            Some("custom_tool_call" | "function_call")
-        )
-    }));
-    assert!(events.iter().any(|event| {
-        event["delta"]
-            .as_str()
-            .is_some_and(|text| text.contains("clarify"))
-    }));
-    assert!(
-        events
-            .iter()
-            .any(|event| event["type"] == "response.completed")
-    );
+    let code = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done"
+                && event["item"]["type"] == "custom_tool_call"
+        })
+        .unwrap()["item"]["input"]
+        .as_str()
+        .unwrap();
+    assert!(code.contains("human.send("));
+    assert!(code.contains("await human.reply()"));
+    assert!(code.contains("clarify"));
     clarifying.shutdown().await.unwrap();
 }
 
@@ -358,7 +381,8 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
                 "{code}"
             );
         } else {
-            assert!(code.is_empty());
+            assert!(code.contains("human.send("));
+            assert!(code.contains("await human.reply()"));
         }
     }
     let metrics = server.metrics();

@@ -1028,6 +1028,59 @@ pub(crate) fn agent_state_label(
     facts: &rho_agents_client::AgentFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
+    if let Some(since) = facts.awaiting_human {
+        let mut label = format!(
+            "waiting on you · {}",
+            crate::home::elapsed_label(since.0 as i64, now.timestamp_millis())
+        );
+        if let Some(notebook) = facts.notebook {
+            if notebook.archived {
+                label.push_str(" · archived");
+            } else if notebook.running_tasks > 0 {
+                label.push_str(&format!(
+                    " · {} running task{}",
+                    notebook.running_tasks,
+                    if notebook.running_tasks == 1 { "" } else { "s" }
+                ));
+            } else if notebook.responding {
+                label.push_str(" · responding");
+            }
+        }
+        return Some(label);
+    }
+    if facts.errored {
+        return Some("errored".to_owned());
+    }
+    if let Some(notebook) = facts.notebook {
+        if notebook.archived {
+            return Some("archived".to_owned());
+        }
+        if notebook.responding {
+            return Some("responding".to_owned());
+        }
+        if notebook.running_tasks > 0 {
+            return Some(format!(
+                "{} running task{}",
+                notebook.running_tasks,
+                if notebook.running_tasks == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(checkin) = notebook.checkin_at {
+            let now_ms = now.timestamp_millis();
+            return Some(if checkin.0 as i64 > now_ms {
+                format!(
+                    "next check-in in {}",
+                    crate::home::elapsed_label(now_ms, checkin.0 as i64)
+                )
+            } else {
+                format!(
+                    "check-in due · {} ago",
+                    crate::home::elapsed_label(checkin.0 as i64, now_ms)
+                )
+            });
+        }
+        return Some("idle".to_owned());
+    }
     if facts.turn_running {
         return Some(match facts.turn_started_at {
             Some(started) => format!(

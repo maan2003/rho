@@ -1,4 +1,4 @@
-//! The host-wide inference runtime and the sessions created from it.
+//! Host-wide account policy and transport construction.
 
 use std::sync::{Arc, OnceLock};
 
@@ -7,21 +7,18 @@ use rho_agent_types::UnixMs;
 use rho_db::RhoDb;
 use tokio::sync::watch;
 
-use crate::InferenceSession;
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
-use crate::responses::{
-    DialRoute, InferenceAuth, PromptCacheKey, QuotaUpdate, RouteSelection, RouteSelector,
-};
+use crate::responses::{DialRoute, InferenceAuth, QuotaUpdate, RouteSelection, RouteSelector};
 
-/// Provider account policy, quota, persistence, and session creation. Cheap to
-/// clone.
+/// Provider account policy, quota, persistence, and model construction. Cheap
+/// to clone.
 #[derive(Clone, Debug)]
 pub struct Inference(Arc<Inner>);
 
-/// The session-facing agent host services. A worker receives account decisions
-/// and route observations; it never opens the account database or starts
-/// pollers.
+/// The inference-facing agent host services. A worker receives account
+/// decisions and route observations; it never opens the account database or
+/// starts pollers.
 pub trait InferenceHost: std::fmt::Debug + Send + Sync {
     fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>>;
     fn select_resolved(
@@ -54,11 +51,6 @@ enum Backend {
         routes: RouteSelector,
     },
     Host(Arc<dyn InferenceHost>),
-    #[cfg(test)]
-    Fixed {
-        auth: InferenceAuth,
-        routes: RouteSelector,
-    },
 }
 
 #[derive(Debug)]
@@ -108,23 +100,11 @@ impl Inference {
         Ok(inference)
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(auth: InferenceAuth) -> Self {
-        Self(Arc::new(Inner {
-            backend: Backend::Fixed {
-                auth,
-                routes: RouteSelector::new(None),
-            },
-            responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
-            credentials: OnceLock::new(),
-        }))
-    }
-
     pub fn responses_base_url(&self) -> &str {
         &self.0.responses_base_url
     }
 
-    /// Session transport without host-owned account state or background work.
+    /// Step transport without host-owned account state or background work.
     pub fn from_host(host: Arc<dyn InferenceHost>, config: InferenceConfig) -> Self {
         Self(Arc::new(Inner {
             backend: Backend::Host(host),
@@ -137,25 +117,24 @@ impl Inference {
         match &self.0.backend {
             Backend::AgentHost { routes, .. } => routes.subscribe(),
             Backend::Host(host) => host.route_updates(),
-            #[cfg(test)]
-            Backend::Fixed { routes, .. } => routes.subscribe(),
         }
     }
 
-    pub(crate) fn route_for_session(
+    pub(crate) fn route_for_model(
         &self,
-        config: &crate::responses::session::ResponsesConfig,
+        model: InferenceModel,
+        fast: bool,
         selected: Option<&SelectedAuth>,
     ) -> DialRoute {
-        self.route_updates().borrow().for_session(config, selected)
+        self.route_updates()
+            .borrow()
+            .for_model(model, fast, selected)
     }
 
     pub async fn report_connect_failure(&self, route: DialRoute, selected: Option<&SelectedAuth>) {
         match &self.0.backend {
             Backend::AgentHost { routes, .. } => routes.report_connect_failure(route, selected),
             Backend::Host(host) => host.report_connect_failure(route, selected.cloned()).await,
-            #[cfg(test)]
-            Backend::Fixed { routes, .. } => routes.report_connect_failure(route, selected),
         }
     }
 
@@ -176,57 +155,34 @@ impl Inference {
         });
     }
 
-    pub fn deep_session(
-        &self,
-        profile: InferenceProfile,
-        model: InferenceModel,
-        prompt_cache_key: PromptCacheKey,
-    ) -> InferenceSession {
-        InferenceSession::new_deep(self.clone(), profile, model, prompt_cache_key)
+    /// One provider step; account selection and credential resolution happen
+    /// per request.
+    pub fn model(&self, profile: InferenceProfile, model: InferenceModel) -> crate::step::Model {
+        crate::step::Model::OpenAi(crate::step::openai::OpenAi {
+            inference: self.clone(),
+            model,
+            effort: match profile.effort {
+                crate::config::ReasoningEffort::Low => crate::step::openai::Effort::Low,
+                crate::config::ReasoningEffort::Medium => crate::step::openai::Effort::Medium,
+                crate::config::ReasoningEffort::High => crate::step::openai::Effort::High,
+                crate::config::ReasoningEffort::Xhigh => crate::step::openai::Effort::XHigh,
+            },
+            fast: profile.fast_mode,
+        })
     }
 
-    /// A single text-only exchange. The caller owns its deadline and any retry.
-    /// Dropping this future drops the session and cancels its socket task.
+    /// A text-only provider exchange, with no exec tool. The caller owns
+    /// retries.
     pub async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
-        use rho_agent_types::ContentPart;
-
-        use crate::types::{
-            ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem, MessageSender,
-            PendingInferenceResponse,
-        };
-        let mut session = InferenceSession::new_title(self.clone(), PromptCacheKey::generate());
-        session.request(InferenceRequest {
-            instructions,
-            input: vec![Arc::new(ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content: vec![ContentPart::Text { text: input }],
-            })],
-            agent_id_labels: Default::default(),
-        });
-        let mut pending = PendingInferenceResponse::default();
-        loop {
-            match session.run().await {
-                InferenceEvent::ContextItem { index, event } => pending.apply(index, event),
-                InferenceEvent::Finished { .. } => {
-                    let mut text = String::new();
-                    for item in pending.finish()? {
-                        match item {
-                            InferenceResponseItem::AssistantMessage { content, .. } => {
-                                text.push_str(&crate::types::text_content(&content));
-                            }
-                            InferenceResponseItem::ToolCall { .. } => {
-                                anyhow::bail!("text completion returned a tool call")
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Ok(text);
-                }
-                InferenceEvent::Failed { error }
-                | InferenceEvent::TemporaryFailure { error, .. } => anyhow::bail!("{error:#}"),
-                _ => {}
-            }
-        }
+        self.model(
+            InferenceProfile {
+                effort: crate::config::ReasoningEffort::Medium,
+                fast_mode: true,
+            },
+            InferenceModel::Gpt6Luna,
+        )
+        .text(instructions, input)
+        .await
     }
 
     /// Returns the account decision already made by the account manager.
@@ -279,12 +235,6 @@ impl Inference {
         match &self.0.backend {
             Backend::AgentHost { accounts, .. } => accounts.select().await,
             Backend::Host(host) => host.select().await,
-            #[cfg(test)]
-            Backend::Fixed { auth, .. } => Ok(SelectedAuth {
-                auth: auth.clone(),
-                namespace: None,
-                account_id: None,
-            }),
         }
     }
 
@@ -292,8 +242,6 @@ impl Inference {
         match &self.0.backend {
             Backend::AgentHost { accounts, .. } => accounts.mark_rate_limited(selected).await,
             Backend::Host(host) => host.mark_rate_limited(selected.clone()).await,
-            #[cfg(test)]
-            Backend::Fixed { .. } => false,
         }
     }
 
@@ -301,8 +249,6 @@ impl Inference {
         match &self.0.backend {
             Backend::AgentHost { accounts, .. } => accounts.observe_quota(selected, quota).await,
             Backend::Host(host) => host.observe_quota(selected.clone(), quota).await,
-            #[cfg(test)]
-            Backend::Fixed { .. } => {}
         }
     }
 
@@ -432,7 +378,7 @@ mod host_tests {
     }
 
     #[tokio::test]
-    async fn worker_sessions_delegate_policy_without_opening_a_store_or_selecting_early() {
+    async fn worker_models_delegate_policy_without_opening_a_store_or_selecting_early() {
         let host = Arc::new(Host {
             selected: SelectedAuth {
                 auth: InferenceAuth::oauth_file("/unused/credentials.json"),

@@ -16,8 +16,8 @@ use rho_agent_types::{
     UnixMs, WorksetMode,
 };
 use rho_inference::types::{
-    ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessageSender,
-    PendingInferenceResponse, ToolCall, ToolCallId, ToolResult, ToolSpec,
+    ApplyPatchMetadata, ContextBlock, MessageSender, PendingInferenceResponse, ToolCall,
+    ToolCallId, ToolResult, ToolSpec,
 };
 use senax_encoder::{Decode, Encode};
 
@@ -25,7 +25,7 @@ use crate::db::{AgentEventPos, AgentRuntime, AgentSpawnedBy, ClaudeRewind, Sessi
 
 pub mod agent;
 mod claude;
-pub mod native;
+mod runtime;
 pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;
@@ -182,7 +182,7 @@ pub enum AgentEvent<'a> {
         at: UnixMs,
     },
     /// Canonical native conversation records; legacy block rows are read-only.
-    Native(native::NativeEvent),
+    Native(db::legacy::NativeEvent),
     ClaudeOutput {
         batch: ClaudeOutputBatch,
     },
@@ -236,7 +236,7 @@ pub struct WakeFacts {
 }
 
 impl WakeFacts {
-    /// A request an interrupt forced: nothing was weighed.
+    /// Historical interrupt wake; retained for decoding old logs.
     pub fn interrupt() -> Self {
         Self {
             trigger: WakeTrigger::Interrupt,
@@ -253,7 +253,7 @@ impl WakeFacts {
 pub enum WakeTrigger {
     /// A previously selected durable output batch is handed off.
     Delivery,
-    /// The user's message threw away an in-flight request.
+    /// Historical interruption by a message; live messages now queue.
     Interrupt,
     /// A request somebody asked for outright: a retry, a compaction.
     Asked,
@@ -458,6 +458,11 @@ impl InputQueues {
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 // should be cheap to clone, it is cloned a lot
 pub enum AgentStateKind {
+    /// Native Python source while the provider is writing it. This is not a
+    /// user-facing message and does not imply the cell has finished.
+    Writing {
+        call: Option<rho_inference::step::Call>,
+    },
     ApiStreaming {
         pending_response: PendingInferenceResponse,
         previous_attempt: Option<FailedInferenceResponse>,
@@ -520,7 +525,10 @@ pub(crate) fn execution_settled(
 impl AgentStateKind {
     /// Whether the agent is actively executing a turn.
     pub fn is_working(&self) -> bool {
-        matches!(self, Self::ApiStreaming { .. } | Self::ToolCalling { .. })
+        matches!(
+            self,
+            Self::Writing { .. } | Self::ApiStreaming { .. } | Self::ToolCalling { .. }
+        )
     }
 }
 
@@ -600,34 +608,6 @@ impl StartPlace {
     }
 }
 
-pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
-    let text_of = |want_final: bool| {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                InferenceResponseItem::AssistantMessage { content, phase, .. }
-                    if !want_final
-                        || *phase == Some(rho_agent_types::MessagePhase::FinalAnswer) =>
-                {
-                    Some(content.iter().filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        ContentPart::Image { .. } => None,
-                    }))
-                }
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let final_text = text_of(true);
-    if final_text.is_empty() {
-        text_of(false)
-    } else {
-        final_text
-    }
-}
-
 #[cfg(test)]
 mod encoding_tests {
     use rho_agent_types::AgentIdDomain;
@@ -656,19 +636,19 @@ mod encoding_tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs(8),
             }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
                 input: Vec::from(vec![ContextBlock::CompactionTrigger]),
                 at: UnixMs(9),
                 wake: None,
                 context: None,
             }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+            AgentEvent::Native(crate::db::legacy::NativeEvent::ResponseFinished {
                 output: Vec::from(Vec::new()),
                 context_used: Some(12),
                 usage: None,
                 at: UnixMs(10),
             }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
                 input: Vec::from(vec![ContextBlock::DeveloperMessage {
                     text: "boundary".into(),
                 }]),
@@ -676,7 +656,7 @@ mod encoding_tests {
                 at: UnixMs(11),
                 wake: None,
             }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
                 input: Vec::from(Vec::new()),
                 context: Some(ContextChange::Preparing {
                     retain_from: 1,
@@ -685,7 +665,7 @@ mod encoding_tests {
                 at: UnixMs(11),
                 wake: None,
             }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
                 input: Vec::from(vec![ContextBlock::ContextRotation { retain_from: 1 }]),
                 at: UnixMs(11),
                 wake: None,
