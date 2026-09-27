@@ -33,7 +33,6 @@ use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event, Image, Inference, InferenceSession, Request, Response, Step,
 };
-use crate::lazy::Lazy;
 use crate::runtime::mailroom::{Mailroom, Outbound};
 use crate::runtime::wake::{Decision, Facts};
 use crate::runtime::{Progress, tools, wake};
@@ -84,15 +83,14 @@ pub struct AgentHandle {
     /// The record as the loop keeps it: read here instead of folding the
     /// log again for every mail, tool call, or shell.
     head: Arc<RwLock<AgentHead>>,
-    /// The agent's place, materialized on first use: a new agent's clone
-    /// may still be in flight when a terminal or shell asks for it.
-    view: Arc<Lazy<Arc<View>>>,
+    /// Cwd and command configuration within the already-entered workset.
+    view: Arc<View>,
 }
 
 impl AgentHandle {
-    /// The agent's view, ready once its place is.
-    pub async fn view(&self) -> anyhow::Result<Arc<View>> {
-        Ok(Arc::clone(self.view.get().await?))
+    /// Cwd and command configuration within the worker's workset.
+    pub fn view(&self) -> Arc<View> {
+        Arc::clone(&self.view)
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -332,7 +330,7 @@ pub(crate) struct Agent {
     inference: Inference,
     session: InferenceSession,
     model_name: String,
-    view: Arc<Lazy<Arc<View>>>,
+    view: Arc<View>,
     context: context::Context,
     continuation: Option<crate::inference::Continuation>,
     notebook: Option<Notebook>,
@@ -381,7 +379,7 @@ impl Agent {
         agent_id: AgentId,
         host: Arc<crate::worker::Host>,
         inference: Inference,
-        view: Arc<Lazy<Arc<View>>>,
+        view: Arc<View>,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
@@ -931,11 +929,10 @@ impl Agent {
         }
     }
 
-    /// The notebook, started on first use: a load never fails on a place
-    /// that has gone, a wake may.
+    /// Start the notebook on first use; workset setup has already completed.
     async fn notebook(&mut self) -> anyhow::Result<&Notebook> {
         if self.notebook.is_none() {
-            let view = Arc::clone(self.view.get().await?);
+            let view = Arc::clone(&self.view);
             let team = self.host.team().await?;
             let role = self.head.read().expect("poison").config.role;
             let (shell, exports) = tools::host_tools(
@@ -955,7 +952,7 @@ impl Agent {
     }
 
     async fn instructions(&mut self) -> anyhow::Result<Arc<str>> {
-        let view = Arc::clone(self.view.get().await?);
+        let view = Arc::clone(&self.view);
         let team = self.host.team().await?;
         let role = self.head.read().expect("poison").config.role;
         Ok(prompt::prompt(&view, team.as_ref(), role))

@@ -21,7 +21,7 @@ struct Harness {
     agent: AgentId,
     host: Arc<crate::worker::Host>,
     inference: Inference,
-    view: Arc<Lazy<Arc<View>>>,
+    view: Arc<View>,
 }
 
 impl Harness {
@@ -79,7 +79,7 @@ impl Harness {
             agent,
             host,
             inference: accounts.client(),
-            view: Arc::new(Lazy::ready(view)),
+            view,
         }
     }
 

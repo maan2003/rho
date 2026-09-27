@@ -14,12 +14,12 @@ use camino::Utf8PathBuf;
 use rho_agent_types::transcript::{ContextItemEvent, PendingInferenceResponse};
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
-use crate::inference::Inference;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind, UnixMillis};
 use crate::entry::{Block, Entry, MessageId, Notice, Party, Report};
+use crate::inference::Inference;
 use crate::runtime::mailroom::{Mailroom, Outbound};
 use crate::{
     AgentEvent, AgentState, AgentStatus, InferenceState, InputKind, InputQueues, QueuedInput,
@@ -32,8 +32,6 @@ pub(crate) mod python_host;
 use projection::{
     ClaudeStreamItem, Projection, assistant_row, compacted_row, live_response, user_row,
 };
-
-use crate::lazy::Lazy;
 
 #[derive(Clone)]
 pub struct ClaudeAgent {
@@ -49,7 +47,7 @@ impl ClaudeAgent {
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<crate::View>>>,
+        view: Arc<crate::View>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -297,9 +295,7 @@ pub(crate) struct ClaudeLoop {
     claude: rho_claude::accounts::ClaudePaths,
     inference: Inference,
     agent_id: AgentId,
-    view: Arc<Lazy<Arc<crate::View>>>,
-    /// The primary workdir's repo, which is where Claude files the
-    /// session. Known without materializing the view.
+    view: Arc<crate::View>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -470,7 +466,7 @@ impl ClaudeLoop {
         host: Arc<crate::worker::Host>,
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
-        view: Arc<Lazy<Arc<crate::View>>>,
+        view: Arc<crate::View>,
     ) -> anyhow::Result<(ClaudeAgent, Self)> {
         let record = host.head().await?;
         let AgentRuntime::Claude { session_id } = record.config.runtime else {
@@ -1448,7 +1444,7 @@ impl ClaudeLoop {
             ":rewind is not available with queued inputs"
         );
 
-        let view = Arc::clone(self.view.get().await?);
+        let view = Arc::clone(&self.view);
         let (source_session_id, messages) = if self.pending_rewind {
             match self.start_mode {
                 ClaudeStartMode::Fork {
@@ -1554,7 +1550,7 @@ impl ClaudeLoop {
             );
             self.close_process().await?;
         }
-        let view = Arc::clone(self.view.get().await?);
+        let view = Arc::clone(&self.view);
         let session = match self.start_mode {
             ClaudeStartMode::New => Session::New {
                 session_id: self.session_id,
@@ -2278,7 +2274,7 @@ impl ClaudeLoop {
             return Ok(());
         }
         self.close_process().await?;
-        let view = Arc::clone(self.view.get().await?);
+        let view = Arc::clone(&self.view);
         let messages = rho_claude::read_session_messages_by_id(
             &self.claude.projects(),
             self.session_id,

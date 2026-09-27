@@ -343,11 +343,7 @@ pub(super) async fn run(
         let inference = inference.clone();
         tasks.spawn(async move {
             let result = async {
-                let namespace = base.for_cwd(&bootstrap.cwd)?;
-                let view = Arc::new(crate::lazy::Lazy::new(move || {
-                    let namespace = namespace.clone();
-                    async move { Ok(namespace) }
-                }));
+                let view = base.for_cwd(&bootstrap.cwd)?;
                 let head = host.head().await?;
                 match head.config.runtime {
                     crate::db::AgentRuntime::Rho { .. } => {
