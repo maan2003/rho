@@ -710,11 +710,10 @@ impl ClaudeLoop {
                         stream_dirty = false;
                     }
                     ClaudeLoopEvent::StreamFrame => {
-                        self.drain_outbox().await?;
-                        self.python_tick().await?;
-                        self.published();
+                        // Fall through the ordinary tick and turn-edge path:
+                        // draining output or ticking Python can start or settle
+                        // work even when the event only fired for a body frame.
                         stream_dirty = false;
-                        continue;
                     }
                     ClaudeLoopEvent::Outbound(outbound) => {
                         stream_dirty = false;
