@@ -623,12 +623,12 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
             }
             _ => continue,
         };
-        carry.push(replay.to_string());
+        carry.push(replay);
     }
     Step {
         call,
         prose,
-        carry: Carry::from_openai_items(carry),
+        carry: Carry::from_openai_values(carry),
         usage: Usage {
             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
             cached_tokens: usage["input_tokens_details"]["cached_tokens"]

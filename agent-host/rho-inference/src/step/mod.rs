@@ -2,9 +2,9 @@
 //!
 //! The agent appends model-facing items to [`Context`]; this crate owns the
 //! active window, warm connection and continuation selection. Each wake takes
-//! an O(1) [`Request`] snapshot and receives a [`Step`]. The model answers only by calling `exec` with a
-//! cell of Python. Anything else it writes is kept as `prose`, which the
-//! agent does not deliver anywhere.
+//! an O(1) [`Request`] snapshot and receives a [`Step`]. The model answers only
+//! by calling `exec` with a cell of Python. Anything else it writes is kept as
+//! `prose`, which the agent does not deliver anywhere.
 //!
 //! What only the provider understands (item ids, encrypted reasoning) rides
 //! in a [`Carry`]: stored by the agent, replayed verbatim, never read.
@@ -283,30 +283,51 @@ struct Prepared {
     compaction: Option<usize>,
     calls: Vec<CallId>,
 }
+impl Prepared {
+    fn new(items: Vec<serde_json::Value>) -> Self {
+        let compaction = items.iter().rposition(|item| item["type"] == "compaction");
+        let calls = items
+            .iter()
+            .skip(compaction.unwrap_or(0))
+            .filter(|item| item["type"] == "custom_tool_call")
+            .filter_map(|item| item["call_id"].as_str().map(CallId::new))
+            .collect();
+        Self {
+            items,
+            compaction,
+            calls,
+        }
+    }
+}
 impl Carry {
     fn prepared(&self) -> Option<&Prepared> {
         let Inner::OpenAi { items, _prepared } = &*self.0 else {
             return None;
         };
         Some(_prepared.get_or_init(|| {
-            let items: Vec<serde_json::Value> = items
-                .iter()
-                .map(|item| serde_json::from_str(item).expect("persisted provider replay item"))
-                .collect();
-            let compaction = items.iter().rposition(|item| item["type"] == "compaction");
-            let calls = items
-                .iter()
-                .skip(compaction.unwrap_or(0))
-                .filter(|item| item["type"] == "custom_tool_call")
-                .filter_map(|item| item["call_id"].as_str().map(CallId::new))
-                .collect();
-            Prepared {
-                items,
-                compaction,
-                calls,
-            }
+            Prepared::new(
+                items
+                    .iter()
+                    .map(|item| serde_json::from_str(item).expect("persisted provider replay item"))
+                    .collect(),
+            )
         }))
     }
+
+    /// Live output is already parsed. Keep it rather than decoding our own
+    /// serialized persistence representation on the next request.
+    fn from_openai_values(items: Vec<serde_json::Value>) -> Self {
+        let encoded = items.iter().map(serde_json::Value::to_string).collect();
+        let prepared = OnceLock::new();
+        prepared
+            .set(Prepared::new(items))
+            .expect("new response cache");
+        Self(Arc::new(Inner::OpenAi {
+            items: encoded,
+            _prepared: Arc::new(prepared),
+        }))
+    }
+
     fn same_response(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
