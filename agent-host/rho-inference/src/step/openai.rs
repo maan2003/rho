@@ -1,5 +1,6 @@
 //! The OpenAI Responses API, as ChatGPT serves it to Codex: one WebSocket
-//! per step, `response.create` in, events out until the response ends.
+//! kept warm across steps, `response.create` in, events out until the response
+//! ends.
 //!
 //! Every model rho uses takes the Responses Lite shape: the tool and the
 //! instructions are developer items at the head of the input, not top-level
@@ -20,12 +21,110 @@ use crate::config::InferenceModel;
 use crate::responses::{DialRoute, QuotaUpdate, ws};
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(300);
+const PING_INTERVAL: Duration = Duration::from_secs(25);
+const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct Connection {
+    socket: Socket,
+    selected: crate::SelectedAuth,
+    auth: crate::ResolvedAuth,
+    route: DialRoute,
+    opened: tokio::time::Instant,
+    cache_key: super::CacheKey,
+    previous: Option<Previous>,
+    ping: tokio::time::Interval,
+}
+
+struct Previous {
+    id: String,
+    lineage: uuid::Uuid,
+    at: usize,
+    carry: Carry,
+    instructions: Arc<str>,
+}
+
+/// An idle connection still answers pings and observes close/route changes.
+/// Taking it out before a request makes cancellation drop the in-flight socket.
+pub(crate) struct Idle {
+    take: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Option<Connection>>,
+}
+impl Drop for Idle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl Idle {
+    async fn take(mut self) -> Option<Connection> {
+        let _ = self.take.take()?.send(());
+        (&mut self.task).await.ok().flatten()
+    }
+}
+impl Connection {
+    async fn next(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<Option<WsMessage>> {
+        loop {
+            tokio::select! {
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Err(super::Retryable("the provider went quiet".into()).into()),
+                _ = self.ping.tick() => self.socket.send(WsMessage::Ping(Vec::new().into())).await?,
+                message = self.socket.next() => return Ok(message.transpose()?),
+            }
+        }
+    }
+
+    fn park(mut self, inference: Inference, model: InferenceModel, fast: bool) -> Idle {
+        let (take, mut taken) = tokio::sync::oneshot::channel();
+        let mut routes = inference.route_updates();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = &mut taken => return result.ok().map(|_| self),
+                    changed = routes.changed() => {
+                        if changed.is_err() || routes.borrow().for_model(model, fast, Some(&self.selected)) != self.route {
+                            return None;
+                        }
+                    }
+                    message = self.next(None) => match message {
+                        Ok(Some(WsMessage::Ping(payload))) => {
+                            if self.socket.send(WsMessage::Pong(payload)).await.is_err() { return None; }
+                        }
+                        Ok(Some(WsMessage::Pong(_))) => {}
+                        Ok(Some(WsMessage::Text(text))) => {
+                            if let Ok(event) = serde_json::from_str::<Value>(&text) {
+                                if let Some(quota) = QuotaUpdate::from_event(&event) {
+                                    inference.observe_quota(&self.selected, quota).await;
+                                } else if matches!(event["type"].as_str(), Some("error" | "response.failed")) {
+                                    return None;
+                                }
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        });
+        Idle {
+            take: Some(take),
+            task,
+        }
+    }
+}
 
 pub struct OpenAi {
     pub(crate) inference: Inference,
     pub(crate) model: InferenceModel,
     pub(crate) effort: Effort,
     pub(crate) fast: bool,
+    pub(crate) idle: tokio::sync::Mutex<Option<Idle>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,8 +174,7 @@ impl OpenAi {
         request: &Request,
         stream: &mut (dyn FnMut(Stream<'_>) + Send),
     ) -> anyhow::Result<Step> {
-        self.exchange(request.cache_key, self.body(request), stream)
-            .await
+        self.exchange(request, true, stream).await
     }
 
     pub(crate) async fn text(
@@ -84,17 +182,15 @@ impl OpenAi {
         instructions: Arc<str>,
         input: String,
     ) -> anyhow::Result<String> {
-        let request = Request {
+        let request = Request::new(
             instructions,
-            items: vec![Item::User {
+            vec![Item::User {
                 text: input,
                 images: Vec::new(),
             }],
-            cache_key: super::CacheKey::new(),
-        };
-        let mut body = self.body(&request);
-        body["input"].as_array_mut().unwrap().remove(0); // Text requests have no tools.
-        let response = self.exchange(request.cache_key, body, &mut |_| {}).await?;
+            super::CacheKey::new(),
+        );
+        let response = self.exchange(&request, false, &mut |_| {}).await?;
         if response.call.is_some() {
             bail!("text completion returned a tool call");
         }
@@ -103,19 +199,91 @@ impl OpenAi {
 
     async fn exchange(
         &self,
-        cache_key: super::CacheKey,
-        body: Value,
+        request: &Request,
+        tools: bool,
         stream: &mut (dyn FnMut(Stream<'_>) + Send),
     ) -> anyhow::Result<Step> {
-        crate::ensure_crypto_provider();
+        // Hold admission, not the connection, in the mutex while in flight.
+        // An aborted caller drops its local connection and cannot reuse a partial turn.
+        let mut idle = self.idle.lock().await;
         let (mut selected, resolved) = self.inference.select_resolved().await?;
         selected.account_id = resolved.account_id.clone();
-        let mut route = self
+        let route = self
             .inference
             .route_for_model(self.model, self.fast, Some(&selected));
+        let connection = match idle.take() {
+            Some(parked) => parked.take().await.filter(|c| {
+                c.selected == selected
+                    && c.auth.bearer_token == resolved.bearer_token
+                    && c.auth.client_secret == resolved.client_secret
+                    && c.auth.account_id == resolved.account_id
+                    && c.route == route
+                    && c.cache_key == request.cache_key
+                    && c.opened.elapsed() < MAX_CONNECTION_AGE
+            }),
+            None => None,
+        };
+        let mut connection = match connection {
+            Some(c) => c,
+            None => {
+                self.connect(request.cache_key, selected, resolved, route)
+                    .await?
+            }
+        };
+        let previous = connection.previous.take().filter(|p|
+            tools && p.lineage == request.lineage
+            && (Arc::ptr_eq(&p.instructions, &request.instructions) || p.instructions == request.instructions)
+            && matches!(request.items.get(p.at), Some(Item::Step(carry)) if carry.same_response(&p.carry))
+            && !p.carry.has_compaction());
+        let mut body = self.body_from(request, previous.as_ref().map(|p| p.at + 1).unwrap_or(0));
+        if let Some(previous) = previous {
+            body["previous_response_id"] = Value::String(previous.id);
+        }
+        body["prompt_cache_key"] = request
+            .cache_key
+            .wire_uuid(
+                self.inference.responses_base_url(),
+                connection.auth.client_secret,
+            )
+            .to_string()
+            .into();
+        if !tools {
+            body["input"].as_array_mut().unwrap().remove(0);
+        }
+        connection
+            .socket
+            .send(WsMessage::Text(body.to_string().into()))
+            .await?;
+        let result = self.read_response(&mut connection, stream).await?;
+        let (step, response_id, complete_replay) = result;
+        if tools && complete_replay && !step.carry.has_compaction() {
+            connection.previous = response_id.map(|id| Previous {
+                id,
+                lineage: request.lineage,
+                at: request.items.len(),
+                carry: step.carry.clone(),
+                instructions: request.instructions.clone(),
+            });
+        }
+        *idle = Some(connection.park(self.inference.clone(), self.model, self.fast));
+        Ok(step)
+    }
+
+    async fn connect(
+        &self,
+        cache_key: super::CacheKey,
+        selected: crate::SelectedAuth,
+        resolved: crate::ResolvedAuth,
+        mut route: DialRoute,
+    ) -> anyhow::Result<Connection> {
+        crate::ensure_crypto_provider();
         let request = ws::request(
             self.inference.responses_base_url(),
-            Some(&cache_key.to_string()),
+            Some(
+                &cache_key
+                    .wire_uuid(self.inference.responses_base_url(), resolved.client_secret)
+                    .to_string(),
+            ),
             &resolved,
         )?;
         let mut connected = ws::connect(request, route).await;
@@ -129,37 +297,58 @@ impl OpenAi {
             route = DialRoute::Dns;
             let request = ws::request(
                 self.inference.responses_base_url(),
-                Some(&cache_key.to_string()),
+                Some(
+                    &cache_key
+                        .wire_uuid(self.inference.responses_base_url(), resolved.client_secret)
+                        .to_string(),
+                ),
                 &resolved,
             )?;
             connected = ws::connect(request, route).await;
         }
-        let (mut socket, _) = match connected {
+        let (socket, _) = match connected {
             Ok(connection) => connection,
             Err(error) => {
                 if websocket_status(&error) == Some(429) {
-                    self.inference.mark_rate_limited(&selected).await;
-                    return Err(super::Retryable(error.to_string()).into());
+                    if self.inference.mark_rate_limited(&selected).await {
+                        return Err(super::Retryable(error.to_string()).into());
+                    }
+                    bail!("provider quota exhausted: {error}");
                 }
                 return Err(error).context("connecting to the Responses endpoint");
             }
         };
-        socket
-            .send(WsMessage::Text(body.to_string().into()))
-            .await?;
+        Ok(Connection {
+            socket,
+            selected,
+            auth: resolved,
+            route,
+            opened: tokio::time::Instant::now(),
+            cache_key,
+            previous: None,
+            ping: tokio::time::interval_at(
+                tokio::time::Instant::now() + PING_INTERVAL,
+                PING_INTERVAL,
+            ),
+        })
+    }
+
+    async fn read_response(
+        &self,
+        connection: &mut Connection,
+        stream: &mut (dyn FnMut(Stream<'_>) + Send),
+    ) -> anyhow::Result<(Step, Option<String>, bool)> {
+        let mut deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
         let mut items = Vec::new();
         let mut streaming: Option<(String, Value)> = None;
         loop {
-            let message = tokio::time::timeout(EVENT_TIMEOUT, socket.next())
-                .await
-                .context("the provider went quiet")?
-                .ok_or_else(|| {
-                    super::Retryable("the provider closed the connection mid-response".into())
-                })??;
+            let message = connection.next(Some(deadline)).await?.ok_or_else(|| {
+                super::Retryable("the provider closed the connection mid-response".into())
+            })?;
             let text = match message {
                 WsMessage::Text(text) => text,
                 WsMessage::Ping(payload) => {
-                    socket.send(WsMessage::Pong(payload)).await?;
+                    connection.socket.send(WsMessage::Pong(payload)).await?;
                     continue;
                 }
                 WsMessage::Close(frame) => {
@@ -170,9 +359,12 @@ impl OpenAi {
                 }
                 _ => continue,
             };
+            deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
             let event: Value = serde_json::from_str(&text)?;
             if let Some(quota) = QuotaUpdate::from_event(&event) {
-                self.inference.observe_quota(&selected, quota).await;
+                self.inference
+                    .observe_quota(&connection.selected, quota)
+                    .await;
             }
             match event["type"].as_str().unwrap_or_default() {
                 "response.output_item.added" if streaming.is_none() && is_call(&event["item"]) => {
@@ -197,8 +389,17 @@ impl OpenAi {
                 }
                 "response.output_item.done" => items.push(event["item"].clone()),
                 "response.completed" | "response.done" => {
-                    let _ = socket.close(None).await;
-                    return Ok(step(items, &event["response"]["usage"]));
+                    let count = items.len();
+                    let answer = step(items, &event["response"]["usage"]);
+                    let complete_replay = answer
+                        .carry
+                        .prepared()
+                        .is_some_and(|p| p.items.len() == count);
+                    return Ok((
+                        answer,
+                        event["response"]["id"].as_str().map(str::to_owned),
+                        complete_replay,
+                    ));
                 }
                 "response.incomplete" => bail!(
                     "response incomplete: {}",
@@ -206,22 +407,26 @@ impl OpenAi {
                 ),
                 "response.failed" | "error" => {
                     let error = if event["type"] == "error" {
-                        &event["error"]
+                        event.get("error").unwrap_or(&event)
                     } else {
                         &event["response"]["error"]
                     };
-                    let retryable = if is_rate_limit(error) {
-                        let replacement = self.inference.mark_rate_limited(&selected).await;
-                        replacement
-                            || ["code", "type"]
-                                .iter()
-                                .any(|key| error[key] == "rate_limit_exceeded")
+                    let stale = error.to_string().to_ascii_lowercase();
+                    let retryable = if stale.contains("previous_response")
+                        || stale.contains("previous response")
+                        || stale.contains("response not found")
+                    {
+                        true
+                    } else if is_rate_limit(error) {
+                        self.inference.mark_rate_limited(&connection.selected).await
                     } else {
                         ["code", "type"].iter().any(|key| {
                             matches!(
                                 error[key].as_str(),
                                 Some(
-                                    "server_error"
+                                    "previous_response_not_found"
+                                        | "previous_response_id_not_found"
+                                        | "server_error"
                                         | "internal_server_error"
                                         | "server_is_overloaded"
                                         | "overloaded"
@@ -241,64 +446,57 @@ impl OpenAi {
         }
     }
 
+    #[cfg(test)]
     fn body(&self, request: &Request) -> Value {
-        let mut input = vec![
-            json!({
-                "type": "additional_tools",
-                "role": "developer",
-                "tools": [{
-                    "type": "custom",
-                    "name": EXEC,
-                    "description": "Run Python in your notebook. Every response is one call to this tool.",
-                    "format": { "type": "text" },
-                }],
-            }),
-            json!({
-                "type": "message",
-                "role": "developer",
-                "content": [{ "type": "input_text", "text": &*request.instructions }],
-            }),
-        ];
-        // Keep the latest provider compaction item itself and everything after it.
-        let latest_compaction = request
-            .items
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, item)| match item {
-                Item::Step(Carry(Inner::OpenAi { items })) => items
-                    .iter()
-                    .rposition(|item| {
-                        serde_json::from_str::<Value>(item)
-                            .is_ok_and(|item| item["type"] == "compaction")
-                    })
-                    .map(|offset| (index, offset)),
-                Item::Step(Carry(Inner::ScriptedCompaction)) => Some((index, 0)),
-                _ => None,
-            });
+        self.body_from(request, 0)
+    }
+
+    fn body_from(&self, request: &Request, start: usize) -> Value {
+        let mut input = if start == 0 {
+            vec![
+                json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "custom",
+                        "name": EXEC,
+                        "description": "Run Python in your notebook. Every response is one call to this tool.",
+                        "format": { "type": "text" },
+                    }],
+                }),
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": &*request.instructions }],
+                }),
+            ]
+        } else {
+            Vec::new()
+        };
+        // Context already discarded everything before its latest compaction.
+        // Cached metadata also handles a compaction within one response.
         let mut compaction_requested = false;
-        for (index, item) in request.items.iter().enumerate() {
-            if latest_compaction.is_some_and(|(start, _)| index < start) {
-                continue;
-            }
+        for item in request.items.iter().skip(start) {
             match item {
-                Item::Step(Carry(Inner::OpenAi { items })) => input.extend(
-                    items
-                        .iter()
-                        .skip(match latest_compaction {
-                            Some((start, offset)) if start == index => offset,
-                            _ => 0,
-                        })
-                        .filter_map(|item| serde_json::from_str::<Value>(item).ok()),
-                ),
-                Item::Step(Carry(Inner::ScriptedCompaction)) => {}
-                Item::CompactionTrigger => compaction_requested = true,
-                // Another provider's step: all that can be said is the call.
-                Item::Step(Carry(Inner::Scripted { call })) => {
-                    if let Some(call) = call {
-                        input.push(call_item(call));
+                Item::Step(carry) => match &*carry.0 {
+                    Inner::OpenAi { .. } => {
+                        let prepared = carry.prepared().unwrap();
+                        input.extend(
+                            prepared
+                                .items
+                                .iter()
+                                .skip(prepared.compaction.unwrap_or(0))
+                                .cloned(),
+                        );
                     }
-                }
+                    Inner::ScriptedCompaction => {}
+                    Inner::Scripted { call } => {
+                        if let Some(call) = call {
+                            input.push(call_item(call));
+                        }
+                    }
+                },
+                Item::CompactionTrigger => compaction_requested = true,
                 Item::Result {
                     call_id,
                     text,
@@ -430,7 +628,7 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
     Step {
         call,
         prose,
-        carry: Carry(Inner::OpenAi { items: carry }),
+        carry: Carry::from_openai_items(carry),
         usage: Usage {
             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
             cached_tokens: usage["input_tokens_details"]["cached_tokens"]
@@ -471,6 +669,8 @@ mod tests {
         selected: SelectedAuth,
         calls: Mutex<Vec<&'static str>>,
         route: watch::Sender<RouteSelection>,
+        stable: std::sync::atomic::AtomicBool,
+        replacement: std::sync::atomic::AtomicBool,
     }
     impl Host {
         fn new() -> Arc<Self> {
@@ -483,6 +683,8 @@ mod tests {
                 },
                 calls: Mutex::new(vec![]),
                 route,
+                stable: false.into(),
+                replacement: true.into(),
             })
         }
     }
@@ -501,6 +703,11 @@ mod tests {
                     .count()
                     + 1;
                 calls.push("select-resolved");
+                let nth = if self.stable.load(std::sync::atomic::Ordering::Relaxed) {
+                    1
+                } else {
+                    nth
+                };
                 Ok((
                     self.selected.clone(),
                     crate::ResolvedAuth {
@@ -521,7 +728,7 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(selected.account_id.as_deref(), Some("account-9"));
                 self.calls.lock().unwrap().push("limited");
-                true
+                self.replacement.load(std::sync::atomic::Ordering::Relaxed)
             })
         }
         fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()> {
@@ -553,14 +760,14 @@ mod tests {
     }
 
     fn request() -> Request {
-        Request {
-            instructions: "answer with exec".into(),
-            items: vec![Item::User {
+        Request::new(
+            "answer with exec".into(),
+            vec![Item::User {
                 text: "run".into(),
                 images: vec![],
             }],
-            cache_key: super::super::CacheKey::from_u128(19),
-        }
+            super::super::CacheKey::from_u128(19),
+        )
     }
 
     fn local_model() -> OpenAi {
@@ -572,15 +779,15 @@ mod tests {
             model: InferenceModel::Gpt6Sol,
             effort: Effort::Low,
             fast: false,
+            idle: Default::default(),
         }
     }
 
     #[test]
     fn request_contains_one_exec_tool_and_replays_results() {
-        let body = local_model().body(&Request {
-            instructions: "instructions".into(),
-            cache_key: super::super::CacheKey::from_u128(17),
-            items: vec![
+        let body = local_model().body(&Request::new(
+            "instructions".into(),
+            vec![
                 Item::Result {
                     call_id: CallId::new("call-1"),
                     text: "result".into(),
@@ -591,7 +798,8 @@ mod tests {
                     images: vec![],
                 },
             ],
-        });
+            super::super::CacheKey::from_u128(17),
+        ));
         assert_eq!(body["input"][0]["tools"][0]["name"], "exec");
         assert_eq!(body["input"][1]["content"][0]["text"], "instructions");
         assert_eq!(
@@ -609,34 +817,30 @@ mod tests {
     #[test]
     fn compaction_keeps_latest_boundary_and_following_items() {
         let latest = json!({"type":"compaction", "id":"new", "encrypted_content":"new-key", "opaque":{"keep":1}});
-        let request = Request {
-            instructions: "instructions".into(),
-            cache_key: super::super::CacheKey::from_u128(17),
-            items: vec![
+        let request = Request::new(
+            "instructions".into(),
+            vec![
                 Item::User {
                     text: "discard".into(),
                     images: vec![],
                 },
-                Item::Step(Carry(Inner::OpenAi {
-                    items: vec![
-                        json!({"type":"compaction","id":"old","encrypted_content":"old-key"})
-                            .to_string(),
-                    ],
-                })),
-                Item::Step(Carry(Inner::OpenAi {
-                    items: vec![
-                        json!({"type":"reasoning","id":"discard"}).to_string(),
-                        latest.to_string(),
-                        json!({"type":"message","id":"keep"}).to_string(),
-                    ],
-                })),
+                Item::Step(Carry::from_openai_items(vec![
+                    json!({"type":"compaction","id":"old","encrypted_content":"old-key"})
+                        .to_string(),
+                ])),
+                Item::Step(Carry::from_openai_items(vec![
+                    json!({"type":"reasoning","id":"discard"}).to_string(),
+                    latest.to_string(),
+                    json!({"type":"message","id":"keep"}).to_string(),
+                ])),
                 Item::User {
                     text: "keep".into(),
                     images: vec![],
                 },
                 Item::CompactionTrigger,
             ],
-        };
+            super::super::CacheKey::from_u128(17),
+        );
         let body = local_model().body(&request);
         assert_eq!(
             body["input"].as_array().unwrap()[2..],
@@ -664,7 +868,7 @@ mod tests {
         assert_eq!(answer.prose, "prose");
         assert_eq!(answer.usage.cached_tokens, 4);
         assert_eq!(answer.carry.call_ids(), [CallId::new("first")]);
-        let Carry(Inner::OpenAi { items }) = answer.carry else {
+        let Inner::OpenAi { items, .. } = &*answer.carry.0 else {
             panic!()
         };
         assert_eq!(items.len(), 3);
@@ -688,7 +892,7 @@ mod tests {
                         assert_eq!(request.headers()["chatgpt-account-id"], "account-9");
                         assert_eq!(
                             request.headers()["session-id"],
-                            "00000000-0000-0000-0000-000000000013"
+                            request.headers()["thread-id"]
                         );
                         Ok(response)
                     },
@@ -818,6 +1022,361 @@ mod tests {
                 .unwrap(),
             "A name"
         );
+        server.await.unwrap();
+    }
+    type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn envelope(socket: &mut TestSocket) -> Value {
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                WsMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                WsMessage::Ping(payload) => socket.send(WsMessage::Pong(payload)).await.unwrap(),
+                other => panic!("expected request, got {other:?}"),
+            }
+        }
+    }
+
+    async fn complete(socket: &mut TestSocket, id: &str, compacted: bool) {
+        let item = if compacted {
+            json!({"type":"compaction","id":id,"encrypted_content":"summary"})
+        } else {
+            json!({"type":"custom_tool_call","name":"exec","id":id,"call_id":format!("call-{id}"),"input":"pass"})
+        };
+        for event in [
+            json!({"type":"response.output_item.done","item":item}),
+            json!({"type":"response.completed","response":{"id":id,"usage":{}}}),
+        ] {
+            socket
+                .send(WsMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn infer(model: &crate::step::Model, context: &super::super::Context) -> Step {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            model.step(
+                &context.request("instructions".into(), super::super::CacheKey::from_u128(19)),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn warm_socket_uses_suffix_and_compaction_replays_without_reconnecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+        let header = Arc::new(Mutex::new(String::new()));
+        let server_header = header.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    *server_header.lock().unwrap() =
+                        request.headers()["session-id"].to_str().unwrap().to_owned();
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let first = envelope(&mut socket).await;
+            assert_eq!(first["input"].as_array().unwrap().len(), 3);
+            assert!(first.get("previous_response_id").is_none());
+            assert_eq!(
+                first["prompt_cache_key"].as_str().unwrap(),
+                &*header.lock().unwrap()
+            );
+            complete(&mut socket, "r1", false).await;
+            // Server ping must be serviced while no step future is being polled.
+            socket
+                .send(WsMessage::Ping(vec![9, 4].into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                WsMessage::Pong(vec![9, 4].into())
+            );
+            pong_tx.send(()).unwrap();
+            let next = envelope(&mut socket).await;
+            assert_eq!(next["previous_response_id"], "r1");
+            assert_eq!(next["input"].as_array().unwrap().len(), 2);
+            assert_eq!(next["input"][0]["type"], "custom_tool_call_output");
+            assert_eq!(next["input"][1]["content"][0]["text"], "second");
+            complete(&mut socket, "compact", true).await;
+            let replay = envelope(&mut socket).await;
+            assert!(replay.get("previous_response_id").is_none());
+            assert_eq!(replay["input"].as_array().unwrap().len(), 4);
+            assert_eq!(replay["input"][2]["type"], "compaction");
+            assert_eq!(replay["input"][3]["content"][0]["text"], "third");
+            complete(&mut socket, "r3", false).await;
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let model = model(host, addr);
+        let mut context = super::super::Context::default();
+        context.push(Item::User {
+            text: "first".into(),
+            images: vec![],
+        });
+        let answer = infer(&model, &context).await;
+        context.push(Item::Step(answer.carry));
+        tokio::time::timeout(Duration::from_secs(5), pong_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        context.push(Item::Result {
+            call_id: CallId::new("call-r1"),
+            text: "output".into(),
+            images: vec![],
+        });
+        context.push(Item::User {
+            text: "second".into(),
+            images: vec![],
+        });
+        let answer = infer(&model, &context).await;
+        context.push(Item::Step(answer.carry));
+        context.push(Item::User {
+            text: "third".into(),
+            images: vec![],
+        });
+        infer(&model, &context).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_continuation_is_reported_then_retry_replays_on_new_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            envelope(&mut socket).await;
+            complete(&mut socket, "r1", false).await;
+            let next = envelope(&mut socket).await;
+            assert_eq!(next["previous_response_id"], "r1");
+            socket
+                .send(WsMessage::Text(
+                    json!({"type":"error","code":"previous_response_not_found"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut retry = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let full = envelope(&mut retry).await;
+            assert!(full.get("previous_response_id").is_none());
+            assert_eq!(full["input"].as_array().unwrap().len(), 5);
+            assert_eq!(full["input"][3]["call_id"], "call-r1");
+            complete(&mut retry, "r2", false).await;
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let model = model(host, addr);
+        let mut context = super::super::Context::default();
+        context.push(Item::User {
+            text: "first".into(),
+            images: vec![],
+        });
+        let answer = infer(&model, &context).await;
+        context.push(Item::Step(answer.carry));
+        context.push(Item::Result {
+            call_id: CallId::new("call-r1"),
+            text: "result".into(),
+            images: vec![],
+        });
+        let request = context.request("instructions".into(), super::super::CacheKey::from_u128(19));
+        let error = tokio::time::timeout(Duration::from_secs(5), model.step(&request, &mut |_| {}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(super::super::is_retryable(&error));
+        infer(&model, &context).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebuilt_context_and_changed_instructions_do_not_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for id in ["r1", "r2", "r3"] {
+                let body = envelope(&mut socket).await;
+                assert!(body.get("previous_response_id").is_none());
+                assert_eq!(body["input"][0]["type"], "additional_tools");
+                complete(&mut socket, id, false).await;
+            }
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let model = model(host, addr);
+        let mut original = super::super::Context::default();
+        original.push(Item::User {
+            text: "original".into(),
+            images: vec![],
+        });
+        let first = infer(&model, &original).await;
+        let mut rebuilt = super::super::Context::default();
+        rebuilt.push(Item::User {
+            text: "different prefix".into(),
+            images: vec![],
+        });
+        rebuilt.push(Item::Step(first.carry));
+        let second = infer(&model, &rebuilt).await;
+        rebuilt.push(Item::Step(second.carry));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            model.step(
+                &rebuilt.request("changed".into(), super::super::CacheKey::from_u128(19)),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_drops_socket_and_never_replays_it_internally() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (admitted, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            envelope(&mut socket).await;
+            socket.send(WsMessage::Text(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"i","name":"exec","call_id":"c"}}).to_string().into())).await.unwrap();
+            socket.send(WsMessage::Text(json!({"type":"response.custom_tool_call_input.delta","item_id":"i","delta":"print(9)"}).to_string().into())).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut fresh = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let body = envelope(&mut fresh).await;
+            assert!(body.get("previous_response_id").is_none());
+            complete(&mut fresh, "fresh", false).await;
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let model = Arc::new(model(host, addr));
+        let running = model.clone();
+        let task = tokio::spawn(async move {
+            let mut admitted = Some(admitted);
+            running
+                .step(&request(), &mut |event| {
+                    if matches!(event, Stream::Code(_)) {
+                        if let Some(tx) = admitted.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), model.step(&request(), &mut |_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn pong_traffic_cannot_extend_the_active_event_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = Host::new();
+        let crate::step::Model::OpenAi(openai) = model(host.clone(), addr) else {
+            unreachable!()
+        };
+        let connecting = tokio::spawn(async move {
+            let (mut selected, resolved) = openai.inference.select_resolved().await.unwrap();
+            selected.account_id = resolved.account_id.clone();
+            let connection = openai
+                .connect(
+                    super::super::CacheKey::from_u128(1),
+                    selected,
+                    resolved,
+                    DialRoute::Dns,
+                )
+                .await
+                .unwrap();
+            (openai, connection)
+        });
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let (openai, mut connection) = connecting.await.unwrap();
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let reading =
+            tokio::spawn(async move { openai.read_response(&mut connection, &mut |_| {}).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(EVENT_TIMEOUT / 2).await;
+        socket.send(WsMessage::Pong(vec![1].into())).await.unwrap();
+        // Give the received frame a chance to be processed before the deadline.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(EVENT_TIMEOUT / 2 + Duration::from_secs(1)).await;
+        let error = reading.await.unwrap().unwrap_err();
+        assert!(super::super::is_retryable(&error));
+        assert!(error.to_string().contains("went quiet"));
+        assert!(start.elapsed() <= EVENT_TIMEOUT + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn changing_cache_key_reopens_socket_and_quota_without_replacement_stops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let first = envelope(&mut socket).await;
+            complete(&mut socket, "r1", false).await;
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut fresh = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let next = envelope(&mut fresh).await;
+            assert!(next.get("previous_response_id").is_none());
+            assert_ne!(first["prompt_cache_key"], next["prompt_cache_key"]);
+            fresh.send(WsMessage::Text(json!({"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}).to_string().into())).await.unwrap();
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        host.replacement
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let model = model(host, addr);
+        let mut context = super::super::Context::default();
+        context.push(Item::User {
+            text: "first".into(),
+            images: vec![],
+        });
+        let answer = infer(&model, &context).await;
+        context.push(Item::Step(answer.carry));
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            model.step(
+                &context.request("instructions".into(), super::super::CacheKey::from_u128(99)),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!super::super::is_retryable(&error));
         server.await.unwrap();
     }
 }

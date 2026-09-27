@@ -299,6 +299,7 @@ pub(crate) struct Agent {
     view: Arc<Lazy<Arc<View>>>,
     /// The visible branch of this runtime's rows, oldest first.
     entries: Vec<Entry>,
+    context: context::Context,
     notebook: Option<Notebook>,
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
@@ -337,6 +338,7 @@ pub(crate) struct Agent {
     cache_key: CacheKey,
     context_used: Option<u64>,
     compaction_pending: bool,
+    compaction_owes_reply: bool,
     compaction_reply: bool,
 }
 
@@ -355,13 +357,14 @@ impl Agent {
         };
         let (model, model_name) = model(&inference, head.config.binding)?;
         let (_, rows) = host.history().await?;
-        let entries = rows
+        let entries: Vec<Entry> = rows
             .into_iter()
             .filter_map(|(_, event)| match event {
                 AgentEvent::Entry(entry) => Some(entry),
                 _ => None,
             })
             .collect();
+        let context = context::Context::restore(&entries);
         let (mailroom, outbox) = Mailroom::new();
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let head = Arc::new(RwLock::new(head));
@@ -377,6 +380,7 @@ impl Agent {
             model_name,
             view: Arc::clone(&view),
             entries,
+            context,
             notebook: None,
             mailroom,
             outbox,
@@ -404,6 +408,7 @@ impl Agent {
             cache_key: cache_key(prompt_cache_key),
             context_used: None,
             compaction_pending: false,
+            compaction_owes_reply: false,
             compaction_reply: false,
         };
         agent.resume().await?;
@@ -752,6 +757,7 @@ impl Agent {
                 _ => None,
             })
             .collect();
+        self.context = context::Context::restore(&self.entries);
         self.unread.clear();
         self.progress.last_response = None;
         self.cell = None;
@@ -769,36 +775,42 @@ impl Agent {
     /// Occupancy and an unfinished compaction, from the current branch
     /// only: a rewind can restore a pre-compaction context.
     fn refresh_compaction_state(&mut self) {
-        let mut used = None;
-        let mut pending = false;
-        let mut owes_reply = false;
-        let mut reply = false;
-        for entry in &self.entries {
-            match entry {
-                Entry::CompactionTrigger { manual, .. } => {
-                    pending = true;
-                    owes_reply = !manual;
-                }
-                Entry::Woken { .. } if pending => owes_reply = true,
-                Entry::Woken { .. } => reply = false,
-                Entry::Step { carry, usage, .. } => {
-                    if carry.has_compaction() {
-                        used = None;
-                    } else if usage.input_tokens > 0 {
-                        used = Some(usage.input_tokens.saturating_add(usage.output_tokens));
-                    }
-                    if pending {
-                        reply = carry.has_compaction() && owes_reply;
-                        pending = false;
-                        owes_reply = false;
-                    }
-                }
-                _ => {}
-            }
+        self.context_used = None;
+        self.compaction_pending = false;
+        self.compaction_owes_reply = false;
+        self.compaction_reply = false;
+        // Only restoration scans history. Live appends update these facts once.
+        let entries = std::mem::take(&mut self.entries);
+        for entry in &entries {
+            self.observe_compaction(entry);
         }
-        self.context_used = used;
-        self.compaction_pending = pending;
-        self.compaction_reply = reply;
+        self.entries = entries;
+    }
+
+    fn observe_compaction(&mut self, entry: &Entry) {
+        match entry {
+            Entry::CompactionTrigger { manual, .. } => {
+                self.compaction_pending = true;
+                self.compaction_owes_reply = !manual;
+            }
+            Entry::Woken { .. } if self.compaction_pending => self.compaction_owes_reply = true,
+            Entry::Woken { .. } => self.compaction_reply = false,
+            Entry::Step { carry, usage, .. } => {
+                let compacted = carry.has_compaction();
+                if compacted {
+                    self.context_used = None;
+                } else if usage.input_tokens > 0 {
+                    self.context_used =
+                        Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                }
+                if self.compaction_pending {
+                    self.compaction_reply = compacted && self.compaction_owes_reply;
+                    self.compaction_pending = false;
+                    self.compaction_owes_reply = false;
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn compact(&mut self) -> anyhow::Result<()> {
@@ -808,7 +820,6 @@ impl Agent {
                 manual: true,
             })
             .await?;
-            self.refresh_compaction_state();
         }
         Ok(())
     }
@@ -817,6 +828,8 @@ impl Agent {
         self.writer
             .append(vec![AgentEvent::Entry(entry.clone())])
             .await?;
+        self.context.observe(&entry);
+        self.observe_compaction(&entry);
         self.entries.push(entry);
         Ok(())
     }
@@ -1080,20 +1093,12 @@ impl Agent {
             && lines == ["Nothing new."];
         let report = lines.join("\n\n");
         if !manual_only {
-            let pending = self
-                .entries
+            let results = self
+                .context
+                .pending_calls()
                 .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    Entry::Step { calls, .. } => Some(calls.clone()),
-                    Entry::Woken { .. } => Some(Vec::new()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let results = pending
-                .into_iter()
-                .map(|call| CallResult {
-                    id: call.id,
+                .map(|id| CallResult {
+                    id: id.clone(),
                     text: report.clone(),
                     images: images.clone(),
                 })
@@ -1124,9 +1129,8 @@ impl Agent {
                 manual: false,
             })
             .await?;
-            self.refresh_compaction_state();
         }
-        let request = context::request(instructions, &self.entries, self.cache_key);
+        let request = self.context.request(instructions, self.cache_key);
 
         let previous_backoff = self.backoff.take();
         self.responding = true;
@@ -1170,6 +1174,7 @@ impl Agent {
                     }
                 }
             };
+            drop(request);
             while let Ok(piece) = code_rx.try_recv() {
                 self.stream(&mut streaming, piece);
             }
@@ -1241,7 +1246,6 @@ impl Agent {
             usage: ResponseUsage::rho(self.model_name.clone(), usage),
         })
         .await?;
-        self.refresh_compaction_state();
         match (step.call, streaming) {
             (Some(call), Some(streaming)) => {
                 self.progress.prose = 0;

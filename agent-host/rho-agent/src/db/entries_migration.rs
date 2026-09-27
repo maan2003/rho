@@ -77,7 +77,7 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         rho_inference::step::CacheKey::from_u128(0),
     );
     let answered = request
-        .items
+        .items()
         .iter()
         .filter_map(|item| match item {
             rho_inference::step::Item::Result { call_id, .. } => Some(call_id.clone()),
@@ -85,7 +85,7 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         })
         .collect::<HashSet<_>>();
     let mut unanswered = request
-        .items
+        .items()
         .iter()
         .flat_map(|item| match item {
             rho_inference::step::Item::Step(carry) => carry.call_ids(),
@@ -847,7 +847,7 @@ mod tests {
             rho_inference::step::CacheKey::new(),
         );
         let shown = request
-            .items
+            .items()
             .iter()
             .map(|item| match item {
                 Item::Step(carry) => format!("step {:?}", carry.call_ids()),

@@ -144,7 +144,7 @@ async fn say(handle: &AgentHandle, text: &str) {
 /// Everything a request tells the model, besides replayed steps.
 fn told(request: &rho_inference::step::Request) -> String {
     request
-        .items
+        .items()
         .iter()
         .filter_map(|item| match item {
             Item::Result { text, .. } | Item::User { text, .. } => Some(text.as_str()),
@@ -210,7 +210,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let told = told(&second[1]);
     assert!(told.contains("second"), "{told}");
     assert!(
-        second[1].items.iter().any(
+        second[1].items().iter().any(
             |item| matches!(item, Item::Result { call_id, .. } if call_id.as_str() == "call_1")
         ),
         "the first call's result is reported"
@@ -632,7 +632,7 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
     assert!(told(&attempts[1]).contains("cut off"));
     assert!(
         attempts[1]
-            .items
+            .items()
             .iter()
             .any(|item| matches!(item, Item::Step(carry) if !carry.call_ids().is_empty())),
         "the next request must record admitted code, not replay the failed request"
@@ -686,16 +686,22 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
         let mut saw_responding = false;
         loop {
             if let crate::journal::Feed::Status { status, .. } = updates.recv().await.unwrap() {
-                assert!(status.response.is_none(), "unfocused response bodies must stay private to the worker/host cache");
+                assert!(
+                    status.response.is_none(),
+                    "unfocused response bodies must stay private to the worker/host cache"
+                );
                 saw_responding |= status.runtime.inference == InferenceState::Responding;
-                if status.runtime.awaiting_human && status.runtime.inference == InferenceState::Idle {
+                if status.runtime.awaiting_human && status.runtime.inference == InferenceState::Idle
+                {
                     assert!(saw_responding);
                     assert!(status.runtime.running_tasks > 0);
                     break;
                 }
             }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(grew, "must exercise multiple streamed replacements");
     assert!(
         !harness

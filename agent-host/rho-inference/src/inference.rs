@@ -156,7 +156,7 @@ impl Inference {
     }
 
     /// One provider step; account selection and credential resolution happen
-    /// per request.
+    /// per request; compatible connections stay warm across steps.
     pub fn model(&self, profile: InferenceProfile, model: InferenceModel) -> crate::step::Model {
         crate::step::Model::OpenAi(crate::step::openai::OpenAi {
             inference: self.clone(),
@@ -168,6 +168,7 @@ impl Inference {
                 crate::config::ReasoningEffort::Xhigh => crate::step::openai::Effort::XHigh,
             },
             fast: profile.fast_mode,
+            idle: Default::default(),
         })
     }
 

@@ -1,15 +1,15 @@
 //! One model step at a time, for an agent whose every response is code.
 //!
-//! The agent keeps its own log and renders it into a [`Request`] each time
-//! the model wakes; this crate turns that into one provider exchange and
-//! hands back a [`Step`]. The model answers only by calling `exec` with a
+//! The agent appends model-facing items to [`Context`]; this crate owns the
+//! active window, warm connection and continuation selection. Each wake takes
+//! an O(1) [`Request`] snapshot and receives a [`Step`]. The model answers only by calling `exec` with a
 //! cell of Python. Anything else it writes is kept as `prose`, which the
 //! agent does not deliver anywhere.
 //!
 //! What only the provider understands (item ids, encrypted reasoning) rides
 //! in a [`Carry`]: stored by the agent, replayed verbatim, never read.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use senax_encoder::{Decode, Encode};
 
@@ -66,8 +66,58 @@ pub const EXEC: &str = "exec";
 #[derive(Clone, Debug)]
 pub struct Request {
     pub instructions: Arc<str>,
-    pub items: Vec<Item>,
+    pub(crate) items: Arc<Vec<Item>>,
+    // Only Context can mint an append-only lineage. Rebuild/rewind gets a new one.
+    pub(crate) lineage: uuid::Uuid,
     pub cache_key: CacheKey,
+}
+
+impl Request {
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+    pub fn new(instructions: Arc<str>, items: Vec<Item>, cache_key: CacheKey) -> Self {
+        let mut context = Context::default();
+        for item in items {
+            context.push(item);
+        }
+        context.request(instructions, cache_key)
+    }
+}
+
+/// The active provider context, independent of the agent's durable/display log.
+/// Appends preserve lineage; compaction or reconstruction invalidate
+/// continuation.
+pub struct Context {
+    items: Arc<Vec<Item>>,
+    lineage: uuid::Uuid,
+}
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            items: Arc::default(),
+            lineage: uuid::Uuid::new_v4(),
+        }
+    }
+}
+impl Context {
+    pub fn push(&mut self, item: Item) {
+        if matches!(&item, Item::Step(carry) if carry.has_compaction()) {
+            self.items = Arc::default();
+            self.lineage = uuid::Uuid::new_v4();
+        }
+        Arc::make_mut(&mut self.items).push(item);
+    }
+
+    /// O(1) snapshot. The runtime drops it before appending the next response.
+    pub fn request(&self, instructions: Arc<str>, cache_key: CacheKey) -> Request {
+        Request {
+            instructions,
+            items: self.items.clone(),
+            cache_key,
+            lineage: self.lineage,
+        }
+    }
 }
 
 /// Stable per agent, so the provider can reuse its cache across steps.
@@ -81,6 +131,29 @@ impl CacheKey {
 
     pub fn from_u128(key: u128) -> Self {
         Self(key)
+    }
+
+    pub(crate) fn wire_uuid(self, base_url: &str, client_secret: [u8; 32]) -> uuid::Uuid {
+        use std::hash::Hasher;
+        let mut bytes = [0; 16];
+        for (part, tag) in bytes
+            .chunks_mut(8)
+            .zip([b"rho-step-cache:v1:0", b"rho-step-cache:v1:1"])
+        {
+            let mut hash = fnv::FnvHasher::default();
+            for input in [
+                &tag[..],
+                &self.0.to_le_bytes(),
+                base_url.as_bytes(),
+                &client_secret,
+            ] {
+                hash.write(input);
+            }
+            part.copy_from_slice(&hash.finish().to_be_bytes());
+        }
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        uuid::Uuid::from_bytes(bytes)
     }
 
     fn uuid(self) -> uuid::Uuid {
@@ -175,16 +248,68 @@ pub struct Usage {
 
 /// What a provider needs to see again, opaque to everyone else.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Carry(Inner);
+pub struct Carry(Arc<Inner>);
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Encode, Decode)]
 enum Inner {
     /// Responses API output items, normalized for replay, as JSON text.
-    OpenAi { items: Vec<String> },
+    OpenAi {
+        items: Vec<String>,
+        #[senax(skip_encode, skip_decode)]
+        _prepared: Arc<OnceLock<Prepared>>,
+    },
     /// A scripted step: the call is all there is.
     Scripted { call: Option<Call> },
     /// A scripted response standing in for a provider compaction.
     ScriptedCompaction,
+}
+
+// The cache does not participate in persisted identity.
+impl PartialEq for Inner {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::OpenAi { items: a, .. }, Self::OpenAi { items: b, .. }) => a == b,
+            (Self::Scripted { call: a }, Self::Scripted { call: b }) => a == b,
+            (Self::ScriptedCompaction, Self::ScriptedCompaction) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for Inner {}
+
+#[derive(Debug)]
+struct Prepared {
+    items: Vec<serde_json::Value>,
+    compaction: Option<usize>,
+    calls: Vec<CallId>,
+}
+impl Carry {
+    fn prepared(&self) -> Option<&Prepared> {
+        let Inner::OpenAi { items, _prepared } = &*self.0 else {
+            return None;
+        };
+        Some(_prepared.get_or_init(|| {
+            let items: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| serde_json::from_str(item).expect("persisted provider replay item"))
+                .collect();
+            let compaction = items.iter().rposition(|item| item["type"] == "compaction");
+            let calls = items
+                .iter()
+                .skip(compaction.unwrap_or(0))
+                .filter(|item| item["type"] == "custom_tool_call")
+                .filter_map(|item| item["call_id"].as_str().map(CallId::new))
+                .collect();
+            Prepared {
+                items,
+                compaction,
+                calls,
+            }
+        }))
+    }
+    fn same_response(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The `exec` call as it arrives, so its code can run while the rest of
@@ -226,43 +351,32 @@ impl Model {
 }
 
 impl Carry {
-    /// Reconstitute normalized Responses output items from an older typed
-    /// agent log. The importer has already validated their JSON and ids.
+    /// Decode once on restoration; live responses initialize the same cache.
     pub fn from_openai_items(items: Vec<String>) -> Self {
-        Self(Inner::OpenAi { items })
+        Self(Arc::new(Inner::OpenAi {
+            items,
+            _prepared: Arc::default(),
+        }))
     }
 
-    /// Whether this response contains a provider compaction boundary.
     pub fn has_compaction(&self) -> bool {
-        match &self.0 {
-            Inner::OpenAi { items } => items.iter().any(|item| {
-                serde_json::from_str::<serde_json::Value>(item)
-                    .is_ok_and(|item| item["type"] == "compaction")
-            }),
+        match &*self.0 {
+            Inner::OpenAi { .. } => self.prepared().unwrap().compaction.is_some(),
             Inner::ScriptedCompaction => true,
             Inner::Scripted { .. } => false,
         }
     }
 
-    /// The calls this response replays; a result for any other call has
-    /// nothing to answer.
     pub fn call_ids(&self) -> Vec<CallId> {
-        match &self.0 {
-            Inner::OpenAi { items } => items
-                .iter()
-                .filter_map(|item| serde_json::from_str::<serde_json::Value>(item).ok())
-                .filter(|item| item["type"] == "custom_tool_call")
-                .filter_map(|item| item["call_id"].as_str().map(CallId::new))
-                .collect(),
+        match &*self.0 {
+            Inner::OpenAi { .. } => self.prepared().unwrap().calls.clone(),
             Inner::Scripted { call } => call.iter().map(|call| call.id.clone()).collect(),
             Inner::ScriptedCompaction => Vec::new(),
         }
     }
 
-    /// A call that was cut off: all that can be replayed is the code that
-    /// ran.
     pub fn bare(call: Call) -> Self {
-        Self(Inner::Scripted { call: Some(call) })
+        Self(Arc::new(Inner::Scripted { call: Some(call) }))
     }
 }
 
@@ -296,5 +410,65 @@ mod retry_tests {
         assert!(!is_retryable(&anyhow::Error::from(
             serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
         )));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn carry_bytes_remain_compatible_and_metadata_is_cached_across_clones() {
+        #[derive(Encode)]
+        struct OldCarry(OldInner);
+        #[derive(Encode)]
+        enum OldInner {
+            OpenAi { items: Vec<String> },
+        }
+        let items = vec![r#"{"type":"custom_tool_call","call_id":"c","input":"pass"}"#.to_owned()];
+        let old = senax_encoder::encode(&OldCarry(OldInner::OpenAi {
+            items: items.clone(),
+        }))
+        .unwrap();
+        let carry: Carry = senax_encoder::decode(&mut old.as_ref()).unwrap();
+        assert_eq!(carry.call_ids(), [CallId::new("c")]);
+        let cloned = carry.clone();
+        assert!(std::ptr::eq(
+            carry.prepared().unwrap(),
+            cloned.prepared().unwrap()
+        ));
+        assert_eq!(old, senax_encoder::encode(&carry).unwrap());
+    }
+
+    #[test]
+    fn context_snapshot_shares_storage_and_compaction_changes_lineage() {
+        let mut context = Context::default();
+        context.push(Item::User {
+            text: "discard".repeat(10000),
+            images: vec![],
+        });
+        let key = CacheKey::from_u128(7);
+        let first = context.request("instructions".into(), key);
+        let second = context.request("instructions".into(), key);
+        assert!(Arc::ptr_eq(&first.items, &second.items));
+        let lineage = first.lineage;
+        context.push(Item::Step(Carry(Arc::new(Inner::ScriptedCompaction))));
+        context.push(Item::User {
+            text: "keep".into(),
+            images: vec![],
+        });
+        let compacted = context.request("instructions".into(), key);
+        assert_ne!(lineage, compacted.lineage);
+        assert_eq!(compacted.items.len(), 2);
+        assert_eq!(first.items.len(), 1); // existing immutable request stays unchanged
+    }
+
+    #[test]
+    fn wire_cache_identity_is_endpoint_and_credential_scoped() {
+        let key = CacheKey::from_u128(19);
+        let id = key.wire_uuid("https://one", [1; 32]);
+        assert_eq!(id, key.wire_uuid("https://one", [1; 32]));
+        assert_ne!(id, key.wire_uuid("https://two", [1; 32]));
+        assert_ne!(id, key.wire_uuid("https://one", [2; 32]));
     }
 }

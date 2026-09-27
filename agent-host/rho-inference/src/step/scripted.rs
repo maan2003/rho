@@ -1,7 +1,7 @@
 //! A model that answers from a script, for tests and dry runs.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{Call, CallId, Carry, Inner, Request, Step, Stream, Usage};
 
@@ -118,11 +118,11 @@ impl Scripted {
             } else {
                 String::new()
             },
-            carry: Carry(if compacted {
+            carry: Carry(Arc::new(if compacted {
                 Inner::ScriptedCompaction
             } else {
                 Inner::Scripted { call: call.clone() }
-            }),
+            })),
             call,
             usage: Usage::default(),
         })
@@ -138,11 +138,7 @@ mod tests {
     async fn scripted_compaction_marks_a_replay_boundary() {
         let model = Scripted::new();
         model.then("print(1)").then_compaction().then("print(2)");
-        let request = Request {
-            instructions: "hello".into(),
-            items: vec![],
-            cache_key: crate::step::CacheKey::new(),
-        };
+        let request = Request::new("hello".into(), vec![], crate::step::CacheKey::new());
         let first = model.step(&request, &mut |_| {}).await.unwrap();
         assert!(!first.carry.has_compaction());
         let compacted = model.step(&request, &mut |_| {}).await.unwrap();
@@ -150,18 +146,19 @@ mod tests {
         assert!(compacted.call.is_none());
         assert!(compacted.prose.is_empty());
         let later = model.step(&request, &mut |_| {}).await.unwrap();
-        let replay = Request {
-            items: vec![
+        let replay = Request::new(
+            request.instructions.clone(),
+            vec![
                 Item::Step(first.carry),
                 Item::Step(compacted.carry),
                 Item::Step(later.carry),
             ],
-            ..request
-        };
+            request.cache_key,
+        );
         model.then_prose();
         model.step(&replay, &mut |_| {}).await.unwrap();
         let seen = model.requests();
         assert_eq!(seen.len(), 4);
-        assert!(matches!(&seen[3].items[1], Item::Step(carry) if carry.has_compaction()));
+        assert!(matches!(&seen[3].items[0], Item::Step(carry) if carry.has_compaction()));
     }
 }
