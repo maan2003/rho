@@ -29,6 +29,36 @@ pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// The socket stopped carrying a turn without the provider failing it, so the
+/// request itself is not in question and a fresh connection may resend it.
+#[derive(Debug)]
+pub(crate) enum StreamInterrupted {
+    /// No event for this long while a turn was in flight.
+    Silent(Duration),
+    /// The stream ended without a close frame or a terminal event.
+    Ended,
+    /// The server sent a close frame before the terminal event.
+    Closed,
+}
+
+impl std::fmt::Display for StreamInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Silent(timeout) => write!(
+                formatter,
+                "stream error: ws turn produced no events for {}s",
+                timeout.as_secs()
+            ),
+            Self::Ended => {
+                formatter.write_str("stream error: websocket ended before response.completed")
+            }
+            Self::Closed => formatter.write_str("stream error: websocket closed mid-stream"),
+        }
+    }
+}
+
+impl std::error::Error for StreamInterrupted {}
+
 /// One live WebSocket to the Responses endpoint, kept warm across turns. The
 /// keepalive ping timer and the last-event clock live here so they persist
 /// across the many short `run` calls that drive a single turn.
@@ -139,8 +169,7 @@ where
         tokio::pin!(timeout_sleep);
         tokio::select! {
             _ = &mut timeout_sleep => {
-                let secs = event_timeout.map(|t| t.as_secs()).unwrap_or_default();
-                bail!("stream error: ws turn produced no events for {secs}s");
+                return Err(StreamInterrupted::Silent(event_timeout.unwrap_or_default()).into());
             }
             _ = ping_interval.tick() => {
                 socket.send(WsMessage::Ping(Vec::new().into())).await?;

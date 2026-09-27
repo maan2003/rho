@@ -358,9 +358,11 @@ fn stale_previous_response_error_builds_full_replay_request() {
 
     // A stale-`previous_response` error is recognized, and the full replay drops
     // `previous_response_id` and forwards the whole history.
-    assert!(is_stale_previous_response_error(&anyhow::anyhow!(
-        "stream error: previous_response_id expired"
-    )));
+    let stale = parse_response_events([
+        r#"{"type":"error","error":{"message":"Previous response not found.","code":"previous_response_not_found"}}"#,
+    ])
+    .unwrap_err();
+    assert!(is_stale_previous_response_error(&stale));
     let replay = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
         &request,
@@ -373,11 +375,14 @@ fn stale_previous_response_error_builds_full_replay_request() {
 
 #[test]
 fn non_stale_previous_response_error_is_not_classified_stale() {
+    // The wording alone is not the signal; only the provider's code is.
+    let other = parse_response_events([
+        r#"{"type":"error","error":{"message":"previous response not found","code":"invalid_request_error"}}"#,
+    ])
+    .unwrap_err();
+    assert!(!is_stale_previous_response_error(&other));
     assert!(!is_stale_previous_response_error(&anyhow::anyhow!(
-        "stream error: rate limit"
-    )));
-    assert!(is_stale_previous_response_error(&anyhow::anyhow!(
-        "response not found"
+        "previous_response_id expired"
     )));
 }
 

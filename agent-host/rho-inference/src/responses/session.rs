@@ -702,9 +702,7 @@ impl SessionTask {
                     .await
             }
             .and_then(|message| {
-                message.ok_or_else(|| {
-                    anyhow::anyhow!("stream error: websocket ended before response.completed")
-                })
+                message.ok_or_else(|| ws::StreamInterrupted::Ended.into())
             });
 
             match read {
@@ -715,10 +713,8 @@ impl SessionTask {
                     }
                 }
                 Ok(WsMessage::Close(_)) => {
-                    self.on_socket_failure(anyhow::anyhow!(
-                        "stream error: websocket closed mid-stream"
-                    ))
-                    .await
+                    self.on_socket_failure(ws::StreamInterrupted::Closed.into())
+                        .await
                 }
                 Ok(WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {}
                 Err(error) => self.on_socket_failure(error).await,
@@ -1063,22 +1059,28 @@ pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<ProviderError>() {
         return error.is_transient();
     }
-    let message = error.to_string().to_ascii_lowercase();
-    [
-        "server_is_overloaded",
-        "slow_down",
-        "overloaded",
-        "service_unavailable",
-        "server_error",
-        "internal_server_error",
-        "timed out",
-        "timeout",
-        "websocket ended before response.completed",
-        "websocket closed mid-stream",
-        "connection reset",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+    if let Some(error) = error.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+        return is_transient_socket_error(error);
+    }
+    error.is::<ws::StreamInterrupted>()
+}
+
+/// Classified by type, not message: the transport's wording (a TLS
+/// `close_notify`, an OS reset) varies by layer and platform, and a dropped
+/// connection says nothing about the request that was riding it.
+fn is_transient_socket_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    match error {
+        Error::ConnectionClosed
+        | Error::AlreadyClosed
+        | Error::Io(_)
+        | Error::Tls(_)
+        | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        // 401, 403 and 429 are mapped before reaching here; other 4xx are ours.
+        Error::Http(response) => response.status().is_server_error(),
+        _ => false,
+    }
 }
 
 pub(crate) fn is_quota_exhaustion_error(error: &anyhow::Error) -> bool {
@@ -1150,8 +1152,11 @@ mod account_selection_tests {
         };
 
         assert!(matches!(
-            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
-                .await,
+            task.on_turn_error(
+                ProviderError::new("stream error", "overloaded", Some("server_is_overloaded"))
+                    .into()
+            )
+            .await,
             InferenceEvent::TemporaryFailure { .. }
         ));
         assert_eq!(task.selected_auth, Some(selected.clone()));

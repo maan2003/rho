@@ -27,8 +27,7 @@ fn responses_url(base_url: &str) -> String {
 }
 
 fn is_stale_previous_response_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("previous_response")
-        || message.contains("previous response")
-        || message.contains("response not found")
+    error
+        .downcast_ref::<wire::ProviderError>()
+        .is_some_and(wire::ProviderError::is_stale_previous_response)
 }

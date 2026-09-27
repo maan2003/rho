@@ -340,6 +340,55 @@ fn classifies_transient_stream_errors_for_retry() {
 }
 
 #[test]
+fn classifies_retryable_provider_codes_seen_in_production() {
+    for code in [
+        "service_unavailable_error",
+        "websocket_connection_limit_reached",
+    ] {
+        let event = json!({"type": "error", "error": {"message": "Please retry.", "code": code}});
+        let error = parse_response_events([event.to_string().as_str()]).unwrap_err();
+        assert!(super::is_transient_turn_error(&error), "{code}");
+    }
+}
+
+#[test]
+fn classifies_dropped_transport_for_retry() {
+    use tungstenite::error::ProtocolError;
+    let transient = [
+        tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        )),
+        tungstenite::Error::ConnectionClosed,
+        tungstenite::Error::Http(Box::new(
+            tungstenite::http::Response::builder()
+                .status(502)
+                .body(None)
+                .unwrap(),
+        )),
+    ];
+    for error in transient {
+        let label = error.to_string();
+        assert!(super::is_transient_turn_error(&error.into()), "{label}");
+    }
+    let bad_request = tungstenite::Error::Http(Box::new(
+        tungstenite::http::Response::builder()
+            .status(400)
+            .body(None)
+            .unwrap(),
+    ));
+    assert!(!super::is_transient_turn_error(&bad_request.into()));
+    for interrupted in [
+        super::ws::StreamInterrupted::Silent(Duration::from_secs(300)),
+        super::ws::StreamInterrupted::Ended,
+        super::ws::StreamInterrupted::Closed,
+    ] {
+        assert!(super::is_transient_turn_error(&interrupted.into()));
+    }
+}
+
+#[test]
 fn does_not_classify_user_actionable_stream_errors_for_retry() {
     let error = parse_response_events([
         r#"{"type":"error","error":{"message":"Invalid model","code":"invalid_request_error"}}"#,

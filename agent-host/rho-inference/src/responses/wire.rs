@@ -35,7 +35,7 @@ pub(crate) struct ProviderError {
 }
 
 impl ProviderError {
-    fn new(context: &'static str, detail: &str, code: Option<&str>) -> Self {
+    pub(crate) fn new(context: &'static str, detail: &str, code: Option<&str>) -> Self {
         Self {
             context,
             detail: detail.to_owned(),
@@ -55,6 +55,12 @@ impl ProviderError {
         self.code.as_deref() == Some("rate_limit_exceeded")
     }
 
+    /// The chain `previous_response_id` named is gone, so only a full replay
+    /// can continue it.
+    pub(crate) fn is_stale_previous_response(&self) -> bool {
+        self.code.as_deref() == Some("previous_response_not_found")
+    }
+
     pub(crate) fn is_transient(&self) -> bool {
         matches!(
             self.code.as_deref(),
@@ -62,8 +68,11 @@ impl ProviderError {
                 "server_is_overloaded"
                     | "slow_down"
                     | "service_unavailable"
+                    | "service_unavailable_error"
                     | "server_error"
                     | "internal_server_error"
+                    // The server's cap on one socket's age; a new one continues.
+                    | "websocket_connection_limit_reached"
             )
         )
     }
