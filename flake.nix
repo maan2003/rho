@@ -437,7 +437,7 @@
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-agent-host -p rho-agent -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
+            packageCargoExtraArgs = "-p rho-cli -p rho-agent-host -p rho-inference -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
             # Each copied tree is its own store path: `${buildSrc}/vendor/…`
             # would make the dependency cache depend on every source file,
             # rebuilding all dependencies on any commit.
@@ -488,6 +488,8 @@
               env.RHO_FIND_BIN = "${findutils}/bin";
               env.RHO_SHARED_CARGO_BIN = "${cargoSharedCache}/bin";
               postInstall = ''
+                # The host starts this sibling for every workset.
+                test -x "$out/bin/rho-agent-worker"
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
