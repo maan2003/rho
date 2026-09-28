@@ -11,7 +11,7 @@ use senax_encoder::{Decode, Encode};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
-use crate::Candidate;
+use crate::{Candidate, Event, Record};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -30,6 +30,8 @@ pub enum Request {
         data: Vec<u8>,
     },
     Forget(u64),
+    Record { flake: String, event: Event },
+    Records,
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -38,6 +40,7 @@ pub enum Reply {
     Rooted(bool),
     Stored(u64),
     Done,
+    Records(Vec<Record>),
     Error(String),
 }
 
@@ -149,6 +152,23 @@ impl Client {
         };
         match self.request(request).await? {
             Reply::Stored(id) => Ok(id),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Log `event` of the flake in `flake`.
+    pub async fn record(&self, flake: &Path, event: Event) -> Result<()> {
+        let flake = flake.display().to_string();
+        match self.request(Request::Record { flake, event }).await? {
+            Reply::Done => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Every logged event, oldest first.
+    pub async fn records(&self) -> Result<Vec<Record>> {
+        match self.request(Request::Records).await? {
+            Reply::Records(records) => Ok(records),
             _ => Err(unexpected()),
         }
     }

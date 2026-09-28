@@ -46,10 +46,8 @@ pub const SNOOZED_MESSAGE_BUMP_CAP: f64 = 0.5;
 /// An agent's reply this soon after the user's own message reaches them
 /// through a snooze: they are in that conversation.
 pub const REPLY_BREAKTHROUGH: SignedDuration = SignedDuration::from_hours(1);
-/// A skipped card drops this far, and climbs back over [`SKIP_FADE`]
-/// (quadratically, so most of the way in the first few minutes).
-pub const SKIP_PENALTY: f64 = 1.0;
-pub const SKIP_FADE: SignedDuration = SignedDuration::from_mins(30);
+/// How long a skipped card stays behind the rest, unless its source moves.
+pub const SKIP_HOLD: SignedDuration = SignedDuration::from_mins(30);
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub const LAMP_THRESHOLD: f64 = 0.5;

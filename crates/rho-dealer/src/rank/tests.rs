@@ -1115,41 +1115,39 @@ fn x1_a_node_is_one_card_at_its_strongest() {
 }
 
 #[test]
-fn x2_a_skip_lowers_a_card_for_minutes_and_its_source_moving_ends_it() {
+fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
     let mut w = world();
     let a = w.dm("D1", "U1");
+    w.pass(hours(3));
+    w.dm("D2", "U2");
     w.pass(hours(1));
-    let b = w.dm("D2", "U2");
+    w.dm("D3", "U3");
+    let skip_top = |w: &mut World| {
+        let card = w.deal().cards[0].clone();
+        w.skips.skip(card.node, card.cursor, w.now.timestamp());
+        w.pass(mins(1));
+        w.top()
+    };
+    // D1 has waited hours longer than the others: a penalty would leave
+    // it on top. Each is dealt once before any comes round again, and
+    // then the longest-skipped first.
     assert_eq!(w.top().as_deref(), Some("D1"));
-    let cursor = w.deal().cards[0].cursor.clone();
-    w.skips.skip(a.clone(), cursor, w.now.timestamp());
-    assert_eq!(w.top().as_deref(), Some("D2"));
-    w.pass(mins(5));
-    assert_eq!(
-        w.top().as_deref(),
-        Some("D2"),
-        "still down after five minutes"
-    );
-    w.pass(mins(25));
-    assert_eq!(w.top().as_deref(), Some("D1"), "back by thirty");
+    assert_eq!(skip_top(&mut w).as_deref(), Some("D2"));
+    assert_eq!(skip_top(&mut w).as_deref(), Some("D3"));
+    assert_eq!(skip_top(&mut w).as_deref(), Some("D1"));
+    assert!(w.deal().cards.iter().all(|card| card.skipped));
 
-    let cursor = w.deal().cards[0].cursor.clone();
-    w.skips.skip(a.clone(), cursor, w.now.timestamp());
-    assert!(
-        w.deal()
-            .cards
-            .iter()
-            .any(|card| card.node == a && card.skipped)
-    );
     w.post("D1", None, "U1", "urgent");
+    let first = w.deal().cards[0].clone();
     assert!(
-        w.deal()
-            .cards
-            .iter()
-            .any(|card| card.node == a && !card.skipped),
+        first.node == a && !first.skipped,
         "something new voids the skip"
     );
-    let _ = b;
+    w.pass(SKIP_HOLD);
+    assert!(
+        w.deal().cards.iter().all(|card| !card.skipped),
+        "a skip runs out"
+    );
 }
 
 #[test]
@@ -1162,7 +1160,7 @@ fn x3_the_hand_says_when_it_next_changes() {
     assert_eq!(w.deal().next_change, None);
     let cursor = w.deal().cards[0].cursor.clone();
     w.skips.skip(d, cursor, w.now.timestamp());
-    assert_eq!(w.deal().next_change, Some(w.now.timestamp() + SKIP_FADE));
+    assert_eq!(w.deal().next_change, Some(w.now.timestamp() + SKIP_HOLD));
 }
 
 #[test]

@@ -159,7 +159,10 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("agent id {agent}"))?;
             let call = rho_agents_client::protocol::AgentCommand::Send {
                 agent_id,
-                content: vec![rho_agent_types::ContentPart::Text { text }],
+                messages: vec![rho_agents_client::protocol::UserMessage {
+                    id: rho_agent::entry::MessageId::new().0,
+                    content: vec![rho_agent_types::ContentPart::Text { text }],
+                }],
             };
             rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
             Ok(())

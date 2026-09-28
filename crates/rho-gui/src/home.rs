@@ -45,15 +45,11 @@ pub(crate) struct HomeRow {
     pub skipped: bool,
 }
 
-/// One live agent: name, what it is on, how long it has been on it, and the
-/// last thing it said.
+/// One live agent, by name.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunningRow {
     pub agent_id: AgentId,
     pub name: String,
-    pub topic: String,
-    pub elapsed: String,
-    pub last_line: String,
 }
 
 /// One pile the user put cards on: Enter deals from it.
@@ -113,17 +109,6 @@ pub(crate) fn card_title(card: &Card, agent_tag: impl Fn(AgentId) -> String) -> 
 /// How long a running turn has been running, in the deal bar's own units.
 pub(crate) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
     age_label(((now_ms - since_ms).max(0)) as f64 / 86_400_000.0)
-}
-
-/// How long the running turn has run, for the row that says it is running.
-/// Empty when the head says a turn runs without saying since when, which
-/// is every turn that started before the client was listening: a row with
-/// no start has no duration to print, and printing one from a missing
-/// start is how a turn came to have been running since the epoch.
-pub(crate) fn running_elapsed_label(facts: &rho_agents_client::AgentFacts, now_ms: i64) -> String {
-    facts.turn_started_at.map_or_else(String::new, |started| {
-        elapsed_label(started.0 as i64, now_ms)
-    })
 }
 
 /// What a Home row offers when the cursor is on it. Home closes nothing
@@ -326,10 +311,8 @@ impl HomeView {
         }
         if !self.rows.running.is_empty() {
             items.push(section("running"));
-            let column = column_of(self.rows.running.iter().map(|row| row.name.as_str()));
-            let topics = column_of(self.rows.running.iter().map(|row| row.topic.as_str()));
             for row in &self.rows.running {
-                items.push(running_line(row, column, topics));
+                items.push(running_line(row));
             }
         }
         if !self.rows.piles.is_empty() {
@@ -429,17 +412,8 @@ fn card_line(
         .with_lines(vec![HomeTarget::Card(row.card.clone())])
 }
 
-fn running_line(
-    row: &RunningRow,
-    name_column: usize,
-    topic_column: usize,
-) -> Item<HomeKey, HomeClass, HomeTarget> {
-    let (text, styles) = columns(&[
-        (row.name.as_str(), HomeClass::Title, name_column),
-        (row.topic.as_str(), HomeClass::Muted, topic_column),
-        (row.elapsed.as_str(), HomeClass::Label, 4),
-        (row.last_line.as_str(), HomeClass::Muted, 0),
-    ]);
+fn running_line(row: &RunningRow) -> Item<HomeKey, HomeClass, HomeTarget> {
+    let (text, styles) = columns(&[(row.name.as_str(), HomeClass::Title, 0)]);
     Item::new(HomeKey::Agent(row.agent_id), text)
         .with_styles(styles)
         .with_lines(vec![HomeTarget::Agent(row.agent_id)])

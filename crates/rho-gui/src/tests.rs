@@ -19,6 +19,7 @@ use rho_agents_client::state::{
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
+mod agent_status;
 mod call_punctuation;
 mod editor_shutdown;
 mod elision_block_geometry;
@@ -35,7 +36,6 @@ mod prose_buffers;
 mod record_anchors;
 mod removing_a_turn_after_growth;
 mod row_spacing;
-mod running_turn_elapsed;
 mod scene_walk;
 pub(super) mod story;
 mod syntax_parsed_in_frame;
@@ -982,6 +982,54 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_agents_status_line_sits_above_the_draft(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    let say = |activity: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        let activity = activity.to_owned();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    ready_with(
+                        vec![story::UiAgentHead {
+                            activity: Some(activity),
+                            ..ui_head(agent_id)
+                        }],
+                        2,
+                    ),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    // Said before the transcript opens, and shown when it does.
+    say("reading tests", &workspace, cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        state(vec![user("question")], vec![assistant("answer", None)]),
+    );
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("answer\n\nreading tests\n\nWrite a message…"),
+        "{text:?}"
+    );
+    // A new status replaces the old one rather than adding a line.
+    say("fixing the build", &workspace, cx);
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("answer\n\nfixing the build\n\nWrite a message…")
+            && !text.contains("reading tests"),
+        "{text:?}"
+    );
+}
+
+#[gpui::test]
 fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
@@ -1054,6 +1102,136 @@ fn queued_human_and_peer_messages_change_to_delivered_blocks(cx: &mut TestAppCon
     assert!(delivered.contains("my update"), "{delivered:?}");
     assert!(delivered.contains("peer update"), "{delivered:?}");
     assert!(!delivered.contains("(queued)"), "{delivered:?}");
+}
+
+/// Messages written while their host is down wait in the transcript as
+/// unsent and go together, in order, when the host is back. A send the
+/// host fails keeps them, and the next try is the same messages under the
+/// same ids; only an answer takes them off the transcript.
+#[gpui::test]
+fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(741);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 742),
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("half a thought", window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let remade = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                let model = workspace.remake_agent_model_for_test(agent_id, window, cx);
+                model.read(cx).prompt_text(cx)
+            })
+            .unwrap()
+    };
+    assert_eq!(remade(cx), "half a thought");
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert_eq!(remade(cx), "", "a sent draft is not written again");
+}
+
+#[gpui::test]
+fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAppContext) {
+    use rho_agent_hosts::connection::ConnEvent;
+    use rho_agents_client::protocol::{AgentCommand, Request};
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(731);
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
+    let feed = |cx: &mut TestAppContext, frame: story::Frame| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                story::feed(workspace, HostId::default(), frame, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    feed(cx, ready_with(vec![ui_head(agent_id)], 732));
+    feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
+    feed(cx, ConnEvent::Disconnected("gone".into()).into());
+
+    let editor = active_editor(&workspace, cx);
+    for text in ["while away", "and again"] {
+        workspace
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.insert(text, window, cx));
+            })
+            .unwrap();
+        cx.dispatch_action(*workspace, crate::SubmitPrompt);
+        cx.run_until_parked();
+    }
+    assert!(
+        story::calls(&mut host).is_empty(),
+        "nothing goes to a host that is down"
+    );
+    let unsent = |cx: &mut TestAppContext| {
+        let shown = display_text(&workspace, cx);
+        assert!(shown.contains("while away (unsent)"), "{shown:?}");
+        assert!(shown.contains("and again (unsent)"), "{shown:?}");
+    };
+    unsent(cx);
+
+    let mut sent = || {
+        let mut calls = story::calls(&mut host);
+        assert_eq!(calls.len(), 1, "both messages go in one call");
+        let (call, stream) = calls.pop().unwrap();
+        let Request::Command(AgentCommand::Send {
+            agent_id: to,
+            messages,
+        }) = call
+        else {
+            panic!("expected a send: {call:?}");
+        };
+        assert_eq!(to, agent_id);
+        let texts: Vec<_> = messages
+            .iter()
+            .map(|message| rho_agent_types::transcript::text_content(&message.content))
+            .collect();
+        assert_eq!(texts, ["while away", "and again"], "in the order written");
+        let ids: Vec<u64> = messages.iter().map(|message| message.id).collect();
+        (ids, stream)
+    };
+    feed(cx, ConnEvent::Ready.into());
+    let (first, mut stream) = sent();
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::<()>::Failed {
+            reason: "worker restarting".into(),
+        },
+    );
+    cx.run_until_parked();
+    unsent(cx);
+
+    feed(cx, ConnEvent::Recovered.into());
+    let (again, mut stream) = sent();
+    assert_eq!(
+        again, first,
+        "the same messages, so the host logs each once"
+    );
+    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(()));
+    cx.run_until_parked();
+    let shown = display_text(&workspace, cx);
+    assert!(!shown.contains("(unsent)"), "{shown:?}");
 }
 
 #[gpui::test]
@@ -5421,7 +5599,7 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext) {
+fn running_home_row_is_the_name_alone(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(777);
     workspace
@@ -5431,6 +5609,7 @@ fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
+                        generated_title: Some("flaky-ci".to_owned()),
                         activity: Some("reading tests".to_owned()),
                         turn_running: true,
                         ..ui_head(agent_id)
@@ -5458,10 +5637,9 @@ fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext
         .unwrap();
     cx.run_until_parked();
     let text = home_text(&workspace, cx);
-    assert!(
-        text.contains("responding · reading tests"),
-        "home text: {text:?}"
-    );
+    // The status and the handle are the transcript's to say; Home only
+    // says that it runs.
+    assert_eq!(text.lines().collect::<Vec<_>>(), ["running", "  flaky-ci"]);
 }
 
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {

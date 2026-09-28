@@ -238,6 +238,11 @@ pub struct Workspace {
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
     transcripts: rho_agents_view::Transcripts,
+    /// What the user wrote that no host has taken yet.
+    outbox: rho_agents_client::outbox::Outbox,
+    /// What the user is writing to each agent, kept on disk as it is
+    /// typed: a restart or an evicted view puts it back.
+    drafts: HashMap<AgentId, String>,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -467,6 +472,9 @@ impl Workspace {
                                 workspace.finish_initial_agent_load(*agent_id, view, cx);
                             }
                         }
+                        rho_agents_view::agent_view::AgentModelEvent::DraftEdited(agent_id) => {
+                            workspace.draft_edited(*agent_id, loaded_model, cx);
+                        }
                         rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                             if workspace
                                 .active_transcript()
@@ -480,6 +488,9 @@ impl Workspace {
             ));
             if view == TranscriptView::Conversation {
                 self.refresh_view_status(&agent_id, &model, cx);
+                if let Some(text) = self.drafts.get(&agent_id) {
+                    model.update(cx, |model, cx| model.set_prompt_text(text, cx));
+                }
                 self.models.insert(agent_id, model.clone());
             } else {
                 self.activity_models.insert(agent_id, model.clone());
@@ -892,6 +903,10 @@ impl Workspace {
             hosts,
             active: ActiveAgents::default(),
             transcripts: rho_agents_view::Transcripts::default(),
+            outbox: rho_agents_client::outbox::Outbox::load(),
+            drafts: rho_agents_client::cache::read_drafts()
+                .into_iter()
+                .collect(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -973,6 +988,10 @@ impl Workspace {
         // The marks are on this disk, so Home's first draw already shows
         // the user's own verdicts.
         this.refresh_workdirs();
+        // What the last session could not send shows where it waits.
+        for agent_id in this.outbox.agents() {
+            this.show_unsent(agent_id, cx);
+        }
         let agents: Vec<AgentId> = this.registry.known_agents().copied().collect();
         this.push_agent_marks(&agents);
         // A cold start lands on Home: what is running, what is next, and
@@ -1378,16 +1397,17 @@ impl Workspace {
         let now = jiff::Timestamp::now();
         let hand = self.hand(cx).cards;
         let registry = &self.registry;
-        // The name the user gave it, with the handle beside it to tell two
-        // of the same name apart — the same label a transcript tab carries,
-        // because a card and the surface it opens are the same agent and
-        // were reading as two.
-        let mut rows = crate::home::split_hand(&hand, |card| {
-            crate::home::card_title(card, |agent_id| {
-                registry.agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
-            })
-        });
-        let now_ms = now.as_millisecond();
+        // The name and where it is filed. Home is a glance: the handle is
+        // left to the transcript, and only an agent with no name shows it.
+        let name = |agent_id| {
+            registry.agent_name_with_labels(
+                agent_id,
+                registry
+                    .agent_display_name(agent_id)
+                    .map_or_else(|| registry.agent_id_label(agent_id), str::to_owned),
+            )
+        };
+        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
         // An agent working for another agent belongs to it and is not the
         // reader's to watch; only the ones the reader manages are listed.
         // Nor one the user put away. A running turn decides how loudly an
@@ -1396,7 +1416,7 @@ impl Workspace {
         // either back. This list read neither, which is why muting or
         // snoozing a working agent did nothing a reader could see until
         // the turn ended.
-        let mut running = self
+        let running = self
             .registry
             .known_agents()
             .copied()
@@ -1417,44 +1437,17 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
         // Sorted by what the row shows, or the order is of something the
-        // reader cannot see.
-        running.sort_by_key(|agent_id| self.registry.agent_display_label(*agent_id));
-        rows.running = running
+        // reader cannot see. Only the name: what it is doing is in the
+        // transcript, and Home says only that it is.
+        let mut running = running
             .into_iter()
-            .map(|agent_id| {
-                let facts = self.registry.agent_facts(agent_id);
-                crate::home::RunningRow {
-                    agent_id,
-                    // The name, then where the user filed it: two agents
-                    // doing the same thing in different places read as two
-                    // rows rather than as one name said twice.
-                    name: self.registry.agent_name_with_labels(
-                        agent_id,
-                        self.registry.agent_display_label(agent_id),
-                    ),
-                    // Where it is filed, not the whole path: the row is
-                    // about the agent, and the leaf is what names the work.
-                    topic: self
-                        .node_context(&rho_dealer::NodeId::Agent(agent_id), cx)
-                        .split(", ")
-                        .next()
-                        .and_then(|path| path.rsplit('/').next())
-                        .unwrap_or_default()
-                        .to_owned(),
-                    elapsed: if facts.runtime.is_some() {
-                        String::new()
-                    } else {
-                        crate::home::running_elapsed_label(&facts, now_ms)
-                    },
-                    last_line: crate::attention::agent_status_label(
-                        &facts,
-                        self.registry.agent_activity(agent_id),
-                        chrono::Local::now().fixed_offset(),
-                    )
-                    .unwrap_or_default(),
-                }
+            .map(|agent_id| crate::home::RunningRow {
+                agent_id,
+                name: name(agent_id),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        running.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.running = running;
         let local = jiff::Zoned::now();
         rows.piles = self
             .attention
@@ -1807,6 +1800,9 @@ impl Workspace {
                 self.loaded(host, agents, verdicts);
                 let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
                 self.push_agent_marks(&agents);
+                for agent_id in &agents {
+                    self.show_status(*agent_id, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
@@ -1831,6 +1827,9 @@ impl Workspace {
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
+                for agent_id in &changed {
+                    self.show_status(*agent_id, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 // Status is workspace chrome, not part of the transcript editor.
                 if matches!(
@@ -1985,6 +1984,7 @@ impl Workspace {
                 // The focus set is this client's to keep; an agent host that
                 // just came up is told it whole.
                 self.send_agent_focus_to(host);
+                self.send_unsent_to(host, cx);
                 self.update_statuses(cx);
                 cx.notify();
             }
@@ -2013,6 +2013,7 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                self.send_unsent_to(host, cx);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -2302,15 +2303,6 @@ impl Workspace {
         content: Vec<ContentPart>,
         cx: &mut Context<Self>,
     ) {
-        if !self.connected() {
-            self.notice_on(
-                Some(&agent_id),
-                "not connected to an agent host",
-                StyleClass::SystemImportant,
-                cx,
-            );
-            return;
-        }
         rho_journal::record(rho_journal::Event::AgentMessageSent {
             agent: agent_id.encoded(),
             text: content
@@ -2326,12 +2318,98 @@ impl Workspace {
                 .filter(|part| !matches!(part, ContentPart::Text { .. }))
                 .count() as u32,
         });
-        self.send_to_agent(agent_id, AgentCommand::Send { agent_id, content }, cx);
+        // Kept before it is sent: a host that is down, or goes before it
+        // answers, gets it again when it is back.
+        self.outbox.push(agent_id, content);
+        self.show_unsent(agent_id, cx);
+        self.send_unsent(agent_id, cx);
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
         self.invalidate_dealer_signals(cx);
         cx.notify();
+    }
+
+    /// Sends each unsent message for a host's agents that just became
+    /// reachable.
+    fn send_unsent_to(&mut self, host: HostId, cx: &mut Context<Self>) {
+        for agent_id in self.outbox.agents() {
+            if self.host_of(agent_id) == Some(host) {
+                self.send_unsent(agent_id, cx);
+            }
+        }
+    }
+
+    /// Hands everything unsent to the agent to its host in one call, if the
+    /// host is up and no call of the agent's is already on its way. What is
+    /// written meanwhile goes when that call is answered.
+    fn send_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(host) = self
+            .host_of(agent_id)
+            .filter(|host| self.hosts.is_online(*host))
+        else {
+            return;
+        };
+        let Some(agents) = self.agents(host) else {
+            return;
+        };
+        let Some(command) = self.outbox.next(agent_id) else {
+            return;
+        };
+        let reply = agents.call(command);
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            this.update(cx, |this, cx| match reply {
+                Ok(()) => {
+                    this.outbox.delivered(agent_id);
+                    this.show_unsent(agent_id, cx);
+                    this.send_unsent(agent_id, cx);
+                }
+                Err(error) => {
+                    this.outbox.failed(agent_id);
+                    this.report_refusal(host, &format!("{error:#}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Keeps what the user is writing to an agent. Every edit goes to the
+    /// writer thread, which folds a burst of them into one commit.
+    fn draft_edited(&mut self, agent_id: AgentId, model: &Entity<AgentModel>, cx: &App) {
+        let text = model.read(cx).prompt_text(cx);
+        if self.drafts.get(&agent_id).map_or("", String::as_str) == text {
+            return;
+        }
+        if text.is_empty() {
+            self.drafts.remove(&agent_id);
+        } else {
+            self.drafts.insert(agent_id, text.clone());
+        }
+        rho_agents_client::cache::write_draft(agent_id, text);
+    }
+
+    fn show_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let texts = self.outbox.texts(agent_id);
+        self.show(agent_id, TranscriptFrame::Unsent(texts), cx);
+    }
+
+    /// The agent's status line, at the end of its transcript.
+    fn show_status(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let text = self.registry.agent_activity(agent_id).map(str::to_owned);
+        self.show(agent_id, TranscriptFrame::Status(text), cx);
+    }
+
+    /// Lands a frame the client makes itself on the agent's open views.
+    fn show(&mut self, agent_id: AgentId, frame: TranscriptFrame, cx: &mut Context<Self>) {
+        let summary = self.transcripts.apply(agent_id, frame).summary;
+        if let Some(view) = self.models.get(&agent_id).cloned() {
+            self.sync_agent_model(agent_id, &view, summary, false, cx);
+        }
+        if let Some(view) = self.activity_models.get(&agent_id).cloned() {
+            self.sync_agent_model(agent_id, &view, summary, false, cx);
+        }
     }
 
     /// What the map says about the label in the start field. The map is
@@ -3890,6 +3968,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.notice_on(agent_id, text, StyleClass::SystemInfo, cx);
+    }
+
+    /// The agent's view made again, as after an eviction.
+    #[cfg(test)]
+    pub(crate) fn remake_agent_model_for_test(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AgentModel> {
+        self.models.remove(&agent_id);
+        self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx)
+            .0
     }
 
     #[cfg(test)]
@@ -6118,7 +6209,7 @@ impl Workspace {
                 &held,
                 rho_journal::DealerVerdict::Skip,
                 now,
-                Some(now + rho_dealer::curve::SKIP_FADE),
+                Some(now + rho_dealer::curve::SKIP_HOLD),
             );
         }
         if self.attention.open_pile.is_some() {
@@ -7370,14 +7461,13 @@ impl Workspace {
                         context if context.is_empty() => leaf,
                         context => format!("{context} / {leaf}"),
                     };
-                    format!(
-                        "{path} · {}",
-                        if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
-                            "activity"
-                        } else {
-                            "conversation"
-                        }
-                    )
+                    // The conversation is what a transcript is; only the
+                    // activity view needs saying.
+                    if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+                        format!("{path} · activity")
+                    } else {
+                        path
+                    }
                 }
                 SurfaceKey::Browser(page) => {
                     rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
@@ -7393,10 +7483,8 @@ impl Workspace {
         let state = agent_in_view
             .filter(|_| echo.is_none())
             .and_then(|agent_id| {
-                let facts = self.registry.agent_facts(agent_id);
-                crate::attention::agent_status_label(
-                    &facts,
-                    self.registry.agent_activity(agent_id),
+                crate::attention::agent_state_label(
+                    &self.registry.agent_facts(agent_id),
                     chrono::Local::now().fixed_offset(),
                 )
             });

@@ -145,6 +145,8 @@ pub enum AgentModelEvent {
     Loaded(AgentId),
     /// The history the reader asked for is composed; nothing is waiting.
     HistoryComposed(AgentId),
+    /// The user changed what they are writing to the agent.
+    DraftEdited(AgentId),
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
@@ -188,6 +190,11 @@ impl AgentModel {
         let subscriptions = vec![cx.subscribe(&prompt_buffer, |this, _, event, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
                 this.update_prompt_chrome(cx);
+                if this.view == TranscriptView::Conversation
+                    && let Some(agent_id) = this.agent_id
+                {
+                    cx.emit(AgentModelEvent::DraftEdited(agent_id));
+                }
             }
         })];
 
@@ -683,6 +690,19 @@ impl AgentModel {
     }
 
     /// Takes the trimmed prompt draft, clearing it. Returns `None` when empty.
+    /// What the user is writing, as they wrote it.
+    pub fn prompt_text(&self, cx: &App) -> String {
+        self.prompt_buffer.read(cx).text()
+    }
+
+    /// Puts back what the user was writing when the view was last open.
+    pub fn set_prompt_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.prompt_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+    }
+
     pub fn take_prompt(&mut self, cx: &mut Context<Self>) -> Option<Vec<ContentPart>> {
         if self.view == TranscriptView::Activity {
             return None;

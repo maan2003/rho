@@ -497,6 +497,7 @@ mod tests {
         let user = Message::Control {
             id: 1,
             body: Control::User {
+                id: crate::entry::MessageId(5),
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: "queue this".into(),
                 }],
@@ -504,7 +505,7 @@ mod tests {
         };
         let decoded = decode(&encode(&user).unwrap()).unwrap();
         assert!(
-            matches!(decoded, Message::Control { id: 1, body: Control::User { content } }
+            matches!(decoded, Message::Control { id: 1, body: Control::User { content, .. } }
             if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this"))
         );
         let mail = Message::Control {

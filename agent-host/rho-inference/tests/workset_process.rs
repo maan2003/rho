@@ -357,9 +357,12 @@ async fn streaming_crash() {
         let agent = agent.clone();
         async move {
             agent
-                .send_user_content_accepted(vec![rho_agent_types::ContentPart::Text {
-                    text: "blocked".into(),
-                }])
+                .send_user_content_accepted(
+                    rho_agent::entry::MessageId::new(),
+                    vec![rho_agent_types::ContentPart::Text {
+                        text: "blocked".into(),
+                    }],
+                )
                 .await
         }
     });

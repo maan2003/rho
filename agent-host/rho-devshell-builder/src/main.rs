@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use devenv_nix_backend::logger::strip_ansi;
 use devenv_nix_backend::{DevShellRequest, LocalInput, NIX_STACK_SIZE, NixRuntime};
-use rho_devshell::{Client, Evaluated, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch};
+use rho_devshell::{Client, Evaluated, Event, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch};
 
 const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR] [--no-cache]
        rho-devshell-builder activate <env-store-path> --dir DIR
@@ -131,22 +131,35 @@ fn main() -> Result<()> {
 /// `flake`'s shell: a valid cached one, pinned, or a new evaluation, cached
 /// if it can be. Cache failures are reported and otherwise ignored.
 fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -> Result<Result<Shell, Failure>> {
+    let started = std::time::Instant::now();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = dir.filter(|_| cache).map(Client::new);
+    let record = |event: fn(u64) -> Event| {
+        if let Some(client) = &client {
+            let _ = runtime.block_on(client.record(&flake.dir, event(started.elapsed().as_millis() as u64)));
+        }
+    };
     let mut key = flake.key()?;
-    let mut found = None;
+    let (mut found, mut stale) = (None, false);
     if let (Some(client), Some(dir)) = (&client, dir) {
         match runtime.block_on(cached(nix, client, flake, &key, dir)) {
-            Ok(hit) => found = hit,
+            Ok((hit, candidates)) => (found, stale) = (hit, candidates),
             Err(e) => eprintln!("rho: dev shell cache unavailable: {e:#}"),
         }
     }
     let (id, evaluated) = match found {
-        Some(hit) => hit,
+        Some(hit) => {
+            record(|ms| Event::Hit { ms });
+            hit
+        }
         None => {
+            let failed = |failure: Failure| -> Result<Result<Shell, Failure>> {
+                record(|ms| Event::Failed { ms });
+                Ok(Err(failure))
+            };
             let mut evaluation = match evaluate(nix, flake) {
                 Ok(evaluation) => evaluation,
-                Err(failure) => return Ok(Err(failure)),
+                Err(failure) => return failed(failure),
             };
             // Locking that wrote `flake.lock` changed what evaluation had
             // observed of it: evaluate the locked flake again, to cache that.
@@ -155,7 +168,7 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
             if locked != key {
                 evaluation = match evaluate(nix, flake) {
                     Ok(evaluation) => evaluation,
-                    Err(failure) => return Ok(Err(failure)),
+                    Err(failure) => return failed(failure),
                 };
                 stable = flake.key()? == locked;
                 key = locked;
@@ -166,6 +179,11 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
                     Ok(stored) => id = Some(stored),
                     Err(e) => eprintln!("rho: failed to cache dev shell: {e:#}"),
                 }
+            }
+            match (id, stale) {
+                (None, _) => record(|ms| Event::Uncached { ms }),
+                (Some(_), false) => record(|ms| Event::Miss { ms, stale: false }),
+                (Some(_), true) => record(|ms| Event::Miss { ms, stale: true }),
             }
             (id, evaluation.into_evaluated())
         }
@@ -196,15 +214,16 @@ fn plain<'a>(chain: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>)
 
 
 /// The newest cached shell whose observations all hold now and whose
-/// environment could be pinned.
+/// environment could be pinned, and whether the key had entries at all.
 async fn cached(
     nix: &mut NixRuntime,
     client: &Client,
     flake: &Flake,
     key: &str,
     dir: &Path,
-) -> Result<Option<(Option<u64>, Evaluated)>> {
+) -> Result<(Option<(Option<u64>, Evaluated)>, bool)> {
     let candidates = client.lookup(key.to_owned()).await?;
+    let any = !candidates.is_empty();
     let mut now = Now::new(&flake.source.root);
     for candidate in candidates {
         let Ok(evaluated) = serde_json::from_slice::<Evaluated>(&candidate.data) else {
@@ -218,9 +237,9 @@ async fn cached(
             client.forget(candidate.id).await?;
             continue;
         }
-        return Ok(Some((Some(candidate.id), evaluated)));
+        return Ok((Some((Some(candidate.id), evaluated)), any));
     }
-    Ok(None)
+    Ok((None, any))
 }
 
 /// What local inputs observe now, each input opened and each thing

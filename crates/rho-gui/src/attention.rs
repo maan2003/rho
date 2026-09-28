@@ -1035,21 +1035,6 @@ impl Workspace {
     }
 }
 
-/// The agent's own latest status beside its runtime state. The runtime
-/// still explains retries and waits; the agent says what it is doing.
-pub(crate) fn agent_status_label(
-    facts: &rho_agents_client::AgentFacts,
-    activity: Option<&str>,
-    now: chrono::DateTime<chrono::FixedOffset>,
-) -> Option<String> {
-    let state = agent_state_label(facts, now);
-    match (state, activity.filter(|text| !text.is_empty())) {
-        (Some(state), Some(activity)) => Some(format!("{state} · {activity}")),
-        (None, Some(activity)) => Some(activity.to_owned()),
-        (state, None) => state,
-    }
-}
-
 /// What an agent is doing, for the status line: how long its turn has run,
 /// or how its last turn ended and how long ago.
 pub(crate) fn agent_state_label(
@@ -1088,15 +1073,6 @@ pub(crate) fn agent_state_label(
                 {
                     label.push_str(" · archived")
                 }
-                rho_agents_client::protocol::transcript::InferenceState::Idle
-                    if runtime.running_tasks > 0 =>
-                {
-                    label.push_str(&format!(
-                        " · {} running task{}",
-                        runtime.running_tasks,
-                        if runtime.running_tasks == 1 { "" } else { "s" }
-                    ))
-                }
                 _ => {}
             }
         }
@@ -1128,13 +1104,6 @@ pub(crate) fn agent_state_label(
         }
         if runtime.archived {
             return Some("archived".to_owned());
-        }
-        if runtime.running_tasks > 0 {
-            return Some(format!(
-                "{} running task{}",
-                runtime.running_tasks,
-                if runtime.running_tasks == 1 { "" } else { "s" }
-            ));
         }
         if let Some(checkin) = runtime.checkin_at {
             let now_ms = now.timestamp_millis();

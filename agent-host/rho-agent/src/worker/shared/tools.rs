@@ -35,6 +35,7 @@ pub(crate) fn host_tools(
     multi_agent: Option<&Team>,
     host: Option<&Arc<HostClient>>,
     mailroom: Option<&Arc<Mailroom>>,
+    original_images: bool,
 ) -> (ShellTools, Vec<Export>) {
     let shell = ShellTools::in_directory(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -53,6 +54,7 @@ pub(crate) fn host_tools(
         "view_image",
         ViewImage {
             images: ImageTools::new(cwd.to_owned()),
+            original: original_images,
         },
     )];
     if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
@@ -230,6 +232,10 @@ impl EngineerAgents {
 #[pyclass(frozen, module = "__main__")]
 struct ViewImage {
     images: ImageTools,
+    /// Whether `detail='original'` is honored. Claude scales anything past
+    /// 1568 down itself and refuses over 2000 in a many-image request, so
+    /// for it original is high.
+    original: bool,
 }
 
 #[pymethods]
@@ -238,7 +244,8 @@ impl ViewImage {
     fn __call__(&self, py: Python<'_>, path: PathBuf, detail: &str) -> PyResult<Py<PyAny>> {
         let detail = match detail {
             "high" => ImageDetail::High,
-            "original" => ImageDetail::Original,
+            "original" if self.original => ImageDetail::Original,
+            "original" => ImageDetail::High,
             _ => return Err(PyValueError::new_err("detail must be 'high' or 'original'")),
         };
         let images = self.images.clone();

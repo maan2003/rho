@@ -16,7 +16,7 @@ use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq};
 use rho_agents_client::protocol::transcript::{DetailBody, TranscriptEvent};
 use rho_agents_client::protocol::{
     AgentCommand, ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame,
-    StartMode,
+    StartMode, UserMessage,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_rpc::protocol::client::Client;
@@ -399,7 +399,10 @@ async fn run_async(args: Args) -> Result<()> {
                                     *cycle += 1;
                                     client.send(AgentCommand::Send {
                                         agent_id: entry.agent_id,
-                                        content: prompt(0, *cycle),
+                                        messages: vec![UserMessage {
+                                            id: *cycle,
+                                            content: prompt(0, *cycle),
+                                        }],
                                     });
                                 }
                             } else {

@@ -15,7 +15,10 @@ use tokio::sync::Semaphore;
 pub const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 16_384;
 pub const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
-pub const MAX_OUTPUT_DIMENSION: u32 = 2_048;
+/// 2000, not Codex's 2048: Anthropic refuses a request of more than 20
+/// images if any side of one is over 2000, and a pasted screenshot 2048
+/// wide stays in a conversation long after it is the only image.
+pub const MAX_OUTPUT_DIMENSION: u32 = 2_000;
 pub const MAX_ORIGINAL_DIMENSION: u32 = 6_000;
 pub const MAX_OUTPUT_BYTES: usize = (10 * 1024 * 1024 / 4) * 3;
 pub const PATCH_SIZE: u32 = 32;
@@ -182,9 +185,9 @@ mod tests {
 
         let prepared = prepare_pixels(&bytes.into_inner(), ImageDetail::High).unwrap();
         assert_eq!(prepared.content.media_type, "image/png");
-        assert_eq!((prepared.width, prepared.height), (2048, 512));
+        assert_eq!((prepared.width, prepared.height), (2000, 500));
         let decoded = image::load_from_memory(&prepared.content.data).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (2048, 512));
+        assert_eq!((decoded.width(), decoded.height()), (2000, 500));
     }
 
     #[test]

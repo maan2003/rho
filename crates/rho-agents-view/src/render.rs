@@ -153,7 +153,9 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         | UiBlock::MessageDraft { .. }
         | UiBlock::Tool(_)
         | UiBlock::Notice { .. } => BlockKind::Response { working: true },
-        UiBlock::QueuedMessage { .. } => BlockKind::QueuedUser,
+        UiBlock::QueuedMessage { .. } | UiBlock::Unsent { .. } | UiBlock::Status { .. } => {
+            BlockKind::QueuedUser
+        }
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
 }
@@ -173,7 +175,9 @@ pub fn block_visible(block: &UiBlock) -> bool {
         | UiBlock::MessageDraft { text }
         | UiBlock::Notice { text }
         | UiBlock::AgentMessage { text, .. }
-        | UiBlock::QueuedMessage { text, .. } => !text.is_empty(),
+        | UiBlock::QueuedMessage { text, .. }
+        | UiBlock::Unsent { text }
+        | UiBlock::Status { text } => !text.is_empty(),
     }
 }
 
@@ -411,6 +415,28 @@ pub fn render_block_with_agent_labels(
                 content: InlayContent::Label(" (queued)"),
             });
             spans.push(Span::new("", StyleClass::SystemInfo));
+            spans.push(Span::new("\n\n", StyleClass::Default));
+        }
+        UiBlock::Unsent { text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            gutter_span = Some(spans.len());
+            spans.push(Span::new(text.clone(), StyleClass::UserMessage));
+            inlay = Some(InlaySpec {
+                span_index: spans.len(),
+                content: InlayContent::Label(" (unsent)"),
+            });
+            spans.push(Span::new("", StyleClass::SystemInfo));
+            spans.push(Span::new("\n\n", StyleClass::Default));
+        }
+        UiBlock::Status { text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            spans.push(Span::new(text.clone(), StyleClass::SystemInfo));
             spans.push(Span::new("\n\n", StyleClass::Default));
         }
     }

@@ -22,6 +22,7 @@ use anyhow::Result;
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 pub use rho_devshell::Candidate;
+use rho_devshell::{Event, Record};
 use rho_devshell::protocol::{self, Reply, Request};
 use rho_devshell::{activations_dir, activations_root, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
@@ -38,6 +39,11 @@ const NIX_STORE: &str = "/nix/store";
 
 const SHELLS_TABLE: &str = "devshell_shells";
 const SHELLS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new(SHELLS_TABLE);
+/// Logged events beyond this many are dropped, oldest first.
+pub const MAX_RECORDS: u64 = 100_000;
+
+const RECORDS_TABLE: &str = "devshell_records";
+const RECORDS: TableDefinition<u64, Sen<Record>> = TableDefinition::new(RECORDS_TABLE);
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct Entry {
@@ -62,6 +68,8 @@ pub struct Store {
 struct State {
     entries: BTreeMap<u64, Entry>,
     clock: u64,
+    /// The keys of the oldest logged event and of the next one.
+    records: std::ops::Range<u64>,
 }
 
 impl Store {
@@ -167,6 +175,41 @@ impl Store {
         .await
     }
 
+    /// Log `event` of the flake in `flake`, now.
+    pub async fn record(&self, flake: String, event: Event) -> Result<()> {
+        let record = Record {
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            flake,
+            event,
+        };
+        let mut state = self.state.lock().await;
+        let mut write = self.db.write().await;
+        {
+            let mut table = write.open_table(RECORDS);
+            table.insert(state.records.end, SenValue::borrowed(&record));
+            state.records.end += 1;
+            while state.records.end - state.records.start > MAX_RECORDS {
+                table.remove(state.records.start);
+                state.records.start += 1;
+            }
+        }
+        write.commit();
+        Ok(())
+    }
+
+    /// Every logged event, oldest first.
+    pub async fn records(&self) -> Vec<Record> {
+        let read = self.db.read();
+        if !read.has_table(RECORDS_TABLE) {
+            return Vec::new();
+        }
+        let table = read.open_table(RECORDS);
+        table.iter().map(|(_, record)| record.value().into_owned()).collect()
+    }
+
     /// Listen on the socket in the shared cache directory, replacing a
     /// previous daemon's, and return the loop answering its clients.
     pub fn serve(self: Arc<Self>) -> Result<impl Future<Output = ()> + Send + 'static> {
@@ -197,6 +240,8 @@ impl Store {
                     data,
                 } => self.store(key, env_store_path, data).await.map(Reply::Stored),
                 Request::Forget(id) => self.forget(id).await.map(|()| Reply::Done),
+                Request::Record { flake, event } => self.record(flake, event).await.map(|()| Reply::Done),
+                Request::Records => Ok(Reply::Records(self.records().await)),
             };
             let reply = result.unwrap_or_else(|error| Reply::Error(format!("{error:#}")));
             if protocol::write(&mut stream, &reply).await.is_err() {
@@ -243,6 +288,13 @@ async fn load(db: &RhoDb, dir: &Path) -> State {
             let entry = entry.value().into_owned();
             state.clock = state.clock.max(entry.used);
             state.entries.insert(id.value(), entry);
+        }
+        if read.has_table(RECORDS_TABLE) {
+            let table = read.open_table(RECORDS);
+            let mut keys = table.iter().map(|(key, _)| key.value());
+            if let Some(first) = keys.next() {
+                state.records = first..keys.last().unwrap_or(first) + 1;
+            }
         }
     }
     let pinned: HashSet<PathBuf> = state
@@ -490,6 +542,38 @@ mod tests {
         store.lookup("k").await.unwrap();
         assert!(root_b.symlink_metadata().is_err());
         assert!(!store.used(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn records_are_logged_in_order_and_survive_reopening() {
+        let f = Fixture::new().await;
+        for (flake, event) in [
+            ("/a", Event::Hit { ms: 50 }),
+            ("/b", Event::Miss { ms: 4000, stale: true }),
+            ("/a", Event::Kept { uses: 12 }),
+        ] {
+            f.store.record(flake.into(), event).await.unwrap();
+        }
+        let Fixture { temp, store } = f;
+        drop(store);
+        let store = Fixture::open(&temp).await;
+        // Keys continue after the reopened log's last.
+        store.record("/c".into(), Event::Failed { ms: 7 }).await.unwrap();
+        let records = store.records().await;
+        let seen: Vec<_> = records.iter().map(|r| (r.flake.as_str(), r.event)).collect();
+        assert_eq!(
+            seen,
+            [
+                ("/a", Event::Hit { ms: 50 }),
+                ("/b", Event::Miss { ms: 4000, stale: true }),
+                ("/a", Event::Kept { uses: 12 }),
+                ("/c", Event::Failed { ms: 7 }),
+            ]
+        );
+        assert!(records.windows(2).all(|w| w[0].at_ms <= w[1].at_ms));
+        let stats = rho_devshell::Stats::of(&records);
+        assert_eq!((stats.hit.count, stats.stale.count, stats.failed.count, stats.kept), (1, 1, 1, 12));
+        assert!(stats.to_string().contains("served from cache: 86.7% of 15"));
     }
 
     #[tokio::test]

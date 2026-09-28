@@ -15,6 +15,7 @@ mod scripted;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -111,18 +112,22 @@ impl AgentHandle {
 
     pub fn send_user_content(&self, content: Vec<ContentPart>) {
         let _ = self.control.send(Control::Received {
+            id: MessageId::new(),
             from: Party::Human,
             content,
             done: None,
         });
     }
 
-    /// Send user input and wait until the loop has durably logged it.
+    /// Send user input and wait until the loop has durably logged it. An
+    /// `id` already logged is acknowledged without a second row.
     pub async fn send_user_content_accepted(
         &self,
+        id: MessageId,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<()> {
         self.send(|done| Control::Received {
+            id,
             from: Party::Human,
             content,
             done: Some(done),
@@ -133,6 +138,7 @@ impl AgentHandle {
     /// Deliver mail from a peer agent.
     pub fn send_agent_message(&self, sender: AgentId, text: impl Into<String>) {
         let _ = self.control.send(Control::Received {
+            id: MessageId::new(),
             from: Party::Agent(sender),
             content: vec![ContentPart::Text { text: text.into() }],
             done: None,
@@ -147,6 +153,7 @@ impl AgentHandle {
     ) -> anyhow::Result<()> {
         let content = vec![ContentPart::Text { text: text.into() }];
         self.send(|done| Control::Received {
+            id: MessageId::new(),
             from: Party::Agent(sender),
             content,
             done: Some(done),
@@ -242,6 +249,7 @@ enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
     Drain(oneshot::Sender<()>),
     Received {
+        id: MessageId,
         from: Party,
         content: Vec<ContentPart>,
         done: Option<oneshot::Sender<()>>,
@@ -352,6 +360,9 @@ pub(crate) struct Agent {
     interrupted: bool,
     /// Messages the model has not seen, oldest first.
     unread: Vec<(MessageId, Party, UnixMs)>,
+    /// Every message id the loaded log holds, so a message sent again
+    /// after its answer was lost is not logged twice.
+    received: HashSet<MessageId>,
     progress: Progress,
     awaiting: bool,
     /// The notebook went with a restart since the model's last wake: tell
@@ -414,6 +425,13 @@ impl Agent {
             cell: None,
             interrupted: false,
             unread: Vec::new(),
+            received: entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Received { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect(),
             progress: Progress::default(),
             awaiting: false,
             restarted: false,
@@ -577,12 +595,19 @@ impl Agent {
             Control::Drain(reply) => self.draining = Some(reply),
             Control::TellTail => self.host.tell_tail(),
             Control::Received {
+                id,
                 from,
                 content,
                 done,
             } => {
+                if !self.received.insert(id) {
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
+                    return Ok(());
+                }
                 let text = rho_agent_types::transcript::text_content(&content);
-                self.receive(from, blocks(content)).await?;
+                self.receive(id, from, blocks(content)).await?;
                 if !text.trim().is_empty() {
                     self.name(&text).await?;
                 }
@@ -777,9 +802,13 @@ impl Agent {
         Ok(self.writer.flush().await?)
     }
 
-    async fn receive(&mut self, from: Party, body: Vec<Block>) -> anyhow::Result<()> {
+    async fn receive(
+        &mut self,
+        id: MessageId,
+        from: Party,
+        body: Vec<Block>,
+    ) -> anyhow::Result<()> {
         let at = UnixMs::now();
-        let id = MessageId::new();
         if from == Party::Human {
             if self.archived && !self.responding {
                 self.fresh_notebook(at).await?;
@@ -920,6 +949,7 @@ impl Agent {
                 team.as_ref(),
                 Some(&self.host),
                 Some(&self.mailroom),
+                true,
             );
             let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
                 .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;

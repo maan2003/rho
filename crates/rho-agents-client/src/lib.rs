@@ -26,6 +26,8 @@ pub mod map;
 #[cfg(feature = "client")]
 pub mod model;
 #[cfg(feature = "client")]
+pub mod outbox;
+#[cfg(feature = "client")]
 pub mod quota;
 #[cfg(feature = "client")]
 pub mod remote;

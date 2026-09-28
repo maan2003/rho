@@ -12668,6 +12668,7 @@ dependencies = [
  "collections",
  "futures",
  "prefix-id",
+ "rand 0.8.7",
  "redb",
  "rho-agent-hosts",
  "rho-agent-types",
@@ -12949,6 +12950,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "redb",
  "rho-db",
  "rho-devshell",

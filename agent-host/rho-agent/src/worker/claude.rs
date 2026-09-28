@@ -117,6 +117,7 @@ impl ClaudeAgent {
             delivered: Vec::new(),
             deferred: VecDeque::new(),
             uncertain_receipts: Vec::new(),
+            received: HashSet::new(),
             pending_output,
             python_wake: None,
             python_recheck: None,
@@ -174,15 +175,17 @@ impl ClaudeAgent {
             content,
             uuid,
             accepted: None,
-            source: InputSource::Human,
+            source: InputSource::Human(MessageId::new()),
         });
     }
 
+    /// An `id` already logged is acknowledged without a second row.
     pub async fn send_user_content_accepted(
         &self,
+        id: MessageId,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<()> {
-        self.send_content_accepted(content, InputSource::Human)
+        self.send_content_accepted(content, InputSource::Human(id))
             .await
     }
 
@@ -279,7 +282,7 @@ enum ClaudeStartMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputSource {
-    Human,
+    Human(MessageId),
     Agent(AgentId),
     DeferredAgent(AgentId, MessageId),
     Internal,
@@ -347,6 +350,9 @@ pub(crate) struct ClaudeLoop {
     )>,
     deferred: VecDeque<(Vec<ContentPart>, String, AgentId, MessageId)>,
     uncertain_receipts: Vec<MessageId>,
+    /// Every message id the log holds, so a message sent again after its
+    /// answer was lost is not logged twice.
+    received: HashSet<MessageId>,
     pending_output: Option<crate::ClaudeOutputBatch>,
     /// Why the notebook last spoke, until the transcript row it produced
     /// arrives to carry it.
@@ -656,7 +662,15 @@ impl ClaudeLoop {
                 } else {
                     None
                 }
-            });
+            })
+            .collect::<Vec<_>>();
+        loop_state.received = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Received { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
         let (archived, deferred, uncertain) = recover_receipts(entries);
         loop_state.archived = archived;
         loop_state.uncertain_receipts = uncertain;
@@ -894,8 +908,16 @@ impl ClaudeLoop {
                 accepted,
                 source,
             } => {
+                if let InputSource::Human(id) = source
+                    && !self.received.insert(id)
+                {
+                    if let Some(accepted) = accepted {
+                        let _ = accepted.send(Ok(()));
+                    }
+                    return Ok(());
+                }
                 let at = rho_agent_types::UnixMs::now();
-                let reviving = source == InputSource::Human && self.archived;
+                let reviving = matches!(source, InputSource::Human(_)) && self.archived;
                 if reviving {
                     self.fresh_notebook(at).await?;
                 }
@@ -927,7 +949,7 @@ impl ClaudeLoop {
                     }
                     return Ok(());
                 }
-                if source == InputSource::Human {
+                if matches!(source, InputSource::Human(_)) {
                     self.mailroom.received();
                     self.pending_human.push_back(at);
                 }
@@ -957,7 +979,7 @@ impl ClaudeLoop {
                     content = combined;
                 }
                 self.cancelling = false;
-                if source == InputSource::Human {
+                if matches!(source, InputSource::Human(_)) {
                     if let Some(host) = &mut self.python {
                         host.user_spoke();
                     }
@@ -987,7 +1009,7 @@ impl ClaudeLoop {
                     return Ok(());
                 }
                 let message = match source {
-                    InputSource::Human => Some((MessageId::new(), Party::Human)),
+                    InputSource::Human(id) => Some((id, Party::Human)),
                     InputSource::Agent(sender) => Some((MessageId::new(), Party::Agent(sender))),
                     InputSource::DeferredAgent(_, id) => Some((id, Party::Human)),
                     InputSource::Internal => None,
@@ -1657,6 +1679,7 @@ impl ClaudeLoop {
             team.as_ref(),
             Some(&self.host),
             Some(&self.mailroom),
+            false,
         );
         let notify = Arc::new(tokio::sync::Notify::new());
         let notebook = rho_notebook::Notebook::new(shell, exports, Arc::clone(&notify))
@@ -2372,7 +2395,7 @@ impl ClaudeLoop {
         let turn = self.queued_turns.remove(index).expect("found turn");
         if let Some(id) = turn.message {
             match turn.source {
-                InputSource::Human => {
+                InputSource::Human(_) => {
                     self.pending_human.pop_front();
                     self.mailroom.read(1);
                 }

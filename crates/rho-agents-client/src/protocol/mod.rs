@@ -204,12 +204,22 @@ pub struct NewAgent {
     pub content: Option<Vec<ContentPart>>,
 }
 
+/// One message the user wrote, under the client's own random name for it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct UserMessage {
+    pub id: u64,
+    pub content: Vec<ContentPart>,
+}
+
 /// What a client tells a host to do to one of its agents.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum AgentCommand {
+    /// Messages from the user, logged in order. The host logs each id
+    /// once however often it is sent, so a client that never heard an
+    /// answer sends them all again.
     Send {
         agent_id: AgentId,
-        content: Vec<ContentPart>,
+        messages: Vec<UserMessage>,
     },
     Compact {
         agent_id: AgentId,
@@ -414,15 +424,18 @@ mod tests {
             QuotaUsage.into(),
             AgentCommand::Send {
                 agent_id,
-                content: vec![
-                    ContentPart::Text {
-                        text: "inspect".to_owned(),
-                    },
-                    ContentPart::Image {
-                        media_type: "image/gif".to_owned(),
-                        data: vec![1, 2, 3],
-                    },
-                ],
+                messages: vec![UserMessage {
+                    id: 7,
+                    content: vec![
+                        ContentPart::Text {
+                            text: "inspect".to_owned(),
+                        },
+                        ContentPart::Image {
+                            media_type: "image/gif".to_owned(),
+                            data: vec![1, 2, 3],
+                        },
+                    ],
+                }],
             }
             .into(),
             AgentCommand::Compact { agent_id }.into(),
