@@ -349,6 +349,7 @@ fn spawn_log_follow(
                     let live = rho_agents_client::protocol::transcript::Live::Snapshot {
                         state: status.runtime.clone(),
                         response: status.response.clone(),
+                        draft: status.draft.clone(),
                     };
                     if outgoing_tx
                         .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })

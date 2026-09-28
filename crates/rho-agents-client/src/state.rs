@@ -55,6 +55,10 @@ pub enum UiBlock {
     Reasoning {
         text: String,
     },
+    /// Host-owned tentative outgoing text while its notebook cell has not sent.
+    MessageDraft {
+        text: String,
+    },
     Tool(UiTool),
     Notice {
         text: String,

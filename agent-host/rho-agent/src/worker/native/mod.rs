@@ -266,6 +266,7 @@ enum Control {
 struct Latest {
     cell: CellHandle,
     call: Call,
+    published: bool,
 }
 
 /// The call of the step in progress, as its code arrives.
@@ -814,7 +815,12 @@ impl Agent {
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
         let at = UnixMs::now();
         match outbound {
-            Outbound::Send(text) => {
+            Outbound::Send { cell, text } => {
+                if let Some(latest) = &mut self.cell
+                    && latest.cell.source_id() == cell
+                {
+                    latest.published = true;
+                }
                 let to = self
                     .head
                     .read()
@@ -1213,7 +1219,11 @@ impl Agent {
             (Some(call), None) => {
                 self.progress.prose = 0;
                 let cell = self.notebook().await?.run(call.code.clone());
-                self.cell = Some(Latest { cell, call });
+                self.cell = Some(Latest {
+                    cell,
+                    call,
+                    published: false,
+                });
                 self.progress.told_returned = false;
             }
             (None, streaming) => {
@@ -1291,6 +1301,7 @@ impl Agent {
             self.cell = Some(Latest {
                 cell: notebook.stream(),
                 call: carry.with_code(String::new()),
+                published: false,
             });
             self.progress.told_returned = false;
             *streaming = Some(Streaming {
@@ -1376,6 +1387,19 @@ impl Agent {
                 archived: self.archived,
             },
             response: self.response(),
+            draft: self
+                .cell
+                .as_ref()
+                .filter(|latest| {
+                    !latest.published && (self.responding || latest.cell.facts().finished.is_none())
+                })
+                .and_then(|latest| {
+                    super::shared::python_preview::tool_preview(
+                        "exec",
+                        &latest.call.code,
+                        ArgumentsFormat::Text,
+                    )
+                }),
             queued: self.unread.len(),
         }
     }

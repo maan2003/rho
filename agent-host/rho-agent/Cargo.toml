@@ -12,6 +12,7 @@ rustls.workspace = true
 rho-rpc.workspace = true
 alacritty_terminal.workspace = true
 rustix-openpty.workspace = true
+json-stream.workspace = true
 libc.workspace = true
 rho-agent-types.workspace = true
 rho-agents-client.workspace = true
@@ -45,6 +46,8 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+tree-sitter = "0.26"
+tree-sitter-python = "0.25"
 uuid.workspace = true
 
 rho-shell.workspace = true

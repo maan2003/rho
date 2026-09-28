@@ -11,7 +11,9 @@ mod source;
 #[cfg(test)]
 mod tests;
 
-pub use notebook::{CellHandle, Export, Notebook, RenderedReport, Report, ToolCx, operation};
+pub use notebook::{
+    CellHandle, Export, Notebook, RenderedReport, Report, ToolCx, current_source_id, operation,
+};
 use senax_encoder::{Decode, Encode};
 pub use source::{End, Kind, SessionId, SourceFacts, StreamProgress};
 

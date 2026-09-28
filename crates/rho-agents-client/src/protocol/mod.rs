@@ -383,10 +383,12 @@ mod tests {
                         phase: Some(TextPhase::FinalAnswer),
                     }],
                 }),
+                draft: None,
             },
             Live::Snapshot {
                 state: Default::default(),
                 response: None,
+                draft: Some("Still writing".into()),
             },
             Live::Queued { items: vec![] },
         ] {

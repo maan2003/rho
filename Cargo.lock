@@ -12522,6 +12522,7 @@ dependencies = [
  "dirs",
  "futures",
  "image",
+ "json-stream",
  "libc",
  "prefix-id",
  "pyo3",
@@ -12554,6 +12555,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tree-sitter",
+ "tree-sitter-python",
  "uuid",
 ]
 

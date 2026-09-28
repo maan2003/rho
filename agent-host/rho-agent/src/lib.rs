@@ -49,6 +49,10 @@ pub use rho_agents_client::protocol::transcript::{
 pub struct AgentStatus {
     pub runtime: RuntimeState,
     pub response: Option<StreamingResponse>,
+    /// Tentative outgoing text, retained across provider completion until
+    /// its originating cell sends or the cell is replaced.
+    #[senax(default)]
+    pub draft: Option<String>,
     /// Inputs waiting to enter model context.
     pub queued: usize,
 }

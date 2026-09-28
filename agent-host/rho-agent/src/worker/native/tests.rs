@@ -155,6 +155,44 @@ fn received(entries: &[Entry], text: &str) -> bool {
 }
 
 #[tokio::test]
+async fn draft_waits_for_the_originating_cells_actual_send() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("import asyncio\nawait asyncio.sleep(0.6)\nhuman.send('hello from cell')");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "start").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = handle.status();
+        if status.response.is_none() && status.draft.as_deref() == Some("hello from cell") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the completed source never remained a draft: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    harness
+        .until("the cell's send", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "hello from cell"))
+        })
+        .await;
+    loop {
+        if handle.status().draft.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cell's send did not withdraw its draft"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());

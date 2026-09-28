@@ -266,13 +266,16 @@ pub struct LogEntry {
 /// is a row: the queue is `Message` rows no `Sent` has carried, a call
 /// runs until a `Sent` answers it, a turn ends with a `Turn` row.
 ///
-/// Each snapshot replaces the entire runtime state and streaming response.
-/// Durable transcript rows remain the source of committed history.
+/// Each snapshot replaces the runtime state, streaming response and tentative
+/// draft. Durable transcript rows remain the source of committed history.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Live {
     Snapshot {
         state: RuntimeState,
         response: Option<StreamingResponse>,
+        /// Host-computed draft retained while the originating cell runs.
+        #[senax(default)]
+        draft: Option<String>,
     },
     /// Claude Code holds its queue in its process, outside the mirror.
     Queued { items: Vec<QueuedItem> },

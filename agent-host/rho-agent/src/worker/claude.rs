@@ -85,6 +85,7 @@ impl ClaudeAgent {
                 ..Default::default()
             },
             response: None,
+            draft: None,
             queued: state.queued_inputs.len(),
         }));
         let head = Arc::new(RwLock::new(head));
@@ -122,6 +123,7 @@ impl ClaudeAgent {
             pending_response: PendingInferenceResponse::default(),
             response_id: None,
             stream_items: BTreeMap::new(),
+            draft: None,
             response_execs: BTreeMap::new(),
             queued_turns: VecDeque::new(),
             turn_usage: None,
@@ -354,6 +356,8 @@ pub(crate) struct ClaudeLoop {
     pending_response: PendingInferenceResponse,
     response_id: Option<String>,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
+    /// The last streamed exec's source prefix while its cell may still send.
+    draft: Option<(String, String)>,
     response_execs: BTreeMap<usize, rho_agent_types::transcript::ExecId>,
     queued_turns: VecDeque<ClaudeTurn>,
     /// Usage of the in-flight message: `message_start` seeds it,
@@ -395,8 +399,29 @@ fn claude_status(
     AgentStatus {
         runtime: claude_runtime(inference, python, awaiting_human, archived),
         response: live_response(response_id, stream_items),
+        draft: None,
         queued,
     }
+}
+
+/// Source still being written, or about to be admitted as a notebook cell.
+fn streamed_draft(items: &BTreeMap<usize, ClaudeStreamItem>) -> Option<(String, String)> {
+    items.values().find_map(|item| {
+        let ClaudeStreamItem::ToolUse {
+            id,
+            name,
+            arguments,
+        } = item
+        else {
+            return None;
+        };
+        super::shared::python_preview::tool_preview(
+            name,
+            arguments,
+            rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
+        )
+        .map(|text| (id.clone(), text))
+    })
 }
 
 fn claude_runtime(
@@ -1109,7 +1134,10 @@ impl ClaudeLoop {
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
         let at = rho_agent_types::UnixMs::now();
         match outbound {
-            Outbound::Send(text) => {
+            Outbound::Send { cell, text } => {
+                if self.python.as_mut().is_some_and(|python| python.sent(cell)) {
+                    self.draft = None;
+                }
                 let to = self
                     .head
                     .read()
@@ -1752,6 +1780,7 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
+                self.draft = streamed_draft(&self.stream_items);
                 if let Some(host) = &mut self.python {
                     host.turn_ended(
                         rho_agent_types::UnixMs::now(),
@@ -1775,6 +1804,7 @@ impl ClaudeLoop {
                     }
                 }
                 if self.cancelling {
+                    self.draft = None;
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
                     self.response_id = None;
@@ -2405,7 +2435,7 @@ impl ClaudeLoop {
     /// in the tail if anyone is looking. Every row this loop writes is
     /// committed before the state moves, so the tail follows its row.
     fn snapshot(&self) -> AgentStatus {
-        claude_status(
+        let mut status = claude_status(
             &self.state.kind,
             self.python.as_ref(),
             self.awaiting,
@@ -2413,7 +2443,31 @@ impl ClaudeLoop {
             self.response_id.as_deref(),
             &self.stream_items,
             self.state.queued_inputs.len(),
-        )
+        );
+        let draft = if status.response.is_some() {
+            streamed_draft(&self.stream_items)
+        } else {
+            self.draft.clone()
+        };
+        status.draft = draft
+            .filter(|(id, _)| {
+                self.python
+                    .as_ref()
+                    .and_then(python_host::PythonHost::published_call)
+                    != Some(id.as_str())
+                    && (status.response.is_some()
+                        || self
+                            .python
+                            .as_ref()
+                            .and_then(python_host::PythonHost::latest_call)
+                            == Some(id.as_str())
+                            && !self
+                                .python
+                                .as_ref()
+                                .is_some_and(|python| python.latest_finished(id)))
+            })
+            .map(|(_, text)| text);
+        status
     }
 
     fn runtime_snapshot(&self) -> RuntimeState {
@@ -2475,6 +2529,7 @@ impl ClaudeLoop {
         self.host.failed(error.to_string()).await?;
         self.response_id = None;
         self.stream_items.clear();
+        self.draft = None;
         self.set_kind(InferenceState::Failed {
             error: error.to_string(),
         });
@@ -2529,6 +2584,7 @@ impl ClaudeLoop {
             rho_claude::protocol::MessageStreamEvent::MessageStart { message } => {
                 self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
+                self.draft = None;
                 self.response_id = Some(Uuid::new_v4().to_string());
                 self.turn_usage = message.usage;
                 self.set_streaming_kind();
@@ -2791,6 +2847,39 @@ fn write_generated_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_exec_draft_keeps_its_call_identity_after_source_completes() {
+        let mut items = BTreeMap::new();
+        items.insert(
+            0,
+            ClaudeStreamItem::ToolUse {
+                id: "unrelated".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            },
+        );
+        items.insert(
+            1,
+            ClaudeStreamItem::ToolUse {
+                id: "exec-1".into(),
+                name: "mcp__py__exec".into(),
+                arguments: r#"{"source":"human.send('Hel"#.into(),
+            },
+        );
+        assert_eq!(
+            streamed_draft(&items),
+            Some(("exec-1".into(), "Hel".into()))
+        );
+        let ClaudeStreamItem::ToolUse { arguments, .. } = items.get_mut(&1).unwrap() else {
+            unreachable!()
+        };
+        *arguments = r#"{"source":"human.send('Hello')"}"#.into();
+        assert_eq!(
+            streamed_draft(&items),
+            Some(("exec-1".into(), "Hello".into()))
+        );
+    }
 
     #[test]
     fn pending_context_copies_only_finished_blocks_or_failure_partials() {

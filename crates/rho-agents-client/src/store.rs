@@ -109,6 +109,11 @@ impl Layered {
                 }
                 Arc::new(block)
             }));
+        if let Some(text) = &self.tail.draft {
+            self.state
+                .blocks
+                .push(Arc::new(UiBlock::MessageDraft { text: text.clone() }));
+        }
         self.state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
@@ -152,15 +157,21 @@ impl Layered {
 struct Tail {
     runtime: Option<RuntimeState>,
     response: Option<StreamingResponse>,
+    draft: Option<String>,
     queue: Vec<UiBlock>,
 }
 
 impl Tail {
     fn apply(&mut self, live: Live) {
         match live {
-            Live::Snapshot { state, response } => {
+            Live::Snapshot {
+                state,
+                response,
+                draft,
+            } => {
                 self.runtime = Some(state);
                 self.response = response;
+                self.draft = draft;
             }
             Live::Queued { items } => self.queue = items.into_iter().map(queued_block).collect(),
         }
@@ -282,6 +293,7 @@ impl AgentStore {
         self.change(agent_id, true, |layered| {
             layered.tail.runtime = None;
             layered.tail.response = None;
+            layered.tail.draft = None;
             layered.tail.queue.clear();
         })
     }
@@ -444,6 +456,7 @@ mod tests {
                 id: id.into(),
                 items,
             }),
+            draft: None,
         }
     }
     fn blocks(store: &AgentStore) -> Vec<UiBlock> {
@@ -532,6 +545,7 @@ mod tests {
                     id: "first".into(),
                     items: vec![text("answer")],
                 }),
+                draft: None,
             },
         );
         assert_eq!(blocks(&store), vec![block(&text("answer"))]);
@@ -550,10 +564,81 @@ mod tests {
             Live::Snapshot {
                 state: RuntimeState::default(),
                 response: None,
+                draft: None,
             },
         );
         assert!(blocks(&store).is_empty());
         assert_eq!(store.get(&agent()).unwrap().status, UiAgentStatus::Idle);
+    }
+
+    #[test]
+    fn draft_survives_source_completion_and_unrelated_sends_until_cell_publishes() {
+        let mut store = AgentStore::default();
+        let live = |source: Option<&str>, draft: Option<&str>| Live::Snapshot {
+            state: RuntimeState {
+                running_tasks: 1,
+                ..Default::default()
+            },
+            response: source.map(|source| StreamingResponse {
+                id: "response".into(),
+                items: vec![Item::ToolCall {
+                    id: "call".into(),
+                    name: "exec".into(),
+                    arguments: source.into(),
+                    format: ArgumentsFormat::Text,
+                }],
+            }),
+            draft: draft.map(str::to_owned),
+        };
+        store.apply_live(agent(), live(Some("human.send('Hel"), Some("Hel")));
+        let text = |store: &AgentStore| {
+            store
+                .get(&agent())
+                .unwrap()
+                .blocks
+                .iter()
+                .find_map(|block| match block.as_ref() {
+                    UiBlock::MessageDraft { text } => Some(text.clone()),
+                    _ => None,
+                })
+        };
+        assert_eq!(text(&store), Some("Hel".into()));
+        store.apply_live(agent(), live(Some("human.send('Hello')"), Some("Hello")));
+        assert_eq!(
+            text(&store),
+            Some("Hello".into()),
+            "closing the call must not withdraw it"
+        );
+        store.apply_live(agent(), live(None, Some("Hello")));
+        assert_eq!(
+            text(&store),
+            Some("Hello".into()),
+            "provider completion must not withdraw it"
+        );
+
+        let mut fold = TranscriptFold::default();
+        fold.tell(
+            AgentPos(0),
+            &TranscriptEvent::MessageSent {
+                to: None,
+                text: "other cell".into(),
+                at: UnixMs(1),
+            },
+        );
+        store.apply_fold_delta(agent(), fold.delta().unwrap());
+        assert_eq!(
+            text(&store),
+            Some("Hello".into()),
+            "an older cell cannot withdraw it"
+        );
+        store.apply_live(agent(), live(None, None));
+        assert_eq!(
+            text(&store),
+            None,
+            "host withdraws after the latest cell sends"
+        );
+        assert!(matches!(store.get(&agent()).unwrap().blocks[0].as_ref(),
+            UiBlock::MessageSent { text, .. } if text == "other cell"));
     }
 
     #[test]
@@ -588,6 +673,7 @@ mod tests {
             Live::Snapshot {
                 state: RuntimeState::default(),
                 response: None,
+                draft: None,
             },
         );
         let ids: Vec<_> = store
@@ -617,6 +703,7 @@ mod tests {
                     id: "first".into(),
                     items: vec![text("live")],
                 }),
+                draft: None,
             },
         );
         store.disconnect(agent());

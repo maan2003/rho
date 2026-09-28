@@ -2,6 +2,7 @@
 //! Transport correlation and conversation ownership stay in the drivers.
 
 pub(crate) mod mailroom;
+pub(crate) mod python_preview;
 pub(crate) mod tools;
 pub(crate) mod wake;
 

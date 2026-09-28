@@ -373,6 +373,11 @@ impl CellHandle {
         self.cell.id.session()
     }
 
+    /// Internal source identity, unlike the display session label.
+    pub fn source_id(&self) -> u64 {
+        self.cell.id.0
+    }
+
     pub fn facts(&self) -> SourceFacts {
         self.cell.facts()
     }
@@ -488,6 +493,11 @@ pub(crate) fn current(py: Python<'_>, purpose: &str) -> PyResult<(Arc<Shared>, A
     let cell = owner.getattr("cell")?.cast_into::<Cell>()?;
     let cell = cell.get();
     Ok((Arc::clone(&cell.shared), Arc::clone(&cell.source)))
+}
+
+/// The running Python source's identity for correlating its outbound messages.
+pub fn current_source_id(py: Python<'_>) -> PyResult<u64> {
+    Ok(current(py, "human.send() is available")?.1.id.0)
 }
 
 /// A cell as its kernel sees it: where its events go.

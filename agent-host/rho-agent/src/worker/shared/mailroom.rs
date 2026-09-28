@@ -17,7 +17,10 @@ use tokio::sync::mpsc;
 /// What the notebook hands the agent loop.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outbound {
-    Send(String),
+    Send {
+        cell: u64,
+        text: String,
+    },
     Status(String),
     Archive,
     /// The first task began awaiting `human.reply()`.
@@ -112,11 +115,12 @@ struct Bridge(Arc<Mailroom>);
 
 #[pymethods]
 impl Bridge {
-    fn send(&self, text: String) -> PyResult<()> {
+    fn send(&self, py: Python<'_>, text: String) -> PyResult<()> {
         if text.trim().is_empty() {
             return Err(PyValueError::new_err("a message needs text"));
         }
-        let _ = self.0.outbox.send(Outbound::Send(text));
+        let cell = rho_notebook::current_source_id(py)?;
+        let _ = self.0.outbox.send(Outbound::Send { cell, text });
         Ok(())
     }
 

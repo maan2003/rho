@@ -186,6 +186,7 @@ impl Services {
                                     crate::AgentStatus {
                                         runtime: status.runtime.clone(),
                                         response: None,
+                                        draft: None,
                                         queued: status.queued,
                                     }
                                 };

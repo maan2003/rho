@@ -39,6 +39,25 @@ impl TranscriptView {
         label: &impl Fn(AgentId) -> String,
     ) -> RenderedBlock {
         if self.visible(block) {
+            if self == Self::Conversation
+                && let UiBlock::MessageDraft { text } = block
+            {
+                let mut rendered = render_block_with_agent_labels(
+                    &UiBlock::MessageSent {
+                        to: None,
+                        text: text.to_owned(),
+                    },
+                    previous,
+                    now_ms,
+                    label,
+                );
+                rendered.kind = block_kind(block);
+                rendered.spans.insert(
+                    rendered.spans.len() - 1,
+                    Span::new("draft\n", StyleClass::StatusRunning),
+                );
+                return rendered;
+            }
             render_block_with_agent_labels(block, previous, now_ms, label)
         } else {
             invisible(block_kind(block))
@@ -130,9 +149,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::AssistantMessage { phase, .. } => BlockKind::Response {
             working: *phase != Some(UiMessagePhase::FinalAnswer),
         },
-        UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
-            BlockKind::Response { working: true }
-        }
+        UiBlock::Reasoning { .. }
+        | UiBlock::MessageDraft { .. }
+        | UiBlock::Tool(_)
+        | UiBlock::Notice { .. } => BlockKind::Response { working: true },
         UiBlock::QueuedMessage { .. } => BlockKind::QueuedUser,
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
@@ -150,6 +170,7 @@ pub fn block_visible(block: &UiBlock) -> bool {
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageSent { text, .. }
+        | UiBlock::MessageDraft { text }
         | UiBlock::Notice { text }
         | UiBlock::AgentMessage { text, .. }
         | UiBlock::QueuedMessage { text, .. } => !text.is_empty(),
@@ -335,7 +356,7 @@ pub fn render_block_with_agent_labels(
             }
             spans.push(Span::new(text, StyleClass::Default));
         }
-        UiBlock::Reasoning { .. } => return invisible(kind),
+        UiBlock::Reasoning { .. } | UiBlock::MessageDraft { .. } => return invisible(kind),
         UiBlock::Tool(tool) => {
             spans.extend(separator(prev, kind));
             // A call is what was run, shown as it was run: no markdown
@@ -973,6 +994,29 @@ mod tests {
             tool_label("Write", r#"{"file_p"#, ArgumentsFormat::Json),
             ("write".to_owned(), StyleClass::ToolName)
         );
+    }
+
+    #[test]
+    fn host_draft_shows_in_conversation_while_activity_keeps_the_source() {
+        let mut exec = tool(UiToolStatus::Running);
+        exec.name = "exec".into();
+        exec.arguments = "human.send('Hello')".into();
+        let source = UiBlock::Tool(exec);
+        let draft = UiBlock::MessageDraft {
+            text: "Hello".into(),
+        };
+        let label = |_| String::new();
+        assert!(!TranscriptView::Conversation.visible(&source));
+        assert!(TranscriptView::Activity.visible(&source));
+        assert!(TranscriptView::Conversation.visible(&draft));
+        assert!(!TranscriptView::Activity.visible(&draft));
+        let conversation = TranscriptView::Conversation.render(&draft, None, 0, &label);
+        assert_eq!(text_of(&conversation.spans), "draft\nHello\n");
+        assert!(conversation.markdown);
+        assert_eq!(conversation.spans[0].class, StyleClass::StatusRunning);
+        let activity = TranscriptView::Activity.render(&source, None, 0, &label);
+        assert!(text_of(&activity.spans).contains("human.send('Hello')"));
+        assert!(!text_of(&activity.spans).contains("draft"));
     }
 
     #[test]

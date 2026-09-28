@@ -48,6 +48,7 @@ pub(crate) struct PythonHost {
     notify: Arc<Notify>,
     pending: Option<PendingExec>,
     latest: Option<(ExecId, CellHandle)>,
+    published: bool,
     /// The model has been told the latest cell finished.
     progress: Progress,
     /// The user stopped the agent, or its requests failed, since anything
@@ -80,6 +81,7 @@ impl PythonHost {
             notify,
             pending: None,
             latest: None,
+            published: false,
             progress: Progress::default(),
             stopped: false,
         }
@@ -120,6 +122,7 @@ impl PythonHost {
         }
         self.notebook.reset_checkin();
         self.latest = Some((exec_id.clone(), self.notebook.run(source)));
+        self.published = false;
         self.progress.told_returned = false;
         self.progress.last_response = Some(now);
         self.progress.prose = 0;
@@ -129,6 +132,35 @@ impl PythonHost {
             exec_id,
         });
         None
+    }
+
+    /// Only a send from the latest cell retires its tentative preview.
+    pub(crate) fn sent(&mut self, cell: u64) -> bool {
+        if self
+            .latest
+            .as_ref()
+            .is_some_and(|(_, latest)| latest.source_id() == cell)
+        {
+            self.published = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn latest_call(&self) -> Option<&str> {
+        self.latest.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    pub(crate) fn latest_finished(&self, id: &str) -> bool {
+        self.latest
+            .as_ref()
+            .is_some_and(|(latest, cell)| latest.as_str() == id && cell.facts().finished.is_some())
+    }
+
+    pub(crate) fn published_call(&self) -> Option<&str> {
+        self.latest
+            .as_ref()
+            .and_then(|(id, _)| self.published.then(|| id.as_str()))
     }
 
     /// The user spoke: a stop, if there was one, is lifted.
@@ -391,6 +423,29 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "never woke");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_cell_send_retires_its_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path());
+        host.exec(
+            "request".into(),
+            serde_json::json!(1),
+            "call".try_into().unwrap(),
+            "print('ran')".into(),
+            UnixMs::now(),
+        );
+        let cell = host.latest.as_ref().unwrap().1.source_id();
+        assert_eq!(host.latest_call(), Some("call"));
+        assert!(
+            !host.sent(cell + 1),
+            "a different cell cannot retire this draft"
+        );
+        assert_eq!(host.published_call(), None);
+        assert!(host.sent(cell));
+        assert_eq!(host.published_call(), Some("call"));
+        host.shutdown().await.unwrap();
     }
 
     #[tokio::test]

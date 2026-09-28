@@ -603,6 +603,7 @@ mod tests {
             live: crate::protocol::transcript::Live::Snapshot {
                 state: Default::default(),
                 response: None,
+                draft: None,
             },
         }
     }
@@ -687,6 +688,7 @@ mod tests {
                     id: "private-response".into(),
                     items: vec![],
                 }),
+                draft: None,
             },
         };
         let received = model.ingest(HOST, snapshot);
