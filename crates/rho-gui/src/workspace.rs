@@ -7421,14 +7421,13 @@ impl Workspace {
                         context if context.is_empty() => leaf,
                         context => format!("{context} / {leaf}"),
                     };
-                    format!(
-                        "{path} · {}",
-                        if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
-                            "activity"
-                        } else {
-                            "conversation"
-                        }
-                    )
+                    // The conversation is what a transcript is; only the
+                    // activity view needs saying.
+                    if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+                        format!("{path} · activity")
+                    } else {
+                        path
+                    }
                 }
                 SurfaceKey::Browser(page) => {
                     rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
