@@ -21,3 +21,7 @@ tokio = { workspace = true, features = ["io-util", "sync", "rt", "macros", "time
 camino.workspace = true
 rho-fs-view.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "rho-notebook-test-child"
+path = "tests/support/child.rs"

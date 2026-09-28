@@ -1010,6 +1010,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_wake_starts_a_separate_notebook_guardian() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let (id, agent) = pool
+            .create(
+                AgentRole::default(),
+                Some("notebook child".into()),
+                StartPlace::new(place.clone()),
+            )
+            .await
+            .unwrap();
+        agent
+            .send_user_content_accepted(
+                crate::entry::MessageId::new(),
+                vec![rho_agent_types::ContentPart::Text {
+                    text: "hello".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        use std::os::unix::ffi::OsStrExt as _;
+
+        use base64::Engine as _;
+        let snapshot_dir = pool
+            .worksets
+            .open_workset(&place.workset)
+            .await
+            .unwrap()
+            .state_dir()
+            .unwrap()
+            .join("notebooks")
+            .join(id.encoded());
+        let marker =
+            base64::engine::general_purpose::STANDARD.encode(snapshot_dir.as_os_str().as_bytes());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let guardian = std::fs::read_dir("/proc")
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+                    .any(|cmdline| {
+                        cmdline
+                            .windows(marker.len())
+                            .any(|bytes| bytes == marker.as_bytes())
+                            && cmdline
+                                .windows(b"--notebook-guardian".len())
+                                .any(|bytes| bytes == b"--notebook-guardian")
+                    });
+                if guardian {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native wake did not start a notebook guardian");
+    }
+
+    #[tokio::test]
+    async fn planned_drain_restores_the_notebook_child() {
+        if std::env::var_os("RHO_CRIU_TEST").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let (id, agent) = pool
+            .create(
+                AgentRole::default(),
+                Some("notebook snapshot".into()),
+                StartPlace::new(place.clone()),
+            )
+            .await
+            .unwrap();
+        agent
+            .send_user_content_accepted(
+                crate::entry::MessageId::new(),
+                vec![rho_agent_types::ContentPart::Text {
+                    text: "start a notebook".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !matches!(
+                agent.status().runtime.inference,
+                crate::InferenceState::Responding
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native request did not start");
+        agent.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !matches!(
+                agent.status().runtime.inference,
+                crate::InferenceState::Idle
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native request did not cancel");
+        agent.drain().await.unwrap();
+        let state = pool
+            .worksets
+            .open_workset(&place.workset)
+            .await
+            .unwrap()
+            .state_dir()
+            .unwrap()
+            .join("notebooks")
+            .join(id.encoded());
+        assert!(
+            state.join("current").exists(),
+            "dump did not publish a snapshot"
+        );
+        let process = pool.execution(id).await.unwrap();
+        process.stop();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            process.closed.clone().wait_for(|closed| *closed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(agent);
+        let (_, restarted, _) = pool.load(id).await.unwrap();
+        assert!(
+            state.join("used").exists(),
+            "restore did not consume the snapshot"
+        );
+        assert!(!state.join("current").exists());
+        assert!(!restarted.status().runtime.archived);
+        let requests_before = pool
+            .db
+            .read()
+            .agent_event_records(id)
+            .1
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    crate::AgentEvent::Entry(crate::entry::Entry::RequestSent { .. })
+                )
+            })
+            .count();
+        restarted
+            .send_user_content_accepted(
+                crate::entry::MessageId::new(),
+                vec![rho_agent_types::ContentPart::Text {
+                    text: "what state survived?".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let notices = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let requests = pool
+                    .db
+                    .read()
+                    .agent_event_records(id)
+                    .1
+                    .into_iter()
+                    .filter_map(|(_, event)| match event {
+                        crate::AgentEvent::Entry(crate::entry::Entry::RequestSent {
+                            report,
+                            ..
+                        }) => Some(report.notices),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(notices) = requests.get(requests_before) {
+                    break notices.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("restarted agent did not wake on new input");
+        assert!(
+            notices.contains(&crate::entry::RequestNotice::Restored),
+            "notebook fell back to fresh state: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_placement_commits_before_preparing_and_outlives_caller_cancellation() {
         let directory = tempfile::tempdir().unwrap();
         let (pool, mut place) = test_pool(directory.path()).await;

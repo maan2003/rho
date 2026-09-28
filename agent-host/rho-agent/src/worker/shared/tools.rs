@@ -14,7 +14,7 @@ use rho_agent_types::transcript::{ImageDetail, ToolExecutionContext};
 use rho_agent_types::{AgentId, AgentRole};
 use rho_notebook::{Export, operation};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
-use rho_web_search::{WebRequest, WebSearchTools};
+use rho_web_search::{CredentialsProvider, WebRequest, WebSearchTools};
 
 use super::mailroom::Mailroom;
 use crate::inference::Inference;
@@ -38,12 +38,6 @@ pub(crate) fn host_tools(
     mailroom: Option<&Arc<Mailroom>>,
     original_images: bool,
 ) -> (ShellTools, Vec<Export>) {
-    let shell = ShellTools::in_directory(
-        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        cwd.to_owned(),
-        Default::default(),
-    )
-    .with_env("RHO_AGENT_ID", agent_id.encoded());
     let agent_host = host.map(|host| {
         let host = Arc::clone(host);
         Arc::new(move |call| -> Pin<Box<dyn Future<Output = _> + Send>> {
@@ -51,6 +45,43 @@ pub(crate) fn host_tools(
             Box::pin(async move { host.shared_tool(call).await })
         }) as AgentHost
     });
+    let credentials = inference.map(|inference| {
+        let inference = inference.clone();
+        Arc::new(move || -> futures::future::BoxFuture<'static, anyhow::Result<rho_web_search::Credentials>> {
+            let inference = inference.clone();
+            Box::pin(async move { inference.web_credentials().await })
+        }) as CredentialsProvider
+    });
+    host_tools_with_services(
+        cwd,
+        role,
+        agent_id,
+        agent_host,
+        multi_agent.is_some(),
+        credentials,
+        mailroom,
+        original_images,
+    )
+}
+
+/// Build Python exports in either the local worker or the notebook child.
+/// The child supplies explicit service RPCs in place of worker-owned handles.
+pub(crate) fn host_tools_with_services(
+    cwd: &camino::Utf8Path,
+    role: AgentRole,
+    agent_id: AgentId,
+    agent_host: Option<AgentHost>,
+    has_team: bool,
+    credentials: Option<CredentialsProvider>,
+    mailroom: Option<&Arc<Mailroom>>,
+    original_images: bool,
+) -> (ShellTools, Vec<Export>) {
+    let shell = ShellTools::in_directory(
+        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        cwd.to_owned(),
+        Default::default(),
+    )
+    .with_env("RHO_AGENT_ID", agent_id.encoded());
     let mut exports = vec![Export::new(
         "view_image",
         ViewImage {
@@ -58,23 +89,14 @@ pub(crate) fn host_tools(
             original: original_images,
         },
     )];
-    if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
+    if let Some(agent_host) = agent_host.as_ref().filter(|_| has_team) {
         exports.push(agents(role, Arc::clone(agent_host)));
     }
-    if let Some(inference) = inference {
+    if let Some(credentials) = credentials {
         exports.push(Export::new(
             "web",
             Web {
-                tools: WebSearchTools::new(
-                    {
-                        let inference = inference.clone();
-                        Arc::new(move || {
-                            let inference = inference.clone();
-                            Box::pin(async move { inference.web_credentials().await })
-                        })
-                    },
-                    agent_id.encoded().to_owned(),
-                ),
+                tools: WebSearchTools::new(credentials, agent_id.encoded().to_owned()),
             },
         ));
     }
@@ -90,7 +112,7 @@ pub(crate) fn host_tools(
 }
 
 /// Whoever answers the calls the agent host owns: the worker's host, over IPC.
-type AgentHost = Arc<
+pub(crate) type AgentHost = Arc<
     dyn Fn(SharedCall) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,

@@ -29,12 +29,11 @@ impl Controller {
             // back before its own stop deadline (`DRAIN_TIMEOUT` there).
             Control::Drain => match self {
                 Self::Rho(agent) => {
-                    if tokio::time::timeout(DRAIN_TIMEOUT, agent.drain())
+                    tokio::time::timeout(DRAIN_TIMEOUT, agent.drain())
                         .await
-                        .is_err()
-                    {
-                        anyhow::bail!("request still in flight after {DRAIN_TIMEOUT:?}");
-                    }
+                        .map_err(|_| {
+                            anyhow::anyhow!("request still in flight after {DRAIN_TIMEOUT:?}")
+                        })??;
                 }
                 // Claude Code keeps its own conversation; there is no tail
                 // of ours to flush.
@@ -339,6 +338,7 @@ pub(crate) async fn run(
         let sender = sender.clone();
         let host = HostClient::connect(sender.clone(), packet.port, messages, next.clone());
         let claude = startup.claude.clone();
+        let state = startup.layout.state.clone();
         let inference = inference.clone();
         tasks.spawn(async move {
             let result = async {
@@ -350,8 +350,15 @@ pub(crate) async fn run(
                 let head = host.head().await?;
                 match head.config.runtime {
                     crate::log::AgentRuntime::Rho { .. } => {
-                        let (handle, runtime) =
-                            Agent::load(agent, host.clone(), inference, cwd).await?;
+                        let checkpoint_dir = state.join("notebooks").join(agent.encoded());
+                        let (handle, runtime) = Agent::load_with_checkpoint(
+                            agent,
+                            host.clone(),
+                            inference,
+                            cwd,
+                            Some(checkpoint_dir.into_std_path_buf()),
+                        )
+                        .await?;
                         drive_native(runtime, handle, host.clone()).await
                     }
                     crate::log::AgentRuntime::Claude { .. } => {

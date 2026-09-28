@@ -168,7 +168,40 @@ impl Process {
         let executable = if sibling.is_file() {
             sibling
         } else {
-            "rho-agent-worker".into()
+            pool.worksets()
+                .environment()
+                .get("PATH")
+                .and_then(|path| {
+                    std::env::split_paths(path)
+                        .map(|dir| dir.join("rho-agent-worker"))
+                        .find(|path| path.is_file())
+                })
+                .unwrap_or_else(|| "rho-agent-worker".into())
+        };
+        // The workset overlays /src, so a development worker built there is
+        // invisible to its own notebook child and to CRIU when it reopens mapped
+        // executable pages. Give the workset one visible link to the same inode.
+        let executable = if executable.is_absolute() && executable.starts_with("/src") {
+            use std::os::unix::fs::MetadataExt as _;
+            let directory = startup.layout.state.as_std_path();
+            std::fs::create_dir_all(directory)?;
+            let staged = directory.join("rho-agent-worker");
+            let incoming = directory.join("rho-agent-worker.new");
+            if staged.is_file()
+                && std::fs::metadata(&staged)?.dev() == std::fs::metadata(&executable)?.dev()
+                && std::fs::metadata(&staged)?.ino() == std::fs::metadata(&executable)?.ino()
+            {
+                staged
+            } else {
+                let _ = std::fs::remove_file(&incoming);
+                if std::fs::hard_link(&executable, &incoming).is_err() {
+                    std::fs::copy(&executable, &incoming)?;
+                }
+                std::fs::rename(incoming, &staged)?;
+                staged
+            }
+        } else {
+            executable
         };
         let mut command = tokio::process::Command::new(executable);
         pool.worksets().environment().apply(&mut command);

@@ -39,7 +39,7 @@ impl SourceId {
 }
 
 /// The label a source is reported under, and what the model names it by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SessionId(u32);
 
 impl SessionId {
@@ -54,7 +54,7 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Kind {
     Cell,
     Task,
@@ -136,7 +136,7 @@ pub(crate) struct CellState {
 
 /// How far a streamed cell's code has got, as byte ends of whole top-level
 /// statements.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct StreamProgress {
     pub ready: Option<usize>,
     pub admitted: usize,
@@ -578,7 +578,7 @@ impl Part {
 }
 
 /// One source, as its reader sees it. Observations, not verdicts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct SourceFacts {
     pub session_id: SessionId,
     pub kind: Kind,
@@ -596,7 +596,7 @@ pub struct SourceFacts {
     pub delivered: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct End {
     pub at: UnixMs,
     /// A raise, a non-zero or missing exit code, a cancellation, or a host

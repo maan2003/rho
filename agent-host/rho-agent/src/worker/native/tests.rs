@@ -748,21 +748,25 @@ async fn code_fragments_wait_for_a_publication_frame() {
     agent.responding = true;
     agent.response_id = "response-id".into();
     let mut streaming = None;
-    agent.stream(
-        &mut streaming,
-        (
-            Some(scripted::carry(Call::new("call-id", String::new()))),
-            String::new(),
-        ),
-    );
+    agent
+        .stream(
+            &mut streaming,
+            (
+                Some(scripted::carry(Call::new("call-id", String::new()))),
+                String::new(),
+            ),
+        )
+        .unwrap();
     for _ in 0..100 {
-        agent.stream(&mut streaming, (None, "# fragment\n".into()));
+        agent
+            .stream(&mut streaming, (None, "# fragment\n".into()))
+            .unwrap();
     }
     assert!(
         agent.status.read().unwrap().response.is_none(),
         "fragments must not copy accumulated code into status"
     );
-    agent.publish_stream(streaming.as_ref(), true);
+    agent.publish_stream(streaming.as_ref(), true).unwrap();
     let published = agent.status.read().unwrap().response.clone().unwrap();
     assert_eq!(published.id, "response-id");
     assert_eq!(
@@ -774,12 +778,14 @@ async fn code_fragments_wait_for_a_publication_frame() {
             format: ArgumentsFormat::Text,
         }]
     );
-    agent.stream(&mut streaming, (None, "# final\n".into()));
+    agent
+        .stream(&mut streaming, (None, "# final\n".into()))
+        .unwrap();
     assert_eq!(
         agent.status.read().unwrap().response.as_ref(),
         Some(&published)
     );
-    agent.publish_stream(streaming.as_ref(), false);
+    agent.publish_stream(streaming.as_ref(), false).unwrap();
     assert!(
         matches!(&agent.status.read().unwrap().response.as_ref().unwrap().items[0],
         rho_agents_client::protocol::transcript::Item::ToolCall { arguments, .. }

@@ -8,7 +8,9 @@
 //! call and speaks to the person only through `human.send`.
 
 pub(crate) mod context;
+pub(crate) mod notebook;
 mod persistence;
+pub mod process;
 
 #[cfg(test)]
 mod scripted;
@@ -16,14 +18,17 @@ mod scripted;
 mod tests;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use notebook::{CellSide, NotebookSide};
 use rho_agent_types::{
     AgentId, AgentRole, ContentPart, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMs,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
-use rho_notebook::{CellHandle, Notebook};
+use rho_notebook::Notebook;
+use rho_notebook::process::{Event as NotebookEvent, ServiceKind, ServiceRequest};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::entry::{
@@ -197,7 +202,7 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("agent loop is closed"))?;
         drained
             .await
-            .map_err(|_| anyhow::anyhow!("agent loop is closed"))
+            .map_err(|_| anyhow::anyhow!("agent loop is closed"))?
     }
 
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
@@ -247,7 +252,7 @@ impl AgentHandle {
 /// landed: after its row is on disk, not after the model has seen it.
 enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
-    Drain(oneshot::Sender<()>),
+    Drain(oneshot::Sender<anyhow::Result<()>>),
     Received {
         id: MessageId,
         from: Party,
@@ -272,7 +277,7 @@ enum Control {
 
 /// The latest cell, the call that wrote it, and when it started.
 struct Latest {
-    cell: CellHandle,
+    cell: CellSide,
     call: Call,
     published: bool,
 }
@@ -334,7 +339,13 @@ pub(crate) struct Agent {
     cwd: camino::Utf8PathBuf,
     context: context::Context,
     continuation: Option<crate::inference::Continuation>,
-    notebook: Option<Notebook>,
+    notebook: Option<NotebookSide>,
+    checkpoint_dir: Option<PathBuf>,
+    notebook_process: Option<process::Process>,
+    notebook_events_tx: mpsc::UnboundedSender<(u64, NotebookEvent)>,
+    notebook_events: mpsc::UnboundedReceiver<(u64, NotebookEvent)>,
+    checkpointed: bool,
+    restored: bool,
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     control_rx: mpsc::UnboundedReceiver<Control>,
@@ -342,7 +353,7 @@ pub(crate) struct Agent {
     status: Arc<RwLock<AgentStatus>>,
     head: Arc<RwLock<AgentHead>>,
     name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
-    draining: Option<oneshot::Sender<()>>,
+    draining: Option<oneshot::Sender<anyhow::Result<()>>>,
     /// Whether the last published state counted as a running turn, so the
     /// turn's edges are told once each.
     working: bool,
@@ -365,8 +376,8 @@ pub(crate) struct Agent {
     received: HashSet<MessageId>,
     progress: Progress,
     awaiting: bool,
-    /// The notebook went with a restart since the model's last wake: tell
-    /// it at the next. Coming up is never itself a wake.
+    /// The worker restarted since the last model wake; tell it whether
+    /// Python was restored at the next request. Loading is not a wake.
     restarted: bool,
     rewound: bool,
     retry: bool,
@@ -377,13 +388,23 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// Construct a worker-owned runtime from agent host services, without
-    /// opening a database or retaining the pool.
+    /// Construct a worker-owned runtime without a notebook subprocess in tests.
+    #[cfg(test)]
     pub(crate) async fn load(
         agent_id: AgentId,
         host: Arc<HostClient>,
         inference: Inference,
         cwd: camino::Utf8PathBuf,
+    ) -> anyhow::Result<(AgentHandle, Self)> {
+        Self::load_with_checkpoint(agent_id, host, inference, cwd, None).await
+    }
+
+    pub(crate) async fn load_with_checkpoint(
+        agent_id: AgentId,
+        host: Arc<HostClient>,
+        inference: Inference,
+        cwd: camino::Utf8PathBuf,
+        checkpoint_dir: Option<PathBuf>,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
@@ -393,6 +414,7 @@ impl Agent {
         let (boundary, recovery, entries) = host.native_history(None).await?;
         let context = context::Context::restore(&entries);
         let (mailroom, outbox) = Mailroom::new();
+        let (notebook_events_tx, notebook_events) = mpsc::unbounded_channel();
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -409,6 +431,12 @@ impl Agent {
             context,
             continuation: None,
             notebook: None,
+            checkpoint_dir,
+            notebook_process: None,
+            notebook_events_tx,
+            notebook_events,
+            checkpointed: false,
+            restored: false,
             mailroom,
             outbox,
             control_rx,
@@ -443,6 +471,13 @@ impl Agent {
             compaction: recovery.compaction,
         };
         agent.resume(&entries, recovery.woken);
+        if agent
+            .checkpoint_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join("current").exists())
+        {
+            agent.start_process().await?;
+        }
         agent.publish().await?;
         Ok((
             AgentHandle {
@@ -452,6 +487,104 @@ impl Agent {
             },
             agent,
         ))
+    }
+
+    /// Start the process on first notebook use, or attach a saved one at load.
+    async fn start_process(&mut self) -> anyhow::Result<()> {
+        if let Some(dir) = self.checkpoint_dir.clone() {
+            let team = self.host.team().await?;
+            let role = self.head.read().expect("poison").config.role;
+            let (services_tx, mut services) = mpsc::unbounded_channel::<ServiceRequest>();
+            let (child, restored) = tokio::task::block_in_place(|| {
+                process::Process::start(
+                    &dir,
+                    &self.cwd,
+                    role,
+                    self.agent_id,
+                    team.is_some(),
+                    Arc::clone(&self.wake),
+                    self.notebook_events_tx.clone(),
+                    services_tx,
+                )
+            })?;
+            let client = Arc::clone(&child.client);
+            let service_client = Arc::clone(&client);
+            let host = Arc::clone(&self.host);
+            let inference = self.inference.clone();
+            tokio::spawn(async move {
+                while let Some(request) = services.recv().await {
+                    let reply = match request.kind {
+                        ServiceKind::HostCall => {
+                            let mut bytes = request.payload.as_slice();
+                            match senax_encoder::decode::<crate::ipc::protocol::SharedCall>(
+                                &mut bytes,
+                            ) {
+                                Ok(call) if bytes.is_empty() => {
+                                    host.shared_tool(call).await.and_then(|text| {
+                                        senax_encoder::encode(&text)
+                                            .map(|bytes| bytes.to_vec())
+                                            .map_err(|e| e.to_string())
+                                    })
+                                }
+                                _ => Err("invalid notebook host call".into()),
+                            }
+                        }
+                        ServiceKind::WebCredentials => inference
+                            .web_credentials()
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|value| {
+                                senax_encoder::encode(&process::CredentialsWire {
+                                    bearer_token: value.bearer_token,
+                                    account_id: value.account_id,
+                                })
+                                .map(|bytes| bytes.to_vec())
+                                .map_err(|e| e.to_string())
+                            }),
+                    };
+                    if service_client.service_reply(request.id, reply).is_err() {
+                        break;
+                    }
+                }
+            });
+            if restored {
+                client.resume().map_err(anyhow::Error::msg)?;
+                if let Some((id, _)) = client.latest_cell().map_err(anyhow::Error::msg)? {
+                    self.cell = Some(Latest {
+                        cell: CellSide::Process {
+                            client: Arc::clone(&client),
+                            id,
+                        },
+                        // A restored cell is never an in-flight provider stream.
+                        call: Call::new("restored", String::new()),
+                        published: true,
+                    });
+                }
+                let (_, _, entries) = self.host.native_history(None).await?;
+                self.progress.last_response = entries.iter().rev().find_map(|entry| match entry {
+                    Entry::Step { at, .. } => Some(*at),
+                    _ => None,
+                });
+                for entry in &entries {
+                    match entry {
+                        Entry::AwaitingHuman { .. } => {
+                            self.awaiting = true;
+                            self.progress.ended = true;
+                        }
+                        Entry::StoppedAwaitingHuman { .. }
+                        | Entry::Received {
+                            from: Party::Human, ..
+                        } => self.awaiting = false,
+                        Entry::RequestSent { .. } => self.progress.ended = false,
+                        _ => {}
+                    }
+                }
+            }
+            self.restored = restored;
+            self.notebook = Some(NotebookSide::Process(client));
+            self.notebook_process = Some(child);
+        }
+        Ok(())
     }
 
     /// Answer from `script` instead of the role's provider.
@@ -488,9 +621,25 @@ impl Agent {
         loop {
             self.writer.check()?;
             if self.draining.is_some() && !self.responding {
+                self.drain_outbox().await?;
                 self.publish().await?;
                 self.flush().await?;
-                let _ = self.draining.take().expect("checked above").send(());
+                if let Some(process) = &self.notebook_process {
+                    if process.client.prepare().is_err() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    let result = tokio::task::block_in_place(|| process.checkpoint());
+                    self.checkpointed = result.is_ok();
+                    if let Err(error) = result {
+                        // The log is durable even when CRIU cannot save the
+                        // interpreter. A restart will use a fresh notebook.
+                        eprintln!("notebook checkpoint failed; restarting fresh: {error:#}");
+                    }
+                    let _ = self.draining.take().expect("checked above").send(Ok(()));
+                } else {
+                    let _ = self.draining.take().expect("checked above").send(Ok(()));
+                }
                 // Frozen like a retired loop; the driver cancels this future
                 // when the agent host lets go.
                 std::future::pending::<()>().await;
@@ -516,7 +665,7 @@ impl Agent {
                     Decision::Later(Some(backoff.at))
                 }
             } else {
-                wake::decide(&self.facts(), UnixMs::now())
+                wake::decide(&self.facts()?, UnixMs::now())
             };
             let recheck = match decision {
                 Decision::Now(why) => {
@@ -544,6 +693,7 @@ impl Agent {
                     None => return Ok(()),
                 },
                 Some(outbound) = self.outbox.recv() => self.outbound(outbound).await?,
+                Some((id, event)) = self.notebook_events.recv() => self.notebook_event(id, event).await?,
                 () = self.wake.notified() => {}
                 () = sleep => {}
             }
@@ -551,9 +701,13 @@ impl Agent {
     }
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
-        if let Some(notebook) = self.notebook.take() {
-            notebook.cancel();
-            notebook.shutdown().await.map_err(anyhow::Error::msg)?;
+        if !self.checkpointed {
+            if let Some(process) = self.notebook_process.take() {
+                tokio::task::block_in_place(|| process.shutdown())?;
+            } else if let Some(notebook) = self.notebook.take() {
+                notebook.cancel()?;
+                notebook.shutdown().await?;
+            }
         }
         self.flush().await?;
         Ok(())
@@ -571,11 +725,27 @@ impl Agent {
     async fn control(&mut self, control: Control) -> anyhow::Result<()> {
         match control {
             Control::Retire(reply) => {
-                if self.settled() {
+                if self.settled()? {
+                    self.drain_outbox().await?;
+                    self.publish().await?;
+                    self.flush().await?;
+                    if let Some(process) = &self.notebook_process {
+                        if let Err(error) = process.client.prepare() {
+                            let _ = reply.send(Err(anyhow::Error::msg(error)));
+                            return Ok(());
+                        }
+                        if let Err(error) = tokio::task::block_in_place(|| process.checkpoint()) {
+                            let message = format!("notebook checkpoint failed: {error:#}");
+                            let _ = reply.send(Err(anyhow::anyhow!(message.clone())));
+                            // A failed CRIU dump can leave its target stopped.
+                            // Stop this runtime rather than retaining a prepared,
+                            // potentially unusable interpreter after failed eviction.
+                            anyhow::bail!(message);
+                        }
+                        self.checkpointed = true;
+                    }
                     let _ = reply.send(Ok(()));
-                    // Freeze scheduling and admission at this serialized
-                    // boundary. The driver cancels this future on agent host
-                    // disconnect.
+                    // The driver cancels this future when the host disconnects.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));
@@ -639,23 +809,26 @@ impl Agent {
     }
 
     /// Nothing in motion, nothing waiting to be seen.
-    fn settled(&self) -> bool {
-        !self.responding
+    fn settled(&self) -> anyhow::Result<bool> {
+        Ok(!self.responding
             && self.backoff.is_none()
             && self.unread.is_empty()
-            && self.notebook.as_ref().is_none_or(|notebook| {
-                notebook
-                    .facts()
-                    .iter()
-                    .all(|source| source.finished.is_some())
-            })
-            && (self.archived || self.stopped.is_some() || self.progress.last_response.is_none())
+            && self
+                .notebook
+                .as_ref()
+                .map(NotebookSide::facts)
+                .transpose()?
+                .is_none_or(|sources| sources.iter().all(|source| source.finished.is_some()))
+            && (self.archived || self.stopped.is_some() || self.progress.last_response.is_none()))
     }
 
-    fn cell_running(&self) -> bool {
-        self.cell
+    fn cell_running(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .cell
             .as_ref()
-            .is_some_and(|latest| latest.cell.facts().finished.is_none())
+            .map(|latest| latest.cell.facts())
+            .transpose()?
+            .is_some_and(|facts| facts.finished.is_none()))
     }
 
     async fn name(&mut self, input: &str) -> anyhow::Result<()> {
@@ -669,7 +842,7 @@ impl Agent {
 
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.responding && !self.cell_running(),
+            !self.responding && !self.cell_running()?,
             "a role change is only available while idle; cancel the turn first"
         );
         let requested = match requested {
@@ -814,9 +987,11 @@ impl Agent {
     }
 
     async fn fresh_notebook(&mut self, at: UnixMs) -> anyhow::Result<()> {
-        if let Some(notebook) = self.notebook.take() {
-            notebook.cancel();
-            let _ = notebook.shutdown().await;
+        if self.notebook_process.is_none() {
+            if let Some(notebook) = self.notebook.take() {
+                notebook.cancel()?;
+                let _ = notebook.shutdown().await;
+            }
         }
         self.archived = false;
         self.fresh = true;
@@ -862,8 +1037,8 @@ impl Agent {
                 self.archived = true;
                 self.backoff = None;
                 if let Some(notebook) = self.notebook.take() {
-                    notebook.cancel();
-                    notebook.shutdown().await.map_err(anyhow::Error::msg)?;
+                    notebook.cancel()?;
+                    notebook.shutdown().await?;
                 }
                 self.cell = None;
                 if self.awaiting {
@@ -887,19 +1062,59 @@ impl Agent {
         }
     }
 
-    async fn drain_outbox(&mut self) -> anyhow::Result<()> {
-        while let Ok(outbound) = self.outbox.try_recv() {
+    async fn notebook_event(&mut self, id: u64, event: NotebookEvent) -> anyhow::Result<()> {
+        let archive = matches!(event, NotebookEvent::Archive);
+        if archive {
+            let at = UnixMs::now();
+            self.archived = true;
+            self.backoff = None;
+            if self.awaiting {
+                self.awaiting = false;
+                self.append(Entry::StoppedAwaitingHuman { at }).await?;
+            }
+            self.append(Entry::Notice {
+                at,
+                notice: Notice::Archived,
+            })
+            .await?;
+        } else {
+            let outbound = match event {
+                NotebookEvent::Send { cell, text } => Outbound::Send { cell, text },
+                NotebookEvent::Status(text) => Outbound::Status(text),
+                NotebookEvent::EndTurn => Outbound::EndTurn,
+                NotebookEvent::Archive => unreachable!(),
+            };
             self.outbound(outbound).await?;
+        }
+        self.flush().await?;
+        if let Some(process) = &self.notebook_process {
+            process.client.ack(id).map_err(anyhow::Error::msg)?;
+        }
+        if archive {
+            if let Some(process) = &self.notebook_process {
+                process.client.fresh().map_err(anyhow::Error::msg)?;
+            }
+            self.cell = None;
         }
         Ok(())
     }
 
-    fn facts(&self) -> Facts {
-        let notebook = self.progress.facts(
+    async fn drain_outbox(&mut self) -> anyhow::Result<()> {
+        while let Ok(outbound) = self.outbox.try_recv() {
+            self.outbound(outbound).await?;
+        }
+        while let Ok((id, event)) = self.notebook_events.try_recv() {
+            self.notebook_event(id, event).await?;
+        }
+        Ok(())
+    }
+
+    fn facts(&self) -> anyhow::Result<Facts> {
+        let notebook = self.progress.process_facts(
             self.notebook.as_ref(),
             self.cell.as_ref().map(|latest| &latest.cell),
-        );
-        Facts {
+        )?;
+        Ok(Facts {
             // The cell that ended the turn returns to nobody.
             finished: notebook.finished.filter(|_| !self.progress.ended),
             human: self
@@ -919,11 +1134,14 @@ impl Agent {
             archived: self.archived,
             prose_silenced: self.stopped.is_some(),
             ..notebook
-        }
+        })
     }
 
     /// Start the notebook on first use; workset setup has already completed.
-    async fn notebook(&mut self) -> anyhow::Result<&Notebook> {
+    async fn notebook(&mut self) -> anyhow::Result<&NotebookSide> {
+        if self.notebook.is_none() && self.checkpoint_dir.is_some() {
+            self.start_process().await?;
+        }
         if self.notebook.is_none() {
             let team = self.host.team().await?;
             let role = self.head.read().expect("poison").config.role;
@@ -939,7 +1157,7 @@ impl Agent {
             );
             let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
                 .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
-            self.notebook = Some(notebook);
+            self.notebook = Some(NotebookSide::Local(notebook));
         }
         Ok(self.notebook.as_ref().expect("started above"))
     }
@@ -977,7 +1195,11 @@ impl Agent {
                 notice: Notice::Restarted,
             })
             .await?;
-            report.notices.push(RequestNotice::Restarted);
+            report.notices.push(if self.restored {
+                RequestNotice::Restored
+            } else {
+                RequestNotice::Restarted
+            });
         }
         match why {
             Wake::Rewound => report.notices.push(RequestNotice::Rewound),
@@ -995,7 +1217,9 @@ impl Agent {
         if let Some(output) = self
             .notebook
             .as_ref()
-            .and_then(|notebook| notebook.report())
+            .map(NotebookSide::report)
+            .transpose()?
+            .flatten()
         {
             report.notebook = output;
         }
@@ -1044,7 +1268,7 @@ impl Agent {
         self.rewound = false;
         self.progress.ended = false;
         if let Some(notebook) = &self.notebook {
-            notebook.reset_checkin();
+            notebook.reset_checkin()?;
         }
         let turn = self.prepare_turn(instructions).await?;
         self.respond(turn).await
@@ -1101,12 +1325,12 @@ impl Agent {
                         event = async { response.as_mut().unwrap().recv().await }, if response.is_some() => {
                             match event {
                                 Some(Event::Call { carry }) => {
-                                    self.stream(&mut streaming, (Some(carry), String::new()));
+                                    self.stream(&mut streaming, (Some(carry), String::new()))?;
                                     pending_stream = true;
                                     stream_needs_runtime = true;
                                 }
                                 Some(Event::Code(code)) => {
-                                    self.stream(&mut streaming, (None, code));
+                                    self.stream(&mut streaming, (None, code))?;
                                     pending_stream = true;
                                 }
                                 Some(Event::Completed(step)) => break 'exchange Ok(step),
@@ -1118,7 +1342,7 @@ impl Agent {
                             }
                         },
                         _ = stream_frame.tick(), if pending_stream => {
-                            self.publish_stream(streaming.as_ref(), stream_needs_runtime);
+                            self.publish_stream(streaming.as_ref(), stream_needs_runtime)?;
                             pending_stream = false;
                             stream_needs_runtime = false;
                         },
@@ -1136,12 +1360,16 @@ impl Agent {
                             self.outbound(outbound).await?;
                             self.publish().await?;
                         },
+                        Some((id, event)) = self.notebook_events.recv() => {
+                            self.notebook_event(id, event).await?;
+                            self.publish().await?;
+                        },
                         () = self.wake.notified() => self.publish().await?,
                     }
                 }
             };
             if pending_stream {
-                self.publish_stream(streaming.as_ref(), stream_needs_runtime);
+                self.publish_stream(streaming.as_ref(), stream_needs_runtime)?;
             }
             match result {
                 Ok(step) => Ok((step, streaming)),
@@ -1156,7 +1384,7 @@ impl Agent {
                     // Code that already ran cannot be taken back: it stands
                     // as the step, and the model hears it was cut off.
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
-                        && let Some(ran) = latest.cell.interrupt()
+                        && let Some(ran) = latest.cell.interrupt()?
                     {
                         Err((
                             streaming.carry,
@@ -1224,13 +1452,13 @@ impl Agent {
                 if let Some(latest) = &mut self.cell {
                     // Whatever the stream missed, then the end.
                     let rest = call.code.strip_prefix(&streaming.code).unwrap_or_default();
-                    let _ = latest.cell.feed(rest.to_owned(), true);
+                    latest.cell.feed(rest.to_owned(), true)?;
                     latest.call = call;
                 }
             }
             (Some(call), None) => {
                 self.progress.prose = 0;
-                let cell = self.notebook().await?.run(call.code.clone());
+                let cell = self.notebook().await?.run(call.code.clone())?;
                 self.cell = Some(Latest {
                     cell,
                     call,
@@ -1246,7 +1474,7 @@ impl Agent {
                 if streaming.is_some()
                     && let Some(latest) = &self.cell
                 {
-                    latest.cell.stop();
+                    latest.cell.stop()?;
                 }
                 self.progress.prose += 1;
                 if self.progress.prose >= Progress::MAX_PROSE {
@@ -1278,7 +1506,7 @@ impl Agent {
     async fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
         self.backoff = None;
         if let Some(notebook) = &self.notebook {
-            notebook.cancel();
+            notebook.cancel()?;
         }
         self.cell = None;
         self.responding = false;
@@ -1306,12 +1534,12 @@ impl Agent {
         &mut self,
         streaming: &mut Option<Streaming>,
         (carry, code): (Option<Carry>, String),
-    ) {
+    ) -> anyhow::Result<()> {
         if let Some(carry) = carry
             && let Some(notebook) = &self.notebook
         {
             self.cell = Some(Latest {
-                cell: notebook.stream(),
+                cell: notebook.stream()?,
                 call: carry.with_code(String::new()),
                 published: false,
             });
@@ -1326,25 +1554,31 @@ impl Agent {
         {
             streaming.code.push_str(&code);
             latest.call.code.push_str(&code);
-            let _ = latest.cell.feed(code, false);
+            latest.cell.feed(code, false)?;
         }
+        Ok(())
     }
 
-    fn publish_stream(&mut self, streaming: Option<&Streaming>, refresh_runtime: bool) {
+    fn publish_stream(
+        &mut self,
+        streaming: Option<&Streaming>,
+        refresh_runtime: bool,
+    ) -> anyhow::Result<()> {
         self.writing = streaming.map(|stream| stream.carry.with_code(stream.code.clone()));
         if refresh_runtime {
             // Starting a cell changes occupancy; subsequent fragments do not.
-            *self.status.write().expect("poison") = self.status();
+            *self.status.write().expect("poison") = self.status()?;
         } else {
             // Notebook and mail events publish runtime independently. A code
             // frame changes the response and its derived draft, not runtime.
             let response = self.response();
-            let draft = self.draft();
+            let draft = self.draft()?;
             let mut status = self.status.write().expect("poison");
             status.response = response;
             status.draft = draft;
         }
         self.host.published();
+        Ok(())
     }
 
     fn response(&self) -> Option<StreamingResponse> {
@@ -1362,24 +1596,22 @@ impl Agent {
                 .collect(),
         })
     }
-
-    fn draft(&self) -> Option<String> {
-        self.cell
-            .as_ref()
-            .filter(|latest| {
-                !latest.published && (self.responding || latest.cell.facts().finished.is_none())
-            })
-            .and_then(|latest| {
-                super::shared::python_preview::tool_preview(
-                    "exec",
-                    &latest.call.code,
-                    ArgumentsFormat::Text,
-                )
-            })
+    fn draft(&self) -> anyhow::Result<Option<String>> {
+        let Some(latest) = self.cell.as_ref().filter(|latest| !latest.published) else {
+            return Ok(None);
+        };
+        if !self.responding && latest.cell.facts()?.finished.is_some() {
+            return Ok(None);
+        }
+        Ok(super::shared::python_preview::tool_preview(
+            "exec",
+            &latest.call.code,
+            ArgumentsFormat::Text,
+        ))
     }
 
     /// What a reader sees, built from the loop's own state.
-    fn status(&self) -> AgentStatus {
+    fn status(&self) -> anyhow::Result<AgentStatus> {
         let inference = if let Some(backoff) = &self.backoff {
             InferenceState::Retrying {
                 at: backoff.at,
@@ -1394,40 +1626,43 @@ impl Agent {
         } else {
             InferenceState::Idle
         };
-        AgentStatus {
+        let running_tasks = self
+            .notebook
+            .as_ref()
+            .map(NotebookSide::facts)
+            .transpose()?
+            .unwrap_or_default()
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source.kind,
+                    rho_notebook::Kind::Cell | rho_notebook::Kind::Task
+                ) && source.finished.is_none()
+            })
+            .count() as u32;
+        Ok(AgentStatus {
             runtime: RuntimeState {
                 inference,
-                running_tasks: self.notebook.as_ref().map_or(0, |notebook| {
-                    notebook
-                        .facts()
-                        .iter()
-                        .filter(|source| {
-                            matches!(
-                                source.kind,
-                                rho_notebook::Kind::Cell | rho_notebook::Kind::Task
-                            ) && source.finished.is_none()
-                        })
-                        .count() as u32
-                }),
+                running_tasks,
                 awaiting_human: self.awaiting,
                 checkin_at: if self.archived || self.stopped.is_some() {
                     None
                 } else {
-                    self.facts().checkin
+                    self.facts()?.checkin
                 },
                 archived: self.archived,
             },
             response: self.response(),
-            draft: self.draft(),
+            draft: self.draft()?,
             queued: self.unread.len(),
-        }
+        })
     }
 
     /// Durable history is committed before replacing the live response.
     /// Current occupancy is published directly, never appended to history.
     async fn publish(&mut self) -> anyhow::Result<()> {
         self.flush().await?;
-        let status = self.status();
+        let status = self.status()?;
         let working = status.runtime.is_working();
         if working != self.working {
             let edge = if working {

@@ -4,8 +4,13 @@
 
 The native `Agent` and `ClaudeLoop` are separate concrete runtimes. There is no
 universal runtime trait and Claude Code is not a raw inference provider.
-One workset process contains its agents' runtimes, notebooks, local tools,
-jobs, provider transports, retained terminals, and interactive shells. The agent host alone owns the shared
+One workset process contains its agents' runtimes, provider transports,
+retained terminals, and interactive shells. Each native Python notebook runs in
+its own child process with its local tools and jobs, reachable through a typed
+Unix channel. A small notebook-only guardian owns its private PID/mount namespace
+and its checkpoint lifecycle; it does not change the workset's user identity.
+Planned workset drains checkpoint those children after the agent log is
+committed; only completed snapshots are eligible for restore. The agent host alone owns the shared
 database, account and route policy, naming tasks, workset allocation, pool,
 subscriptions, and UI projection. Each runtime serializes its own controls and
 scheduling. Native events replicate through an ordered, bounded background writer;

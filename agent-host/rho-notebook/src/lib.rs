@@ -6,6 +6,7 @@
 mod commands;
 mod interpreter;
 mod notebook;
+pub mod process;
 mod runtime;
 mod source;
 #[cfg(test)]

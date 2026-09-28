@@ -51,7 +51,7 @@ pub enum Wake {
     Checkin,
     /// The last step wrote prose and made no call.
     Prose,
-    /// The host restarted; everything running is gone.
+    /// The host restarted; the next request describes whether Python survived.
     Restarted,
     /// The model's history branched; notebook state was not changed.
     Rewound,
@@ -135,6 +135,7 @@ pub enum RequestNotice {
     PreviousResponseHadNoExec,
     Checkin,
     NothingNew,
+    Restored,
 }
 
 impl RequestNotice {
@@ -142,6 +143,9 @@ impl RequestNotice {
         match self {
             Self::Restarted => {
                 "rho restarted. Your notebook and everything running in it are gone, and their side effects may remain. Check the current state before carrying on."
+            }
+            Self::Restored => {
+                "rho restarted. Your Python notebook and its running tasks were restored; check external state before carrying on."
             }
             Self::Rewound => {
                 "The human rewound your visible history. Your Python notebook, running work, and side effects were not rewound. Check the current state before continuing."

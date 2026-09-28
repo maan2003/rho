@@ -7,7 +7,9 @@ pub(crate) mod tools;
 pub(crate) mod wake;
 
 use rho_agent_types::UnixMs;
-use rho_notebook::{CellHandle, Notebook};
+use rho_notebook::{CellHandle, Notebook, SourceFacts};
+
+use crate::worker::native::notebook::{CellSide, NotebookSide};
 
 /// The model's attention, independent of how a provider delivers its replies.
 /// A response is not a task ending, and a report is not a task finishing.
@@ -28,9 +30,34 @@ impl Progress {
         let wait = notebook
             .map(Notebook::checkin)
             .unwrap_or(wake::DEFAULT_CHECKIN);
+        self.source_facts(&sources, wait, latest.map(CellHandle::facts))
+    }
+
+    pub fn process_facts(
+        &self,
+        notebook: Option<&NotebookSide>,
+        latest: Option<&CellSide>,
+    ) -> anyhow::Result<wake::Facts> {
+        let sources = notebook
+            .map(NotebookSide::facts)
+            .transpose()?
+            .unwrap_or_default();
+        let wait = notebook
+            .map(NotebookSide::checkin)
+            .transpose()?
+            .unwrap_or(wake::DEFAULT_CHECKIN);
+        Ok(self.source_facts(&sources, wait, latest.map(CellSide::facts).transpose()?))
+    }
+
+    fn source_facts(
+        &self,
+        sources: &[SourceFacts],
+        wait: std::time::Duration,
+        latest: Option<SourceFacts>,
+    ) -> wake::Facts {
         wake::Facts {
             finished: latest
-                .and_then(|cell| cell.facts().finished)
+                .and_then(|facts| facts.finished)
                 .filter(|end| !end.failed && !self.told_returned)
                 .map(|end| end.at),
             notified: sources

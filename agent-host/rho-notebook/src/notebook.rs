@@ -369,6 +369,11 @@ pub struct CellHandle {
 }
 
 impl CellHandle {
+    /// The notebook-lifetime-unique identity used by its owner.
+    pub fn id(&self) -> u64 {
+        self.cell.id.0
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.cell.id.session()
     }
