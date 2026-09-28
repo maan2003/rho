@@ -43,6 +43,11 @@ pub enum ModelMsg {
         agent_id: AgentId,
         rows: Vec<(AgentPos, TranscriptEvent)>,
     },
+    /// Runtime status for an agent without an open transcript.
+    Runtime {
+        agent_id: AgentId,
+        state: crate::protocol::transcript::RuntimeState,
+    },
     /// The live tail of an agent the main thread follows.
     Live { agent_id: AgentId, live: Live },
     /// Whose agents these are: the host's database seed, which agent ids
@@ -252,14 +257,15 @@ impl Model {
                 msg: ModelMsg::Auth { auth },
             }],
             AgentFrame::Log { entries } => self.told(host, entries),
-            // A live tell for an agent no screen is reading says nothing
-            // the digest does not: what a reader sees of it comes from the
-            // Turn rows the fold already folded. Dropping it here is what
-            // keeps a connect from costing the main thread one rebuild per
-            // agent.
             AgentFrame::Live { agent_id, live } => {
                 if !self.followed.contains(&agent_id) {
-                    return Vec::new();
+                    return match live {
+                        Live::Snapshot { state, .. } => vec![ModelEvent {
+                            host,
+                            msg: ModelMsg::Runtime { agent_id, state },
+                        }],
+                        Live::Queued { .. } => Vec::new(),
+                    };
                 }
                 vec![ModelEvent {
                     host,
@@ -595,7 +601,10 @@ mod tests {
     fn live(agent_id: AgentId) -> AgentFrame {
         AgentFrame::Live {
             agent_id,
-            live: crate::protocol::transcript::Live::Idle,
+            live: crate::protocol::transcript::Live::Snapshot {
+                state: Default::default(),
+                response: None,
+            },
         }
     }
 
@@ -661,19 +670,44 @@ mod tests {
     }
 
     #[test]
-    fn a_live_tell_for_an_agent_nobody_reads_stops_here() {
+    fn unfollowed_snapshots_deliver_status_without_a_response_or_transcript() {
+        use crate::protocol::transcript::{InferenceState, StreamingResponse};
         let mut model = Model::new();
         model.attach(HOST, "local".to_owned());
         model.ingest(HOST, ready(0));
         model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
-
-        let read = model.ingest(HOST, live(agent(1)));
-        assert_eq!(read.len(), 1, "the tail of a followed agent goes up");
-
-        let unread = model.ingest(HOST, live(agent(2)));
+        let snapshot = AgentFrame::Live {
+            agent_id: agent(2),
+            live: Live::Snapshot {
+                state: crate::protocol::transcript::RuntimeState {
+                    inference: InferenceState::Responding,
+                    running_tasks: 3,
+                    ..Default::default()
+                },
+                response: Some(StreamingResponse {
+                    id: "private-response".into(),
+                    items: vec![],
+                }),
+            },
+        };
+        let received = model.ingest(HOST, snapshot);
         assert!(
-            unread.is_empty(),
-            "a connect tells every agent's tail; only the read ones cost the main thread anything"
+            matches!(&received[0].msg, ModelMsg::Runtime { agent_id, state } if *agent_id == agent(2) && state.running_tasks == 3)
+        );
+        assert_eq!(received.len(), 1);
+        assert!(
+            model
+                .ingest(
+                    HOST,
+                    AgentFrame::Live {
+                        agent_id: agent(2),
+                        live: Live::Queued { items: vec![] }
+                    }
+                )
+                .is_empty()
+        );
+        assert!(
+            matches!(&model.ingest(HOST, live(agent(1)))[0].msg, ModelMsg::Live { agent_id, .. } if *agent_id == agent(1))
         );
     }
 

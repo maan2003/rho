@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, TurnEdge};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq};
 use rho_agents_client::protocol::transcript::{DetailBody, TranscriptEvent};
 use rho_agents_client::protocol::{
     AgentCommand, ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame,
@@ -70,10 +70,10 @@ struct FakeMetrics {
 
 struct Children(Vec<Child>);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ExpectedDetail {
-    Response,
-    Results,
+    Response(Vec<rho_agents_client::protocol::transcript::Item>),
+    Report(Vec<String>),
 }
 
 impl Drop for Children {
@@ -219,8 +219,14 @@ async fn run_async(args: Args) -> Result<()> {
     let deadline = started + Duration::from_secs(args.seconds);
     let mut agents = HashSet::new();
     let mut expected_pos: HashMap<AgentId, AgentPos> = HashMap::new();
-    let mut sent_at = HashMap::new();
-    let mut open_turns = HashSet::new();
+    let mut report_at = HashMap::new();
+    let mut responding = HashSet::new();
+    let mut awaiting = HashSet::new();
+    let mut received = HashMap::new();
+    let mut delivered_ids = HashSet::new();
+    let mut reported_calls = HashSet::new();
+    let mut messages_sent = 0usize;
+    let mut reported_output_sizes = Vec::new();
     let mut pending_details = HashMap::new();
     let mut latencies = Vec::new();
     let mut replies = 0u64;
@@ -229,8 +235,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut calls = 0usize;
     let mut compacted = 0u64;
     let mut clarifying = 0u64;
-    let mut result_sizes = Vec::new();
-    let mut tool_durations_ms = Vec::new();
+
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
     let mut last_seq = Seq(0);
     let quiesce_deadline = deadline
@@ -244,8 +249,10 @@ async fn run_async(args: Args) -> Result<()> {
         };
 
     loop {
-        let all_idle =
-            agents.len() == agent_count && open_turns.is_empty() && pending_details.is_empty();
+        let all_idle = agents.len() == agent_count
+            && responding.is_empty()
+            && pending_details.is_empty()
+            && (args.scenario == Scenario::Baseline || awaiting.len() == agent_count);
         if (args.scenario != Scenario::Baseline
             && all_idle
             && scenario_complete(
@@ -255,7 +262,8 @@ async fn run_async(args: Args) -> Result<()> {
                 calls,
                 compacted,
                 clarifying,
-                result_sizes.len(),
+                reported_calls.len(),
+                messages_sent,
                 &latencies,
             ))
             || (Instant::now() >= deadline && all_idle)
@@ -291,6 +299,19 @@ async fn run_async(args: Args) -> Result<()> {
                     "agent host created more than {agent_count} agents"
                 );
             }
+            Incoming::Agents(AgentsServerFrame::Live {
+                agent_id,
+                live: rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
+            }) => {
+                if matches!(
+                    state.inference,
+                    rho_agents_client::protocol::transcript::InferenceState::Responding
+                ) {
+                    responding.insert(agent_id);
+                } else {
+                    responding.remove(&agent_id);
+                }
+            }
             Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
                     ensure!(
@@ -318,35 +339,79 @@ async fn run_async(args: Args) -> Result<()> {
                             );
                             agents.insert(entry.agent_id);
                         }
-                        TranscriptEvent::Sent { results, at, .. } => {
-                            for result in &results {
-                                tool_durations_ms.push(
-                                    result
-                                        .finished_at
-                                        .saturating_duration_since(result.started_at),
+                        TranscriptEvent::Received { id, from, text, .. } => {
+                            ensure!(from.is_none(), "unexpected peer message in isolated proof");
+                            ensure!(!text.is_empty(), "empty human message");
+                            ensure!(
+                                received.insert((entry.agent_id, id), ()).is_none(),
+                                "duplicate received message id"
+                            );
+                        }
+                        TranscriptEvent::NotebookReport {
+                            calls: answered,
+                            delivered,
+                            acknowledged,
+                            at,
+                            ..
+                        } => {
+                            for id in delivered {
+                                ensure!(
+                                    received.contains_key(&(entry.agent_id, id)),
+                                    "report delivered an unknown message"
                                 );
-                                if args.scenario == Scenario::RealToolRounds {
-                                    ensure!(
-                                        result.status
-                                            == rho_agents_client::protocol::transcript::ToolStatus::Success,
-                                        "real-tool-rounds tool failed"
-                                    );
-                                }
+                                ensure!(
+                                    delivered_ids.insert((entry.agent_id, id)),
+                                    "message delivered twice"
+                                );
                             }
-                            sent_at.insert(entry.agent_id, at);
-                            if !results.is_empty() {
-                                pending_details
-                                    .insert((entry.agent_id, entry.pos), ExpectedDetail::Results);
+                            for id in acknowledged {
+                                ensure!(
+                                    received.contains_key(&(entry.agent_id, id)),
+                                    "report acknowledged an unknown message"
+                                );
+                            }
+                            for id in &answered {
+                                ensure!(
+                                    reported_calls.insert((entry.agent_id, id.clone())),
+                                    "provider call was answered twice"
+                                );
+                            }
+                            if !answered.is_empty() {
+                                pending_details.insert(
+                                    (entry.agent_id, entry.pos),
+                                    ExpectedDetail::Report(answered),
+                                );
                                 client
                                     .send_agents(&AgentsClientFrame::Detail {
                                         agent_id: entry.agent_id,
                                         pos: entry.pos,
-                                        // One position per request here; the
-                                        // GUI batches a chunk's into one.
                                         more: Vec::new(),
                                     })
                                     .await?;
                             }
+                            report_at.insert(entry.agent_id, at);
+                        }
+                        TranscriptEvent::AwaitingHuman { since, .. } => {
+                            if since.is_some() {
+                                awaiting.insert(entry.agent_id);
+                                if args.scenario == Scenario::Baseline && Instant::now() < deadline
+                                {
+                                    let cycle = cycles.entry(entry.agent_id).or_default();
+                                    *cycle += 1;
+                                    client.send(AgentCommand::Send {
+                                        agent_id: entry.agent_id,
+                                        content: prompt(0, *cycle),
+                                    });
+                                }
+                            } else {
+                                awaiting.remove(&entry.agent_id);
+                            }
+                        }
+                        TranscriptEvent::MessageSent { to, text, .. } => {
+                            ensure!(to.is_none(), "fake agent sent mail to another agent");
+                            ensure!(!text.trim().is_empty(), "empty user-facing message");
+                            messages_sent += 1;
+                            clarifying += u64::from(text.trim_end().ends_with('?'));
                         }
                         TranscriptEvent::Replied {
                             items,
@@ -354,45 +419,43 @@ async fn run_async(args: Args) -> Result<()> {
                             at,
                             ..
                         } => {
-                            let sent = sent_at
-                                .remove(&entry.agent_id)
-                                .context("Replied without preceding Sent")?;
-                            latencies.push(at.saturating_duration_since(sent));
+                            // A usage row is a second Replied event, not another model step.
+                            if items.is_empty() && !did_compact {
+                                continue;
+                            }
+                            let started = report_at
+                                .get(&entry.agent_id)
+                                .context("Replied without preceding NotebookReport")?;
+                            latencies.push(at.saturating_duration_since(*started));
                             replies += 1;
-                            calls += items
-                                .iter()
-                                .filter(|item| {
-                                    matches!(
-                                        item,
-                                        rho_agents_client::protocol::transcript::Item::ToolCall { .. }
-                                    )
-                                })
-                                .count();
-                            compacted += u64::from(did_compact);
-                            clarifying += u64::from(
+                            calls +=
                                 items
                                     .iter()
-                                    .rev()
-                                    .find_map(|item| match item {
-                                        rho_agents_client::protocol::transcript::Item::Text {
-                                            text,
-                                            ..
-                                        } => Some(text),
-                                        _ => None,
+                                    .filter(|item| {
+                                        matches!(item,
+                                rho_agents_client::protocol::transcript::Item::ToolCall { .. }
+                            )
                                     })
-                                    .is_some_and(|text| text.trim_end().ends_with('?')),
-                            );
-                            pending_details
-                                .insert((entry.agent_id, entry.pos), ExpectedDetail::Response);
-                            client
-                                .send_agents(&AgentsClientFrame::Detail {
-                                    agent_id: entry.agent_id,
-                                    pos: entry.pos,
-                                    // Exercise detail retrieval independently of the GUI,
-                                    // which does not fetch tool output.
-                                    more: Vec::new(),
-                                })
-                                .await?;
+                                    .count();
+                            compacted += u64::from(did_compact);
+                            if !items.is_empty() {
+                                ensure!(items.iter().all(|item| matches!(item,
+                                    rho_agents_client::protocol::transcript::Item::ToolCall { name, arguments, format, .. }
+                                        if name == "exec" && !arguments.is_empty()
+                                            && *format == rho_agents_client::protocol::transcript::ArgumentsFormat::Text
+                                )), "native response contained prose or a non-exec tool");
+                                pending_details.insert(
+                                    (entry.agent_id, entry.pos),
+                                    ExpectedDetail::Response(items),
+                                );
+                                client
+                                    .send_agents(&AgentsClientFrame::Detail {
+                                        agent_id: entry.agent_id,
+                                        pos: entry.pos,
+                                        more: Vec::new(),
+                                    })
+                                    .await?;
+                            }
                         }
                         TranscriptEvent::Failed {
                             retrying: is_retrying,
@@ -400,27 +463,6 @@ async fn run_async(args: Args) -> Result<()> {
                         } => {
                             failed += 1;
                             retrying += u64::from(is_retrying);
-                        }
-                        TranscriptEvent::Turn {
-                            edge: TurnEdge::Started,
-                            ..
-                        } => {
-                            open_turns.insert(entry.agent_id);
-                        }
-                        TranscriptEvent::Turn {
-                            edge: TurnEdge::Ended(_),
-                            ..
-                        } => {
-                            open_turns.remove(&entry.agent_id);
-                            if args.scenario == Scenario::Baseline && Instant::now() < deadline {
-                                let cycle = cycles.entry(entry.agent_id).or_default();
-                                *cycle += 1;
-                                client.send(AgentCommand::Send {
-                                    agent_id: entry.agent_id,
-                                    content: prompt(0, *cycle),
-                                    delivery: MessageDelivery::Immediate,
-                                });
-                            }
                         }
                         _ => {}
                     }
@@ -435,9 +477,34 @@ async fn run_async(args: Args) -> Result<()> {
                     .remove(&(agent_id, pos))
                     .context("unexpected Detail response")?;
                 match (expected, body) {
-                    (ExpectedDetail::Response, DetailBody::Response(_)) => {}
-                    (ExpectedDetail::Results, DetailBody::Results(results)) => {
-                        result_sizes.extend(results.into_iter().map(|result| result.output.len()));
+                    (ExpectedDetail::Response(visible), DetailBody::Response(detail)) => {
+                        ensure!(
+                            detail == visible,
+                            "response detail did not match visible code calls"
+                        );
+                    }
+                    (ExpectedDetail::Report(ids), DetailBody::Results(results)) => {
+                        ensure!(results.len() == ids.len(), "report detail omitted calls");
+                        for (result, id) in results.iter().zip(ids) {
+                            ensure!(
+                                result.id == id,
+                                "report detail named a different provider call"
+                            );
+                            ensure!(result.status == rho_agents_client::protocol::transcript::ToolStatus::Reported,
+                                "notebook report was mistaken for a successful tool result");
+                            ensure!(
+                                !result.output.is_empty(),
+                                "empty notebook report for a provider call"
+                            );
+                            if args.scenario == Scenario::RealToolRounds {
+                                let step = reported_output_sizes.len() + 1;
+                                ensure!(
+                                    result.output.contains(&format!("rho-e2e-step-{step}:ok")),
+                                    "real shell command did not report its expected step marker"
+                                );
+                            }
+                            reported_output_sizes.push(result.output.len());
+                        }
                     }
                     _ => bail!("agent host Detail body did not match its journal event"),
                 }
@@ -455,6 +522,18 @@ async fn run_async(args: Args) -> Result<()> {
         agents.len()
     );
     ensure!(!latencies.is_empty(), "no model replies completed");
+    ensure!(
+        messages_sent > 0,
+        "model prose did not become a human.send delivery"
+    );
+    ensure!(
+        received.len() >= agent_count,
+        "not every agent received a message"
+    );
+    ensure!(
+        delivered_ids.len() >= agent_count,
+        "not every agent delivered a message to its model"
+    );
 
     let final_head = Streams::open(connect(&socket).await?, &socket)
         .await?
@@ -481,7 +560,6 @@ async fn run_async(args: Args) -> Result<()> {
     );
     if args.rounds <= REAL_TOOL_ROUNDS {
         println!("MODEL_IDLE_GAPS_US {:?}", metrics.idle_gaps_us);
-        println!("TOOL_DURATIONS_MS {:?}", tool_durations_ms);
     }
     if args.scenario == Scenario::RealToolRounds {
         ensure!(
@@ -489,24 +567,13 @@ async fn run_async(args: Args) -> Result<()> {
             "missing model request gaps"
         );
         let gaps = &metrics.idle_gaps_us[metrics.idle_gaps_us.len() - args.rounds..];
-        for start in (0..args.rounds).step_by((args.rounds / 10).max(20)) {
-            let end = (start + (args.rounds / 10).max(20)).min(args.rounds);
-            let first = start.max(1); // exclude the first, cold tool round
-            if first >= end {
-                continue;
-            }
-            let mut sorted = gaps[first..end].to_vec();
-            sorted.sort_unstable();
-            println!(
-                "WARM_ROUNDS {}-{} gap_mean_us={} gap_p50_us={} gap_p95_us={} tool_mean_ms={:.2}",
-                first + 1,
-                end,
-                sorted.iter().sum::<u64>() / sorted.len() as u64,
-                percentile(&sorted, 50),
-                percentile(&sorted, 95),
-                tool_durations_ms[first..end].iter().sum::<u64>() as f64 / (end - first) as f64
-            );
-        }
+        let mut sorted = gaps.to_vec();
+        sorted.sort_unstable();
+        println!(
+            "WARM_ROUNDS gap_p50_us={} gap_p95_us={}",
+            percentile(&sorted, 50),
+            percentile(&sorted, 95)
+        );
     }
     println!(
         "END_TO_END_US total={} model_active={} between_requests={} outside_request_window={}",
@@ -525,17 +592,17 @@ async fn run_async(args: Args) -> Result<()> {
             calls,
             compacted,
             clarifying,
-            result_sizes: &result_sizes,
+            reported_calls: reported_calls.len(),
+            messages_sent,
             latencies: &latencies,
             model_result_max: metrics.max_input_tool_output_bytes,
+            reported_output_sizes: &reported_output_sizes,
         },
     )
     .err();
-    let mut sorted_result_sizes = result_sizes.clone();
-    sorted_result_sizes.sort_unstable();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} journal_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} reported_calls={} messages_sent={} delivered={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} report_reply_p50_ms={} report_reply_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} journal_head={}",
         args.scenario.as_str(),
         agent_count,
         args.seconds,
@@ -545,12 +612,9 @@ async fn run_async(args: Args) -> Result<()> {
         calls,
         compacted,
         clarifying,
-        result_sizes.len(),
-        result_sizes.iter().sum::<usize>(),
-        usize_percentile(&sorted_result_sizes, 50),
-        result_sizes.iter().sum::<usize>() / result_sizes.len().max(1),
-        usize_percentile(&sorted_result_sizes, 90),
-        sorted_result_sizes.last().copied().unwrap_or(0),
+        reported_calls.len(),
+        messages_sent,
+        delivered_ids.len(),
         metrics.max_input_tool_output_bytes,
         metrics.completed_turns as f64 / elapsed,
         metrics.completed_turns,
@@ -574,19 +638,22 @@ fn scenario_complete(
     calls: usize,
     compacted: u64,
     clarifying: u64,
-    results: usize,
+    reported_calls: usize,
+    messages_sent: usize,
     latencies: &[u64],
 ) -> bool {
     match scenario {
-        Scenario::RealToolRounds => calls == rounds && results == rounds && !latencies.is_empty(),
         Scenario::Baseline => false,
-        Scenario::RateLimit => failed >= 2 && !latencies.is_empty(),
-        Scenario::StreamCut => failed >= 1 && !latencies.is_empty(),
-        Scenario::SlowTrickle => !latencies.is_empty(),
-        Scenario::HugeToolOutput => results >= 100,
-        Scenario::FortyToolCalls => calls >= 40 && results >= 40,
-        Scenario::ReasoningCompaction => compacted >= 1,
-        Scenario::ClarifyingQuestion => clarifying >= 1,
+        Scenario::RealToolRounds => {
+            calls == rounds + 1 && reported_calls == rounds && messages_sent >= 1
+        }
+        Scenario::RateLimit => failed >= 2 && messages_sent >= 1,
+        Scenario::StreamCut => failed >= 1 && messages_sent >= 1,
+        Scenario::SlowTrickle => messages_sent >= 1 && !latencies.is_empty(),
+        Scenario::HugeToolOutput => calls >= 101 && reported_calls >= 100 && messages_sent >= 1,
+        Scenario::FortyToolCalls => calls >= 41 && reported_calls >= 40 && messages_sent >= 1,
+        Scenario::ReasoningCompaction => compacted >= 1 && messages_sent >= 1,
+        Scenario::ClarifyingQuestion => clarifying >= 1 && messages_sent >= 1,
     }
 }
 
@@ -596,19 +663,22 @@ struct ScenarioResults<'a> {
     calls: usize,
     compacted: u64,
     clarifying: u64,
-    result_sizes: &'a [usize],
+    reported_calls: usize,
+    messages_sent: usize,
     latencies: &'a [u64],
     model_result_max: u64,
+    reported_output_sizes: &'a [usize],
 }
 
 fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<'_>) -> Result<()> {
     match scenario {
         Scenario::RealToolRounds => {
             ensure!(
-                results.calls == rounds
-                    && results.result_sizes.len() == rounds
+                results.calls == rounds + 1
+                    && results.reported_calls == rounds
+                    && results.messages_sent == 1
                     && results.failed == 0,
-                "real-tool-rounds did not complete all expected successful tool exchanges"
+                "real-tool-rounds did not complete all sequential exchanges and send a final message"
             );
         }
         Scenario::Baseline => {}
@@ -640,28 +710,33 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
         }
         Scenario::HugeToolOutput => {
             ensure!(
-                results.result_sizes.len() == 100,
-                "expected 100 tool results"
-            );
-            let mut sorted = results.result_sizes.to_vec();
-            sorted.sort_unstable();
-            ensure!(usize_percentile(&sorted, 50) == 227, "result p50 drifted");
-            ensure!(
-                results.result_sizes.iter().sum::<usize>() / 100 == 4_047,
-                "result mean drifted"
+                results.calls == 101 && results.reported_calls == 100,
+                "100 sequential heavy-tail cells were not answered before the final message"
             );
             ensure!(
-                usize_percentile(&sorted, 90) == 13_097,
-                "result p90 drifted"
+                results.model_result_max >= 7_000 && results.model_result_max <= 40_100,
+                "model-facing output did not exercise or exceeded the 10,000-token budget"
             );
-            ensure!(sorted.last() == Some(&170_448), "result max drifted");
             ensure!(
-                results.model_result_max <= 40_100,
-                "model-facing result exceeded its 10,000-token budget"
+                results.reported_output_sizes.len() == 100,
+                "missing notebook detail for heavy-tail calls"
+            );
+            let mut sizes = results.reported_output_sizes.to_vec();
+            sizes.sort_unstable();
+            ensure!(
+                sizes[49] >= 227 && sizes[49] < 2_000,
+                "heavy-tail median report drifted"
+            );
+            ensure!(
+                sizes[89] >= 5_000 && sizes[99] >= 7_000,
+                "heavy-tail report tail was not preserved"
             );
         }
         Scenario::FortyToolCalls => {
-            ensure!(results.calls == 40, "agent host did not retain forty calls")
+            ensure!(
+                results.calls == 41 && results.reported_calls == 40,
+                "forty sequential cells were not answered before the final message"
+            );
         }
         Scenario::ReasoningCompaction => {
             ensure!(
@@ -675,8 +750,8 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
                 "client did not see the clarifying question"
             );
             ensure!(
-                results.calls == 0,
-                "clarifying persona unexpectedly called a tool"
+                results.calls == 1 && results.messages_sent == 1,
+                "clarifying question was not delivered by a single exec call"
             );
         }
     }
@@ -794,13 +869,6 @@ fn only_loopback<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
 
 fn percentile(sorted: &[u64], percent: usize) -> u64 {
     sorted[(sorted.len() * percent).div_ceil(100).saturating_sub(1)]
-}
-
-fn usize_percentile(sorted: &[usize], percent: usize) -> usize {
-    sorted
-        .get((sorted.len() * percent).div_ceil(100).saturating_sub(1))
-        .copied()
-        .unwrap_or(0)
 }
 
 fn vmrss_kib(pid: u32) -> Result<u64> {

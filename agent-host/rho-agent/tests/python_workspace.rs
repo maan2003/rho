@@ -2,8 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent::python::PythonNotebook;
-use rho_inference::types::ExecCall;
+use rho_notebook::Notebook;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 use rho_tool_shell::ShellTools;
@@ -24,36 +23,36 @@ fn main() {
         eprintln!("skipping python_workspace: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    common::run("", |base| async move {
+    common::run("", || async move {
         let host_cwd = std::env::current_dir().unwrap();
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
         let work = std::path::Path::new("/src");
         std::fs::create_dir_all(work.join("project")).unwrap();
         std::fs::write(work.join("project/value"), "host").unwrap();
-        let view = base.for_cwd(camino::Utf8Path::new("/src/project")).unwrap();
-        let tool =
-            PythonNotebook::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let cell = tool.exec(ExecCall {
-            id: "view".try_into().unwrap(),
-            source: "assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into(),
-        }, wake.clone());
+        let notebook = Notebook::new(
+            ShellTools::in_directory(
+                Duration::from_secs(5),
+                "/src/project".into(),
+                Default::default(),
+            ),
+            vec![],
+            wake.clone(),
+        )
+        .unwrap();
+        let cell = notebook.run("assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into());
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !cell.quiescent() {
+            while cell.facts().finished.is_none() {
                 wake.notified().await;
             }
         })
         .await
         .unwrap();
-        let output = cell.first_output();
-        cell.acknowledge_output();
-        assert_eq!(
-            output.status,
-            rho_agent_types::ToolOutputStatus::Success,
-            "{output:?}"
-        );
-        assert!(output.output.contains("/src/project"), "{output:?}");
+        let end = cell.facts().finished.unwrap();
+        let report = notebook.report().unwrap_or_default();
+        assert!(!end.failed, "{report:?}");
+        assert!(report.render().text.contains("/src/project"), "{report:?}");
         assert_eq!(
             std::fs::read_to_string(work.join("project/value")).unwrap(),
             "python"

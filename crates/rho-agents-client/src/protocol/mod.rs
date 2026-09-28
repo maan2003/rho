@@ -8,9 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, WorksetMode, WorkspaceInfo,
-};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq, WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -215,11 +213,9 @@ pub enum AgentCommand {
     Send {
         agent_id: AgentId,
         content: Vec<ContentPart>,
-        delivery: MessageDelivery,
     },
     Compact {
         agent_id: AgentId,
-        delivery: MessageDelivery,
     },
     ChangeRole {
         agent_id: AgentId,
@@ -379,22 +375,30 @@ mod tests {
             more: vec![AgentPos(4), AgentPos(9)],
         });
         for live in [
-            Live::Requesting,
-            Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "hel".to_owned(),
-                    phase: Some(TextPhase::FinalAnswer),
+            Live::Snapshot {
+                state: transcript::RuntimeState {
+                    inference: transcript::InferenceState::Retrying {
+                        at: rho_agent_types::UnixMs(5),
+                        error: "temporary".into(),
+                    },
+                    running_tasks: 2,
+                    awaiting_human: true,
+                    checkin_at: Some(rho_agent_types::UnixMs(7)),
+                    archived: false,
                 },
+                response: Some(transcript::StreamingResponse {
+                    id: "response-1".into(),
+                    items: vec![Item::Text {
+                        text: "hello".into(),
+                        phase: Some(TextPhase::FinalAnswer),
+                    }],
+                }),
             },
-            Live::Appended {
-                index: 0,
-                text: "lo".to_owned(),
+            Live::Snapshot {
+                state: Default::default(),
+                response: None,
             },
-            Live::Waiting {
-                until: Some(rho_agent_types::UnixMs(5)),
-            },
-            Live::Idle,
+            Live::Queued { items: vec![] },
         ] {
             round_trips(ServerFrame::Live { agent_id, live });
         }
@@ -427,9 +431,10 @@ mod tests {
                         data: vec![1, 2, 3],
                     },
                 ],
-                delivery: MessageDelivery::NextRequest,
             }
             .into(),
+            AgentCommand::Compact { agent_id }.into(),
+            AgentCommand::Cancel { agent_id }.into(),
         ] {
             round_trips(Open::Request(request));
         }

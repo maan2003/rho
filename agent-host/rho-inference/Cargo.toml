@@ -7,7 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-inventory = "0.3"
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
@@ -20,10 +19,12 @@ futures-util.workspace = true
 rand.workspace = true
 rpassword.workspace = true
 rho-agent-types.workspace = true
+rho-agent.workspace = true
+rho-web-search.workspace = true
 rho-db.workspace = true
 redb.workspace = true
 rustls.workspace = true
-senax-encoder = { workspace = true, features = ["serde_json"] }
+senax-encoder = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -35,4 +36,13 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rho-rpc.workspace = true
+rho-terminal.workspace = true
+rho-shell-view.workspace = true
+rustix = { version = "1", features = ["process"] }
+rho-fs-view.workspace = true
+rho-claude.workspace = true
+camino.workspace = true
+
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

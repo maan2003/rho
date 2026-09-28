@@ -16,7 +16,6 @@ use rho_agent_types::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
@@ -24,8 +23,6 @@ mod call_punctuation;
 mod editor_shutdown;
 mod elision_block_geometry;
 mod elision_caret;
-mod elision_paging;
-mod elision_unfold;
 mod fold_accounting_streaming;
 mod fold_cost;
 mod fold_widen_bias;
@@ -356,126 +353,6 @@ fn image_inlays_are_fixed_cell_decorations(cx: &mut TestAppContext) {
             assert_eq!(editor.display_snapshot(cx).line_len(DisplayRow(0)), 2);
         })
         .expect("remove image inlay");
-}
-
-/// A spec whose anchors do not resolve is not a fold, so it must not take
-/// a fold's crease id. The ids come back for the resolved specs only, and
-/// pairing them against every spec by position hands each spec after an
-/// unresolved one its neighbour's crease and drops the last one — after
-/// which the editor's record of which crease belongs to which turn is wrong
-/// and the next reconcile unfolds turns that should have stayed folded. A
-/// transcript still composing its history hands this path unresolved specs
-/// as a matter of course, so it is not a corner.
-#[gpui::test]
-fn an_elision_that_cannot_resolve_takes_no_crease(cx: &mut TestAppContext) {
-    cx.update(init_test_app);
-    let text = (0..9)
-        .map(|row| format!("line {row}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let buffer = cx.update(|cx| cx.new(|cx| language::Buffer::local(text, cx)));
-    // Never an excerpt of the multibuffer, so its anchors resolve to
-    // nothing — the same answer an excerpt that has not been composed yet
-    // gives.
-    let elsewhere = cx.update(|cx| cx.new(|cx| language::Buffer::local("a\nb\nc", cx)));
-    let multi_buffer = cx.update(|cx| {
-        cx.new(|cx| {
-            let mut multi_buffer =
-                multi_buffer::MultiBuffer::without_headers(language::Capability::ReadWrite);
-            multi_buffer.set_excerpts_for_path(
-                multi_buffer::PathKey::sorted(0),
-                buffer.clone(),
-                [language::Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer
-        })
-    });
-    let window = cx.add_window(|window, cx| {
-        Editor::new(
-            editor::EditorMode::Full {
-                scale_ui_elements_with_buffer_font_size: true,
-                show_active_line_background: false,
-                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
-            },
-            multi_buffer.clone(),
-            None,
-            window,
-            cx,
-        )
-    });
-    let editor = window.root(cx).expect("editor");
-
-    let spec = |start_block: usize, anchors: (text::Anchor, text::Anchor), tool_count: usize| {
-        ElisionSpec {
-            start_block,
-            range: anchors.0..anchors.1,
-            tool_count,
-            tail_rows: 0,
-        }
-    };
-    let (first, unresolvable, last) = cx.update(|cx| {
-        let buffer = buffer.read(cx);
-        let elsewhere = elsewhere.read(cx);
-        (
-            spec(0, (buffer.anchor_before(7), buffer.anchor_after(21)), 2),
-            spec(
-                3,
-                (elsewhere.anchor_before(0), elsewhere.anchor_after(3)),
-                3,
-            ),
-            spec(6, (buffer.anchor_before(35), buffer.anchor_after(49)), 4),
-        )
-    });
-
-    let host = cx.update(|cx| cx.new(|_| ()));
-    let mut sync = ElisionSync::default();
-    let mut state = ElisionState::default();
-    sync.set_specs(vec![first.clone(), unresolvable.clone(), last.clone()]);
-    cx.update(|cx| {
-        host.update(cx, |_, cx| {
-            sync.apply(&mut state, &multi_buffer, &editor, cx)
-        })
-    });
-    assert_eq!(
-        state.active_specs().cloned().collect::<Vec<_>>(),
-        vec![first.clone(), last.clone()],
-        "the two folds that happened are the two the editor is carrying"
-    );
-
-    // The first turn changes, so its fold is the only stale one; the fold
-    // that never moved keeps the crease it was given.
-    sync.set_specs(vec![unresolvable, last.clone()]);
-    cx.update(|cx| {
-        host.update(cx, |_, cx| {
-            sync.apply(&mut state, &multi_buffer, &editor, cx)
-        })
-    });
-    assert_eq!(
-        state.active_specs().cloned().collect::<Vec<_>>(),
-        vec![last],
-        "only the stale fold left"
-    );
-}
-
-/// A fold placeholder stands in for buffer text, so it draws in the
-/// buffer's face. The editor's prepaint pushes the buffer's font size and
-/// line height onto the text style stack but not its family, so a
-/// placeholder that does not name the family draws in the window's UI font
-/// — a proportional caption in the middle of monospace rows, which is what
-/// the transcript's "N tools" rows did.
-#[gpui::test]
-fn a_fold_placeholder_wears_the_buffer_s_face(cx: &mut TestAppContext) {
-    cx.update(init_test_app);
-    cx.update(|cx| {
-        let buffer_font = theme_settings::ThemeSettings::get_global(cx)
-            .buffer_font
-            .clone();
-        let mut row = rho_agents_view::transcript::elisions::elision_row("2 tools", cx);
-        let style = gpui::Styled::text_style(&mut row);
-        assert_eq!(style.font_family, Some(buffer_font.family));
-    });
 }
 
 pub(super) fn init_test_app(cx: &mut App) {
@@ -821,6 +698,24 @@ fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -
         .expect("read workspace")
 }
 
+fn open_activity(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_agent_view(rho_agents_view::TranscriptView::Activity, window, cx);
+        })
+        .expect("open Activity");
+    cx.run_until_parked();
+}
+
+fn open_conversation(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_agent_view(rho_agents_view::TranscriptView::Conversation, window, cx);
+        })
+        .expect("open Conversation");
+    cx.run_until_parked();
+}
+
 fn display_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
     let editor = active_editor(workspace, cx);
     workspace
@@ -915,32 +810,6 @@ fn syntax_highlights_for_text(
             })
         })
         .expect("read buffer syntax highlights")
-}
-
-/// The display elisions this transcript elided history with, by id, so a
-/// test can ask both whether history is elided and whether the same
-/// elisions survived a rebuild.
-fn history_elisions(
-    editor: &Entity<editor::Editor>,
-    cx: &mut TestAppContext,
-) -> rustc_hash::FxHashSet<editor::DisplayElisionId> {
-    cx.update(|cx| {
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.display_snapshot(cx);
-            snapshot
-                .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
-                .filter_map(|(_, block)| match block {
-                    editor::display_map::Block::DisplayElision(elision) => Some(elision.id),
-                    _ => None,
-                })
-                .collect()
-        })
-    })
-}
-
-fn has_display_elision(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
-    let editor = active_editor(workspace, cx);
-    !history_elisions(&editor, cx).is_empty()
 }
 
 fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
@@ -1706,78 +1575,6 @@ fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn document_preview_reconciles_decorations_when_appending_a_user_turn(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        state(
-            vec![user("do work")],
-            vec![assistant(
-                &long_working_text(),
-                Some(UiMessagePhase::Commentary),
-            )],
-        ),
-    );
-    let preview = workspace
-        .update(cx, |workspace, window, cx| {
-            let model = workspace.active_agent_model().expect("agent view");
-            model.update(cx, |model, cx| model.preview_editor(window, cx))
-        })
-        .expect("open document preview");
-    let folded_elisions = |cx: &mut TestAppContext| history_elisions(&preview, cx);
-    let initial_elisions = folded_elisions(cx);
-    assert_eq!(initial_elisions.len(), 1);
-
-    // The existing decorated response becomes an interior excerpt, but is not
-    // rebuilt. Its concrete editor decoration and reconciliation state must
-    // remain paired rather than inserting a duplicate.
-    feed_edit(&workspace, cx, agent(1), |state| {
-        replace_block(state, 2, user("continue"))
-    });
-    assert_eq!(folded_elisions(cx), initial_elisions);
-}
-
-#[gpui::test]
-fn document_preview_preserves_decorations_across_invisible_tail_status_change(
-    cx: &mut TestAppContext,
-) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        state(
-            vec![user("do work")],
-            vec![
-                assistant(&long_working_text(), Some(UiMessagePhase::Commentary)),
-                UiBlock::Reasoning {
-                    text: String::new(),
-                },
-            ],
-        ),
-    );
-    let preview = workspace
-        .update(cx, |workspace, window, cx| {
-            let model = workspace.active_agent_model().expect("agent view");
-            model.update(cx, |model, cx| model.preview_editor(window, cx))
-        })
-        .expect("open document preview");
-    let folded_elisions = |cx: &mut TestAppContext| history_elisions(&preview, cx);
-    let initial_elisions = folded_elisions(cx);
-    assert_eq!(initial_elisions.len(), 1);
-
-    // Only the invisible terminal reasoning buffer is rebuilt. Cropping the
-    // preceding composed document tail must not discard decoration state for
-    // its surviving excerpt and insert a duplicate editor object.
-    feed_edit(&workspace, cx, agent(1), |state| {
-        state.status = UiAgentStatus::Idle
-    });
-    assert_eq!(folded_elisions(cx), initial_elisions);
-}
-
-#[gpui::test]
 fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let user_text = (0..120)
@@ -2153,6 +1950,141 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(
+            vec![user("question")],
+            vec![UiBlock::Tool(tool("t1", UiToolStatus::Running, None, None))],
+        ),
+    );
+    let conversation = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |editor, cx| editor.insert("unsent draft", window, cx));
+        })
+        .expect("compose draft");
+    assert!(display_text(&workspace, cx).contains("unsent draft"));
+    assert!(!display_text(&workspace, cx).contains("$ echo"));
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::agent_menu(), window, cx);
+        })
+        .expect("open agent menu");
+    cx.simulate_keystrokes(*workspace, "a");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Activity(agent(1))
+            );
+            assert_eq!(workspace.menu_title_for_test(), None);
+            assert!(
+                workspace
+                    .buffer_table()
+                    .iter()
+                    .any(|(name, kind)| name.contains("activity") && kind == "activity")
+            );
+            assert!(
+                workspace
+                    .buffer_table()
+                    .iter()
+                    .any(|(name, kind)| name.contains("conversation") && kind == "conversation")
+            );
+            assert_eq!(
+                workspace.active_agent_model().unwrap().read(cx).view(),
+                rho_agents_view::TranscriptView::Activity
+            );
+        })
+        .expect("inspect activity");
+    assert!(display_text(&workspace, cx).contains("$ echo ok"));
+    assert!(!display_text(&workspace, cx).contains("unsent draft"));
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    assert!(
+        workspace
+            .update(cx, |workspace, _, cx| !workspace
+                .message_log_texts(cx)
+                .iter()
+                .any(|message| message.contains("failed send")))
+            .unwrap(),
+        "Activity must not submit the hidden Conversation draft"
+    );
+
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_tool_arguments(state, 1, "echo ok".len(), " && pwd")
+    });
+    assert!(
+        display_text(&workspace, cx).contains("$ echo ok && pwd"),
+        "live tool updates must feed Activity"
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.step_surface_back_for_test(window, cx);
+        })
+        .expect("back to conversation");
+    assert_eq!(
+        active_editor(&workspace, cx),
+        conversation,
+        "back reuses conversation editor and cursor"
+    );
+    assert!(display_text(&workspace, cx).contains("unsent draft"));
+    assert!(!display_text(&workspace, cx).contains("$ echo"));
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::agent_menu(), window, cx);
+        })
+        .expect("open agent menu again");
+    cx.simulate_keystrokes(*workspace, "a");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::agent_menu(), window, cx);
+        })
+        .expect("open agent menu from Activity");
+    cx.simulate_keystrokes(*workspace, "m");
+    cx.run_until_parked();
+    assert_eq!(active_editor(&workspace, cx), conversation);
+    assert!(display_text(&workspace, cx).contains("unsent draft"));
+
+    open_activity(&workspace, cx);
+    let first_activity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.active_agent_model().unwrap()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.close_current_surface(window, cx);
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Transcript(agent(1))
+            );
+        })
+        .expect("close Activity without closing Conversation");
+    open_activity(&workspace, cx);
+    let reopened = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.active_agent_model().unwrap()
+        })
+        .unwrap();
+    assert_ne!(
+        reopened, first_activity,
+        "closing Activity releases its model"
+    );
+    assert!(display_text(&workspace, cx).contains("$ echo ok && pwd"));
+    open_conversation(&workspace, cx);
+    assert_eq!(active_editor(&workspace, cx), conversation);
+    assert!(display_text(&workspace, cx).contains("unsent draft"));
+}
+
+#[gpui::test]
 fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
@@ -2178,6 +2110,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
         ),
     );
 
+    open_activity(&workspace, cx);
     feed_edit(&workspace, cx, agent(1), |state| {
         stream_tool_arguments(state, 1, 4, " ok")
     });
@@ -2190,7 +2123,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) {
+fn commentary_and_final_answers_remain_visible_without_collapsing(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2204,19 +2137,18 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
             )],
         ),
     );
-    assert!(has_display_elision(&workspace, cx));
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("do work"),
         "user prompt should render: {text:?}"
     );
     assert!(
-        !text.contains("alpha"),
-        "explicit commentary assistant should be elided: {text:?}"
+        text.contains("alpha"),
+        "Conversation shows commentary without hiding it: {text:?}"
     );
     assert!(
         text.contains("echo"),
-        "limited elision should leave tail rows visible: {text:?}"
+        "commentary tail remains visible: {text:?}"
     );
 
     feed_frame(
@@ -2234,12 +2166,12 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("alpha") && text.contains("foxtrot"),
-        "final answer should not be elided: {text:?}"
+        "final answer remains visible: {text:?}"
     );
 }
 
 #[gpui::test]
-fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
+fn burst_of_pending_tools_keeps_every_code_row_visible(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let pending = (0..16)
         .map(|ix| {
@@ -2266,15 +2198,15 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
         state(vec![user("run tools")], pending),
     );
 
-    assert!(has_display_elision(&workspace, cx));
+    open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert!(
-        !text.contains("tool_0"),
-        "burst of pending tools should elide earliest tools: {text:?}"
+        text.contains("tool_0"),
+        "Activity should show earliest tool in a burst: {text:?}"
     );
     assert!(
         text.contains("tool_15"),
-        "burst of pending tools should keep the tail visible: {text:?}"
+        "Activity should show latest tool in a burst: {text:?}"
     );
 }
 
@@ -2293,6 +2225,7 @@ fn finished_tool_renders_duration(cx: &mut TestAppContext) {
             Vec::new(),
         ),
     );
+    open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("$ echo ok ok 2s"),
@@ -2316,6 +2249,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
             Vec::new(),
         ),
     );
+    open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("$ echo ok …"),
@@ -2755,7 +2689,7 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn elided_history_still_soft_wraps_the_rows_it_leaves(cx: &mut TestAppContext) {
+fn long_conversation_rows_soft_wrap_without_collapsing(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let long_line = "wrap me ".repeat(200);
     feed_frame(
@@ -2771,14 +2705,9 @@ fn elided_history_still_soft_wraps_the_rows_it_leaves(cx: &mut TestAppContext) {
         ),
     );
     let editor = active_editor(&workspace, cx);
-    assert!(
-        !history_elisions(&editor, cx).is_empty(),
-        "the working text is elided"
-    );
 
-    // A fold takes rows out of the wrap's input; it must not take the wrap
-    // away from the rows that are left. The long user line is not inside a
-    // fold, so it still has to come out of the display as several rows.
+    // Commentary and the user's long line remain visible and soft-wrap in
+    // Conversation.
     let (fold_rows, display_rows) = cx.update(|cx| {
         editor.update(cx, |editor, cx| {
             editor
@@ -2802,55 +2731,6 @@ fn elided_history_still_soft_wraps_the_rows_it_leaves(cx: &mut TestAppContext) {
         "the rows a fold leaves still wrap: {display_rows} rows before the \
          rewrap and {display_rows_after_parking} after, over {fold_rows} \
          rows of wrap input"
-    );
-}
-
-#[gpui::test]
-fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        state(
-            vec![user("do work")],
-            vec![assistant(
-                &long_working_text(),
-                Some(UiMessagePhase::Commentary),
-            )],
-        ),
-    );
-    let collapsed = display_text(&workspace, cx);
-    assert!(
-        !collapsed.contains("alpha"),
-        "working text should start collapsed: {collapsed:?}"
-    );
-
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |_, window, cx| {
-            let focus_handle = editor.read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            editor.update(cx, |editor, cx| {
-                editor.move_to_beginning(&Default::default(), window, cx);
-            });
-        })
-        .expect("focus editor");
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.simulate_keystrokes(*workspace, "j j z o");
-    let expanded = display_text(&workspace, cx);
-    assert!(
-        expanded.contains("alpha"),
-        "z o should expand the working elision: {expanded:?}"
-    );
-
-    cx.simulate_keystrokes(*workspace, "z c");
-    let recollapsed = display_text(&workspace, cx);
-    assert!(
-        !recollapsed.contains("alpha"),
-        "z c should collapse the working elision again: {recollapsed:?}"
     );
 }
 
@@ -2922,6 +2802,8 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
                 Arc::new(assistant("done", Some(UiMessagePhase::FinalAnswer))),
             ],
             status: UiAgentStatus::Idle,
+            runtime: None,
+            awaiting_human: None,
             context_used: Some(194_816),
             usage: Default::default(),
         },
@@ -2952,6 +2834,8 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
             exec_timings: Default::default(),
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
+            runtime: None,
+            awaiting_human: None,
             context_used: Some(62_300),
             usage: Default::default(),
         },
@@ -3018,6 +2902,8 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             exec_timings: Default::default(),
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
+            runtime: None,
+            awaiting_human: None,
             context_used: Some(62_300),
             usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
@@ -4018,11 +3904,24 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
 
+    let conversation = display_text(&workspace, cx);
+    assert!(
+        !conversation.contains("$ echo"),
+        "tool calls belong in Activity"
+    );
+    open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("$ echo **bold** and _under_"),
         "the call's own punctuation was read as markup: {text:?}"
     );
+    let call = syntax_highlights_for_text(&workspace, "echo **bold** and _under_", cx);
+    assert!(
+        call.iter().all(Option::is_none),
+        "a call's row is highlighted: {call:?}"
+    );
+    open_conversation(&workspace, cx);
+    let text = display_text(&workspace, cx);
     assert!(
         text.contains("**my** request"),
         "the reader's own punctuation was read as markup: {text:?}"
@@ -4038,11 +3937,6 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
 
     // Nothing parses those two rows, so no chunk in them carries a
     // highlight, while the model's prose keeps the ones it had.
-    let call = syntax_highlights_for_text(&workspace, "echo **bold** and _under_", cx);
-    assert!(
-        call.iter().all(Option::is_none),
-        "a call's row is highlighted: {call:?}"
-    );
     let typed = syntax_highlights_for_text(&workspace, "**my** request", cx);
     assert!(
         typed.iter().all(Option::is_none),
@@ -5709,6 +5603,8 @@ fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
         exec_timings: Default::default(),
         blocks,
         status: UiAgentStatus::Streaming,
+        runtime: None,
+        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }

@@ -16,8 +16,8 @@ use db::{FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, Pr
 use futures_util::stream::{self, StreamExt as _};
 use octo_types::{PrFeedback, PrSnapshot};
 use rho_agent::db::AgentReadTxnExt as _;
-use rho_agent::pool::AgentPool;
-use rho_agent_types::{AgentId, MessageDelivery};
+use rho_agent::host::pool::AgentPool;
+use rho_agent_types::AgentId;
 use rho_db::RhoDb;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
@@ -216,10 +216,9 @@ impl PrMonitor {
         let (_, agent, _) = self.pool.load(subscriber).await?;
         tokio::time::timeout(
             DELIVERY_TIMEOUT,
-            agent.send_user_content_accepted(
-                vec![rho_agent_types::ContentPart::Text { text: message }],
-                MessageDelivery::NextRequest,
-            ),
+            agent.send_user_content_accepted(vec![rho_agent_types::ContentPart::Text {
+                text: message,
+            }]),
         )
         .await??;
         Ok(())

@@ -1,19 +1,16 @@
 //! Harness-free execution tests: parent owns scratch directories; child
 //! establishes its workset before Tokio, just like the production companion.
-pub fn run<F: std::future::Future<Output = ()>>(
-    bashrc: &str,
-    test: impl FnOnce(std::sync::Arc<rho_fs_view::Namespace>) -> F,
-) {
+pub fn run<F: std::future::Future<Output = ()>>(bashrc: &str, test: impl FnOnce() -> F) {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "--workset-test") {
         let bytes = std::fs::read(&args[2]).unwrap();
         let layout: rho_fs_view::WorksetLayout =
             senax_encoder::decode(&mut bytes.as_slice()).unwrap();
-        let view = unsafe {
+        unsafe {
             layout.build().unwrap();
             layout.enter().unwrap()
         };
-        tokio::runtime::Runtime::new().unwrap().block_on(test(view));
+        tokio::runtime::Runtime::new().unwrap().block_on(test());
         return;
     }
     let temp = tempfile::tempdir().unwrap();

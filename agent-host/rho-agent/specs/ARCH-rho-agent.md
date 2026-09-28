@@ -12,6 +12,14 @@ scheduling. Native events replicate through an ordered, bounded background write
 Claude's durable operations retain acknowledged agent host services.
 There is no in-agent host runtime fallback.
 
+Within `rho-agent`, `host` owns lifecycle and service handlers; `worker` owns
+the concrete native and Claude loops and local execution. `ipc` contains only
+their shared messages and transport. `log` defines durable records and
+recovery data; `db` owns transactions, indexes, and migrations. Tests connect
+the same host handlers and worker clients through an in-process Unix socket
+pair, not an alternate local backend. These are module boundaries within one
+crate, not separate build targets.
+
 The append-only `NativeEvent` log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
@@ -20,8 +28,55 @@ normalize legacy events. Claude Code instead owns its session, history, and comp
 records bounded transcript observations, execution admission, output ownership,
 and timing, and controls its worker-local MCP server.
 
-`rho-inference` owns native wire adaptation and validates the model action as
-prose or one custom Python `exec`. `rho-claude` owns CLI transport and MCP protocol
+`rho-agent` defines the inference service and turn contract. `rho-inference`
+depends on it and implements that contract; the worker binary supplies the
+implementation. Scripted models use the same injected session interface.
+Naming and web-search credentials are injected services too. Provider policy
+frames are opaque to the workset transport.
+
+`rho-inference` has a concrete host account owner and a separate client;
+workers cannot administer accounts. Each OpenAI Responses Lite session has one
+socket-owning task across active and idle periods. It receives resolved
+credentials and emits model events and acknowledged account observations; it
+does not call host services or retry responses. Dropping a response receiver
+cancels that exchange and discards its connection.
+
+The native runtime owns the prepared turn, Python admission, and retry decision.
+Provider call identity and result pairing stay inside inference's replay payload;
+the agent retains the latest opaque `Carry` for its unanswered input group.
+A carry stores shared raw JSON plus explicit compaction and transcript display
+facts; only inference interprets the JSON. Completed provider items come from
+`response.output_item.done` and survive persistence and replay byte-for-byte.
+Inference selects the retained context without rewriting those items. Extra
+unexecuted calls remain stored but are excluded from replay; such responses
+cannot use provider continuation. Interrupted execution synthesizes its call
+from the admitted code instead of pretending a completed item arrived. Historical provider decoders
+are isolated in the temporary database migration. A streamed
+call supplies a carry before code, so interruption can preserve admitted code
+without exposing provider IDs. Historical multi-call pairing and compaction
+filtering remain inference concerns; transcript readers use IDs only for display.
+Each `RequestSent` records only the typed contributions collected for that
+attempt, not provider acknowledgment. Notebook sources retain identity, output,
+images, and typed completion facts; their renderer is deterministic. Human
+messages reference immutable `Received` records. A native `RequestSent` consumes
+all messages since the preceding send; per-message selection is import-only. Request construction merges
+consecutive unanswered reports, preserving output and advancing source state,
+until a complete or interrupted `Step` closes the group. Retries collect fresh
+sources and messages; they never rewrite earlier reports or store cumulative
+copies. A step stores at most one exec and its complete billable usage.
+Compaction intent remains queued until included in an attempt; only the current
+input group sends its compaction instruction. Imported historical request carries
+preserve old delayed/multi-call pairings without exposing them to new reports.
+Live input and database replay use the same conversation projection. Between
+exchanges it retains only unanswered contributions and replay metadata. Warm requests
+pass an opaque continuation token. Each prepared turn pins a writer barrier;
+when continuation is unavailable, its acknowledgment supplies the exact committed
+log range to replay. A small index updated transactionally with each append holds
+the retained context start and recovery facts. Cold loads and full requests read
+that range, preserving messages received during the compacting response. Rewinds
+append a record and rebuild the index from visible history; the log remains
+authoritative. The temporary format migration builds indexes for existing logs;
+ordinary database initialization does not scan agents or history. The transport neither retains the context window nor loads history. `rho-claude` owns CLI transport and MCP protocol
 adaptation. Neither adapter owns Rho's scheduling or persistence.
 
 One private Senax Unix connection multiplexes agent services and controls with
@@ -30,11 +85,11 @@ subscription and one shared client per workset, not per agent. Its pushes and
 RPC replies share workset FIFO ordering; agent retirement does not close it.
 Policy admission is bounded across the workset; a published request retains
 its slot through caller cancellation until reply or disconnect.
-Bounded fragments preserve per-port
-order; routing and fair writes do not await runtime work. Agent-port receipt
-credit is returned after decoding, bounding inboxes while slow consumers
-backpressure their own senders. Retirement discards late replies, not sibling
-runtimes. Completion publication
+The shared workset connection carries bounded, whole-message frames in FIFO
+order; a bounded reader drains frames and routing does not await runtime work.
+Workers cooperate: a large frame or a slow receiver can delay other ports,
+without per-agent receipt credit or fragment scheduling. Retirement discards
+late replies, not sibling runtimes. Completion publication
 does not await recipient acceptance, keeping reciprocal subscriptions outside
 serialized actor-loop dependencies. Lost persistence acknowledgements stop the
 runtime; uncertain mutations are not retried. Native inference does not wait for
@@ -43,8 +98,14 @@ response batches include usage accounting in the same transaction. Explicit
 barriers synchronize rewind, profile changes, terminal publication and shutdown.
 A crash may lose the unflushed tail, but cannot expose a partial database batch.
 
-The workset process builds one filesystem namespace before starting threads.
-Normal execution inherits it. Claude launcher children alone clone it to install
+The host uses persisted `Place` and `Workset` directly; no per-agent view
+descriptor is retained. New checkouts have a one-shot preparation future,
+awaited after committing the agent record and before starting execution.
+The workset process builds one filesystem namespace and installs its base
+environment before starting threads. Worker runtimes and tools use ordinary
+paths and per-agent cwd, not host-side view descriptors or path translation.
+Commands inherit the process environment, with explicit command overrides and
+per-directory devshell additions. Normal execution inherits the namespace. Claude launcher children alone clone it to install
 private provider overlays; no generic agent namespace or setup thread is needed.
 Mode changes exclude new admission, require settled agents and no live sessions,
 then drain and replace the whole workset execution.

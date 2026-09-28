@@ -7,7 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rho-inference.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 rho-agent-types.workspace = true

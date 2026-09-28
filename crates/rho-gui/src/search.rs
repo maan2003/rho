@@ -9,6 +9,7 @@
 
 use gpui::{App, Entity};
 use rho_agent_types::AgentId;
+use rho_agents_view::TranscriptView;
 
 /// Which way a search runs. Not a `bool`: three call sites in a row read
 /// `backwards`, and the one that repeats a search in the other direction
@@ -68,6 +69,7 @@ pub(crate) struct Query {
 /// first is not what it was waiting for.
 pub(crate) struct Pending {
     pub(crate) agent: AgentId,
+    pub(crate) view: TranscriptView,
     pub(crate) query: Query,
 }
 
@@ -105,8 +107,16 @@ impl Search {
 
     /// Takes the waiting search if this is the agent it was waiting for,
     /// and otherwise leaves it waiting.
-    pub(crate) fn take_waiting_for(&mut self, agent: AgentId) -> Option<Query> {
-        if self.pending.as_ref().is_some_and(|it| it.agent == agent) {
+    pub(crate) fn take_waiting_for(
+        &mut self,
+        agent: AgentId,
+        view: TranscriptView,
+    ) -> Option<Query> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|it| it.agent == agent && it.view == view)
+        {
             self.pending.take().map(|it| it.query)
         } else {
             None
@@ -269,13 +279,24 @@ mod tests {
         let mut search = Search::default();
         search.wait_for(Pending {
             agent: mine,
+            view: TranscriptView::Conversation,
             query: query("needle", Direction::Forward),
         });
-        assert_eq!(search.take_waiting_for(theirs), None);
         assert_eq!(
-            search.take_waiting_for(mine),
+            search.take_waiting_for(theirs, TranscriptView::Conversation),
+            None
+        );
+        assert_eq!(
+            search.take_waiting_for(mine, TranscriptView::Activity),
+            None
+        );
+        assert_eq!(
+            search.take_waiting_for(mine, TranscriptView::Conversation),
             Some(query("needle", Direction::Forward))
         );
-        assert_eq!(search.take_waiting_for(mine), None);
+        assert_eq!(
+            search.take_waiting_for(mine, TranscriptView::Conversation),
+            None
+        );
     }
 }

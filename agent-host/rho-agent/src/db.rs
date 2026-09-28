@@ -8,18 +8,31 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::TableDefinition;
 use redb_derive::{Key, Value as RedbValue};
+#[cfg(test)]
+use rho_agent_types::{AdvisorIntelligence, EngineerIntelligence};
 use rho_agent_types::{
-    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWant, EngineerIntelligence, Place,
-    Seq, TurnEdge, UnixMs, WorksetMode,
+    AgentId, AgentIdDomain, AgentRole, AgentWant, Place, Seq, TurnEdge, WorksetMode,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use rho_inference::PromptCacheKey;
-pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use senax_encoder::{Decode, Encode, Pack, Unpack};
+use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
 
 use crate::AgentEvent;
+use crate::inference::PromptCacheKey;
+#[cfg(test)]
+use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::journal::{Feed, Journal, LogAppended};
+use crate::log::{
+    AgentConfig, AgentEventPos, AgentHead, AgentOrigin, AgentRuntime, AgentSpawnedBy,
+    AgentUsageBucket, AgentUsageModel, ClaudeRewind, ContextBoundary, NativeRecovery,
+    SessionBinding, UnixMillis, usage_model_of,
+};
+
+mod code_first_migration;
+mod entries_migration;
+pub(crate) mod legacy;
+mod native;
+mod reports_migration;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -37,6 +50,14 @@ const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_log");
 /// Current heads, derived from the log in the same transaction as every append.
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> = TableDefinition::new("agent_heads");
+/// The workset's authoritative mode. `None` marks legacy mixed-mode members
+/// until an explicit ChangeMode resolves them.
+const WORKSET_MODES: TableDefinition<String, Sen<Option<WorksetMode>>> =
+    TableDefinition::new("workset_modes");
+/// Membership changes only at creation; ordered by workset for mode
+/// transitions.
+const WORKSET_AGENTS: TableDefinition<(String, AgentId), ()> =
+    TableDefinition::new("workset_agents");
 /// The order every append landed in, across agents: `seq -> (agent, pos)`,
 /// written in the same transaction as the row it names. What a client
 /// follows to stay current.
@@ -47,6 +68,22 @@ const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, (
     TableDefinition::new("agent_response_subscriptions");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct AgentUsageKey {
+    agent_id: AgentId,
+    bucket_start_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct GlobalAgentUsageKey {
+    bucket_start_ms: u64,
+    model: AgentUsageModel,
+}
+
+fn usage_model(config: &AgentConfig) -> AgentUsageModel {
+    usage_model_of(&config.runtime, config.binding)
+}
+
 const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_agent_time");
 const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
@@ -56,7 +93,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "a7e43d91";
+const CURRENT_AGENT_DB_FORMAT: &str = "dc371fa2";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -67,19 +104,46 @@ struct AgentDbMigration {
 
 const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
     AgentDbMigration {
-        from: "b906d137",
-        to: "6bcd407c",
-        // The dev shell cache moved to its daemon's own database.
-        migrate: |write| {
-            write.delete_table("devshell_shells");
-        },
+        from: "a7e43d91",
+        to: "e31bcf82",
+        migrate: code_first_migration::migrate,
     },
     AgentDbMigration {
-        from: "6bcd407c",
-        to: "a7e43d91",
-        migrate: rebuild_agent_heads,
+        from: "e31bcf82",
+        to: "7f24a9d3",
+        migrate: migrate_workset_modes,
+    },
+    AgentDbMigration {
+        from: "7f24a9d3",
+        to: "dc371fa2",
+        migrate: reports_migration::migrate,
     },
 ];
+
+fn migrate_workset_modes(write: &mut WriteTxn) {
+    let members = write
+        .open_table(AGENT_HEADS)
+        .iter()
+        .map(|(id, head)| (id.value(), head.value().into_owned().place().clone()))
+        .collect::<Vec<_>>();
+    for (id, place) in members {
+        write
+            .open_table(WORKSET_AGENTS)
+            .insert(&(place.workset.clone(), id), &());
+        let previous = write
+            .open_table(WORKSET_MODES)
+            .get(&place.workset)
+            .map(|value| value.value().into_owned());
+        let mode = match previous {
+            None => Some(place.mode),
+            Some(Some(existing)) if existing == place.mode => Some(existing),
+            Some(_) => None,
+        };
+        write
+            .open_table(WORKSET_MODES)
+            .insert(&place.workset, SenValue::borrowed(&mode));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -138,111 +202,6 @@ pub struct QuotaObservationRecord {
     pub reset_at_unix: Option<i64>,
 }
 
-pub const AGENT_USAGE_BUCKET_MS: u64 = 5 * 60 * 1_000;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
-struct AgentUsageKey {
-    agent_id: AgentId,
-    bucket_start_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
-pub struct AgentUsageModel(u8);
-
-impl AgentUsageModel {
-    pub const UNKNOWN: Self = Self(0);
-    pub const GPT: Self = Self(1);
-    pub const FABLE: Self = Self(2);
-    pub const OPUS: Self = Self(3);
-    pub const TERRA: Self = Self(4);
-    pub const LUNA: Self = Self(5);
-    pub const ASTRA: Self = Self(7);
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::GPT => "gpt",
-            Self::FABLE => "fable",
-            Self::OPUS => "opus",
-            Self::TERRA => "terra",
-            Self::LUNA => "luna",
-            Self::ASTRA => "astra",
-            _ => "unknown",
-        }
-    }
-}
-
-impl Default for AgentUsageModel {
-    fn default() -> Self {
-        Self::UNKNOWN
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
-struct GlobalAgentUsageKey {
-    bucket_start_ms: u64,
-    model: AgentUsageModel,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub struct AgentUsageBucket {
-    pub bucket_start_ms: u64,
-    #[senax(default)]
-    pub model: AgentUsageModel,
-    pub input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    #[senax(default)]
-    pub cache_write_1h_tokens: u64,
-    pub output_tokens: u64,
-    pub requests: u64,
-    #[senax(default)]
-    pub approximate: bool,
-}
-
-impl AgentUsageBucket {
-    pub fn add(&mut self, other: &Self) {
-        if self.requests == 0 {
-            self.model = other.model;
-        } else if other.model != AgentUsageModel::UNKNOWN && self.model != other.model {
-            self.model = AgentUsageModel::UNKNOWN;
-        }
-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(other.cache_read_tokens);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(other.cache_write_tokens);
-        self.cache_write_1h_tokens = self
-            .cache_write_1h_tokens
-            .saturating_add(other.cache_write_1h_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.requests = self.requests.saturating_add(other.requests);
-        self.approximate |= other.approximate;
-    }
-}
-
-fn usage_model(config: &AgentConfig) -> AgentUsageModel {
-    usage_model_of(&config.runtime, config.binding)
-}
-
-/// The model a runtime and binding bill as.
-pub fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentUsageModel {
-    match runtime {
-        AgentRuntime::Rho { .. } => match binding.deep_model() {
-            Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
-            Some(InferenceModel::Gpt6Luna) => AgentUsageModel::LUNA,
-            _ => AgentUsageModel::GPT,
-        },
-        AgentRuntime::Claude { .. } => match binding.claude_model() {
-            Some(rho_claude::Model::Opus) => AgentUsageModel::OPUS,
-            Some(rho_claude::Model::Fable | rho_claude::Model::Sonnet) | None => {
-                AgentUsageModel::FABLE
-            }
-        },
-    }
-}
-
 fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: &AgentUsageBucket) {
     let key = GlobalAgentUsageKey {
         bucket_start_ms: bucket.bucket_start_ms,
@@ -271,343 +230,6 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
         }
 }
 
-/// A position in one agent's log: dense from zero, never reused.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub struct AgentEventPos {
-    pub pos: u64,
-}
-
-impl AgentEventPos {
-    pub const ZERO: Self = Self { pos: 0 };
-
-    pub fn new(pos: u64) -> Self {
-        Self { pos }
-    }
-
-    pub fn next(self) -> Self {
-        Self {
-            pos: self
-                .pos
-                .checked_add(1)
-                .expect("agent log position overflow"),
-        }
-    }
-
-    /// The position before this one; zero stays zero.
-    pub fn previous(self) -> Self {
-        Self {
-            pos: self.pos.saturating_sub(1),
-        }
-    }
-}
-
-impl From<AgentEventPos> for rho_agent_types::AgentPos {
-    fn from(pos: AgentEventPos) -> Self {
-        Self(pos.pos)
-    }
-}
-
-impl From<rho_agent_types::AgentPos> for AgentEventPos {
-    fn from(pos: rho_agent_types::AgentPos) -> Self {
-        Self { pos: pos.0 }
-    }
-}
-
-/// A sidecar-derived title/activity update. `through` is a durable source
-/// position, not the position where this update happens to be recorded. That
-/// distinction makes a late result harmless after rewind.
-
-/// The title and activity a reader sees, and what seeds a fresh Luna turn.
-
-pub type UnixMillis = UnixMs;
-
-/// What the agent is, folded from `Created` and the config events that
-/// follow it. Nothing here is written directly: a change is an event
-/// first and reaches the head through the fold.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentConfig {
-    pub role: AgentRole,
-    pub(crate) binding: SessionBinding,
-    pub runtime: AgentRuntime,
-    /// Where the agent works. Fixed at creation, but for a migration.
-    pub place: Place,
-    pub spawned_by: AgentSpawnedBy,
-    /// The name the spawner gave. A generated title is never made for an
-    /// agent that has one, and it always beats a generated title.
-    pub spawn_name: Option<String>,
-    pub created_at: UnixMillis,
-    /// A message-only Claude rewind whose destination transcript has not yet
-    /// been durably materialized and verified. The old runtime remains
-    /// authoritative until then.
-    pub claude_rewind: Option<ClaudeRewind>,
-}
-
-/// What an agent is now: the fold of its whole log, hidden rows included
-/// (a rewind takes back history, not configuration). Stored as a read
-/// projection, updated atomically with the log.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentHead {
-    pub config: AgentConfig,
-    /// Naming is attempted at most once, including across rewind and restart.
-    pub title_attempted: bool,
-    /// A generated title. A spawn name always takes precedence.
-    pub generated_title: Option<String>,
-    /// The last durable, model-derived activity label.
-    pub activity: Option<String>,
-    /// Whether a turn is running, folded from the log's turn events.
-    pub turn_running: bool,
-    /// The agent that spawned this one.
-    pub parent: Option<AgentId>,
-    /// The user has messaged this agent directly (agent mail doesn't count).
-    /// Sticky: once engaged, the agent's turn ends are the user's court even
-    /// for a sub-agent, so it gets turn reports like a root.
-    pub user_interacted: bool,
-    /// What a `Notice` said, until a user message has carried it.
-    pub pending_notice: Option<String>,
-    pub last_turn_ended: Option<UnixMillis>,
-    /// Where the next event goes: one past the last row, hidden or not.
-    pub next: AgentEventPos,
-}
-
-impl AgentHead {
-    pub fn config(&self) -> AgentRole {
-        self.config.role
-    }
-
-    pub fn place(&self) -> &Place {
-        &self.config.place
-    }
-
-    /// The agent's name for a reader: what the spawner called it, else what
-    /// the sidecar made of it.
-    pub fn title(&self) -> Option<&str> {
-        self.config
-            .spawn_name
-            .as_deref()
-            .or(self.generated_title.as_deref())
-    }
-}
-
-impl AgentConfig {
-    /// Where the agent works: default cwd, prompt header, UI label.
-    pub fn place(&self) -> &Place {
-        &self.place
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum AgentRuntime {
-    Rho { prompt_cache_key: PromptCacheKey },
-    Claude { session_id: Uuid },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct ClaudeRewind {
-    pub source_session_id: Uuid,
-    pub session_id: Uuid,
-    pub resume_at: Option<Uuid>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub enum AgentSpawnedBy {
-    #[default]
-    Direct,
-    Engineer,
-    /// An Engineer started it for the user, who manages it from then on.
-    UserOwned {
-        by: AgentId,
-    },
-}
-
-impl AgentSpawnedBy {
-    /// The user manages the agent: it has no parent to answer to.
-    pub fn user_owned(self) -> bool {
-        !matches!(self, Self::Engineer)
-    }
-}
-
-/// How an agent comes to exist. The `parent` of its `Created` event is
-/// the agent it answers to, so only a child has one: a user-owned
-/// Engineer answers to the user and only remembers who started it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentOrigin {
-    /// The user started it.
-    User,
-    /// An agent spawned it to work for that agent.
-    Child { parent: AgentId },
-    /// An Engineer started it for the user.
-    UserOwned { by: AgentId },
-}
-
-impl AgentOrigin {
-    pub fn parent(self) -> Option<AgentId> {
-        match self {
-            Self::Child { parent } => Some(parent),
-            Self::User | Self::UserOwned { .. } => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum SessionBinding {
-    ClaudeFable {
-        effort: ClaudeEffort,
-    },
-    ClaudeOpus {
-        effort: ClaudeEffort,
-    },
-    ResponsesSol(InferenceProfile),
-    ResponsesLuna(InferenceProfile),
-    /// Fable-backed advisor; distinct so its role survives session pinning.
-    ClaudeAdvisor {
-        effort: ClaudeEffort,
-    },
-    /// Sol-backed advisor.
-    AdvisorSol(InferenceProfile),
-    ResponsesAstra(InferenceProfile),
-    /// Astra-backed advisor; distinct so its role survives session pinning.
-    AdvisorAstra(InferenceProfile),
-}
-
-pub(crate) trait AgentRoleSessionProfile {
-    fn session_profile(self) -> SessionBinding;
-}
-
-impl AgentRoleSessionProfile for AgentRole {
-    fn session_profile(self) -> SessionBinding {
-        let deep = |effort| InferenceProfile {
-            effort,
-            fast_mode: false,
-        };
-        match self {
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Mini,
-            } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High,
-            } => SessionBinding::ResponsesAstra(deep(ReasoningEffort::Medium)),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium1,
-            } => SessionBinding::ClaudeOpus {
-                effort: ClaudeEffort::Medium,
-            },
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High1,
-            } => SessionBinding::ClaudeFable {
-                effort: ClaudeEffort::Medium,
-            },
-            AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Low,
-            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
-            AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium,
-            } => SessionBinding::AdvisorAstra(deep(ReasoningEffort::Xhigh)),
-            AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium1,
-            } => SessionBinding::ClaudeAdvisor {
-                effort: ClaudeEffort::Xhigh,
-            },
-        }
-    }
-}
-
-impl SessionBinding {
-    pub fn agent_role(self) -> AgentRole {
-        match self {
-            Self::ResponsesLuna(_) => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Mini,
-            },
-            Self::ResponsesSol(_) => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium,
-            },
-            Self::ResponsesAstra(_) => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High,
-            },
-            Self::ClaudeOpus { .. } => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium1,
-            },
-            Self::ClaudeFable { .. } => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High1,
-            },
-            Self::AdvisorSol(_) => AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Low,
-            },
-            Self::AdvisorAstra(_) => AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium,
-            },
-            Self::ClaudeAdvisor { .. } => AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium1,
-            },
-        }
-    }
-
-    pub fn deep_config(self) -> Option<InferenceProfile> {
-        match self {
-            Self::ResponsesSol(config)
-            | Self::ResponsesLuna(config)
-            | Self::ResponsesAstra(config)
-            | Self::AdvisorAstra(config)
-            | Self::AdvisorSol(config) => Some(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
-        }
-    }
-
-    pub fn deep_model(self) -> Option<InferenceModel> {
-        match self {
-            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt6Sol),
-            Self::ResponsesLuna(_) => Some(InferenceModel::Gpt6Luna),
-            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
-        }
-    }
-
-    pub fn claude_model(self) -> Option<rho_claude::Model> {
-        match self {
-            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
-            Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
-            Self::ResponsesSol(_)
-            | Self::ResponsesLuna(_)
-            | Self::ResponsesAstra(_)
-            | Self::AdvisorAstra(_)
-            | Self::AdvisorSol(_) => None,
-        }
-    }
-
-    pub fn claude_effort(self) -> Option<rho_claude::Effort> {
-        match self {
-            Self::ClaudeFable { effort } | Self::ClaudeAdvisor { effort } => {
-                Some(effort.to_claude_effort())
-            }
-            Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
-            Self::ResponsesSol(_)
-            | Self::ResponsesLuna(_)
-            | Self::ResponsesAstra(_)
-            | Self::AdvisorAstra(_)
-            | Self::AdvisorSol(_) => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum ClaudeEffort {
-    Medium,
-    Xhigh,
-    High,
-}
-
-impl ClaudeEffort {
-    fn to_claude_effort(self) -> rho_claude::Effort {
-        match self {
-            Self::Medium => rho_claude::Effort::Medium,
-            Self::Xhigh => rho_claude::Effort::Xhigh,
-            Self::High => rho_claude::Effort::High,
-        }
-    }
-}
-
 pub trait AgentReadTxnExt {
     /// This database's random machine seed; present once
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
@@ -621,6 +243,10 @@ pub trait AgentReadTxnExt {
     fn list_agent_ids(&self) -> Vec<AgentId>;
     /// Every agent's fold: the whole store. For conversions and tools.
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
+    /// `None` means an unclaimed workset; `Some(None)` means legacy mixed
+    /// modes.
+    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>>;
+    fn workset_agents(&self, workset: &str) -> Vec<AgentId>;
     /// Who spawned an agent, read from its creation alone.
     fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId>;
     /// The agent that spawned this one: its parent, or the Engineer that
@@ -631,21 +257,30 @@ pub trait AgentReadTxnExt {
     /// The agent's history as it stands: every row a later `Rewound` did
     /// not take back, oldest first, and where the next row goes.
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
+    /// Frozen native replay range for the log's current visible branch.
+    fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary;
+    fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery;
+    /// Visible native entries in this fixed half-open range, independent of
+    /// later appends.
+    fn agent_context_records(
+        &self,
+        agent_id: AgentId,
+        boundary: ContextBoundary,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
     fn agent_event_records(
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
-    fn agent_recovery_records(
-        &self,
-        agent_id: AgentId,
-    ) -> (
-        AgentEventPos,
-        Vec<(AgentEventPos, AgentEvent<'static>)>,
-        Vec<rho_inference::types::ExecId>,
-    );
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
+    /// Last response on the visible branch before this input's position.
+    fn agent_input_carry(
+        &self,
+        agent_id: AgentId,
+        before: AgentEventPos,
+    ) -> Option<crate::inference::Carry>;
+
     /// Newest text-bearing visible rows, read backward and bounded before
     /// decoding/building a Luna request.
 
@@ -676,6 +311,8 @@ pub trait AgentReadTxnExt {
 #[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
+    /// Capture the exact native replay boundary within the append transaction.
+    fn agent_context_boundary(&mut self, agent_id: AgentId) -> ContextBoundary;
 
     /// Appends one event at the agent's tail and names it in the journal.
     /// The tail is read from the table, not from a runtime's cursor, so
@@ -688,6 +325,8 @@ pub trait AgentWriteTxnExt {
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
 
     fn alloc_agent_id(&mut self) -> AgentId;
+    /// Changes the mode and all member projections in the same transaction.
+    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId>;
 
     /// Applies an update only when its source is still visible. The
     /// returned cache is the acknowledged source of truth for a sidecar
@@ -749,8 +388,6 @@ pub(crate) trait AgentProfileWriteTxnExt {
     );
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
-    /// The agent sees the filesystem in `mode` from its next load on.
-    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode);
 }
 
 impl AgentProfileWriteTxnExt for WriteTxn {
@@ -811,16 +448,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             },
         );
     }
-
-    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode) {
-        self.append_agent_event(
-            agent_id,
-            &AgentEvent::ModeChanged {
-                mode,
-                at: UnixMillis::now(),
-            },
-        );
-    }
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -864,6 +491,20 @@ impl AgentReadTxnExt for ReadTxn {
         self.open_table(AGENT_HEADS)
             .iter()
             .map(|(id, head)| (id.value(), head.value().into_owned()))
+            .collect()
+    }
+
+    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>> {
+        self.open_table(WORKSET_MODES)
+            .get(&workset.to_owned())
+            .map(|value| value.value().into_owned())
+    }
+
+    fn workset_agents(&self, workset: &str) -> Vec<AgentId> {
+        let workset = workset.to_owned();
+        self.open_table(WORKSET_AGENTS)
+            .range((workset.clone(), AgentId::MIN)..=(workset, AgentId::MAX))
+            .map(|(key, _)| key.value().1)
             .collect()
     }
 
@@ -914,6 +555,53 @@ impl AgentReadTxnExt for ReadTxn {
         visible_rows(rows(log.range(agent_range(agent_id))))
     }
 
+    fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary {
+        let cursor = self
+            .open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned())
+            .unwrap_or_default();
+        ContextBoundary {
+            from: cursor.from,
+            through: self.get_agent(agent_id).next,
+        }
+    }
+
+    fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery {
+        self.open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned().recovery)
+            .unwrap_or_default()
+    }
+
+    fn agent_context_records(
+        &self,
+        agent_id: AgentId,
+        boundary: ContextBoundary,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
+        if boundary.from >= boundary.through {
+            return Vec::new();
+        }
+        let log = self.open_table(AGENT_LOG);
+        let mut hidden = Hidden::default();
+        let mut visible = Vec::new();
+        for (key, value) in log
+            .range((agent_id, boundary.from.pos)..(agent_id, boundary.through.pos))
+            .rev()
+        {
+            let pos = AgentEventPos::new(key.value().1);
+            if hidden.from.is_some_and(|from| pos.pos >= from) {
+                continue;
+            }
+            let event = value.value().into_owned();
+            if hidden.visible(pos, &event) && matches!(event, AgentEvent::Entry(_)) {
+                visible.push((pos, event));
+            }
+        }
+        visible.reverse();
+        visible
+    }
+
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch> {
         let log = self.open_table(AGENT_LOG);
         let mut handed_off = BTreeSet::new();
@@ -933,40 +621,22 @@ impl AgentReadTxnExt for ReadTxn {
         None
     }
 
-    fn agent_recovery_records(
+    fn agent_input_carry(
         &self,
         agent_id: AgentId,
-    ) -> (
-        AgentEventPos,
-        Vec<(AgentEventPos, AgentEvent<'static>)>,
-        Vec<rho_inference::types::ExecId>,
-    ) {
+        before: AgentEventPos,
+    ) -> Option<crate::inference::Carry> {
         let log = self.open_table(AGENT_LOG);
-        let mut admitted = Vec::new();
-        // Include identities from hidden branches: rewinds never reauthorize them.
-        let events = rows(log.range(agent_range(agent_id))).inspect(|(_, event)| {
-            if let AgentEvent::ClaudeExecAdmitted { call, .. } = event {
-                admitted.push(call.id.clone());
+        let mut hidden = Hidden::default();
+        for (pos, event) in rows(log.range((agent_id, 0)..(agent_id, before.pos)).rev()) {
+            if !hidden.visible(pos, &event) {
+                continue;
             }
-            if let Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =
-                event.native_event()
-            {
-                for block in output {
-                    if let rho_inference::types::ContextBlock::InferenceResponse { items, .. } =
-                        block
-                    {
-                        admitted.extend(items.iter().filter_map(|item| match item {
-                            rho_inference::types::InferenceResponseItem::ToolCall {
-                                id, ..
-                            } => Some(id.clone()),
-                            _ => None,
-                        }));
-                    }
-                }
+            if let AgentEvent::Entry(crate::entry::Entry::Step { carry, .. }) = event {
+                return Some(carry);
             }
-        });
-        let (next, visible) = visible_rows(events);
-        (next, visible, admitted)
+        }
+        None
     }
 
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {
@@ -1090,6 +760,9 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
         self.open_table(AGENT_HEADS);
+        self.open_table(native::NATIVE_CURSORS);
+        self.open_table(WORKSET_MODES);
+        self.open_table(WORKSET_AGENTS);
         self.open_table(JOURNAL);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(QUOTA_OBSERVATIONS);
@@ -1102,6 +775,21 @@ impl AgentWriteTxnExt for WriteTxn {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
     }
+    fn agent_context_boundary(&mut self, agent_id: AgentId) -> ContextBoundary {
+        let from = self
+            .open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|row| row.value().into_owned().from)
+            .unwrap_or_default();
+        let through = self
+            .open_table(AGENT_LOG)
+            .range(agent_range(agent_id))
+            .next_back()
+            .map(|(key, _)| AgentEventPos::new(key.value().1).next())
+            .unwrap_or_default();
+        ContextBoundary { from, through }
+    }
+
     fn append_agent_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) -> AgentEventPos {
         let pos = {
             let log = self.open_table(AGENT_LOG);
@@ -1116,6 +804,7 @@ impl AgentWriteTxnExt for WriteTxn {
         );
         self.open_table(AGENT_LOG)
             .insert(&(agent_id, pos.pos), SenValue::borrowed(event));
+        native::append(self, agent_id, pos, event);
         let head = if pos == AgentEventPos::ZERO {
             created_head(event, pos)
         } else {
@@ -1131,6 +820,23 @@ impl AgentWriteTxnExt for WriteTxn {
         };
         self.open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
+        if pos == AgentEventPos::ZERO {
+            let place = head.place();
+            let previous = self
+                .open_table(WORKSET_MODES)
+                .get(&place.workset)
+                .map(|value| value.value().into_owned());
+            assert!(
+                previous.is_none() || previous == Some(Some(place.mode)),
+                "new agents must use the workset's filesystem mode"
+            );
+            if previous.is_none() {
+                self.open_table(WORKSET_MODES)
+                    .insert(&place.workset, SenValue::borrowed(&Some(place.mode)));
+            }
+            self.open_table(WORKSET_AGENTS)
+                .insert(&(place.workset.clone(), agent_id), &());
+        }
         let seq = {
             let mut journal = self.open_table(JOURNAL);
             let seq = journal
@@ -1195,6 +901,27 @@ impl AgentWriteTxnExt for WriteTxn {
                 at: UnixMillis::now(),
             },
         );
+    }
+
+    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId> {
+        let workset_key = workset.to_owned();
+        let ids = self
+            .open_table(WORKSET_AGENTS)
+            .range((workset_key.clone(), AgentId::MIN)..=(workset_key.clone(), AgentId::MAX))
+            .map(|(key, _)| key.value().1)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.append_agent_event(
+                *id,
+                &AgentEvent::ModeChanged {
+                    mode,
+                    at: UnixMillis::now(),
+                },
+            );
+        }
+        self.open_table(WORKSET_MODES)
+            .insert(&workset_key, SenValue::borrowed(&Some(mode)));
+        ids
     }
 
     fn alloc_agent_id(&mut self) -> AgentId {
@@ -1441,13 +1168,16 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
     matches!(
         event,
         AgentEvent::Accepted(crate::QueuedInput {
-            source: rho_inference::types::MessageSender::User,
+            source: rho_agent_types::transcript::MessageSender::User,
             kind: crate::InputKind::Message { .. },
             ..
         }) | AgentEvent::Transcript {
             line: crate::TranscriptLine::User { .. },
             ..
-        }
+        } | AgentEvent::Entry(crate::entry::Entry::Received {
+            from: crate::entry::Party::Human,
+            ..
+        })
     )
 }
 
@@ -1583,11 +1313,12 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             TurnEdge::Started => head.turn_running = true,
             TurnEdge::Ended(_) => {
                 head.turn_running = false;
-                // The activity label describes work that just stopped.
-                head.activity = None;
                 head.last_turn_ended = Some(*at);
             }
         },
+        AgentEvent::Entry(crate::entry::Entry::Status { text, .. }) => {
+            head.activity = (!text.is_empty()).then(|| text.clone());
+        }
         event if carries_notice(event) => {
             head.user_interacted = true;
             head.pending_notice = None;
@@ -1602,6 +1333,8 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::ExecObserved { .. }
         | AgentEvent::Native(_)
         | AgentEvent::Failed { .. }
+        | AgentEvent::LegacyEntry(_)
+        | AgentEvent::Entry(_)
         | AgentEvent::Transcript { .. } => {}
     }
 }
@@ -1707,6 +1440,7 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
         }
         drop(log);
         write.open_table(AGENT_HEADS).remove(&agent_id);
+        write.open_table(native::NATIVE_CURSORS).remove(&agent_id);
         deleted.push((agent_id, keys.len()));
 
         let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
@@ -1728,6 +1462,21 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
         drop(usage);
         write.open_table(AGENT_USAGE_TOTALS).remove(&agent_id);
     }
+
+    // Deletion also handles heads this build cannot decode. Inspect only the
+    // index keys rather than reading an agent head to discover its workset.
+    let mut members = write.open_table(WORKSET_AGENTS);
+    let keys = members
+        .iter()
+        .map(|(key, _)| key.value())
+        .filter(|(_, id)| doomed.contains(id))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        members.remove(key);
+    }
+    drop(members);
+    // Mode belongs to the workset, not its agents. Retain it even when the
+    // last member is deleted so future creation cannot silently change it.
 
     let mut journal = write.open_table(JOURNAL);
     let seqs = journal
@@ -1798,43 +1547,6 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
     write.delete_persistent_savepoint(id);
     write.commit();
     Ok(hop)
-}
-
-/// Backfill the cheap read projection once. The log is still the source of
-/// truth, including branches hidden by rewinds when folding the head.
-fn rebuild_agent_heads(write: &mut WriteTxn) {
-    let heads = {
-        let log = write.open_table(AGENT_LOG);
-        let mut heads = Vec::new();
-        let mut current: Option<(AgentId, AgentHead)> = None;
-        for (key, value) in log.iter() {
-            let (id, position) = key.value();
-            let pos = AgentEventPos::new(position);
-            let event = value.value().into_owned();
-            if current.as_ref().is_none_or(|(previous, _)| *previous != id) {
-                if let Some(previous) = current.take() {
-                    heads.push(previous);
-                }
-                current = Some((
-                    id,
-                    fold_head(std::iter::once((pos, event)))
-                        .expect("agent log must start with creation"),
-                ));
-            } else {
-                let head = &mut current.as_mut().expect("current agent").1;
-                fold_agent_head(head, &event);
-                head.next = pos.next();
-            }
-        }
-        if let Some(last) = current {
-            heads.push(last);
-        }
-        heads
-    };
-    let mut table = write.open_table(AGENT_HEADS);
-    for (id, head) in heads {
-        table.insert(&id, SenValue::borrowed(&head));
-    }
 }
 
 fn migrate_agent_db_format(write: &mut WriteTxn) {

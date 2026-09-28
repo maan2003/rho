@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use rho_agent_types::ToolOutputStatus;
-use rho_inference::types::{ExecId, ToolName, ToolOutput, ToolSpec, ToolType};
+use rho_agent_types::transcript::{ExecId, ToolName, ToolOutput, ToolSpec, ToolType};
 use serde_json::{Value, json};
 
 /// The server's name in Claude Code, which is where the model's tool name

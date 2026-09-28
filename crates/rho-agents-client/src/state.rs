@@ -15,6 +15,9 @@ pub struct UiAgentState {
     /// row copies pointers, never text.
     pub blocks: Vec<std::sync::Arc<UiBlock>>,
     pub status: UiAgentStatus,
+    /// Latest ephemeral runtime snapshot; absent when disconnected.
+    pub runtime: Option<crate::protocol::transcript::RuntimeState>,
+    pub awaiting_human: Option<UnixMs>,
     /// Tokens occupying the model's context window after the latest
     /// response; `None` until the agent's first response.
     pub context_used: Option<u64>,
@@ -24,6 +27,14 @@ pub struct UiAgentState {
     #[senax(default)]
     pub exec_timings:
         std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiNotebookActivity {
+    pub responding: bool,
+    pub running_tasks: u32,
+    pub checkin_at: Option<UnixMs>,
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -57,6 +68,10 @@ pub enum UiBlock {
         sender: Option<rho_agent_types::AgentId>,
     },
     /// A delivered message from another agent.
+    MessageSent {
+        to: Option<rho_agent_types::AgentId>,
+        text: String,
+    },
     AgentMessage {
         /// The sending agent.
         sender: rho_agent_types::AgentId,
@@ -68,6 +83,9 @@ pub enum UiBlock {
 pub enum UiAgentStatus {
     Idle,
     Streaming,
+    Retrying {
+        at: UnixMs,
+    },
     ToolCalling {
         /// Deadline of the batch's armed `wait` call, if one is parked
         /// until mail arrives or the wall clock passes it.
@@ -137,6 +155,7 @@ pub struct UiTool {
 pub enum UiToolStatus {
     Running,
     Success,
+    Reported,
     Error,
     Cancelled,
 }

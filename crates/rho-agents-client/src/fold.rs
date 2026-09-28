@@ -8,16 +8,18 @@
 use std::sync::Arc;
 
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, TurnEdge, TurnOutcome,
-    UnixMs,
+    AgentId, AgentPos, AgentRole, AgentWant, MessageDelivery, Place, PresentationField, TurnEdge,
+    TurnOutcome, UnixMs,
 };
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{
-    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
+    RuntimeKind, RuntimeState, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
 };
-use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
+use crate::state::{
+    UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiNotebookActivity, UiToolStatus,
+};
 
 /// How much an agent wants the user, as the view decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,13 +44,16 @@ pub struct Verdict {
 }
 
 /// What of a digest attention is decided from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttentionFacts {
     pub turn_running: bool,
     /// Where the last turn died, if nothing has happened since.
     pub errored: Option<AgentPos>,
     /// Where the last finished turn said what it wants.
     pub wants_at: Option<AgentPos>,
+    pub awaiting_at: Option<AgentPos>,
+    pub sent_at: Option<AgentPos>,
+    pub runtime: Option<RuntimeState>,
 }
 
 /// How badly an agent wants the user: the join of what its rows say and
@@ -63,10 +68,28 @@ pub fn attention(facts: AttentionFacts, verdict: Verdict) -> Attention {
     // how loudly an agent may ask and not of whether it may ask at all.
     if verdict.muted {
         Attention::Quiet
-    } else if facts.turn_running {
-        Attention::Working
+    } else if facts.awaiting_at.map_or_else(
+        || {
+            facts
+                .runtime
+                .as_ref()
+                .is_some_and(|state| state.awaiting_human)
+        },
+        past,
+    ) {
+        Attention::NeedsInput
+    } else if facts.sent_at.is_some_and(past) {
+        Attention::Pending
     } else if facts.errored.is_some_and(past) {
         Attention::NeedsInput
+    } else if let Some(runtime) = facts.runtime.as_ref() {
+        if runtime.is_working() {
+            Attention::Working
+        } else {
+            Attention::Quiet
+        }
+    } else if facts.turn_running {
+        Attention::Working
     } else if facts.wants_at.is_some_and(past) {
         Attention::Pending
     } else {
@@ -101,7 +124,7 @@ pub struct AgentIdentity {
 /// Which fold made a stored digest. Bump when `Digest::tell` changes
 /// what it makes of a row; a client finding another version on disk
 /// folds that agent's rows again, once.
-pub const DIGEST_VERSION: u32 = 1;
+pub const DIGEST_VERSION: u32 = 2;
 
 /// What the rails read of an agent, folded from its mirror. Incremental,
 /// and kept on disk by the client, so a restart reads it back instead of
@@ -125,6 +148,10 @@ pub struct Digest {
     /// Where the last turn died, if nothing has happened since.
     pub errored: Option<AgentPos>,
     pub wants: Option<Wants>,
+    /// Explicit code-first wait and latest human delivery positions.
+    pub awaiting_human: Option<(AgentPos, UnixMs)>,
+    pub message_sent: Option<(AgentPos, UnixMs)>,
+    pub notebook: Option<UiNotebookActivity>,
     /// Every reply's usage, summed.
     pub usage: AgentUsageBucket,
     /// The model the newest usage named.
@@ -137,6 +164,9 @@ impl Digest {
             turn_running: self.turn_running,
             errored: self.errored,
             wants_at: self.wants.as_ref().map(|wants| wants.at),
+            awaiting_at: self.awaiting_human.map(|(pos, _)| pos),
+            sent_at: self.message_sent.map(|(pos, _)| pos),
+            runtime: None,
         }
     }
 
@@ -149,6 +179,12 @@ impl Digest {
         self.newest = pos.next();
         self.last_active = self.last_active.max(event.at());
         match event {
+            TranscriptEvent::Received {
+                from: None,
+                text,
+                at,
+                ..
+            } => self.user_spoke(*at, text),
             TranscriptEvent::Message {
                 from: None,
                 text,
@@ -176,9 +212,27 @@ impl Digest {
                 self.turn_running = false;
                 self.turn_started_at = None;
                 self.last_turn_ended = Some(*at);
-                // The label described work that just stopped.
-                self.activity = None;
                 self.errored = matches!(outcome, TurnOutcome::Errored { .. }).then_some(pos);
+            }
+            TranscriptEvent::MessageSent { to: None, at, .. } => {
+                self.message_sent = Some((pos, *at));
+            }
+            TranscriptEvent::AwaitingHuman { since, .. } => {
+                self.awaiting_human = since.map(|since| (pos, since));
+            }
+            TranscriptEvent::NotebookActivity {
+                responding,
+                running_tasks,
+                checkin_at,
+                archived,
+                ..
+            } => {
+                self.notebook = Some(UiNotebookActivity {
+                    responding: *responding,
+                    running_tasks: *running_tasks,
+                    checkin_at: *checkin_at,
+                    archived: *archived,
+                });
             }
             TranscriptEvent::Presented {
                 title, activity, ..
@@ -212,8 +266,15 @@ impl Digest {
                 if self.errored.is_some_and(|errored| errored >= *to) {
                     self.errored = None;
                 }
+                if self.awaiting_human.is_some_and(|(at, _)| at >= *to) {
+                    self.awaiting_human = None;
+                }
+                if self.message_sent.is_some_and(|(at, _)| at >= *to) {
+                    self.message_sent = None;
+                }
             }
             TranscriptEvent::Message { .. }
+            | TranscriptEvent::Received { .. }
             | TranscriptEvent::ClaudeMessage { .. }
             | TranscriptEvent::Created { .. }
             | TranscriptEvent::RoleChanged { .. }
@@ -222,6 +283,8 @@ impl Digest {
             | TranscriptEvent::CompactionRequested { .. }
             | TranscriptEvent::QueueCleared { .. }
             | TranscriptEvent::Sent { .. }
+            | TranscriptEvent::NotebookReport { .. }
+            | TranscriptEvent::MessageSent { .. }
             | TranscriptEvent::ExecObserved { .. }
             | TranscriptEvent::Results { .. }
             | TranscriptEvent::Replied { .. }
@@ -236,6 +299,8 @@ impl Digest {
         // The ball is the agent's again.
         self.wants = None;
         self.errored = None;
+        self.awaiting_human = None;
+        self.message_sent = None;
     }
 }
 
@@ -354,7 +419,7 @@ pub struct TranscriptFold {
     /// told after it and keeps the rest.
     told_at: Vec<AgentPos>,
     /// Messages no request has carried yet; drawn after the blocks.
-    queue: Vec<(AgentPos, UiBlock)>,
+    queue: Vec<(AgentPos, Option<u64>, UiBlock)>,
     turn_running: bool,
     errored: bool,
     /// What the last reply said the context holds, and where it said it.
@@ -376,6 +441,7 @@ pub struct FoldDelta {
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
+    pub awaiting_human: Option<UnixMs>,
     pub context_used: Option<u64>,
     pub usage: UiAgentUsage,
 }
@@ -413,7 +479,7 @@ impl TranscriptFold {
         let queued = self
             .queue
             .iter()
-            .map(|(_, queued)| Arc::new(queued.clone()));
+            .map(|(_, _, queued)| Arc::new(queued.clone()));
         if from < self.blocks.len() {
             self.blocks[from..].iter().cloned().chain(queued).collect()
         } else {
@@ -431,6 +497,7 @@ impl TranscriptFold {
             from,
             blocks: self.composed_from(from),
             status: state.status,
+            awaiting_human: state.awaiting_human,
             context_used: state.context_used,
             usage: state.usage,
         })
@@ -439,6 +506,23 @@ impl TranscriptFold {
     /// Each result lands on the call it answers: its status and its two
     /// timestamps. Where the log holds the output is not kept, because
     /// nothing in the transcript draws it.
+    fn report_calls(&mut self, calls: &[String]) {
+        for id in calls {
+            if let Some(index) = self
+                .blocks
+                .iter()
+                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id))
+            {
+                self.touch(index);
+                if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+                    tool.status = UiToolStatus::Reported;
+                    tool.started_at = None;
+                    tool.finished_at = None;
+                }
+            }
+        }
+    }
+
     fn finish_calls(&mut self, results: &[ToolOutcome]) {
         for result in results {
             let called = self
@@ -453,6 +537,7 @@ impl TranscriptFold {
             {
                 tool.status = match result.status {
                     ToolStatus::Success => UiToolStatus::Success,
+                    ToolStatus::Reported => UiToolStatus::Reported,
                     ToolStatus::Error => UiToolStatus::Error,
                     ToolStatus::Cancelled => UiToolStatus::Cancelled,
                 };
@@ -499,9 +584,23 @@ impl TranscriptFold {
                 self.touch(self.blocks.len() + self.queue.len());
                 self.queue.push((
                     pos,
+                    None,
                     UiBlock::QueuedMessage {
                         text: text.clone(),
                         delivery: *delivery,
+                        sender: *from,
+                    },
+                ));
+            }
+            TranscriptEvent::Received { id, from, text, .. } => {
+                self.errored = false;
+                self.touch(self.blocks.len() + self.queue.len());
+                self.queue.push((
+                    pos,
+                    Some(*id),
+                    UiBlock::QueuedMessage {
+                        text: text.clone(),
+                        delivery: MessageDelivery::Immediate,
                         sender: *from,
                     },
                 ));
@@ -510,6 +609,7 @@ impl TranscriptFold {
                 self.touch(self.blocks.len() + self.queue.len());
                 self.queue.push((
                     pos,
+                    None,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
                     },
@@ -524,7 +624,7 @@ impl TranscriptFold {
                 compaction,
                 ..
             } => {
-                for (_, queued) in std::mem::take(&mut self.queue) {
+                for (_, _, queued) in std::mem::take(&mut self.queue) {
                     self.push(pos, delivered(queued));
                 }
                 if *compaction {
@@ -536,6 +636,47 @@ impl TranscriptFold {
                     );
                 }
                 self.finish_calls(results);
+            }
+            TranscriptEvent::NotebookReport {
+                calls,
+                delivered: delivered_ids,
+                acknowledged,
+                compaction,
+                ..
+            } => {
+                let queue = std::mem::take(&mut self.queue);
+                for (queued_at, id, queued) in queue {
+                    if id.is_some_and(|id| delivered_ids.contains(&id)) {
+                        self.push(pos, delivered(queued));
+                    } else if id.is_some_and(|id| acknowledged.contains(&id)) {
+                        self.touch(self.blocks.len() + self.queue.len());
+                    } else if *compaction
+                        && id.is_none()
+                        && matches!(queued, UiBlock::Notice { .. })
+                    {
+                        self.touch(self.blocks.len() + self.queue.len());
+                    } else {
+                        self.queue.push((queued_at, id, queued));
+                    }
+                }
+                if *compaction {
+                    self.push(
+                        pos,
+                        UiBlock::Notice {
+                            text: "compacting context".to_owned(),
+                        },
+                    );
+                }
+                self.report_calls(calls);
+            }
+            TranscriptEvent::MessageSent { to, text, .. } => {
+                self.push(
+                    pos,
+                    UiBlock::MessageSent {
+                        to: *to,
+                        text: text.clone(),
+                    },
+                );
             }
             TranscriptEvent::Results { results, .. } => self.finish_calls(results),
             TranscriptEvent::Replied {
@@ -663,7 +804,7 @@ impl TranscriptFold {
                 self.touch(kept);
                 self.blocks.truncate(kept);
                 self.told_at.truncate(kept);
-                self.queue.retain(|(queued_at, _)| queued_at < to);
+                self.queue.retain(|(queued_at, _, _)| queued_at < to);
                 if self.context_used.is_some_and(|(said_at, _)| said_at >= *to) {
                     self.context_used = None;
                 }
@@ -674,6 +815,9 @@ impl TranscriptFold {
             | TranscriptEvent::Notice { .. }
             | TranscriptEvent::Presented { .. }
             | TranscriptEvent::Wants { .. } => {}
+            TranscriptEvent::AwaitingHuman { .. } | TranscriptEvent::NotebookActivity { .. } => {
+                self.touch(self.blocks.len() + self.queue.len());
+            }
         }
         true
     }
@@ -684,11 +828,13 @@ impl TranscriptFold {
         blocks.extend(
             self.queue
                 .iter()
-                .map(|(_, queued)| Arc::new(queued.clone())),
+                .map(|(_, _, queued)| Arc::new(queued.clone())),
         );
         UiAgentState {
             exec_timings: self.exec_timings.clone(),
             blocks,
+            runtime: None,
+            awaiting_human: self.digest.awaiting_human.map(|(_, since)| since),
             // Never `Streaming`: this is the mirror, not the live tail. A
             // turn that was running when the client last heard is the
             // agent host's to report again.
@@ -885,17 +1031,10 @@ mod tests {
         );
     }
 
-    /// The last few tool calls of a running turn stay visible.
-    ///
-    /// Before 5 September they were: the turn in progress keeps its final
-    /// working fold open to a limited tail, and the reader watches the calls
-    /// arrive. On a story-made transcript they stopped, and the link that
-    /// broke is this one - the mirror never says `Streaming`, because it is
-    /// not the live tail, so it reports a running turn as `Unloaded`, and
-    /// `turn_open` read that as a turn that had finished. The last plan then
-    /// took `tail_rows` 0 and the calls folded away whole.
+    /// A mirror does not claim to stream, but an unloaded running turn
+    /// must still be treated as open when a surface composes its tail.
     #[test]
-    fn a_running_turn_read_back_from_the_mirror_keeps_its_tail() {
+    fn a_running_turn_read_back_from_the_mirror_stays_open() {
         let mut events = vec![
             user("go", 1),
             TranscriptEvent::Turn {
@@ -928,21 +1067,6 @@ mod tests {
         assert!(
             crate::store::turn_open(state.status),
             "a turn the mirror saw running is a turn in progress"
-        );
-
-        let visible = vec![true; state.blocks.len()];
-        let plans = crate::elision::elision_plans_from(
-            &state.blocks,
-            &visible,
-            0,
-            None,
-            crate::store::turn_open(state.status),
-        );
-        let last = plans.last().expect("the calls of the open turn elide");
-        assert_eq!(
-            last.tail_rows,
-            crate::elision::LIMITED_TAIL_ROWS,
-            "the open turn's last fold keeps its tail: {plans:?}"
         );
     }
 
@@ -1246,6 +1370,219 @@ mod tests {
     /// is the agent's court — which made the mute last exactly until the
     /// agent moved.
     #[test]
+    fn code_first_wait_and_activity_are_independent() {
+        let mut digest = Digest::default();
+        let activity =
+            |responding, running_tasks, archived, at| TranscriptEvent::NotebookActivity {
+                responding,
+                running_tasks,
+                archived,
+                checkin_at: Some(UnixMs(44)),
+                at: UnixMs(at),
+            };
+        digest.tell(AgentPos(0), &activity(true, 3, false, 10));
+        digest.tell(
+            AgentPos(1),
+            &TranscriptEvent::MessageSent {
+                to: None,
+                text: "progress, not done".into(),
+                at: UnixMs(11),
+            },
+        );
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::Pending
+        );
+        digest.tell(
+            AgentPos(2),
+            &TranscriptEvent::AwaitingHuman {
+                since: Some(UnixMs(12)),
+                at: UnixMs(12),
+            },
+        );
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::NeedsInput
+        );
+        digest.tell(AgentPos(3), &activity(false, 2, false, 13));
+        assert_eq!(digest.awaiting_human, Some((AgentPos(2), UnixMs(12))));
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::NeedsInput
+        );
+        digest.tell(AgentPos(4), &user("continue", 14));
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::Quiet // historical activity is not current runtime state
+        );
+        digest.tell(AgentPos(5), &activity(false, 0, true, 15));
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::Quiet
+        );
+        digest.tell(AgentPos(6), &activity(true, 1, false, 16));
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::Quiet
+        );
+    }
+
+    #[test]
+    fn permanent_error_after_idle_snapshot_still_needs_input() {
+        let mut digest = Digest::default();
+        digest.tell(
+            AgentPos(0),
+            &TranscriptEvent::NotebookActivity {
+                responding: false,
+                running_tasks: 0,
+                checkin_at: None,
+                archived: false,
+                at: UnixMs(1),
+            },
+        );
+        digest.tell(
+            AgentPos(1),
+            &TranscriptEvent::Turn {
+                edge: TurnEdge::Ended(TurnOutcome::Errored {
+                    message: "failed".into(),
+                }),
+                at: UnixMs(2),
+            },
+        );
+        assert_eq!(
+            attention(digest.attention_facts(), Verdict::default()),
+            Attention::NeedsInput
+        );
+    }
+
+    #[test]
+    fn checkin_turn_end_preserves_explicit_activity_label() {
+        let mut digest = Digest::default();
+        digest.tell(
+            AgentPos(0),
+            &TranscriptEvent::NotebookActivity {
+                responding: false,
+                running_tasks: 1,
+                checkin_at: Some(UnixMs(10)),
+                archived: false,
+                at: UnixMs(1),
+            },
+        );
+        digest.tell(
+            AgentPos(1),
+            &TranscriptEvent::Presented {
+                title: PresentationField::Unchanged,
+                activity: PresentationField::Set("Checking build logs".into()),
+                at: UnixMs(2),
+            },
+        );
+        digest.tell(
+            AgentPos(2),
+            &TranscriptEvent::Turn {
+                edge: TurnEdge::Ended(TurnOutcome::Completed),
+                at: UnixMs(3),
+            },
+        );
+        assert_eq!(digest.activity.as_deref(), Some("Checking build logs"));
+    }
+
+    #[test]
+    fn report_delivers_exact_messages_and_reports_call_while_task_runs() {
+        let mut fold = TranscriptFold::default();
+        let mut tell = |pos, event| {
+            fold.tell(AgentPos(pos), &event);
+        };
+        tell(
+            0,
+            TranscriptEvent::NotebookActivity {
+                responding: true,
+                running_tasks: 2,
+                checkin_at: None,
+                archived: false,
+                at: UnixMs(1),
+            },
+        );
+        tell(
+            1,
+            TranscriptEvent::Replied {
+                items: vec![Item::ToolCall {
+                    id: "exec-1".into(),
+                    name: "exec".into(),
+                    arguments: "print(1)".into(),
+                    format: ArgumentsFormat::Text,
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(2),
+            },
+        );
+        for (pos, id) in [(2, 41), (3, 73), (4, 82)] {
+            tell(
+                pos,
+                TranscriptEvent::Received {
+                    id,
+                    from: None,
+                    text: format!("message-{id}"),
+                    at: UnixMs(pos),
+                },
+            );
+        }
+        tell(
+            5,
+            TranscriptEvent::NotebookReport {
+                calls: vec!["exec-1".into()],
+                delivered: vec![41],
+                acknowledged: vec![73],
+                compaction: false,
+                at: UnixMs(5),
+            },
+        );
+        let state = fold.state();
+        assert!(state.runtime.is_none());
+        assert_eq!(fold.digest.notebook.unwrap().running_tasks, 2);
+        let UiBlock::Tool(tool) = &*state.blocks[0] else {
+            panic!("expected tool")
+        };
+        assert_eq!(tool.status, UiToolStatus::Reported);
+        assert_eq!((tool.started_at, tool.finished_at), (None, None));
+        assert_eq!(
+            *state.blocks[1],
+            UiBlock::UserMessage {
+                text: "message-41".into()
+            }
+        );
+        assert!(
+            matches!(&*state.blocks[2], UiBlock::QueuedMessage { text, .. } if text == "message-82")
+        );
+        assert_eq!(
+            state.blocks.len(),
+            3,
+            "acknowledged message is not delivered"
+        );
+    }
+
+    #[test]
+    fn live_wait_respects_a_handled_durable_wait() {
+        let mut facts = AttentionFacts {
+            runtime: Some(RuntimeState {
+                awaiting_human: true,
+                ..RuntimeState::default()
+            }),
+            ..AttentionFacts::default()
+        };
+        let verdict = Verdict {
+            handled_through: AgentPos(8),
+            muted: false,
+        };
+        assert_eq!(attention(facts.clone(), verdict), Attention::NeedsInput);
+        facts.awaiting_at = Some(AgentPos(7));
+        assert_eq!(attention(facts.clone(), verdict), Attention::Quiet);
+        facts.awaiting_at = Some(AgentPos(8));
+        assert_eq!(attention(facts, verdict), Attention::NeedsInput);
+    }
+
+    #[test]
     fn a_muted_agent_stays_quiet_through_a_turn() {
         let muted = Verdict {
             handled_through: AgentPos(0),
@@ -1255,8 +1592,9 @@ mod tests {
             turn_running: true,
             errored: None,
             wants_at: None,
+            ..AttentionFacts::default()
         };
-        assert_eq!(attention(running, muted), Attention::Quiet);
+        assert_eq!(attention(running.clone(), muted), Attention::Quiet);
         assert_eq!(
             attention(running, Verdict::default()),
             Attention::Working,
@@ -1266,6 +1604,7 @@ mod tests {
             turn_running: false,
             errored: None,
             wants_at: Some(AgentPos(1)),
+            ..AttentionFacts::default()
         };
         assert_eq!(attention(asking, muted), Attention::Quiet);
     }

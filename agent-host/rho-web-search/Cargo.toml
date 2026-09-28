@@ -7,10 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 rho-agent-types.workspace = true
-rho-inference.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true

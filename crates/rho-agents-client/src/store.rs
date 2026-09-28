@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use rho_agent_types::AgentId;
 
-use crate::protocol::transcript::{Item, Live, QueuedItem};
+use crate::protocol::transcript::{
+    InferenceState, Item, Live, QueuedItem, RuntimeState, StreamingResponse,
+};
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +74,22 @@ struct Layered {
     fold: UiAgentState,
     tail: Tail,
     state: UiAgentState,
+    committed_tools: std::collections::HashSet<String>,
 }
 
 impl Layered {
+    fn refresh_committed_tools(&mut self) {
+        self.committed_tools = self
+            .fold
+            .blocks
+            .iter()
+            .filter_map(|block| match block.as_ref() {
+                UiBlock::Tool(tool) => Some(tool.id.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+
     /// Composes from one index on, leaving the blocks before it as the
     /// pointers they already were.
     fn compose_from(&mut self, from: usize) {
@@ -85,121 +100,69 @@ impl Layered {
         self.state
             .blocks
             .extend(self.fold.blocks[from..].iter().cloned());
-        self.state
-            .blocks
-            .extend(self.tail.items.iter().flatten().map(|item| {
+        self.state.blocks.extend(self.tail.response.iter().flat_map(|response| &response.items)
+            .filter(|item| !matches!(item, Item::ToolCall { id, .. } if self.committed_tools.contains(id)))
+            .map(|item| {
                 let mut block = block(item);
                 if let UiBlock::Tool(tool) = &mut block {
-                    tool.timing = self
-                        .fold
-                        .exec_timings
-                        .get(&tool.id)
-                        .copied()
-                        .unwrap_or_default();
+                    tool.timing = self.fold.exec_timings.get(&tool.id).copied().unwrap_or_default();
                 }
                 Arc::new(block)
             }));
         self.state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
-        self.state.status = match self.tail.phase {
-            Phase::Requesting => UiAgentStatus::Streaming,
-            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
-            Phase::Idle | Phase::Unknown => self.fold.status,
+        self.state.status = match self.tail.runtime.as_ref() {
+            Some(RuntimeState {
+                inference: InferenceState::Responding,
+                ..
+            }) => UiAgentStatus::Streaming,
+            Some(RuntimeState {
+                inference: InferenceState::Retrying { at, .. },
+                ..
+            }) => UiAgentStatus::Retrying { at: *at },
+            Some(RuntimeState {
+                inference: InferenceState::Failed { .. },
+                ..
+            }) => UiAgentStatus::Error,
+            Some(RuntimeState {
+                running_tasks,
+                archived: false,
+                ..
+            }) if *running_tasks > 0 => UiAgentStatus::ToolCalling { waiting: None },
+            Some(_) => UiAgentStatus::Idle,
+            None => self.fold.status,
         };
+        self.state.runtime = self.tail.runtime.clone();
+        self.state.awaiting_human = self.fold.awaiting_human.filter(|_| {
+            self.tail
+                .runtime
+                .as_ref()
+                .is_some_and(|state| state.awaiting_human)
+        });
         self.state.context_used = self.fold.context_used;
         self.state.usage = self.fold.usage.clone();
         self.state.exec_timings = self.fold.exec_timings.clone();
     }
-
-    fn compose(&mut self) {
-        let mut state = self.fold.clone();
-        state
-            .blocks
-            .extend(self.tail.items.iter().flatten().map(|item| {
-                let mut block = block(item);
-                if let UiBlock::Tool(tool) = &mut block {
-                    tool.timing = self
-                        .fold
-                        .exec_timings
-                        .get(&tool.id)
-                        .copied()
-                        .unwrap_or_default();
-                }
-                Arc::new(block)
-            }));
-        state
-            .blocks
-            .extend(self.tail.queue.iter().cloned().map(Arc::new));
-        state.status = match self.tail.phase {
-            Phase::Requesting => UiAgentStatus::Streaming,
-            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
-            Phase::Idle | Phase::Unknown => state.status,
-        };
-        self.state = state;
-    }
 }
 
-/// What the runtime has past the log, kept from its deltas. Every phase
-/// message empties the items: a request starts with none, and once calls
-/// run or the turn ends the row carries the response.
+/// Runtime snapshots replace the response and state together. The Claude
+/// queue is a separate live stream and survives a response replacement.
 #[derive(Default)]
 struct Tail {
-    phase: Phase,
-    /// By the runtime's index; `None` where nothing was told.
-    items: Vec<Option<Item>>,
-    /// What the runtime holds for later, told whole whenever it changes.
-    /// Live state, not rows: it outlives the phase and the items.
+    runtime: Option<RuntimeState>,
+    response: Option<StreamingResponse>,
     queue: Vec<UiBlock>,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum Phase {
-    /// Nothing told yet: the fold's status stands.
-    #[default]
-    Unknown,
-    Requesting,
-    Waiting(Option<rho_agent_types::UnixMs>),
-    Idle,
 }
 
 impl Tail {
     fn apply(&mut self, live: Live) {
         match live {
-            Live::Requesting => {
-                self.phase = Phase::Requesting;
-                self.items.clear();
+            Live::Snapshot { state, response } => {
+                self.runtime = Some(state);
+                self.response = response;
             }
-            Live::Item { index, item } => {
-                let index = index as usize;
-                if self.items.len() <= index {
-                    self.items.resize(index + 1, None);
-                }
-                self.items[index] = Some(item);
-            }
-            // An index not held is from before this client was told the
-            // tail whole; the whole item follows.
-            Live::Appended { index, text } => {
-                if let Some(Some(item)) = self.items.get_mut(index as usize) {
-                    match item {
-                        Item::Text { text: held, .. } | Item::Reasoning { text: held } => {
-                            held.push_str(&text)
-                        }
-                        Item::ToolCall { arguments, .. } => arguments.push_str(&text),
-                    }
-                }
-            }
-            Live::Waiting { until } => {
-                self.phase = Phase::Waiting(until);
-                self.items.clear();
-            }
-            Live::Idle => {
-                self.phase = Phase::Idle;
-                self.items.clear();
-            }
-            Live::Queued { items } => {
-                self.queue = items.into_iter().map(queued_block).collect();
-            }
+            Live::Queued { items } => self.queue = items.into_iter().map(queued_block).collect(),
         }
     }
 }
@@ -261,7 +224,10 @@ impl AgentStore {
     /// The transcript as folded from the mirror. The live tail, if any,
     /// stays on top of it.
     pub fn set_fold(&mut self, agent_id: AgentId, fold: UiAgentState) -> FrameSummary {
-        self.change(agent_id, |layered| layered.fold = fold)
+        self.change(agent_id, false, |layered| {
+            layered.fold = fold;
+            layered.refresh_committed_tools();
+        })
     }
 
     /// One telling of the mirror, as the suffix it moved. The reader is
@@ -277,12 +243,24 @@ impl AgentStore {
             fold: empty_state(),
             tail: Tail::default(),
             state: empty_state(),
+            committed_tools: Default::default(),
         });
         let from = delta.from.min(layered.fold.blocks.len());
         let open_before = turn_open(layered.state.status);
+        for block in &layered.fold.blocks[from..] {
+            if let UiBlock::Tool(tool) = block.as_ref() {
+                layered.committed_tools.remove(&tool.id);
+            }
+        }
         layered.fold.blocks.truncate(from);
         layered.fold.blocks.extend(delta.blocks);
+        for block in &layered.fold.blocks[from..] {
+            if let UiBlock::Tool(tool) = block.as_ref() {
+                layered.committed_tools.insert(tool.id.clone());
+            }
+        }
         layered.fold.status = delta.status;
+        layered.fold.awaiting_human = delta.awaiting_human;
         layered.fold.context_used = delta.context_used;
         layered.fold.usage = delta.usage;
         layered.fold.exec_timings = delta.exec_timings;
@@ -304,7 +282,16 @@ impl AgentStore {
 
     /// One change to what the runtime has past the mirror.
     pub fn apply_live(&mut self, agent_id: AgentId, live: Live) -> FrameSummary {
-        self.change(agent_id, |layered| layered.tail.apply(live))
+        self.change(agent_id, true, |layered| layered.tail.apply(live))
+    }
+
+    /// Drop ephemeral status and response when transport is lost.
+    pub fn disconnect(&mut self, agent_id: AgentId) -> FrameSummary {
+        self.change(agent_id, true, |layered| {
+            layered.tail.runtime = None;
+            layered.tail.response = None;
+            layered.tail.queue.clear();
+        })
     }
 
     pub fn get(&self, agent_id: &AgentId) -> Option<&UiAgentState> {
@@ -317,20 +304,47 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
-    fn change(&mut self, agent_id: AgentId, change: impl FnOnce(&mut Layered)) -> FrameSummary {
+    fn change(
+        &mut self,
+        agent_id: AgentId,
+        tail_only: bool,
+        change: impl FnOnce(&mut Layered),
+    ) -> FrameSummary {
         let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
             fold: empty_state(),
             tail: Tail::default(),
             state: empty_state(),
+            committed_tools: Default::default(),
         });
-        let old = std::mem::replace(&mut layered.state, empty_state());
+        // The durable prefix cannot change on a live update. Keep its Arc
+        // pointers in place and compare only the old and new live suffix:
+        // O(tail blocks + their payload), independent of loaded history.
+        // A replacement snapshot still has to materialize its whole tail.
+        let from = if tail_only {
+            layered.fold.blocks.len()
+        } else {
+            0
+        };
+        let old_status = layered.state.status;
+        let old_tail = layered.state.blocks.split_off(from);
         change(layered);
-        layered.compose();
-        let mut summary = summarize(&old.blocks, &layered.state.blocks);
+        layered.compose_from(from);
+        let mut summary = summarize(&old_tail, &layered.state.blocks[from..]);
+        if let Some(index) = &mut summary.first_changed_block {
+            *index += from;
+        }
+        match &mut summary.incremental {
+            Some(
+                IncrementalUpdate::AssistantText { index }
+                | IncrementalUpdate::ReasoningText { index }
+                | IncrementalUpdate::Tool { index },
+            ) => *index += from,
+            None => {}
+        }
         // Elision gives the last fold in an open turn a limited visible tail,
         // so ending (or reopening) a turn re-renders its last block even when
         // no block content changed.
-        if turn_open(old.status) != turn_open(layered.state.status)
+        if turn_open(old_status) != turn_open(layered.state.status)
             && !layered.state.blocks.is_empty()
         {
             summary = summary.merge(FrameSummary {
@@ -347,6 +361,7 @@ impl AgentStore {
 pub fn turn_open(status: UiAgentStatus) -> bool {
     match status {
         UiAgentStatus::Streaming
+        | UiAgentStatus::Retrying { .. }
         | UiAgentStatus::ToolCalling { .. }
         | UiAgentStatus::UnfinishedTurn { .. } => true,
         // The mirror's word for a turn in progress. It never says `Streaming`
@@ -363,6 +378,8 @@ fn empty_state() -> UiAgentState {
         exec_timings: Default::default(),
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
+        runtime: None,
+        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }
@@ -402,215 +419,238 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, MessageDelivery};
+    use rho_agent_types::{AgentIdDomain, AgentPos, ExecMilestone, UnixMs};
 
     use super::*;
+    use crate::fold::TranscriptFold;
+    use crate::protocol::transcript::{ArgumentsFormat, TranscriptEvent};
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()
     }
+    fn text(value: &str) -> Item {
+        Item::Text {
+            text: value.into(),
+            phase: None,
+        }
+    }
+    fn call(id: &str) -> Item {
+        Item::ToolCall {
+            id: id.into(),
+            name: "exec".into(),
+            arguments: "x".into(),
+            format: ArgumentsFormat::Text,
+        }
+    }
+    fn snapshot(id: &str, items: Vec<Item>) -> Live {
+        Live::Snapshot {
+            state: RuntimeState {
+                inference: InferenceState::Responding,
+                ..Default::default()
+            },
+            response: Some(StreamingResponse {
+                id: id.into(),
+                items,
+            }),
+        }
+    }
+    fn blocks(store: &AgentStore) -> Vec<UiBlock> {
+        store
+            .get(&agent())
+            .unwrap()
+            .blocks
+            .iter()
+            .map(|block| (**block).clone())
+            .collect()
+    }
 
-    fn fold(texts: &[&str]) -> UiAgentState {
-        UiAgentState {
-            blocks: texts
-                .iter()
-                .map(|text| {
-                    Arc::new(UiBlock::UserMessage {
-                        text: (*text).to_owned(),
-                    })
+    #[test]
+    fn snapshots_replace_shrinking_or_new_responses_and_repeat_idempotently() {
+        let mut store = AgentStore::default();
+        store.apply_live(
+            agent(),
+            snapshot("first", vec![text("a long answer"), call("one")]),
+        );
+        store.apply_live(agent(), snapshot("first", vec![text("short")]));
+        assert_eq!(blocks(&store), vec![block(&text("short"))]);
+        assert_eq!(
+            store.apply_live(agent(), snapshot("first", vec![text("short")])),
+            FrameSummary::nothing()
+        );
+        store.apply_live(agent(), snapshot("second", vec![text("new")]));
+        assert_eq!(blocks(&store), vec![block(&text("new"))]);
+    }
+
+    #[test]
+    fn live_changes_touch_only_the_suffix_of_a_long_fold() {
+        let mut store = AgentStore::default();
+        let mut fold = empty_state();
+        fold.blocks = (0..1_000)
+            .map(|index| {
+                Arc::new(UiBlock::Notice {
+                    text: index.to_string(),
                 })
-                .collect(),
-            ..empty_state()
-        }
-    }
-
-    #[test]
-    fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_agent_types::{AgentPos, ExecMilestone, UnixMs};
-
-        use crate::fold::TranscriptFold;
-        use crate::protocol::transcript::TranscriptEvent;
-        let mut store = AgentStore::default();
-        let mut transcript = TranscriptFold::default();
-        store.apply_live(agent(), Live::Requesting);
-        store.apply_live(
-            agent(),
-            Live::Item {
-                index: 0,
-                item: Item::ToolCall {
-                    id: "exec-1".into(),
-                    name: "exec".into(),
-                    arguments: "print(1)".into(),
-                    format: crate::protocol::transcript::ArgumentsFormat::Text,
-                },
-            },
-        );
-        for (pos, milestone, at) in [
-            (0, ExecMilestone::FirstBlock, 10),
-            (1, ExecMilestone::ArgumentsFinished, 20),
-        ] {
-            transcript.tell(
-                AgentPos(pos),
-                &TranscriptEvent::ExecObserved {
-                    id: "exec-1".into(),
-                    milestone,
-                    at: UnixMs(at),
-                },
-            );
-            store.apply_fold_delta(agent(), transcript.delta().unwrap());
-        }
-        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
-            panic!("live exec")
-        };
-        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
-        assert_eq!(tool.timing.arguments_finished_at, Some(UnixMs(20)));
-        transcript.tell(
-            AgentPos(2),
-            &TranscriptEvent::Rewound {
-                to: AgentPos(1),
-                at: UnixMs(30),
-            },
-        );
-        store.apply_fold_delta(agent(), transcript.delta().unwrap());
-        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
-            panic!("live exec")
-        };
-        assert_eq!(tool.timing.arguments_finished_at, None);
-        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
-    }
-
-    #[test]
-    fn a_live_queue_trails_the_tail_and_outlives_the_phase() {
-        let mut store = AgentStore::default();
-        store.set_fold(agent(), fold(&["one"]));
-        let queued = QueuedItem::Message {
-            from: None,
-            text: "later".to_owned(),
-            delivery: MessageDelivery::NextRequest,
-        };
-        let summary = store.apply_live(
-            agent(),
-            Live::Queued {
-                items: vec![queued.clone()],
-            },
-        );
-        assert_eq!(summary.first_changed_block, Some(1));
-        let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 2);
+            })
+            .collect();
+        let first = Arc::clone(&fold.blocks[0]);
+        let last = Arc::clone(&fold.blocks[999]);
+        store.set_fold(agent(), fold);
         assert_eq!(
-            *state.blocks[1],
-            UiBlock::QueuedMessage {
-                text: "later".to_owned(),
-                delivery: MessageDelivery::NextRequest,
-                sender: None,
-            }
-        );
-
-        // The response streams in before the queue, which stays put.
-        store.apply_live(agent(), Live::Requesting);
-        store.apply_live(
-            agent(),
-            Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "two".to_owned(),
-                    phase: None,
-                },
-            },
-        );
-        let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 3);
-        assert!(matches!(*state.blocks[1], UiBlock::AssistantMessage { .. }));
-        assert!(matches!(*state.blocks[2], UiBlock::QueuedMessage { .. }));
-
-        // The turn ends; the queue is still there until it is told empty.
-        store.set_fold(agent(), fold(&["one", "two"]));
-        store.apply_live(agent(), Live::Idle);
-        let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 3);
-        assert!(matches!(*state.blocks[2], UiBlock::QueuedMessage { .. }));
-        let summary = store.apply_live(agent(), Live::Queued { items: vec![] });
-        assert_eq!(summary.first_changed_block, Some(2));
-        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 2);
-    }
-
-    #[test]
-    fn the_live_tail_rides_on_the_fold() {
-        let mut store = AgentStore::default();
-        assert_eq!(
-            store.set_fold(agent(), fold(&["one", "two"])),
+            store.apply_live(agent(), snapshot("response", vec![text("part")])),
             FrameSummary {
-                first_changed_block: Some(0),
+                first_changed_block: Some(1_000),
                 incremental: None,
             }
         );
-        let summary = store.apply_live(agent(), Live::Requesting);
-        assert_eq!(summary.first_changed_block, Some(1));
         assert_eq!(
-            store.get(&agent()).unwrap().status,
-            UiAgentStatus::Streaming
-        );
-        let summary = store.apply_live(
-            agent(),
-            Live::Item {
-                index: 0,
-                item: Item::Text {
-                    text: "th".to_owned(),
-                    phase: None,
-                },
-            },
-        );
-        assert_eq!(summary.first_changed_block, Some(2));
-        let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 3);
-        assert_eq!(state.status, UiAgentStatus::Streaming);
-
-        // The same block growing is an incremental update.
-        let summary = store.apply_live(
-            agent(),
-            Live::Appended {
-                index: 0,
-                text: "ree".to_owned(),
-            },
-        );
-        assert_eq!(
-            summary.incremental,
-            Some(IncrementalUpdate::AssistantText { index: 2 })
-        );
-        assert_eq!(
-            *store.get(&agent()).unwrap().blocks[2],
-            UiBlock::AssistantMessage {
-                text: "three".to_owned(),
-                phase: None
+            store.apply_live(agent(), snapshot("response", vec![text("partial")])),
+            FrameSummary {
+                first_changed_block: Some(1_000),
+                incremental: Some(IncrementalUpdate::AssistantText { index: 1_000 }),
             }
         );
-
-        // An append to an index never told is from before this client
-        // was told the tail; it is dropped.
-        assert_eq!(
-            store.apply_live(
-                agent(),
-                Live::Appended {
-                    index: 3,
-                    text: "x".to_owned()
-                }
-            ),
-            FrameSummary::nothing()
-        );
-
-        // The row lands first, then the tail says the turn is over.
-        store.set_fold(agent(), fold(&["one", "two", "three"]));
-        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 4);
-        let summary = store.apply_live(agent(), Live::Idle);
-        assert_eq!(summary.first_changed_block, Some(2));
         let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 3);
-        assert_eq!(state.status, UiAgentStatus::Idle);
-
-        // An unchanged fold is no change at all.
+        assert_eq!(state.blocks.len(), 1_001);
+        assert!(Arc::ptr_eq(&state.blocks[0], &first));
+        assert!(Arc::ptr_eq(&state.blocks[999], &last));
+        // Ending the turn also changes the final folded row's elision.
         assert_eq!(
-            store.set_fold(agent(), fold(&["one", "two", "three"])),
-            FrameSummary::nothing()
+            store.disconnect(agent()),
+            FrameSummary {
+                first_changed_block: Some(999),
+                incremental: None,
+            }
         );
+        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 1_000);
+    }
+
+    #[test]
+    fn runtime_changes_do_not_erase_response_and_none_removes_it() {
+        let mut store = AgentStore::default();
+        store.apply_live(agent(), snapshot("first", vec![text("answer")]));
+        store.apply_live(
+            agent(),
+            Live::Snapshot {
+                state: RuntimeState {
+                    running_tasks: 2,
+                    awaiting_human: true,
+                    ..Default::default()
+                },
+                response: Some(StreamingResponse {
+                    id: "first".into(),
+                    items: vec![text("answer")],
+                }),
+            },
+        );
+        assert_eq!(blocks(&store), vec![block(&text("answer"))]);
+        assert_eq!(
+            store
+                .get(&agent())
+                .unwrap()
+                .runtime
+                .as_ref()
+                .unwrap()
+                .running_tasks,
+            2
+        );
+        store.apply_live(
+            agent(),
+            Live::Snapshot {
+                state: RuntimeState::default(),
+                response: None,
+            },
+        );
+        assert!(blocks(&store).is_empty());
+        assert_eq!(store.get(&agent()).unwrap().status, UiAgentStatus::Idle);
+    }
+
+    #[test]
+    fn committed_tool_is_not_repeated_while_snapshot_remains() {
+        let mut store = AgentStore::default();
+        store.apply_live(agent(), snapshot("first", vec![call("one"), call("two")]));
+        let mut fold = TranscriptFold::default();
+        fold.tell(
+            AgentPos(0),
+            &TranscriptEvent::Replied {
+                items: vec![call("one")],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(1),
+            },
+        );
+        store.apply_fold_delta(agent(), fold.delta().unwrap());
+        let ids: Vec<_> = store
+            .get(&agent())
+            .unwrap()
+            .blocks
+            .iter()
+            .filter_map(|block| match block.as_ref() {
+                UiBlock::Tool(tool) => Some(tool.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["one", "two"]);
+        store.apply_live(
+            agent(),
+            Live::Snapshot {
+                state: RuntimeState::default(),
+                response: None,
+            },
+        );
+        let ids: Vec<_> = store
+            .get(&agent())
+            .unwrap()
+            .blocks
+            .iter()
+            .filter_map(|block| match block.as_ref() {
+                UiBlock::Tool(tool) => Some(tool.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["one"]);
+    }
+
+    #[test]
+    fn disconnect_clears_runtime_and_tail() {
+        let mut store = AgentStore::default();
+        store.apply_live(
+            agent(),
+            Live::Snapshot {
+                state: RuntimeState {
+                    running_tasks: 3,
+                    ..Default::default()
+                },
+                response: Some(StreamingResponse {
+                    id: "first".into(),
+                    items: vec![text("live")],
+                }),
+            },
+        );
+        store.disconnect(agent());
+        let state = store.get(&agent()).unwrap();
+        assert!(state.runtime.is_none());
+        assert!(state.blocks.is_empty());
+        assert_eq!(state.status, UiAgentStatus::Idle);
+    }
+
+    #[test]
+    fn durable_provider_timing_reaches_the_live_tail() {
+        let mut store = AgentStore::default();
+        store.apply_live(agent(), snapshot("first", vec![call("one")]));
+        let mut fold = TranscriptFold::default();
+        fold.tell(
+            AgentPos(0),
+            &TranscriptEvent::ExecObserved {
+                id: "one".into(),
+                milestone: ExecMilestone::FirstBlock,
+                at: UnixMs(10),
+            },
+        );
+        store.apply_fold_delta(agent(), fold.delta().unwrap());
+        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
+            panic!("missing tool")
+        };
+        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
     }
 }

@@ -47,17 +47,17 @@ pub enum Scenario {
     RealToolRounds,
     /// Return a rate limit, then an overload, then allow retries to succeed.
     RateLimit,
-    /// End the first stream during a text delta, then allow retries to succeed.
+    /// End the first OpenAI stream before tool admission, then allow retry.
     StreamCut,
-    /// Emit approximately one word-sized text chunk every 300 ms when timed.
+    /// Emit approximately one word-sized code chunk every 300 ms when timed.
     SlowTrickle,
     /// Cycle through a documented synthetic 100-result heavy-tail population.
     HugeToolOutput,
-    /// Emit forty valid tool calls in one response.
+    /// Emit forty sequential executable calls, each in its own response.
     FortyToolCalls,
     /// Emit encrypted reasoning followed by a compaction item.
     ReasoningCompaction,
-    /// Ask a question without invoking a tool, then end the turn.
+    /// Ask a question through exec/human.send and await the human.
     ClarifyingQuestion,
 }
 
@@ -232,6 +232,7 @@ type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>)>;
 struct AppState {
     config: Arc<FakeModelConfig>,
     next_request: Arc<AtomicU64>,
+    next_native_request: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
     observations: Arc<Mutex<Vec<Observation>>>,
     response_tools: Arc<Mutex<ResponseTools>>,
@@ -262,6 +263,7 @@ impl FakeModel {
         let state = AppState {
             config: Arc::new(config),
             next_request: Arc::new(AtomicU64::new(0)),
+            next_native_request: Arc::new(AtomicU64::new(0)),
             metrics: metrics.clone(),
             observations: observations.clone(),
             response_tools: Arc::default(),
@@ -422,7 +424,20 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
         }
         let (request_number, request_guard) = begin_request(&state.metrics, &state.next_request);
         observe_input_tool_outputs(&state.metrics, &envelope.request);
-        let events = openai_turn(&state, request_number, &envelope.request);
+        // Text-only naming is not a native agent step: it cannot consume
+        // seeded native failures or the first stream cut.
+        let terminal = if request_tools(&envelope.request)
+            .iter()
+            .any(|tool| tool.name == "exec")
+        {
+            outcome(
+                &state.config,
+                state.next_native_request.fetch_add(1, Ordering::Relaxed),
+            )
+        } else {
+            TerminalOutcome::Complete
+        };
+        let events = openai_turn(&state, request_number, &envelope.request, terminal);
         for (index, event) in events.into_iter().enumerate() {
             delay(&state.config, index, &event).await;
             let bytes = event.to_string();
@@ -441,8 +456,8 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
             if socket.send(Message::Text(bytes.into())).await.is_err() {
                 return;
             }
-            if outcome(&state.config, request_number) == TerminalOutcome::Disconnect
-                && ((state.config.scenario == Scenario::StreamCut && is_text_delta(&event))
+            if terminal == TerminalOutcome::Disconnect
+                && ((state.config.scenario == Scenario::StreamCut && index >= 2)
                     || (state.config.scenario != Scenario::StreamCut && index >= 2))
             {
                 let _ = socket.close().await;
@@ -450,10 +465,7 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
                 return;
             }
         }
-        end_request(
-            request_guard,
-            outcome(&state.config, request_number) == TerminalOutcome::Complete,
-        );
+        end_request(request_guard, terminal == TerminalOutcome::Complete);
     }
 }
 
@@ -468,7 +480,7 @@ async fn openai_http(
         end_request(request_guard, false);
         return openai_error_response(terminal, request_number);
     }
-    let events = openai_turn(&state, request_number, &request);
+    let events = openai_turn(&state, request_number, &request, terminal);
     let config = state.config.clone();
     let metrics = state.metrics.clone();
     let observed_state = state.clone();
@@ -531,9 +543,13 @@ fn observe_input_tool_outputs(metrics: &Metrics, request: &OpenAiRequest) {
         .fetch_max(max as u64, Ordering::Relaxed);
 }
 
-fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -> Vec<Value> {
+fn openai_turn(
+    state: &AppState,
+    request_number: u64,
+    request: &OpenAiRequest,
+    terminal: TerminalOutcome,
+) -> Vec<Value> {
     let response_id = format!("resp_fake_{:016x}_{request_number}", state.config.seed);
-    let terminal = outcome(&state.config, request_number);
     if terminal != TerminalOutcome::Complete && terminal != TerminalOutcome::Disconnect {
         let (message, code) = match terminal {
             TerminalOutcome::RateLimit => {
@@ -563,6 +579,20 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
         .input
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"));
+    let has_compaction = request
+        .input
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"));
+    let output_count = request
+        .input
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .count();
     let mut tools = request_tools(request);
     {
         let mut remembered = state.response_tools.lock().unwrap();
@@ -625,19 +655,63 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             let tool = tools.iter().find(|tool| tool.name == "exec").unwrap();
             append_tool_call(&mut events, state, request_number, 0, tool, Some(source));
         } else {
-            append_text(&mut events, state, request_number, request, 0);
+            append_finish(&mut events, state, request_number, request, &tools, 0);
         }
-    } else if state.config.scenario == Scenario::ReasoningCompaction {
+    } else if state.config.scenario == Scenario::ReasoningCompaction && !has_compaction {
         append_reasoning(&mut events, request_number, 0);
         append_compaction(&mut events, state, request_number, 1);
+        // A call returning after the compaction wakes the model once more,
+        // so the next request must replay the compacted provider boundary.
+        if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
+            append_tool_call(
+                &mut events,
+                state,
+                request_number,
+                2,
+                tool,
+                Some("print('compacted')".into()),
+            );
+        }
     } else if asks_compaction {
         append_compaction(&mut events, state, request_number, 0);
+    } else if state.config.scenario == Scenario::ReasoningCompaction && has_compaction {
+        append_finish(&mut events, state, request_number, request, &tools, 0);
+    } else if matches!(
+        state.config.scenario,
+        Scenario::HugeToolOutput | Scenario::FortyToolCalls
+    ) && !tools.is_empty()
+        && output_count
+            < if state.config.scenario == Scenario::HugeToolOutput {
+                100
+            } else {
+                40
+            }
+    {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "exec")
+            .unwrap_or(&tools[0]);
+        append_tool_call(&mut events, state, request_number, 0, tool, None);
     } else if matches!(
         state.config.scenario,
         Scenario::ClarifyingQuestion | Scenario::SlowTrickle | Scenario::StreamCut
     ) {
-        append_text(&mut events, state, request_number, request, 0);
+        if state.config.scenario == Scenario::StreamCut {
+            append_reasoning(&mut events, request_number, 0);
+        }
+        append_finish(
+            &mut events,
+            state,
+            request_number,
+            request,
+            &tools,
+            usize::from(state.config.scenario == Scenario::StreamCut),
+        );
     } else if !tools.is_empty()
+        && !matches!(
+            state.config.scenario,
+            Scenario::HugeToolOutput | Scenario::FortyToolCalls
+        )
         && (!has_tool_result
             || (matches!(
                 state.config.scenario,
@@ -645,28 +719,11 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             ) && !mix(state.config.seed ^ request_number).is_multiple_of(20)))
     {
         append_reasoning(&mut events, request_number, 0);
-        let tool = if matches!(
-            state.config.scenario,
-            Scenario::HugeToolOutput | Scenario::FortyToolCalls
-        ) {
-            tools
-                .iter()
-                .find(|tool| tool.name == "exec")
-                .unwrap_or(&tools[0])
-        } else {
-            &tools[(mix(state.config.seed ^ request_number) as usize) % tools.len()]
-        };
-        let call_count = match state.config.scenario {
-            Scenario::HugeToolOutput => 100,
-            Scenario::FortyToolCalls => 40,
-            _ => state.config.distribution.parallel_tool_calls.max(1),
-        };
-        for offset in 0..call_count {
-            append_tool_call(&mut events, state, request_number, offset + 1, tool, None);
-        }
+        let tool = &tools[(mix(state.config.seed ^ request_number) as usize) % tools.len()];
+        append_tool_call(&mut events, state, request_number, 1, tool, None);
     } else {
         append_reasoning(&mut events, request_number, 0);
-        append_text(&mut events, state, request_number, request, 1);
+        append_finish(&mut events, state, request_number, request, &tools, 1);
     }
     events.push(json!({"type":"response.completed","response":{"id":response_id,"usage":{"input_tokens":request.input.len() * 31 + 17,"input_tokens_details":{"cached_tokens":if request.previous_response_id.is_some(){19}else{0}},"output_tokens":events.len() * 7 + 3}}}));
     events
@@ -695,6 +752,32 @@ fn append_compaction(
     let id = format!("cmp_{request_number}");
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"compaction","id":id}}));
     events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"compaction","id":id,"encrypted_content":format!("fake-compaction-{}-{request_number}",state.config.seed)}}));
+}
+
+fn append_finish(
+    events: &mut Vec<Value>,
+    state: &AppState,
+    request_number: u64,
+    request: &OpenAiRequest,
+    tools: &[ProviderTool],
+    output_index: usize,
+) {
+    if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
+        let text = scenario_text(state, request_number, request);
+        let source = format!("human.send({text:?})\nset_max_wait(86400)\nawait human.reply()");
+        append_tool_call(
+            events,
+            state,
+            request_number,
+            output_index,
+            tool,
+            Some(source),
+        );
+    } else {
+        // Naming requests have no exec tool; Claude and HTTP text consumers
+        // retain the normal provider message shape.
+        append_text(events, state, request_number, request, output_index);
+    }
 }
 
 fn append_text(
@@ -745,7 +828,7 @@ fn append_tool_call(
             tool,
             state.config.distribution.large_tool_body_bytes,
             if state.config.scenario == Scenario::HugeToolOutput {
-                output_index as u64 - 1
+                request_number
             } else {
                 request_number ^ output_index as u64
             },
@@ -757,7 +840,7 @@ fn append_tool_call(
     for chunk in chunks(&arguments, &state.config, request_number) {
         events.push(json!({"type":delta_type,"output_index":output_index,"delta":chunk}));
     }
-    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
+    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name,"input":arguments,"arguments":arguments}}));
 }
 
 fn append_reasoning(events: &mut Vec<Value>, request_number: u64, output_index: usize) {
@@ -775,13 +858,13 @@ fn tool_arguments(
     seed: u64,
 ) -> String {
     if tool.kind == "custom" || tool.name == "exec" {
-        let body = "x".repeat(if scenario == Scenario::FortyToolCalls {
-            0
-        } else {
-            size.saturating_sub(180)
-        });
         let result_bytes = synthetic_result_bytes(scenario, seed, request_number);
-        format!("const payload_{request_number} = {body:?};\ntext('x'.repeat({result_bytes}));")
+        if scenario == Scenario::FortyToolCalls {
+            format!("print('rho-fake-call-{request_number}')")
+        } else {
+            let padding = "#".repeat(size.saturating_sub(180));
+            format!("print('x' * {result_bytes})\n{padding}")
+        }
     } else {
         json!({"cmd":format!("python3 - <<'PY'\nprint('x' * {size})\nPY"),"max_output_tokens":10000}).to_string()
     }
@@ -913,7 +996,7 @@ async fn delay(config: &FakeModelConfig, event_index: usize, event: &Value) {
         return;
     }
     if config.scenario == Scenario::SlowTrickle {
-        if is_text_delta(event) {
+        if is_text_delta(event) || is_code_delta(event) {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         return;
@@ -929,6 +1012,10 @@ async fn delay(config: &FakeModelConfig, event_index: usize, event: &Value) {
         timing.between_chunks
     };
     tokio::time::sleep(duration).await;
+}
+
+fn is_code_delta(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("response.custom_tool_call_input.delta")
 }
 
 fn is_text_delta(event: &Value) -> bool {

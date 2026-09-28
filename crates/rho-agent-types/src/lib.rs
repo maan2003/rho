@@ -6,6 +6,7 @@
 
 mod log;
 mod place;
+pub mod transcript;
 mod vocab;
 
 pub use log::*;

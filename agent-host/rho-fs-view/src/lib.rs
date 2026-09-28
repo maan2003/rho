@@ -25,7 +25,7 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{MAX_BOUNDED_READ, Mode, Namespace, WorksetLayout};
+pub use ns::{MAX_BOUNDED_READ, Mode, WorksetLayout, read_file_bounded};
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
 /// The agent's base userland: a nix `buildEnv` fixed at build
@@ -85,8 +85,10 @@ pub fn devshell_daemon() -> PathBuf {
 pub fn devshell_dir() -> anyhow::Result<PathBuf> {
     match std::env::var_os("RHO_DEVSHELL_DIR") {
         Some(dir) => Ok(dir.into()),
-        None => Ok(ns::devshell_cache(&Utf8PathBuf::try_from(Worksets::default_root()?.join("cache"))?)
-            .into_std_path_buf()),
+        None => Ok(ns::devshell_cache(&Utf8PathBuf::try_from(
+            Worksets::default_root()?.join("cache"),
+        )?)
+        .into_std_path_buf()),
     }
 }
 
@@ -603,14 +605,6 @@ impl Workset {
             .owner
             .upgrade()
             .context("worksets manager was dropped")
-    }
-
-    /// A namespace over this workset for one agent, whose working
-    /// directory is `cwd` as the agent sees it (below the mode's visible
-    /// root, or relative to it). The mount namespace itself is built on the
-    /// first command.
-    pub fn enter(&self, mode: Mode, cwd: &Utf8Path) -> anyhow::Result<Arc<Namespace>> {
-        Namespace::new(self.clone(), mode, cwd)
     }
 
     /// Checks out `rev` (a branch, tag or commit, as `git checkout` takes

@@ -17,7 +17,6 @@ pub mod cache;
 #[cfg(feature = "client")]
 pub mod create;
 #[cfg(feature = "client")]
-pub mod elision;
 #[cfg(feature = "client")]
 pub mod find;
 #[cfg(feature = "client")]

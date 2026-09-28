@@ -106,12 +106,13 @@ impl AgentRole {
     }
 }
 
-/// When a message sent while an agent is busy enters model context.
+/// Historical queued-input delivery annotation, retained for decoding old
+/// records and drawing old transcript queues. Live sends have no lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum MessageDelivery {
-    /// Start immediately when idle; while busy, steer the next request.
+    /// Historical immediate/steering lane.
     Immediate,
-    /// Enter at the next inference-request boundary.
+    /// Historical next-request lane.
     NextRequest,
 }
 

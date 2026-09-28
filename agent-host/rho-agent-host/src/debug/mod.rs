@@ -4,10 +4,11 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime};
+use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::log::AgentRuntime;
 use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
-use rho_inference::Inference;
+use rho_inference::Accounts;
 
 use crate::default_db_path;
 
@@ -168,7 +169,6 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             let call = rho_agents_client::protocol::AgentCommand::Send {
                 agent_id,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
-                delivery: rho_agent_types::MessageDelivery::Immediate,
             };
             rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
             Ok(())
@@ -215,13 +215,14 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
         rho_fs_view::StoreService::None,
     )
     .await?;
-    let view = worksets.adopt(&cwd)?.enter(
-        rho_fs_view::Mode::View {
-            home_skeleton: None,
-        },
-        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-    )?;
-    let surface = rho_agent::render_agent_surface(view, role)?;
+    let workset = worksets.adopt(&cwd)?;
+    let place = rho_agent_types::Place {
+        workset: workset.id().to_owned(),
+        cwd: rho_fs_view::MOUNT_ROOT.into(),
+        mode: rho_agent_types::WorksetMode::View,
+        origin: None,
+    };
+    let surface = rho_agent::render_agent_surface(&workset, &place, role)?;
 
     println!("# System prompt\n");
     if surface.system_prompt.is_empty() {
@@ -550,15 +551,21 @@ async fn print_context(
                 let mut context_used = None;
                 let mut responses = 0usize;
                 for event in &events {
-                    if let Some(native) = event.native_event()
-                        && let rho_agent::native::NativeEvent::ResponseFinished {
-                            context_used: response_context_used,
-                            ..
-                        } = native
+                    if let rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
+                        usage,
+                        ..
+                    }) = event
                     {
                         responses += 1;
-                        if response_context_used.is_some() {
-                            context_used = *response_context_used;
+                        if let Some(usage) = usage
+                            && usage.input_tokens.saturating_add(usage.cache_read_tokens) > 0
+                        {
+                            context_used = Some(
+                                usage
+                                    .input_tokens
+                                    .saturating_add(usage.cache_read_tokens)
+                                    .saturating_add(usage.output_tokens),
+                            );
                         }
                     }
                 }
@@ -648,7 +655,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
-    Inference::migrate(db).await?;
+    Accounts::migrate(db).await?;
     rho_agent::db::prepare(db).await;
     Ok(())
 }

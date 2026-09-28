@@ -330,6 +330,9 @@ impl Workspace {
             let Some(surface) = this.phone_surface() else {
                 return;
             };
+            if !matches!(surface.key, super::SurfaceKey::Transcript(_)) {
+                return;
+            }
             let super::SurfaceView::Transcript { model, editor } = &surface.view else {
                 return;
             };
@@ -1076,10 +1079,10 @@ impl Workspace {
         };
         let primary = if self.phone_surface().is_some_and(|surface| {
             matches!(
-                surface.view,
-                super::SurfaceView::Draft { .. }
-                    | super::SurfaceView::Transcript { .. }
-                    | super::SurfaceView::SlackConversation(_)
+                surface.key,
+                super::SurfaceKey::Draft
+                    | super::SurfaceKey::Transcript(_)
+                    | super::SurfaceKey::SlackConversation(_)
             )
         }) {
             Some(
@@ -1122,11 +1125,14 @@ impl Workspace {
         let Some(surface) = self.phone_surface() else {
             return;
         };
-        match surface.view {
-            super::SurfaceView::Draft { .. } | super::SurfaceView::Transcript { .. } => {
+        match surface.key {
+            super::SurfaceKey::Draft | super::SurfaceKey::Transcript(_) => {
                 self.submit_prompt(&crate::SubmitPrompt, window, cx)
             }
-            super::SurfaceView::SlackConversation(view) => {
+            super::SurfaceKey::SlackConversation(_) => {
+                let super::SurfaceView::SlackConversation(view) = surface.view else {
+                    return;
+                };
                 // The answer says what Slack made of it, which the journal
                 // wants and the phone has nowhere to put. Dropping it drops
                 // the answer, not the message: the write is detached inside

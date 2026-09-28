@@ -1,23 +1,27 @@
-//! Inference provider integrations for rho.
+//! OpenAI Responses Lite transport and its ChatGPT account/route policy.
 
 mod accounts;
 pub mod auth_cli;
-pub mod config;
+pub use rho_agent::inference::config;
 mod credentials;
-pub mod exec;
 mod inference;
+mod policy;
+mod wiring;
 pub use credentials::{CredentialSnapshot, CredentialState};
+pub use wiring::worker_main;
 mod responses;
-pub mod types;
+mod step;
+pub mod transcript;
 
 pub use accounts::{
     InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState, SelectedAuth,
 };
 pub use auth_cli::{AuthArgs, run_auth_cli};
-pub use inference::{Inference, InferenceConfig, InferenceHost};
+pub use inference::{Accounts, Inference, InferenceConfig};
+pub(crate) use inference::{PolicyCall, PolicyReply, PolicyRequest};
 pub use responses::{
-    DialRoute, InferenceAuth, InferenceRouteProbe, InferenceSession, OpenAiResponsesProviderData,
-    PromptCacheKey, QuotaUpdate, ResolvedAuth, ResolvedOAuth, RouteSelection,
+    DialRoute, InferenceAuth, InferenceRouteProbe, PromptCacheKey, QuotaUpdate, ResolvedAuth,
+    ResolvedOAuth, RouteSelection,
 };
 
 /// Installs the TLS crypto provider if nothing has yet. Any HTTP client built

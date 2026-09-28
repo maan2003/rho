@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent_types::ToolOutputStatus;
-use rho_fs_view::{Namespace as View, PathOverrides};
-use rho_inference::types::{
+use rho_agent_types::transcript::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolResultMetadata, ToolSpec, ToolType,
 };
+use rho_fs_view::PathOverrides;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -65,7 +65,8 @@ struct BashEnvironment {
 
 #[derive(Clone, Debug)]
 pub struct ShellTools {
-    exec: ExecContext,
+    working_directory: Utf8PathBuf,
+    path_overrides: PathOverrides,
     env: Vec<(String, String)>,
     processes: Arc<ProcessManager>,
     environments: Arc<environment::Worker>,
@@ -182,15 +183,6 @@ fn exec_output(
         session_id: process_id,
         output: content,
     }
-}
-
-#[derive(Clone, Debug)]
-enum ExecContext {
-    Directory {
-        working_directory: Utf8PathBuf,
-        path_overrides: PathOverrides,
-    },
-    View(Arc<View>),
 }
 
 #[derive(Clone, Debug)]
@@ -372,30 +364,15 @@ impl Default for ProcessManager {
 }
 
 impl ShellTools {
-    /// Tools for an agent's workspace view. Namespace setup and cache warming
-    /// run lazily on the first shell command, hiding their latency behind the
-    /// model's first response.
-    pub fn new(_timeout: Duration, view: Arc<View>) -> Self {
-        Self {
-            exec: ExecContext::View(view),
-            env: Vec::new(),
-            processes: Arc::new(ProcessManager::default()),
-            environments: Arc::new(environment::Worker::default()),
-            executor: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// Tools running directly in a directory, without a workspace.
+    /// Tools running in a directory in the current process namespace.
     pub fn in_directory(
         _timeout: Duration,
         working_directory: Utf8PathBuf,
         path_overrides: PathOverrides,
     ) -> Self {
         Self {
-            exec: ExecContext::Directory {
-                working_directory,
-                path_overrides,
-            },
+            working_directory,
+            path_overrides,
             env: Vec::new(),
             processes: Arc::new(ProcessManager::default()),
             environments: Arc::new(environment::Worker::default()),
@@ -408,23 +385,14 @@ impl ShellTools {
         self
     }
 
-    /// Resolve a patch path to where in-process file operations apply: the
-    /// real checkout files, never a namespace-relative path. Relative paths
-    /// land in the primary workdir's checkout; absolute paths inside any
-    /// workdir are translated to that workdir's checkout.
+    /// Resolve a patch path against the tool's working directory. Absolute
+    /// paths are interpreted directly in the current process namespace.
     fn resolve_patch_path(&self, path: &Path) -> Result<std::path::PathBuf, String> {
-        match &self.exec {
-            ExecContext::Directory {
-                working_directory, ..
-            } => Ok(if path.is_absolute() {
-                path.to_owned()
-            } else {
-                working_directory.as_std_path().join(path)
-            }),
-            ExecContext::View(view) => view
-                .resolve_host_path_checked(path)
-                .map_err(|error| error.to_string()),
-        }
+        Ok(if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.working_directory.as_std_path().join(path)
+        })
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -589,15 +557,9 @@ impl ShellTools {
     /// Must run on a dedicated interpreter thread with CLONE_FS unshared.
     /// Poll this future on that same thread throughout.
     pub async unsafe fn enter_interpreter_thread(&self) -> Result<()> {
-        match &self.exec {
-            ExecContext::Directory {
-                working_directory, ..
-            } => {
-                std::env::set_current_dir(working_directory)?;
-                Ok(())
-            }
-            ExecContext::View(view) => unsafe { view.enter_interpreter_thread().await },
-        }
+        rho_fs_view::layout::unshare_fs_attributes()?;
+        std::env::set_current_dir(&self.working_directory)
+            .with_context(|| format!("enter working directory {}", self.working_directory))
     }
 
     /// Start `cmd` the way `exec_command` would, and hand the running process
@@ -643,31 +605,13 @@ impl ShellTools {
 
     async fn spawn_process(&self, cmd: &str, workdir: Option<&str>) -> Result<ProcessSession> {
         let mut command = Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE));
-        for (name, value) in &self.env {
-            command.env(name, value);
-        }
-        let cwd = workdir.map(Utf8Path::new);
-        match &self.exec {
-            ExecContext::Directory {
-                working_directory,
-                path_overrides,
-            } => {
-                command.env(
-                    "PATH",
-                    path_overrides.add_to(&std::env::var_os("PATH").expect("PATH must be set")),
-                );
-                // An absolute model-supplied cwd wins; a relative one resolves
-                // against the tool's working directory (join handles both).
-                let cwd = cwd.map_or_else(
-                    || working_directory.clone(),
-                    |cwd| working_directory.join(cwd),
-                );
-                command.current_dir(cwd.as_std_path());
-            }
-            ExecContext::View(view) => {
-                view.prepare_command(&mut command, cwd).await?;
-            }
-        }
+        // An absolute model-supplied cwd wins; a relative one resolves
+        // against the tool's working directory (join handles both).
+        let cwd = workdir.map_or_else(
+            || self.working_directory.clone(),
+            |cwd| self.working_directory.join(Utf8Path::new(cwd)),
+        );
+        command.current_dir(cwd.as_std_path());
 
         let directory = command
             .as_std()
@@ -679,20 +623,14 @@ impl ShellTools {
         } else {
             std::env::current_dir()?.join(directory)
         };
-        let mut base = match &self.exec {
-            ExecContext::Directory { .. } => std::env::vars_os().collect(),
-            ExecContext::View(_) => environment::Environment::new(),
-        };
-        for (key, value) in command.as_std().get_envs() {
-            match value {
-                Some(value) => {
-                    base.insert(key.to_owned(), value.to_owned());
-                }
-                None => {
-                    base.remove(key);
-                }
-            }
+        let mut base: environment::Environment = std::env::vars_os().collect();
+        for (name, value) in &self.env {
+            base.insert(name.into(), value.into());
         }
+        let path = base
+            .get(std::ffi::OsStr::new("PATH"))
+            .expect("PATH must be set");
+        base.insert("PATH".into(), self.path_overrides.add_to(path));
         let resolved = self.environments.resolve(directory.clone(), base).await?;
         let server = {
             let mut cached = self.executor.lock().await;

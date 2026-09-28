@@ -31,9 +31,6 @@ pub enum Feed {
         status: Arc<AgentStatus>,
         /// The live queue, for a loop whose queue is not rows (Claude).
         queue: Option<Arc<[QueuedInput]>>,
-        /// Whatever was told of this loop's tail before is void: tell it
-        /// whole.
-        reset: bool,
     },
 }
 
@@ -58,13 +55,11 @@ pub fn tell_status(
     agent_id: AgentId,
     status: Arc<AgentStatus>,
     queue: Option<Arc<[QueuedInput]>>,
-    reset: bool,
 ) {
     let _ = db.observer(Journal::new).feed.send(Feed::Status {
         agent_id,
         status,
         queue,
-        reset,
     });
 }
 

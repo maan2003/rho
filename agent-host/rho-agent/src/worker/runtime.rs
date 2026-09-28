@@ -4,9 +4,11 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use tokio::net::UnixStream;
 
-use super::ipc::{self, Control, Host, Message};
-use crate::agent::{Agent, AgentHandle};
-use crate::claude::{ClaudeAgent, ClaudeLoop};
+use super::host_client::HostClient;
+use crate::ipc::protocol::{self, Control, Message};
+use crate::ipc::{transport, workset};
+use crate::worker::claude::{ClaudeAgent, ClaudeLoop};
+use crate::worker::native::{Agent, AgentHandle};
 
 /// How long one agent may take to finish the request in flight when drained.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
@@ -38,8 +40,8 @@ impl Controller {
                 // of ours to flush.
                 Self::Claude(_) => {}
             },
-            Control::User { content, delivery } => match self {
-                Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await?,
+            Control::User { content } => match self {
+                Self::Rho(agent) => agent.send_user_content_accepted(content).await?,
                 Self::Claude(agent) => agent.send_user_content_accepted(content).await?,
             },
             Control::Mail {
@@ -51,9 +53,10 @@ impl Controller {
                 Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await?,
                 Self::Claude(agent) => {
                     agent
-                        .send_agent_message_accepted(format!(
-                            "Message Type: MESSAGE\nSender: {label}\nPayload:\n{body}"
-                        ))
+                        .send_agent_message_accepted(
+                            sender,
+                            format!("Message Type: MESSAGE\nSender: {label}\nPayload:\n{body}"),
+                        )
                         .await?
                 }
             },
@@ -99,7 +102,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn run(&self, host: &Host) -> anyhow::Result<()> {
+    async fn run(&self, host: &HostClient) -> anyhow::Result<()> {
         let mut controls = host.controls();
         while let Some((id, body)) = controls.recv().await {
             let retiring = matches!(body, Control::Retire);
@@ -124,7 +127,7 @@ impl Controller {
 async fn drive_native(
     mut runtime: Agent,
     handle: AgentHandle,
-    host: Arc<Host>,
+    host: Arc<HostClient>,
 ) -> anyhow::Result<()> {
     let status = handle.status();
     let control = Controller::Rho(handle);
@@ -142,7 +145,7 @@ async fn drive_native(
 async fn drive_claude(
     mut runtime: ClaudeLoop,
     handle: ClaudeAgent,
-    host: Arc<Host>,
+    host: Arc<HostClient>,
 ) -> anyhow::Result<()> {
     let status = handle.status();
     let control = Controller::Claude(handle);
@@ -157,50 +160,60 @@ async fn drive_claude(
     result.and(cleanup)
 }
 
-pub(super) async fn run(
+pub(crate) async fn run(
     socket: UnixStream,
-    startup: super::process::Startup,
-    base: Arc<crate::View>,
+    startup: protocol::Startup,
+    factory: crate::inference::WorkerFactory,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
-    use super::transport::Port;
-    let (sender, mut receiver, mut writer) = super::transport::connect(socket);
+    use transport::Port;
+    let (sender, mut receiver, mut writer) = transport::connect(socket);
     let agents: Arc<
         std::sync::Mutex<
             HashMap<
                 rho_agent_types::AgentId,
-                tokio::sync::mpsc::UnboundedSender<super::transport::Packet>,
+                tokio::sync::mpsc::UnboundedSender<transport::Packet>,
             >,
         >,
     > = Arc::default();
     let execution = Arc::new(super::workset::Execution {
-        base: base.clone(),
         terminals: Arc::default(),
         shells: Arc::default(),
         clients: Arc::default(),
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let policy = super::policy::Host::new(sender.clone(), next.clone());
-    let devshell_dir = base.devshell_cache().as_std_path();
+    let policy_sender: crate::inference::PolicySender = Arc::new({
+        let sender = sender.clone();
+        move |bytes| {
+            let sender = sender.clone();
+            Box::pin(async move {
+                sender
+                    .send(
+                        Port::Workset,
+                        workset::encode(&workset::Message::Policy(bytes))?,
+                    )
+                    .await?;
+                Ok(())
+            })
+        }
+    });
+    let provider = factory(&startup.responses_base_url, policy_sender)?;
+    let inference = provider.inference;
+    let policy = provider.policy;
+    let devshell_path = startup.layout.cache.join("rho-devshell");
+    let devshell_dir = devshell_path.as_std_path();
     let mut devshells = rho_devshell::Resolver::new(
         Some(rho_devshell::Client::new(devshell_dir)),
         devshell_dir.to_owned(),
         rho_fs_view::devshell_builder(),
-        base.command_environment(),
+        std::env::vars_os().collect(),
     );
     match rho_watch::Watcher::global() {
         Ok(watcher) => devshells = devshells.with_watcher(watcher),
         Err(error) => eprintln!("rho: not watching dev shell inputs: {error}"),
     }
     rho_devshell::install(devshells);
-    let inference = rho_inference::Inference::from_host(
-        policy.clone(),
-        rho_inference::InferenceConfig::with_responses_base_url(
-            startup.responses_base_url.clone(),
-        )?,
-    );
-
     let mut tasks = tokio::task::JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = 'connection: loop {
@@ -227,15 +240,14 @@ pub(super) async fn run(
         let agent = match packet.port {
             Port::Agent(agent) => agent,
             Port::Workset => {
-                let message = match super::workset::decode::<super::workset::Message>(&packet.bytes)
-                {
+                let message = match workset::decode::<workset::Message>(&packet.bytes) {
                     Ok(message) => message,
                     Err(error) => break Err(error),
                 };
-                use super::workset::{Message as W, Reply};
+                use workset::{Message as W, Reply};
                 match message {
                     W::Policy(message) => {
-                        if let Err(error) = policy.receive(message) {
+                        if let Err(error) = policy.receive(&message) {
                             break Err(error);
                         }
                     }
@@ -250,7 +262,7 @@ pub(super) async fn run(
                             let _ = sender
                                 .send(
                                     Port::Workset,
-                                    super::workset::encode(&W::Reply { id, body })
+                                    workset::encode(&W::Reply { id, body })
                                         .expect("encode workset reply"),
                                 )
                                 .await;
@@ -273,7 +285,7 @@ pub(super) async fn run(
                                 let _ = sender
                                     .send(
                                         Port::Workset,
-                                        super::workset::encode(&W::Reply {
+                                        workset::encode(&W::Reply {
                                             id,
                                             body: Reply::Error(format!("{error:#}")),
                                         })
@@ -313,7 +325,7 @@ pub(super) async fn run(
                 continue;
             }
         }
-        let message = match ipc::decode(&packet.bytes) {
+        let message = match protocol::decode(&packet.bytes) {
             Ok(message) => message,
             Err(error) => break Err(error.into()),
         };
@@ -325,27 +337,26 @@ pub(super) async fn run(
         agents.lock().expect("poison").insert(agent, incoming);
         let agents = agents.clone();
         let sender = sender.clone();
-        let host = Host::connect(sender.clone(), packet.port, messages, next.clone());
-        let base = base.clone();
+        let host = HostClient::connect(sender.clone(), packet.port, messages, next.clone());
         let claude = startup.claude.clone();
         let inference = inference.clone();
         tasks.spawn(async move {
             let result = async {
-                let namespace = base.for_cwd(&bootstrap.cwd)?;
-                let view = Arc::new(crate::lazy::Lazy::new(move || {
-                    let namespace = namespace.clone();
-                    async move { Ok(namespace) }
-                }));
+                let cwd = bootstrap.cwd;
+                anyhow::ensure!(
+                    cwd.is_absolute() && cwd.is_dir(),
+                    "working directory does not exist: {cwd}"
+                );
                 let head = host.head().await?;
                 match head.config.runtime {
-                    crate::db::AgentRuntime::Rho { .. } => {
+                    crate::log::AgentRuntime::Rho { .. } => {
                         let (handle, runtime) =
-                            Agent::load(agent, host.clone(), inference, view).await?;
+                            Agent::load(agent, host.clone(), inference, cwd).await?;
                         drive_native(runtime, handle, host.clone()).await
                     }
-                    crate::db::AgentRuntime::Claude { .. } => {
+                    crate::log::AgentRuntime::Claude { .. } => {
                         let (handle, runtime) =
-                            ClaudeLoop::load(agent, host.clone(), inference, claude, view).await?;
+                            ClaudeLoop::load(agent, host.clone(), inference, claude, cwd).await?;
                         drive_claude(runtime, handle, host.clone()).await
                     }
                 }
@@ -356,7 +367,7 @@ pub(super) async fn run(
             let _ = sender
                 .send(
                     packet.port,
-                    ipc::encode(&Message::Stopped {
+                    protocol::encode(&Message::Stopped {
                         error: result.err().map(|error| format!("{error:#}")),
                     })
                     .expect("encode stopped"),
@@ -376,7 +387,7 @@ pub(super) async fn run(
 
 /// Consume the inherited channel before Python or any child can inherit fd 0.
 /// Must run before the runtime starts threads.
-pub(super) fn control_socket() -> anyhow::Result<std::os::unix::net::UnixStream> {
+pub(crate) fn control_socket() -> anyhow::Result<std::os::unix::net::UnixStream> {
     let channel = rustix::io::fcntl_dupfd_cloexec(rustix::stdio::stdin(), 3)
         .context("duplicate agent control channel")?;
     let null = std::fs::File::open("/dev/null")?;

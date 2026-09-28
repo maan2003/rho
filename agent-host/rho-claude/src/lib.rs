@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately stays at the Claude Code boundary: process
 //! spawning, stream-json messages, and transcript loading. Rho-specific
-//! projection into `rho_inference::types` lives in `rho-agent`.
+//! projection into `rho_agent_types::transcript` lives in `rho-agent`.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -108,7 +108,8 @@ impl ClaudeCodeOptions {
 
     pub async fn command(&self) -> Result<Command> {
         // In the dev shell of the flake the working directory is in.
-        let mut command = rho_devshell::command(self.cwd.as_std_path(), self.command.as_std_path()).await;
+        let mut command =
+            rho_devshell::command(self.cwd.as_std_path(), self.command.as_std_path()).await;
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
         command.env(
@@ -126,7 +127,7 @@ impl ClaudeCodeOptions {
         }
         command.args(self.args());
         // The working directory and PATH are the agent namespace's: the
-        // caller enters it with `Namespace::prepare_command`, and `cwd` is a
+        // caller already runs in the workset namespace, and `cwd` is a
         // path as the agent sees it, which need not exist on the host.
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());
