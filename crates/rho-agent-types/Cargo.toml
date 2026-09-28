@@ -12,6 +12,6 @@ bytes.workspace = true
 camino.workspace = true
 inventory = "0.3"
 prefix-id = { workspace = true, default-features = false }
-senax-encoder.workspace = true
+senax-encoder = { workspace = true, features = ["serde_json"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
