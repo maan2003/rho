@@ -9,7 +9,6 @@
 //! What only the provider understands (item ids, encrypted reasoning) rides
 //! in a [`Carry`]: stored by the agent, replayed verbatim, never read.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::value::RawValue;
@@ -90,7 +89,7 @@ impl Request {
             .unwrap_or(0);
         Self {
             instructions,
-            items: resolve_reports(items.into_iter().skip(start).collect(), true),
+            items: items.into_iter().skip(start).collect(),
             cache_key,
             previous_response_id: None,
         }
@@ -104,7 +103,7 @@ impl Request {
     ) -> Self {
         Self {
             instructions,
-            items: resolve_reports(items, false),
+            items,
             cache_key,
             previous_response_id: Some(previous_response_id),
         }
@@ -164,28 +163,6 @@ impl std::fmt::Display for CacheKey {
     }
 }
 
-// Provider identity stays inside inference. Keep this newtype's encoding for
-// logs.
-#[derive(
-    Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, serde::Serialize, serde::Deserialize,
-)]
-#[serde(transparent)]
-struct CallId(String);
-
-impl CallId {
-    fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl std::fmt::Display for CallId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum Item {
     /// One of the model's earlier responses, replayed as it came.
@@ -194,13 +171,6 @@ pub enum Item {
     CompactionTrigger,
     /// What an earlier step's `exec` call produced.
     Result(CallResult),
-    /// A persisted wake. Inference resolves legacy results against retained
-    /// calls.
-    Report {
-        text: String,
-        images: Vec<Image>,
-        results: Vec<CallResult>,
-    },
     /// Anything else the model is told: messages, and a report on a step
     /// that made no call.
     User { text: String, images: Vec<Image> },
@@ -221,18 +191,17 @@ pub struct Step {
     pub usage: Usage,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
-    id: CallId,
+    id: String,
     pub code: String,
 }
 
 #[cfg(test)]
 impl Call {
-    /// Import an already persisted provider call; live callers receive a Carry.
-    pub fn from_legacy(id: impl Into<String>, code: String) -> Self {
+    pub fn new(id: impl Into<String>, code: String) -> Self {
         Self {
-            id: CallId::new(id),
+            id: id.into(),
             code,
         }
     }
@@ -244,78 +213,17 @@ impl Call {
 }
 
 /// An opaque provider pairing with an execution's output.
-/// Field names and encodings preserve existing persisted CallResult records.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CallResult {
-    id: CallId,
-    // Derived wire output kind; legacy Senax results contain only id/text/images.
-    #[senax(skip_encode, skip_decode)]
-    #[serde(default)]
+    id: String,
     function: bool,
     pub text: String,
     pub images: Vec<Image>,
 }
 impl CallResult {
-    #[cfg(test)]
-    pub fn from_legacy(id: impl Into<String>, text: String, images: Vec<Image>) -> Self {
-        Self {
-            id: CallId::new(id),
-            function: false,
-            text,
-            images,
-        }
-    }
-
     pub fn display_id(&self) -> &str {
         self.id.as_str()
     }
-}
-
-/// Old logs can contain results for calls no longer retained after compaction.
-/// The agent passes those records through without interpreting provider
-/// identities.
-fn resolve_reports(items: Vec<Item>, replay: bool) -> Vec<Item> {
-    let mut retained = HashSet::new();
-    let mut out = Vec::new();
-    for item in items {
-        let item = match &item {
-            Item::Step(carry) => match carry.imported_report() {
-                Some(imported) => Item::Report {
-                    text: imported.text,
-                    images: imported.images,
-                    results: imported.results,
-                },
-                None => item,
-            },
-            _ => item,
-        };
-        match item {
-            Item::Step(carry) => {
-                if replay {
-                    retained.extend(carry.call_ids());
-                }
-                out.push(Item::Step(carry));
-            }
-            Item::Report {
-                text,
-                images,
-                results,
-            } => {
-                let mut answered = false;
-                for result in results {
-                    if !replay || retained.contains(&result.id) {
-                        answered = true;
-                        out.push(Item::Result(result));
-                    }
-                }
-                if !answered && (!text.is_empty() || !images.is_empty()) {
-                    out.push(Item::User { text, images });
-                }
-            }
-            item => out.push(item),
-        }
-    }
-    out
 }
 
 /// Provider view of the agent's opaque replay record. The JSON remains shared.
@@ -331,14 +239,6 @@ struct Replay<'a> {
     single_exec: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_exec: bool,
-    #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
-    imported: Option<&'a RawValue>,
-}
-#[derive(serde::Deserialize)]
-struct Imported {
-    text: String,
-    images: Vec<Image>,
-    results: Vec<CallResult>,
 }
 #[derive(serde::Deserialize)]
 struct ItemMeta<'a> {
@@ -350,22 +250,14 @@ struct ItemMeta<'a> {
 struct Prepared<'a> {
     items: Vec<&'a RawValue>,
     compaction: Option<usize>,
-    calls: Vec<(CallId, bool)>,
+    calls: Vec<(String, bool)>,
 }
 impl Carry {
     fn replay(&self) -> Replay<'_> {
         serde_json::from_str(self.0.data().get()).expect("provider replay record")
     }
-    fn imported_report(&self) -> Option<Imported> {
-        self.replay()
-            .imported
-            .map(|raw| serde_json::from_str(raw.get()).expect("imported report"))
-    }
-    fn prepared(&self) -> Option<Prepared<'_>> {
+    fn prepared(&self) -> Prepared<'_> {
         let replay = self.replay();
-        if replay.imported.is_some() {
-            return None;
-        }
         let mut prepared = Prepared {
             items: Vec::new(),
             compaction: None,
@@ -387,11 +279,11 @@ impl Carry {
             if call && let Some(id) = meta.call_id {
                 prepared
                     .calls
-                    .push((CallId::new(id), meta.kind == "function_call"));
+                    .push((id.into(), meta.kind == "function_call"));
             }
             prepared.items.push(item);
         }
-        Some(prepared)
+        prepared
     }
     fn from_raw_items(items: Vec<Box<RawValue>>, single_exec: bool) -> Self {
         let mut calls = Vec::new();
@@ -436,12 +328,6 @@ impl Carry {
             false,
         )
     }
-}
-pub(crate) fn imported_results(carry: &rho_agent::inference::Carry) -> Vec<CallResult> {
-    Carry(carry.clone())
-        .imported_report()
-        .expect("imported report")
-        .results
 }
 pub(crate) fn display_results(
     carry: &rho_agent::inference::Carry,
@@ -504,10 +390,13 @@ impl Carry {
     fn has_compaction(&self) -> bool {
         self.0.has_compaction()
     }
-    fn call_ids(&self) -> Vec<CallId> {
-        self.prepared().map_or_else(Vec::new, |p| {
-            p.calls.into_iter().map(|(id, _)| id).collect()
-        })
+    #[cfg(test)]
+    fn call_ids(&self) -> Vec<String> {
+        self.prepared()
+            .calls
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
     #[cfg(test)]
     fn has_call(&self) -> bool {
@@ -519,7 +408,7 @@ impl Carry {
             response.0.data(),
             calls
                 .into_iter()
-                .map(|c| rho_agent::inference::Call::new(c.id.0, c.code))
+                .map(|c| rho_agent::inference::Call::new(c.id, c.code))
                 .collect(),
             response.has_compaction(),
         ))
@@ -528,17 +417,9 @@ impl Carry {
     fn display_calls(&self) -> Vec<rho_agent::inference::Call> {
         self.0.display_calls()
     }
-    #[cfg(test)]
-    fn imported(text: String, images: Vec<Image>, results: Vec<CallResult>) -> Self {
-        Self(rho_agent::inference::Carry::new(
-            serde_json::json!({"imported": {"text":text, "images":images, "results":results}}),
-            vec![],
-            false,
-        ))
-    }
     fn reply(&self, text: &str, images: &[Image]) -> Vec<CallResult> {
         self.prepared()
-            .map_or_else(Vec::new, |p| p.calls)
+            .calls
             .into_iter()
             .map(|(id, function)| CallResult {
                 id,
@@ -550,7 +431,7 @@ impl Carry {
     }
     #[cfg(test)]
     fn with_code(&self, code: String) -> Call {
-        Call::from_legacy(self.call_ids().last().unwrap().as_str(), code)
+        Call::new(self.call_ids().last().unwrap().as_str(), code)
     }
     fn bare(call: Call) -> Self {
         let display = rho_agent::inference::Call::new(call.id.as_str(), call.code.clone());
@@ -576,48 +457,14 @@ mod retry_tests {
     use super::*;
 
     #[test]
-    fn imported_inputs_keep_delayed_pairing_and_original_fallback_rules() {
-        let first = Carry::bare(Call::from_legacy("old-a", "a()".into()));
-        let second = Carry::bare(Call::from_legacy("old-b", "b()".into()));
-        let input = Carry::imported(
-            "fallback-must-not-duplicate".into(),
-            vec![],
-            vec![
-                CallResult::from_legacy("old-a", "late alpha".into(), vec![]),
-                CallResult::from_legacy("old-b", "different beta".into(), vec![]),
-            ],
-        );
-        let request = Request::new(
-            "system".into(),
-            vec![Item::Step(first), Item::Step(second), Item::Step(input)],
-            CacheKey::from_u128(4),
-        );
-        assert_eq!(request.items().len(), 4);
-        assert!(matches!(&request.items()[2], Item::Result(r)
-            if r.display_id() == "old-a" && r.text == "late alpha"));
-        assert!(matches!(&request.items()[3], Item::Result(r)
-            if r.display_id() == "old-b" && r.text == "different beta"));
-        let evicted = Request::new(
-            "system".into(),
-            vec![Item::Step(Carry::imported(
-                "fallback-kept".into(),
-                vec![],
-                vec![CallResult::from_legacy("absent", "discard".into(), vec![])],
-            ))],
-            CacheKey::from_u128(4),
-        );
-        assert!(matches!(&evicted.items()[0], Item::User { text, .. } if text == "fallback-kept"));
-    }
-
-    #[test]
-    fn imported_response_preserves_evicted_code_for_display_not_provider_input() {
+    fn display_code_does_not_create_a_provider_call() {
         let carry = Carry::import_response(
             Carry::from_openai_items(vec![]),
-            vec![Call::from_legacy("evicted", "print('old code')".into())],
+            vec![Call::new("evicted", "print('old code')".into())],
         );
         assert!(!carry.has_call());
         assert!(carry.reply("new output", &[]).is_empty());
-        assert!(carry.prepared().unwrap().items.is_empty());
+        assert!(carry.prepared().items.is_empty());
         assert_eq!(carry.display_calls()[0].code, "print('old code')");
         let bytes = senax_encoder::encode(&carry).unwrap();
         let decoded: Carry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
@@ -627,7 +474,7 @@ mod retry_tests {
 
     #[test]
     fn opaque_stream_carry_pairs_partial_code_and_output() {
-        let carry = Carry::bare(Call::from_legacy("provider-stream-7", String::new()));
+        let carry = Carry::bare(Call::new("provider-stream-7", String::new()));
         let partial = carry.with_code("print('admitted')".into());
         assert_eq!(partial.code, "print('admitted')");
         let persisted = Carry::bare(partial);
@@ -640,11 +487,7 @@ mod retry_tests {
         );
         let request = Request::continuation(
             "system".into(),
-            vec![Item::Report {
-                text: "fallback".into(),
-                images: vec![],
-                results,
-            }],
+            results.into_iter().map(Item::Result).collect(),
             CacheKey::from_u128(2),
             "response-previous".into(),
         );
@@ -661,14 +504,14 @@ mod retry_tests {
     }
 
     #[test]
-    fn replay_filters_only_calls_removed_by_compaction_not_older_retained_calls() {
+    fn reply_pairs_only_calls_retained_after_compaction() {
         let first = Carry::from_openai_items(vec![
             r#"{"type":"custom_tool_call","call_id":"removed","input":"old()"}"#.into(),
             r#"{"type":"compaction","encrypted_content":"summary"}"#.into(),
             r#"{"type":"custom_tool_call","call_id":"retained-a","input":"a()"}"#.into(),
             r#"{"type":"custom_tool_call","call_id":"retained-b","input":"b()"}"#.into(),
         ]);
-        let replies = first.reply("legacy multi-call output", &[]);
+        let replies = first.reply("multi-call output", &[]);
         assert_eq!(
             replies
                 .iter()
@@ -676,83 +519,6 @@ mod retry_tests {
                 .collect::<Vec<_>>(),
             ["retained-a", "retained-b"]
         );
-        let later = Carry::bare(Call::from_legacy("later", "later()".into()));
-        let request = Request::new(
-            "system".into(),
-            vec![
-                Item::Step(first),
-                Item::Step(later),
-                Item::Report {
-                    text: "do not duplicate".into(),
-                    images: vec![],
-                    results: vec![
-                        CallResult::from_legacy("removed", "must disappear".into(), vec![]),
-                        replies[0].clone(),
-                    ],
-                },
-                Item::Report {
-                    text: "keep unmatched report".into(),
-                    images: vec![],
-                    results: vec![CallResult::from_legacy(
-                        "removed",
-                        "not a result".into(),
-                        vec![],
-                    )],
-                },
-            ],
-            CacheKey::from_u128(3),
-        );
-        assert_eq!(request.items().len(), 4);
-        assert!(matches!(&request.items()[2], Item::Result(result)
-            if result.display_id() == "retained-a" && result.text == "legacy multi-call output"));
-        assert!(matches!(&request.items()[3], Item::User { text, .. }
-            if text == "keep unmatched report"));
-    }
-
-    #[test]
-    fn private_provider_identity_preserves_persisted_layout() {
-        // These are the original public log shapes, independent of the new types.
-        mod old {
-            use super::*;
-            #[derive(Encode, Decode)]
-            pub struct CallId(pub String);
-            #[derive(Encode, Decode)]
-            pub struct Call {
-                pub id: CallId,
-                pub code: String,
-            }
-            #[derive(Encode, Decode)]
-            pub struct CallResult {
-                pub id: CallId,
-                pub text: String,
-                pub images: Vec<Image>,
-            }
-        }
-        let call_bytes = senax_encoder::encode(&old::Call {
-            id: old::CallId("call-old-31".into()),
-            code: "print(31)".into(),
-        })
-        .unwrap();
-        let call: Call = senax_encoder::decode(&mut call_bytes.as_ref()).unwrap();
-        assert_eq!(call.display_id(), "call-old-31");
-        assert_eq!(call.code, "print(31)");
-        assert_eq!(senax_encoder::encode(&call).unwrap(), call_bytes);
-
-        let images = vec![Image {
-            media_type: "image/png".into(),
-            data: vec![2, 7, 1],
-        }];
-        let result_bytes = senax_encoder::encode(&old::CallResult {
-            id: old::CallId("call-old-31".into()),
-            text: "result".into(),
-            images: images.clone(),
-        })
-        .unwrap();
-        let result: CallResult = senax_encoder::decode(&mut result_bytes.as_ref()).unwrap();
-        assert_eq!(result.display_id(), "call-old-31");
-        assert_eq!(result.text, "result");
-        assert_eq!(result.images, images);
-        assert_eq!(senax_encoder::encode(&result).unwrap(), result_bytes);
     }
 
     #[test]
@@ -815,7 +581,7 @@ mod context_tests {
         assert!(std::ptr::eq(carry.0.data(), cloned.0.data()));
         let bytes = senax_encoder::encode(&carry).unwrap();
         let restored: Carry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
-        assert_eq!(restored.call_ids(), [CallId::new("c")]);
+        assert_eq!(restored.call_ids(), ["c".to_owned()]);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(restored.0.data().get()).unwrap()["items"][0]
                 ["input"],

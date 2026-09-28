@@ -662,19 +662,12 @@ mod tests {
             client
                 .write(&Message::Request {
                     id: 19,
-                    body: Request::Append(AgentEvent::Native(
-                        crate::db::legacy::NativeEvent::RequestStarted {
-                            input: vec![rho_agent_types::transcript::ContextBlock::UserMessage {
-                                sender: rho_agent_types::transcript::MessageSender::User,
-                                content: vec![rho_agent_types::ContentPart::Text {
-                                    text: "a".repeat(count),
-                                }],
-                            }],
-                            context: None,
-                            wake: None,
-                            at: rho_agent_types::UnixMs(1),
-                        },
-                    )),
+                    body: Request::Append(AgentEvent::Entry(crate::entry::Entry::Received {
+                        at: rho_agent_types::UnixMs(1),
+                        id: crate::entry::MessageId(37),
+                        from: crate::entry::Party::Human,
+                        body: vec![crate::entry::Block::Text("a".repeat(count))],
+                    })),
                 })
                 .await
                 .unwrap();
@@ -683,20 +676,17 @@ mod tests {
         let Message::Request {
             id: 19,
             body:
-                Request::Append(AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
-                    input,
+                Request::Append(AgentEvent::Entry(crate::entry::Entry::Received {
+                    id: crate::entry::MessageId(37),
+                    body,
                     ..
                 })),
         } = server.read().await.unwrap()
         else {
             panic!("wrong logical message")
         };
-        let rho_agent_types::transcript::ContextBlock::UserMessage { content, .. } = &input[0]
-        else {
-            panic!()
-        };
-        let rho_agent_types::ContentPart::Text { text } = &content[0] else {
-            panic!()
+        let crate::entry::Block::Text(text) = &body[0] else {
+            panic!("wrong message body")
         };
         assert_eq!(text.len(), count);
         assert!(text.bytes().all(|byte| byte == b'a'));

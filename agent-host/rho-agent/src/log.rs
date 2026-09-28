@@ -474,10 +474,9 @@ pub struct NativeRecovery {
 
 /// One event of an agent's raw log.
 ///
-/// The Rho runtime writes `Accepted`, `QueueCleared`, `Sent`, `Replied` and
-/// `Failed`; the Claude runtime `Accepted`, `QueueCleared`, `Failed` and
-/// `Transcript`; the head's config events are written by the store on the
-/// agent's behalf.
+/// Both runtimes write typed `Entry` records. Claude also records its stream
+/// observations and failed partial responses. The store writes configuration
+/// events on the agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
     /// An input entered a queue: user text, mail, or a `/compact`. It becomes
@@ -600,8 +599,10 @@ pub enum AgentEvent<'a> {
         call: rho_agent_types::transcript::ExecCall,
         at: UnixMs,
     },
-    /// Canonical native conversation records; legacy block rows are read-only.
+    /// Temporary decoder until the remaining historical rows are rewritten.
     Native(db::legacy::NativeEvent),
+    #[senax(rename = "Entry")]
+    LegacyEntry(db::legacy::Entry),
     ClaudeOutput {
         batch: ClaudeOutputBatch,
     },
@@ -609,12 +610,18 @@ pub enum AgentEvent<'a> {
         id: uuid::Uuid,
         at: UnixMs,
     },
-    /// Temporary decoder for pre-typed-report rows; migrated before use.
-    #[senax(rename = "Entry")]
-    LegacyEntry(db::legacy::Entry),
     /// One of the Rho runtime's own rows.
     #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
+}
+
+/// Historical notes-preparation transitions, retained for transcript decoding.
+/// New eviction boundaries are `ContextBlock::ToolHistoryEvicted` items.
+/// Indices refer to full history, never to the provider projection.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum ContextChange {
+    Marked { retain_from: u64 },
+    Preparing { retain_from: u64, repair: bool },
 }
 
 /// Leased notebook contributions transferred to durable host ownership before
@@ -628,15 +635,6 @@ pub struct ClaudeOutputBatch {
     )>,
     pub wake: WakeFacts,
     pub at: UnixMs,
-}
-
-/// Historical notes-preparation transitions, retained for transcript decoding.
-/// New eviction boundaries are `ContextBlock::ToolHistoryEvicted` items.
-/// Indices refer to full history, never to the provider projection.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum ContextChange {
-    Marked { retain_from: u64 },
-    Preparing { retain_from: u64, repair: bool },
 }
 
 /// Why a request went out when it did: the scheduler's reading of its
@@ -800,7 +798,7 @@ pub struct TranscriptCall {
 
 #[cfg(test)]
 mod encoding_tests {
-    use rho_agent_types::transcript::{ContextBlock, MessageSender};
+    use rho_agent_types::transcript::MessageSender;
     use rho_agent_types::{
         AgentId, AgentIdDomain, AgentWant, ContentPart, MessageDelivery, TurnEdge, UnixMs,
         WorksetMode,
@@ -830,40 +828,11 @@ mod encoding_tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs(8),
             }),
-            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
-                input: Vec::from(vec![ContextBlock::CompactionTrigger]),
+            AgentEvent::Entry(entry::Entry::Received {
                 at: UnixMs(9),
-                wake: None,
-                context: None,
-            }),
-            AgentEvent::Native(crate::db::legacy::NativeEvent::ResponseFinished {
-                output: Vec::from(Vec::new()),
-                context_used: Some(12),
-                usage: None,
-                at: UnixMs(10),
-            }),
-            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
-                input: Vec::from(vec![ContextBlock::DeveloperMessage {
-                    text: "boundary".into(),
-                }]),
-                context: Some(ContextChange::Marked { retain_from: 1 }),
-                at: UnixMs(11),
-                wake: None,
-            }),
-            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
-                input: Vec::from(Vec::new()),
-                context: Some(ContextChange::Preparing {
-                    retain_from: 1,
-                    repair: true,
-                }),
-                at: UnixMs(11),
-                wake: None,
-            }),
-            AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
-                input: Vec::from(vec![ContextBlock::ContextRotation { retain_from: 1 }]),
-                at: UnixMs(11),
-                wake: None,
-                context: None,
+                id: entry::MessageId(41),
+                from: entry::Party::Human,
+                body: vec![entry::Block::Text("current log".into())],
             }),
             AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {
@@ -906,15 +875,7 @@ mod encoding_tests {
                 wake: None,
             },
         ];
-        let current = events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .native_event()
-                    .map(|event| AgentEvent::Native(event.clone()))
-            })
-            .collect::<Vec<_>>();
-        for event in events.into_iter().chain(current) {
+        for event in events {
             let mut buffer = bytes::BytesMut::new();
             event.encode(&mut buffer).expect("encode");
             let mut reader = buffer.freeze();

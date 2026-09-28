@@ -58,6 +58,8 @@ enum Inner {
         items: Vec<String>,
         #[senax(default)]
         display: Option<Vec<Call>>,
+        #[senax(default)]
+        evidence: Vec<String>,
     },
     Scripted {
         call: Option<Call>,
@@ -74,6 +76,14 @@ impl Carry {
         Self(Arc::new(Inner::OpenAi {
             items,
             display: None,
+            evidence: Vec::new(),
+        }))
+    }
+    pub fn from_openai_items_with_evidence(items: Vec<String>, evidence: Vec<String>) -> Self {
+        Self(Arc::new(Inner::OpenAi {
+            items,
+            display: None,
+            evidence,
         }))
     }
     pub fn has_compaction(&self) -> bool {
@@ -114,8 +124,10 @@ impl Carry {
         }
     }
     pub fn into_live(&self, display: &[Call]) -> inference::Carry {
-        let (items, compacted) = match &*self.0 {
-            Inner::OpenAi { items, .. } => (
+        let (items, compacted, evidence) = match &*self.0 {
+            Inner::OpenAi {
+                items, evidence, ..
+            } => (
                 items
                     .iter()
                     .map(|item| {
@@ -124,6 +136,12 @@ impl Carry {
                     })
                     .collect(),
                 self.has_compaction(),
+                evidence
+                    .iter()
+                    .map(|item| {
+                        serde_json::from_str::<Value>(item).expect("migration evidence JSON")
+                    })
+                    .collect(),
             ),
             Inner::Scripted { call } => (
                 call.iter()
@@ -136,16 +154,19 @@ impl Carry {
                     })
                     .collect(),
                 false,
+                vec![],
             ),
-            Inner::ScriptedCompaction => (vec![], true),
+            Inner::ScriptedCompaction => (vec![], true, vec![]),
             Inner::Imported { .. } => unreachable!("input is not a response"),
         };
         #[derive(serde::Serialize)]
         struct Payload {
             items: Vec<Box<serde_json::value::RawValue>>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            evidence: Vec<Value>,
         }
         inference::Carry::new(
-            Payload { items },
+            Payload { items, evidence },
             display.iter().map(Call::display).collect(),
             compacted,
         )

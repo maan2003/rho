@@ -1021,7 +1021,10 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
             why: Wake::Compaction,
             compact: true,
             imported: None,
-            report: Report::default(),
+            report: Report {
+                messages: agent.unread.iter().map(|(id, _, _)| *id).collect(),
+                ..Report::default()
+            },
         })
         .await
         .unwrap();
@@ -1100,7 +1103,10 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
             why: Wake::Compaction,
             compact: true,
             imported: None,
-            report: Report::default(),
+            report: Report {
+                messages: vec![agent.unread.last().unwrap().0],
+                ..Report::default()
+            },
         })
         .await
         .unwrap();

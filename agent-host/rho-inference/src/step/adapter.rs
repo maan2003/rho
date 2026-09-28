@@ -99,7 +99,7 @@ async fn classify(
 fn step_output(step: Step) -> agent::Step {
     agent::Step {
         continuation: step.response_id.map(agent::Continuation::new),
-        call: step.call.map(|call| agent::Call::new(call.id.0, call.code)),
+        call: step.call.map(|call| agent::Call::new(call.id, call.code)),
         prose: step.prose,
         carry: step.carry.0,
         usage: step.usage,
@@ -110,7 +110,7 @@ fn request_input(request: agent::Request) -> Request {
     let items = request
         .items
         .into_iter()
-        .map(|item| match item {
+        .flat_map(|item| match item {
             agent::Item::Step { carry, exec } => {
                 // Interrupted execution records only the code actually admitted.
                 // The provider-start payload still owns the original call identity.
@@ -124,7 +124,7 @@ fn request_input(request: agent::Request) -> Request {
                     data["items"][0]["input"] = code.into();
                     carry.0 = agent::Carry::new(data, carry.0.display_calls(), false);
                 }
-                Item::Step(carry)
+                vec![Item::Step(carry)]
             }
             agent::Item::Report {
                 text,
@@ -133,14 +133,14 @@ fn request_input(request: agent::Request) -> Request {
             } => {
                 let results =
                     reply_to.map_or_else(Vec::new, |carry| Carry(carry).reply(&text, &images));
-                Item::Report {
-                    text,
-                    images,
-                    results,
+                if results.is_empty() {
+                    vec![Item::User { text, images }]
+                } else {
+                    results.into_iter().map(Item::Result).collect()
                 }
             }
-            agent::Item::User { text, images } => Item::User { text, images },
-            agent::Item::CompactionTrigger => Item::CompactionTrigger,
+            agent::Item::User { text, images } => vec![Item::User { text, images }],
+            agent::Item::CompactionTrigger => vec![Item::CompactionTrigger],
         })
         .collect();
     let key = super::CacheKey::from_u128(request.cache_key.0);
@@ -161,8 +161,7 @@ mod tests {
 
     #[test]
     fn interrupted_code_is_patched_but_historical_calls_are_never_rewritten() {
-        let start =
-            super::super::Carry::bare(super::super::Call::from_legacy("stream", String::new())).0;
+        let start = super::super::Carry::bare(super::super::Call::new("stream", String::new())).0;
         let historical = agent::Carry::new(
             json!({"items":[
                 {"type":"custom_tool_call","call_id":"old-a","input":"alpha()"},
@@ -251,7 +250,9 @@ mod tests {
     #[test]
     fn display_metadata_is_not_authority_for_provider_pairing() {
         let carry = agent::Carry::new(
-            json!({"items":[]}),
+            json!({"items":[], "evidence":[{
+                "type":"custom_tool_call", "call_id":"not-replayed", "input":"never_run()"
+            }]}),
             vec![DisplayCall::new("evicted", "old()".into())],
             false,
         );

@@ -68,7 +68,17 @@ pub struct Report {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 enum Entry {
     Source(Vec<SourceUpdate>),
-    Imported { text: String, images: Vec<Image> },
+    Text {
+        text: String,
+        images: Vec<Image>,
+    },
+    /// Temporary reader for reports written before text contributions were
+    /// named.
+    #[senax(rename = "Imported")]
+    LegacyText {
+        text: String,
+        images: Vec<Image>,
+    },
 }
 
 /// The presentation sent to the model.
@@ -83,14 +93,25 @@ impl Report {
         self.entries.is_empty()
     }
 
-    /// Carry historical text as opaque content; never infer source state from
-    /// it.
+    /// Add text and images without inferring notebook source state from them.
     pub fn from_text(text: String, images: Vec<Image>) -> Self {
         if text.is_empty() && images.is_empty() {
             return Self::default();
         }
         Self {
-            entries: vec![Entry::Imported { text, images }],
+            entries: vec![Entry::Text { text, images }],
+        }
+    }
+
+    /// Temporary database rewrite; remove with the old text decoder.
+    pub fn migrate_text(&mut self) {
+        for entry in &mut self.entries {
+            if let Entry::LegacyText { text, images } = entry {
+                *entry = Entry::Text {
+                    text: std::mem::take(text),
+                    images: std::mem::take(images),
+                };
+            }
         }
     }
 
@@ -109,7 +130,7 @@ impl Report {
                         self.entries.push(Entry::Source(updates));
                     }
                 }
-                imported => self.entries.push(imported),
+                text => self.entries.push(text),
             }
         }
     }
@@ -119,7 +140,11 @@ impl Report {
         let mut images = Vec::new();
         for entry in &self.entries {
             match entry {
-                Entry::Imported {
+                Entry::Text {
+                    text,
+                    images: entry_images,
+                }
+                | Entry::LegacyText {
                     text,
                     images: entry_images,
                 } => {
@@ -935,7 +960,34 @@ mod report_tests {
     }
 
     #[test]
-    fn imported_text_is_opaque_and_ordered() {
+    fn migration_rewrites_old_text_tag_without_changing_content() {
+        #[derive(senax_encoder::Encode)]
+        enum OldEntry {
+            Imported { text: String, images: Vec<Image> },
+        }
+        #[derive(senax_encoder::Encode)]
+        struct OldReport {
+            entries: Vec<OldEntry>,
+        }
+        let bytes = senax_encoder::encode(&OldReport {
+            entries: vec![OldEntry::Imported {
+                text: "distinct old output".into(),
+                images: vec![image(7), image(2)],
+            }],
+        })
+        .unwrap();
+        let mut report: Report = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+        report.migrate_text();
+        let expected = Report::from_text("distinct old output".into(), vec![image(7), image(2)]);
+        assert_eq!(report, expected);
+        assert_eq!(
+            senax_encoder::encode(&report).unwrap(),
+            senax_encoder::encode(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn text_contributions_are_opaque_and_ordered() {
         let mut report = Report::from_text("Session ID: 1234\nOutput:\nold".into(), vec![image(3)]);
         report.merge(update(
             Uuid::new_v4(),

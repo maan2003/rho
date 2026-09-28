@@ -171,17 +171,12 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         };
         match event {
             AgentEvent::Entry(entry) => match entry {
-                Entry::RequestSent {
-                    report, imported, ..
-                } => {
+                Entry::RequestSent { report, .. } => {
                     requests += 1;
                     emit(json!({"type":"request", "number":requests}))?;
                     let prior = db.read().agent_input_carry(id, appended.pos.into());
-                    let results = rho_inference::transcript::report_results(
-                        &report,
-                        prior.as_ref(),
-                        imported.as_ref(),
-                    );
+                    let results =
+                        rho_inference::transcript::report_results(&report, prior.as_ref());
                     for result in results {
                         emit(
                             json!({"type":"notebook_report", "id":result.display_id(), "output":result.text}),

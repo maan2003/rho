@@ -14,7 +14,6 @@ pub(crate) struct Context {
     report: Report,
     delivered: Vec<(Party, Vec<Block>)>,
     compact: bool,
-    imported: Vec<Item>,
 }
 
 impl Context {
@@ -36,48 +35,22 @@ impl Context {
                 self.report = Report::default();
                 self.delivered.clear();
                 self.compact = false;
-                self.imported.clear();
             }
             Entry::RequestSent {
-                report,
-                compact,
-                imported,
-                ..
+                report, compact, ..
             } => {
-                let delivered: Vec<_> = if imported.is_none() {
-                    // A native send consumes the whole interval since the preceding
-                    // send. IDs in the report are transcript references, not a queue.
-                    std::mem::take(&mut self.messages)
-                        .into_iter()
-                        .map(|(_, from, body)| (from, body))
-                        .collect()
-                } else {
-                    // Old logs allowed selective delivery, in the report's order.
-                    let mut delivered = Vec::new();
-                    for id in &report.messages {
-                        if let Some(index) = self
-                            .messages
-                            .iter()
-                            .position(|(message, _, _)| message == id)
-                        {
-                            let (_, from, body) = self.messages.remove(index);
-                            delivered.push((from, body));
-                        }
-                    }
-                    self.messages
-                        .retain(|(id, _, _)| !report.acknowledged.contains(id));
-                    delivered
-                };
-                if let Some(carry) = imported {
-                    self.imported.push(Item::Step {
-                        carry: carry.clone(),
-                        exec: None,
-                    });
-                    self.imported.extend(delivered.iter().map(message_input));
-                } else {
-                    self.delivered.extend(delivered);
-                    self.report.merge(report.clone());
+                for id in &report.messages {
+                    let index = self
+                        .messages
+                        .iter()
+                        .position(|(message, _, _)| message == id)
+                        .expect("send references a queued message");
+                    let (_, from, body) = self.messages.remove(index);
+                    self.delivered.push((from, body));
                 }
+                self.messages
+                    .retain(|(id, _, _)| !report.acknowledged.contains(id));
+                self.report.merge(report.clone());
                 self.compact |= compact;
             }
             _ => {}
@@ -95,17 +68,12 @@ impl Context {
                 data: image.data,
             })
             .collect();
-        let mut items = self.imported.clone();
+        let mut items = Vec::new();
         if !rendered.text.is_empty() || !images.is_empty() {
-            let reply_to = if self.imported.is_empty() {
-                self.pending.clone()
-            } else {
-                None
-            };
             items.push(Item::Report {
                 text: rendered.text,
                 images,
-                reply_to,
+                reply_to: self.pending.clone(),
             });
         }
         items.extend(self.delivered.iter().map(message_input));
@@ -220,28 +188,18 @@ mod tests {
     }
 
     #[test]
-    fn imported_selection_preserves_order_and_native_send_consumes_the_remainder() {
+    fn delivery_preserves_order_acknowledgment_and_deferred_messages() {
         let mut entries = vec![
             received(1, "first"),
             received(2, "acknowledged"),
             received(3, "third"),
             received(4, "still-pending"),
         ];
-        let mut imported = attempt("old", vec![MessageId(3), MessageId(1)], vec![]);
-        if let Entry::RequestSent {
-            imported: carry,
-            report,
-            ..
-        } = &mut imported
-        {
-            *carry = Some(Carry::new(
-                serde_json::json!("historical-input"),
-                vec![],
-                false,
-            ));
+        let mut sent = attempt("old", vec![MessageId(3), MessageId(1)], vec![]);
+        if let Entry::RequestSent { report, .. } = &mut sent {
             report.acknowledged.push(MessageId(2));
         }
-        entries.push(imported);
+        entries.push(sent);
         let mut context = Context::restore(&entries);
         let messages = |context: &Context| {
             context

@@ -1030,14 +1030,11 @@ fn agent_detail(
     let event = db.read().agent_event(agent_id, pos.into());
     match event {
         Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
-            report,
-            imported,
-            ..
+            report, ..
         })) => DetailBody::Results(
             crate::transcript::report_results(
                 &report,
                 db.read().agent_input_carry(agent_id, pos.into()).as_ref(),
-                imported.as_ref(),
             )
             .into_iter()
             .map(

@@ -228,13 +228,12 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
         Entry::RequestSent {
             report,
             compact,
-            imported,
             at,
             ..
         } => TranscriptEvent::NotebookReport {
             delivered: report.messages.iter().map(|id| id.0).collect(),
             acknowledged: report.acknowledged.iter().map(|id| id.0).collect(),
-            calls: report_results(report, prior_carry, imported.as_ref())
+            calls: report_results(report, prior_carry)
                 .iter()
                 .map(|result| result.display_id().to_owned())
                 .collect(),
@@ -315,9 +314,8 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
 pub(crate) fn report_results(
     report: &Report,
     prior_carry: Option<&Carry>,
-    imported: Option<&Carry>,
 ) -> Vec<rho_inference::transcript::ReportOutput> {
-    rho_inference::transcript::report_results(report, prior_carry, imported)
+    rho_inference::transcript::report_results(report, prior_carry)
 }
 
 /// A step's visible items: the prose it wrote, then its calls.
@@ -412,8 +410,7 @@ mod tests {
                     AgentEvent::Entry(Entry::RequestSent { report, .. }) => report,
                     _ => unreachable!(),
                 },
-                Some(&prior),
-                None
+                Some(&prior)
             )[0]
             .text,
             "rho restarted. Your notebook and everything running in it are gone, and their side effects may remain. Check the current state before carrying on."
@@ -427,57 +424,6 @@ mod tests {
                 acknowledged: vec![11],
                 at: UnixMs(71),
             }
-        );
-    }
-
-    #[test]
-    fn imported_results_keep_distinct_historical_outputs() {
-        let first = rho_inference::transcript::ReportOutput {
-            id: "old-a".into(),
-            text: "first output".into(),
-            images: vec![],
-        };
-        let second = rho_inference::transcript::ReportOutput {
-            id: "old-b".into(),
-            text: "different output".into(),
-            images: vec![],
-        };
-        let imported = Carry::new(
-            serde_json::json!({"imported":{
-                "text":"fallback report","images":[],
-                "results":[
-                    {"id":"old-a","text":"first output","images":[]},
-                    {"id":"old-b","text":"different output","images":[]}
-                ]
-            }}),
-            vec![],
-            false,
-        );
-        let unrelated = call_carry("wrong-pairing", "code");
-        let report = Report {
-            notices: vec![RequestNotice::Restarted],
-            ..Default::default()
-        };
-        let event = AgentEvent::Entry(Entry::RequestSent {
-            at: UnixMs(73),
-            why: rho_agent::entry::Wake::Returned,
-            report: report.clone(),
-            compact: false,
-            imported: Some(imported.clone()),
-        });
-        assert_eq!(
-            report_results(&report, Some(&unrelated), Some(&imported)),
-            vec![first, second]
-        );
-        assert_eq!(
-            strip(&event, Some(&unrelated)),
-            Some(TranscriptEvent::NotebookReport {
-                calls: vec!["old-a".into(), "old-b".into()],
-                compaction: false,
-                delivered: vec![],
-                acknowledged: vec![],
-                at: UnixMs(73),
-            })
         );
     }
 

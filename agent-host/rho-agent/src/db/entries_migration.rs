@@ -1,11 +1,11 @@
-//! Converts a7e43d91 native rows as part of the direct e31bcf82 migration.
+//! Temporary conversion of any native rows left in dc371fa2 histories.
 //! Rows are rewritten in place, preserving positions, journal, and rewinds.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use rho_agent_types::transcript::{
     ContextBlock, InferenceResponseItem, MessageSender, OpenAiResponsesProviderData as Provider,
-    ToolResult,
+    PendingInferenceResponse, ProviderSpecificData, StreamingContextItemState, ToolResult,
 };
 use rho_agent_types::{AgentId, ContentPart, MessagePhase, UnixMs};
 use rho_db::{SenValue, WriteTxn};
@@ -13,26 +13,32 @@ use serde_json::json;
 
 use super::legacy::Entry;
 use super::legacy::provider::{Call, CallResult, Carry};
-use super::{AGENT_HEADS, AGENT_LOG, AgentRuntime, agent_range, fold_head, rows};
+use super::{AGENT_HEADS, AGENT_LOG, agent_range, fold_head, rows};
 use crate::db::legacy::NativeEvent;
 use crate::entry::{Block, MessageId, Notice, Party, Wake};
 use crate::inference::{Image, Usage};
 use crate::{AgentEvent, InputKind};
 
-pub(super) fn migrate(write: &mut WriteTxn) {
-    let rho = write
+pub(super) fn migrate(write: &mut WriteTxn) -> BTreeMap<(AgentId, u64), Vec<Entry>> {
+    let agents = write
         .open_table(AGENT_HEADS)
         .iter()
-        .filter(|(_, head)| {
-            matches!(
-                head.value().into_owned().config.runtime,
-                AgentRuntime::Rho { .. }
-            )
-        })
         .map(|(id, _)| id.value())
         .collect::<Vec<_>>();
-    for agent_id in rho {
-        let unmatched = migrate_agent(write, agent_id);
+    let mut synthetic = BTreeMap::new();
+    for agent_id in agents {
+        let has_native = write
+            .open_table(AGENT_LOG)
+            .range(agent_range(agent_id))
+            .any(|(_, row)| matches!(row.value().into_owned(), AgentEvent::Native(_)));
+        if !has_native {
+            continue;
+        }
+        synthetic.extend(
+            migrate_agent(write, agent_id)
+                .into_iter()
+                .map(|(pos, entries)| ((agent_id, pos), entries)),
+        );
         // The rewrite folds the same, but the stored head must be the log's.
         let head = {
             let log = write.open_table(AGENT_LOG);
@@ -42,81 +48,27 @@ pub(super) fn migrate(write: &mut WriteTxn) {
         write
             .open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
-        check(write, agent_id, unmatched);
     }
-}
-
-/// Says what a person checking the migrated log should look at: messages
-/// found only in model input, messages the next wake will deliver, and
-/// replayed calls nothing answers.
-fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
-    let entries = {
-        let log = write.open_table(AGENT_LOG);
-        super::visible_rows(rows(log.range(agent_range(agent_id))))
-            .1
-            .into_iter()
-            .filter_map(|(_, event)| match event {
-                AgentEvent::LegacyEntry(entry) => Some(entry),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-    let delivered = entries
-        .iter()
-        .flat_map(|entry| match entry {
-            Entry::Woken {
-                messages,
-                acknowledged,
-                ..
-            } => messages.iter().chain(acknowledged).copied().collect(),
-            _ => Vec::new(),
-        })
-        .collect::<HashSet<_>>();
-    let unread = entries
-        .iter()
-        .filter(|entry| matches!(entry, Entry::Received { id, .. } if !delivered.contains(id)))
-        .count();
-    let request = crate::db::legacy::request(&entries);
-    let answered = request
-        .iter()
-        .filter_map(|item| match item {
-            super::legacy::Item::Result(result) => Some(result.display_id().to_owned()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut unanswered = request
-        .iter()
-        .flat_map(|item| match item {
-            super::legacy::Item::Step(calls) => calls.clone(),
-            _ => Vec::new(),
-        })
-        .filter(|id| !answered.contains(id))
-        .collect::<Vec<_>>();
-    // The last step's calls are answered by the wake still to come.
-    if let Some(Entry::Step { calls, .. }) = entries
-        .iter()
-        .rev()
-        .find(|entry| matches!(entry, Entry::Step { .. } | Entry::Woken { .. }))
-    {
-        unanswered.retain(|id| !calls.iter().any(|call| call.display_id() == id.as_str()));
-    }
-    if unmatched + unread + unanswered.len() > 0 {
-        eprintln!(
-            "agent {}: {unmatched} messages only in model input, {unread} unread, \
-             unanswered calls {unanswered:?}",
-            agent_id.encoded()
-        );
-    }
+    synthetic
 }
 
 /// How many delivered messages had no accepted row to become.
-fn migrate_agent(write: &mut WriteTxn, agent_id: AgentId) -> usize {
+fn migrate_agent(write: &mut WriteTxn, agent_id: AgentId) -> BTreeMap<u64, Vec<Entry>> {
     let window = {
         let log = write.open_table(AGENT_LOG);
         Window::scan(rows(log.range(agent_range(agent_id))))
     };
+    let targets = {
+        let log = write.open_table(AGENT_LOG);
+        rows(log.range(agent_range(agent_id)))
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Rewound { to, .. } => Some(to.pos),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+    };
     let mut log = write.open_table(AGENT_LOG);
-    let mut convert = Convert::new(window);
+    let mut convert = Convert::new(window, targets);
     for pos in convert.window.positions.clone() {
         let event = log
             .get(&(agent_id, pos))
@@ -130,7 +82,7 @@ fn migrate_agent(write: &mut WriteTxn, agent_id: AgentId) -> usize {
             );
         }
     }
-    convert.unmatched
+    convert.synthetic.into_iter().collect()
 }
 
 /// Where the old provider's view began: its latest rotation, then its latest
@@ -265,23 +217,48 @@ struct Convert {
     pending: VecDeque<(MessageId, MessageSender, Vec<ContentPart>)>,
     /// Calls replayed in the provider's view so far.
     calls: HashSet<String>,
-    unmatched: usize,
+    synthetic: HashMap<u64, Vec<Entry>>,
+    // Snapshot before each physical row so rewinding restores pending messages
+    // on the branch without losing conversion of the hidden branch's rows.
+    before: HashMap<
+        u64,
+        (
+            VecDeque<(MessageId, MessageSender, Vec<ContentPart>)>,
+            HashSet<String>,
+            bool,
+        ),
+    >,
+    targets: HashSet<u64>,
+    old_native_epoch: bool,
 }
 
 impl Convert {
-    fn new(window: Window) -> Self {
+    fn new(window: Window, targets: HashSet<u64>) -> Self {
         Self {
             window,
             pending: VecDeque::new(),
             calls: HashSet::new(),
-            unmatched: 0,
+            synthetic: HashMap::new(),
+            before: HashMap::new(),
+            targets,
+            old_native_epoch: true,
         }
     }
 
     fn row(&mut self, pos: u64, event: &AgentEvent<'static>) -> Option<Entry> {
+        if self.targets.contains(&pos) {
+            self.before.insert(
+                pos,
+                (
+                    self.pending.clone(),
+                    self.calls.clone(),
+                    self.old_native_epoch,
+                ),
+            );
+        }
         let visible = self.window.visible.contains(&pos);
         Some(match event {
-            AgentEvent::Accepted(input) => match &input.kind {
+            AgentEvent::Accepted(input) if self.old_native_epoch => match &input.kind {
                 InputKind::Message { content } => {
                     let id = MessageId(pos);
                     self.pending.push_back((id, input.source, content.clone()));
@@ -292,25 +269,14 @@ impl Convert {
                         body: content.iter().map(block_of).collect(),
                     }
                 }
-                // A request the provider already answered, or asked for
-                // before a later rotation, is spent.
-                InputKind::Compaction if visible && self.accepted_before_start(pos) => {
-                    Entry::Woken {
-                        at: input.at,
-                        why: Wake::Compaction,
-                        report: String::new(),
-                        images: Vec::new(),
-                        messages: Vec::new(),
-                        acknowledged: Vec::new(),
-                        results: Vec::new(),
-                    }
-                }
-                InputKind::Compaction => Entry::CompactionTrigger {
+                InputKind::Compaction => Entry::Sent {
                     at: input.at,
-                    manual: true,
+                    id: MessageId::new(),
+                    to: Party::Human,
+                    text: "[Historical event: compaction requested.]".into(),
                 },
             },
-            AgentEvent::Cleared { at } => Entry::Woken {
+            AgentEvent::Cleared { at } if self.old_native_epoch => Entry::Woken {
                 at: *at,
                 why: Wake::Message,
                 report: String::new(),
@@ -320,36 +286,70 @@ impl Convert {
                 results: Vec::new(),
             },
             AgentEvent::Rewound { to, .. } => {
-                self.pending.retain(|(id, ..)| id.0 < to.pos);
+                let (pending, calls, old_native_epoch) = self
+                    .before
+                    .get(&to.pos)
+                    .unwrap_or_else(|| panic!("rewind to absent row {}", to.pos))
+                    .clone();
+                self.pending = pending;
+                self.calls = calls;
+                self.old_native_epoch = old_native_epoch;
+                return None;
+            }
+            AgentEvent::Entry(crate::entry::Entry::Received { id, from, body, .. }) => {
+                self.old_native_epoch = false;
+                let sender = match from {
+                    Party::Human => MessageSender::User,
+                    Party::Agent(id) => MessageSender::Agent { id: *id },
+                };
+                self.pending.push_back((
+                    *id,
+                    sender,
+                    body.iter()
+                        .map(|part| match part {
+                            Block::Text(text) => ContentPart::Text { text: text.clone() },
+                            Block::Image(image) => ContentPart::Image {
+                                media_type: image.media_type.clone(),
+                                data: image.data.clone(),
+                            },
+                        })
+                        .collect(),
+                ));
+                return None;
+            }
+            AgentEvent::Entry(crate::entry::Entry::RequestSent { report, .. }) => {
+                self.old_native_epoch = false;
+                for id in report.messages.iter().chain(&report.acknowledged) {
+                    if let Some(index) = self
+                        .pending
+                        .iter()
+                        .position(|(candidate, ..)| candidate == id)
+                    {
+                        self.pending.remove(index);
+                    }
+                }
                 return None;
             }
             AgentEvent::Failed { error, at, .. } => Entry::Notice {
                 at: *at,
                 notice: Notice::Error(error.to_string()),
             },
-            AgentEvent::Native(NativeEvent::RequestFailed { error, at, .. }) => Entry::Notice {
-                at: *at,
-                notice: Notice::Error(error.clone()),
-            },
+            AgentEvent::Native(NativeEvent::RequestFailed { partial, at, .. }) => {
+                partial_step(partial, *at)
+            }
             AgentEvent::Native(NativeEvent::RequestStarted { input, at, .. }) => {
-                let before = visible && self.window.before_start(pos, false);
-                self.request(input, *at, visible, before)
+                self.request(input, *at, pos, visible, false)
             }
             AgentEvent::Native(NativeEvent::ResponseFinished {
                 output, usage, at, ..
             }) => {
-                let before = visible && self.window.before_start(pos, true);
-                let window = &self.window;
-                let (calls, carry, prose) =
-                    response(output, &|call| visible && window.dropped(pos, call), pos);
-                if !before {
-                    self.calls.extend(carry_calls(&carry));
-                }
+                let (calls, carry, prose, evidence) = response(output, &|_| false, pos);
+                self.calls.extend(carry_calls(&carry));
                 Entry::Step {
                     at: *at,
                     calls,
                     prose,
-                    carry: Carry::from_openai_items(if before { Vec::new() } else { carry }),
+                    carry: Carry::from_openai_items_with_evidence(carry, evidence),
                     usage: usage
                         .as_ref()
                         .map_or_else(Default::default, |bucket| Usage {
@@ -360,6 +360,10 @@ impl Convert {
                             output_tokens: bucket.output_tokens,
                         }),
                 }
+            }
+            AgentEvent::Entry(_) | AgentEvent::LegacyEntry(_) => {
+                self.old_native_epoch = false;
+                return None;
             }
             _ => return None,
         })
@@ -412,11 +416,13 @@ impl Convert {
         &mut self,
         input: &[ContextBlock],
         at: UnixMs,
+        pos: u64,
         visible: bool,
         before: bool,
     ) -> Entry {
         let mut messages = Vec::new();
         let mut results: Vec<CallResult> = Vec::new();
+        let mut images = Vec::new();
         let mut extra = Vec::new();
         let mut why = None;
         for block in input {
@@ -429,36 +435,40 @@ impl Convert {
                     match self.take(*sender, content) {
                         Some(ids) => messages.extend(ids),
                         None => {
-                            self.unmatched += 1;
-                            extra.push(crate::worker::native::context::render_message(
-                                &party(*sender),
-                                &content.iter().map(block_of).collect::<Vec<_>>(),
-                            ))
+                            let id = MessageId::new();
+                            self.synthetic
+                                .entry(pos)
+                                .or_default()
+                                .push(Entry::Received {
+                                    at,
+                                    id,
+                                    from: party(*sender),
+                                    body: content.iter().map(block_of).collect(),
+                                });
+                            messages.push(id);
                         }
                     }
                 }
                 ContextBlock::ToolResults { results: answered } => {
                     why.get_or_insert(Wake::Returned);
                     for result in answered {
-                        let id = result.call_id.as_str();
-                        let evicted = visible && self.window.evicted.contains(id);
-                        if !visible || before || evicted || self.calls.contains(id) {
-                            results.push(call_result(result));
-                        } else {
-                            extra.push(format!(
-                                "Output of earlier exec {id}:\n{}",
-                                result.body.output
-                            ));
-                        }
+                        results.push(call_result(result));
                     }
                 }
                 ContextBlock::ToolUpdate(update) => {
                     why.get_or_insert(Wake::Notify);
                     extra.push(format!(
-                        "Update from exec {}:\n{}",
+                        "Update from exec {}:\\n{}",
                         update.call_id.as_str(),
-                        update.output
+                        complete_output(
+                            update.full_output.as_ref().map(|s| s.as_str()),
+                            &update.output
+                        )
                     ));
+                    images.extend(update.images.iter().map(|image| Image {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    }));
                 }
                 ContextBlock::DeveloperMessage { text } => extra.push(text.clone()),
                 ContextBlock::CompactionTrigger => {
@@ -469,20 +479,11 @@ impl Convert {
                 | ContextBlock::ToolHistoryEvicted { .. } => {}
             }
         }
-        let mut report = String::new();
-        if !before && !extra.is_empty() {
-            let text = extra.join("\n\n");
-            match results
-                .iter_mut()
-                .find(|result| self.calls.contains(result.display_id()))
-            {
-                Some(result) => {
-                    result.text.push_str("\n\n");
-                    result.text.push_str(&text);
-                }
-                None => report = text,
-            }
-        }
+        let report = if before {
+            String::new()
+        } else {
+            extra.join("\n\n")
+        };
         let (messages, acknowledged) = if before {
             (Vec::new(), messages)
         } else {
@@ -492,7 +493,7 @@ impl Convert {
             at,
             why: why.unwrap_or(Wake::Notify),
             report,
-            images: Vec::new(),
+            images,
             messages,
             acknowledged,
             results,
@@ -500,14 +501,14 @@ impl Convert {
     }
 }
 
-fn party(sender: MessageSender) -> Party {
+pub(super) fn party(sender: MessageSender) -> Party {
     match sender {
         MessageSender::User => Party::Human,
         MessageSender::Agent { id } => Party::Agent(id),
     }
 }
 
-fn block_of(part: &ContentPart) -> Block {
+pub(super) fn block_of(part: &ContentPart) -> Block {
     match part {
         ContentPart::Text { text } => Block::Text(text.clone()),
         ContentPart::Image { media_type, data } => Block::Image(Image {
@@ -517,10 +518,23 @@ fn block_of(part: &ContentPart) -> Block {
     }
 }
 
+fn complete_output(full: Option<&str>, bounded: &str) -> String {
+    match full {
+        None => bounded.to_owned(),
+        Some(full) if full.contains(bounded) => full.to_owned(),
+        Some(full) => {
+            format!("Full recorded output:\n{full}\n\nModel-visible output:\n{bounded}")
+        }
+    }
+}
+
 fn call_result(result: &ToolResult) -> CallResult {
     CallResult::from_legacy(
         result.call_id.as_str(),
-        (*result.body.output).clone(),
+        complete_output(
+            result.body.full_output.as_ref().map(|s| s.as_str()),
+            &result.body.output,
+        ),
         result
             .body
             .images
@@ -542,7 +556,7 @@ fn carry_calls(carry: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn compaction(item: &InferenceResponseItem) -> Option<(&str, &str)> {
+pub(super) fn compaction(item: &InferenceResponseItem) -> Option<(&str, &str)> {
     let (InferenceResponseItem::Compaction { provider_specific }
     | InferenceResponseItem::Unknown { provider_specific }) = item
     else {
@@ -564,10 +578,21 @@ fn response(
     output: &[ContextBlock],
     dropped: &dyn Fn(&str) -> bool,
     pos: u64,
-) -> (Vec<Call>, Vec<String>, String) {
+) -> (Vec<Call>, Vec<String>, String, Vec<String>) {
     let mut calls = Vec::new();
     let mut carry = Vec::new();
     let mut prose = String::new();
+    let mut evidence = Vec::new();
+    for block in output {
+        match block {
+            ContextBlock::InferenceResponse {
+                provider_response_id: Some(id),
+                ..
+            } => evidence.push(json!({"provider_response_id": id.as_str()}).to_string()),
+            ContextBlock::InferenceResponse { .. } => {}
+            _ => evidence.push(json!({"unreplayed_block_senax_hex": exact_hex(block)}).to_string()),
+        }
+    }
     let items = output.iter().flat_map(|block| match block {
         ContextBlock::InferenceResponse { items, .. } => items.as_slice(),
         _ => &[],
@@ -580,6 +605,17 @@ fn response(
                 phase,
             } => {
                 let text = rho_agent_types::transcript::text_content(content);
+                if !matches!(
+                    provider_specific.as_any().downcast_ref::<Provider>(),
+                    Some(Provider::Message { .. })
+                ) || content
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::Image { .. }))
+                {
+                    evidence.push(
+                        json!({"response_index": index, "item": evidence_of(item)}).to_string(),
+                    );
+                }
                 prose.push_str(&text);
                 let id = match provider_specific.as_any().downcast_ref::<Provider>() {
                     Some(Provider::Message { item_id }) => item_id.as_str().to_owned(),
@@ -602,9 +638,21 @@ fn response(
             InferenceResponseItem::ToolCall {
                 provider_specific,
                 id,
+                name,
+                tool_type,
                 arguments,
-                ..
             } => {
+                if name.as_str() != "exec"
+                    || *tool_type != rho_agent_types::transcript::ToolType::Custom
+                    || !matches!(
+                        provider_specific.as_any().downcast_ref::<Provider>(),
+                        Some(Provider::FunctionCall { .. } | Provider::CustomToolCall { .. })
+                    )
+                {
+                    evidence.push(
+                        json!({"response_index": index, "item": evidence_of(item)}).to_string(),
+                    );
+                }
                 calls.push(Call::from_legacy(id.as_str(), arguments.clone()));
                 if dropped(id.as_str()) {
                     continue;
@@ -632,9 +680,15 @@ fn response(
                     encrypted_content,
                 }) = provider_specific.as_any().downcast_ref::<Provider>()
                 else {
+                    evidence.push(
+                        json!({"response_index": index, "item": evidence_of(item)}).to_string(),
+                    );
                     continue;
                 };
                 if encrypted_content.is_empty() {
+                    evidence.push(
+                        json!({"response_index": index, "item": evidence_of(item)}).to_string(),
+                    );
                     continue;
                 }
                 json!({
@@ -649,16 +703,143 @@ fn response(
             }
             InferenceResponseItem::Compaction { .. } | InferenceResponseItem::Unknown { .. } => {
                 let Some((id, encrypted_content)) = compaction(item) else {
+                    evidence.push(
+                        json!({"response_index": index, "item": evidence_of(item)}).to_string(),
+                    );
                     continue;
                 };
                 json!({ "type": "compaction", "id": id, "encrypted_content": encrypted_content })
             }
-            // Old replay never sent raw reasoning.
-            InferenceResponseItem::RawReasoning { .. } => continue,
+            // Raw reasoning was never provider replay; preserve it as opaque
+            // evidence rather than showing previously private text to the model.
+            InferenceResponseItem::RawReasoning { .. } => {
+                evidence
+                    .push(json!({"response_index": index, "item": evidence_of(item)}).to_string());
+                continue;
+            }
         };
         carry.push(value.to_string());
     }
-    (calls, carry, prose)
+    (calls, carry, prose, evidence)
+}
+
+fn exact_hex<T: senax_encoder::Encoder>(value: &T) -> String {
+    senax_encoder::encode(value)
+        .expect("persisted native item encodes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn provider_evidence(
+    item: &InferenceResponseItem,
+    provider: &dyn ProviderSpecificData,
+) -> serde_json::Value {
+    match provider.as_any().downcast_ref::<Provider>() {
+        Some(Provider::Message { item_id }) => {
+            json!({"type":"message", "item_id":item_id.as_str()})
+        }
+        Some(Provider::FunctionCall { item_id }) => {
+            json!({"type":"function_call", "item_id":item_id.as_str()})
+        }
+        Some(Provider::CustomToolCall { item_id }) => {
+            json!({"type":"custom_tool_call", "item_id":item_id.as_str()})
+        }
+        Some(Provider::EncryptedReasoning {
+            item_id,
+            encrypted_content,
+        }) => {
+            json!({"type":"encrypted_reasoning", "item_id":item_id.as_str(), "encrypted_content":encrypted_content})
+        }
+        Some(Provider::Compaction {
+            item_id,
+            encrypted_content,
+        }) => {
+            json!({"type":"compaction", "item_id":item_id.as_str(), "encrypted_content":encrypted_content})
+        }
+        None => json!({"original_item_senax_hex": exact_hex(item)}),
+    }
+}
+
+fn evidence_of(item: &InferenceResponseItem) -> serde_json::Value {
+    match item {
+        InferenceResponseItem::AssistantMessage {
+            provider_specific,
+            content,
+            phase,
+        } => {
+            let content = content
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => json!({"type":"text", "text":text}),
+                    ContentPart::Image { media_type, data } => {
+                        json!({"type":"image", "media_type":media_type, "data":data})
+                    }
+                })
+                .collect::<Vec<_>>();
+            json!({"type":"assistant_message", "content":content, "phase":format!("{phase:?}"),
+                "provider":provider_evidence(item, provider_specific.as_ref())})
+        }
+        InferenceResponseItem::ToolCall {
+            provider_specific,
+            id,
+            name,
+            tool_type,
+            arguments,
+        } => json!({"type":"tool_call", "id":id.as_str(), "name":name.as_str(),
+                "tool_type":format!("{tool_type:?}"), "arguments":arguments,
+                "provider":provider_evidence(item, provider_specific.as_ref())}),
+        InferenceResponseItem::RawReasoning {
+            provider_specific,
+            content,
+            summary,
+        } => json!({"type":"raw_reasoning", "content":content, "summary":summary,
+                "provider":provider_evidence(item, provider_specific.as_ref())}),
+        InferenceResponseItem::EncryptedReasoning {
+            provider_specific,
+            summary,
+        } => json!({"type":"encrypted_reasoning", "summary":summary,
+                "provider":provider_evidence(item, provider_specific.as_ref())}),
+        InferenceResponseItem::Compaction { provider_specific } => {
+            json!({"type":"compaction", "provider":provider_evidence(item, provider_specific.as_ref())})
+        }
+        InferenceResponseItem::Unknown { provider_specific } => {
+            json!({"type":"unknown", "provider":provider_evidence(item, provider_specific.as_ref())})
+        }
+    }
+}
+
+fn partial_step(partial: &PendingInferenceResponse, at: UnixMs) -> Entry {
+    let mut calls = Vec::new();
+    let mut prose = String::new();
+    let mut evidence = Vec::new();
+    for (index, state) in partial.items.iter().enumerate() {
+        let (kind, item) = match state {
+            StreamingContextItemState::Empty => {
+                evidence.push(json!({"response_index": index, "state":"empty"}).to_string());
+                continue;
+            }
+            StreamingContextItemState::Pending(item) => ("pending", item),
+            StreamingContextItemState::Finished(item) => ("finished", item),
+        };
+        let item = item.to_context_item().expect("persisted partial item");
+        if let InferenceResponseItem::AssistantMessage { content, .. } = &item {
+            prose.push_str(&rho_agent_types::transcript::text_content(content));
+        }
+        if let InferenceResponseItem::ToolCall { id, arguments, .. } = &item {
+            calls.push(Call::from_legacy(id.as_str(), arguments.clone()));
+        }
+        evidence.push(
+            json!({"response_index":index, "state":kind, "item": evidence_of(&item)}).to_string(),
+        );
+    }
+    Entry::Step {
+        at,
+        calls,
+        prose,
+        carry: Carry::from_openai_items_with_evidence(vec![], evidence),
+        usage: Usage::default(),
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +1014,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(unread, vec![MessageId(rows[8].0.pos)]);
 
+        assert!(entries.iter().any(|entry|
+            matches!(entry, Entry::Woken { report, .. } if report == "note")));
         let request = crate::db::legacy::request(&entries);
         let shown = request
             .iter()
@@ -847,9 +1030,10 @@ mod tests {
             shown,
             [
                 "user Message from the human:\nhi",
-                "step []",
+                "step [\"c1\"]",
+                "result c1: one",
                 "step [\"c2\"]",
-                "result c2: two\n\nnote",
+                "result c2: two",
                 "step []",
             ]
         );

@@ -16,14 +16,8 @@ impl ReportOutput {
         &self.id
     }
 }
-pub fn report_results(
-    report: &Report,
-    prior: Option<&Carry>,
-    imported: Option<&Carry>,
-) -> Vec<ReportOutput> {
-    let results: Vec<step::CallResult> = if let Some(imported) = imported {
-        step::imported_results(imported)
-    } else {
+pub fn report_results(report: &Report, prior: Option<&Carry>) -> Vec<ReportOutput> {
+    let results: Vec<step::CallResult> = {
         let rendered = report.render();
         let images = rendered
             .images

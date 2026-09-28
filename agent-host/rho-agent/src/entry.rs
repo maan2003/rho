@@ -77,10 +77,9 @@ pub enum Notice {
 pub struct Report {
     pub notices: Vec<RequestNotice>,
     pub notebook: rho_notebook::Report,
-    /// Transcript references to Received records consumed by this send.
-    /// Native sends consume the whole interval; only imported sends select IDs.
+    /// Queued Received records delivered by this send, in delivery order.
     pub messages: Vec<MessageId>,
-    /// Historical inputs handled without being shown to the model.
+    /// Queued inputs handled without being shown to the model.
     pub acknowledged: Vec<MessageId>,
 }
 
@@ -178,8 +177,7 @@ pub enum Entry {
         why: Wake,
         report: Report,
         compact: bool,
-        /// Exact provider inputs imported from historical call/result records.
-        /// New attempts never write this.
+        /// Temporary migration input; current-format rows always contain None.
         imported: Option<Carry>,
     },
     Received {

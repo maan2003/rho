@@ -28,8 +28,8 @@ use crate::log::{
     SessionBinding, UnixMillis, usage_model_of,
 };
 
-mod code_first_migration;
 mod entries_migration;
+mod history_migration;
 pub(crate) mod legacy;
 mod native;
 mod reports_migration;
@@ -93,7 +93,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "dc371fa2";
+const CURRENT_AGENT_DB_FORMAT: &str = "b7e91ac4";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -102,48 +102,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "a7e43d91",
-        to: "e31bcf82",
-        migrate: code_first_migration::migrate,
-    },
-    AgentDbMigration {
-        from: "e31bcf82",
-        to: "7f24a9d3",
-        migrate: migrate_workset_modes,
-    },
-    AgentDbMigration {
-        from: "7f24a9d3",
-        to: "dc371fa2",
-        migrate: reports_migration::migrate,
-    },
-];
-
-fn migrate_workset_modes(write: &mut WriteTxn) {
-    let members = write
-        .open_table(AGENT_HEADS)
-        .iter()
-        .map(|(id, head)| (id.value(), head.value().into_owned().place().clone()))
-        .collect::<Vec<_>>();
-    for (id, place) in members {
-        write
-            .open_table(WORKSET_AGENTS)
-            .insert(&(place.workset.clone(), id), &());
-        let previous = write
-            .open_table(WORKSET_MODES)
-            .get(&place.workset)
-            .map(|value| value.value().into_owned());
-        let mode = match previous {
-            None => Some(place.mode),
-            Some(Some(existing)) if existing == place.mode => Some(existing),
-            Some(_) => None,
-        };
-        write
-            .open_table(WORKSET_MODES)
-            .insert(&place.workset, SenValue::borrowed(&mode));
-    }
-}
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "dc371fa2",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: history_migration::migrate,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -752,9 +715,8 @@ impl AgentReadTxnExt for ReadTxn {
 
 impl AgentWriteTxnExt for WriteTxn {
     fn init_agent_tables(&mut self) {
-        // Migrations run before the typed opens below: a migration may need
-        // to rewrite a table whose stored key/value types no longer match
-        // the current definitions.
+        // Migrations run before typed opens because a migration may rewrite
+        // tables whose stored types no longer match the current definitions.
         migrate_agent_db_format(self);
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
@@ -1332,8 +1294,8 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::ClaudeExecAdmitted { .. }
         | AgentEvent::ExecObserved { .. }
         | AgentEvent::Native(_)
-        | AgentEvent::Failed { .. }
         | AgentEvent::LegacyEntry(_)
+        | AgentEvent::Failed { .. }
         | AgentEvent::Entry(_)
         | AgentEvent::Transcript { .. } => {}
     }
@@ -1361,7 +1323,22 @@ pub fn pending_migration(read: &rho_db::ReadTxn) -> Option<(&'static str, &'stat
 /// so the store can be put back if the migrated build turns out wrong,
 /// then the tables and the migration itself.
 pub async fn prepare(db: &rho_db::RhoDb) {
-    if let Some((from, to)) = pending_migration(&db.read()) {
+    let read = db.read();
+    let unstamped = !read.has_table("format") || read.open_table(FORMAT).get(&()).is_none();
+    if unstamped
+        && ["agent_log", "agent_heads", "counters"]
+            .iter()
+            .any(|table| read.has_table(table))
+    {
+        panic!(
+            "this rho agent database has no format stamp but contains agent tables; \
+             this build expects {CURRENT_AGENT_DB_FORMAT}. Restore a compatible rho build \
+             or remove the local rho database if you do not need the saved agents."
+        );
+    }
+    let pending = pending_migration(&read);
+    drop(read);
+    if let Some((from, to)) = pending {
         let key = format!("{from}->{to}");
         let id = db
             .persistent_savepoint(|write, id| {
@@ -1567,7 +1544,7 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
             panic!(
                 "this rho agent database was written by an older or different rho version \
                  (database format {format}, this build expects {current}). \
-                 Update rho one version at a time so migrations can run, or remove \
+                 Restore a compatible rho build, or remove \
                  the local rho database if you do not need the saved agents."
             );
         };

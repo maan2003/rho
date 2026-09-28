@@ -16,9 +16,11 @@ pub(super) const NATIVE_CURSORS: TableDefinition<AgentId, Sen<NativeCursor>> =
 #[derive(Clone, Debug, Default, Encode, Decode)]
 pub(super) struct NativeCursor {
     pub from: AgentEventPos,
-    /// The current response's preceding native request; imported attempts do
-    /// not establish a replay boundary.
+    /// The preceding request can establish a compaction boundary only when
+    /// no older Received row is still pending.
     request: Option<AgentEventPos>,
+    /// Number of Received rows awaiting delivery or acknowledgment.
+    pending: usize,
     pub recovery: NativeRecovery,
 }
 
@@ -29,8 +31,15 @@ impl NativeCursor {
         };
         self.recovery.compaction.observe(entry);
         match entry {
-            Entry::RequestSent { imported, .. } => {
-                self.request = imported.is_none().then_some(pos);
+            Entry::Received { .. } => self.pending += 1,
+            Entry::RequestSent { report, .. } => {
+                let consumed = report.messages.len() + report.acknowledged.len();
+                assert!(
+                    consumed <= self.pending,
+                    "send consumed more messages than pending"
+                );
+                self.pending -= consumed;
+                self.request = (self.pending == 0).then_some(pos);
                 self.recovery.woken = true;
             }
             Entry::Step { carry, .. } => {

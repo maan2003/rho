@@ -577,26 +577,50 @@ async fn init_agent_tables_stamps_current_db_format() {
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
-#[test]
-fn migration_accepts_only_the_live_source_format() {
-    assert_eq!(AGENT_DB_MIGRATIONS.len(), 3);
-    assert_eq!(AGENT_DB_MIGRATIONS[0].from, "a7e43d91");
-    assert_eq!(AGENT_DB_MIGRATIONS[0].to, "e31bcf82");
-    assert_eq!(AGENT_DB_MIGRATIONS[1].from, "e31bcf82");
-    assert_eq!(AGENT_DB_MIGRATIONS[1].to, "7f24a9d3");
-    assert_eq!(AGENT_DB_MIGRATIONS[2].from, "7f24a9d3");
-    assert_eq!(AGENT_DB_MIGRATIONS[2].to, CURRENT_AGENT_DB_FORMAT);
+#[tokio::test]
+async fn current_agent_db_format_is_accepted_on_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    prepare(&db).await;
+    prepare(&db).await;
+    assert_eq!(
+        db.read().open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
 }
 
 #[tokio::test]
-#[should_panic(expected = "Update rho one version at a time")]
-async fn init_agent_tables_rejects_unsupported_db_format() {
+#[should_panic(expected = "database format 7f24a9d3, this build expects b7e91ac4")]
+async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"7f24a9d3".to_owned());
+    write.commit();
+    prepare(&db).await;
+}
 
+#[tokio::test]
+#[should_panic(expected = "database format deadbeef, this build expects b7e91ac4")]
+async fn init_agent_tables_rejects_unknown_db_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.open_table(FORMAT).insert(&(), &"deadbeef".to_owned());
-    write.init_agent_tables();
+    write.commit();
+    prepare(&db).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "no format stamp but contains agent tables")]
+async fn prepare_rejects_nonempty_database_without_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.open_table(COUNTERS);
+    write.open_table(FORMAT);
+    write.commit();
+    prepare(&db).await;
 }
 
 #[tokio::test]
@@ -1087,106 +1111,6 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
 }
 
 #[tokio::test]
-async fn native_later_image_survives_reopen_and_provider_projection() {
-    use rho_agent_types::ToolOutputStatus;
-    use rho_agent_types::transcript::{ContextBlock, ExecOutput, ToolOutput};
-
-    use crate::db::legacy::NativeEvent;
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("rho.redb");
-    let first = ToolOutput {
-        output: std::sync::Arc::new("running".into()),
-        images: Default::default(),
-        full_output: None,
-        status: ToolOutputStatus::Success,
-    };
-    let image = rho_agent_types::transcript::ImageContent {
-        media_type: "image/png".into(),
-        data: vec![1, 2, 3],
-        detail: rho_agent_types::transcript::ImageDetail::Original,
-    };
-    let later = ToolOutput {
-        output: std::sync::Arc::new("later".into()),
-        images: std::sync::Arc::new(vec![image.clone()]),
-        ..first.clone()
-    };
-    let agent = {
-        let db = RhoDb::open(&path);
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let id = create(&mut write, None, None);
-        for output in [
-            ExecOutput::Reply {
-                id: "exec-1".try_into().unwrap(),
-                body: first,
-                first_block_at: UnixMs(1),
-                at: UnixMs(2),
-            },
-            ExecOutput::Report {
-                id: "exec-1".try_into().unwrap(),
-                body: later,
-                at: UnixMs(3),
-            },
-        ] {
-            write.append_agent_event(
-                id,
-                &AgentEvent::Native(NativeEvent::RequestStarted {
-                    input: vec![legacy_output(&output)],
-                    context: None,
-                    wake: None,
-                    at: UnixMs(3),
-                }),
-            );
-        }
-        write.commit();
-        id
-    };
-    let db = RhoDb::open(&path);
-    let (_, events) = db.read().agent_events(agent);
-    let native = events.last().unwrap().native_event().unwrap();
-    let NativeEvent::RequestStarted { input, .. } = native else {
-        panic!("request")
-    };
-    let ContextBlock::ToolUpdate(update) = input[0].clone() else {
-        panic!("later output must not be another result")
-    };
-    assert_eq!(update.images.as_ref(), &[image]);
-    assert_eq!(update.output.as_str(), "later");
-}
-
-fn legacy_output(
-    output: &rho_agent_types::transcript::ExecOutput,
-) -> rho_agent_types::transcript::ContextBlock {
-    use rho_agent_types::transcript::{ContextBlock, ExecOutput, ToolResult, ToolType, ToolUpdate};
-    match output {
-        ExecOutput::Reply {
-            id,
-            body,
-            first_block_at,
-            at,
-        } => ContextBlock::ToolResults {
-            results: vec![ToolResult {
-                call_id: id.clone(),
-                tool_type: ToolType::Custom,
-                body: body.clone(),
-                started_at: *first_block_at,
-                finished_at: *at,
-                metadata: None,
-            }],
-        },
-        ExecOutput::Report { id, body, at } => ContextBlock::ToolUpdate(ToolUpdate {
-            status: Some(body.status),
-            call_id: id.clone(),
-            tool_type: ToolType::Custom,
-            output: body.output.clone(),
-            full_output: body.full_output.clone(),
-            images: body.images.clone(),
-            at: *at,
-        }),
-    }
-}
-
-#[tokio::test]
 async fn workset_modes_are_independent_and_transition_only_their_members() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("rho.redb");
@@ -1251,76 +1175,6 @@ async fn workset_modes_are_independent_and_transition_only_their_members() {
     );
 }
 
-#[tokio::test]
-async fn migration_marks_legacy_mixed_modes_until_explicit_transition() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("rho.redb");
-    let db = RhoDb::open(&path);
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let ids = (0..2)
-        .map(|_| {
-            let id = write.alloc_agent_id();
-            write.create_agent(
-                UnixMs(1),
-                id,
-                None,
-                test_workspace(),
-                AgentRole::default(),
-                AgentRole::default().session_profile(),
-                test_agent_runtime(),
-                AgentOrigin::User,
-            );
-            id
-        })
-        .collect::<Vec<_>>();
-    // Simulate the previous format: its agent heads could disagree and it had
-    // no workset tables. Its log is retained exactly as originally recorded.
-    write.append_agent_event(
-        ids[1],
-        &AgentEvent::ModeChanged {
-            mode: WorksetMode::Exposed,
-            at: UnixMs(2),
-        },
-    );
-    for id in &ids {
-        write
-            .open_table(WORKSET_AGENTS)
-            .remove(&(test_workspace().workset, *id));
-    }
-    write
-        .open_table(WORKSET_MODES)
-        .remove(&test_workspace().workset);
-    write.open_table(FORMAT).insert(&(), &"e31bcf82".to_owned());
-    write.commit();
-    drop(db);
-    let reopened = RhoDb::open(&path);
-    let mut write = reopened.write().await;
-    write.init_agent_tables();
-    write.commit();
-    assert_eq!(
-        reopened.read().workset_mode(&test_workspace().workset),
-        Some(None)
-    );
-    let mut sorted = ids.clone();
-    sorted.sort();
-    assert_eq!(
-        reopened.read().workset_agents(&test_workspace().workset),
-        sorted
-    );
-    let mut write = reopened.write().await;
-    write.set_workset_mode(&test_workspace().workset, WorksetMode::View);
-    write.commit();
-    assert_eq!(
-        reopened.read().workset_mode(&test_workspace().workset),
-        Some(Some(WorksetMode::View))
-    );
-    assert!(
-        ids.iter()
-            .all(|id| reopened.read().get_agent(*id).place().mode == WorksetMode::View)
-    );
-}
-
 fn native_request(imported: bool, compact: bool) -> AgentEvent<'static> {
     AgentEvent::Entry(crate::entry::Entry::RequestSent {
         at: UnixMs(1),
@@ -1329,6 +1183,14 @@ fn native_request(imported: bool, compact: bool) -> AgentEvent<'static> {
         compact,
         imported: imported.then(|| crate::inference::Carry::new("legacy", vec![], false)),
     })
+}
+
+fn native_request_delivering(compact: bool, ids: &[u64]) -> AgentEvent<'static> {
+    let mut event = native_request(false, compact);
+    if let AgentEvent::Entry(crate::entry::Entry::RequestSent { report, .. }) = &mut event {
+        report.messages = ids.iter().map(|id| crate::entry::MessageId(*id)).collect();
+    }
+    event
 }
 
 fn native_step(compacted: bool, tokens: Option<u64>) -> AgentEvent<'static> {
@@ -1365,7 +1227,7 @@ async fn native_compaction_keeps_received_during_response_and_freezes_cutoff() {
     write.init_agent_tables();
     let agent = create(&mut write, None, None);
     write.append_agent_event(agent, &native_received(11));
-    write.append_agent_event(agent, &native_request(false, true));
+    write.append_agent_event(agent, &native_request_delivering(true, &[11]));
     write.append_agent_event(agent, &native_received(22));
     write.append_agent_event(agent, &native_step(true, None));
     let frozen = AgentWriteTxnExt::agent_context_boundary(&mut write, agent);
@@ -1377,7 +1239,7 @@ async fn native_compaction_keeps_received_during_response_and_freezes_cutoff() {
         }
     );
     write.append_agent_event(agent, &native_received(33));
-    write.append_agent_event(agent, &native_request(false, false));
+    write.append_agent_event(agent, &native_request_delivering(false, &[22, 33]));
     write.append_agent_event(agent, &native_step(false, Some(17)));
     write.commit();
 
@@ -1406,7 +1268,7 @@ async fn native_nested_rewinds_restore_prior_state_and_frozen_branch() {
     write.init_agent_tables();
     let agent = create(&mut write, None, None);
     write.append_agent_event(agent, &native_received(1)); // 1
-    write.append_agent_event(agent, &native_request(false, false)); // 2
+    write.append_agent_event(agent, &native_request_delivering(false, &[1])); // 2
     write.append_agent_event(agent, &native_step(false, Some(7))); // 3
     write.append_agent_event(agent, &native_request(false, true)); // 4
     write.append_agent_event(agent, &native_step(true, None)); // 5
@@ -1560,4 +1422,543 @@ async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
     write.commit();
     let recovery = db.read().agent_native_recovery(agent);
     assert!(!recovery.archived && !recovery.awaiting && !recovery.woken);
+}
+
+#[tokio::test]
+async fn prepare_accepts_other_subsystems_before_agent_initialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write
+        .open_table(redb::TableDefinition::<(), String>::new(
+            "chatgpt_inference_format",
+        ))
+        .insert(&(), &"75b4468b".to_owned());
+    write.commit();
+    prepare(&db).await;
+    assert_eq!(
+        db.read().open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+}
+
+#[tokio::test]
+async fn migration_retains_deferred_delivery_across_hidden_rewind_and_native_claude_rows() {
+    use crate::db::legacy::provider::{self, CallResult};
+    use crate::entry::{Entry, MessageId, Report, Wake};
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("history.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let rho = create(&mut write, None, None);
+    let claude = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        claude,
+        None,
+        test_workspace(),
+        AgentRole::default(),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        AgentRuntime::Claude {
+            session_id: uuid::Uuid::new_v4(),
+        },
+        AgentOrigin::User,
+    );
+    for id in [11, 22] {
+        write.append_agent_event(rho, &native_received(id));
+    }
+    let image = crate::inference::Image {
+        media_type: "image/png".into(),
+        data: vec![13, 99],
+    };
+    let imported = provider::imported(
+        "fallback",
+        std::slice::from_ref(&image),
+        &[
+            CallResult::from_legacy("first", "alpha".into(), vec![]),
+            CallResult::from_legacy("second", "beta".into(), vec![image.clone()]),
+        ],
+    );
+    let historical = |id| {
+        AgentEvent::Entry(Entry::RequestSent {
+            at: UnixMs(3),
+            why: Wake::Message,
+            report: Report {
+                notebook: rho_notebook::Report::from_text(
+                    "fallback".into(),
+                    vec![rho_notebook::Image {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    }],
+                ),
+                messages: vec![MessageId(id)],
+                ..Default::default()
+            },
+            compact: true,
+            imported: Some(imported.clone()),
+        })
+    };
+    write.append_agent_event(rho, &historical(22)); // 3: 11 is deferred.
+    write.append_agent_event(rho, &native_step(true, None)); // 4: cannot cut past 11.
+    write.append_agent_event(
+        rho,
+        &AgentEvent::Rewound {
+            to: AgentEventPos::new(3),
+            at: UnixMs(5),
+        },
+    ); // 5
+    write.append_agent_event(rho, &historical(11)); // 6: 22 now deferred.
+    write.append_agent_event(rho, &native_step(true, None)); // 7: cannot cut past 22.
+    write.append_agent_event(rho, &historical(22)); // 8: all pending consumed.
+    write.append_agent_event(rho, &native_step(true, None)); // 9
+    // Native rows left on a Claude history by the old filtered migration
+    // must still be converted even though this agent is not a Rho runtime.
+    write.append_agent_event(
+        claude,
+        &AgentEvent::Native(crate::db::legacy::NativeEvent::ResponseFinished {
+            output: vec![
+                rho_agent_types::transcript::ContextBlock::InferenceResponse {
+                    items: vec![
+                        rho_agent_types::transcript::InferenceResponseItem::AssistantMessage {
+                            provider_specific: Box::new(
+                                rho_agent_types::transcript::OpenAiResponsesProviderData::Message {
+                                    item_id: "claude-old-response".try_into().unwrap(),
+                                },
+                            ),
+                            content: vec![ContentPart::Text {
+                                text: "old native answer".into(),
+                            }],
+                            phase: None,
+                        },
+                    ],
+                    provider_response_id: None,
+                },
+            ],
+            context_used: None,
+            usage: None,
+            at: UnixMs(2),
+        }),
+    );
+    write.append_agent_event(claude, &native_received(71));
+    write.append_agent_event(
+        claude,
+        &AgentEvent::Entry(Entry::RequestSent {
+            at: UnixMs(3),
+            why: Wake::Message,
+            report: Report {
+                acknowledged: vec![MessageId(71)],
+                ..Default::default()
+            },
+            compact: false,
+            imported: None,
+        }),
+    );
+    write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    assert_eq!(read.agent_context_boundary(rho).from.pos, 9);
+    for (position, id) in [(3, 22), (6, 11), (8, 22)] {
+        let Some(AgentEvent::Entry(Entry::RequestSent {
+            report,
+            imported: None,
+            ..
+        })) = read.agent_event(rho, AgentEventPos::new(position))
+        else {
+            panic!("migrated report");
+        };
+        assert_eq!(report.messages, vec![MessageId(id)]);
+        let rendered = report.notebook.render();
+        assert!(rendered.text.contains("fallback"));
+        assert!(
+            rendered
+                .text
+                .contains("Output of earlier exec first:\nalpha")
+        );
+        assert!(
+            rendered
+                .text
+                .contains("Output of earlier exec second:\nbeta")
+        );
+        assert_eq!(rendered.images.len(), 1, "same image appears only once");
+        assert_eq!(rendered.images[0].data, image.data);
+    }
+    assert!(matches!(
+        read.agent_event(claude, AgentEventPos::new(1)),
+        Some(AgentEvent::Entry(Entry::Step { .. }))
+    ));
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(2)),
+        Some(AgentEvent::Entry(Entry::Sent { text, .. })) if text == "old native answer"));
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(4)),
+        Some(AgentEvent::Entry(Entry::RequestSent { report: Report { acknowledged, messages, .. }, .. }))
+            if acknowledged == vec![MessageId(71)] && messages.is_empty()));
+    assert_eq!(read.journal_head().0, 15);
+}
+
+#[tokio::test]
+async fn migration_synthesizes_unmatched_native_messages_with_images_on_hidden_branches() {
+    use rho_agent_types::transcript::{ContextBlock, MessageSender};
+
+    use crate::entry::{Block, Entry};
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("unmatched.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let claude = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        claude,
+        None,
+        test_workspace(),
+        AgentRole::default(),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        AgentRuntime::Claude {
+            session_id: uuid::Uuid::new_v4(),
+        },
+        AgentOrigin::User,
+    );
+    let request = |name: &str, bytes: Vec<u8>| {
+        AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
+            input: vec![ContextBlock::UserMessage {
+                sender: MessageSender::User,
+                content: vec![
+                    ContentPart::Text {
+                        text: name.to_owned(),
+                    },
+                    ContentPart::Image {
+                        media_type: "image/png".into(),
+                        data: bytes,
+                    },
+                ],
+            }],
+            context: None,
+            wake: None,
+            at: UnixMs(2),
+        })
+    };
+    write.append_agent_event(claude, &request("hidden", vec![1, 7])); // old 1
+    write.append_agent_event(
+        claude,
+        &AgentEvent::Rewound {
+            to: AgentEventPos::new(1),
+            at: UnixMs(3),
+        },
+    ); // old 2
+    write.append_agent_event(claude, &request("visible", vec![9, 4])); // old 3
+    write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
+    write.commit();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(3)),
+        Some(AgentEvent::Rewound { to, .. }) if to.pos == 1));
+    for (received_pos, sent_pos, text, bytes) in
+        [(1, 2, "hidden", vec![1, 7]), (4, 5, "visible", vec![9, 4])]
+    {
+        let Some(AgentEvent::Entry(Entry::Received { id, body, .. })) =
+            read.agent_event(claude, AgentEventPos::new(received_pos))
+        else {
+            panic!("synthesized Received");
+        };
+        assert!(body.contains(&Block::Text(text.into())));
+        assert!(body.contains(&Block::Image(crate::inference::Image {
+            media_type: "image/png".into(),
+            data: bytes,
+        })));
+        assert!(
+            matches!(read.agent_event(claude, AgentEventPos::new(sent_pos)),
+            Some(AgentEvent::Entry(Entry::RequestSent { report, imported: None, .. }))
+                if report.messages == vec![id] && report.acknowledged.is_empty())
+        );
+    }
+    let (_, visible) = read.agent_events(claude);
+    assert!(matches!(visible[1], AgentEvent::Rewound { .. }));
+    assert!(matches!(
+        visible[2],
+        AgentEvent::Entry(Entry::Received { .. })
+    ));
+    assert_eq!(read.journal_head().0, 6);
+}
+
+#[tokio::test]
+async fn migration_preserves_failed_partial_and_unreplayed_reasoning_as_inert_evidence() {
+    use rho_agent_types::transcript::{
+        AppendString, ContextBlock, ContextItemEvent, InferenceResponseItem,
+        OpenAiResponsesProviderData as Provider, PendingInferenceResponse, StreamingContextItem,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("partial.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    let mut partial = PendingInferenceResponse::default();
+    let mut text = AppendString::new();
+    text.push_str("partial text");
+    partial.apply(
+        0,
+        ContextItemEvent::Update(StreamingContextItem::AssistantMessage {
+            provider_specific: Box::new(Provider::Message {
+                item_id: "partial-msg".try_into().unwrap(),
+            }),
+            content: vec![text.snapshot()],
+            phase: None,
+        }),
+    );
+    write.append_agent_event(
+        agent,
+        &AgentEvent::Native(crate::db::legacy::NativeEvent::RequestFailed {
+            partial,
+            error: "provider interrupted".into(),
+            retrying: false,
+            at: UnixMs(2),
+        }),
+    ); // old position 1 -> Step 1, Notice 2.
+    write.append_agent_event(
+        agent,
+        &AgentEvent::Native(crate::db::legacy::NativeEvent::ResponseFinished {
+            output: vec![ContextBlock::InferenceResponse {
+                items: vec![InferenceResponseItem::RawReasoning {
+                    provider_specific: Box::new(Provider::EncryptedReasoning {
+                        item_id: "secret".try_into().unwrap(),
+                        encrypted_content: String::new(),
+                    }),
+                    content: "private thoughts".into(),
+                    summary: vec!["do not replay".into()],
+                }],
+                provider_response_id: None,
+            }],
+            context_used: None,
+            usage: None,
+            at: UnixMs(3),
+        }),
+    ); // old position 2 -> new 3.
+    write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
+    write.commit();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    let Some(AgentEvent::Entry(crate::entry::Entry::Step {
+        exec, prose, carry, ..
+    })) = read.agent_event(agent, AgentEventPos::new(1))
+    else {
+        panic!("failed partial step");
+    };
+    assert_eq!(exec, None);
+    assert_eq!(prose, "partial text");
+    let data: serde_json::Value = serde_json::from_str(carry.data().get()).unwrap();
+    assert_eq!(
+        data["items"].as_array().unwrap().len(),
+        0,
+        "partial did not enter replay"
+    );
+    assert_eq!(
+        data["evidence"][0]["item"]["content"][0]["text"],
+        "partial text"
+    );
+    assert_eq!(data["evidence"][0]["state"], "pending");
+    assert!(matches!(read.agent_event(agent, AgentEventPos::new(2)),
+        Some(AgentEvent::Entry(crate::entry::Entry::Notice {
+            notice: crate::entry::Notice::Error(error), ..
+        })) if error == "provider interrupted"));
+    let Some(AgentEvent::Entry(crate::entry::Entry::Step { carry, .. })) =
+        read.agent_event(agent, AgentEventPos::new(3))
+    else {
+        panic!("reasoning step");
+    };
+    let data: serde_json::Value = serde_json::from_str(carry.data().get()).unwrap();
+    assert!(data["items"].as_array().unwrap().is_empty());
+    assert_eq!(data["evidence"][0]["item"]["content"], "private thoughts");
+    assert_eq!(data["evidence"][0]["item"]["summary"][0], "do not replay");
+    assert_eq!(read.journal_head().0, 4);
+}
+
+#[tokio::test]
+async fn migration_makes_remaining_claude_queue_events_inert_without_losing_content() {
+    use crate::entry::{Block, Entry, MessageId};
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("old-queue.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let claude = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        claude,
+        None,
+        test_workspace(),
+        AgentRole::default(),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        AgentRuntime::Claude {
+            session_id: uuid::Uuid::new_v4(),
+        },
+        AgentOrigin::User,
+    );
+    write.append_agent_event(claude, &native_received(41)); // old 1
+    write.append_agent_event(claude, &AgentEvent::Cleared { at: UnixMs(2) }); // old 2
+    let compact = AgentEvent::Accepted(QueuedInput {
+        source: MessageSender::User,
+        kind: InputKind::Compaction,
+        delivery: MessageDelivery::Immediate,
+        at: UnixMs(3),
+    });
+    write.append_agent_event(claude, &compact); // old 3 -> new 3.
+    write.append_agent_event(
+        claude,
+        &AgentEvent::Accepted(QueuedInput {
+            source: MessageSender::Agent { id: claude },
+            kind: InputKind::Message {
+                content: vec![
+                    ContentPart::Text {
+                        text: "hidden mail".into(),
+                    },
+                    ContentPart::Image {
+                        media_type: "image/png".into(),
+                        data: vec![8, 3],
+                    },
+                ],
+            },
+            delivery: MessageDelivery::Immediate,
+            at: UnixMs(4),
+        }),
+    ); // old 4 -> new 4,5.
+    write.append_agent_event(
+        claude,
+        &AgentEvent::Rewound {
+            to: AgentEventPos::new(3),
+            at: UnixMs(5),
+        },
+    ); // old 5 -> new 6.
+    write.append_agent_event(claude, &compact); // old 6 -> new 7.
+    write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
+    write.commit();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(2)),
+        Some(AgentEvent::Entry(Entry::RequestSent { report, .. }))
+            if report.acknowledged == vec![MessageId(41)] && report.messages.is_empty()));
+    let Some(AgentEvent::Entry(Entry::Received { id, from, body, .. })) =
+        read.agent_event(claude, AgentEventPos::new(4))
+    else {
+        panic!("mail retained");
+    };
+    assert_eq!(from, crate::entry::Party::Agent(claude));
+    assert_eq!(
+        body,
+        vec![
+            Block::Text("hidden mail".into()),
+            Block::Image(crate::inference::Image {
+                media_type: "image/png".into(),
+                data: vec![8, 3]
+            }),
+        ]
+    );
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(5)),
+        Some(AgentEvent::Entry(Entry::RequestSent { report, .. }))
+            if report.acknowledged == vec![id]));
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(6)),
+        Some(AgentEvent::Rewound { to, .. }) if to.pos == 3));
+    assert!(matches!(read.agent_event(claude, AgentEventPos::new(7)),
+        Some(AgentEvent::Entry(Entry::Sent { text, .. }))
+            if text == "[Historical event: compaction requested.]"));
+    assert!(!read.agent_native_recovery(claude).compaction.pending);
+    assert_eq!(read.journal_head().0, 8);
+}
+
+#[tokio::test]
+async fn migration_keeps_complete_and_bounded_tool_text_and_distinct_images() {
+    use std::sync::Arc;
+
+    use rho_agent_types::transcript::{
+        ContextBlock, ImageContent, ToolCallId, ToolOutput, ToolResult, ToolType, ToolUpdate,
+    };
+
+    use crate::entry::Entry;
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("tool-outputs.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    let image = |data| ImageContent {
+        media_type: "image/png".into(),
+        data,
+        detail: Default::default(),
+    };
+    let id = ToolCallId::try_from("old-call").unwrap();
+    write.append_agent_event(
+        agent,
+        &AgentEvent::Native(crate::db::legacy::NativeEvent::RequestStarted {
+            input: vec![
+                ContextBlock::ToolResults {
+                    results: vec![ToolResult {
+                        call_id: id.clone(),
+                        tool_type: ToolType::Custom,
+                        body: ToolOutput {
+                            output: Arc::new("bounded result".into()),
+                            full_output: Some(Arc::new("complete result".into())),
+                            images: Arc::new(vec![image(vec![1, 6])]),
+                            status: rho_agent_types::ToolOutputStatus::Success,
+                        },
+                        started_at: UnixMs(2),
+                        finished_at: UnixMs(2),
+                        metadata: None,
+                    }],
+                },
+                ContextBlock::ToolUpdate(ToolUpdate {
+                    status: None,
+                    call_id: id,
+                    tool_type: ToolType::Custom,
+                    output: Arc::new("bounded progress".into()),
+                    full_output: Some(Arc::new("complete progress".into())),
+                    at: UnixMs(3),
+                    images: Arc::new(vec![image(vec![7, 9])]),
+                }),
+            ],
+            context: None,
+            wake: None,
+            at: UnixMs(4),
+        }),
+    );
+    write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
+    write.commit();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    let Some(AgentEvent::Entry(Entry::RequestSent {
+        report,
+        imported: None,
+        ..
+    })) = read.agent_event(agent, AgentEventPos::new(1))
+    else {
+        panic!("converted native request");
+    };
+    let rendered = report.notebook.render();
+    for text in [
+        "complete result",
+        "bounded result",
+        "complete progress",
+        "bounded progress",
+    ] {
+        assert!(
+            rendered.text.contains(text),
+            "missing {text}: {:?}",
+            rendered.text
+        );
+    }
+    assert!(rendered.text.contains("Output of earlier exec old-call:"));
+    assert!(rendered.text.contains("Update from exec old-call:"));
+    assert_eq!(
+        rendered
+            .images
+            .iter()
+            .map(|i| i.data.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![7, 9], vec![1, 6]]
+    );
 }

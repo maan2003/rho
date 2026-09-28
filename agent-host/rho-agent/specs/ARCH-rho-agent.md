@@ -15,16 +15,16 @@ There is no in-agent host runtime fallback.
 Within `rho-agent`, `host` owns lifecycle and service handlers; `worker` owns
 the concrete native and Claude loops and local execution. `ipc` contains only
 their shared messages and transport. `log` defines durable records and
-recovery data; `db` owns transactions, indexes, and migrations. Tests connect
+recovery data; `db` owns transactions, indexes, and format validation. Tests connect
 the same host handlers and worker clients through an in-process Unix socket
 pair, not an alternate local backend. These are module boundaries within one
 crate, not separate build targets.
 
-The append-only `NativeEvent` log owns the recoverable conversation prefix. The
+The append-only agent log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
-inference. Historical rows already use this canonical format; normal replay does not
-normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
+inference. Historical rows are normalized into the same format by a temporary migration;
+normal replay has no historical input mode. Claude Code instead owns its session, history, and compaction; Rho
 records bounded transcript observations, execution admission, output ownership,
 and timing, and controls its worker-local MCP server.
 
@@ -50,34 +50,33 @@ facts; only inference interprets the JSON. Completed provider items come from
 Inference selects the retained context without rewriting those items. Extra
 unexecuted calls remain stored but are excluded from replay; such responses
 cannot use provider continuation. Interrupted execution synthesizes its call
-from the admitted code instead of pretending a completed item arrived. Historical provider decoders
-are isolated in the temporary database migration. A streamed
-call supplies a carry before code, so interruption can preserve admitted code
-without exposing provider IDs. Historical multi-call pairing and compaction
-filtering remain inference concerns; transcript readers use IDs only for display.
+from the admitted code instead of pretending a completed item arrived. A streamed
+call supplies a carry before code, so interruption can preserve admitted code without exposing provider IDs. Transcript readers use IDs only
+for display.
 Each `RequestSent` records only the typed contributions collected for that
 attempt, not provider acknowledgment. Notebook sources retain identity, output,
 images, and typed completion facts; their renderer is deterministic. Human
-messages reference immutable `Received` records. A native `RequestSent` consumes
-all messages since the preceding send; per-message selection is import-only. Request construction merges
+messages reference immutable `Received` records. Every `RequestSent` names its
+delivered messages in order and any messages acknowledged without delivery.
+New native attempts collect all unread messages. Request construction merges
 consecutive unanswered reports, preserving output and advancing source state,
 until a complete or interrupted `Step` closes the group. Retries collect fresh
 sources and messages; they never rewrite earlier reports or store cumulative
 copies. A step stores at most one exec and its complete billable usage.
 Compaction intent remains queued until included in an attempt; only the current
-input group sends its compaction instruction. Imported historical request carries
-preserve old delayed/multi-call pairings without exposing them to new reports.
-Live input and database replay use the same conversation projection. Between
-exchanges it retains only unanswered contributions and replay metadata. Warm requests
+input group sends its compaction instruction. Live input and database replay use
+the same conversation projection. Between exchanges it retains only unanswered contributions and replay metadata. Warm requests
 pass an opaque continuation token. Each prepared turn pins a writer barrier;
 when continuation is unavailable, its acknowledgment supplies the exact committed
 log range to replay. A small index updated transactionally with each append holds
-the retained context start and recovery facts. Cold loads and full requests read
+the retained context start, pending-message count, and recovery facts. A
+compacting response advances the retained start only when its request left no
+older messages pending. Cold loads and full requests read
 that range, preserving messages received during the compacting response. Rewinds
 append a record and rebuild the index from visible history; the log remains
-authoritative. The temporary format migration builds indexes for existing logs;
-ordinary database initialization does not scan agents or history. The transport neither retains the context window nor loads history. `rho-claude` owns CLI transport and MCP protocol
-adaptation. Neither adapter owns Rho's scheduling or persistence.
+authoritative. Database rewrites rebuild the derived indexes once; ordinary
+initialization does not scan history. The transport neither retains the context
+window nor loads history. `rho-claude` owns CLI transport and MCP protocol adaptation. Neither adapter owns Rho's scheduling or persistence.
 
 One private Senax Unix connection multiplexes agent services and controls with
 workset control and terminal/shell traffic. Inference policy has one agent host

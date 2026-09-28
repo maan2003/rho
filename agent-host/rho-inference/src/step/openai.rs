@@ -19,8 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::{
-    Call, CallId, CallResult, Carry, EXEC, Event, Image, Item, Observation, Request, Response,
-    Step, Usage,
+    Call, CallResult, Carry, EXEC, Event, Image, Item, Observation, Request, Response, Step, Usage,
 };
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::responses::{DialRoute, QuotaUpdate, ws};
@@ -432,10 +431,7 @@ impl Session {
                 let completed: Completion = serde_json::from_str(&text)?;
                 let count = items.len();
                 let answer = step(items, &completed.response.usage);
-                let complete_replay = answer
-                    .carry
-                    .prepared()
-                    .is_some_and(|p| p.items.len() == count);
+                let complete_replay = answer.carry.prepared().items.len() == count;
                 return Ok((answer, completed.response.id, complete_replay));
             }
             let event: Value = serde_json::from_str(&text)?;
@@ -451,7 +447,7 @@ impl Session {
                     ));
                     let _ = events.send(Event::Call {
                         carry: Carry::bare(Call {
-                            id: CallId::new(item["call_id"].as_str().unwrap_or_default()),
+                            id: item["call_id"].as_str().unwrap_or_default().to_owned(),
                             code: String::new(),
                         }),
                     });
@@ -546,7 +542,7 @@ impl Session {
         for item in request.items.iter() {
             match item {
                 Item::Step(carry) => {
-                    let prepared = carry.prepared().expect("provider replay items");
+                    let prepared = carry.prepared();
                     input.extend(
                         prepared
                             .items
@@ -556,7 +552,6 @@ impl Session {
                     );
                 }
                 Item::CompactionTrigger => compaction_requested = true,
-                Item::Report { .. } => unreachable!("requests resolve reports"),
                 Item::Result(CallResult {
                     id: call_id,
                     function,
@@ -650,7 +645,7 @@ fn step(items: Vec<Box<RawValue>>, usage: &Value) -> Step {
     }
     let carry = Carry::from_raw_items(items, true);
     let call = carry.0.display_calls().into_iter().next().map(|call| Call {
-        id: CallId::new(call.display_id()),
+        id: call.display_id().to_owned(),
         code: call.code,
     });
     Step {
@@ -972,7 +967,7 @@ mod tests {
             "instructions".into(),
             vec![
                 Item::Result(CallResult {
-                    id: CallId::new("call-1"),
+                    id: "call-1".to_owned(),
                     function: false,
                     text: "result".into(),
                     images: vec![],
@@ -1054,8 +1049,8 @@ mod tests {
         assert_eq!(answer.call.unwrap().id.as_str(), "first");
         assert_eq!(answer.prose, "prose");
         assert_eq!(answer.usage.cached_tokens, 4);
-        assert_eq!(answer.carry.call_ids(), [CallId::new("first")]);
-        let items = answer.carry.prepared().unwrap().items;
+        assert_eq!(answer.carry.call_ids(), ["first".to_owned()]);
+        let items = answer.carry.prepared().items;
         assert_eq!(items.len(), 3);
         assert_eq!(
             serde_json::from_str::<Value>(items[2].get()).unwrap()["call_id"],
@@ -1348,7 +1343,7 @@ mod tests {
                 "r1",
                 vec![
                     Item::Result(CallResult {
-                        id: CallId::new("call-r1"),
+                        id: "call-r1".to_owned(),
                         function: false,
                         text: "output".into(),
                         images: vec![],
@@ -1403,7 +1398,7 @@ mod tests {
         let session = session(host, addr);
         let answer = infer(&session, full(vec![user("first")])).await;
         let suffix = vec![Item::Result(CallResult {
-            id: CallId::new("call-r1"),
+            id: "call-r1".to_owned(),
             function: false,
             text: "result".into(),
             images: vec![],

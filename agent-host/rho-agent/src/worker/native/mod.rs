@@ -477,8 +477,6 @@ impl Agent {
         for entry in entries {
             match entry {
                 Entry::Received { at, id, from, .. } => self.unread.push((*id, *from, *at)),
-                Entry::RequestSent { imported: None, .. } => self.unread.clear(),
-                // Imported requests could select or acknowledge individual messages.
                 Entry::RequestSent { report, .. } => self.unread.retain(|(id, _, _)| {
                     !report.messages.contains(id) && !report.acknowledged.contains(id)
                 }),

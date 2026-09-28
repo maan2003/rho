@@ -1,6 +1,7 @@
-//! Temporary 7f24a9d3 -> dc371fa2 migration to typed reports and native
-//! indexes. Drop this after active databases have opened the migrated build.
-//! All branch rows are converted, including rows hidden by a later rewind.
+//! Temporary dc371fa2 migration of remaining legacy rows to typed reports and
+//! native indexes. Drop this after active databases have opened the migrated
+//! build. All branch rows are converted, including rows hidden by a later
+//! rewind.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,29 +9,49 @@ use rho_agent_types::AgentId;
 use rho_db::{SenValue, WriteTxn};
 
 use super::legacy::provider;
-use super::{AGENT_HEADS, AGENT_LOG, AgentEventPos, JOURNAL, legacy};
+use super::{AGENT_HEADS, AGENT_LOG, AgentEventPos, AgentRuntime, JOURNAL, fold_head, legacy};
 use crate::AgentEvent;
 use crate::entry::{Entry, Report, ResponseUsage};
 use crate::inference::Usage;
 
-pub(super) fn migrate(write: &mut WriteTxn) {
+pub(super) fn migrate(
+    write: &mut WriteTxn,
+    native_spoken: &BTreeMap<(AgentId, u64), Option<super::AgentUsageBucket>>,
+    native_failed: &BTreeMap<(AgentId, u64), (rho_agent_types::UnixMs, String)>,
+    synthetic: &BTreeMap<(AgentId, u64), Vec<legacy::Entry>>,
+) {
     // This migration remaps log positions. A derived cursor, if present in
     // a partially upgraded/test store, must be rebuilt from the rewritten log.
     write.delete_table("agent_native_cursors");
+    // Only agents with old rows can gain/remove positions. Decoding all
+    // physical rows is needed for discovery, but cloning/reinserting millions
+    // of already-current rows would make opening a live database prohibitively
+    // slow and multiply its page use during the recovery savepoint.
+    let affected = write
+        .open_table(AGENT_LOG)
+        .iter()
+        .filter_map(|(key, row)| {
+            matches!(
+                row.value().into_owned(),
+                AgentEvent::LegacyEntry(_) | AgentEvent::Accepted(_) | AgentEvent::Cleared { .. }
+            )
+            .then_some(key.value().0)
+        })
+        .collect::<BTreeSet<_>>();
+    eprintln!(
+        "rho-agent history migration: {} agents have old rows to remap",
+        affected.len()
+    );
     let old = write
         .open_table(AGENT_LOG)
         .iter()
+        .filter(|(key, _)| affected.contains(&key.value().0))
         .map(|(key, row)| (key.value(), row.value().into_owned()))
         .collect::<Vec<_>>();
     let journal = write
         .open_table(JOURNAL)
         .iter()
         .map(|(_, row)| row.value())
-        .collect::<Vec<_>>();
-    let heads = write
-        .open_table(AGENT_HEADS)
-        .iter()
-        .map(|(id, head)| (id.value(), head.value().into_owned()))
         .collect::<Vec<_>>();
 
     // Old Usage immediately followed its Step, and was already counted in the
@@ -95,9 +116,47 @@ pub(super) fn migrate(write: &mut WriteTxn) {
     // A removed row maps to the first surviving row after it. This preserves
     // rewind targets even when a branch begins on a removed Usage/Activity.
     let mut positions = BTreeMap::<(AgentId, u64), u64>::new();
+    let mut added = BTreeMap::<(AgentId, u64), Vec<u64>>::new();
     let mut expanded = Vec::new();
     let mut retained = BTreeSet::new();
+    let rewind_targets = old
+        .iter()
+        .filter_map(|((agent, _), event)| match event {
+            AgentEvent::Rewound { to, .. } => Some((*agent, to.pos)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut before =
+        BTreeMap::<(AgentId, u64), (Vec<crate::entry::MessageId>, Option<AgentRuntime>)>::new();
+    let mut pending = Vec::<crate::entry::MessageId>::new();
+    let mut runtime = None::<AgentRuntime>;
+    let mut previous_agent = None;
     for ((agent, pos), event) in &old {
+        if previous_agent != Some(*agent) {
+            pending.clear();
+            runtime = None;
+            previous_agent = Some(*agent);
+        }
+        if rewind_targets.contains(&(*agent, *pos)) {
+            before.insert((*agent, *pos), (pending.clone(), runtime.clone()));
+        }
+        let accepted_id = if matches!(
+            event,
+            AgentEvent::Accepted(crate::QueuedInput {
+                kind: crate::InputKind::Message { .. },
+                ..
+            })
+        ) {
+            Some(crate::entry::MessageId::new())
+        } else {
+            None
+        };
+        let cleared = matches!(event, AgentEvent::Cleared { .. });
+        let cleared_ids = if cleared {
+            std::mem::take(&mut pending)
+        } else {
+            Vec::new()
+        };
         let converted = match event {
             AgentEvent::LegacyEntry(entry) => match entry {
                 legacy::Entry::Step {
@@ -107,13 +166,28 @@ pub(super) fn migrate(write: &mut WriteTxn) {
                     carry,
                     usage,
                 } => {
-                    let usage = billed.get(&(*agent, *pos)).cloned().or_else(|| {
-                        (*usage != Usage::default())
-                            .then(|| ResponseUsage::rho("unknown".into(), *usage))
-                    });
+                    let usage = native_spoken
+                        .get(&(*agent, *pos))
+                        .and_then(|bucket| {
+                            bucket.as_ref().map(|bucket| ResponseUsage {
+                                model: bucket.model.name().to_owned(),
+                                input_tokens: bucket.input_tokens,
+                                cache_read_tokens: bucket.cache_read_tokens,
+                                cache_write_tokens: bucket.cache_write_tokens,
+                                cache_write_1h_tokens: bucket.cache_write_1h_tokens,
+                                output_tokens: bucket.output_tokens,
+                            })
+                        })
+                        .or_else(|| billed.get(&(*agent, *pos)).cloned())
+                        .or_else(|| {
+                            (*usage != Usage::default())
+                                .then(|| ResponseUsage::rho("unknown".into(), *usage))
+                        });
                     Some(AgentEvent::Entry(Entry::Step {
                         at: *at,
-                        exec: calls.first().map(|call| call.code.clone()),
+                        exec: (!native_failed.contains_key(&(*agent, *pos)))
+                            .then(|| calls.first().map(|call| call.code.clone()))
+                            .flatten(),
                         prose: prose.clone(),
                         carry: carry.into_live(calls),
                         usage,
@@ -182,19 +256,124 @@ pub(super) fn migrate(write: &mut WriteTxn) {
                     notice: notice.clone(),
                 })),
             },
+            AgentEvent::Accepted(input) => match &input.kind {
+                crate::InputKind::Message { content } => Some(AgentEvent::Entry(Entry::Received {
+                    at: input.at,
+                    id: accepted_id.expect("message id assigned"),
+                    from: super::entries_migration::party(input.source),
+                    body: content
+                        .iter()
+                        .map(super::entries_migration::block_of)
+                        .collect(),
+                })),
+                crate::InputKind::Compaction => Some(AgentEvent::Entry(Entry::Sent {
+                    at: input.at,
+                    id: crate::entry::MessageId::new(),
+                    to: crate::entry::Party::Human,
+                    text: "[Historical event: compaction requested.]".into(),
+                })),
+            },
+            AgentEvent::Cleared { at } => Some(AgentEvent::Entry(Entry::RequestSent {
+                at: *at,
+                why: crate::entry::Wake::Message,
+                report: Report {
+                    acknowledged: cleared_ids,
+                    ..Default::default()
+                },
+                compact: false,
+                // The pre-existing Claude queue was cleared; do not retry it.
+                imported: Some(provider::imported("", &[], &[])),
+            })),
             other => Some(other.clone()),
         };
         let cursor = next.entry(*agent).or_default();
         positions.insert((*agent, *pos), *cursor);
+        let mut new_rows = Vec::new();
+        if converted.is_some() {
+            for extra in synthetic.get(&(*agent, *pos)).into_iter().flatten() {
+                let legacy::Entry::Received { at, id, from, body } = extra else {
+                    panic!("only Received can precede a historical request");
+                };
+                new_rows.push(*cursor);
+                expanded.push((
+                    *agent,
+                    *cursor,
+                    AgentEvent::Entry(Entry::Received {
+                        at: *at,
+                        id: *id,
+                        from: *from,
+                        body: body.clone(),
+                    }),
+                ));
+                *cursor += 1;
+            }
+        } else {
+            assert!(
+                !synthetic.contains_key(&(*agent, *pos)),
+                "synthetic message has no request"
+            );
+        }
         if let Some(converted) = converted {
+            new_rows.push(*cursor);
             retained.insert((*agent, *pos));
             expanded.push((*agent, *cursor, converted));
             *cursor += 1;
+            if let Some(id) = accepted_id {
+                new_rows.push(*cursor);
+                expanded.push((
+                    *agent,
+                    *cursor,
+                    AgentEvent::Entry(Entry::RequestSent {
+                        at: match event {
+                            AgentEvent::Accepted(input) => input.at,
+                            _ => unreachable!(),
+                        },
+                        why: crate::entry::Wake::Message,
+                        report: Report {
+                            acknowledged: vec![id],
+                            ..Default::default()
+                        },
+                        compact: false,
+                        imported: Some(provider::imported("", &[], &[])),
+                    }),
+                ));
+                *cursor += 1;
+            }
+            if native_spoken.contains_key(&(*agent, *pos))
+                && let AgentEvent::LegacyEntry(legacy::Entry::Step { at, prose, .. }) = event
+                && !prose.is_empty()
+            {
+                new_rows.push(*cursor);
+                expanded.push((
+                    *agent,
+                    *cursor,
+                    AgentEvent::Entry(Entry::Sent {
+                        at: *at,
+                        id: crate::entry::MessageId::new(),
+                        to: crate::entry::Party::Human,
+                        text: prose.clone(),
+                    }),
+                ));
+                *cursor += 1;
+            }
+            if let Some((at, error)) = native_failed.get(&(*agent, *pos)) {
+                new_rows.push(*cursor);
+                expanded.push((
+                    *agent,
+                    *cursor,
+                    AgentEvent::Entry(Entry::Notice {
+                        at: *at,
+                        notice: crate::entry::Notice::Error(error.clone()),
+                    }),
+                ));
+                *cursor += 1;
+            }
             if synth_trigger.contains(&(*agent, *pos)) {
                 let at = match event {
                     AgentEvent::LegacyEntry(legacy::Entry::CompactionTrigger { at, .. }) => *at,
                     _ => unreachable!("only triggers synthesize sends"),
                 };
+                new_rows.push(*cursor);
                 expanded.push((
                     *agent,
                     *cursor,
@@ -210,6 +389,54 @@ pub(super) fn migrate(write: &mut WriteTxn) {
                 *cursor += 1;
             }
         }
+        // The historical branch's pending queue determines what Cleared
+        // acknowledged, independently of later branches hidden by a rewind.
+        match event {
+            AgentEvent::Created {
+                runtime: initial, ..
+            } => runtime = Some(initial.clone()),
+            AgentEvent::RuntimeRebound { change, .. } => match change {
+                crate::RuntimeChange::ClaudeRewound { session_id } => {
+                    runtime = Some(AgentRuntime::Claude {
+                        session_id: *session_id,
+                    })
+                }
+                crate::RuntimeChange::PromptCacheKey(key) => {
+                    runtime = Some(AgentRuntime::Rho {
+                        prompt_cache_key: *key,
+                    })
+                }
+                crate::RuntimeChange::ClaudeRewindPending(_) => {}
+            },
+            AgentEvent::Rewound { to, .. } => {
+                (pending, runtime) = before
+                    .get(&(*agent, to.pos))
+                    .expect("rewind target must precede row")
+                    .clone();
+            }
+            AgentEvent::Entry(Entry::Received { id, .. })
+            | AgentEvent::LegacyEntry(legacy::Entry::Received { id, .. }) => pending.push(*id),
+            AgentEvent::Entry(Entry::RequestSent {
+                report, imported, ..
+            }) => {
+                if imported.is_none() && matches!(runtime, Some(AgentRuntime::Rho { .. })) {
+                    pending.clear();
+                } else {
+                    pending.retain(|id| {
+                        !report.messages.contains(id) && !report.acknowledged.contains(id)
+                    });
+                }
+            }
+            AgentEvent::LegacyEntry(legacy::Entry::Woken {
+                messages,
+                acknowledged,
+                ..
+            }) => {
+                pending.retain(|id| !messages.contains(id) && !acknowledged.contains(id));
+            }
+            _ => {}
+        }
+        added.insert((*agent, *pos), new_rows);
     }
     for (agent, _, event) in &mut expanded {
         if let AgentEvent::Rewound { to, .. } = event {
@@ -218,44 +445,54 @@ pub(super) fn migrate(write: &mut WriteTxn) {
     }
     {
         let mut log = write.open_table(AGENT_LOG);
-        for ((agent, pos), _) in &old {
-            log.remove(&(*agent, *pos));
+        for (key, _) in &old {
+            if expanded
+                .binary_search_by_key(key, |(agent, pos, _)| (*agent, *pos))
+                .is_err()
+            {
+                log.remove(key);
+            }
         }
         for (agent, pos, event) in &expanded {
-            log.insert(&(*agent, *pos), SenValue::borrowed(event));
+            let key = (*agent, *pos);
+            if old
+                .binary_search_by_key(&key, |(key, _)| *key)
+                .ok()
+                .is_some_and(|index| old[index].1 == *event)
+            {
+                continue;
+            }
+            log.insert(&key, SenValue::borrowed(event));
         }
     }
-    {
+    if !affected.is_empty() {
+        let mut rewritten = Vec::with_capacity(journal.len());
+        for key in &journal {
+            if !affected.contains(&key.0) {
+                rewritten.push(*key);
+            } else if retained.contains(key) {
+                rewritten.extend(added[key].iter().map(|pos| (key.0, *pos)));
+            }
+        }
         let mut table = write.open_table(JOURNAL);
-        for (seq, _) in table
-            .iter()
-            .map(|(key, value)| (key.value(), value.value()))
-            .collect::<Vec<_>>()
-        {
+        for seq in (rewritten.len() + 1) as u64..=journal.len() as u64 {
             table.remove(&seq);
         }
-        let mut seq = 1;
-        for key in journal {
-            if retained.contains(&key) {
-                table.insert(&seq, &(key.0, positions[&key]));
-                seq += 1;
-                if synth_trigger.contains(&key) {
-                    table.insert(&seq, &(key.0, positions[&key] + 1));
-                    seq += 1;
-                }
+        for (index, key) in rewritten.iter().enumerate() {
+            if journal.get(index) != Some(key) {
+                table.insert(&((index + 1) as u64), key);
             }
         }
     }
-    for (agent, mut head) in heads {
-        head.next = AgentEventPos::new(next[&agent]);
+    for agent in next.keys().copied() {
+        let head = {
+            let log = write.open_table(AGENT_LOG);
+            fold_head(super::rows(log.range(super::agent_range(agent))))
+                .expect("rewritten log starts with creation")
+        };
         write
             .open_table(AGENT_HEADS)
             .insert(&agent, SenValue::borrowed(&head));
-        // Build the index once, after all log positions and rewinds are final.
-        let cursor = super::native::rebuild(write, agent);
-        write
-            .open_table(super::native::NATIVE_CURSORS)
-            .insert(&agent, SenValue::borrowed(&cursor));
     }
 }
 
@@ -362,7 +599,7 @@ mod tests {
         write
             .open_table(super::super::native::NATIVE_CURSORS)
             .insert(&id, SenValue::borrowed(&stale));
-        write.open_table(FORMAT).insert(&(), &"7f24a9d3".to_owned());
+        write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
         write.commit();
 
         let mut write = db.write().await;
@@ -492,7 +729,7 @@ mod tests {
                 at: UnixMs(4),
             },
         ); // old 4
-        write.open_table(FORMAT).insert(&(), &"7f24a9d3".to_owned());
+        write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
         write.commit();
 
         let mut write = db.write().await;
@@ -515,7 +752,7 @@ mod tests {
             Entry::RequestSent { compact: false, .. }
         ));
         assert!(
-            matches!(&auto[2], Entry::RequestSent { compact: true, imported: Some(_), report, .. } if report.is_empty())
+            matches!(&auto[2], Entry::RequestSent { compact: true, imported: None, report, .. } if report.is_empty())
         );
         assert!(matches!(
             &auto[4],
@@ -527,7 +764,7 @@ mod tests {
             Entry::CompactionTrigger { manual: true, .. }
         ));
         assert!(
-            matches!(&manual[1], Entry::RequestSent { compact: true, imported: Some(_), report, .. } if report.is_empty())
+            matches!(&manual[1], Entry::RequestSent { compact: true, imported: None, report, .. } if report.is_empty())
         );
         assert!(matches!(
             &manual[3],
@@ -560,9 +797,8 @@ mod tests {
                 .any(|item| matches!(item, crate::inference::Item::CompactionTrigger))
         );
         assert!(visible_request.items().iter().any(
-            |item| matches!(item, crate::inference::Item::Step { carry, .. }
-                    if serde_json::from_str::<serde_json::Value>(carry.data().get()).unwrap()["imported"]["text"] == "survives rewind"
-                        && !carry.has_compaction())
+            |item| matches!(item, crate::inference::Item::Report { text, .. }
+                    if text.contains("survives rewind"))
         ));
         assert!(
             matches!(read.agent_event(ids[3], AgentEventPos::new(5)), Some(AgentEvent::Rewound { to, .. }) if to.pos == 2)
@@ -591,7 +827,7 @@ mod tests {
                     event,
                     AgentEvent::Entry(Entry::RequestSent {
                         compact: true,
-                        imported: Some(_),
+                        imported: None,
                         ..
                     })
                 ))
@@ -805,7 +1041,7 @@ mod tests {
             .unwrap()
             .value()
             .into_owned();
-        write.open_table(FORMAT).insert(&(), &"7f24a9d3".to_owned());
+        write.open_table(FORMAT).insert(&(), &"dc371fa2".to_owned());
         write.commit();
 
         let mut write = db.write().await;
@@ -870,6 +1106,7 @@ mod tests {
         assert_eq!(actual_head.next.pos, 11);
         let mut expected_head = previous_head;
         expected_head.next = AgentEventPos::new(11);
+        expected_head.user_interacted = true; // Newly typed Received now folds as user contact.
         assert_eq!(actual_head, expected_head);
         let rows = (0..11)
             .map(|pos| {
@@ -899,7 +1136,7 @@ mod tests {
         );
         let AgentEvent::Entry(Entry::RequestSent {
             report,
-            imported: Some(imported),
+            imported: None,
             compact,
             ..
         }) = &rows[4]
@@ -909,42 +1146,13 @@ mod tests {
         assert!(!compact);
         assert_eq!(report.messages, vec![MessageId(11)]);
         assert_eq!(report.acknowledged, vec![MessageId(12)]);
-        assert_eq!(report.notebook.render().text, "literal text");
-        assert_eq!(report.notebook.render().images[0].data, images[0].data);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(imported.data().get()).unwrap(),
-            serde_json::json!({"imported": {
-                "text": "literal text", "images": [{"media_type": "image/png", "data": [7, 19]}],
-                "results": [
-                    {"id": "first", "text": "alpha", "images": []},
-                    {"id": "evicted", "text": "beta", "images": [{"media_type": "image/png", "data": [7, 19]}]}
-                ]
-            }})
+            report.notebook.render().text,
+            "literal text\n\nOutput of earlier exec first:\nalpha\n\nOutput of earlier exec evicted:\nbeta"
         );
-        let migrated = rows[1..=4]
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::Entry(entry) => Some(entry.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let projected = crate::worker::native::context::request(
-            "".into(),
-            &migrated,
-            crate::inference::CacheKey::from_u128(0),
-        );
-        assert!(projected.items().iter().any(|item| matches!(item,
-            crate::inference::Item::Step { carry, .. } if serde_json::from_str::<serde_json::Value>(carry.data().get()).unwrap()["items"][0]["call_id"] == "first"
-        )));
-        assert!(projected.items().iter().any(|item| matches!(item,
-            crate::inference::Item::Step { carry, .. } if serde_json::from_str::<serde_json::Value>(carry.data().get()).unwrap()["imported"]["results"][1]["id"] == "evicted"
-        )));
-        assert!(projected.items().iter().any(|item| matches!(item,
-            crate::inference::Item::User { text, .. } if text.contains("chosen")
-        )));
-        assert!(!projected.items().iter().any(|item| matches!(item,
-            crate::inference::Item::User { text, .. } if text.contains("acknowledged")
-        )));
+        assert_eq!(report.notebook.render().images[0].data, images[0].data);
+        assert_eq!(report.notebook.render().images.len(), 1);
+
         assert!(matches!(
             &rows[6],
             AgentEvent::Entry(Entry::RequestSent { compact: true, .. })
