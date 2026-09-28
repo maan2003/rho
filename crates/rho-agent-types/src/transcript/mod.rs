@@ -126,7 +126,6 @@ pub enum InferenceResponseItem {
 pub struct ImageContent {
     pub media_type: String,
     pub data: Vec<u8>,
-    #[senax(default)]
     pub detail: ImageDetail,
 }
 
@@ -182,10 +181,8 @@ pub struct ToolOutput {
     /// Complete textual record for persistence and readers. `None` means the
     /// model-facing output is already the complete record.
     #[serde(default)]
-    #[senax(default)]
     pub full_output: Option<Arc<String>>,
     /// Typed image items sent to the model after the textual output.
-    #[senax(default)]
     pub images: Arc<Vec<ImageContent>>,
     /// Harness/UI metadata only; not included in the provider wire payload.
     pub status: ToolOutputStatus,
@@ -238,7 +235,6 @@ pub enum ExecOutput {
 pub struct ToolUpdate {
     /// Status of this contribution when recorded natively; unknown on old
     /// wire-only reports.
-    #[senax(default)]
     pub status: Option<ToolOutputStatus>,
     /// The [`ToolCall`] this update annotates.
     pub call_id: ExecId,
@@ -246,12 +242,10 @@ pub struct ToolUpdate {
     pub tool_type: ToolType,
     pub output: Arc<String>,
     /// Complete textual record when `output` is a bounded model view.
-    #[senax(default)]
     pub full_output: Option<Arc<String>>,
     /// When the tool emitted the update (a single instant; updates have no
     /// duration).
     pub at: UnixMs,
-    #[senax(default)]
     pub images: Arc<Vec<ImageContent>>,
 }
 
@@ -512,30 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_without_images_decodes_from_legacy_shape() {
-        #[derive(Encode)]
-        struct LegacyToolOutput {
-            output: Arc<String>,
-            status: ToolOutputStatus,
-        }
-
-        let mut encoded = bytes::BytesMut::new();
-        senax_encoder::encode_to(
-            &LegacyToolOutput {
-                output: Arc::new("done".to_owned()),
-                status: ToolOutputStatus::Success,
-            },
-            &mut encoded,
-        )
-        .unwrap();
-        let decoded = <ToolOutput as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
-        assert_eq!(decoded.output.as_str(), "done");
-        assert!(decoded.full_output.is_none());
-        assert!(decoded.images.is_empty());
-        assert_eq!(decoded.status, ToolOutputStatus::Success);
-    }
-
-    #[test]
     fn tool_output_round_trips_its_complete_record() {
         let output = ToolOutput {
             output: Arc::new("bounded".to_owned()),
@@ -548,29 +518,6 @@ mod tests {
         let decoded = senax_encoder::decode::<ToolOutput>(&mut encoded).unwrap();
         assert_eq!(decoded, output);
         assert_eq!(decoded.recorded_output(), "complete");
-    }
-
-    #[test]
-    fn tool_update_without_complete_record_decodes_from_legacy_shape() {
-        #[derive(Encode)]
-        struct LegacyToolUpdate {
-            call_id: ExecId,
-            tool_type: ToolType,
-            output: Arc<String>,
-            at: UnixMs,
-        }
-
-        let mut encoded = senax_encoder::encode(&LegacyToolUpdate {
-            call_id: "call-1".try_into().unwrap(),
-            tool_type: ToolType::Custom,
-            output: Arc::new("done".to_owned()),
-            at: UnixMs(1),
-        })
-        .unwrap();
-        let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
-        assert_eq!(decoded.output.as_str(), "done");
-        assert_eq!(decoded.status, None);
-        assert!(decoded.full_output.is_none());
     }
 
     #[test]

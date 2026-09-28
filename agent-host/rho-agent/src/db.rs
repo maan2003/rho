@@ -23,7 +23,7 @@ use crate::journal::{Feed, Journal, LogAppended};
 use crate::log::{
     AgentConfig, AgentEventPos, AgentHead, AgentOrigin, AgentRuntime, AgentSpawnedBy,
     AgentUsageBucket, AgentUsageModel, ClaudeRewind, ContextBoundary, NativeRecovery,
-    SessionBinding, WakeTrigger, usage_model_of,
+    SessionBinding, usage_model_of,
 };
 
 mod awaiting_migration;
@@ -53,9 +53,6 @@ const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("jour
 /// came from and one past the last line copied. Written with the rows.
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
-/// Legacy timestamp key, read only during the one-hop migration.
-const OLD_QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
-    TableDefinition::new("quota_observations_by_model_time");
 /// Model, namespace presence, namespace text, per-namespace sequence.
 const QUOTA_OBSERVATIONS: TableDefinition<
     (QuotaModel, u8, String, u64),
@@ -87,7 +84,6 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 const CURRENT_AGENT_DB_FORMAT: &str = "e3a95c07";
-const PREVIOUS_AGENT_DB_FORMAT: &str = "b7e91ac4";
 /// Exposed-only worksets, before waits had a start and a stop.
 const WORKSETS_AGENT_DB_FORMAT: &str = "a3f26d91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
@@ -123,12 +119,6 @@ impl QuotaModel {
             _ => "unknown",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
-struct QuotaObservationKey {
-    model: QuotaModel,
-    observed_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -1119,7 +1109,6 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.config.binding = *binding;
             }
         }
-        AgentEvent::ModeChanged { .. } => {} // Only decoded until the migration rewrites it.
         // An empty notice is nothing to say (what the old `WorkdirAdded`
         // rows became).
         AgentEvent::Notice { text, .. } => {
@@ -1197,7 +1186,7 @@ pub async fn prepare(db: &rho_db::RhoDb) {
     }
     let from = stored.as_deref().unwrap_or_default();
     let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
-    let needs_savepoint = [PREVIOUS_AGENT_DB_FORMAT, WORKSETS_AGENT_DB_FORMAT].contains(&from)
+    let needs_savepoint = from == WORKSETS_AGENT_DB_FORMAT
         && (!read.has_table("recovery_savepoints")
             || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
@@ -1369,10 +1358,6 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
-        Some(PREVIOUS_AGENT_DB_FORMAT) => {
-            migrate_agent_db(write);
-            awaiting_migration::migrate(write);
-        }
         Some(WORKSETS_AGENT_DB_FORMAT) => awaiting_migration::migrate(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
@@ -1384,139 +1369,6 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     write
         .open_table(FORMAT)
         .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
-}
-
-/// One-hop migration from b7e91ac4. Remove this after active stores have
-/// opened once with the new format; the recovery savepoint remains usable.
-fn migrate_agent_db(write: &mut WriteTxn) {
-    let keys = write
-        .open_table(AGENT_LOG)
-        .iter()
-        .map(|(key, _)| key.value())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let mut event = write
-            .open_table(AGENT_LOG)
-            .get(&key)
-            .unwrap()
-            .value()
-            .into_owned();
-        match &mut event {
-            AgentEvent::ModeChanged { mode, at } => {
-                let label = match mode {
-                    crate::log::LegacyWorksetMode::View => "view",
-                    crate::log::LegacyWorksetMode::Exposed => "exposed",
-                };
-                event = AgentEvent::Entry(crate::entry::Entry::Sent {
-                    at: *at,
-                    id: crate::entry::MessageId::new(),
-                    to: crate::entry::Party::Human,
-                    text: format!("Workset filesystem changed to {label} mode."),
-                });
-            }
-            AgentEvent::Transcript {
-                wake: Some(wake), ..
-            } => normalize_wake(wake),
-            AgentEvent::ClaudeOutput { batch } => normalize_wake(&mut batch.wake),
-            _ => {}
-        }
-        write
-            .open_table(AGENT_LOG)
-            .insert(&key, SenValue::borrowed(&event));
-    }
-    let heads = write
-        .open_table(AGENT_HEADS)
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect::<Vec<_>>();
-    for (key, head) in heads {
-        write
-            .open_table(AGENT_HEADS)
-            .insert(&key, SenValue::borrowed(&head));
-    }
-    let keys = write
-        .open_table(AGENT_USAGE_BUCKETS)
-        .iter()
-        .map(|(key, _)| key.value())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let value = write
-            .open_table(AGENT_USAGE_BUCKETS)
-            .get(&key)
-            .unwrap()
-            .value()
-            .into_owned();
-        write
-            .open_table(AGENT_USAGE_BUCKETS)
-            .insert(&key, SenValue::borrowed(&value));
-    }
-    let totals = write
-        .open_table(AGENT_USAGE_TOTALS)
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect::<Vec<_>>();
-    for (key, value) in totals {
-        write
-            .open_table(AGENT_USAGE_TOTALS)
-            .insert(&key, SenValue::borrowed(&value));
-    }
-    let keys = write
-        .open_table(GLOBAL_AGENT_USAGE)
-        .iter()
-        .map(|(key, _)| key.value())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let value = write
-            .open_table(GLOBAL_AGENT_USAGE)
-            .get(&key)
-            .unwrap()
-            .value()
-            .into_owned();
-        write
-            .open_table(GLOBAL_AGENT_USAGE)
-            .insert(&key, SenValue::borrowed(&value));
-    }
-    // The old key orders by model and timestamp. Keep that order for each
-    // namespace's new sequence, including colliding timestamp samples.
-    let keys = write
-        .open_table(OLD_QUOTA_OBSERVATIONS)
-        .iter()
-        .map(|(key, _)| key.value())
-        .collect::<Vec<_>>();
-    for key in keys {
-        let observation = write
-            .open_table(OLD_QUOTA_OBSERVATIONS)
-            .get(&key)
-            .unwrap()
-            .value()
-            .into_owned();
-        let namespace = observation.auth_namespace.clone().unwrap_or_default();
-        let present = u8::from(observation.auth_namespace.is_some());
-        let mut table = write.open_table(QUOTA_OBSERVATIONS);
-        let sequence = table
-            .range(
-                (observation.model, present, namespace.clone(), 0)
-                    ..=(observation.model, present, namespace.clone(), u64::MAX),
-            )
-            .next_back()
-            .map(|(key, _)| key.value().3 + 1)
-            .unwrap_or(0);
-        table.insert(
-            &(observation.model, present, namespace, sequence),
-            SenValue::borrowed(&observation),
-        );
-    }
-    write.delete_table("quota_observations_by_model_time");
-    write.delete_table("workset_modes");
-    write.delete_table("workset_agents");
-}
-
-fn normalize_wake(wake: &mut crate::log::WakeFacts) {
-    wake.trigger = match wake.trigger {
-        WakeTrigger::Interrupt => WakeTrigger::User,
-        WakeTrigger::ContextRotation => WakeTrigger::Asked,
-        other => other,
-    };
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

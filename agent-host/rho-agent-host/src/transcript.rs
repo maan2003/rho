@@ -157,7 +157,6 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             }),
             at: *at,
         },
-        AgentEvent::ModeChanged { .. } => return None,
         AgentEvent::Notice { text, .. } if text.is_empty() => return None,
         AgentEvent::Notice { text, at } => TranscriptEvent::Notice {
             text: text.to_string(),

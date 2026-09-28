@@ -67,16 +67,13 @@ impl Default for AgentUsageModel {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct AgentUsageBucket {
     pub bucket_start_ms: u64,
-    #[senax(default)]
     pub model: AgentUsageModel,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    #[senax(default)]
     pub cache_write_1h_tokens: u64,
     pub output_tokens: u64,
     pub requests: u64,
-    #[senax(default)]
     pub approximate: bool,
 }
 
@@ -525,7 +522,6 @@ pub enum AgentEvent<'a> {
         /// On a row the notebook produced (an exec call's results, or a
         /// message of output injected into an idle model): why the notebook
         /// spoke when it did.
-        #[senax(default)]
         wake: Option<WakeFacts>,
     },
 
@@ -542,28 +538,18 @@ pub enum AgentEvent<'a> {
         spawn_name: Option<String>,
         created_at: rho_agent_types::UnixMs,
         /// The agent that spawned this one.
-        #[senax(default)]
         parent: Option<AgentId>,
     },
     RoleChanged {
         role: AgentRole,
         /// `None` when only the role moved and the session binding stands.
         binding: Option<SessionBinding>,
-        #[senax(default)]
-        at: UnixMs,
-    },
-    /// Temporary decoder for a historical mode change, rewritten by the
-    /// agent database migration to a sent annotation.
-    ModeChanged {
-        mode: LegacyWorksetMode,
-        #[senax(default)]
         at: UnixMs,
     },
     /// Something Rho has to tell the agent, carried ahead of its next user
     /// message and then done: what a migration did to its place, say.
     Notice {
         text: Cow<'a, str>,
-        #[senax(default)]
         at: UnixMs,
     },
     /// The runtime itself changing under the agent: a Claude rewind before
@@ -571,7 +557,6 @@ pub enum AgentEvent<'a> {
     /// cache key for the Rho runtime.
     RuntimeRebound {
         change: RuntimeChange,
-        #[senax(default)]
         at: UnixMs,
     },
     /// A provider/host lifecycle observation shared only for presentation.
@@ -598,14 +583,6 @@ pub enum AgentEvent<'a> {
     /// One of the Rho runtime's own rows.
     #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
-}
-
-/// Temporary decoder for the removed filesystem mode, until the one-hop
-/// agent database migration has been run on active stores.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum LegacyWorksetMode {
-    View,
-    Exposed,
 }
 
 /// Leased notebook contributions transferred to durable host ownership before
@@ -644,8 +621,6 @@ pub struct WakeFacts {
 pub enum WakeTrigger {
     /// A previously selected durable output batch is handed off.
     Delivery,
-    /// Historical interruption by a message; live messages now queue.
-    Interrupt,
     /// A request somebody asked for outright: a retry, a compaction.
     Asked,
     /// A failed request's own clock.
@@ -658,7 +633,6 @@ pub enum WakeTrigger {
     Finished,
     /// The model's check-in came due.
     Checkin,
-    ContextRotation,
 }
 
 /// One pending event as the scheduler saw it.
@@ -783,10 +757,6 @@ mod encoding_tests {
             AgentEvent::Rewound {
                 to: crate::log::AgentEventPos::new(3),
                 at: UnixMs(15),
-            },
-            AgentEvent::ModeChanged {
-                mode: LegacyWorksetMode::Exposed,
-                at: UnixMs(16),
             },
             AgentEvent::Transcript {
                 uuid: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
