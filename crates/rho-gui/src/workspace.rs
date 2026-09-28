@@ -6209,7 +6209,7 @@ impl Workspace {
                 &held,
                 rho_journal::DealerVerdict::Skip,
                 now,
-                Some(now + rho_dealer::curve::SKIP_FADE),
+                Some(now + rho_dealer::curve::SKIP_HOLD),
             );
         }
         if self.attention.open_pile.is_some() {

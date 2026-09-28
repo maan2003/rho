@@ -40,7 +40,8 @@ pub struct Card {
     /// Where the node's source stood: a skip holds on to it, and the source
     /// moving past it voids the skip.
     pub cursor: String,
-    /// Passed over a moment ago, and lower for it until the skip fades.
+    /// Passed over this sitting: behind every card that was not, until its
+    /// source moves or the skip runs out.
     pub skipped: bool,
 }
 
@@ -138,16 +139,12 @@ impl Skips {
         self.skips.contains_key(node)
     }
 
-    /// What a skip still takes off the card, if its source has not moved.
-    fn penalty(&self, node: &NodeId, cursor: &str, now: Timestamp) -> Option<(f64, Timestamp)> {
+    /// When the card was skipped and when that runs out, if its source
+    /// has not moved since.
+    fn held(&self, node: &NodeId, cursor: &str, now: Timestamp) -> Option<(Timestamp, Timestamp)> {
         let skip = self.skips.get(node).filter(|skip| skip.cursor == cursor)?;
-        let gone = skip.at + curve::SKIP_FADE;
-        (now < gone).then(|| {
-            (
-                curve::fading(skip.at, now, curve::SKIP_FADE, curve::SKIP_PENALTY),
-                gone,
-            )
-        })
+        let gone = skip.at + curve::SKIP_HOLD;
+        (now < gone).then_some((skip.at, gone))
     }
 }
 
@@ -556,7 +553,7 @@ fn rank_into(
             }
             continue;
         };
-        let penalty = sources.skips.penalty(&node, &part.cursor, at);
+        let skip = sources.skips.held(&node, &part.cursor, at);
         if let Some(trace) = trace.as_deref_mut() {
             let snoozes: Vec<String> = snoozes
                 .iter()
@@ -568,38 +565,55 @@ fn rank_into(
                 format!(
                     "card at {:.3}{}",
                     priority,
-                    penalty.map_or(String::new(), |(penalty, gone)| format!(
-                        ", less {penalty:.3} for a skip until {gone}"
+                    skip.map_or(String::new(), |(_, gone)| format!(
+                        ", at the back for a skip until {gone}"
                     ))
                 ),
             );
         }
-        if let Some((_, gone)) = penalty {
+        if let Some((_, gone)) = skip {
             steps.push(gone);
         }
-        cards.push(Card {
-            kind: match node {
-                NodeId::Agent(_) => CardKind::Agent,
-                NodeId::Slack(_) => CardKind::Slack,
-                _ => CardKind::Dated,
+        cards.push((
+            skip.map(|(skipped, _)| skipped),
+            Card {
+                kind: match node {
+                    NodeId::Agent(_) => CardKind::Agent,
+                    NodeId::Slack(_) => CardKind::Slack,
+                    _ => CardKind::Dated,
+                },
+                title: String::new(),
+                context: String::new(),
+                label: part.curve.label(&part.reason, at),
+                priority,
+                cursor: part.cursor.clone(),
+                skipped: skip.is_some(),
+                node,
             },
-            title: String::new(),
-            context: String::new(),
-            label: part.curve.label(&part.reason, at),
-            priority: priority - penalty.map_or(0.0, |(penalty, _)| penalty),
-            cursor: part.cursor.clone(),
-            skipped: penalty.is_some(),
-            node,
-        });
+        ));
     }
-    cards.sort_by(|a, b| {
-        b.priority
-            .total_cmp(&a.priority)
-            // An agent wins an exact tie: it is the user's own work coming
-            // back.
-            .then_with(|| (b.kind == CardKind::Agent).cmp(&(a.kind == CardKind::Agent)))
-            .then_with(|| a.node.cmp(&b.node))
-    });
+    // A skip is a turn at the back, not a lower score: a card waiting for
+    // hours outscores any fixed penalty, and skipping went back and forth
+    // between the same two cards. Skipped cards go behind the rest, the
+    // longest-skipped first, so every card is dealt once before any comes
+    // round again.
+    cards.sort_by(
+        |(a_skipped, a), (b_skipped, b)| match (a_skipped, b_skipped) {
+            (Some(a_skipped), Some(b_skipped)) => {
+                a_skipped.cmp(b_skipped).then_with(|| a.node.cmp(&b.node))
+            }
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => b
+                .priority
+                .total_cmp(&a.priority)
+                // An agent wins an exact tie: it is the user's own work coming
+                // back.
+                .then_with(|| (b.kind == CardKind::Agent).cmp(&(a.kind == CardKind::Agent)))
+                .then_with(|| a.node.cmp(&b.node)),
+        },
+    );
+    let mut cards: Vec<Card> = cards.into_iter().map(|(_, card)| card).collect();
     for card in &mut cards {
         card.title = title(sources, &card.node, cache);
         card.context = context(sources, &card.node);

@@ -93,7 +93,7 @@ agents that speak by ending a turn.
 | # | Rule |
 |---|---|
 | X1 | One card per node |
-| X2 | A skip lowers the card, most in its first ~5 minutes and not at all after 30, in memory only; the node's source moving voids it. Every deal takes the top card at that moment |
+| X2 | A skip sends the card behind every card not skipped, for 30 minutes, in memory only; skipped cards come round longest-skipped first, so each is dealt once before any repeats. The node's source moving voids the skip. Every deal takes the top card at that moment |
 | X3 | The hand changes by itself only at `next_change`: a snooze ending, a todo starting, a deadline coming into view or passing, a skip running out |
 | X4 | "In 1h" is an hour on any clock; "tomorrow" starts at the user's own midnight |
 | X5 | Ranking with a warm cache is ranking from scratch |
