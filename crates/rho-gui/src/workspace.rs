@@ -1412,7 +1412,7 @@ impl Workspace {
                         let facts = self.registry.agent_facts(*agent_id);
                         facts
                             .runtime
-                            .map_or(facts.turn_running, |activity| activity.is_working())
+                            .map_or(facts.turn_running, |activity| activity.is_busy())
                     }
             })
             .collect::<Vec<_>>();

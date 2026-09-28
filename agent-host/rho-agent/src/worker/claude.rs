@@ -661,11 +661,6 @@ impl ClaudeLoop {
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
-        self.entry(Entry::Awaiting {
-            at: rho_agent_types::UnixMs::now(),
-            since: None,
-        })
-        .await?;
         if !self.uncertain_receipts.is_empty() {
             let at = rho_agent_types::UnixMs::now();
             let acknowledged = std::mem::take(&mut self.uncertain_receipts);
@@ -1131,15 +1126,18 @@ impl ClaudeLoop {
                 self.host.message_sent(text).await?;
             }
             Outbound::Status(text) => self.entry(Entry::Status { at, text }).await?,
-            Outbound::Awaiting(waiting) if !self.archived && waiting != self.awaiting => {
-                self.awaiting = waiting;
-                self.entry(Entry::Awaiting {
-                    at,
-                    since: waiting.then_some(at),
-                })
-                .await?;
+            Outbound::Awaiting if !self.archived => {
+                self.awaiting = true;
+                self.entry(Entry::AwaitingHuman { at }).await?;
             }
-            Outbound::Awaiting(_) => {}
+            // The human's message already ends a wait it answers.
+            Outbound::StoppedAwaiting { answered } if !self.archived && self.awaiting => {
+                self.awaiting = false;
+                if !answered {
+                    self.entry(Entry::StoppedAwaitingHuman { at }).await?;
+                }
+            }
+            Outbound::Awaiting | Outbound::StoppedAwaiting { .. } => {}
             Outbound::Archive => {
                 self.archived = true;
                 self.entry(Entry::Notice {
@@ -1187,7 +1185,7 @@ impl ClaudeLoop {
                 }
                 if self.awaiting {
                     self.awaiting = false;
-                    self.entry(Entry::Awaiting { at, since: None }).await?;
+                    self.entry(Entry::StoppedAwaitingHuman { at }).await?;
                 }
                 self.python_recheck = None;
                 self.queued_turns.clear();

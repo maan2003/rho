@@ -463,7 +463,6 @@ pub struct ContextBoundary {
 #[derive(Clone, Debug, Default, Encode, Decode)]
 pub struct NativeRecovery {
     pub archived: bool,
-    pub awaiting: bool,
     pub woken: bool,
     pub compaction: CompactionState,
 }

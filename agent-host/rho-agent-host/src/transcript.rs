@@ -257,7 +257,15 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             activity: PresentationField::Set(text.clone()),
             at: *at,
         },
-        Entry::Awaiting { since, at } => TranscriptEvent::AwaitingHuman {
+        Entry::AwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
+            since: Some(*at),
+            at: *at,
+        },
+        Entry::StoppedAwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
+            since: None,
+            at: *at,
+        },
+        Entry::LegacyAwaiting { since, at } => TranscriptEvent::AwaitingHuman {
             since: *since,
             at: *at,
         },
@@ -546,23 +554,17 @@ mod tests {
     fn wait_is_projected() {
         assert_eq!(
             strip(
-                &AgentEvent::Entry(Entry::Awaiting {
-                    at: UnixMs(10),
-                    since: Some(UnixMs(8)),
-                }),
+                &AgentEvent::Entry(Entry::AwaitingHuman { at: UnixMs(10) }),
                 None
             ),
             Some(TranscriptEvent::AwaitingHuman {
                 at: UnixMs(10),
-                since: Some(UnixMs(8))
+                since: Some(UnixMs(10))
             })
         );
         assert_eq!(
             strip(
-                &AgentEvent::Entry(Entry::Awaiting {
-                    at: UnixMs(14),
-                    since: None,
-                }),
+                &AgentEvent::Entry(Entry::StoppedAwaitingHuman { at: UnixMs(14) }),
                 None
             ),
             Some(TranscriptEvent::AwaitingHuman {

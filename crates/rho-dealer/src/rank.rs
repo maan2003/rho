@@ -217,8 +217,8 @@ fn rank_into(
     let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
     let mut running = BTreeSet::new();
 
-    // Agents (A1–A9): its last turn ended with something the user has not
-    // dealt with and has not answered.
+    // Agents (A1–A9, R1–R6): something it put to the user that they have
+    // not dealt with and have not answered.
     let agents = sources.agents;
     for agent_id in agents.known_agents().copied() {
         let node = NodeId::Agent(agent_id);
@@ -229,12 +229,12 @@ fn rank_into(
             continue;
         };
         let facts = agents.agent_facts(agent_id);
-        if facts
+        // A task waiting on the user is not work (R2).
+        let busy = facts
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.is_working())
-            || (facts.runtime.is_none() && facts.turn_running)
-        {
+            .map_or(facts.turn_running, |runtime| runtime.is_busy());
+        if busy {
             running.insert(node.clone());
         }
         let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
@@ -246,80 +246,77 @@ fn rank_into(
         let code_first = facts.runtime.is_some()
             || digest.awaiting_human.is_some()
             || digest.message_sent.is_some();
-        let attention_at = if code_first {
-            digest
-                .awaiting_human
-                .map(|(_, since)| since)
-                .or_else(|| digest.message_sent.map(|(_, at)| at))
-                .or_else(|| facts.errored.then_some(facts.last_turn_ended).flatten())
-        } else {
-            facts.last_turn_ended
-        };
-        let quiet = if code_first && attention_at.is_none() {
-            Some("no message or human wait")
-        } else if !code_first && facts.turn_running {
-            Some("running")
-        } else if attention_at.is_none() {
-            Some("no turn has ended")
-        } else if attention_at <= Some(facts.last_user_message_at) {
-            Some("the user wrote after its turn ended")
-        } else if if code_first {
-            digest
-                .awaiting_human
-                .map(|(pos, _)| pos.0)
-                .or_else(|| digest.message_sent.map(|(pos, _)| pos.0))
-                .or_else(|| {
-                    facts
-                        .errored
-                        .then_some(digest.errored.map(|pos| pos.0))
-                        .flatten()
-                })
-                .is_some_and(|pos| pos < seen)
-        } else {
-            digest.newest.0 <= seen
-        } {
-            Some("seen through its newest")
-        } else {
-            None
-        };
-        if let Some(quiet) = quiet {
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&node, format!("no card: {quiet}"));
+        // What the agent last put to the user: since when, whether it
+        // blocks on them, how the card says it, and whether a done has
+        // already seen it. A notebook agent speaks through `human`
+        // (R1–R6); an older one through how its turn ended (A1–A9).
+        let asked: Result<(rho_agent_types::UnixMs, bool, &str, bool), &str> = if code_first {
+            let errored = digest
+                .errored
+                .filter(|_| facts.errored)
+                .zip(facts.last_turn_ended);
+            // What it told the user since they last wrote: the message is
+            // the card, and done's cursor is its place in the story.
+            let sent = digest.message_sent;
+            if let Some((pos, ended)) = errored {
+                Ok((ended, true, "errored · {age} ago", pos.0 < seen))
+            } else if let Some((pos, at)) = sent {
+                if let Some((_, since)) = digest.awaiting_human {
+                    Ok((since, true, "waiting on you · {age}", pos.0 < seen))
+                } else if busy {
+                    Err("working; what it sent waits until it stops")
+                } else {
+                    // It stopped after sending: the message is new from then.
+                    let at = facts.last_turn_ended.map_or(at, |ended| ended.max(at));
+                    Ok((at, false, "message · {age} ago", pos.0 < seen))
+                }
+            } else {
+                Err("nothing sent since the user wrote")
             }
-            continue;
-        }
-        let ended = attention_at.expect("checked above");
-        let ended = unix(ended.0 as i64);
-        let (curve, reason) = if digest.awaiting_human.is_some()
-            || facts.errored
-            || (!code_first && facts.needs_you_hint)
-        {
-            (
-                Curve::Waiting {
-                    head_start: curve::AGENT_BLOCKED_HEAD_START,
-                    since: ended,
-                },
-                if facts.errored {
-                    "errored · {age} ago"
-                } else if code_first {
-                    "waiting on you · {age}"
-                } else {
-                    "waiting on reply · {age}"
-                },
-            )
+        } else if facts.turn_running {
+            Err("running")
+        } else if let Some(ended) = facts.last_turn_ended {
+            let (blocks, reason) = if facts.errored {
+                (true, "errored · {age} ago")
+            } else if facts.needs_you_hint {
+                (true, "waiting on reply · {age}")
+            } else {
+                (false, "finished · {age} ago")
+            };
+            Ok((ended, blocks, reason, digest.newest.0 <= seen))
         } else {
-            (
-                Curve::Fading {
-                    head_start: curve::AGENT_FINISHED_HEAD_START,
-                    since: ended,
-                    gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-                },
-                if code_first {
-                    "message · {age} ago"
-                } else {
-                    "finished · {age} ago"
-                },
-            )
+            Err("no turn has ended")
+        };
+        let asked = asked.and_then(|(at, blocks, reason, seen)| {
+            if at <= facts.last_user_message_at {
+                Err("the user wrote after it")
+            } else if seen {
+                Err("seen through its newest")
+            } else {
+                Ok((at, blocks, reason))
+            }
+        });
+        let (ended, blocks, reason) = match asked {
+            Ok(asked) => asked,
+            Err(quiet) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.outcome(&node, format!("no card: {quiet}"));
+                }
+                continue;
+            }
+        };
+        let ended = unix(ended.0 as i64);
+        let curve = if blocks {
+            Curve::Waiting {
+                head_start: curve::AGENT_BLOCKED_HEAD_START,
+                since: ended,
+            }
+        } else {
+            Curve::Fading {
+                head_start: curve::AGENT_FINISHED_HEAD_START,
+                since: ended,
+                gone_days: curve::AGENT_FINISHED_GONE_DAYS,
+            }
         };
         let mut part = Part::source(curve, reason.to_owned(), digest.newest.0.to_string());
         let spoke = unix(facts.last_user_message_at.0 as i64);

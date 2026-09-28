@@ -775,7 +775,7 @@ async fn one_hop_migrates_hidden_modes_wakes_and_quota_without_changing_journal(
     drop(read);
     let points = savepoints(&db).await;
     assert_eq!(points.len(), 1);
-    assert_eq!(points[0].1.as_deref(), Some("b7e91ac4->a3f26d91"));
+    assert_eq!(points[0].1.as_deref(), Some("b7e91ac4->e3a95c07"));
     prepare(&db).await;
     assert_eq!(savepoints(&db).await.len(), 1);
 }
@@ -793,7 +793,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format 7f24a9d3, this build expects a3f26d91")]
+#[should_panic(expected = "database format 7f24a9d3, this build expects e3a95c07")]
 async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -804,7 +804,7 @@ async fn init_agent_tables_rejects_older_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format deadbeef, this build expects a3f26d91")]
+#[should_panic(expected = "database format deadbeef, this build expects e3a95c07")]
 async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -1448,7 +1448,7 @@ async fn native_compaction_preserves_deferred_messages_on_reopen() {
 }
 
 #[tokio::test]
-async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
+async fn native_recovery_notices_follow_visible_branch() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
@@ -1457,9 +1457,9 @@ async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
     let entry = |entry| AgentEvent::Entry(entry);
     write.append_agent_event(
         agent,
-        &entry(crate::entry::Entry::Awaiting {
+        &entry(crate::entry::Entry::Status {
             at: UnixMs(2),
-            since: Some(UnixMs(1)),
+            text: "working".into(),
         }),
     ); // 1
     write.append_agent_event(
@@ -1485,7 +1485,7 @@ async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
         .value()
         .into_owned()
         .recovery;
-    assert!(before.archived && before.awaiting && before.woken);
+    assert!(before.archived && before.woken);
     assert!(before.compaction.reply && !before.compaction.pending);
     write.rewind_agent(UnixMs(6), agent, AgentEventPos::new(2));
     let restored = write
@@ -1495,18 +1495,54 @@ async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
         .value()
         .into_owned()
         .recovery;
-    assert!(!restored.archived && restored.awaiting && !restored.woken);
+    assert!(!restored.archived && !restored.woken);
     assert!(!restored.compaction.reply);
-    write.append_agent_event(
-        agent,
-        &entry(crate::entry::Entry::Awaiting {
-            at: UnixMs(7),
-            since: None,
-        }),
-    );
     write.commit();
     let recovery = db.read().agent_native_recovery(agent);
-    assert!(!recovery.archived && !recovery.awaiting && !recovery.woken);
+    assert!(!recovery.archived && !recovery.woken);
+}
+
+#[tokio::test]
+async fn migration_splits_old_waits_into_starts_and_stops() {
+    use crate::entry::Entry;
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    for (at, since) in [(2, Some(UnixMs(2))), (3, None)] {
+        write.append_agent_event(
+            agent,
+            &AgentEvent::Entry(Entry::LegacyAwaiting {
+                at: UnixMs(at),
+                since,
+            }),
+        );
+    }
+    write.open_table(FORMAT).insert(&(), &"a3f26d91".to_owned());
+    write.commit();
+    prepare(&db).await;
+    let read = db.read();
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    let waits: Vec<_> = read
+        .agent_events(agent)
+        .1
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Entry(entry) => Some(entry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        waits,
+        vec![
+            Entry::AwaitingHuman { at: UnixMs(2) },
+            Entry::StoppedAwaitingHuman { at: UnixMs(3) },
+        ]
+    );
 }
 
 #[tokio::test]

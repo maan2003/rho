@@ -26,6 +26,7 @@ use crate::log::{
     SessionBinding, WakeTrigger, usage_model_of,
 };
 
+mod awaiting_migration;
 mod native;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -85,8 +86,10 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "a3f26d91";
+const CURRENT_AGENT_DB_FORMAT: &str = "e3a95c07";
 const PREVIOUS_AGENT_DB_FORMAT: &str = "b7e91ac4";
+/// Exposed-only worksets, before waits had a start and a stop.
+const WORKSETS_AGENT_DB_FORMAT: &str = "a3f26d91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -1192,8 +1195,9 @@ pub async fn prepare(db: &rho_db::RhoDb) {
              or remove the local rho database if you do not need the saved agents."
         );
     }
-    let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
-    let needs_savepoint = stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT)
+    let from = stored.as_deref().unwrap_or_default();
+    let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
+    let needs_savepoint = [PREVIOUS_AGENT_DB_FORMAT, WORKSETS_AGENT_DB_FORMAT].contains(&from)
         && (!read.has_table("recovery_savepoints")
             || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
@@ -1365,7 +1369,11 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
-        Some(PREVIOUS_AGENT_DB_FORMAT) => migrate_agent_db(write),
+        Some(PREVIOUS_AGENT_DB_FORMAT) => {
+            migrate_agent_db(write);
+            awaiting_migration::migrate(write);
+        }
+        Some(WORKSETS_AGENT_DB_FORMAT) => awaiting_migration::migrate(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \

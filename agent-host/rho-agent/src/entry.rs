@@ -194,7 +194,22 @@ pub enum Entry {
         at: UnixMs,
         text: String,
     },
-    Awaiting {
+    /// Some task began awaiting `human.reply()`: from here the agent is
+    /// parked on the human until they write, it is archived, or it stops
+    /// waiting unanswered. A restart does not end it; a restarted agent
+    /// still waits for fresh input.
+    AwaitingHuman {
+        at: UnixMs,
+    },
+    /// The last waiting task stopped without the human writing: cancelled,
+    /// failed, or given up.
+    StoppedAwaitingHuman {
+        at: UnixMs,
+    },
+    /// The wait before it had a start and a stop: `since` set began it,
+    /// unset ended it. Only the store migration reads it.
+    #[senax(rename = "Awaiting")]
+    LegacyAwaiting {
         at: UnixMs,
         since: Option<UnixMs>,
     },
@@ -295,7 +310,9 @@ impl Entry {
             | Entry::Received { at, .. }
             | Entry::Sent { at, .. }
             | Entry::Status { at, .. }
-            | Entry::Awaiting { at, .. }
+            | Entry::AwaitingHuman { at }
+            | Entry::StoppedAwaitingHuman { at }
+            | Entry::LegacyAwaiting { at, .. }
             | Entry::Notice { at, .. }
             | Entry::CompactionTrigger { at, .. } => *at,
         }

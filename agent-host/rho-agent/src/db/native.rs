@@ -52,7 +52,6 @@ impl NativeCursor {
                 }
                 self.request = None;
             }
-            Entry::Awaiting { since, .. } => self.recovery.awaiting = since.is_some(),
             Entry::Notice {
                 notice: Notice::Archived,
                 ..

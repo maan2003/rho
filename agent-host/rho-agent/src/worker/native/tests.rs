@@ -170,7 +170,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
                 matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "hello there")
             }) && entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
         })
         .await;
     assert!(received(&entries, "hi"));
@@ -193,13 +193,56 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
             .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
-    harness
+    let entries = harness
         .until("the status", |entries| {
             entries
                 .iter()
                 .any(|entry| matches!(entry, Entry::Status { text, .. } if text == "reading"))
         })
         .await;
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::StoppedAwaitingHuman { .. })),
+        "the answer ends the wait; nothing else says so"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_given_up_unanswered_is_logged() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then(
+        "import asyncio\nwaiting = asyncio.create_task(human.reply())\nawait asyncio.sleep(0.3)\nwaiting.cancel()",
+    );
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "hi").await;
+    let entries = harness
+        .until("the wait given up", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::StoppedAwaitingHuman { .. }))
+        })
+        .await;
+    let waits: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                Entry::AwaitingHuman { .. } | Entry::StoppedAwaitingHuman { .. }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            waits[..],
+            [
+                Entry::AwaitingHuman { .. },
+                Entry::StoppedAwaitingHuman { .. }
+            ]
+        ),
+        "{waits:?}"
+    );
 }
 
 #[tokio::test]
@@ -249,7 +292,7 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
         .until("the wait", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
         })
         .await;
     drop(handle);
@@ -258,20 +301,16 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     let script = Arc::new(Scripted::new());
     script.then("await human.reply()");
     let (handle, _task) = harness.start(&script).await;
-    // What awaited the human went with the old notebook.
-    harness
-        .until("the wait ending", |entries| {
-            matches!(
-                entries
-                    .iter()
-                    .filter(|entry| matches!(entry, Entry::Awaiting { .. }))
-                    .nth(1),
-                Some(Entry::Awaiting { since: None, .. })
-            )
-        })
-        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(script.requests().is_empty(), "a reload is not a wake");
+    // What awaited the human went with the old notebook, but the agent
+    // still waits on them: nothing moves until they write.
+    assert!(
+        !harness
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::StoppedAwaitingHuman { .. }))
+    );
     assert!(!harness.entries().iter().any(|entry| matches!(
         entry,
         Entry::Notice {
@@ -301,7 +340,7 @@ async fn rewind_branches_before_the_last_human_message() {
         .until("the first wait", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
         })
         .await;
     say(&handle, "two").await;
@@ -387,7 +426,7 @@ async fn waiting_still_checks_in_and_archive_revival_has_a_fresh_notebook() {
         .until("a live task waiting for the human", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
                 && {
                     let state = handle.status().runtime;
                     state.inference == InferenceState::Idle
@@ -998,10 +1037,7 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .await
         .unwrap();
     agent
-        .append(Entry::Awaiting {
-            at: UnixMs(2),
-            since: Some(UnixMs(2)),
-        })
+        .append(Entry::AwaitingHuman { at: UnixMs(2) })
         .await
         .unwrap();
     agent
@@ -1060,7 +1096,7 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
     .await
     .unwrap();
     assert!(agent.restarted);
-    assert!(!agent.awaiting, "restart clears the obsolete notebook wait");
+    assert!(!agent.awaiting, "the live wait went with the old notebook");
     assert!(
         agent.compaction.reply,
         "automatic compaction still owes a reply"

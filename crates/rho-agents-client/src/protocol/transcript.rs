@@ -294,6 +294,12 @@ impl RuntimeState {
             InferenceState::Responding | InferenceState::Retrying { .. }
         ) || (!self.archived && self.running_tasks > 0)
     }
+
+    /// Working on its own: a task waiting on the human is not work, even
+    /// beside others.
+    pub fn is_busy(&self) -> bool {
+        self.is_working() && !self.awaiting_human
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

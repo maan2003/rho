@@ -20,8 +20,13 @@ pub(crate) enum Outbound {
     Send(String),
     Status(String),
     Archive,
-    /// Whether some task now awaits `human.reply()`.
-    Awaiting(bool),
+    /// The first task began awaiting `human.reply()`.
+    Awaiting,
+    /// The last waiting task stopped; `answered` when the human wrote
+    /// since the wait began, not when it was cancelled or gave up.
+    StoppedAwaiting {
+        answered: bool,
+    },
 }
 
 /// Shared by the notebook's `human` and the agent loop.
@@ -39,6 +44,8 @@ struct Waits {
     unread: u64,
     /// Tasks awaiting `human.reply()`.
     waiting: u32,
+    /// `received` when the current wait began.
+    wait_began: u64,
 }
 
 impl Mailroom {
@@ -127,7 +134,8 @@ impl Bridge {
         let mut waits = self.0.waits.lock().unwrap();
         waits.waiting += 1;
         if waits.waiting == 1 {
-            let _ = self.0.outbox.send(Outbound::Awaiting(true));
+            waits.wait_began = waits.received;
+            let _ = self.0.outbox.send(Outbound::Awaiting);
         }
         waits.received - waits.unread
     }
@@ -140,7 +148,8 @@ impl Bridge {
         let mut waits = self.0.waits.lock().unwrap();
         waits.waiting = waits.waiting.saturating_sub(1);
         if waits.waiting == 0 {
-            let _ = self.0.outbox.send(Outbound::Awaiting(false));
+            let answered = waits.received > waits.wait_began;
+            let _ = self.0.outbox.send(Outbound::StoppedAwaiting { answered });
         }
     }
 

@@ -23,6 +23,21 @@ user put away, which they open to be dealt from it.
 | A8 | Muted, or its host is gone | nothing |
 | A9 | Opened, not replied | priority unchanged |
 
+## Notebook agents
+
+A Rho agent speaks only through its notebook: `human.send()` is what it
+tells the user, and `await human.reply()` parks it on them. A1–A9 are
+agents that speak by ending a turn.
+
+| # | History and facts | Card |
+|---|---|---|
+| R1 | Sent a message, still working | nothing until it stops; then "message", fades, new from when it stopped |
+| R2 | Sent a message and waits on the user | "waiting on you", rises from when the wait began, even beside other running work; never under running |
+| R3 | Waits, nothing sent since the user wrote | nothing |
+| R4 | Errored | "errored", rises |
+| R5 | Archived | as stopped: its last message is the card |
+| R6 | Done, or the user wrote | nothing until a newer message; waiting again is not one |
+
 ## Snoozes
 
 | # | History and facts | Card |

@@ -487,7 +487,7 @@ fn a4_an_agent_at_work_or_holding_the_users_message_has_no_card() {
 }
 
 #[test]
-fn code_first_permanent_failure_without_message_is_blocking() {
+fn r4_an_errored_agent_rises_with_nothing_sent() {
     let mut w = world();
     let a = w.agent("a");
     let agent = World::id(&a);
@@ -504,51 +504,141 @@ fn code_first_permanent_failure_without_message_is_blocking() {
     assert_eq!(w.hand(), "a · errored · 0m ago");
 }
 
-#[test]
-fn code_first_message_and_human_wait_create_cards_during_background_tasks() {
-    let mut w = world();
-    let a = w.agent("a");
-    let agent = World::id(&a);
-    let at = UnixMs(w.ms());
+/// The agent's live state, as the runtime publishes it.
+fn runtime(w: &mut World, node: &NodeId, running_tasks: u32, awaiting_human: bool, archived: bool) {
     w.agents.set_runtime(
-        agent,
+        World::id(node),
         rho_agents_client::protocol::transcript::RuntimeState {
-            running_tasks: 2,
-            checkin_at: Some(at),
-            archived: false,
+            running_tasks,
+            awaiting_human,
+            archived,
             ..Default::default()
         },
     );
-    assert_eq!(w.hand(), "", "tasks alone do not demand user attention");
+}
+
+fn sends(w: &mut World, node: &NodeId) {
+    let at = UnixMs(w.ms());
     w.log(
-        agent,
+        World::id(node),
         TranscriptEvent::MessageSent {
             to: None,
             text: "update".into(),
             at,
         },
     );
-    assert_eq!(w.hand(), "a · message · 0m ago");
+}
+
+/// The wire keeps the old shape: a start carries `since`, a stop does not.
+fn waits(w: &mut World, node: &NodeId, waiting: bool) {
+    let at = UnixMs(w.ms());
     w.log(
-        agent,
+        World::id(node),
         TranscriptEvent::AwaitingHuman {
-            since: Some(at),
+            since: waiting.then_some(at),
             at,
         },
     );
-    assert_eq!(w.hand(), "a · waiting on you · 0m");
+}
+
+#[test]
+fn r1_a_message_waits_until_the_agent_stops_working() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 2, false, false);
+    sends(&mut w, &a);
+    assert_eq!(w.hand(), "", "it is still working");
+    w.pass(mins(30));
+    runtime(&mut w, &a, 0, false, false);
+    w.ends(&a, TurnOutcome::Completed);
+    assert_eq!(
+        w.hand(),
+        "a · message · 0m ago",
+        "new from when it stopped, not from when it was sent"
+    );
+}
+
+#[test]
+fn r2_a_message_it_waits_on_rises_even_beside_other_work() {
+    let mut w = world();
+    let a = w.agent("a");
+    let b = w.agent("b");
+    for node in [&a, &b] {
+        runtime(&mut w, node, 0, false, false);
+        sends(&mut w, node);
+    }
+    runtime(&mut w, &a, 2, true, false);
+    waits(&mut w, &a, true);
+    assert_eq!(w.hand(), "a · waiting on you · 0m\nb · message · 0m ago");
+    let early = w.priority(&a).unwrap();
+    w.pass(hours(3));
+    assert!(w.priority(&a).unwrap() > early, "a wait rises");
+    assert!(
+        w.priority(&a).unwrap() > w.priority(&b).unwrap(),
+        "a wait outranks a message"
+    );
+    assert!(
+        w.hand().starts_with("a · waiting on you · 3.0h"),
+        "{}",
+        w.hand()
+    );
+}
+
+#[test]
+fn r2_a_todo_on_an_agent_waiting_on_the_user_is_not_hidden_as_work() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 1, true, false);
+    waits(&mut w, &a, true);
+    w.todo(&a, None);
+    assert_eq!(w.hand(), "a · todo · 0m");
+}
+
+#[test]
+fn r3_a_wait_with_nothing_sent_is_no_card() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 1, true, false);
+    waits(&mut w, &a, true);
+    assert_eq!(w.hand(), "");
+}
+
+#[test]
+fn r6_done_holds_through_waiting_again_until_a_new_message() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 1, true, false);
+    sends(&mut w, &a);
+    waits(&mut w, &a, true);
     w.done(&a);
     assert_eq!(w.hand(), "");
-    w.agents.set_runtime(
-        agent,
-        rho_agents_client::protocol::transcript::RuntimeState {
-            running_tasks: 1,
-            checkin_at: Some(at),
-            archived: true,
-            ..Default::default()
-        },
-    );
-    assert_eq!(w.hand(), "", "archiving does not fabricate a new message");
+    waits(&mut w, &a, false);
+    waits(&mut w, &a, true);
+    assert_eq!(w.hand(), "", "waiting again asks nothing new");
+    sends(&mut w, &a);
+    assert_eq!(w.hand(), "a · waiting on you · 0m");
+}
+
+#[test]
+fn r5_archiving_makes_its_last_message_the_result() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 1, false, false);
+    sends(&mut w, &a);
+    assert_eq!(w.hand(), "");
+    runtime(&mut w, &a, 1, false, true);
+    assert_eq!(w.hand(), "a · message · 0m ago");
+}
+
+#[test]
+fn r6_the_user_writing_clears_what_it_sent() {
+    let mut w = world();
+    let a = w.agent("a");
+    runtime(&mut w, &a, 0, false, false);
+    sends(&mut w, &a);
+    w.pass(mins(1));
+    w.writes_to(&a);
+    assert_eq!(w.hand(), "");
 }
 
 #[test]

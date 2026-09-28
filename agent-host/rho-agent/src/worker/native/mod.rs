@@ -423,9 +423,7 @@ impl Agent {
             cache_key: cache_key(prompt_cache_key),
             compaction: recovery.compaction,
         };
-        agent
-            .resume(&entries, recovery.woken, recovery.awaiting)
-            .await?;
+        agent.resume(&entries, recovery.woken);
         agent.publish().await?;
         Ok((
             AgentHandle {
@@ -445,25 +443,11 @@ impl Agent {
 
     /// Pick up from the log: what the model has not seen, and whether there
     /// was a notebook that is now gone.
-    async fn resume(
-        &mut self,
-        entries: &[Entry],
-        woken: bool,
-        awaiting: bool,
-    ) -> anyhow::Result<()> {
+    fn resume(&mut self, entries: &[Entry], woken: bool) {
         self.restore_unread(entries);
         if woken && !self.archived {
             self.restarted = true;
         }
-        if awaiting {
-            // Whatever awaited the human went with the old notebook.
-            self.append(Entry::Awaiting {
-                at: UnixMs::now(),
-                since: None,
-            })
-            .await?;
-        }
-        Ok(())
     }
 
     fn restore_unread(&mut self, entries: &[Entry]) {
@@ -859,23 +843,28 @@ impl Agent {
                     notebook.shutdown().await.map_err(anyhow::Error::msg)?;
                 }
                 self.cell = None;
-                self.append(Entry::Awaiting { at, since: None }).await?;
-                self.awaiting = false;
+                if self.awaiting {
+                    self.awaiting = false;
+                    self.append(Entry::StoppedAwaitingHuman { at }).await?;
+                }
                 self.append(Entry::Notice {
                     at,
                     notice: Notice::Archived,
                 })
                 .await
             }
-            Outbound::Awaiting(awaiting) if awaiting != self.awaiting => {
-                self.awaiting = awaiting;
-                self.append(Entry::Awaiting {
-                    at,
-                    since: awaiting.then_some(at),
-                })
-                .await
+            Outbound::Awaiting => {
+                self.awaiting = true;
+                self.append(Entry::AwaitingHuman { at }).await
             }
-            Outbound::Awaiting(_) => Ok(()),
+            // The human's message already ends a wait it answers.
+            Outbound::StoppedAwaiting { answered } => {
+                self.awaiting = false;
+                if answered {
+                    return Ok(());
+                }
+                self.append(Entry::StoppedAwaitingHuman { at }).await
+            }
         }
     }
 
