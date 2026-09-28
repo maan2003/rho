@@ -216,9 +216,10 @@ impl PrMonitor {
         let (_, agent, _) = self.pool.load(subscriber).await?;
         tokio::time::timeout(
             DELIVERY_TIMEOUT,
-            agent.send_user_content_accepted(vec![rho_agent_types::ContentPart::Text {
-                text: message,
-            }]),
+            agent.send_user_content_accepted(
+                rho_agent::entry::MessageId::new(),
+                vec![rho_agent_types::ContentPart::Text { text: message }],
+            ),
         )
         .await??;
         Ok(())

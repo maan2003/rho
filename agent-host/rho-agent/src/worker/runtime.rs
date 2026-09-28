@@ -40,9 +40,9 @@ impl Controller {
                 // of ours to flush.
                 Self::Claude(_) => {}
             },
-            Control::User { content } => match self {
-                Self::Rho(agent) => agent.send_user_content_accepted(content).await?,
-                Self::Claude(agent) => agent.send_user_content_accepted(content).await?,
+            Control::User { id, content } => match self {
+                Self::Rho(agent) => agent.send_user_content_accepted(id, content).await?,
+                Self::Claude(agent) => agent.send_user_content_accepted(id, content).await?,
             },
             Control::Mail {
                 sender,

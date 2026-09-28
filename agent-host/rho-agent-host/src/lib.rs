@@ -683,10 +683,14 @@ async fn resume_after_restart(services: Arc<Services>, path: Utf8PathBuf) {
         };
         let command = rho_agents_client::protocol::AgentCommand::Send {
             agent_id,
-            content: vec![ContentPart::Text {
-                text: "The agent host was stopped on purpose (for example to deploy a new rho) \
-                       while you were working, and has started again. Continue your task."
-                    .to_owned(),
+            messages: vec![rho_agents_client::protocol::UserMessage {
+                id: rho_agent::entry::MessageId::new().0,
+                content: vec![ContentPart::Text {
+                    text: "The agent host was stopped on purpose (for example to deploy a new \
+                           rho) while you were working, and has started again. Continue your \
+                           task."
+                        .to_owned(),
+                }],
             }],
         };
         if let Err(error) = agents::handle_agent_command(&services, command).await {

@@ -548,7 +548,9 @@ async fn new_agent(services: &Arc<Services>, new: NewAgent) -> anyhow::Result<Ag
     }
     let (agent_id, agent) = services.create(role, start).await?;
     if let Some(content) = content {
-        agent.send_user_content_accepted(content).await?;
+        agent
+            .send_user_content_accepted(rho_agent::entry::MessageId::new(), content)
+            .await?;
     }
     Ok(agent_id)
 }
@@ -560,20 +562,29 @@ pub(crate) async fn handle_agent_command(
     match command {
         AgentCommand::Send {
             agent_id,
-            mut content,
+            mut messages,
         } => {
-            prepare_image_content(&mut content).await?;
-            let (_, agent, _) = services.load(agent_id).await?;
-            // What Rho has to tell the agent goes ahead of the person's
-            // words, once: the loop's head forgets it as soon as the
-            // message is accepted, the log when the message's row lands.
-            let notice = agent.head().pending_notice;
-            if let Some(text) = notice.clone() {
-                content.insert(0, rho_agent_types::ContentPart::Text { text });
+            for message in &mut messages {
+                prepare_image_content(&mut message.content).await?;
             }
-            agent.send_user_content_accepted(content).await?;
-            if notice.is_some() {
-                agent.notice_carried();
+            let (_, agent, _) = services.load(agent_id).await?;
+            // One at a time, in order: a message fails before any after it
+            // is logged, and the client sends them all again.
+            for message in messages {
+                let mut content = message.content;
+                // What Rho has to tell the agent goes ahead of the person's
+                // words, once: the loop's head forgets it as soon as the
+                // message is accepted, the log when the message's row lands.
+                let notice = agent.head().pending_notice;
+                if let Some(text) = notice.clone() {
+                    content.insert(0, rho_agent_types::ContentPart::Text { text });
+                }
+                agent
+                    .send_user_content_accepted(rho_agent::entry::MessageId(message.id), content)
+                    .await?;
+                if notice.is_some() {
+                    agent.notice_carried();
+                }
             }
         }
         AgentCommand::Compact { agent_id } => {

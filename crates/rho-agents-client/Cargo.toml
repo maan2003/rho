@@ -15,6 +15,7 @@ client = [
   "dep:collections",
   "dep:futures",
   "dep:prefix-id",
+  "dep:rand",
   "dep:redb",
   "dep:rho-db",
   "dep:rho-agent-hosts",
@@ -33,6 +34,7 @@ anyhow = { workspace = true, optional = true }
 collections = { path = "../../vendor/zed/crates/collections", optional = true }
 futures = { workspace = true, optional = true }
 prefix-id = { workspace = true, default-features = false, features = ["redb"], optional = true }
+rand = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }

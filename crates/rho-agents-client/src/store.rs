@@ -69,10 +69,12 @@ impl FrameSummary {
     }
 }
 
-/// One agent's transcript: the fold, the live tail, and the two composed.
+/// One agent's transcript: the fold, the live tail, what the user has not
+/// yet sent, and the three composed.
 struct Layered {
     fold: UiAgentState,
     tail: Tail,
+    unsent: Vec<Arc<UiBlock>>,
     state: UiAgentState,
     committed_tools: std::collections::HashSet<String>,
 }
@@ -112,6 +114,7 @@ impl Layered {
         self.state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
+        self.state.blocks.extend(self.unsent.iter().cloned());
         self.state.status = match self.tail.runtime.as_ref() {
             Some(RuntimeState {
                 inference: InferenceState::Responding,
@@ -210,6 +213,9 @@ pub fn block(item: &Item) -> UiBlock {
 #[derive(Default)]
 pub struct AgentStore {
     states: HashMap<AgentId, Layered>,
+    /// Kept apart from `states` so a transcript forgotten and opened
+    /// again still shows what waits to be sent.
+    unsent: HashMap<AgentId, Vec<Arc<UiBlock>>>,
 }
 
 impl AgentStore {
@@ -231,12 +237,7 @@ impl AgentStore {
         agent_id: AgentId,
         delta: crate::fold::FoldDelta,
     ) -> FrameSummary {
-        let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
-            fold: empty_state(),
-            tail: Tail::default(),
-            state: empty_state(),
-            committed_tools: Default::default(),
-        });
+        let layered = self.layered(agent_id);
         let from = delta.from.min(layered.fold.blocks.len());
         let open_before = turn_open(layered.state.status);
         for block in &layered.fold.blocks[from..] {
@@ -277,6 +278,25 @@ impl AgentStore {
         self.change(agent_id, true, |layered| layered.tail.apply(live))
     }
 
+    /// What the user wrote that no host has taken yet, oldest first.
+    pub fn set_unsent(&mut self, agent_id: AgentId, texts: Vec<String>) -> FrameSummary {
+        let unsent: Vec<_> = texts
+            .into_iter()
+            .map(|text| Arc::new(UiBlock::Unsent { text }))
+            .collect();
+        if unsent.is_empty() {
+            self.unsent.remove(&agent_id);
+        } else {
+            self.unsent.insert(agent_id, unsent.clone());
+        }
+        // A transcript not yet open picks them up when it opens; opening
+        // one here would pass for a transcript with nothing else in it.
+        if !self.states.contains_key(&agent_id) {
+            return FrameSummary::nothing();
+        }
+        self.change(agent_id, true, |layered| layered.unsent = unsent)
+    }
+
     /// Drop ephemeral status and response when transport is lost.
     pub fn disconnect(&mut self, agent_id: AgentId) -> FrameSummary {
         self.change(agent_id, true, |layered| {
@@ -296,18 +316,24 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
+    fn layered(&mut self, agent_id: AgentId) -> &mut Layered {
+        let unsent = &self.unsent;
+        self.states.entry(agent_id).or_insert_with(|| Layered {
+            fold: empty_state(),
+            tail: Tail::default(),
+            unsent: unsent.get(&agent_id).cloned().unwrap_or_default(),
+            state: empty_state(),
+            committed_tools: Default::default(),
+        })
+    }
+
     fn change(
         &mut self,
         agent_id: AgentId,
         tail_only: bool,
         change: impl FnOnce(&mut Layered),
     ) -> FrameSummary {
-        let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
-            fold: empty_state(),
-            tail: Tail::default(),
-            state: empty_state(),
-            committed_tools: Default::default(),
-        });
+        let layered = self.layered(agent_id);
         // The durable prefix cannot change on a live update. Keep its Arc
         // pointers in place and compare only the old and new live suffix:
         // O(tail blocks + their payload), independent of loaded history.
@@ -454,6 +480,47 @@ mod tests {
             .iter()
             .map(|block| (**block).clone())
             .collect()
+    }
+
+    /// Unsent messages trail everything, the agent's own queue included,
+    /// and are still there when a forgotten transcript opens again; setting
+    /// them opens no transcript by itself.
+    #[test]
+    fn unsent_messages_trail_the_transcript_and_outlive_forgetting_it() {
+        let mut store = AgentStore::default();
+        store.set_unsent(agent(), vec!["later".into()]);
+        assert!(store.get(&agent()).is_none(), "no transcript is opened");
+
+        let mut fold = empty_state();
+        fold.blocks
+            .push(Arc::new(UiBlock::UserMessage { text: "hi".into() }));
+        store.set_fold(agent(), fold.clone());
+        store.apply_live(
+            agent(),
+            Live::Queued {
+                items: vec![QueuedItem::Message {
+                    from: None,
+                    text: "queued".into(),
+                }],
+            },
+        );
+        let unsent = UiBlock::Unsent {
+            text: "later".into(),
+        };
+        let queued = UiBlock::QueuedMessage {
+            text: "queued".into(),
+            sender: None,
+        };
+        let said = UiBlock::UserMessage { text: "hi".into() };
+        assert_eq!(blocks(&store), [said.clone(), queued, unsent.clone()]);
+
+        store.forget(agent());
+        store.set_fold(agent(), fold);
+        assert_eq!(blocks(&store), [said.clone(), unsent]);
+
+        let summary = store.set_unsent(agent(), Vec::new());
+        assert_eq!(summary.first_changed_block, Some(1));
+        assert_eq!(blocks(&store), [said]);
     }
 
     #[test]

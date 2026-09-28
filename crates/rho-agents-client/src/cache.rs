@@ -23,6 +23,7 @@ use redb::{TableDefinition, TableHandle};
 use rho_agent_types::{AgentId, AgentPos, Seq};
 use rho_db::{RhoDb, Sen, SenValue};
 
+use crate::outbox::Outgoing;
 use crate::protocol::transcript::{LogEntry, TranscriptEvent};
 use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 
@@ -66,6 +67,11 @@ const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
 /// has it again.
 const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
     TableDefinition::new("gui_agent_verdict_v1");
+/// What the user wrote that no host has taken yet, by agent and the id
+/// the client gave it. The user's own words, with no copy anywhere else:
+/// like `VERDICTS`, never dropped to be asked for again.
+const OUTBOX: TableDefinition<(AgentId, u64), Sen<Outgoing>> =
+    TableDefinition::new("gui_agent_outbox_v1");
 
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
@@ -173,6 +179,8 @@ enum Write {
         digests: Vec<(AgentId, AgentSnapshot)>,
     },
     Verdict(AgentId, Verdict),
+    /// A message kept until its host takes it, or `None` once it has.
+    Outgoing(AgentId, u64, Option<Outgoing>),
     /// Digests folded again at startup, from rows already held.
     Digests(Vec<(AgentId, AgentSnapshot)>),
     /// Everything heard from a host, gone: its agent host has another
@@ -256,6 +264,7 @@ impl Mirror {
             } else {
                 write.open_table(VERDICTS);
             }
+            write.open_table(OUTBOX);
             for table in RETIRED_TABLES {
                 write.delete_table(table);
             }
@@ -385,6 +394,22 @@ impl Mirror {
         self.send(Write::Reset(host.to_owned()));
     }
 
+    pub fn write_outgoing(&self, agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
+        self.send(Write::Outgoing(agent_id, id, outgoing));
+    }
+
+    pub fn read_outbox(&self) -> Vec<(AgentId, u64, Outgoing)> {
+        self.db
+            .read()
+            .open_table(OUTBOX)
+            .iter()
+            .map(|(key, value)| {
+                let (agent_id, id) = key.value();
+                (agent_id, id, value.value().into_owned())
+            })
+            .collect()
+    }
+
     /// Waits for everything already queued to commit. Shutdown calls this;
     /// interaction sites never need to.
     pub fn flush(&self) {
@@ -484,6 +509,17 @@ fn apply(
             transaction
                 .open_table(VERDICTS)
                 .insert(&agent_id, SenValue::borrowed(&verdict));
+        }
+        Write::Outgoing(agent_id, id, outgoing) => {
+            let mut table = transaction.open_table(OUTBOX);
+            match outgoing {
+                Some(outgoing) => {
+                    table.insert(&(agent_id, id), SenValue::borrowed(&outgoing));
+                }
+                None => {
+                    table.remove(&(agent_id, id));
+                }
+            }
         }
         Write::Digests(digests) => {
             let mut table = transaction.open_table(DIGESTS);
@@ -622,6 +658,19 @@ pub fn write_verdict(agent_id: AgentId, verdict: Verdict) {
     }
 }
 
+pub fn write_outgoing(agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
+    if let Some(mirror) = global().as_ref() {
+        mirror.write_outgoing(agent_id, id, outgoing);
+    }
+}
+
+pub fn read_outbox() -> Vec<(AgentId, u64, Outgoing)> {
+    global()
+        .as_ref()
+        .map(Mirror::read_outbox)
+        .unwrap_or_default()
+}
+
 pub fn reset_host(host: &str) {
     if let Some(mirror) = global().as_ref() {
         mirror.reset_host(host);
@@ -723,6 +772,30 @@ mod tests {
 
         assert_eq!(mirror.read_events(mine), events(&told(mine, 1)));
         assert!(mirror.read_events(agent_id(3)).is_empty());
+    }
+
+    /// Unsent messages are the user's words and nothing else has them:
+    /// they outlive a restart and a host whose copy starts over, and only
+    /// an answer from the host takes one away.
+    #[test]
+    fn unsent_messages_outlive_a_restart_until_taken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mine = agent_id(1);
+        let outgoing = |text: &str| Outgoing {
+            at: rho_agent_types::UnixMs(5),
+            content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
+        };
+        {
+            let mirror = Mirror::open(dir.path()).expect("open");
+            write(&mirror, "local", 7, told(mine, 1));
+            mirror.write_outgoing(mine, 40, Some(outgoing("taken")));
+            mirror.write_outgoing(mine, 41, Some(outgoing("waiting")));
+            mirror.write_outgoing(mine, 40, None);
+            mirror.reset_host("local");
+            mirror.flush();
+        }
+        let mirror = Mirror::open(dir.path()).expect("reopen");
+        assert_eq!(mirror.read_outbox(), [(mine, 41, outgoing("waiting"))]);
     }
 
     /// What the GUI comes up holding after a restart: the host's cursor,

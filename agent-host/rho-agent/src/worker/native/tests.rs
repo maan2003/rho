@@ -112,7 +112,10 @@ impl Harness {
 
 async fn say(handle: &AgentHandle, text: &str) {
     handle
-        .send_user_content_accepted(vec![ContentPart::Text { text: text.into() }])
+        .send_user_content_accepted(
+            MessageId::new(),
+            vec![ContentPart::Text { text: text.into() }],
+        )
         .await
         .unwrap();
 }
@@ -323,6 +326,49 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     let told = told(&requests(&script, 1).await[0]);
     assert!(told.contains("rho restarted"), "{told}");
     assert!(told.contains("second"), "{told}");
+}
+
+/// A client that never heard the answer sends the same message again,
+/// maybe after the worker restarted; it lands in the log once.
+#[tokio::test]
+async fn a_message_sent_again_under_its_id_is_logged_once() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("await human.reply()");
+    let (handle, task) = harness.start(&script).await;
+    let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
+    let first = MessageId(11);
+    handle
+        .send_user_content_accepted(first, text("first"))
+        .await
+        .unwrap();
+    handle
+        .send_user_content_accepted(first, text("first"))
+        .await
+        .unwrap();
+    drop(handle);
+    task.await.unwrap();
+
+    let script = Arc::new(Scripted::new());
+    script.then("await human.reply()");
+    let (handle, _task) = harness.start(&script).await;
+    handle
+        .send_user_content_accepted(first, text("first"))
+        .await
+        .unwrap();
+    handle
+        .send_user_content_accepted(MessageId(12), text("second"))
+        .await
+        .unwrap();
+    let received = harness
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Received { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(received, [first, MessageId(12)]);
 }
 
 #[tokio::test]
@@ -880,7 +926,11 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     let instructions: Arc<str> = "test instructions".into();
     for text in ["first-message", "second-message"] {
         agent
-            .receive(Party::Human, vec![Block::Text(text.into())])
+            .receive(
+                MessageId::new(),
+                Party::Human,
+                vec![Block::Text(text.into())],
+            )
             .await
             .unwrap();
         agent
@@ -893,7 +943,11 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         );
     }
     agent
-        .receive(Party::Human, vec![Block::Text("third-message".into())])
+        .receive(
+            MessageId::new(),
+            Party::Human,
+            vec![Block::Text("third-message".into())],
+        )
         .await
         .unwrap();
     let control = async {
@@ -953,7 +1007,11 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .await
         .unwrap();
     agent
-        .receive(Party::Human, vec![Block::Text("initial-message".into())])
+        .receive(
+            MessageId::new(),
+            Party::Human,
+            vec![Block::Text("initial-message".into())],
+        )
         .await
         .unwrap();
     let first = Report {
@@ -968,6 +1026,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
 
     agent
         .receive(
+            MessageId::new(),
             Party::Human,
             vec![Block::Text("arrived-after-failure".into())],
         )
@@ -1041,7 +1100,11 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .await
         .unwrap();
     agent
-        .receive(Party::Human, vec![Block::Text("old-discarded".into())])
+        .receive(
+            MessageId::new(),
+            Party::Human,
+            vec![Block::Text("old-discarded".into())],
+        )
         .await
         .unwrap();
     agent
@@ -1064,7 +1127,11 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .await
         .unwrap();
     agent
-        .receive(Party::Human, vec![Block::Text("during-compaction".into())])
+        .receive(
+            MessageId::new(),
+            Party::Human,
+            vec![Block::Text("during-compaction".into())],
+        )
         .await
         .unwrap();
     agent
@@ -1079,6 +1146,7 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .unwrap();
     agent
         .receive(
+            MessageId::new(),
             Party::Agent(harness.agent),
             vec![Block::Text("after-compaction".into())],
         )
@@ -1128,7 +1196,11 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .receive(Party::Human, vec![Block::Text("too-late".into())])
+        .receive(
+            MessageId::new(),
+            Party::Human,
+            vec![Block::Text("too-late".into())],
+        )
         .await
         .unwrap();
     agent

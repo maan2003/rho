@@ -218,13 +218,20 @@ impl AgentClient {
         self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }]);
     }
     pub fn send_user_content(&self, content: Vec<rho_agent_types::ContentPart>) {
-        self.send(Control::User { content });
+        self.send(Control::User {
+            id: crate::entry::MessageId::new(),
+            content,
+        });
     }
+    /// Waits until the message is logged. A message whose `id` the agent
+    /// already logged is accepted again without a second row, so a client
+    /// that never heard the first answer can safely send it again.
     pub async fn send_user_content_accepted(
         &self,
+        id: crate::entry::MessageId,
         content: Vec<rho_agent_types::ContentPart>,
     ) -> anyhow::Result<()> {
-        self.request(Control::User { content }).await
+        self.request(Control::User { id, content }).await
     }
     pub fn send_agent_message(&self, sender: AgentId, label: String, body: String) {
         self.send(Control::Mail {

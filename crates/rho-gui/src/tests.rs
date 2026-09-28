@@ -1056,6 +1056,98 @@ fn queued_human_and_peer_messages_change_to_delivered_blocks(cx: &mut TestAppCon
     assert!(!delivered.contains("(queued)"), "{delivered:?}");
 }
 
+/// Messages written while their host is down wait in the transcript as
+/// unsent and go together, in order, when the host is back. A send the
+/// host fails keeps them, and the next try is the same messages under the
+/// same ids; only an answer takes them off the transcript.
+#[gpui::test]
+fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAppContext) {
+    use rho_agent_hosts::connection::ConnEvent;
+    use rho_agents_client::protocol::{AgentCommand, Request};
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(731);
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
+    let feed = |cx: &mut TestAppContext, frame: story::Frame| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                story::feed(workspace, HostId::default(), frame, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    feed(cx, ready_with(vec![ui_head(agent_id)], 732));
+    feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
+    feed(cx, ConnEvent::Disconnected("gone".into()).into());
+
+    let editor = active_editor(&workspace, cx);
+    for text in ["while away", "and again"] {
+        workspace
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| editor.insert(text, window, cx));
+            })
+            .unwrap();
+        cx.dispatch_action(*workspace, crate::SubmitPrompt);
+        cx.run_until_parked();
+    }
+    assert!(
+        story::calls(&mut host).is_empty(),
+        "nothing goes to a host that is down"
+    );
+    let unsent = |cx: &mut TestAppContext| {
+        let shown = display_text(&workspace, cx);
+        assert!(shown.contains("while away (unsent)"), "{shown:?}");
+        assert!(shown.contains("and again (unsent)"), "{shown:?}");
+    };
+    unsent(cx);
+
+    let mut sent = || {
+        let mut calls = story::calls(&mut host);
+        assert_eq!(calls.len(), 1, "both messages go in one call");
+        let (call, stream) = calls.pop().unwrap();
+        let Request::Command(AgentCommand::Send {
+            agent_id: to,
+            messages,
+        }) = call
+        else {
+            panic!("expected a send: {call:?}");
+        };
+        assert_eq!(to, agent_id);
+        let texts: Vec<_> = messages
+            .iter()
+            .map(|message| rho_agent_types::transcript::text_content(&message.content))
+            .collect();
+        assert_eq!(texts, ["while away", "and again"], "in the order written");
+        let ids: Vec<u64> = messages.iter().map(|message| message.id).collect();
+        (ids, stream)
+    };
+    feed(cx, ConnEvent::Ready.into());
+    let (first, mut stream) = sent();
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::<()>::Failed {
+            reason: "worker restarting".into(),
+        },
+    );
+    cx.run_until_parked();
+    unsent(cx);
+
+    feed(cx, ConnEvent::Recovered.into());
+    let (again, mut stream) = sent();
+    assert_eq!(
+        again, first,
+        "the same messages, so the host logs each once"
+    );
+    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(()));
+    cx.run_until_parked();
+    let shown = display_text(&workspace, cx);
+    assert!(!shown.contains("(unsent)"), "{shown:?}");
+}
+
 #[gpui::test]
 fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

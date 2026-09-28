@@ -76,6 +76,11 @@ pub enum UiBlock {
         sender: rho_agent_types::AgentId,
         text: String,
     },
+    /// A message the user wrote that no host has taken yet. Always last:
+    /// after the agent's own queue.
+    Unsent {
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

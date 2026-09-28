@@ -238,6 +238,8 @@ pub struct Workspace {
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
     transcripts: rho_agents_view::Transcripts,
+    /// What the user wrote that no host has taken yet.
+    outbox: rho_agents_client::outbox::Outbox,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -892,6 +894,7 @@ impl Workspace {
             hosts,
             active: ActiveAgents::default(),
             transcripts: rho_agents_view::Transcripts::default(),
+            outbox: rho_agents_client::outbox::Outbox::load(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -973,6 +976,10 @@ impl Workspace {
         // The marks are on this disk, so Home's first draw already shows
         // the user's own verdicts.
         this.refresh_workdirs();
+        // What the last session could not send shows where it waits.
+        for agent_id in this.outbox.agents() {
+            this.show_unsent(agent_id, cx);
+        }
         let agents: Vec<AgentId> = this.registry.known_agents().copied().collect();
         this.push_agent_marks(&agents);
         // A cold start lands on Home: what is running, what is next, and
@@ -1985,6 +1992,7 @@ impl Workspace {
                 // The focus set is this client's to keep; an agent host that
                 // just came up is told it whole.
                 self.send_agent_focus_to(host);
+                self.send_unsent_to(host, cx);
                 self.update_statuses(cx);
                 cx.notify();
             }
@@ -2013,6 +2021,7 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                self.send_unsent_to(host, cx);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -2302,15 +2311,6 @@ impl Workspace {
         content: Vec<ContentPart>,
         cx: &mut Context<Self>,
     ) {
-        if !self.connected() {
-            self.notice_on(
-                Some(&agent_id),
-                "not connected to an agent host",
-                StyleClass::SystemImportant,
-                cx,
-            );
-            return;
-        }
         rho_journal::record(rho_journal::Event::AgentMessageSent {
             agent: agent_id.encoded(),
             text: content
@@ -2326,12 +2326,75 @@ impl Workspace {
                 .filter(|part| !matches!(part, ContentPart::Text { .. }))
                 .count() as u32,
         });
-        self.send_to_agent(agent_id, AgentCommand::Send { agent_id, content }, cx);
+        // Kept before it is sent: a host that is down, or goes before it
+        // answers, gets it again when it is back.
+        self.outbox.push(agent_id, content);
+        self.show_unsent(agent_id, cx);
+        self.send_unsent(agent_id, cx);
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
         self.invalidate_dealer_signals(cx);
         cx.notify();
+    }
+
+    /// Sends each unsent message for a host's agents that just became
+    /// reachable.
+    fn send_unsent_to(&mut self, host: HostId, cx: &mut Context<Self>) {
+        for agent_id in self.outbox.agents() {
+            if self.host_of(agent_id) == Some(host) {
+                self.send_unsent(agent_id, cx);
+            }
+        }
+    }
+
+    /// Hands everything unsent to the agent to its host in one call, if the
+    /// host is up and no call of the agent's is already on its way. What is
+    /// written meanwhile goes when that call is answered.
+    fn send_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(host) = self
+            .host_of(agent_id)
+            .filter(|host| self.hosts.is_online(*host))
+        else {
+            return;
+        };
+        let Some(agents) = self.agents(host) else {
+            return;
+        };
+        let Some(command) = self.outbox.next(agent_id) else {
+            return;
+        };
+        let reply = agents.call(command);
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            this.update(cx, |this, cx| match reply {
+                Ok(()) => {
+                    this.outbox.delivered(agent_id);
+                    this.show_unsent(agent_id, cx);
+                    this.send_unsent(agent_id, cx);
+                }
+                Err(error) => {
+                    this.outbox.failed(agent_id);
+                    this.report_refusal(host, &format!("{error:#}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let texts = self.outbox.texts(agent_id);
+        let summary = self
+            .transcripts
+            .apply(agent_id, TranscriptFrame::Unsent(texts))
+            .summary;
+        if let Some(view) = self.models.get(&agent_id).cloned() {
+            self.sync_agent_model(agent_id, &view, summary, false, cx);
+        }
+        if let Some(view) = self.activity_models.get(&agent_id).cloned() {
+            self.sync_agent_model(agent_id, &view, summary, false, cx);
+        }
     }
 
     /// What the map says about the label in the start field. The map is
