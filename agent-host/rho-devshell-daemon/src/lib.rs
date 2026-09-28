@@ -22,6 +22,7 @@ use anyhow::Result;
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 pub use rho_devshell::Candidate;
+use rho_devshell::{Event, Stats};
 use rho_devshell::protocol::{self, Reply, Request};
 use rho_devshell::{activations_dir, activations_root, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
@@ -38,6 +39,8 @@ const NIX_STORE: &str = "/nix/store";
 
 const SHELLS_TABLE: &str = "devshell_shells";
 const SHELLS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new(SHELLS_TABLE);
+const STATS_TABLE: &str = "devshell_stats";
+const STATS: TableDefinition<(), Sen<Stats>> = TableDefinition::new(STATS_TABLE);
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct Entry {
@@ -62,6 +65,7 @@ pub struct Store {
 struct State {
     entries: BTreeMap<u64, Entry>,
     clock: u64,
+    stats: Stats,
 }
 
 impl Store {
@@ -167,6 +171,20 @@ impl Store {
         .await
     }
 
+    /// Count `event` in the stats.
+    pub async fn record(&self, event: Event) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.stats.record(event);
+        let mut write = self.db.write().await;
+        write.open_table(STATS).insert(&(), SenValue::borrowed(&state.stats));
+        write.commit();
+        Ok(())
+    }
+
+    pub async fn stats(&self) -> Stats {
+        self.state.lock().await.stats.clone()
+    }
+
     /// Listen on the socket in the shared cache directory, replacing a
     /// previous daemon's, and return the loop answering its clients.
     pub fn serve(self: Arc<Self>) -> Result<impl Future<Output = ()> + Send + 'static> {
@@ -197,6 +215,8 @@ impl Store {
                     data,
                 } => self.store(key, env_store_path, data).await.map(Reply::Stored),
                 Request::Forget(id) => self.forget(id).await.map(|()| Reply::Done),
+                Request::Record(event) => self.record(event).await.map(|()| Reply::Done),
+                Request::Stats => Ok(Reply::Stats(self.stats().await)),
             };
             let reply = result.unwrap_or_else(|error| Reply::Error(format!("{error:#}")));
             if protocol::write(&mut stream, &reply).await.is_err() {
@@ -244,6 +264,17 @@ async fn load(db: &RhoDb, dir: &Path) -> State {
             state.clock = state.clock.max(entry.used);
             state.entries.insert(id.value(), entry);
         }
+        state.stats = match read.has_table(STATS_TABLE) {
+            true => read.open_table(STATS).get(&()).map(|stats| stats.value().into_owned()),
+            false => None,
+        }
+        .unwrap_or_else(|| Stats {
+            since: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            ..Stats::default()
+        });
     }
     let pinned: HashSet<PathBuf> = state
         .entries
@@ -490,6 +521,30 @@ mod tests {
         store.lookup("k").await.unwrap();
         assert!(root_b.symlink_metadata().is_err());
         assert!(!store.used(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stats_count_events_and_survive_reopening() {
+        let f = Fixture::new().await;
+        let since = f.store.stats().await.since;
+        assert!(since > 0);
+        for event in [
+            Event::Hit { ms: 50 },
+            Event::Hit { ms: 70 },
+            Event::Miss { ms: 4000, stale: true },
+            Event::Kept { uses: 12 },
+            Event::Kept { uses: 3 },
+        ] {
+            f.store.record(event).await.unwrap();
+        }
+        let Fixture { temp, store } = f;
+        drop(store);
+        let stats = Fixture::open(&temp).await.stats().await;
+        assert_eq!(stats.since, since);
+        assert_eq!((stats.hit.count, stats.hit.total_ms, stats.hit.max_ms), (2, 120, 70));
+        assert_eq!((stats.stale.count, stats.miss.count), (1, 0));
+        assert_eq!(stats.kept, 15);
+        assert!(stats.to_string().contains("served from cache: 94.4% of 18"));
     }
 
     #[tokio::test]

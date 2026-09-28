@@ -321,6 +321,87 @@ pub struct Candidate {
     pub data: Vec<u8>,
 }
 
+/// What came of needing a flake's shell, counted in the daemon's [`Stats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub enum Event {
+    /// The builder found a cached shell whose inputs hold.
+    Hit { ms: u64 },
+    /// The builder evaluated and cached the shell: the key had no entry, or
+    /// only `stale` ones whose inputs had changed.
+    Miss { ms: u64, stale: bool },
+    /// The builder evaluated a shell it could not cache.
+    Uncached { ms: u64 },
+    /// The flake has no shell.
+    Failed { ms: u64 },
+    /// Commands a process ran in a shell it kept, without the builder.
+    Kept { uses: u64 },
+}
+
+/// How many of one outcome, and how long they took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct Timing {
+    pub count: u64,
+    pub total_ms: u64,
+    pub max_ms: u64,
+}
+
+impl Timing {
+    fn add(&mut self, ms: u64) {
+        self.count += 1;
+        self.total_ms += ms;
+        self.max_ms = self.max_ms.max(ms);
+    }
+}
+
+/// The daemon's counts of [`Event`]s since `since` (Unix seconds).
+#[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct Stats {
+    pub since: u64,
+    pub hit: Timing,
+    pub miss: Timing,
+    pub stale: Timing,
+    pub uncached: Timing,
+    pub failed: Timing,
+    pub kept: u64,
+}
+
+impl Stats {
+    pub fn record(&mut self, event: Event) {
+        match event {
+            Event::Hit { ms } => self.hit.add(ms),
+            Event::Miss { ms, stale: false } => self.miss.add(ms),
+            Event::Miss { ms, stale: true } => self.stale.add(ms),
+            Event::Uncached { ms } => self.uncached.add(ms),
+            Event::Failed { ms } => self.failed.add(ms),
+            Event::Kept { uses } => self.kept += uses,
+        }
+    }
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        writeln!(f, "over the last {:.1} hours", now.saturating_sub(self.since) as f64 / 3600.0)?;
+        writeln!(f, "{:<34}{:>8}", "kept (no builder)", self.kept)?;
+        for (name, timing) in [
+            ("hit", self.hit),
+            ("miss, new key", self.miss),
+            ("miss, inputs changed", self.stale),
+            ("evaluated, not cacheable", self.uncached),
+            ("failed", self.failed),
+        ] {
+            let mean = timing.total_ms.checked_div(timing.count).unwrap_or(0);
+            writeln!(f, "{name:<34}{:>8}   mean {mean:>6} ms   max {:>6} ms", timing.count, timing.max_ms)?;
+        }
+        let served = self.kept + self.hit.count;
+        let all = served + self.miss.count + self.stale.count + self.uncached.count + self.failed.count;
+        if all > 0 {
+            write!(f, "served from cache: {:.1}% of {all}", 100.0 * served as f64 / all as f64)?;
+        }
+        Ok(())
+    }
+}
+
 /// The GC root pinning `env_store_path` in the directory of roots. One per
 /// environment, whichever entries share it.
 pub fn gc_root(roots: &Path, env_store_path: &str) -> PathBuf {
@@ -506,6 +587,9 @@ struct Kept {
     subscription: rho_watch::Subscription,
     /// When the daemon last heard the entry was used.
     reported: Instant,
+    /// Uses since then, reported with it; those of a process that exits
+    /// first go uncounted.
+    uses: u64,
 }
 
 /// How often a kept shell in use is reported used, to stay among the
@@ -641,15 +725,17 @@ impl Resolver {
                 shells.remove(&slot);
                 return None;
             }
-            let report = kept.reported.elapsed() >= REPORT_USE_EVERY;
-            if report {
+            kept.uses += 1;
+            let report = (kept.reported.elapsed() >= REPORT_USE_EVERY).then(|| {
                 kept.reported = Instant::now();
-            }
+                std::mem::take(&mut kept.uses)
+            });
             (kept.resolved.clone(), report)
         };
-        if report && let (Some(cache), Some(id)) = (self.cache.clone(), resolved.id) {
+        if let (Some(uses), Some(cache), Some(id)) = (report, self.cache.clone(), resolved.id) {
             let pin = self.pin_command(&resolved.env_store_path);
             tokio::spawn(async move {
+                let _ = cache.record(Event::Kept { uses }).await;
                 if let Ok(false) = cache.used(id).await
                     && let Ok(false) = pinned(pin).await
                 {
@@ -722,6 +808,7 @@ impl Resolver {
                 resolved,
                 subscription,
                 reported: Instant::now(),
+                uses: 0,
             },
         );
     }

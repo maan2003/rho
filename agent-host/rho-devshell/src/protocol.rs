@@ -11,7 +11,7 @@ use senax_encoder::{Decode, Encode};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
-use crate::Candidate;
+use crate::{Candidate, Event, Stats};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -30,6 +30,8 @@ pub enum Request {
         data: Vec<u8>,
     },
     Forget(u64),
+    Record(Event),
+    Stats,
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -38,6 +40,7 @@ pub enum Reply {
     Rooted(bool),
     Stored(u64),
     Done,
+    Stats(Stats),
     Error(String),
 }
 
@@ -149,6 +152,20 @@ impl Client {
         };
         match self.request(request).await? {
             Reply::Stored(id) => Ok(id),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub async fn record(&self, event: Event) -> Result<()> {
+        match self.request(Request::Record(event)).await? {
+            Reply::Done => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub async fn stats(&self) -> Result<Stats> {
+        match self.request(Request::Stats).await? {
+            Reply::Stats(stats) => Ok(stats),
             _ => Err(unexpected()),
         }
     }
