@@ -1,143 +1,18 @@
+//! Retained workset execution, independent of loaded agents.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use senax_encoder::{Decode, Encode};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use super::transport::{Port, Sender};
-
-#[derive(Encode, Decode)]
-pub enum Action {
-    TerminalList,
-    ShellList,
-    ShellStart {
-        agent: rho_agent_types::AgentId,
-        cwd: camino::Utf8PathBuf,
-        program: std::path::PathBuf,
-        pager: std::path::PathBuf,
-    },
-    ShellClose {
-        agent: rho_agent_types::AgentId,
-    },
-    Desktop {
-        agent: rho_agent_types::AgentId,
-        session: String,
-    },
-    DesktopList,
-}
-
-#[derive(Encode, Decode)]
-pub enum Attach {
-    Terminal {
-        agent: rho_agent_types::AgentId,
-        terminal: u64,
-        create: bool,
-        cols: u16,
-        rows: u16,
-        cwd: camino::Utf8PathBuf,
-        shell: String,
-    },
-    Shell {
-        agent: rho_agent_types::AgentId,
-    },
-}
-
-#[derive(Encode, Decode)]
-pub enum Reply {
-    Done,
-    Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
-    Shells(Vec<rho_shell_view::protocol::ShellInfo>),
-    Error(String),
-    Desktop { socket: String },
-    DesktopSessions(Vec<rho_desktop_client::protocol::DesktopSession>),
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Message {
-    Policy(Vec<u8>),
-    Action { id: u64, action: Action },
-    Attach { id: u64, port: Port, attach: Attach },
-    Reply { id: u64, body: Reply },
-    Detach(Port),
-}
-
-pub(super) fn encode<T: senax_encoder::Encoder>(value: &T) -> anyhow::Result<bytes::Bytes> {
-    let mut bytes = bytes::BytesMut::new();
-    senax_encoder::encode_to(value, &mut bytes)
-        .map_err(|_| anyhow::anyhow!("encode workset message"))?;
-    Ok(bytes.freeze())
-}
-
-pub(super) fn decode<T: senax_encoder::Decoder>(bytes: &[u8]) -> anyhow::Result<T> {
-    let mut remaining = bytes;
-    let value = senax_encoder::decode(&mut remaining)
-        .map_err(|_| anyhow::anyhow!("invalid workset message"))?;
-    anyhow::ensure!(remaining.is_empty(), "trailing workset message data");
-    Ok(value)
-}
-
-/// One GUI attachment. It owns no PTY, shell, or transport connection.
-pub struct Client {
-    pub(super) port: Port,
-    pub(super) sender: Sender,
-    pub(super) incoming: mpsc::Receiver<bytes::Bytes>,
-    pub(super) commands: mpsc::UnboundedSender<Message>,
-}
-impl Client {
-    /// Relay one already-authenticated GUI stream without owning execution.
-    pub async fn relay<R, W, I, O>(mut self, mut reader: R, mut writer: W) -> anyhow::Result<()>
-    where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
-        I: senax_encoder::Unpacker + senax_encoder::Encoder,
-        O: senax_encoder::Decoder + senax_encoder::Packer,
-    {
-        let input = async {
-            while let Some((frame, _)) =
-                rho_rpc::read_frame_optional::<_, I>(&mut reader, rho_rpc::protocol::MAX_FRAME_LEN)
-                    .await?
-            {
-                self.sender.send(self.port, encode(&frame)?).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        };
-        let output = async {
-            while let Some(bytes) = self.incoming.recv().await {
-                let frame: O = decode(&bytes)?;
-                rho_rpc::write_frame(&mut writer, &frame, rho_rpc::protocol::MAX_FRAME_LEN).await?;
-            }
-            tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
-            Ok::<(), anyhow::Error>(())
-        };
-        tokio::select! { result = input => result, result = output => result }
-    }
-}
-impl Drop for Client {
-    fn drop(&mut self) {
-        let _ = self.commands.send(Message::Detach(self.port));
-    }
-}
-
-pub(super) type Clients = Arc<Mutex<HashMap<Port, mpsc::Sender<bytes::Bytes>>>>;
-pub(super) type Pending = Arc<
-    Mutex<
-        HashMap<
-            u64,
-            (
-                oneshot::Sender<Reply>,
-                Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-            ),
-        >,
-    >,
->;
+use crate::ipc::transport::{Port, Sender};
+use crate::ipc::workset::{Action, Attach, Message, Reply, decode, encode};
 
 /// Root-owned retained execution, independent of loaded agent handles.
-pub(super) struct Execution {
-    pub base: Arc<crate::View>,
-    pub terminals: Arc<crate::terminal::TerminalRegistry>,
-    pub shells: Arc<crate::shell::ShellRegistry>,
-    pub clients: Clients,
+pub(crate) struct Execution {
+    pub terminals: Arc<crate::worker::terminal::TerminalRegistry>,
+    pub shells: Arc<crate::worker::shell::ShellRegistry>,
+    pub clients: Arc<Mutex<HashMap<Port, mpsc::Sender<bytes::Bytes>>>>,
 }
 impl Execution {
     pub async fn action(&self, action: Action) -> anyhow::Result<Reply> {
@@ -205,8 +80,8 @@ impl Execution {
                 self.shells
                     .start(
                         agent,
-                        crate::shell::ShellSpawn {
-                            view: self.base.for_cwd(&cwd)?,
+                        crate::worker::shell::ShellSpawn {
+                            cwd,
                             program: program.into_os_string(),
                             args: Vec::new(),
                             pager_program: pager.into_os_string(),
@@ -246,10 +121,7 @@ impl Execution {
                             terminal,
                             cols,
                             rows,
-                            crate::terminal::TerminalSpawn {
-                                view: self.base.for_cwd(&cwd)?,
-                                shell,
-                            },
+                            crate::worker::terminal::TerminalSpawn { cwd, shell },
                         )
                         .await?
                 } else {
@@ -277,7 +149,7 @@ impl Execution {
                     while let Some(bytes) = incoming.recv().await {
                         use rho_terminal::protocol::TermClientFrame as F;
 
-                        use crate::terminal::ClientInput as I;
+                        use crate::worker::terminal::ClientInput as I;
                         let input = match decode::<F>(&bytes)? {
                             F::Input(bytes) => I::Bytes(bytes),
                             F::Resize { cols, rows } => I::Resize { cols, rows },
@@ -328,21 +200,21 @@ impl Execution {
 }
 
 async fn serve_shell(
-    client: crate::shell::ShellClient,
+    client: crate::worker::shell::ShellClient,
     mut incoming: mpsc::Receiver<bytes::Bytes>,
     sender: Sender,
     port: Port,
 ) -> anyhow::Result<()> {
     use rho_shell_view::protocol::{ShellClientFrame as C, ShellServerFrame as S};
 
-    use crate::shell::{ShellControl, ShellSubmitError};
-    let crate::shell::ShellClient {
+    use crate::worker::shell::{ShellControl, ShellSubmitError};
+    let crate::worker::shell::ShellClient {
         mut frames,
         mut exit,
         submit,
         control,
     } = client;
-    let (accepted, mut accepting) = mpsc::channel(crate::shell::SUBMIT_QUEUE);
+    let (accepted, mut accepting) = mpsc::channel(crate::worker::shell::SUBMIT_QUEUE);
     let output = async {
         loop {
             while let Ok((submission, execution)) = accepting.try_recv() {

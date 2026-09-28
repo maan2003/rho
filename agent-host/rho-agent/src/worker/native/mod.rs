@@ -25,7 +25,6 @@ use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::db::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime, UnixMillis};
 use crate::entry::{
     Block, Entry, MessageId, Notice, Party, Report, RequestNotice, ResponseUsage, Wake,
 };
@@ -33,12 +32,12 @@ use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event, Image, Inference, InferenceSession, Request, Response, Step,
 };
-use crate::runtime::mailroom::{Mailroom, Outbound};
-use crate::runtime::wake::{Decision, Facts};
-use crate::runtime::{Progress, tools, wake};
-use crate::{
-    AgentEvent, AgentStatus, InferenceState, RuntimeState, StreamingResponse, View, prompt,
-};
+use crate::log::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime, UnixMillis};
+use crate::worker::host_client::{HostClient, StoreError};
+use crate::worker::shared::mailroom::{Mailroom, Outbound};
+use crate::worker::shared::wake::{Decision, Facts};
+use crate::worker::shared::{Progress, tools, wake};
+use crate::{AgentEvent, AgentStatus, InferenceState, RuntimeState, StreamingResponse, prompt};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
 struct Backoff {
@@ -83,16 +82,9 @@ pub struct AgentHandle {
     /// The record as the loop keeps it: read here instead of folding the
     /// log again for every mail, tool call, or shell.
     head: Arc<RwLock<AgentHead>>,
-    /// Cwd and command configuration within the already-entered workset.
-    view: Arc<View>,
 }
 
 impl AgentHandle {
-    /// Cwd and command configuration within the worker's workset.
-    pub fn view(&self) -> Arc<View> {
-        Arc::clone(&self.view)
-    }
-
     pub fn status(&self) -> AgentStatus {
         self.status.read().expect("poison").clone()
     }
@@ -298,11 +290,11 @@ struct PreparedTurn {
     instructions: Arc<str>,
     input: Vec<crate::inference::Item>,
     previous: Option<crate::inference::Continuation>,
-    boundary: oneshot::Receiver<crate::db::ContextBoundary>,
+    boundary: oneshot::Receiver<crate::log::ContextBoundary>,
     cache_key: CacheKey,
 }
 impl PreparedTurn {
-    async fn request(&mut self, host: &crate::worker::Host) -> anyhow::Result<Request> {
+    async fn request(&mut self, host: &HostClient) -> anyhow::Result<Request> {
         if let Some(previous) = self.previous.take() {
             return Ok(Request::continuation(
                 self.instructions.clone(),
@@ -325,12 +317,12 @@ impl PreparedTurn {
 
 pub(crate) struct Agent {
     agent_id: AgentId,
-    host: Arc<crate::worker::Host>,
+    host: Arc<HostClient>,
     writer: persistence::Writer,
     inference: Inference,
     session: InferenceSession,
     model_name: String,
-    view: Arc<View>,
+    cwd: camino::Utf8PathBuf,
     context: context::Context,
     continuation: Option<crate::inference::Continuation>,
     notebook: Option<Notebook>,
@@ -377,9 +369,9 @@ impl Agent {
     /// opening a database or retaining the pool.
     pub(crate) async fn load(
         agent_id: AgentId,
-        host: Arc<crate::worker::Host>,
+        host: Arc<HostClient>,
         inference: Inference,
-        view: Arc<View>,
+        cwd: camino::Utf8PathBuf,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
@@ -401,7 +393,7 @@ impl Agent {
             inference,
             session,
             model_name,
-            view: Arc::clone(&view),
+            cwd,
             context,
             continuation: None,
             notebook: None,
@@ -440,7 +432,6 @@ impl Agent {
                 control,
                 status,
                 head,
-                view,
             },
             agent,
         ))
@@ -630,10 +621,7 @@ impl Agent {
             }
             Control::ChangeRole { role, reply } => {
                 let result = self.change_role(role).await;
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<crate::worker::StoreError>())
-                {
+                if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
                     return result;
                 }
                 let _ = reply.send(result);
@@ -644,10 +632,7 @@ impl Agent {
             }
             Control::Rewind { turns, reply } => {
                 let result = self.rewind(turns).await;
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<crate::worker::StoreError>())
-                {
+                if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
                     return result;
                 }
                 let _ = reply.send(result);
@@ -932,11 +917,10 @@ impl Agent {
     /// Start the notebook on first use; workset setup has already completed.
     async fn notebook(&mut self) -> anyhow::Result<&Notebook> {
         if self.notebook.is_none() {
-            let view = Arc::clone(&self.view);
             let team = self.host.team().await?;
             let role = self.head.read().expect("poison").config.role;
             let (shell, exports) = tools::host_tools(
-                &view,
+                &self.cwd,
                 role,
                 self.agent_id,
                 Some(&self.inference),
@@ -952,10 +936,16 @@ impl Agent {
     }
 
     async fn instructions(&mut self) -> anyhow::Result<Arc<str>> {
-        let view = Arc::clone(&self.view);
         let team = self.host.team().await?;
-        let role = self.head.read().expect("poison").config.role;
-        Ok(prompt::prompt(&view, team.as_ref(), role))
+        let (role, mode) = {
+            let head = self.head.read().expect("poison");
+            (head.config.role, head.config.place.mode)
+        };
+        Ok(prompt::prompt(
+            &prompt::WorksetPrompt::new(&self.cwd, mode),
+            team.as_ref(),
+            role,
+        ))
     }
 
     async fn wake_model(&mut self, why: Wake) -> anyhow::Result<()> {
@@ -1441,7 +1431,7 @@ impl Agent {
 /// billed under. Credentials come from the agent host's account selection.
 fn inference_session(
     inference: &Inference,
-    binding: crate::db::SessionBinding,
+    binding: crate::log::SessionBinding,
 ) -> anyhow::Result<(InferenceSession, String)> {
     let profile: InferenceProfile = binding
         .deep_config()
@@ -1450,9 +1440,9 @@ fn inference_session(
         .deep_model()
         .ok_or_else(|| anyhow::anyhow!("Rho runtime stored without a model"))?;
     let billed = match model {
-        InferenceModel::Gpt6Astra => crate::db::AgentUsageModel::ASTRA,
-        InferenceModel::Gpt6Luna => crate::db::AgentUsageModel::LUNA,
-        InferenceModel::Gpt6Sol => crate::db::AgentUsageModel::GPT,
+        InferenceModel::Gpt6Astra => crate::log::AgentUsageModel::ASTRA,
+        InferenceModel::Gpt6Luna => crate::log::AgentUsageModel::LUNA,
+        InferenceModel::Gpt6Sol => crate::log::AgentUsageModel::GPT,
     };
     Ok((inference.session(profile, model), billed.name().to_owned()))
 }
@@ -1481,13 +1471,15 @@ fn until(at: UnixMs) -> Duration {
 /// entry point a new agent of that role would get, without constructing a
 /// notebook.
 pub fn render_agent_surface(
-    view: Arc<View>,
+    workset: &rho_fs_view::Workset,
+    place: &rho_agent_types::Place,
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
+    let place = prompt::WorksetPrompt::for_host(workset, place);
     let binding = role.session_profile();
     if binding.claude_model().is_some() {
         return Ok(crate::RenderedAgentSurface {
-            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role),
+            system_prompt: prompt::claude_prompt(Some(&place), None, role),
             tools: Arc::from([rho_claude::mcp::exec_spec()]),
         });
     }
@@ -1495,7 +1487,7 @@ pub fn render_agent_surface(
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
     Ok(crate::RenderedAgentSurface {
-        system_prompt: prompt::prompt(&view, None, role),
+        system_prompt: prompt::prompt(&place, None, role),
         tools: Arc::from([rho_agent_types::transcript::ToolSpec {
             name: rho_agent_types::transcript::ToolName::try_from("exec").unwrap(),
             tool_type: rho_agent_types::transcript::ToolType::Custom,

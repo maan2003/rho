@@ -199,7 +199,7 @@ mod tests {
                 None,
                 super::super::tests::test_workspace(),
                 Default::default(),
-                crate::db::SessionBinding::ResponsesSol(Default::default()),
+                crate::log::SessionBinding::ResponsesSol(Default::default()),
                 super::super::tests::test_agent_runtime(),
                 super::super::AgentOrigin::User,
             );
@@ -302,7 +302,7 @@ mod tests {
             None,
             super::super::tests::test_workspace(),
             Default::default(),
-            crate::db::SessionBinding::ResponsesSol(Default::default()),
+            crate::log::SessionBinding::ResponsesSol(Default::default()),
             super::super::tests::test_agent_runtime(),
             super::super::AgentOrigin::User,
         );

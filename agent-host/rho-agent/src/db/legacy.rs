@@ -18,7 +18,7 @@ pub enum NativeEvent {
         /// records preserve all original entries and response boundaries.
         output: Vec<ContextBlock>,
         context_used: Option<u64>,
-        usage: Option<crate::db::AgentUsageBucket>,
+        usage: Option<crate::log::AgentUsageBucket>,
         at: UnixMs,
     },
     RequestFailed {
@@ -160,7 +160,7 @@ pub(super) fn request(entries: &[Entry]) -> Vec<Item> {
                 for id in delivered {
                     if let Some((from, body)) = messages.remove(id) {
                         items.push(Item::User {
-                            text: crate::agent::context::render_message(&from, &body),
+                            text: crate::worker::native::context::render_message(&from, &body),
                             images: body
                                 .into_iter()
                                 .filter_map(|b| match b {

@@ -23,17 +23,20 @@ fn main() {
         eprintln!("skipping python_workspace: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    common::run("", |base| async move {
+    common::run("", || async move {
         let host_cwd = std::env::current_dir().unwrap();
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
         let work = std::path::Path::new("/src");
         std::fs::create_dir_all(work.join("project")).unwrap();
         std::fs::write(work.join("project/value"), "host").unwrap();
-        let view = base.for_cwd(camino::Utf8Path::new("/src/project")).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
         let notebook = Notebook::new(
-            ShellTools::new(Duration::from_secs(5), view),
+            ShellTools::in_directory(
+                Duration::from_secs(5),
+                "/src/project".into(),
+                Default::default(),
+            ),
             vec![],
             wake.clone(),
         )

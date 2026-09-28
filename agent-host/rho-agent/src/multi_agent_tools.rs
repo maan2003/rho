@@ -15,7 +15,7 @@ use rho_agent_types::{AgentId, AgentRole};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::AgentReadTxnExt as _;
-use crate::pool::AgentPool;
+use crate::host::pool::AgentPool;
 
 /// Startup presentation identities for a worker's prompts. Pool capabilities
 /// never cross into the worker; its snapshot keeps the original handles even
@@ -24,7 +24,7 @@ use crate::pool::AgentPool;
 pub struct Team {
     pub agent: String,
     pub parent: Option<String>,
-    pub spawned_by: crate::db::AgentSpawnedBy,
+    pub spawned_by: crate::log::AgentSpawnedBy,
     /// The Engineer that started a user-owned agent for the user.
     pub started_by: Option<String>,
 }
@@ -58,7 +58,7 @@ impl MultiAgentTools {
         let pool = self.pool()?;
         let spawned_by = pool.db().read().get_agent(self.self_id).config.spawned_by;
         let started_by = match spawned_by {
-            crate::db::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)),
+            crate::log::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)),
             _ => None,
         };
         Ok(Team {
@@ -232,7 +232,7 @@ fn ensure_may_interrupt(pool: &AgentPool, sender: AgentId, target: AgentId) -> a
     let read = pool.db().read();
     let user_owned = matches!(
         read.get_agent(target).config.spawned_by,
-        crate::db::AgentSpawnedBy::UserOwned { .. }
+        crate::log::AgentSpawnedBy::UserOwned { .. }
     );
     anyhow::ensure!(
         !user_owned || read.agent_parent(sender) == Some(target),

@@ -19,8 +19,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::entry::Wake;
-use crate::runtime::Progress;
-use crate::runtime::wake::{self, Decision};
+use crate::worker::shared::Progress;
+use crate::worker::shared::wake::{self, Decision};
 use crate::{WakeFacts, WakeTrigger};
 
 /// One exec call the CLI is waiting on.

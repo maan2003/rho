@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::entry::{Entry, Party};
 use rho_agent::{AgentEvent, StartPlace};
-use rho_agent_types::{AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
+use rho_agent_types::{AgentRole, EngineerIntelligence, Place, TurnEdge, TurnOutcome, WorksetMode};
 use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
@@ -100,16 +100,17 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         rho_fs_view::StoreService::None,
     )
     .await?;
-    let view = worksets.adopt(&workdir)?.enter(
-        rho_fs_view::Mode::View {
-            home_skeleton: None,
-        },
-        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-    )?;
+    let workset = worksets.adopt(&workdir)?;
+    let place = Place {
+        workset: workset.id().to_owned(),
+        cwd: rho_fs_view::MOUNT_ROOT.into(),
+        mode: WorksetMode::View,
+        origin: None,
+    };
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
     rho_inference::ensure_crypto_provider();
     let inference = rho_inference::Accounts::new(db.clone()).await?;
-    let pool = rho_agent::pool::AgentPool::new(
+    let pool = rho_agent::host::pool::AgentPool::new(
         db.clone(),
         std::sync::Arc::new(inference),
         worksets,
@@ -129,14 +130,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     };
     let mut feed = rho_agent::journal::feed(&db);
     let (id, agent) = pool
-        .create(
-            role,
-            Some("CLI evaluation".into()),
-            StartPlace::new(view, None),
-        )
+        .create(role, Some("CLI evaluation".into()), StartPlace::new(place))
         .await?;
     // Drop is also cancellation, including early output/connection failures.
-    struct CancelOnDrop(rho_agent::pool::RunningAgent);
+    struct CancelOnDrop(rho_agent::host::AgentClient);
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
             self.0.cancel();
@@ -145,7 +142,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     let _cancel = CancelOnDrop(agent.clone());
     let model = match db
         .read()
-        .agent_event(id, rho_agent::db::AgentEventPos::new(0))
+        .agent_event(id, rho_agent::log::AgentEventPos::new(0))
     {
         Some(AgentEvent::Created { binding, .. }) => {
             binding.deep_model().map(|model| model.as_str())

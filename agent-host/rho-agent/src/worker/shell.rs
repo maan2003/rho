@@ -42,8 +42,8 @@ const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
 
 pub struct ShellSpawn {
-    pub view: Arc<rho_fs_view::Namespace>,
-    /// Shell sidecar launched through the agent View.
+    pub cwd: camino::Utf8PathBuf,
+    /// Shell sidecar in the already-entered workset.
     pub program: OsString,
     pub args: Vec<OsString>,
     pub pager_program: OsString,
@@ -1074,7 +1074,7 @@ impl Session {
             UnixStream::from_std(parent_control).context("register rho-shell control socket")?;
 
         // In the dev shell of the agent's working directory.
-        let cwd = spawn.view.command_cwd(None)?;
+        let cwd = spawn.cwd;
         let mut command = rho_devshell::command(cwd.as_std_path(), &spawn.program).await;
         command.args(&spawn.args);
         command
@@ -1084,14 +1084,14 @@ impl Session {
             .env("GIT_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
-        spawn.view.prepare_command(&mut command, None).await?;
+        rho_fs_view::command_stdio_only(&mut command);
+        command.current_dir(&cwd);
         command.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
             child_control,
         )));
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
-        // Enter the workspace namespace first, then make the child a session
-        // leader. rho-shell remains isolated as a session leader; the workset retains
+        // rho-shell is a session leader; the workset retains
         // the session id for generic process cleanup.
         unsafe {
             command.pre_exec(|| {

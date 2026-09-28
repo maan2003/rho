@@ -197,6 +197,53 @@ async fn shell_command_inherits_tool_environment() {
 }
 
 #[tokio::test]
+async fn shell_inherits_process_environment_and_explicit_override_wins() {
+    let inherited_home = std::env::var("HOME").unwrap();
+    let inherited = test_tools(2)
+        .call_code_mode(shell_call(json!({"cmd": "printf '%s' \"$HOME\""})))
+        .await
+        .unwrap();
+    assert_eq!(inherited["exit_code"], 0);
+    assert_eq!(inherited["output"], inherited_home);
+
+    let overridden = test_tools(2)
+        .with_env("HOME", "/explicit-home")
+        .call_code_mode(shell_call(json!({"cmd": "printf '%s' \"$HOME\""})))
+        .await
+        .unwrap();
+    assert_eq!(overridden["exit_code"], 0);
+    assert_eq!(overridden["output"], "/explicit-home");
+}
+
+#[tokio::test]
+async fn requested_workdir_does_not_change_the_process_or_other_commands_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    let process_cwd = std::env::current_dir().unwrap();
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(left.clone()).unwrap(),
+        PathOverrides::default(),
+    );
+    let moved = tools
+        .call_code_mode(shell_call(json!({"cmd": "pwd", "workdir": right})))
+        .await
+        .unwrap();
+    let default = tools
+        .call_code_mode(shell_call(json!({"cmd": "pwd"})))
+        .await
+        .unwrap();
+    assert_eq!(moved["exit_code"], 0);
+    assert_eq!(moved["output"], format!("{}\n", right.display()));
+    assert_eq!(default["exit_code"], 0);
+    assert_eq!(default["output"], format!("{}\n", left.display()));
+    assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+}
+
+#[tokio::test]
 async fn nonzero_exit_is_structured_result_not_tool_error() {
     let tools = test_tools(2);
     let result = tools
@@ -284,6 +331,61 @@ async fn shell_commands_run_in_the_agents_working_directory() {
         "expected pwd under {expected:?}, got: {}",
         result.output
     );
+}
+
+#[test]
+fn interpreter_cwd_is_private_to_its_thread() {
+    let temp = tempfile::tempdir().unwrap();
+    let process_cwd = std::env::current_dir().unwrap();
+    let target = temp.path().to_owned();
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(target.clone()).unwrap(),
+        PathOverrides::default(),
+    );
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            unsafe { tools.enter_interpreter_thread().await }.unwrap();
+            assert_eq!(std::env::current_dir().unwrap(), target);
+        });
+    })
+    .join()
+    .unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+}
+
+#[tokio::test]
+async fn patch_paths_are_absolute_or_relative_to_the_tools_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(root.clone()).unwrap(),
+        PathOverrides::default(),
+    );
+    let absolute = temp.path().join("absolute.txt");
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: relative.txt\n+relative\n*** Add File: {}\n+absolute\n*** End Patch",
+        absolute.display()
+    );
+    let result = tools.call(patch_call(patch)).await;
+    assert_eq!(
+        result.status,
+        ToolOutputStatus::Success,
+        "{}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("relative.txt")).unwrap(),
+        "relative\n"
+    );
+    assert_eq!(std::fs::read_to_string(absolute).unwrap(), "absolute\n");
+    assert!(!temp.path().join("relative.txt").exists());
 }
 
 #[tokio::test]

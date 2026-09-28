@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use rho_agent::db::{
-    AgentReadTxnExt as _, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
-    QuotaObservationRecord, QuotaProvider,
+    AgentReadTxnExt as _, AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider,
 };
+use rho_agent::log::AgentUsageModel;
 use rho_agent_types::AgentId;
 use rho_agents_client::protocol::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, QuotaPoint,
@@ -77,7 +77,7 @@ fn claude_quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
         .collect()
 }
 
-fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsageBucket {
+fn ui_agent_usage_bucket(bucket: rho_agent::log::AgentUsageBucket) -> UiAgentUsageBucket {
     UiAgentUsageBucket {
         bucket_start_ms: bucket.bucket_start_ms,
         input_tokens: bucket.input_tokens,
@@ -94,19 +94,19 @@ fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsag
 /// usage-share chart renders. The persisted key begins with time, so the
 /// preceding database query is already a bounded range scan.
 fn hourly_global_usage_series(
-    usage: Vec<(AgentUsageModel, rho_agent::db::AgentUsageBucket)>,
+    usage: Vec<(AgentUsageModel, rho_agent::log::AgentUsageBucket)>,
 ) -> Vec<AgentUsageSeries> {
     const HOUR_MS: u64 = 60 * 60 * 1_000;
 
-    let mut hourly = BTreeMap::<(AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>::new();
+    let mut hourly = BTreeMap::<(AgentUsageModel, u64), rho_agent::log::AgentUsageBucket>::new();
     for (model, bucket) in usage {
         let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
         hourly
             .entry((model, bucket_start_ms))
-            .or_insert_with(|| rho_agent::db::AgentUsageBucket {
+            .or_insert_with(|| rho_agent::log::AgentUsageBucket {
                 bucket_start_ms,
                 model,
-                ..rho_agent::db::AgentUsageBucket::default()
+                ..rho_agent::log::AgentUsageBucket::default()
             })
             .add(&bucket);
     }
@@ -178,9 +178,9 @@ fn hourly_agent_cost_series(
 }
 
 fn merge_hourly_agent_cost_bucket(
-    hourly: &mut BTreeMap<(AgentId, AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>,
+    hourly: &mut BTreeMap<(AgentId, AgentUsageModel, u64), rho_agent::log::AgentUsageBucket>,
     agent_id: AgentId,
-    bucket: rho_agent::db::AgentUsageBucket,
+    bucket: rho_agent::log::AgentUsageBucket,
     max_buckets: usize,
 ) -> anyhow::Result<()> {
     const HOUR_MS: u64 = 60 * 60 * 1_000;
@@ -188,10 +188,10 @@ fn merge_hourly_agent_cost_bucket(
     let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
     hourly
         .entry((agent_id, bucket.model, bucket_start_ms))
-        .or_insert_with(|| rho_agent::db::AgentUsageBucket {
+        .or_insert_with(|| rho_agent::log::AgentUsageBucket {
             bucket_start_ms,
             model: bucket.model,
-            ..rho_agent::db::AgentUsageBucket::default()
+            ..rho_agent::log::AgentUsageBucket::default()
         })
         .add(&bucket);
     anyhow::ensure!(
@@ -368,9 +368,8 @@ pub(crate) fn spawn_claude_quota_recorder(
 mod tests {
     use std::collections::BTreeMap;
 
-    use rho_agent::db::{
-        AgentUsageModel, AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider,
-    };
+    use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
+    use rho_agent::log::AgentUsageModel;
     use rho_db::RhoDb;
 
     use super::{
@@ -380,7 +379,7 @@ mod tests {
 
     #[test]
     fn global_usage_response_rolls_five_minute_buckets_up_to_hours() {
-        let bucket = |model, bucket_start_ms, input_tokens| rho_agent::db::AgentUsageBucket {
+        let bucket = |model, bucket_start_ms, input_tokens| rho_agent::log::AgentUsageBucket {
             bucket_start_ms,
             model,
             input_tokens,
@@ -418,7 +417,7 @@ mod tests {
     fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
         let agent_id =
             rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
+        let bucket = |bucket_start_ms| rho_agent::log::AgentUsageBucket {
             bucket_start_ms,
             model: AgentUsageModel::GPT,
             requests: 1,

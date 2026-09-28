@@ -1,175 +1,17 @@
-//! A private, full-duplex Unix channel. The reader only routes messages;
-//! it never waits for a service request to finish.
+//! Worker-side client for host-owned persistence and services.
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
-use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
-use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
-
-pub(super) const VERSION: u32 = 16;
-
-#[derive(Encode, Decode)]
-pub(super) struct Bootstrap {
-    pub cwd: camino::Utf8PathBuf,
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Control {
-    Retire,
-    Drain,
-    User {
-        content: Vec<rho_agent_types::ContentPart>,
-    },
-    Mail {
-        sender: rho_agent_types::AgentId,
-        label: String,
-        body: String,
-    },
-    NoticeCarried,
-    TellTail,
-    Compact,
-    Cancel,
-    Retry,
-    Effort(rho_claude::Effort),
-    Role(rho_agent_types::AgentRole),
-    CacheKey,
-    Rewind(u32),
-}
-
-/// A notebook host function the agent host answers for the worker.
-#[derive(Debug, Encode, Decode)]
-pub(crate) enum SharedCall {
-    Agent(crate::multi_agent_tools::AgentCall),
-    Papercut(crate::papercut::PapercutArgs),
-}
-
-/// How the agent host answered a [`SharedCall`]: text for the model either way.
-#[derive(Encode, Decode)]
-pub(super) enum SharedReply {
-    Ok(String),
-    Err(String),
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Request<'a> {
-    Name(String),
-    Team,
-    SharedTool(SharedCall),
-    Usage(AgentUsageBucket),
-    MessageSent(String),
-    Failed(String),
-    Settled,
-    Head,
-    History,
-    NativeHistory(Option<crate::db::ContextBoundary>),
-    Append(AgentEvent<'a>),
-    AppendBatch(Vec<AgentEvent<'static>>),
-    Profile {
-        role: AgentRole,
-        binding: SessionBinding,
-    },
-    CacheKey(crate::inference::PromptCacheKey),
-    Rewind {
-        at: UnixMs,
-        to: AgentEventPos,
-    },
-    ClaudeRewind {
-        at: UnixMs,
-        to: Option<AgentEventPos>,
-        rewind: Option<ClaudeRewind>,
-    },
-    CompleteClaudeRewind(uuid::Uuid),
-    ClaudeAccount,
-    ClaudePendingOutput,
-    UsageTotal,
-    Turn {
-        at: UnixMs,
-        edge: TurnEdge,
-    },
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Reply {
-    Team(Option<crate::multi_agent_tools::Team>),
-    Shared(SharedReply),
-    Head(AgentHead),
-    History {
-        next: AgentEventPos,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
-    },
-    NativeHistory {
-        boundary: crate::db::ContextBoundary,
-        recovery: crate::db::NativeRecovery,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
-    },
-    Boundary(crate::db::ContextBoundary),
-    Position(AgentEventPos),
-    ClaudeAccount(String),
-    ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
-    Usage(AgentUsageBucket),
-    Error(String),
-    Done,
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Message<'a> {
-    Stop,
-    Stopped {
-        error: Option<String>,
-    },
-    Bootstrap(Bootstrap),
-    Ready {
-        status: crate::AgentStatus,
-    },
-    Control {
-        id: u64,
-        body: Control,
-    },
-    Controlled {
-        id: u64,
-        error: Option<String>,
-    },
-    Named(AgentHead),
-    Status {
-        status: crate::AgentStatus,
-        queue: Option<Vec<crate::QueuedInput>>,
-    },
-    HistoryBatch {
-        id: u64,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
-    },
-    Request {
-        id: u64,
-        body: Request<'a>,
-    },
-    Reply {
-        id: u64,
-        body: Reply,
-    },
-}
-
-pub(super) fn decode(bytes: &[u8]) -> io::Result<Message<'static>> {
-    let mut remaining = bytes;
-    let message = senax_encoder::decode(&mut remaining)
-        .map_err(|_| io::Error::other("invalid agent message"))?;
-    if !remaining.is_empty() {
-        return Err(io::Error::other("trailing agent message data"));
-    }
-    Ok(message)
-}
-
-pub(super) fn encode(message: &Message<'_>) -> io::Result<bytes::Bytes> {
-    let mut bytes = bytes::BytesMut::new();
-    senax_encoder::encode_to(message, &mut bytes)
-        .map_err(|_| io::Error::other("invalid agent message"))?;
-    Ok(bytes.freeze())
-}
+use crate::ipc::protocol::{
+    Control, Message, Reply, Request, SharedCall, SharedReply, decode, encode,
+};
+use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
 #[derive(Default)]
 struct Replies {
@@ -205,7 +47,7 @@ struct Publication {
 
 /// Worker-side services. There is no database or account manager behind this
 /// handle. Dropping the last handle closes the socket and its reader task.
-pub(crate) struct Host {
+pub(crate) struct HostClient {
     outgoing: mpsc::Sender<bytes::Bytes>,
     controls: Mutex<Option<mpsc::UnboundedReceiver<(u64, Control)>>>,
     waiters: Waiters,
@@ -217,9 +59,9 @@ pub(crate) struct Host {
     team: tokio::sync::OnceCell<Option<crate::multi_agent_tools::Team>>,
 }
 
-impl std::fmt::Debug for Host {
+impl std::fmt::Debug for HostClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkerHost")
+        f.debug_struct("HostClient")
             .field("closed", &*self.closed.borrow())
             .finish_non_exhaustive()
     }
@@ -236,11 +78,11 @@ impl std::fmt::Display for StoreError {
 }
 impl std::error::Error for StoreError {}
 
-impl Host {
-    pub(super) fn connect(
-        writer: super::transport::Sender,
-        port: super::transport::Port,
-        mut incoming: mpsc::UnboundedReceiver<super::transport::Packet>,
+impl HostClient {
+    pub(crate) fn connect(
+        writer: crate::ipc::transport::Sender,
+        port: crate::ipc::transport::Port,
+        mut incoming: mpsc::UnboundedReceiver<crate::ipc::transport::Packet>,
         next: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -376,7 +218,7 @@ impl Host {
         })
     }
 
-    pub(super) fn controls(&self) -> mpsc::UnboundedReceiver<(u64, Control)> {
+    pub(crate) fn controls(&self) -> mpsc::UnboundedReceiver<(u64, Control)> {
         self.controls
             .lock()
             .expect("poison")
@@ -384,14 +226,14 @@ impl Host {
             .expect("one worker controller")
     }
 
-    pub(super) async fn send(&self, message: Message<'_>) -> anyhow::Result<()> {
+    pub(crate) async fn send(&self, message: Message<'_>) -> anyhow::Result<()> {
         self.outgoing
             .send(encode(&message)?)
             .await
             .map_err(|_| anyhow::anyhow!("agent connection closed"))
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         if let Some(stop) = self.stop.lock().expect("poison").take() {
             let _ = stop.send(());
         }
@@ -497,11 +339,11 @@ impl Host {
     }
     pub(crate) async fn native_history(
         &self,
-        boundary: Option<crate::db::ContextBoundary>,
+        boundary: Option<crate::log::ContextBoundary>,
     ) -> Result<
         (
-            crate::db::ContextBoundary,
-            crate::db::NativeRecovery,
+            crate::log::ContextBoundary,
+            crate::log::NativeRecovery,
             Vec<crate::entry::Entry>,
         ),
         StoreError,
@@ -543,7 +385,7 @@ impl Host {
     pub(crate) async fn append_batch(
         &self,
         events: Vec<AgentEvent<'static>>,
-    ) -> Result<crate::db::ContextBoundary, StoreError> {
+    ) -> Result<crate::log::ContextBoundary, StoreError> {
         match self
             .request(Request::AppendBatch(events))
             .await
@@ -694,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn replies_are_routed_independently_and_eof_fails_pending_requests() {
-        let (client, mut server) = crate::worker::testing::pair();
+        let (client, mut server) = crate::testing::pair();
         let host = client.host();
         let one = tokio::spawn({
             let host = host.clone();
@@ -741,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_snapshot_is_fetched_once_and_survives_service_disconnect() {
-        let (client, mut server) = crate::worker::testing::pair();
+        let (client, mut server) = crate::testing::pair();
         let host = client.host();
         let request = tokio::spawn({
             let host = host.clone();
@@ -760,7 +602,7 @@ mod tests {
                 body: Reply::Team(Some(crate::multi_agent_tools::Team {
                     agent: "eng-once".into(),
                     parent: Some("eng-parent".into()),
-                    spawned_by: crate::db::AgentSpawnedBy::Engineer,
+                    spawned_by: crate::log::AgentSpawnedBy::Engineer,
                     started_by: None,
                 })),
             })
@@ -776,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_call_releases_its_waiter_and_late_reply_is_ignored() {
-        let (client, mut server) = crate::worker::testing::pair();
+        let (client, mut server) = crate::testing::pair();
         let host = client.host();
         let task = tokio::spawn({
             let host = host.clone();
@@ -814,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_canonical_append_crosses_frames_without_partial_delivery() {
-        let (client, mut server) = crate::worker::testing::pair();
+        let (client, mut server) = crate::testing::pair();
         let count = 64 * 1024 * 1024 + 137;
         let sending = tokio::spawn(async move {
             client

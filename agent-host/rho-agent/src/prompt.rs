@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rho_agent_types::AgentRole;
 
-use crate::db::AgentSpawnedBy;
+use crate::log::AgentSpawnedBy;
 use crate::multi_agent_tools::Team;
 
 /// Offered only to an agent the user manages: one working for another
@@ -894,17 +894,20 @@ commit page, for example [`abc1234`](https://github.com/org/repo/commit/abc1234)
 
 /// Render an agent's role, project guidance, team, and environment.
 /// Main agents and Advisors each have a fixed Python interface.
-pub fn prompt(view: &crate::View, multi_agent: Option<&Team>, role: AgentRole) -> Arc<str> {
-    let place = WorksetPrompt::of(view);
+pub(crate) fn prompt(
+    place: &WorksetPrompt,
+    multi_agent: Option<&Team>,
+    role: AgentRole,
+) -> Arc<str> {
     let (agents_md, skills) = {
-        let (agents_files, skills) = discovered_context(view);
+        let (agents_files, skills) = &place.context;
         (
             render_agents_md_prompt(&agents_files).unwrap_or_default(),
             render_skills_prompt(&skills).unwrap_or_default(),
         )
     };
     let team_context = team_context(multi_agent, role);
-    let workspace = render_workspace_prompt(&place);
+    let workspace = render_workspace_prompt(place);
     let context = format!("{workspace}{agents_md}{skills}");
     let user_owned = multi_agent
         .filter(|tools| tools.spawned_by.user_owned())
@@ -979,13 +982,13 @@ Use `{message_tool}` for bidirectional communication with any known agent.
 }
 
 /// The native Rho policy with Claude's concrete MCP transport noted.
-pub fn claude_prompt(
-    view: Option<&crate::View>,
+pub(crate) fn claude_prompt(
+    place: Option<&WorksetPrompt>,
     multi_agent: Option<&Team>,
     role: AgentRole,
 ) -> Arc<str> {
-    let common = match view {
-        Some(view) => prompt(view, multi_agent, role),
+    let common = match place {
+        Some(place) => prompt(place, multi_agent, role),
         None => {
             let team = team_context(multi_agent, role);
             match role {
@@ -1020,7 +1023,7 @@ continue from the existing state rather than running its source again.
 }
 
 /// An agent's place as the prompt renders it.
-struct WorksetPrompt {
+pub(crate) struct WorksetPrompt {
     /// The workset directory as the agent sees it.
     root: String,
     /// The agent's working directory as it sees it.
@@ -1029,49 +1032,76 @@ struct WorksetPrompt {
     git: bool,
     /// Whether the filesystem outside the workset is a disposable view.
     view: bool,
+    context: (
+        Vec<rho_context_config::AgentsFile>,
+        Vec<rho_context_config::Skill>,
+    ),
 }
 
 impl WorksetPrompt {
-    fn of(view: &crate::View) -> Self {
-        let git = view
-            .context_roots()
-            .map(|(_, host_root)| host_root.join(".git").exists())
-            .unwrap_or(false);
-        Self {
-            root: view.visible_root().to_string(),
-            cwd: view.cwd().to_string(),
-            git,
-            view: matches!(view.mode(), rho_fs_view::Mode::View { .. }),
-        }
+    /// Worker paths are already in the workset namespace.
+    pub fn new(cwd: &camino::Utf8Path, mode: rho_agent_types::WorksetMode) -> Self {
+        let roots = rho_fs_view::resolve_workdir_root(cwd.as_std_path()).map(|(root, _)| {
+            let root = if root.starts_with(rho_fs_view::MOUNT_ROOT) {
+                root
+            } else {
+                cwd.to_owned()
+            };
+            (root.clone(), root)
+        });
+        Self::discover(cwd, mode, roots)
     }
-}
 
-/// The context an agent's working directory brings: AGENTS.md files and
-/// skills discovered from the repository containing it (or the directory
-/// itself), plus the user-level ones.
-fn discovered_context(
-    view: &crate::View,
-) -> (
-    Vec<rho_context_config::AgentsFile>,
-    Vec<rho_context_config::Skill>,
-) {
-    let (visible_root, host_root) = match view.context_roots() {
-        Ok(roots) => roots,
-        Err(error) => {
-            eprintln!("rho-agent: context discovery: {error:#}");
-            return (Vec::new(), Vec::new());
-        }
-    };
-    let context = rho_context_config::DiscoveredContext::discover(&visible_root, &host_root);
-    for diagnostic in &context.diagnostics {
-        eprintln!(
-            "rho-agent: context config {:?}: {}: {}",
-            diagnostic.kind,
-            diagnostic.path.display(),
-            diagnostic.message
-        );
+    /// Only the host's read-only preview needs visible/backing path
+    /// translation.
+    pub fn for_host(workset: &rho_fs_view::Workset, place: &rho_agent_types::Place) -> Self {
+        let roots = (|| {
+            let cwd = workset.host_path(&place.cwd)?;
+            let (root, _) = rho_fs_view::resolve_workdir_root(cwd.as_std_path())?;
+            let root = if root.starts_with(workset.root()) {
+                root
+            } else {
+                cwd
+            };
+            let visible = camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT)
+                .join(root.strip_prefix(workset.root())?);
+            anyhow::Ok((visible, root))
+        })();
+        Self::discover(&place.cwd, place.mode, roots)
     }
-    (context.agents_files, context.skills)
+
+    fn discover(
+        cwd: &camino::Utf8Path,
+        mode: rho_agent_types::WorksetMode,
+        roots: anyhow::Result<(camino::Utf8PathBuf, camino::Utf8PathBuf)>,
+    ) -> Self {
+        let mut place = Self {
+            root: rho_fs_view::MOUNT_ROOT.into(),
+            cwd: cwd.to_string(),
+            git: false,
+            view: mode == rho_agent_types::WorksetMode::View,
+            context: (Vec::new(), Vec::new()),
+        };
+        let (visible_root, root) = match roots {
+            Ok(roots) => roots,
+            Err(error) => {
+                eprintln!("rho-agent: context discovery: {error:#}");
+                return place;
+            }
+        };
+        place.git = root.join(".git").exists();
+        let context = rho_context_config::DiscoveredContext::discover(&visible_root, &root);
+        for diagnostic in &context.diagnostics {
+            eprintln!(
+                "rho-agent: context config {:?}: {}: {}",
+                diagnostic.kind,
+                diagnostic.path.display(),
+                diagnostic.message
+            );
+        }
+        place.context = (context.agents_files, context.skills);
+        place
+    }
 }
 
 fn render_agents_md_prompt(files: &[rho_context_config::AgentsFile]) -> Option<String> {
@@ -1239,6 +1269,7 @@ mod tests {
             cwd: "/src/repo".to_owned(),
             git,
             view,
+            context: (Vec::new(), Vec::new()),
         }
     }
 

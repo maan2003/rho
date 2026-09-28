@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::AgentEvent;
-use crate::db::ContextBoundary;
-use crate::worker::{Host, StoreError};
+use crate::log::ContextBoundary;
+use crate::worker::host_client::{HostClient, StoreError};
 
 enum Write {
     Events(Vec<AgentEvent<'static>>),
@@ -19,7 +19,7 @@ pub(super) struct Writer {
 }
 
 impl Writer {
-    pub fn new(host: Arc<Host>, mut boundary: ContextBoundary) -> Self {
+    pub fn new(host: Arc<HostClient>, mut boundary: ContextBoundary) -> Self {
         let (queue, mut incoming) = mpsc::channel(32);
         tokio::spawn(async move {
             while let Some(write) = incoming.recv().await {

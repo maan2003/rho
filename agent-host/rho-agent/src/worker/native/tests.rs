@@ -8,20 +8,18 @@ use rho_db::RhoDb;
 
 use super::scripted::Scripted;
 use super::*;
-use crate::db::{
-    AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentWriteTxnExt as _,
-};
+use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::entry::{Block, Entry, Notice, Party};
 use crate::inference::Item;
+use crate::log::AgentRuntime;
 
 struct Harness {
     _directory: tempfile::TempDir,
     db: RhoDb,
     agent: AgentId,
-    host: Arc<crate::worker::Host>,
+    host: Arc<crate::worker::host_client::HostClient>,
     inference: Inference,
-    view: Arc<View>,
+    cwd: camino::Utf8PathBuf,
 }
 
 impl Harness {
@@ -44,42 +42,25 @@ impl Harness {
             AgentRuntime::Rho {
                 prompt_cache_key: crate::inference::PromptCacheKey::generate(),
             },
-            crate::db::AgentOrigin::User,
+            crate::log::AgentOrigin::User,
         );
         write.commit();
         let accounts = crate::inference::testing::accounts();
-        let host = crate::worker::local_services(
+        let host = crate::testing::services_pair(
             db.clone(),
             accounts.clone(),
             agent,
             std::sync::Weak::new(),
         );
-        let worksets = rho_fs_view::Worksets::open(
-            directory.path().join("state"),
-            rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
-            Default::default(),
-            rho_fs_view::StoreService::None,
-        )
-        .await
-        .unwrap();
-        let view = worksets
-            .create()
-            .await
-            .unwrap()
-            .enter(
-                rho_fs_view::Mode::View {
-                    home_skeleton: None,
-                },
-                camino::Utf8Path::new("/src"),
-            )
-            .unwrap();
+        let cwd = camino::Utf8PathBuf::from_path_buf(directory.path().join("work")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
         Self {
             _directory: directory,
             db,
             agent,
             host,
             inference: accounts.client(),
-            view,
+            cwd,
         }
     }
 
@@ -89,7 +70,7 @@ impl Harness {
             self.agent,
             self.host.clone(),
             self.inference.clone(),
-            self.view.clone(),
+            self.cwd.clone(),
         )
         .await
         .unwrap();
@@ -540,7 +521,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
             harness.agent,
             harness.host.clone(),
             harness.inference.clone(),
-            harness.view.clone(),
+            harness.cwd.clone(),
         )
         .await
         .unwrap();
@@ -582,7 +563,7 @@ async fn exhausted_retry_window_stops_without_another_request() {
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();
@@ -650,7 +631,7 @@ async fn code_fragments_wait_for_a_publication_frame() {
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();
@@ -852,7 +833,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();
@@ -916,7 +897,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();
@@ -1004,7 +985,7 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();
@@ -1072,7 +1053,7 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         harness.agent,
         harness.host.clone(),
         harness.inference.clone(),
-        harness.view.clone(),
+        harness.cwd.clone(),
     )
     .await
     .unwrap();

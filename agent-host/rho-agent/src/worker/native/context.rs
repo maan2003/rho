@@ -182,7 +182,7 @@ mod tests {
             at: UnixMs(1),
             exec: Some("pass".into()),
             prose: String::new(),
-            carry: crate::agent::scripted::carry(Call::new(id, "pass".into())),
+            carry: crate::worker::native::scripted::carry(Call::new(id, "pass".into())),
             usage: None,
         }
     }

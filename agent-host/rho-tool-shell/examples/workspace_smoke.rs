@@ -2,12 +2,10 @@
 //! store, and shell tool commands inside the view namespace.
 //! Run with `cargo run -p rho-tool-shell --example workspace_smoke`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use camino::Utf8Path;
 use rho_agent_types::transcript::{ToolCall, ToolCallId, ToolName, ToolType};
-use rho_fs_view::{Mode, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_fs_view::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
 
 fn shell_call(command: &str) -> ToolCall {
@@ -36,12 +34,12 @@ fn main() -> anyhow::Result<()> {
         let bytes = std::fs::read(&args[2])?;
         let layout: rho_fs_view::WorksetLayout = senax_encoder::decode(&mut bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid layout"))?;
-        let view = unsafe {
+        unsafe {
             layout.build()?;
-            layout.enter()?
+            layout.enter()?;
         }
-        .for_cwd(Utf8Path::new("/src/project"))?;
-        return tokio::runtime::Runtime::new()?.block_on(run_tools(view));
+        std::env::set_current_dir("/src/project")?;
+        return tokio::runtime::Runtime::new()?.block_on(run_tools());
     }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run())
@@ -103,8 +101,12 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_tools(view: Arc<rho_fs_view::Namespace>) -> anyhow::Result<()> {
-    let tools = ShellTools::new(Duration::from_secs(30), Arc::clone(&view));
+async fn run_tools() -> anyhow::Result<()> {
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(30),
+        "/src/project".into(),
+        PathOverrides::default(),
+    );
 
     let started = std::time::Instant::now();
     let result = tools.call(shell_call("pwd; cat file.txt")).await;

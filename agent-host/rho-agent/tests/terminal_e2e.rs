@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 
-use rho_agent::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
+use rho_agent::worker::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
 use rho_agent_types::AgentId;
 use rho_terminal::protocol::{ScrollbackItem, TermRow, TermServerFrame, WireScreen};
 
@@ -30,7 +30,7 @@ fn main() {
     println!("terminal e2e passed");
 }
 
-async fn terminal_end_to_end_over_registry(view: Arc<rho_fs_view::Namespace>) {
+async fn terminal_end_to_end_over_registry() {
     let registry = Arc::new(TerminalRegistry::default());
     let agent_id =
         AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).expect("counter 1 encodes");
@@ -41,7 +41,7 @@ async fn terminal_end_to_end_over_registry(view: Arc<rho_fs_view::Namespace>) {
             80,
             24,
             TerminalSpawn {
-                view: Arc::clone(&view),
+                cwd: "/src".into(),
                 shell: "sh".to_owned(),
             },
         )

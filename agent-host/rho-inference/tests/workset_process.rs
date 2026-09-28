@@ -1,18 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent::pool::AgentPool;
+use rho_agent::host::pool::AgentPool;
 use rho_agent::{StartPlace, WorksetAction, WorksetAttach, WorksetReply};
 use rho_terminal::protocol::{TermClientFrame, TermServerFrame};
 
 #[tokio::test]
 async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
-    let (_directory, pool, workset, view) = fixture("http://127.0.0.1:1").await;
+    let (_directory, pool, workset, place) = fixture("http://127.0.0.1:1").await;
     let (first, a) = pool
         .create(
             Default::default(),
             Some("first".into()),
-            StartPlace::new(view.clone(), None),
+            StartPlace::new(place.clone()),
         )
         .await
         .unwrap();
@@ -20,7 +20,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
         .create(
             Default::default(),
             Some("second".into()),
-            StartPlace::new(view, None),
+            StartPlace::new(place),
         )
         .await
         .unwrap();
@@ -104,7 +104,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     assert!(!Arc::ptr_eq(&process, &replacement));
     let (_, reloaded, _) = pool.load(first).await.unwrap();
     assert_eq!(
-        reloaded.view().await.unwrap().workset_mode(),
+        reloaded.head().config.place.mode,
         rho_agent_types::WorksetMode::Exposed
     );
     // Development integration checks require both companions built first:
@@ -205,7 +205,7 @@ async fn fixture(
     tempfile::TempDir,
     Arc<AgentPool>,
     rho_fs_view::Workset,
-    Arc<rho_agent::View>,
+    rho_agent_types::Place,
 ) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -230,14 +230,12 @@ async fn fixture(
     .await
     .unwrap();
     let workset = worksets.create().await.unwrap();
-    let view = workset
-        .enter(
-            rho_fs_view::Mode::View {
-                home_skeleton: None,
-            },
-            camino::Utf8Path::new("/src"),
-        )
-        .unwrap();
+    let place = rho_agent_types::Place {
+        workset: workset.id().to_owned(),
+        cwd: "/src".into(),
+        mode: rho_agent_types::WorksetMode::View,
+        origin: None,
+    };
     let db = rho_db::RhoDb::open(root.join("agents.redb"));
     let inference = rho_inference::Accounts::new_with_config(
         db.clone(),
@@ -254,7 +252,7 @@ async fn fixture(
         ),
     )
     .await;
-    (directory, pool, workset, view)
+    (directory, pool, workset, place)
 }
 
 #[test]
@@ -307,7 +305,7 @@ async fn streaming_crash() {
     use futures::{SinkExt as _, StreamExt as _};
     use rho_agent::db::AgentReadTxnExt as _;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_directory, pool, workset, view) =
+    let (_directory, pool, workset, place) =
         fixture(&format!("http://{}", listener.local_addr().unwrap())).await;
     let db = pool.db().clone();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -351,7 +349,7 @@ async fn streaming_crash() {
         .create(
             Default::default(),
             Some("recovery-test".into()),
-            StartPlace::new(view, None),
+            StartPlace::new(place),
         )
         .await
         .unwrap();

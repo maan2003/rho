@@ -7,25 +7,11 @@ use rho_db::{Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
 use super::{AGENT_LOG, AgentEvent, AgentEventPos, agent_range, rows, visible_rows};
-use crate::entry::{CompactionState, Entry, Notice};
+use crate::entry::{Entry, Notice};
+use crate::log::NativeRecovery;
 
 pub(super) const NATIVE_CURSORS: TableDefinition<AgentId, Sen<NativeCursor>> =
     TableDefinition::new("agent_native_cursors");
-
-/// A fixed prefix of one log. Both ends are positions, not row counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub struct ContextBoundary {
-    pub from: AgentEventPos,
-    pub through: AgentEventPos,
-}
-
-#[derive(Clone, Debug, Default, Encode, Decode)]
-pub struct NativeRecovery {
-    pub archived: bool,
-    pub awaiting: bool,
-    pub woken: bool,
-    pub compaction: CompactionState,
-}
 
 #[derive(Clone, Debug, Default, Encode, Decode)]
 pub(super) struct NativeCursor {

@@ -66,7 +66,7 @@ const MAX_DIM: u16 = 1000;
 /// Everything needed to spawn a terminal's child process; built by the
 /// caller (which knows agents and views), used when no session is running.
 pub struct TerminalSpawn {
-    pub view: Arc<rho_fs_view::Namespace>,
+    pub cwd: camino::Utf8PathBuf,
     /// Program run in the dev shell of the agent's working directory.
     pub shell: String,
 }
@@ -334,15 +334,16 @@ impl Session {
         set_nonblocking(&master)?;
 
         // In the dev shell of the agent's working directory.
-        let cwd = spawn.view.command_cwd(None)?;
+        let cwd = spawn.cwd;
         let mut command = rho_devshell::command(cwd.as_std_path(), &spawn.shell).await;
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        spawn.view.prepare_command(&mut command, None).await?;
+        rho_fs_view::command_stdio_only(&mut command);
+        command.current_dir(&cwd);
         command.stdin(std::process::Stdio::from(slave.try_clone()?));
         command.stdout(std::process::Stdio::from(slave.try_clone()?));
         command.stderr(std::process::Stdio::from(slave));
-        // Runs after prepare_command's namespace entry: make the child a
+        // Make the child a
         // session leader with the PTY as its controlling terminal.
         unsafe {
             command.pre_exec(|| {

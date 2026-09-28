@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 
-use rho_agent::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
+use rho_agent::worker::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
 use rho_agent_types::AgentId;
 use rho_shell_view::protocol::{ShellColor, ShellServerFrame};
 
@@ -42,22 +42,19 @@ fn main() {
     let program = std::env::current_exe().unwrap();
     common::run(
         "PS1=\'rho-test> \'\nPROMPT_COMMAND=\'export RHO_TEST_CONFIG_HOOK=fired\'\ntrap \'printf fired >/src/brush-exit-hook\' EXIT\n",
-        move |view| shell_end_to_end_over_registry(view, program),
+        move || shell_end_to_end_over_registry(program),
     );
     println!("shell e2e passed");
 }
 
-async fn shell_end_to_end_over_registry(
-    view: Arc<rho_fs_view::Namespace>,
-    program: std::path::PathBuf,
-) {
+async fn shell_end_to_end_over_registry(program: std::path::PathBuf) {
     let work = std::path::Path::new("/src");
     let registry = Arc::new(ShellRegistry::default());
     let agent_id =
         AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).expect("counter encodes");
 
     let spawn = || ShellSpawn {
-        view: Arc::clone(&view),
+        cwd: "/src".into(),
         program: program.clone().into_os_string(),
         args: vec![CHILD_FLAG.into()],
         pager_program: "cat".into(),

@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::db::AgentReadTxnExt as _;
-use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent::host::AgentClient;
+use rho_agent::host::pool::AgentPool;
 use rho_agent_hosts::protocol::GitProviderFrame;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
@@ -531,7 +532,13 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let pool = AgentPool::new(db.clone(), Arc::new(inference.clone()), worksets, claude.clone()).await;
+    let pool = AgentPool::new(
+        db.clone(),
+        Arc::new(inference.clone()),
+        worksets,
+        claude.clone(),
+    )
+    .await;
     let services = Arc::new(
         Services::new(
             db,
@@ -1039,22 +1046,20 @@ impl Services {
         self.inference.set_account_enabled(name, enabled).await;
     }
 
-    /// `mode` is the agent's own: how it sees the filesystem around the
-    /// workset, whether that workset is fresh or one it joins.
+    /// `mode` is the workset's view of the filesystem around it, whether
+    /// the workset is fresh or one this agent joins.
     async fn create(
         &self,
         role: AgentRole,
         start: StartMode,
         mode: WorksetMode,
-    ) -> anyhow::Result<(AgentId, RunningAgent)> {
+    ) -> anyhow::Result<(AgentId, AgentClient)> {
         self.refuse_while_stopping()?;
         let start = match start {
             StartMode::NewOn { repo, revset } => {
-                // The agent exists at once; its workset is placed (cloned
-                // from the mirror store, checked out, entered) by its first
-                // command, and again by the next one if that failed. The
-                // checkout's name is known before the clone, so the record
-                // is complete from the start.
+                // The agent record is committed before its workset is cloned
+                // and checked out, then the worker starts. The checkout name
+                // is known before the clone, so the record is complete.
                 let origin = expand_home(&repo).unwrap_or(repo);
                 let name = rho_fs_view::repo_name(origin.as_str())
                     .with_context(|| format!("no repository name in {origin}"))?;
@@ -1063,36 +1068,25 @@ impl Services {
                 let cwd = visible_path(&workset, &workset.root().join(&name))?;
                 let place = Place {
                     workset: workset.id().to_owned(),
-                    cwd: cwd.clone(),
+                    cwd,
                     mode,
                     origin: Some(origin.clone()),
                 };
-                let mode = rho_fs_view::Mode::from_workset_mode(mode);
-                rho_agent::StartPlace::pending(place, move || {
-                    let workset = workset.clone();
-                    let origin = origin.clone();
-                    let name = name.clone();
-                    let revset = revset.clone();
-                    let cwd = cwd.clone();
-                    let mode = mode.clone();
-                    async move {
-                        let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
-                        workset.checkout(&checkout, &revset).await?;
-                        workset.enter(mode, &cwd)
-                    }
+                rho_agent::StartPlace::pending(place, async move {
+                    let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
+                    workset.checkout(&checkout, &revset).await?;
+                    Ok(())
                 })
-                .owning_workset()
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 let mut place = info
                     .place()
                     .context("agents no longer work in the user's own checkout")?
                     .clone();
-                // The same directory as the agent joined, seen the way this
-                // agent asked to see it.
+                // The same directory as the agent joined, using the requested
+                // workset mode.
                 place.mode = mode;
-                let view = self.pool.materialize_view(&place).await?;
-                rho_agent::StartPlace::new(view, place.origin.clone())
+                rho_agent::StartPlace::new(place)
             }
             StartMode::Join(JoinTarget::User { .. }) => {
                 anyhow::bail!(
@@ -1140,7 +1134,7 @@ impl Services {
         Ok(resolved)
     }
 
-    async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
+    async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, AgentClient, bool)> {
         self.refuse_while_stopping()?;
         self.pool.load(agent_id).await
     }

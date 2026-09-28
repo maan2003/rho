@@ -8,16 +8,16 @@ use rho_db::RhoDb;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use super::ipc::{self, Message, Reply, Request};
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
+use crate::ipc::protocol::{self, Message, Reply, Request};
 
 struct Controls {
     closed: bool,
     pending: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
-pub(super) struct Services {
+pub(crate) struct Services {
     pub stopped: std::sync::atomic::AtomicBool,
     commands: mpsc::UnboundedSender<Message<'static>>,
     command_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Message<'static>>>>,
@@ -27,16 +27,16 @@ pub(super) struct Services {
     pub db: RhoDb,
     pub agent: AgentId,
     pub status: tokio::sync::watch::Sender<crate::AgentStatus>,
-    pool: std::sync::Weak<crate::pool::AgentPool>,
+    pool: std::sync::Weak<crate::host::pool::AgentPool>,
     title: tokio::sync::Mutex<crate::title::Task>,
 }
 
 impl Services {
-    pub(super) fn new(
+    pub(crate) fn new(
         db: RhoDb,
         inference: Accounts,
         agent: AgentId,
-        pool: std::sync::Weak<crate::pool::AgentPool>,
+        pool: std::sync::Weak<crate::host::pool::AgentPool>,
         next_control: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -61,7 +61,7 @@ impl Services {
         }
     }
 
-    pub(super) async fn worker_failed(&self, error: String) {
+    pub(crate) async fn worker_failed(&self, error: String) {
         use rho_agent_types::{TurnEdge, TurnOutcome};
 
         // A stopping agent host lets its workers go; that is no failure.
@@ -100,15 +100,15 @@ impl Services {
         self.status.send_replace(status);
     }
 
-    pub(super) async fn publish_failure(&self, error: String) {
+    pub(crate) async fn publish_failure(&self, error: String) {
         if let Some(pool) = self.pool.upgrade() {
             pool.publish_failed_turn(self.agent, error).await;
         }
     }
 
-    pub(super) fn control(
+    pub(crate) fn control(
         &self,
-        body: super::ipc::Control,
+        body: crate::ipc::protocol::Control,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<Result<(), String>>> {
         let mut controls = self.controls.lock().expect("poison");
         anyhow::ensure!(!controls.closed, "agent worker connection closed");
@@ -124,11 +124,11 @@ impl Services {
         Ok(receive)
     }
 
-    pub(super) fn serve(
+    pub(crate) fn serve(
         self: Arc<Self>,
-        writer: super::transport::Sender,
-        port: super::transport::Port,
-        mut incoming: mpsc::UnboundedReceiver<super::transport::Packet>,
+        writer: crate::ipc::transport::Sender,
+        port: crate::ipc::transport::Port,
+        mut incoming: mpsc::UnboundedReceiver<crate::ipc::transport::Packet>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             let mut commands = self
@@ -147,7 +147,7 @@ impl Services {
                         // payload would corrupt the channel.
                         let frame = async {
                             let bytes = incoming.recv().await.context("agent port closed")?;
-                            Ok::<_, anyhow::Error>(ipc::decode(&bytes.bytes)?)
+                            Ok::<_, anyhow::Error>(protocol::decode(&bytes.bytes)?)
                         };
                         tokio::pin!(frame);
                         let message = loop {
@@ -220,7 +220,7 @@ impl Services {
                             message = commands.recv() => message,
                         };
                         let Some(message) = message else { return Ok(()); };
-                        writer.send(port, ipc::encode(&message)?).await?;
+                        writer.send(port, protocol::encode(&message)?).await?;
                     }
                 } => result,
             };
@@ -261,14 +261,16 @@ impl Services {
             }
             Request::SharedTool(call) => {
                 let result = match call {
-                    super::ipc::SharedCall::Papercut(args) => crate::papercut::PapercutTool {
-                        db: self.db.clone(),
-                        agent_id: self.agent,
+                    crate::ipc::protocol::SharedCall::Papercut(args) => {
+                        crate::papercut::PapercutTool {
+                            db: self.db.clone(),
+                            agent_id: self.agent,
+                        }
+                        .record(args)
+                        .await
+                        .map(|id| format!("Saved papercut #{id}."))
                     }
-                    .record(args)
-                    .await
-                    .map(|id| format!("Saved papercut #{id}.")),
-                    super::ipc::SharedCall::Agent(call) => {
+                    crate::ipc::protocol::SharedCall::Agent(call) => {
                         let pool = self.pool.upgrade().context("agent pool is shutting down")?;
                         let head = self.db.read().get_agent(self.agent);
                         anyhow::ensure!(
@@ -284,8 +286,8 @@ impl Services {
                     }
                 };
                 Reply::Shared(match result {
-                    Ok(text) => super::ipc::SharedReply::Ok(text),
-                    Err(error) => super::ipc::SharedReply::Err(error.to_string()),
+                    Ok(text) => crate::ipc::protocol::SharedReply::Ok(text),
+                    Err(error) => crate::ipc::protocol::SharedReply::Err(error.to_string()),
                 })
             }
             Request::Usage(usage) => {
@@ -296,7 +298,7 @@ impl Services {
             }
             Request::MessageSent(text) => {
                 if let Some(pool) = self.pool.upgrade() {
-                    pool.publish_message(crate::pool::AgentMessage {
+                    pool.publish_message(crate::host::pool::AgentMessage {
                         agent_id: self.agent,
                         text,
                     })
@@ -401,10 +403,10 @@ impl Services {
                     {
                         write.add_agent_usage(
                             self.agent,
-                            &crate::db::AgentUsageBucket {
-                                bucket_start_ms: at.0 / crate::db::AGENT_USAGE_BUCKET_MS
-                                    * crate::db::AGENT_USAGE_BUCKET_MS,
-                                model: crate::db::AgentUsageModel::named(&usage.model),
+                            &crate::log::AgentUsageBucket {
+                                bucket_start_ms: at.0 / crate::log::AGENT_USAGE_BUCKET_MS
+                                    * crate::log::AGENT_USAGE_BUCKET_MS,
+                                model: crate::log::AgentUsageModel::named(&usage.model),
                                 input_tokens: usage.input_tokens,
                                 cache_read_tokens: usage.cache_read_tokens,
                                 cache_write_tokens: usage.cache_write_tokens,
@@ -475,7 +477,7 @@ mod tests {
 
     use super::*;
     use crate::AgentEvent;
-    use crate::db::{AgentRoleSessionProfile as _, AgentRuntime};
+    use crate::log::{AgentRoleSessionProfile as _, AgentRuntime};
 
     #[tokio::test]
     async fn blocked_append_does_not_block_reads_and_history_crosses_multiple_frames() {
@@ -495,7 +497,7 @@ mod tests {
             AgentRuntime::Rho {
                 prompt_cache_key: crate::inference::PromptCacheKey::generate(),
             },
-            crate::db::AgentOrigin::User,
+            crate::log::AgentOrigin::User,
         );
         for _ in 0..3 {
             write.append_agent_event(
@@ -515,7 +517,7 @@ mod tests {
             Default::default(),
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
         ));
-        let (client, server) = crate::worker::testing::pair();
+        let (client, server) = crate::testing::pair();
         let server = tokio::spawn(services.clone().serve(
             server.sender,
             server.port,
@@ -603,7 +605,7 @@ mod tests {
 
         // The agent host committed, but the worker never received its reply.
         // Neither transport nor store client is allowed to resend the append.
-        let (client, mut server) = crate::worker::testing::pair();
+        let (client, mut server) = crate::testing::pair();
         let host = client.host();
         let append = tokio::spawn({
             let host = host.clone();

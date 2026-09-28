@@ -16,7 +16,7 @@ use db::{FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, Pr
 use futures_util::stream::{self, StreamExt as _};
 use octo_types::{PrFeedback, PrSnapshot};
 use rho_agent::db::AgentReadTxnExt as _;
-use rho_agent::pool::AgentPool;
+use rho_agent::host::pool::AgentPool;
 use rho_agent_types::AgentId;
 use rho_db::RhoDb;
 

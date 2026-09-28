@@ -127,7 +127,7 @@ impl ClaudeCodeOptions {
         }
         command.args(self.args());
         // The working directory and PATH are the agent namespace's: the
-        // caller enters it with `Namespace::prepare_command`, and `cwd` is a
+        // caller already runs in the workset namespace, and `cwd` is a
         // path as the agent sees it, which need not exist on the host.
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());

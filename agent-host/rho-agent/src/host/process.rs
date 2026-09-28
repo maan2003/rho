@@ -6,27 +6,21 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{ipc, transport};
-
-#[derive(senax_encoder::Encode, senax_encoder::Decode)]
-pub(super) struct Startup {
-    pub version: u32,
-    pub layout: rho_fs_view::WorksetLayout,
-    pub claude: rho_claude::accounts::ClaudePaths,
-    pub responses_base_url: String,
-}
+use super::workset_client;
+use crate::ipc::protocol::Startup;
+use crate::ipc::{protocol, transport, workset};
 
 pub struct Process {
     #[cfg(test)]
     pub(crate) pid: u32,
     admission: Arc<tokio::sync::RwLock<()>>,
-    commands: mpsc::UnboundedSender<super::workset::Message>,
-    clients: super::workset::Clients,
-    pending: super::workset::Pending,
-    pub(super) sender: transport::Sender,
-    pub(super) agents:
+    commands: mpsc::UnboundedSender<workset::Message>,
+    clients: workset_client::Clients,
+    pending: workset_client::Pending,
+    pub(crate) sender: transport::Sender,
+    pub(crate) agents:
         Arc<Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
-    pub(super) next: Arc<AtomicU64>,
+    pub(crate) next: Arc<AtomicU64>,
     pub(crate) closed: watch::Receiver<bool>,
     pub(crate) mode: rho_agent_types::WorksetMode,
     stop: Mutex<Option<oneshot::Sender<()>>>,
@@ -86,7 +80,7 @@ impl Process {
         self.agents.lock().expect("poison")[&agent]
             .send(transport::Packet::for_test(
                 transport::Port::Agent(agent),
-                ipc::encode(&ipc::Message::Stopped {
+                protocol::encode(&protocol::Message::Stopped {
                     error: Some("test cleanup failed".into()),
                 })
                 .unwrap(),
@@ -94,26 +88,19 @@ impl Process {
             .unwrap();
     }
 
-    pub async fn action(
-        &self,
-        action: super::workset::Action,
-    ) -> anyhow::Result<super::workset::Reply> {
+    pub async fn action(&self, action: workset::Action) -> anyhow::Result<workset::Reply> {
         let admission = self.admission.clone().read_owned().await;
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.request(
-            id,
-            super::workset::Message::Action { id, action },
-            Some(admission),
-        )
-        .await
+        self.request(id, workset::Message::Action { id, action }, Some(admission))
+            .await
     }
 
     async fn request(
         &self,
         id: u64,
-        message: super::workset::Message,
+        message: workset::Message,
         admission: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    ) -> anyhow::Result<super::workset::Reply> {
+    ) -> anyhow::Result<workset::Reply> {
         anyhow::ensure!(!*self.closed.borrow(), "workset process closed");
         let (reply, response) = oneshot::channel();
         self.pending
@@ -125,24 +112,21 @@ impl Process {
             anyhow::bail!("workset process closed");
         }
         match response.await.context("workset process closed")? {
-            super::workset::Reply::Error(error) => anyhow::bail!(error),
+            workset::Reply::Error(error) => anyhow::bail!(error),
             reply => Ok(reply),
         }
     }
 
-    pub async fn attach(
-        &self,
-        attach: super::workset::Attach,
-    ) -> anyhow::Result<super::workset::Client> {
+    pub async fn attach(&self, attach: workset::Attach) -> anyhow::Result<workset_client::Client> {
         let admission = self.admission.clone().read_owned().await;
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let port = match &attach {
-            super::workset::Attach::Terminal { .. } => transport::Port::Terminal(id),
-            super::workset::Attach::Shell { .. } => transport::Port::Shell(id),
+            workset::Attach::Terminal { .. } => transport::Port::Terminal(id),
+            workset::Attach::Shell { .. } => transport::Port::Shell(id),
         };
         let (send, incoming) = mpsc::channel(32);
         self.clients.lock().expect("poison").insert(port, send);
-        let client = super::workset::Client {
+        let client = workset_client::Client {
             port,
             sender: self.sender.clone(),
             incoming,
@@ -150,7 +134,7 @@ impl Process {
         };
         self.request(
             id,
-            super::workset::Message::Attach { id, port, attach },
+            workset::Message::Attach { id, port, attach },
             Some(admission),
         )
         .await?;
@@ -164,7 +148,7 @@ impl Process {
 
     // The caller holds exclusive workset admission.
     pub(crate) async fn no_sessions(&self) -> anyhow::Result<bool> {
-        use super::workset::{Action, Message, Reply};
+        use workset::{Action, Message, Reply};
         for action in [Action::TerminalList, Action::ShellList] {
             let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self
@@ -186,21 +170,21 @@ impl Process {
     }
 
     pub(crate) async fn start(
-        pool: &Arc<crate::pool::AgentPool>,
-        view: &crate::View,
+        pool: &Arc<crate::host::pool::AgentPool>,
+        workset: &rho_fs_view::Workset,
+        mode: rho_agent_types::WorksetMode,
         claude: rho_claude::accounts::ClaudePaths,
         admission: Arc<tokio::sync::RwLock<()>>,
     ) -> anyhow::Result<Arc<Self>> {
-        let workset = pool.worksets().open_workset(view.workset_id()).await?;
         let root = tempfile::Builder::new().prefix("rho-workset-").tempdir()?;
         let layout = rho_fs_view::WorksetLayout::new(
-            &workset,
-            view.mode().clone(),
+            workset,
+            rho_fs_view::Mode::from_workset_mode(mode),
             camino::Utf8PathBuf::from_path_buf(root.path().to_owned())
                 .map_err(|_| anyhow::anyhow!("non-UTF8 workset mount root"))?,
         )?;
         let startup = Startup {
-            version: ipc::VERSION,
+            version: protocol::VERSION,
             layout,
             claude,
             responses_base_url: pool.inference().responses_base_url().to_owned(),
@@ -251,8 +235,8 @@ impl Process {
         let agents: Arc<
             Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>,
         > = Arc::default();
-        let clients: super::workset::Clients = Arc::default();
-        let pending: super::workset::Pending = Arc::default();
+        let clients: workset_client::Clients = Arc::default();
+        let pending: workset_client::Pending = Arc::default();
         let client_routes = clients.clone();
         let replies = pending.clone();
         let pending_close = pending.clone();
@@ -280,9 +264,7 @@ impl Process {
                             sender
                                 .send(
                                     transport::Port::Workset,
-                                    super::workset::encode(&super::workset::Message::Policy(
-                                        bytes,
-                                    ))?,
+                                    workset::encode(&workset::Message::Policy(bytes))?,
                                 )
                                 .await?;
                             Ok(())
@@ -296,10 +278,10 @@ impl Process {
                     result = &mut writer => result.context("workset writer failed")?.map_err(anyhow::Error::from),
                     result = async {
                         while let Some(message) = command_rx.recv().await {
-                            if let super::workset::Message::Detach(port) = &message {
+                            if let workset::Message::Detach(port) = &message {
                                 client_routes.lock().expect("poison").remove(port);
                             }
-                            sender.send(transport::Port::Workset, super::workset::encode(&message)?).await?;
+                            sender.send(transport::Port::Workset, workset::encode(&message)?).await?;
                         }
                         Ok::<(), anyhow::Error>(())
                     } => result,
@@ -315,11 +297,11 @@ impl Process {
                                     }
                                 }
                                 transport::Port::Workset => {
-                                    match super::workset::decode(&packet.bytes)? {
-                                        super::workset::Message::Reply { id, body } => {
+                                    match workset::decode(&packet.bytes)? {
+                                        workset::Message::Reply { id, body } => {
                                             if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send(body); }
                                         }
-                                        super::workset::Message::Policy(message) => {
+                                        workset::Message::Policy(message) => {
                                             policy_incoming.try_send(message).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
                                         }
                                         _ => anyhow::bail!("unexpected workset reply"),
@@ -332,7 +314,7 @@ impl Process {
                                     } else if clients.get(&port).is_some_and(|client| client.try_send(packet.bytes).is_err()) {
                                         clients.remove(&port);
                                         // A slow GUI loses only its attachment; never drop incremental frames and keep it connected.
-                                        let _ = routing_commands.send(super::workset::Message::Detach(port));
+                                        let _ = routing_commands.send(workset::Message::Detach(port));
                                     }
                                 }
                             }
@@ -393,7 +375,7 @@ impl Process {
             agents,
             next: Arc::new(AtomicU64::new(1)),
             closed: closed_rx,
-            mode: view.workset_mode(),
+            mode,
             stop: Mutex::new(Some(stop)),
         }))
     }

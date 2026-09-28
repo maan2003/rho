@@ -1,13 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use rho_agent_types::transcript::{ImageContent, ImageDetail};
 
-use crate::View;
-
 #[derive(Clone)]
 pub(crate) struct ImageTools {
-    view: Arc<View>,
+    cwd: camino::Utf8PathBuf,
 }
 
 /// The arguments of the notebook's `view_image()`.
@@ -17,8 +14,8 @@ pub(crate) struct ViewImageArgs {
 }
 
 impl ImageTools {
-    pub(crate) fn new(view: Arc<View>) -> Self {
-        Self { view }
+    pub(crate) fn new(cwd: camino::Utf8PathBuf) -> Self {
+        Self { cwd }
     }
 
     /// Load an image for the model: a one-line description and the image.
@@ -42,12 +39,14 @@ impl ImageTools {
         let visible = if args.path.is_absolute() {
             args.path
         } else {
-            self.view.cwd().as_std_path().join(args.path)
+            self.cwd.as_std_path().join(args.path)
         };
-        let bytes = self
-            .view
-            .read_file_bounded(&visible, rho_image::MAX_SOURCE_BYTES)
-            .await?;
+        let bytes = rho_fs_view::read_file_bounded(
+            camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
+            &visible,
+            rho_image::MAX_SOURCE_BYTES,
+        )
+        .await?;
         let prepared = rho_image::prepare_with_detail(bytes, args.detail).await?;
         Ok((visible, prepared))
     }
@@ -61,36 +60,20 @@ mod tests {
 
     #[tokio::test]
     async fn loads_relative_path_with_original_detail() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in("/src").unwrap();
         let source =
             DynamicImage::ImageRgba8(ImageBuffer::from_pixel(4096, 1, Rgba([10, 20, 30, 255])));
         let work = temp.path().join("work");
         std::fs::create_dir(&work).unwrap();
         source.save(work.join("image.png")).unwrap();
-        let worksets = rho_fs_view::Worksets::open(
-            temp.path().join("state"),
-            Default::default(),
-            Default::default(),
-            rho_fs_view::StoreService::None,
-        )
-        .await
-        .unwrap();
-        // Reads never build the namespace, so no user namespace is needed.
-        let view = worksets
-            .adopt(&work)
-            .unwrap()
-            .enter(
-                rho_fs_view::Mode::View {
-                    home_skeleton: None,
-                },
-                camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-            )
-            .unwrap();
         let args = ViewImageArgs {
             path: "image.png".into(),
             detail: ImageDetail::Original,
         };
-        let (_, image) = ImageTools::new(view).view(args).await.unwrap();
+        let (_, image) = ImageTools::new(camino::Utf8PathBuf::from_path_buf(work).unwrap())
+            .view(args)
+            .await
+            .unwrap();
 
         assert_eq!(image.media_type, "image/png");
         assert_eq!(image.detail, ImageDetail::Original);

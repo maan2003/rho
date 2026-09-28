@@ -266,12 +266,10 @@ mod tests {
 
     use super::legacy::provider::{Call, CallResult, Carry};
     use super::*;
-    use crate::db::{
-        AgentOrigin, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentWriteTxnExt, FORMAT,
-        SessionBinding,
-    };
+    use crate::db::{AgentProfileWriteTxnExt, AgentReadTxnExt, AgentWriteTxnExt, FORMAT};
     use crate::entry::{MessageId, Party, Wake};
     use crate::inference::Image;
+    use crate::log::{AgentOrigin, SessionBinding};
 
     mod old_wire {
         #[derive(senax_encoder::Encode)]
@@ -550,7 +548,7 @@ mod tests {
             &surviving[0],
             Entry::RequestSent { compact: false, .. }
         ));
-        let visible_request = crate::agent::context::request(
+        let visible_request = crate::worker::native::context::request(
             "".into(),
             &surviving,
             crate::inference::CacheKey::from_u128(0),
@@ -569,7 +567,7 @@ mod tests {
         assert!(
             matches!(read.agent_event(ids[3], AgentEventPos::new(5)), Some(AgentEvent::Rewound { to, .. }) if to.pos == 2)
         );
-        let request = crate::agent::context::request(
+        let request = crate::worker::native::context::request(
             "".into(),
             &manual,
             crate::inference::CacheKey::from_u128(0),
@@ -793,7 +791,7 @@ mod tests {
         write.add_agent_usage(
             agent,
             &super::super::AgentUsageBucket {
-                bucket_start_ms: super::super::AGENT_USAGE_BUCKET_MS,
+                bucket_start_ms: crate::log::AGENT_USAGE_BUCKET_MS,
                 model: super::super::AgentUsageModel::GPT,
                 input_tokens: 101,
                 output_tokens: 23,
@@ -930,7 +928,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let projected = crate::agent::context::request(
+        let projected = crate::worker::native::context::request(
             "".into(),
             &migrated,
             crate::inference::CacheKey::from_u128(0),

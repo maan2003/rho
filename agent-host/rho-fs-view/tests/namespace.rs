@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use camino::Utf8Path;
-use rho_fs_view::{MAX_BOUNDED_READ, Mode};
+use rho_fs_view::{MAX_BOUNDED_READ, Mode, read_file_bounded};
 
 mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
@@ -74,96 +74,90 @@ async fn run() {
 
     let skeleton = temp.path().join("skeleton");
     std::fs::create_dir(&skeleton).unwrap();
-    let ns = workset
-        .enter(
-            Mode::View {
-                home_skeleton: Some(skeleton),
-            },
-            Utf8Path::new("/src"),
-        )
-        .unwrap();
     let mount_root = temp.path().join("view-root");
     std::fs::create_dir(&mount_root).unwrap();
     let layout_path = temp.path().join("layout");
     let layout = rho_fs_view::WorksetLayout::new(
         &workset,
-        ns.mode().clone(),
+        Mode::View {
+            home_skeleton: Some(temp.path().join("skeleton")),
+        },
         mount_root.try_into().unwrap(),
     )
     .unwrap();
     std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
-    assert_eq!(ns.visible_root(), "/src");
-    assert_eq!(ns.cwd(), "/src");
-    assert!(
-        workset
-            .enter(
-                Mode::View {
-                    home_skeleton: None
-                },
-                Utf8Path::new("/src/missing")
-            )
-            .is_err()
+    assert_eq!(
+        workset.host_path(Utf8Path::new("/src")).unwrap(),
+        workset.root()
     );
+    assert!(
+        !workset
+            .host_path(Utf8Path::new("/src/missing"))
+            .unwrap()
+            .is_dir()
+    );
+    assert!(workset.host_path(Utf8Path::new("/src/../outside")).is_err());
 
-    // Bounded reads: visible and relative paths, limits, and escapes.
+    // Bounded reads use paths in the current filesystem (the host here,
+    // /src in a workset process), without a host-visible path translation.
+    let source = workset.root();
+    let file = source.join("project/file.txt");
+    let inside = source.join("project/sub/inside");
     assert_eq!(
-        ns.read_file_bounded(Path::new("/src/project/file.txt"), 1024)
+        read_file_bounded(source, file.as_std_path(), 1024)
             .await
             .unwrap(),
         b"one\n"
     );
     assert_eq!(
-        ns.read_file_bounded(Path::new("project/file.txt"), 4)
+        read_file_bounded(source, inside.as_std_path(), 4)
             .await
             .unwrap(),
         b"one\n"
     );
-    assert_eq!(
-        ns.read_file_bounded(Path::new("project/sub/inside"), 1024)
-            .await
-            .unwrap(),
-        b"one\n",
-        "symlinks staying inside the workset resolve"
-    );
     assert!(
-        ns.read_file_bounded(Path::new("project/file.txt"), 3)
+        read_file_bounded(source, file.as_std_path(), 3)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("project/file.txt"), MAX_BOUNDED_READ + 1)
+        read_file_bounded(source, file.as_std_path(), MAX_BOUNDED_READ + 1)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("project/escape"), 1024)
+        read_file_bounded(source, source.join("project/escape").as_std_path(), 1024)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("../outside.txt"), 1024)
+        read_file_bounded(source, Path::new("project/file.txt"), 1024)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("/src/project/../../etc/passwd"), 1024)
+        read_file_bounded(source, source.join("../outside.txt").as_std_path(), 1024)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("/etc/passwd"), 1024)
+        read_file_bounded(
+            source,
+            source.join("project/../../etc/passwd").as_std_path(),
+            1024
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        read_file_bounded(source, Path::new("/etc/passwd"), 1024)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("project/sub"), 1024)
+        read_file_bounded(source, source.join("project/sub").as_std_path(), 1024)
             .await
             .is_err()
-    );
-    assert_eq!(
-        ns.resolve_host_path_checked(Path::new("/src/project/x"))
-            .unwrap(),
-        checkout.join("x")
     );
 
     // Notes created after the namespace exists use the existing state mount.
@@ -232,9 +226,7 @@ test ! -e /src/.stores
     );
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg(&script);
-    prepare(&ns, &layout_path, &mut command, None)
-        .await
-        .unwrap();
+    prepare(&layout_path, &mut command, "/src").unwrap();
     let output = command.output().await.unwrap();
     assert!(
         output.status.success(),
@@ -246,21 +238,12 @@ test ! -e /src/.stores
         std::fs::read_to_string(notes.join("progress.md")).unwrap(),
         "after rotation"
     );
-    let child = workset
-        .enter(
-            Mode::View {
-                home_skeleton: None,
-            },
-            Utf8Path::new("/src/project"),
-        )
-        .unwrap();
+    // A command can choose a different cwd within its already entered layout.
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg(format!(
         "test \"$(cat {notes}/progress.md)\" = \"after rotation\" && printf child > {notes}/child.md"
     ));
-    prepare(&child, &layout_path, &mut command, None)
-        .await
-        .unwrap();
+    prepare(&layout_path, &mut command, "/src/project").unwrap();
     assert!(command.status().await.unwrap().success());
     assert_eq!(
         std::fs::read_to_string(notes.join("child.md")).unwrap(),
@@ -268,66 +251,30 @@ test ! -e /src/.stores
     );
     assert!(workset.root().join("second/written").exists());
     assert!(root.cache_dir().join("from-view").exists());
-    assert!(
-        workset
-            .state_dir()
-            .unwrap()
-            .join("from-view")
-            .exists()
-    );
+    assert!(workset.state_dir().unwrap().join("from-view").exists());
     assert!(root.devshell_cache_dir().join("from-view").exists());
     assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
     assert_eq!(only_store(temp.path()), store);
 
-    // cwd is a visible path below /src.
+    // Commands inherit the workset environment and can start in a requested cwd.
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg("pwd");
-    prepare(
-        &ns,
-        &layout_path,
-        &mut command,
-        Some(Utf8Path::new("second")),
-    )
-    .await
-    .unwrap();
+    prepare(&layout_path, &mut command, "/src/second").unwrap();
     let output = command.output().await.unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), "/src/second\n");
-    let mut command = tokio::process::Command::new(&sh);
-    assert!(
-        prepare(&ns, &layout_path, &mut command, Some(Utf8Path::new("/tmp")))
-            .await
-            .is_err()
-    );
 
     println!("namespace test passed");
 }
 
-// Exercise command inheritance in a fresh, single-threaded execution process.
-// Mount roots remain owned and cleaned in this test's parent frame.
-async fn prepare(
-    view: &rho_fs_view::Namespace,
-    layout: &Path,
-    command: &mut tokio::process::Command,
-    cwd: Option<&Utf8Path>,
-) -> anyhow::Result<()> {
-    view.prepare_command(command, cwd).await?;
+// The child installs mounts and environment once before executing the command.
+fn prepare(layout: &Path, command: &mut tokio::process::Command, cwd: &str) -> anyhow::Result<()> {
     let mut inside = tokio::process::Command::new(std::env::current_exe()?);
     inside
         .arg("--inside")
         .arg(layout)
-        .arg(command.as_std().get_current_dir().unwrap())
+        .arg(cwd)
         .arg(command.as_std().get_program())
         .args(command.as_std().get_args());
-    for (key, value) in command.as_std().get_envs() {
-        match value {
-            Some(value) => {
-                inside.env(key, value);
-            }
-            None => {
-                inside.env_remove(key);
-            }
-        }
-    }
     *command = inside;
     Ok(())
 }

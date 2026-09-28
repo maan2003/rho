@@ -12,6 +12,14 @@ scheduling. Native events replicate through an ordered, bounded background write
 Claude's durable operations retain acknowledged agent host services.
 There is no in-agent host runtime fallback.
 
+Within `rho-agent`, `host` owns lifecycle and service handlers; `worker` owns
+the concrete native and Claude loops and local execution. `ipc` contains only
+their shared messages and transport. `log` defines durable records and
+recovery data; `db` owns transactions, indexes, and migrations. Tests connect
+the same host handlers and worker clients through an in-process Unix socket
+pair, not an alternate local backend. These are module boundaries within one
+crate, not separate build targets.
+
 The append-only `NativeEvent` log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
@@ -90,8 +98,14 @@ response batches include usage accounting in the same transaction. Explicit
 barriers synchronize rewind, profile changes, terminal publication and shutdown.
 A crash may lose the unflushed tail, but cannot expose a partial database batch.
 
-The workset process builds one filesystem namespace before starting threads.
-Normal execution inherits it. Claude launcher children alone clone it to install
+The host uses persisted `Place` and `Workset` directly; no per-agent view
+descriptor is retained. New checkouts have a one-shot preparation future,
+awaited after committing the agent record and before starting execution.
+The workset process builds one filesystem namespace and installs its base
+environment before starting threads. Worker runtimes and tools use ordinary
+paths and per-agent cwd, not host-side view descriptors or path translation.
+Commands inherit the process environment, with explicit command overrides and
+per-directory devshell additions. Normal execution inherits the namespace. Claude launcher children alone clone it to install
 private provider overlays; no generic agent namespace or setup thread is needed.
 Mode changes exclude new admission, require settled agents and no live sessions,
 then drain and replace the whole workset execution.

@@ -13,7 +13,7 @@ const MAX_MESSAGES: usize = 32;
 const MAX_FRAME_LEN: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Encode, Decode)]
-pub(super) enum Port {
+pub(crate) enum Port {
     Workset,
     Agent(rho_agent_types::AgentId),
     Terminal(u64),
@@ -22,13 +22,13 @@ pub(super) enum Port {
 
 #[derive(Debug, Encode, Decode)]
 pub(crate) struct Packet {
-    pub(super) port: Port,
-    pub(super) bytes: Bytes,
+    pub(crate) port: Port,
+    pub(crate) bytes: Bytes,
 }
 
 #[cfg(test)]
 impl Packet {
-    pub(super) fn for_test(port: Port, bytes: Bytes) -> Self {
+    pub(crate) fn for_test(port: Port, bytes: Bytes) -> Self {
         Self { port, bytes }
     }
 }
@@ -39,7 +39,7 @@ struct Outgoing {
 }
 
 #[derive(Clone)]
-pub(super) struct Sender {
+pub(crate) struct Sender {
     queue: mpsc::UnboundedSender<Outgoing>,
     slots: Arc<Semaphore>,
 }
@@ -102,7 +102,7 @@ impl Writer {
     }
 }
 
-pub(super) struct Receiver {
+pub(crate) struct Receiver {
     incoming: mpsc::Receiver<io::Result<Packet>>,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::AbortHandle,
@@ -125,7 +125,7 @@ impl Receiver {
     }
 }
 
-pub(super) fn connect(
+pub(crate) fn connect(
     socket: UnixStream,
 ) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
     let (mut reader, writer) = socket.into_split();

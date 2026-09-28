@@ -14,14 +14,41 @@ use rho_db::RhoDb;
 use rho_fs_view::{Mode, Workset, Worksets};
 use tokio::sync::{Mutex, broadcast};
 
-use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentOrigin, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
-    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
-    SessionBinding,
-};
+use super::AgentClient;
+use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
-use crate::lazy::Lazy;
-use crate::{StartPlace, View};
+use crate::log::{
+    AGENT_USAGE_BUCKET_MS, AgentOrigin, AgentRoleSessionProfile as _, AgentRuntime,
+    AgentUsageBucket, SessionBinding,
+};
+
+/// Persisted placement and an optional one-shot checkout operation.
+/// Creation commits the agent record before preparing its directory, then
+/// starts the workset worker. Preparation never survives in the loaded agent.
+pub struct StartPlace {
+    pub place: Place,
+    pub(crate) prepare:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>>,
+}
+
+impl StartPlace {
+    pub fn new(place: Place) -> Self {
+        Self {
+            place,
+            prepare: None,
+        }
+    }
+
+    pub fn pending(
+        place: Place,
+        prepare: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> Self {
+        Self {
+            place,
+            prepare: Some(Box::pin(prepare)),
+        }
+    }
+}
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -41,7 +68,7 @@ struct ResponseNotification {
 #[derive(Default)]
 struct ExecutionSlot {
     admission: Arc<tokio::sync::RwLock<()>>,
-    process: Mutex<Option<Arc<crate::worker::Process>>>,
+    process: Mutex<Option<Arc<crate::host::Process>>>,
 }
 
 pub struct AgentPool {
@@ -58,7 +85,7 @@ pub struct AgentPool {
     /// the same reason as `worksets`: a library that resolves `$HOME` puts
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
-    agents: Mutex<HashMap<AgentId, RunningAgent>>,
+    agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Set by [`AgentPool::drain`]: the agent host is stopping, and a worker
     /// that goes away now was let go rather than lost.
     draining: std::sync::atomic::AtomicBool,
@@ -185,16 +212,15 @@ impl AgentPool {
     pub async fn execution(
         self: &Arc<Self>,
         agent: AgentId,
-    ) -> anyhow::Result<Arc<crate::worker::Process>> {
+    ) -> anyhow::Result<Arc<crate::host::Process>> {
         let place = self.db.read().get_agent(agent).config.place;
         let slot = self.execution_slot(&place.workset).await;
         let _admission = slot.admission.clone().read_owned().await;
         let place = self.db.read().get_agent(agent).config.place;
-        let view = self.materialize_view(&place).await?;
-        self.process(&view).await
+        self.process(&place).await
     }
 
-    pub async fn executions(&self) -> Vec<Arc<crate::worker::Process>> {
+    pub async fn executions(&self) -> Vec<Arc<crate::host::Process>> {
         let slots = self
             .processes
             .lock()
@@ -219,24 +245,30 @@ impl AgentPool {
 
     pub(crate) async fn process(
         self: &Arc<Self>,
-        view: &crate::View,
-    ) -> anyhow::Result<Arc<crate::worker::Process>> {
+        place: &Place,
+    ) -> anyhow::Result<Arc<crate::host::Process>> {
         anyhow::ensure!(
-            self.db.read().workset_mode(view.workset_id()) == Some(Some(view.workset_mode())),
+            self.db.read().workset_mode(&place.workset) == Some(Some(place.mode)),
             "workset contains mixed filesystem modes; explicitly select a workset mode first"
         );
-        let slot = self.execution_slot(view.workset_id()).await;
+        let slot = self.execution_slot(&place.workset).await;
         let mut process = slot.process.lock().await;
         if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
             anyhow::ensure!(
-                process.mode == view.workset_mode(),
+                process.mode == place.mode,
                 "workset mode must be changed before loading this agent"
             );
             return Ok(process.clone());
         }
-        let started =
-            crate::worker::Process::start(self, view, self.claude.clone(), slot.admission.clone())
-                .await?;
+        let workset = self.worksets.open_workset(&place.workset).await?;
+        let started = crate::host::Process::start(
+            self,
+            &workset,
+            place.mode,
+            self.claude.clone(),
+            slot.admission.clone(),
+        )
+        .await?;
         *process = Some(started.clone());
         Ok(started)
     }
@@ -347,7 +379,7 @@ impl AgentPool {
         &self.inference
     }
 
-    pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
+    pub async fn get(&self, agent_id: AgentId) -> Option<AgentClient> {
         let lock = self
             .load_locks
             .lock()
@@ -374,7 +406,7 @@ impl AgentPool {
             .collect()
     }
 
-    /// Drains every loaded agent at once; see [`RunningAgent::drain`].
+    /// Drains every loaded agent at once; see [`AgentClient::drain`].
     pub async fn drain(&self) {
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -440,7 +472,7 @@ impl AgentPool {
 
     /// A live agent is loaded: it is watched (titles and activity get
     /// made) and tells its tail whole. Leaving the live set unwatches it.
-    fn attach_live(&self, agent_id: AgentId, agent: &RunningAgent) {
+    fn attach_live(&self, agent_id: AgentId, agent: &AgentClient) {
         if !self.live.lock().expect("poison").contains(&agent_id) {
             return;
         }
@@ -531,7 +563,7 @@ impl AgentPool {
         config: AgentRole,
         display_name: Option<String>,
         start: StartPlace,
-    ) -> anyhow::Result<(AgentId, RunningAgent)> {
+    ) -> anyhow::Result<(AgentId, AgentClient)> {
         self.create_with_origin(config, display_name, start, AgentOrigin::User)
             .await
     }
@@ -542,7 +574,7 @@ impl AgentPool {
         display_name: Option<String>,
         start: StartPlace,
         origin: AgentOrigin,
-    ) -> anyhow::Result<(AgentId, RunningAgent)> {
+    ) -> anyhow::Result<(AgentId, AgentClient)> {
         let pool = self.clone();
         // Admission and its per-ID ownership lock outlive cancellation of
         // the API caller. Never leave an unregistered worker still draining.
@@ -560,7 +592,16 @@ impl AgentPool {
                     prompt_cache_key: crate::inference::PromptCacheKey::generate(),
                 },
             };
-            let StartPlace { view, place, .. } = start;
+            let StartPlace { place, prepare } = start;
+            let workset = pool.worksets.open_workset(&place.workset).await?;
+            let host_cwd = workset.host_path(&place.cwd)?;
+            if prepare.is_none() {
+                anyhow::ensure!(
+                    host_cwd.is_dir(),
+                    "working directory does not exist: {}",
+                    place.cwd
+                );
+            }
             let mut write = pool.db.write().await;
             // Shared workset admission lets independent creators race. Check
             // after taking the DB writer so the first committed mode is visible
@@ -594,7 +635,10 @@ impl AgentPool {
             write.commit();
             // Once its record commits, the workset belongs to that record,
             // even if the companion cannot start. Do not discard it on error.
-            let agent = RunningAgent::start(&pool, pool.claude.clone(), agent_id, view).await?;
+            if let Some(prepare) = prepare {
+                prepare.await?;
+            }
+            let agent = AgentClient::start(&pool, agent_id).await?;
             {
                 let mut agents = pool.agents.lock().await;
                 agents.insert(agent_id, agent.clone());
@@ -676,18 +720,10 @@ impl AgentPool {
             let record = self.db.read().get_agent(spawner);
             (record.place().clone(), record.config.role)
         };
-        let Place {
-            workset,
-            cwd,
-            mode,
-            origin: place_origin,
-        } = spawner_place;
-        let cwd = workdir.unwrap_or(cwd);
-        anyhow::ensure!(cwd.is_absolute(), "workdir must be an absolute path");
-        let workset = self.worksets.open_workset(&workset).await?;
-        let mode = Mode::from_workset_mode(mode);
-        let view = workset.enter(mode, &cwd)?;
-        let start = StartPlace::new(view, place_origin);
+        let mut place = spawner_place;
+        place.cwd = workdir.unwrap_or(place.cwd);
+        anyhow::ensure!(place.cwd.is_absolute(), "workdir must be an absolute path");
+        let start = StartPlace::new(place);
         let config = child_role(spawner_role, config);
         let (agent_id, agent) = self
             .create_with_origin(config, Some(task_name), start, origin)
@@ -832,24 +868,6 @@ impl AgentPool {
         Ok((workset, mode, host_cwd))
     }
 
-    /// Materializes an agent's persisted place into a live view.
-    pub async fn materialize_view(&self, place: &Place) -> anyhow::Result<Arc<View>> {
-        let (workset, mode, _) = self.open_workset(place).await?;
-        workset.enter(mode, &place.cwd)
-    }
-
-    fn lazy_view(self: &Arc<Self>, _agent_id: AgentId, place: Place) -> Arc<Lazy<Arc<View>>> {
-        let pool = Arc::downgrade(self);
-        Arc::new(Lazy::new(move || {
-            let pool = pool.clone();
-            let place = place.clone();
-            async move {
-                let pool = pool.upgrade().context("agent pool dropped")?;
-                pool.materialize_view(&place).await
-            }
-        }))
-    }
-
     /// Mode belongs to the workset. Existing execution must be idle and
     /// retained terminals/shells closed before its base namespace can change.
     pub async fn change_mode(
@@ -921,7 +939,7 @@ impl AgentPool {
     pub fn load(
         self: &Arc<Self>,
         agent_id: AgentId,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<(AgentId, RunningAgent, bool)>> {
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<(AgentId, AgentClient, bool)>> {
         let pool = self.clone();
         Box::pin(async move {
             tokio::spawn(async move {
@@ -945,9 +963,7 @@ impl AgentPool {
                     agent.shutdown().await;
                     pool.agents.lock().await.remove(&agent_id);
                 }
-                let record = pool.db.read().get_agent(agent_id);
-                let view = pool.lazy_view(agent_id, record.place().clone());
-                let agent = RunningAgent::start(&pool, pool.claude.clone(), agent_id, view).await?;
+                let agent = AgentClient::start(&pool, agent_id).await?;
                 {
                     let mut agents = pool.agents.lock().await;
                     agents.insert(agent_id, agent.clone());
@@ -980,8 +996,6 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         (_, child) => child,
     }
 }
-
-pub use crate::worker::Remote as RunningAgent;
 
 #[cfg(test)]
 mod tests {
@@ -1035,7 +1049,7 @@ mod tests {
         }
     }
 
-    async fn test_pool(root: &std::path::Path) -> (Arc<AgentPool>, Arc<View>) {
+    async fn test_pool(root: &std::path::Path) -> (Arc<AgentPool>, Place) {
         let worker = std::env::current_exe()
             .unwrap()
             .ancestors()
@@ -1068,17 +1082,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let view = worksets
-            .create()
-            .await
-            .unwrap()
-            .enter(
-                Mode::View {
-                    home_skeleton: None,
-                },
-                camino::Utf8Path::new("/src"),
-            )
-            .unwrap();
+        let workset = worksets.create().await.unwrap();
+        let place = Place {
+            workset: workset.id().to_owned(),
+            cwd: "/src".into(),
+            mode: WorksetMode::View,
+            origin: None,
+        };
         let db = RhoDb::open(root.join("agents.redb"));
         let inference = crate::inference::testing::accounts();
         let pool = AgentPool::new(
@@ -1090,30 +1100,104 @@ mod tests {
             ),
         )
         .await;
-        (pool, view)
+        (pool, place)
+    }
+
+    #[tokio::test]
+    async fn pending_placement_commits_before_preparing_and_outlives_caller_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, mut place) = test_pool(directory.path()).await;
+        let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
+        place.cwd = "/src/not-cloned-yet".into();
+        let host_cwd = workset.host_path(&place.cwd).unwrap();
+        let (entered, preparing) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let db = pool.db.clone();
+        let create = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.create(
+                    AgentRole::default(),
+                    None,
+                    StartPlace::pending(place, async move {
+                        let ids = db.read().list_agent_ids();
+                        assert_eq!(ids.len(), 1, "the record must commit before preparation");
+                        entered.send(ids[0]).unwrap();
+                        released.await.unwrap();
+                        std::fs::create_dir(host_cwd)?;
+                        Ok(())
+                    }),
+                )
+                .await
+            }
+        });
+        let id = tokio::time::timeout(std::time::Duration::from_secs(5), preparing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pool.executions().await.is_empty(),
+            "no worker before placement"
+        );
+        create.abort();
+        assert!(create.await.err().unwrap().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if pool.agents.lock().await.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, agent, newly_loaded) = pool.load(id).await.unwrap();
+        assert!(
+            !newly_loaded,
+            "cancelled caller must not leave an unregistered agent"
+        );
+        assert_eq!(agent.head().config.place.cwd, "/src/not-cloned-yet");
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_placement_keeps_the_record_without_starting_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let result = pool
+            .create(
+                AgentRole::default(),
+                None,
+                StartPlace::pending(place, async { anyhow::bail!("checkout failed") }),
+            )
+            .await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("checkout failed")
+        );
+        assert_eq!(pool.db.read().list_agent_ids().len(), 1);
+        assert!(pool.executions().await.is_empty());
     }
 
     #[tokio::test]
     async fn conflicting_first_creators_return_a_mode_error_not_a_panic() {
         let directory = tempfile::tempdir().unwrap();
-        let (pool, view) = test_pool(directory.path()).await;
-        let workset = view.workset_id().to_owned();
-        let exposed = pool
-            .worksets
-            .open_workset(&workset)
-            .await
-            .unwrap()
-            .enter(
-                Mode::from_workset_mode(WorksetMode::Exposed),
-                camino::Utf8Path::new("/src"),
-            )
-            .unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let workset = place.workset.clone();
+        let exposed = Place {
+            mode: WorksetMode::Exposed,
+            ..place.clone()
+        };
         let writer = pool.db.write().await;
         let slot = pool.execution_slot(&workset).await;
         let first = tokio::spawn({
             let pool = pool.clone();
             async move {
-                pool.create(AgentRole::default(), None, StartPlace::new(view, None))
+                pool.create(AgentRole::default(), None, StartPlace::new(place))
                     .await
             }
         });
@@ -1127,7 +1211,7 @@ mod tests {
         let second = tokio::spawn({
             let pool = pool.clone();
             async move {
-                pool.create(AgentRole::default(), None, StartPlace::new(exposed, None))
+                pool.create(AgentRole::default(), None, StartPlace::new(exposed))
                     .await
             }
         });
@@ -1156,8 +1240,8 @@ mod tests {
     #[tokio::test]
     async fn workset_mode_admission_and_transition_are_serialized() {
         let directory = tempfile::tempdir().unwrap();
-        let (pool, view) = test_pool(directory.path()).await;
-        let workset = view.workset_id().to_owned();
+        let (pool, place) = test_pool(directory.path()).await;
+        let workset = place.workset.clone();
         let mut write = pool.db.write().await;
         let id = write.alloc_agent_id();
         write.create_agent(
@@ -1178,27 +1262,17 @@ mod tests {
             AgentOrigin::User,
         );
         write.commit();
-        let exposed = pool
-            .worksets
-            .open_workset(&workset)
-            .await
-            .unwrap()
-            .enter(
-                Mode::from_workset_mode(WorksetMode::Exposed),
-                camino::Utf8Path::new("/src"),
-            )
-            .unwrap();
+        let exposed = Place {
+            mode: WorksetMode::Exposed,
+            ..place.clone()
+        };
         assert!(
-            pool.create(
-                AgentRole::default(),
-                None,
-                StartPlace::new(exposed.clone(), None)
-            )
-            .await
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("filesystem mode")
+            pool.create(AgentRole::default(), None, StartPlace::new(exposed.clone()))
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("filesystem mode")
         );
         assert!(
             pool.process(&exposed)
@@ -1236,7 +1310,7 @@ mod tests {
             WorksetMode::Exposed
         );
         assert!(
-            pool.create(AgentRole::default(), None, StartPlace::new(view, None))
+            pool.create(AgentRole::default(), None, StartPlace::new(place))
                 .await
                 .err()
                 .unwrap()
@@ -1248,21 +1322,25 @@ mod tests {
     #[tokio::test]
     async fn child_workdir_selects_existing_directory_before_creation() {
         let directory = tempfile::tempdir().unwrap();
-        let (pool, view) = test_pool(directory.path()).await;
+        let (pool, place) = test_pool(directory.path()).await;
+        let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
         for name in ["parent", "checkout"] {
-            let dir = view.host_cwd().join(name);
+            let dir = workset.host_path(&place.cwd).unwrap().join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
             let skill_dir = dir.join(".agents/skills/catalogue-fixture");
             std::fs::create_dir_all(&skill_dir).unwrap();
             std::fs::write(skill_dir.join("SKILL.md"), "---\nname: catalogue-fixture\ndescription: Directory-specific skill.\n---\nPrivate skill body.\n").unwrap();
         }
-        let view = view.for_cwd(camino::Utf8Path::new("/src/parent")).unwrap();
+        let place = Place {
+            cwd: "/src/parent".into(),
+            ..place
+        };
         let (parent_id, parent) = pool
             .create(
                 AgentRole::default(),
                 Some("parent".into()),
-                StartPlace::new(view.clone(), None),
+                StartPlace::new(place.clone()),
             )
             .await
             .unwrap();
@@ -1309,8 +1387,11 @@ mod tests {
             )
             .team()
             .unwrap();
-            let child_view = view.for_cwd(camino::Utf8Path::new(expected)).unwrap();
-            let rendered = crate::prompt::prompt(&child_view, Some(&team), child.config.role);
+            let rendered = crate::prompt::prompt(
+                &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                Some(&team),
+                child.config.role,
+            );
             let collaboration = rendered
                 .split("## Working with other agents")
                 .nth(1)
@@ -1341,8 +1422,19 @@ mod tests {
                     intelligence: rho_agent_types::AdvisorIntelligence::Medium,
                 },
             ] {
-                let native = crate::prompt::prompt(&child_view, Some(&team), role);
-                let claude = crate::prompt::claude_prompt(Some(&child_view), Some(&team), role);
+                let native = crate::prompt::prompt(
+                    &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                    Some(&team),
+                    role,
+                );
+                let claude = crate::prompt::claude_prompt(
+                    Some(&crate::prompt::WorksetPrompt::for_host(
+                        &workset,
+                        child.place(),
+                    )),
+                    Some(&team),
+                    role,
+                );
                 let native_catalogue = native.split("## Skills\n").nth(1).unwrap();
                 let claude_catalogue = claude.split("## Skills\n").nth(1).unwrap();
                 assert_eq!(native_catalogue, claude_catalogue);
@@ -1385,12 +1477,12 @@ mod tests {
             AgentCall, InterruptArgs, MultiAgentTools, SendArgs, SpawnArgs, call_agent_tool,
         };
         let directory = tempfile::tempdir().unwrap();
-        let (pool, view) = test_pool(directory.path()).await;
+        let (pool, place) = test_pool(directory.path()).await;
         let (creator_id, creator) = pool
             .create(
                 AgentRole::default(),
                 Some("creator".into()),
-                StartPlace::new(view, None),
+                StartPlace::new(place),
             )
             .await
             .unwrap();
@@ -1425,7 +1517,7 @@ mod tests {
             assert_eq!(read.agent_parent(owned), None);
             assert_eq!(
                 read.get_agent(owned).config.spawned_by,
-                crate::db::AgentSpawnedBy::UserOwned { by: creator_id }
+                crate::log::AgentSpawnedBy::UserOwned { by: creator_id }
             );
             assert!(read.agent_response_subscribers(owned).is_empty());
         }
@@ -1512,23 +1604,19 @@ mod tests {
         use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let (pool, view) = test_pool(root).await;
+        let (pool, place) = test_pool(root).await;
         let role = AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         };
         let (first_id, first) = pool
-            .create(
-                role,
-                Some("first".into()),
-                StartPlace::new(view.clone(), None),
-            )
+            .create(role, Some("first".into()), StartPlace::new(place.clone()))
             .await
             .unwrap();
         let (second_id, second) = pool
             .create(
                 AgentRole::default(),
                 Some("second".into()),
-                StartPlace::new(view, None),
+                StartPlace::new(place),
             )
             .await
             .unwrap();

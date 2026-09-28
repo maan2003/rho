@@ -8,18 +8,16 @@ use anyhow::Context as _;
 use rho_agent_types::{AgentId, AgentRole};
 use tokio::sync::{oneshot, watch};
 
-use super::ipc::{self, Bootstrap, Control, Message};
 use super::services::Services;
+use crate::AgentStatus;
 use crate::db::AgentReadTxnExt as _;
-use crate::lazy::Lazy;
-use crate::{AgentStatus, View};
+use crate::ipc::protocol::{self, Bootstrap, Control, Message};
 
 #[derive(Clone)]
-pub struct Remote(Arc<Inner>);
+pub struct AgentClient(Arc<Inner>);
 
 struct Inner {
     services: Arc<Services>,
-    view: Arc<Lazy<Arc<View>>>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     stopping: Arc<AtomicBool>,
     closed: watch::Receiver<bool>,
@@ -41,16 +39,19 @@ impl Drop for Inner {
     }
 }
 
-impl Remote {
+impl AgentClient {
     pub(crate) async fn start(
-        pool: &Arc<crate::pool::AgentPool>,
-        claude: rho_claude::accounts::ClaudePaths,
+        pool: &Arc<crate::host::pool::AgentPool>,
         agent: AgentId,
-        view: Arc<Lazy<Arc<View>>>,
     ) -> anyhow::Result<Self> {
-        let _ = claude; // Process configuration is workset-wide.
-        let description = view.get().await?;
-        let process = pool.process(description).await?;
+        let place = pool.db().read().get_agent(agent).config.place;
+        let (_, _, cwd) = pool.open_workset(&place).await?;
+        anyhow::ensure!(
+            cwd.is_dir(),
+            "working directory does not exist: {}",
+            place.cwd
+        );
+        let process = pool.process(&place).await?;
         let services = Arc::new(Services::new(
             pool.db().clone(),
             pool.inference().clone(),
@@ -68,27 +69,29 @@ impl Remote {
                 .is_none(),
             "agent port already registered"
         );
-        let port = super::transport::Port::Agent(agent);
+        let port = crate::ipc::transport::Port::Agent(agent);
         let (stop, stopping) = oneshot::channel();
         let (closed, closed_rx) = watch::channel(false);
         let is_stopping = Arc::new(AtomicBool::new(false));
         let handle = Self(Arc::new(Inner {
             services: services.clone(),
-            view: view.clone(),
             stop: Mutex::new(Some(stop)),
             stopping: is_stopping.clone(),
             closed: closed_rx.clone(),
             process_closed: process.closed.clone(),
         }));
         let ready = services.ready.subscribe();
-        let cwd = description.cwd().to_owned();
+        let cwd = place.cwd;
         tokio::spawn(async move {
             let mut service = tokio::spawn({
                 let services = services.clone();
                 let sender = process.sender.clone();
                 async move {
                     sender
-                        .send(port, ipc::encode(&Message::Bootstrap(Bootstrap { cwd }))?)
+                        .send(
+                            port,
+                            protocol::encode(&Message::Bootstrap(Bootstrap { cwd }))?,
+                        )
                         .await?;
                     services.serve(sender, port, receiver).await
                 }
@@ -107,7 +110,7 @@ impl Remote {
                 let drain = async {
                     process
                         .sender
-                        .send(port, ipc::encode(&Message::Stop)?)
+                        .send(port, protocol::encode(&Message::Stop)?)
                         .await?;
                     let result = (&mut service).await;
                     joined = true;
@@ -176,13 +179,10 @@ impl Remote {
             .map_err(anyhow::Error::msg)
     }
 
-    pub async fn view(&self) -> anyhow::Result<Arc<View>> {
-        Ok(self.0.view.get().await?.clone())
-    }
     pub fn status(&self) -> AgentStatus {
         self.0.services.status.borrow().clone()
     }
-    pub fn head(&self) -> crate::db::AgentHead {
+    pub fn head(&self) -> crate::log::AgentHead {
         self.0.services.db.read().get_agent(self.0.services.agent)
     }
     /// Lets the request in flight end and freezes the agent with its log
@@ -259,7 +259,7 @@ impl Remote {
         anyhow::ensure!(
             matches!(
                 self.head().config.runtime,
-                crate::db::AgentRuntime::Rho { .. }
+                crate::log::AgentRuntime::Rho { .. }
             ),
             "prompt cache keys are only available for Rho agents"
         );

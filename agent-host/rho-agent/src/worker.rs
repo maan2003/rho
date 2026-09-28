@@ -1,42 +1,16 @@
-//! Process-local runtime connections. Shared services remain in the agent host.
+//! Worker-owned runtimes, host-service client, and workset execution.
 
-mod ipc;
-mod process;
-mod remote;
-mod transport;
-pub use process::Process;
-mod workset;
-pub use workset::{
-    Action as WorksetAction, Attach as WorksetAttach, Client as WorksetClient,
-    Reply as WorksetReply,
-};
+mod claude;
+pub(crate) mod host_client;
+mod image_tool;
+pub mod native;
 mod runtime;
-mod services;
-pub(crate) use ipc::{Host, SharedCall, StoreError};
-pub use remote::Remote;
+pub(crate) mod shared;
+pub mod shell;
+pub mod terminal;
+mod workset;
 
-#[cfg(test)]
-pub(crate) fn local_services(
-    db: rho_db::RhoDb,
-    inference: crate::inference::Accounts,
-    agent: rho_agent_types::AgentId,
-    pool: std::sync::Weak<crate::pool::AgentPool>,
-) -> std::sync::Arc<Host> {
-    let (client, server) = testing::pair();
-    let services = std::sync::Arc::new(services::Services::new(
-        db,
-        inference,
-        agent,
-        pool,
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-    ));
-    tokio::spawn(async move {
-        let _ = services
-            .serve(server.sender, server.port, server.incoming)
-            .await;
-    });
-    client.host()
-}
+use crate::ipc::protocol;
 
 /// Entry point of the companion process; callers must not have started threads.
 pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<()> {
@@ -48,9 +22,12 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
     anyhow::ensure!(length <= 1024 * 1024, "oversized workset startup");
     let mut bytes = vec![0; length];
     socket.read_exact(&mut bytes)?;
-    let mut startup: process::Startup = senax_encoder::decode(&mut bytes.as_slice())
+    let mut startup: protocol::Startup = senax_encoder::decode(&mut bytes.as_slice())
         .map_err(|_| anyhow::anyhow!("invalid workset startup"))?;
-    anyhow::ensure!(startup.version == ipc::VERSION, "workset protocol mismatch");
+    anyhow::ensure!(
+        startup.version == protocol::VERSION,
+        "workset protocol mismatch"
+    );
     let mut config_home = startup.claude.config_home().to_owned();
     if matches!(startup.layout.mode, rho_fs_view::Mode::View { .. }) {
         if let Ok(home) = std::env::var("HOME")
@@ -68,7 +45,7 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         startup.layout.state.as_std_path(),
         config_home,
     )?;
-    let view = unsafe { startup.layout.enter()? };
+    unsafe { startup.layout.enter()? };
     // This process owns provider transports, but does not start the agent host's
     // RPC listener (which installs its own TLS provider).
     rustls::crypto::aws_lc_rs::default_provider()
@@ -80,69 +57,6 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         .enable_all()
         .build()?
         .block_on(async {
-            runtime::run(
-                tokio::net::UnixStream::from_std(socket)?,
-                startup,
-                view,
-                factory,
-            )
-            .await
+            runtime::run(tokio::net::UnixStream::from_std(socket)?, startup, factory).await
         })
-}
-
-#[cfg(test)]
-pub(crate) mod testing {
-    use super::*;
-    pub struct Endpoint {
-        pub(super) sender: transport::Sender,
-        pub(super) port: transport::Port,
-        pub(super) incoming: tokio::sync::mpsc::UnboundedReceiver<transport::Packet>,
-    }
-    impl Endpoint {
-        pub fn host(self) -> std::sync::Arc<Host> {
-            Host::connect(
-                self.sender,
-                self.port,
-                self.incoming,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            )
-        }
-        pub(super) async fn read(&mut self) -> std::io::Result<ipc::Message<'static>> {
-            ipc::decode(
-                &self
-                    .incoming
-                    .recv()
-                    .await
-                    .ok_or(std::io::ErrorKind::UnexpectedEof)?
-                    .bytes,
-            )
-        }
-        pub(super) async fn write(&self, message: &ipc::Message<'_>) -> std::io::Result<()> {
-            self.sender.send(self.port, ipc::encode(message)?).await
-        }
-    }
-    pub fn pair() -> (Endpoint, Endpoint) {
-        let (left, right) = tokio::net::UnixStream::pair().unwrap();
-        fn endpoint(socket: tokio::net::UnixStream) -> Endpoint {
-            let (sender, mut receiver, writer) = transport::connect(socket);
-            let (incoming, messages) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = incoming.closed() => {}
-                    _ = async {
-                        while let Ok(packet) = receiver.next().await {
-                            if incoming.send(packet).is_err() { break; }
-                        }
-                    } => {}
-                }
-                writer.abort();
-            });
-            Endpoint {
-                sender,
-                port: transport::Port::Workset,
-                incoming: messages,
-            }
-        }
-        (endpoint(left), endpoint(right))
-    }
 }

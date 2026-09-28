@@ -4,7 +4,8 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime};
+use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::log::AgentRuntime;
 use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -214,13 +215,14 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
         rho_fs_view::StoreService::None,
     )
     .await?;
-    let view = worksets.adopt(&cwd)?.enter(
-        rho_fs_view::Mode::View {
-            home_skeleton: None,
-        },
-        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-    )?;
-    let surface = rho_agent::render_agent_surface(view, role)?;
+    let workset = worksets.adopt(&cwd)?;
+    let place = rho_agent_types::Place {
+        workset: workset.id().to_owned(),
+        cwd: rho_fs_view::MOUNT_ROOT.into(),
+        mode: rho_agent_types::WorksetMode::View,
+        origin: None,
+    };
+    let surface = rho_agent::render_agent_surface(&workset, &place, role)?;
 
     println!("# System prompt\n");
     if surface.system_prompt.is_empty() {

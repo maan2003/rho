@@ -4,9 +4,9 @@
 //! The runtime writes its own events; this is
 //! the one place they become the client's words.
 
-use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
 use rho_agent::entry::{Block, Entry, Notice, Party, Report};
 use rho_agent::inference::Carry;
+use rho_agent::log::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
 use rho_agent::{AgentEvent, InputKind, QueuedInput};
 #[cfg(test)]
 use rho_agent_types::UnixMs;

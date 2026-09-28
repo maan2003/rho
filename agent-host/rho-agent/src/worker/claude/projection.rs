@@ -197,7 +197,7 @@ pub(super) struct Projection {
 /// for a block a reader never sees (thinking only, empty).
 pub(super) fn assistant_row(
     message: &AssistantMessage,
-    usage_model: crate::db::AgentUsageModel,
+    usage_model: crate::log::AgentUsageModel,
     projection: &mut Projection,
 ) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
     let mut text = String::new();
@@ -338,9 +338,9 @@ fn image_marker(source: &Value) -> &'static str {
 
 fn usage_bucket(
     usage: &TokenUsage,
-    model: crate::db::AgentUsageModel,
-) -> crate::db::AgentUsageBucket {
-    crate::db::AgentUsageBucket {
+    model: crate::log::AgentUsageModel,
+) -> crate::log::AgentUsageBucket {
+    crate::log::AgentUsageBucket {
         model,
         input_tokens: usage.input_tokens.unwrap_or(0),
         cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
@@ -352,7 +352,7 @@ fn usage_bucket(
             .unwrap_or(0),
         output_tokens: usage.output_tokens.unwrap_or(0),
         requests: 1,
-        ..crate::db::AgentUsageBucket::default()
+        ..crate::log::AgentUsageBucket::default()
     }
 }
 
@@ -436,7 +436,7 @@ mod tests {
     fn assistant_line(message: Value) -> Option<TranscriptLine> {
         assistant_row(
             &assistant(message),
-            crate::db::AgentUsageModel::OPUS,
+            crate::log::AgentUsageModel::OPUS,
             &mut Projection::default(),
         )
         .unwrap()
@@ -453,7 +453,7 @@ mod tests {
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
         ]}));
         let (_, _, called_at) =
-            assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut projection)
+            assistant_row(&call, crate::log::AgentUsageModel::OPUS, &mut projection)
                 .unwrap()
                 .unwrap();
         let mut answer: UserOutputMessage = user(json!({"role": "user", "content": [
@@ -548,10 +548,10 @@ mod tests {
             ]}),
         );
         let mut told = Projection::default();
-        let (_, first, _) = assistant_row(&text, crate::db::AgentUsageModel::OPUS, &mut told)
+        let (_, first, _) = assistant_row(&text, crate::log::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
-        let (_, second, _) = assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut told)
+        let (_, second, _) = assistant_row(&call, crate::log::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
         let TranscriptLine::Assistant {

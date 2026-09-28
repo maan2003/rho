@@ -430,7 +430,7 @@ impl Convert {
                         Some(ids) => messages.extend(ids),
                         None => {
                             self.unmatched += 1;
-                            extra.push(crate::agent::context::render_message(
+                            extra.push(crate::worker::native::context::render_message(
                                 &party(*sender),
                                 &content.iter().map(block_of).collect::<Vec<_>>(),
                             ))

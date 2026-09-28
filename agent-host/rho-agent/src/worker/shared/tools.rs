@@ -12,33 +12,34 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rho_agent_types::transcript::{ImageDetail, ToolExecutionContext};
 use rho_agent_types::{AgentId, AgentRole};
-use crate::inference::Inference;
 use rho_notebook::{Export, operation};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
 
 use super::mailroom::Mailroom;
-use crate::View;
-use crate::image_tool::{ImageTools, ViewImageArgs};
+use crate::inference::Inference;
+use crate::ipc::protocol::SharedCall;
 use crate::multi_agent_tools::{AdvisorArgs, AgentCall, InterruptArgs, SendArgs, SpawnArgs, Team};
 use crate::papercut::PapercutArgs;
-use crate::worker::{Host, SharedCall};
+use crate::worker::host_client::HostClient;
+use crate::worker::image_tool::{ImageTools, ViewImageArgs};
 
 /// The shell, and the notebook globals Rho answers itself (images,
 /// collaboration, web search, papercuts, and the mailroom's `human` and
 /// `archive` when there is one). Unavailable services export nothing.
 pub(crate) fn host_tools(
-    view: &Arc<View>,
+    cwd: &camino::Utf8Path,
     role: AgentRole,
     agent_id: AgentId,
     inference: Option<&Inference>,
     multi_agent: Option<&Team>,
-    host: Option<&Arc<Host>>,
+    host: Option<&Arc<HostClient>>,
     mailroom: Option<&Arc<Mailroom>>,
 ) -> (ShellTools, Vec<Export>) {
-    let shell = ShellTools::new(
+    let shell = ShellTools::in_directory(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        Arc::clone(view),
+        cwd.to_owned(),
+        Default::default(),
     )
     .with_env("RHO_AGENT_ID", agent_id.encoded());
     let agent_host = host.map(|host| {
@@ -51,7 +52,7 @@ pub(crate) fn host_tools(
     let mut exports = vec![Export::new(
         "view_image",
         ViewImage {
-            images: ImageTools::new(Arc::clone(view)),
+            images: ImageTools::new(cwd.to_owned()),
         },
     )];
     if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
@@ -61,13 +62,16 @@ pub(crate) fn host_tools(
         exports.push(Export::new(
             "web",
             Web {
-                tools: WebSearchTools::new({
-                    let inference = inference.clone();
-                    Arc::new(move || {
+                tools: WebSearchTools::new(
+                    {
                         let inference = inference.clone();
-                        Box::pin(async move { inference.web_credentials().await })
-                    })
-                }, agent_id.encoded().to_owned()),
+                        Arc::new(move || {
+                            let inference = inference.clone();
+                            Box::pin(async move { inference.web_credentials().await })
+                        })
+                    },
+                    agent_id.encoded().to_owned(),
+                ),
             },
         ));
     }
