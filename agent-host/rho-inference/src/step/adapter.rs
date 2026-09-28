@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use rho_agent::inference as agent;
 
-use super::{Carry, Event, Item, Request, Step};
+use super::{Item, Request};
 
 impl agent::Backend for crate::Inference {
     fn session(
@@ -65,11 +65,8 @@ impl agent::Session for Session {
                     let mut incoming = transport.start(request_input(request), selected.clone(), auth);
                     while let Some(event) = incoming.recv().await {
                         let event = match event {
-                            Event::Call {carry} => agent::Event::Call {carry:carry.0},
-                            Event::Code(code) => agent::Event::Code(code),
-                            Event::Completed(step) => agent::Event::Completed(step_output(step)),
-                            Event::NeedsContext => agent::Event::NeedsContext,
-                            Event::Failed(error) => agent::Event::Failed(classify(error,Some(&selected),&inference).await),
+                            agent::Event::Failed(error) => agent::Event::Failed(classify(error, Some(&selected), &inference).await),
+                            event => event,
                         };
                         if events.send(event).is_err() { break; }
                     }
@@ -96,16 +93,6 @@ async fn classify(
     }
 }
 
-fn step_output(step: Step) -> agent::Step {
-    agent::Step {
-        continuation: step.response_id.map(agent::Continuation::new),
-        call: step.call.map(|call| agent::Call::new(call.id, call.code)),
-        prose: step.prose,
-        carry: step.carry.0,
-        usage: step.usage,
-    }
-}
-
 fn request_input(request: agent::Request) -> Request {
     let items = request
         .items
@@ -114,15 +101,15 @@ fn request_input(request: agent::Request) -> Request {
             agent::Item::Step { carry, exec } => {
                 // Interrupted execution records only the code actually admitted.
                 // The provider-start payload still owns the original call identity.
-                let mut carry = Carry(carry);
+                let mut carry = carry;
                 if let Some(code) = exec
-                    && carry.replay().pending_exec
+                    && super::replay(&carry).pending_exec
                 {
                     // A stream-start carry contains exactly its one unfinished call.
                     let mut data: serde_json::Value =
-                        serde_json::from_str(carry.0.data().get()).expect("stream-start carry");
+                        serde_json::from_str(carry.data().get()).expect("stream-start carry");
                     data["items"][0]["input"] = code.into();
-                    carry.0 = agent::Carry::new(data, carry.0.display_calls(), false);
+                    carry = agent::Carry::new(data, carry.display_calls(), false);
                 }
                 vec![Item::Step(carry)]
             }
@@ -132,7 +119,7 @@ fn request_input(request: agent::Request) -> Request {
                 reply_to,
             } => {
                 let results =
-                    reply_to.map_or_else(Vec::new, |carry| Carry(carry).reply(&text, &images));
+                    reply_to.map_or_else(Vec::new, |carry| super::reply(&carry, &text, &images));
                 if results.is_empty() {
                     vec![Item::User { text, images }]
                 } else {
@@ -143,7 +130,7 @@ fn request_input(request: agent::Request) -> Request {
             agent::Item::CompactionTrigger => vec![Item::CompactionTrigger],
         })
         .collect();
-    let key = super::CacheKey::from_u128(request.cache_key.0);
+    let key = request.cache_key;
     match request.continuation {
         Some(previous) => {
             Request::continuation(request.instructions, items, key, previous.into_token())
@@ -161,7 +148,7 @@ mod tests {
 
     #[test]
     fn interrupted_code_is_patched_but_historical_calls_are_never_rewritten() {
-        let start = super::super::Carry::bare(super::super::Call::new("stream", String::new())).0;
+        let start = super::super::bare(agent::Call::new("stream", String::new()));
         let historical = agent::Carry::new(
             json!({"items":[
                 {"type":"custom_tool_call","call_id":"old-a","input":"alpha()"},
@@ -211,16 +198,14 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(history.0.data().get()).unwrap()["items"][1]
-                ["input"],
+            serde_json::from_str::<serde_json::Value>(history.data().get()).unwrap()["items"][1]["input"],
             "beta()"
         );
         let Item::Step(partial) = &request.items[1] else {
             panic!()
         };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(partial.0.data().get()).unwrap()["items"][0]
-                ["input"],
+            serde_json::from_str::<serde_json::Value>(partial.data().get()).unwrap()["items"][0]["input"],
             "admitted()"
         );
         let Item::Result(result) = &request.items[2] else {
@@ -241,8 +226,8 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(compacted.0.data().get()).unwrap()["items"]
-                [1]["input"],
+            serde_json::from_str::<serde_json::Value>(compacted.data().get()).unwrap()["items"][1]
+                ["input"],
             "retained()"
         );
     }

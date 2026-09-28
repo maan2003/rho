@@ -541,13 +541,12 @@ async fn new_agent(services: &Arc<Services>, new: NewAgent) -> anyhow::Result<Ag
     let NewAgent {
         role,
         start,
-        mode,
         mut content,
     } = new;
     if let Some(content) = content.as_mut() {
         prepare_image_content(content).await?;
     }
-    let (agent_id, agent) = services.create(role, start, mode).await?;
+    let (agent_id, agent) = services.create(role, start).await?;
     if let Some(content) = content {
         agent.send_user_content_accepted(content).await?;
     }
@@ -584,16 +583,6 @@ pub(crate) async fn handle_agent_command(
         AgentCommand::ChangeRole { agent_id, role } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_role(role).await?;
-        }
-        AgentCommand::ChangeMode { agent_id, mode } => {
-            let changed = services.pool.change_mode(agent_id, mode).await?;
-            for id in changed {
-                if id != agent_id && services.pool.is_live(id) {
-                    services.load(id).await?;
-                }
-            }
-            // Back at once, in the new view, for whoever is looking.
-            services.load(agent_id).await?;
         }
         AgentCommand::ChangePromptCacheKey { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
@@ -1113,7 +1102,7 @@ mod tests {
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
         let result = rho_agent_types::transcript::ToolResult {
-            call_id: rho_agent_types::transcript::ToolCallId::try_from("call-1").unwrap(),
+            call_id: rho_agent_types::transcript::ExecId::try_from("call-1").unwrap(),
             tool_type: rho_agent_types::transcript::ToolType::Custom,
             body: rho_agent_types::transcript::ToolOutput {
                 output: Arc::new("bounded model view".to_owned()),

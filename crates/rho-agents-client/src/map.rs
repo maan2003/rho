@@ -920,7 +920,6 @@ mod tests {
             place: rho_agent_types::Place {
                 workset: "0123456789ab".into(),
                 cwd: "/src/repo".into(),
-                mode: Default::default(),
                 origin: None,
             },
             spawned_by: SpawnedBy::Direct,
@@ -1146,7 +1145,6 @@ mod tests {
                         TranscriptEvent::Message {
                             from: None,
                             text: "do the thing\nand then some".to_owned(),
-                            delivery: rho_agent_types::MessageDelivery::Immediate,
                             at: UnixMs(10),
                         },
                         TranscriptEvent::Turn {

@@ -56,9 +56,7 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 #[cfg(test)]
 mod tests {
     use rho_agent_hosts::HostId;
-    use rho_agent_types::{
-        AgentIdDomain, AgentPos, MessageDelivery, TurnEdge, TurnOutcome, UnixMs,
-    };
+    use rho_agent_types::{AgentIdDomain, AgentPos, TurnEdge, TurnOutcome, UnixMs};
 
     use super::*;
     use crate::MirroredAgent;
@@ -75,7 +73,6 @@ mod tests {
             place: rho_agent_types::Place {
                 workset: "0123456789ab".into(),
                 cwd: "/src/repo".into(),
-                mode: Default::default(),
                 origin: None,
             },
             spawned_by: SpawnedBy::Direct,
@@ -90,7 +87,6 @@ mod tests {
         TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
-            delivery: MessageDelivery::Immediate,
             at: UnixMs(at),
         }
     }

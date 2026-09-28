@@ -11,7 +11,7 @@ use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::host::AgentClient;
 use rho_agent::host::pool::AgentPool;
 use rho_agent_hosts::protocol::GitProviderFrame;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorkspaceInfo};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -1046,13 +1046,10 @@ impl Services {
         self.inference.set_account_enabled(name, enabled).await;
     }
 
-    /// `mode` is the workset's view of the filesystem around it, whether
-    /// the workset is fresh or one this agent joins.
     async fn create(
         &self,
         role: AgentRole,
         start: StartMode,
-        mode: WorksetMode,
     ) -> anyhow::Result<(AgentId, AgentClient)> {
         self.refuse_while_stopping()?;
         let start = match start {
@@ -1069,7 +1066,6 @@ impl Services {
                 let place = Place {
                     workset: workset.id().to_owned(),
                     cwd,
-                    mode,
                     origin: Some(origin.clone()),
                 };
                 rho_agent::StartPlace::pending(place, async move {
@@ -1079,13 +1075,10 @@ impl Services {
                 })
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                let mut place = info
+                let place = info
                     .place()
                     .context("agents no longer work in the user's own checkout")?
                     .clone();
-                // The same directory as the agent joined, using the requested
-                // workset mode.
-                place.mode = mode;
                 rho_agent::StartPlace::new(place)
             }
             StartMode::Join(JoinTarget::User { .. }) => {
@@ -1278,7 +1271,7 @@ async fn open_checkout(
     let place = workspace
         .place()
         .context("agents no longer work in the user's own checkout")?;
-    let (workset, _, host_cwd) = services.pool.open_workset(place).await?;
+    let (workset, host_cwd) = services.pool.open_workset(place).await?;
     let (root, _) = rho_fs_view::resolve_workdir_root(host_cwd.as_std_path())?;
     Ok((workset, root))
 }

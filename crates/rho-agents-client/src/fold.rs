@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, AgentWant, MessageDelivery, Place, PresentationField, TurnEdge,
-    TurnOutcome, UnixMs,
+    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, TurnEdge, TurnOutcome,
+    UnixMs,
 };
 
 use crate::HostId;
@@ -278,7 +278,6 @@ impl Digest {
             | TranscriptEvent::ClaudeMessage { .. }
             | TranscriptEvent::Created { .. }
             | TranscriptEvent::RoleChanged { .. }
-            | TranscriptEvent::ModeChanged { .. }
             | TranscriptEvent::Notice { .. }
             | TranscriptEvent::CompactionRequested { .. }
             | TranscriptEvent::QueueCleared { .. }
@@ -378,9 +377,6 @@ impl MirroredAgent {
             if let Some(model) = model {
                 self.identity.model = model.clone();
             }
-        }
-        if let TranscriptEvent::ModeChanged { mode, .. } = event {
-            self.identity.place.mode = *mode;
         }
         true
     }
@@ -574,12 +570,7 @@ impl TranscriptFold {
                 }
             }
 
-            TranscriptEvent::Message {
-                from,
-                text,
-                delivery,
-                ..
-            } => {
+            TranscriptEvent::Message { from, text, .. } => {
                 self.errored = false;
                 self.touch(self.blocks.len() + self.queue.len());
                 self.queue.push((
@@ -587,7 +578,6 @@ impl TranscriptFold {
                     None,
                     UiBlock::QueuedMessage {
                         text: text.clone(),
-                        delivery: *delivery,
                         sender: *from,
                     },
                 ));
@@ -600,7 +590,6 @@ impl TranscriptFold {
                     Some(*id),
                     UiBlock::QueuedMessage {
                         text: text.clone(),
-                        delivery: MessageDelivery::Immediate,
                         sender: *from,
                     },
                 ));
@@ -811,7 +800,6 @@ impl TranscriptFold {
             }
             TranscriptEvent::Created { .. }
             | TranscriptEvent::RoleChanged { .. }
-            | TranscriptEvent::ModeChanged { .. }
             | TranscriptEvent::Notice { .. }
             | TranscriptEvent::Presented { .. }
             | TranscriptEvent::Wants { .. } => {}
@@ -868,7 +856,6 @@ fn delivered(queued: UiBlock) -> UiBlock {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::MessageDelivery;
 
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, ToolOutcome, Usage};
@@ -878,7 +865,6 @@ mod tests {
         Place {
             workset: "0123456789ab".into(),
             cwd: "/src/repo".into(),
-            mode: Default::default(),
             origin: None,
         }
     }
@@ -897,7 +883,6 @@ mod tests {
         TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
-            delivery: MessageDelivery::Immediate,
             at: UnixMs(at),
         }
     }
@@ -1692,19 +1677,6 @@ mod tests {
             }
         ));
         assert_eq!(mirrored.digest.wants, None);
-        // A mode change is the identity's place moving, and nothing else.
-        assert!(mirrored.tell(
-            AgentPos(6),
-            &TranscriptEvent::ModeChanged {
-                mode: rho_agent_types::WorksetMode::Exposed,
-                at: UnixMs(15),
-            }
-        ));
-        assert_eq!(
-            mirrored.identity.place.mode,
-            rho_agent_types::WorksetMode::Exposed
-        );
-        assert_eq!(mirrored.identity.place.cwd, test_place().cwd);
     }
     #[test]
     fn exec_observations_survive_commit_and_rewind_without_retiming() {

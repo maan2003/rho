@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::entry::{Entry, Party};
 use rho_agent::{AgentEvent, StartPlace};
-use rho_agent_types::{AgentRole, EngineerIntelligence, Place, TurnEdge, TurnOutcome, WorksetMode};
+use rho_agent_types::{AgentRole, EngineerIntelligence, Place, TurnEdge, TurnOutcome};
 use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
@@ -91,7 +91,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
     };
     let env = UserEnvironment::new(std::env::vars_os().collect());
-    // An eval adopts its directory as a workset seen in view mode; no
+    // An eval adopts its directory as a workset; no
     // mirror keeper runs, so `git` inside is the plain one.
     let worksets = Worksets::open(
         temp.path().join("state"),
@@ -104,7 +104,6 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     let place = Place {
         workset: workset.id().to_owned(),
         cwd: rho_fs_view::MOUNT_ROOT.into(),
-        mode: WorksetMode::View,
         origin: None,
     };
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));

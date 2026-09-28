@@ -26,9 +26,6 @@ validated_string_type!(
     self::util::validate_identifier
 );
 
-/// Legacy protocol vocabulary; encoded identically to the exec identity.
-pub type ToolCallId = ExecId;
-
 validated_string_type!(
     /// Name of a tool, shared by [`ToolSpec`] and the [`ToolCall`] that invokes it.
     pub ToolName,
@@ -88,7 +85,7 @@ pub enum ContextBlock {
     /// blocks remain available in transcript history. Invalidates continuations
     /// established before this item.
     ToolHistoryEvicted {
-        call_ids: Vec<ToolCallId>,
+        call_ids: Vec<ExecId>,
     },
 }
 
@@ -101,7 +98,7 @@ pub enum InferenceResponseItem {
     },
     ToolCall {
         provider_specific: Box<dyn ProviderSpecificData>,
-        id: ToolCallId,
+        id: ExecId,
         name: ToolName,
         tool_type: ToolType,
         // arbitrary could be json!
@@ -162,7 +159,7 @@ pub struct ExecCall {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolCall {
-    pub id: ToolCallId,
+    pub id: ExecId,
     pub name: ToolName,
     pub tool_type: ToolType,
     // arbitrary could be json!
@@ -203,7 +200,7 @@ impl ToolOutput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolResult {
     /// Matches the [`ToolCall`] this result answers.
-    pub call_id: ToolCallId,
+    pub call_id: ExecId,
     /// Wire shape for replaying this result to the provider.
     pub tool_type: ToolType,
     pub body: ToolOutput,
@@ -244,7 +241,7 @@ pub struct ToolUpdate {
     #[senax(default)]
     pub status: Option<ToolOutputStatus>,
     /// The [`ToolCall`] this update annotates.
-    pub call_id: ToolCallId,
+    pub call_id: ExecId,
     /// Wire shape for replaying this update to the provider.
     pub tool_type: ToolType,
     pub output: Arc<String>,
@@ -320,7 +317,7 @@ pub enum StreamingContextItem {
     },
     ToolCall {
         provider_specific: Box<dyn ProviderSpecificData>,
-        id: ToolCallId,
+        id: ExecId,
         name: ToolName,
         tool_type: ToolType,
         arguments: AStr,
@@ -557,7 +554,7 @@ mod tests {
     fn tool_update_without_complete_record_decodes_from_legacy_shape() {
         #[derive(Encode)]
         struct LegacyToolUpdate {
-            call_id: ToolCallId,
+            call_id: ExecId,
             tool_type: ToolType,
             output: Arc<String>,
             at: UnixMs,
@@ -578,11 +575,11 @@ mod tests {
 
     #[test]
     fn tool_call_id_converts_and_borrows_as_str() {
-        let from_str = ToolCallId::try_from("call-1").unwrap();
+        let from_str = ExecId::try_from("call-1").unwrap();
         assert_eq!(from_str.as_ref(), "call-1");
 
         let arc: Arc<str> = Arc::from("call-2");
-        let from_arc = ToolCallId::try_from(arc.clone()).unwrap();
+        let from_arc = ExecId::try_from(arc.clone()).unwrap();
         assert_eq!(from_arc.as_str(), "call-2");
     }
 
@@ -593,7 +590,7 @@ mod tests {
             error.to_string().contains("invalid character"),
             "unexpected error: {error}"
         );
-        assert!(ToolCallId::try_from("").is_err());
+        assert!(ExecId::try_from("").is_err());
     }
 
     #[test]
@@ -688,7 +685,7 @@ mod tests {
             1,
             ContextItemEvent::Update(StreamingContextItem::ToolCall {
                 provider_specific: test_provider_specific_data(),
-                id: ToolCallId::try_from("call-1").unwrap(),
+                id: ExecId::try_from("call-1").unwrap(),
                 name: ToolName::try_from("shell").unwrap(),
                 tool_type: ToolType::Function,
                 arguments: AStr::from(r#"{"cmd":"ls"}"#),
@@ -703,7 +700,7 @@ mod tests {
                 message_item("hi"),
                 InferenceResponseItem::ToolCall {
                     provider_specific: test_provider_specific_data(),
-                    id: ToolCallId::try_from("call-1").unwrap(),
+                    id: ExecId::try_from("call-1").unwrap(),
                     name: ToolName::try_from("shell").unwrap(),
                     tool_type: ToolType::Function,
                     arguments: r#"{"cmd":"ls"}"#.to_owned(),

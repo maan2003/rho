@@ -25,7 +25,7 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{MAX_BOUNDED_READ, Mode, WorksetLayout, read_file_bounded};
+pub use ns::{MAX_BOUNDED_READ, WorksetLayout, read_file_bounded};
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
 /// The agent's base userland: a nix `buildEnv` fixed at build
@@ -50,10 +50,7 @@ pub const FIND_BIN: Option<&str> = option_env!("RHO_FIND_BIN");
 /// a dev shell's cargo.
 pub const SHARED_CARGO_BIN: Option<&str> = option_env!("RHO_SHARED_CARGO_BIN");
 
-/// The agent's home inside the view.
-pub const AGENT_HOME: &str = "/home/agent";
-
-/// The directory Rho's git really lives in, for exposed mode, whose PATH
+/// The directory Rho's git really lives in; the workset PATH
 /// is the user's own with this first.
 pub fn git_dir() -> PathBuf {
     std::fs::canonicalize(GIT)
@@ -64,8 +61,7 @@ pub fn git_dir() -> PathBuf {
 
 /// `rho-devshell-builder`, which runs programs in flake dev shells:
 /// `$RHO_DEVSHELL_BUILDER`, else installed next to this executable (or, for a
-/// cargo test binary, next to its `deps` directory), else from `PATH`. A view
-/// binds a development executable's directory, so the path holds there too.
+/// cargo test binary, next to its `deps` directory), else from `PATH`.
 pub fn devshell_builder() -> PathBuf {
     match std::env::var_os("RHO_DEVSHELL_BUILDER") {
         Some(program) => program.into(),
@@ -80,8 +76,7 @@ pub fn devshell_daemon() -> PathBuf {
 }
 
 /// The dev shell cache: `$RHO_DEVSHELL_DIR`, else the default root's
-/// ([`Worksets::devshell_cache_dir`]). A view sets the variable, because the
-/// agent's home there is not the owner's.
+/// ([`Worksets::devshell_cache_dir`]).
 pub fn devshell_dir() -> anyhow::Result<PathBuf> {
     match std::env::var_os("RHO_DEVSHELL_DIR") {
         Some(dir) => Ok(dir.into()),
@@ -308,15 +303,13 @@ impl Worksets {
         self.root.join("stores")
     }
 
-    /// The cache every agent shares as `~/.cache`: nix
-    /// evaluation and fetcher caches, cargo, uv, npm. Persistent.
+    /// The persistent cache directory shared by the owner's worksets.
     pub fn cache_dir(&self) -> Utf8PathBuf {
         self.root.join("cache")
     }
 
     /// Where dev shells are cached, shared by the owner's worksets: GC
-    /// roots and activation scripts. Views bind it at this host path
-    /// because the Nix daemon resolves the roots on the host.
+    /// roots and activation scripts at their host path.
     pub fn devshell_cache_dir(&self) -> Utf8PathBuf {
         ns::devshell_cache(&self.cache_dir())
     }
@@ -589,8 +582,7 @@ impl Workset {
     }
 
     /// The workset's state directory, `<state>/worksets/<id>/state`,
-    /// bound into the view at this same path, so that nix GC roots registered
-    /// here resolve on the host and die with the workset.
+    /// used for nix GC roots that die with the workset.
     pub fn state_dir(&self) -> anyhow::Result<Utf8PathBuf> {
         Ok(self
             .owner()?

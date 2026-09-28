@@ -1,5 +1,3 @@
-use std::os::fd::AsRawFd as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -47,93 +45,12 @@ fn build_fixture(temp: &Path) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 #[test]
-fn workset_and_generated_root_work_in_the_view() {
-    if !namespace_setup_available() {
-        return;
-    }
-
-    let temp = tempfile::tempdir().unwrap();
-    let (state, src, store) = build_fixture(temp.path());
-    let skeleton = temp.path().join("skeleton");
-    std::fs::create_dir(&skeleton).unwrap();
-    std::fs::write(skeleton.join("seeded"), "seed\n").unwrap();
-    std::os::unix::fs::symlink("/nix/store", skeleton.join("store-link")).unwrap();
-
-    let [shell, git_bin, unshare] = ["sh", "git", "unshare"].map(|name| {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .find_map(|dir| {
-                dir.join(name)
-                    .canonicalize()
-                    .ok()
-                    .filter(|path| path.is_file())
-            })
-            .unwrap_or_else(|| panic!("{name} is required on PATH"))
-    });
-    let script = format!(
-        r#"
-set -eu
-test "$PWD" = /src
-test -d /src/project
-test -d {stores}
-test -f "$HOME/seeded"
-test -L "$HOME/store-link"
-touch "$HOME/writable"
-test -z "${{RHO_FS_VIEW_TEST_SECRET-}}"
-test ! -e /proc/self/fd/77
-grep -q '^root:' /etc/passwd
-grep -q '^agent:' /etc/passwd
-grep -q '^hosts: files dns$' /etc/nsswitch.conf
-grep -q localhost /etc/hosts
-test -s /etc/resolv.conf
-test -L /etc/localtime
-test -L /etc/ssl/certs/ca-certificates.crt
-grep -q ' / / .* - tmpfs ' /proc/self/mountinfo
-grep ' /nix/store ' /proc/self/mountinfo | grep -q ' ro[, ]'
-{git} -C /src/project status --short
-{unshare} -Ur true
-test ! -w {store}/mirror
-touch /src/project/writable
-test ! -e {temp}/source
-"#,
-        stores = state.join("stores").display(),
-        store = store.display(),
-        temp = temp.path().display(),
-        git = git_bin.display(),
-        unshare = unshare.display(),
-    );
-    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
-    let inherited = std::fs::File::open(temp.path().join("remote.git")).unwrap();
-    // SAFETY: dup2 is async-signal-safe and the captured fd remains open.
-    unsafe {
-        view.pre_exec(move || {
-            libc::umask(0o077);
-            if libc::dup2(inherited.as_raw_fd(), 77) < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    view.env("RHO_FS_VIEW_TEST_SECRET", "must-not-leak")
-        .arg("--src")
-        .arg(&src)
-        .arg("--state")
-        .arg(&state)
-        .args(["--skeleton", skeleton.to_str().unwrap(), "--"])
-        .arg(shell)
-        .args(["-c", &script]);
-    run(view);
-    assert!(src.join("project/writable").exists());
-    git(&src.join("project"), &["status", "--short"]);
-}
-
-#[test]
-fn exposed_mode_mounts_the_workset_over_the_host_src_stub() {
+fn workset_mounts_over_the_host_src_stub() {
     if !namespace_setup_available() {
         return;
     }
     if !Path::new("/src").is_dir() {
-        eprintln!("skipping exposed-mode test: host has no /src mount stub");
+        eprintln!("skipping workset namespace test: host has no /src mount stub");
         return;
     }
 
@@ -158,7 +75,6 @@ touch /src/project/writable
     );
     let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
     view.env("RHO_FS_VIEW_TEST_ENV", "kept")
-        .args(["--exposed"])
         .arg("--src")
         .arg(&src)
         .arg("--state")

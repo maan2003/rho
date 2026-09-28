@@ -6,7 +6,7 @@ use rho_agent::{StartPlace, WorksetAction, WorksetAttach, WorksetReply};
 use rho_terminal::protocol::{TermClientFrame, TermServerFrame};
 
 #[tokio::test]
-async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
+async fn agents_terminal_and_shell_share_workset_process() {
     let (_directory, pool, workset, place) = fixture("http://127.0.0.1:1").await;
     let (first, a) = pool
         .create(
@@ -29,6 +29,12 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
         &process,
         &pool.execution(second).await.unwrap()
     ));
+    // Exposed worksets inherit HOME. Keep this test independent of login
+    // customization (which may replace bash with a different shell).
+    use std::os::unix::fs::PermissionsExt as _;
+    let terminal_shell = workset.root().join("terminal-shell");
+    std::fs::write(&terminal_shell, "#!/bin/sh\nexec bash --noprofile --norc\n").unwrap();
+    std::fs::set_permissions(&terminal_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     let client = process
         .attach(WorksetAttach::Terminal {
             agent: first,
@@ -37,7 +43,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
             cols: 80,
             rows: 24,
             cwd: "/src".into(),
-            shell: "bash".into(),
+            shell: "/src/terminal-shell".into(),
         })
         .await
         .unwrap();
@@ -66,11 +72,6 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     );
     assert!(std::path::Path::new(&format!("/proc/{terminal_pid}")).exists());
 
-    let error = pool
-        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("terminal"));
     rho_rpc::write_frame(
         &mut ui,
         &TermClientFrame::Input(b"exit\n".to_vec()),
@@ -93,20 +94,8 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     })
     .await
     .unwrap();
-    let changed = pool
-        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
-        .await
-        .unwrap();
-    assert!(changed.contains(&first) && changed.contains(&second));
-    assert!(pool.get(first).await.is_none());
-    assert!(pool.get(second).await.is_none());
     let replacement = pool.execution(second).await.unwrap();
-    assert!(!Arc::ptr_eq(&process, &replacement));
-    let (_, reloaded, _) = pool.load(first).await.unwrap();
-    assert_eq!(
-        reloaded.head().config.place.mode,
-        rho_agent_types::WorksetMode::Exposed
-    );
+    assert!(Arc::ptr_eq(&process, &replacement));
     // Development integration checks require both companions built first:
     // cargo build -p rho-inference -p rho-shell --bins
     use rho_shell_view::protocol::{ShellClientFrame, ShellServerFrame};
@@ -170,7 +159,6 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     );
     drop(shell_ui);
     let _ = shell_relay.await.unwrap();
-    drop(reloaded);
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let WorksetReply::Shells(shells) =
@@ -233,7 +221,6 @@ async fn fixture(
     let place = rho_agent_types::Place {
         workset: workset.id().to_owned(),
         cwd: "/src".into(),
-        mode: rho_agent_types::WorksetMode::View,
         origin: None,
     };
     let db = rho_db::RhoDb::open(root.join("agents.redb"));

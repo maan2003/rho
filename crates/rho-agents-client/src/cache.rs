@@ -653,7 +653,6 @@ mod tests {
                 place: rho_agent_types::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
-                    mode: Default::default(),
                     origin: None,
                 },
                 spawned_by: SpawnedBy::Direct,
@@ -665,7 +664,6 @@ mod tests {
             TranscriptEvent::Message {
                 from: None,
                 text: "have a look".to_owned(),
-                delivery: rho_agent_types::MessageDelivery::Immediate,
                 at: rho_agent_types::UnixMs(1_000),
             },
             TranscriptEvent::Turn {

@@ -1159,7 +1159,6 @@ async fn probe_async(name: &str) -> Result<()> {
         start: StartMode::Join(JoinTarget::User {
             repo: workspace.try_into().context("rig workspace is not UTF-8")?,
         }),
-        mode: rho_agent_types::WorksetMode::View,
         content: Some(vec![ContentPart::Text {
             text: "Complete one deterministic rig probe turn.".to_owned(),
         }]),

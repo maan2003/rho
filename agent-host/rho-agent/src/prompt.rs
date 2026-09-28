@@ -1030,8 +1030,6 @@ pub(crate) struct WorksetPrompt {
     cwd: String,
     /// Whether the working directory is inside a git checkout.
     git: bool,
-    /// Whether the filesystem outside the workset is a disposable view.
-    view: bool,
     context: (
         Vec<rho_context_config::AgentsFile>,
         Vec<rho_context_config::Skill>,
@@ -1040,7 +1038,7 @@ pub(crate) struct WorksetPrompt {
 
 impl WorksetPrompt {
     /// Worker paths are already in the workset namespace.
-    pub fn new(cwd: &camino::Utf8Path, mode: rho_agent_types::WorksetMode) -> Self {
+    pub fn new(cwd: &camino::Utf8Path) -> Self {
         let roots = rho_fs_view::resolve_workdir_root(cwd.as_std_path()).map(|(root, _)| {
             let root = if root.starts_with(rho_fs_view::MOUNT_ROOT) {
                 root
@@ -1049,7 +1047,7 @@ impl WorksetPrompt {
             };
             (root.clone(), root)
         });
-        Self::discover(cwd, mode, roots)
+        Self::discover(cwd, roots)
     }
 
     /// Only the host's read-only preview needs visible/backing path
@@ -1067,19 +1065,17 @@ impl WorksetPrompt {
                 .join(root.strip_prefix(workset.root())?);
             anyhow::Ok((visible, root))
         })();
-        Self::discover(&place.cwd, place.mode, roots)
+        Self::discover(&place.cwd, roots)
     }
 
     fn discover(
         cwd: &camino::Utf8Path,
-        mode: rho_agent_types::WorksetMode,
         roots: anyhow::Result<(camino::Utf8PathBuf, camino::Utf8PathBuf)>,
     ) -> Self {
         let mut place = Self {
             root: rho_fs_view::MOUNT_ROOT.into(),
             cwd: cwd.to_string(),
             git: false,
-            view: mode == rho_agent_types::WorksetMode::View,
             context: (Vec::new(), Vec::new()),
         };
         let (visible_root, root) = match roots {
@@ -1189,13 +1185,6 @@ behind you; what is there when you start is the starting state you were given.
 
 "
     );
-    if place.view {
-        out.push_str(
-            "Outside the workset the filesystem is a minimal, disposable environment: `$HOME` \
-             and `/tmp` are empty and vanish when you are done, so keep everything that matters \
-             inside the workset.\n\n",
-        );
-    }
     if place.git {
         out.push_str("This repository is a git checkout; `origin` is the real remote.\n\n");
     }
@@ -1263,19 +1252,18 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
-    fn place(git: bool, view: bool) -> WorksetPrompt {
+    fn place(git: bool) -> WorksetPrompt {
         WorksetPrompt {
             root: "/src".to_owned(),
             cwd: "/src/repo".to_owned(),
             git,
-            view,
             context: (Vec::new(), Vec::new()),
         }
     }
 
     #[test]
     fn workspace_prompt_is_informational() {
-        let prompt = render_workspace_prompt(&place(true, true));
+        let prompt = render_workspace_prompt(&place(true));
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("Your workset is the directory /src"));
         assert!(prompt.contains("Working directory: /src/repo"));
@@ -1286,14 +1274,14 @@ mod tests {
         assert!(prompt.contains("starting state you were given"));
         assert!(!prompt.contains("Other checkouts"));
         assert!(!prompt.contains("share"));
-        assert!(prompt.contains("disposable environment"));
+        assert!(!prompt.contains("disposable environment"));
         assert!(!prompt.contains("agent that started you"));
         assert!(!prompt.contains("do not create"));
     }
 
     #[test]
-    fn workspace_prompt_omits_git_and_view_sections_when_absent() {
-        let prompt = render_workspace_prompt(&place(false, false));
+    fn workspace_prompt_omits_git_section_when_absent() {
+        let prompt = render_workspace_prompt(&place(false));
         assert!(!prompt.contains("This repository is a git checkout"));
         assert!(!prompt.contains("disposable environment"));
         assert!(!prompt.contains("agent that started you"));

@@ -12,8 +12,7 @@
 //! `rho-agent-types`.
 
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, AgentWant, MessageDelivery, Place, PresentationField, Seq,
-    TurnEdge, UnixMs, WorksetMode,
+    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, Seq, TurnEdge, UnixMs,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -99,11 +98,6 @@ pub enum TranscriptEvent {
         model: Option<String>,
         at: UnixMs,
     },
-    /// The agent sees the filesystem this way from here on.
-    ModeChanged {
-        mode: WorksetMode,
-        at: UnixMs,
-    },
     /// Something Rho has to tell the agent, carried by its next user
     /// message: what a migration did to its place, say.
     Notice {
@@ -116,7 +110,6 @@ pub enum TranscriptEvent {
         /// `None` when the person wrote it.
         from: Option<AgentId>,
         text: String,
-        delivery: MessageDelivery,
         at: UnixMs,
     },
     /// A code-first inbox message, identified for exact report delivery.
@@ -235,7 +228,6 @@ impl TranscriptEvent {
         match self {
             Self::Created { at, .. }
             | Self::RoleChanged { at, .. }
-            | Self::ModeChanged { at, .. }
             | Self::Notice { at, .. }
             | Self::Message { at, .. }
             | Self::Received { at, .. }
@@ -331,7 +323,6 @@ pub enum QueuedItem {
         /// `None` when the person wrote it.
         from: Option<AgentId>,
         text: String,
-        delivery: MessageDelivery,
     },
     Compaction,
 }

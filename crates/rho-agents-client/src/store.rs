@@ -169,15 +169,7 @@ impl Tail {
 
 fn queued_block(item: QueuedItem) -> UiBlock {
     match item {
-        QueuedItem::Message {
-            from,
-            text,
-            delivery,
-        } => UiBlock::QueuedMessage {
-            text,
-            delivery,
-            sender: from,
-        },
+        QueuedItem::Message { from, text } => UiBlock::QueuedMessage { text, sender: from },
         QueuedItem::Compaction => UiBlock::Notice {
             text: "compacting context".to_string(),
         },

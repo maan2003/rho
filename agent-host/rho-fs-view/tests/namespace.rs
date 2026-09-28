@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use camino::Utf8Path;
-use rho_fs_view::{MAX_BOUNDED_READ, Mode, read_file_bounded};
+use rho_fs_view::{MAX_BOUNDED_READ, read_file_bounded};
 
 mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
@@ -42,6 +42,10 @@ fn main() {
         eprintln!("skipping namespace test: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
+    if !Path::new("/src").is_dir() {
+        eprintln!("skipping namespace test: host has no /src mount stub");
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -72,19 +76,8 @@ async fn run() {
     std::fs::create_dir(checkout.join("sub")).unwrap();
     std::os::unix::fs::symlink("../file.txt", checkout.join("sub/inside")).unwrap();
 
-    let skeleton = temp.path().join("skeleton");
-    std::fs::create_dir(&skeleton).unwrap();
-    let mount_root = temp.path().join("view-root");
-    std::fs::create_dir(&mount_root).unwrap();
     let layout_path = temp.path().join("layout");
-    let layout = rho_fs_view::WorksetLayout::new(
-        &workset,
-        Mode::View {
-            home_skeleton: Some(temp.path().join("skeleton")),
-        },
-        mount_root.try_into().unwrap(),
-    )
-    .unwrap();
+    let layout = rho_fs_view::WorksetLayout::new(&workset).unwrap();
     std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
     assert_eq!(
         workset.host_path(Utf8Path::new("/src")).unwrap(),
@@ -172,34 +165,19 @@ async fn run() {
     let store = only_store(temp.path());
     let with_store = format!(
         r#"
-test "$(command -v git)" = {base}/bin/git
-test "$(command -v env)" = {base}/bin/env
-/bin/sh -c true
-/usr/bin/env true
-test -f /etc/ssl/certs/ca-certificates.crt
-test -f /etc/nix/registry.json
-test "$XDG_STATE_HOME" = /home/agent/.local/state
-test "$GIT_CONFIG_SYSTEM" = /etc/gitconfig
-test "$(git config --get core.pager)" = cat
-test -n "$RHO_DEVSHELL_BUILDER"
-test -n "$RHO_DEVSHELL_DIR"
-case "$RHO_DEVSHELL_PATH_PREFIX" in *:/home/agent/.cache/cargo/bin|/home/agent/.cache/cargo/bin) ;; *) exit 1 ;; esac
-test "$INSIDE_AGENT" = 1
-test "$CARGO_HOME" = /home/agent/.cache/cargo
-touch /home/agent/.cache/from-view
-touch {state}/from-view {cache}/rho-devshell/from-view
+test "$(command -v git)" = {git}/git
+test "$HOME" = {home}
+test -d {temp}
+test "$RHO_FS_VIEW_TEST_ENV" = kept
 git clone -q -- {remote} second
 test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
 git -C /src/second fetch -q
-if touch {base}/bin/x 2>/dev/null; then echo "base is writable"; exit 1; fi
 git -C /src/second commit -q --allow-empty -m identity
 test "$(git -C /src/second log -1 --format=%an)" = "Test Agent"
-test "$(bash -c 'cat <(echo substituted)')" = substituted
-test "$(echo piped | cat /dev/stdin)" = piped
 "#,
-        base = rho_fs_view::AGENT_BASE,
-        state = workset.state_dir().unwrap(),
-        cache = root.cache_dir(),
+        git = rho_fs_view::git_dir().display(),
+        home = std::env::var("HOME").unwrap(),
+        temp = temp.path().display(),
         store = store.display(),
     );
     let script = format!(
@@ -226,6 +204,9 @@ test ! -e /src/.stores
     );
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg(&script);
+    command.env("RHO_FS_VIEW_TEST_ENV", "kept");
+    command.envs(root.store_environment());
+    command.envs(root.identity_environment().iter().cloned());
     prepare(&layout_path, &mut command, "/src").unwrap();
     let output = command.output().await.unwrap();
     assert!(
@@ -250,9 +231,6 @@ test ! -e /src/.stores
         "child"
     );
     assert!(workset.root().join("second/written").exists());
-    assert!(root.cache_dir().join("from-view").exists());
-    assert!(workset.state_dir().unwrap().join("from-view").exists());
-    assert!(root.devshell_cache_dir().join("from-view").exists());
     assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
     assert_eq!(only_store(temp.path()), store);
 
@@ -275,6 +253,12 @@ fn prepare(layout: &Path, command: &mut tokio::process::Command, cwd: &str) -> a
         .arg(cwd)
         .arg(command.as_std().get_program())
         .args(command.as_std().get_args());
+    inside.envs(
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value))),
+    );
     *command = inside;
     Ok(())
 }

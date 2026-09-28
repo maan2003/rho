@@ -1,19 +1,15 @@
-//! Where an agent works: its workset, directory and view of the filesystem.
+//! Where an agent works: its workset and directory.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// An agent's place: the workset it works in and its working directory
-/// there as it sees it (`/src/<repo>/...`), how it sees the filesystem,
-/// and what was cloned to make the workset when its creation cloned it.
-/// Stored inline on the agent record; the agent DB also stores the
-/// authoritative mode by workset for admission and execution.
+/// there as it sees it (`/src/<repo>/...`), and what was cloned to make
+/// the workset when its creation cloned it. Stored inline on the agent record.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub struct Place {
     pub workset: String,
     pub cwd: Utf8PathBuf,
-    #[senax(default)]
-    pub mode: WorksetMode,
     #[senax(default)]
     pub origin: Option<Utf8PathBuf>,
 }
@@ -27,16 +23,6 @@ pub enum WorkspaceInfo {
         repo: Utf8PathBuf,
     },
     Workset(Place),
-}
-
-/// How an agent in a workset sees the filesystem.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
-pub enum WorksetMode {
-    /// A minimal generated root with the workset at `/src`.
-    #[default]
-    View,
-    /// The host filesystem with the workset mounted over its `/src` stub.
-    Exposed,
 }
 
 impl From<Place> for WorkspaceInfo {

@@ -12,14 +12,14 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_agent_types::transcript::{ContextBlock, ContextItemEvent, PendingInferenceResponse};
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::entry::{Block, Entry, MessageId, Notice, Party, Report};
 use crate::inference::Inference;
-use crate::log::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind, UnixMillis};
+use crate::log::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind};
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::shared::mailroom::{Mailroom, Outbound};
 use crate::{
@@ -549,7 +549,7 @@ impl ClaudeLoop {
                     session_id,
                     ..rewind
                 };
-                host.claude_rewind(UnixMillis::now(), None, Some(rewind.clone()))
+                host.claude_rewind(rho_agent_types::UnixMs::now(), None, Some(rewind.clone()))
                     .await?;
                 let source = rho_claude::read_session_messages_by_id(
                     &claude.projects(),
@@ -823,7 +823,10 @@ impl ClaudeLoop {
                     && !current.is_working());
             if started {
                 self.host
-                    .turn(UnixMillis::now(), rho_agent_types::TurnEdge::Started)
+                    .turn(
+                        rho_agent_types::UnixMs::now(),
+                        rho_agent_types::TurnEdge::Started,
+                    )
                     .await?;
             } else if settled {
                 let outcome = match &current.inference {
@@ -833,7 +836,10 @@ impl ClaudeLoop {
                     _ => rho_agent_types::TurnOutcome::Completed,
                 };
                 self.host
-                    .turn(UnixMillis::now(), rho_agent_types::TurnEdge::Ended(outcome))
+                    .turn(
+                        rho_agent_types::UnixMs::now(),
+                        rho_agent_types::TurnEdge::Ended(outcome),
+                    )
                     .await?;
             }
             if settled {
@@ -940,24 +946,13 @@ impl ClaudeLoop {
                 if !busy {
                     self.execution_generation = self.execution_generation.wrapping_add(1);
                 }
-                // Every message mirrors into the queue until its
-                // --replay-user-messages echo confirms it entered context and
-                // promotes it into history. Mid-turn sends wait on the CLI's
-                // internal queue and show the steering label; turn-opening
-                // sends render as a plain user message right away (the echo
-                // can trail a cold CLI spawn by many seconds).
-                let delivery = if busy {
-                    MessageDelivery::NextRequest
-                } else {
-                    MessageDelivery::Immediate
-                };
+                // The CLI echo confirms that a queued message entered context.
                 let content = Arc::new(content);
                 let input = QueuedInput {
                     source: rho_agent_types::transcript::MessageSender::User,
                     kind: InputKind::Message {
                         content: (*content).clone(),
                     },
-                    delivery,
                     at: rho_agent_types::UnixMs::now(),
                 };
                 // The queue is Claude Code's, in its process: no row says
@@ -1520,7 +1515,7 @@ impl ClaudeLoop {
         };
         self.host
             .claude_rewind(
-                UnixMillis::now(),
+                rho_agent_types::UnixMs::now(),
                 dropped,
                 Some(ClaudeRewind {
                     source_session_id,
@@ -1665,8 +1660,7 @@ impl ClaudeLoop {
         let target = config_home.clone().into_std_path_buf();
         options.set_env("CLAUDE_CONFIG_DIR", target.to_string_lossy());
         let team = self.host.team().await?;
-        let mode = self.head.read().expect("poison").config.place.mode;
-        let place = prompt::WorksetPrompt::new(&self.cwd, mode);
+        let place = prompt::WorksetPrompt::new(&self.cwd);
         let prompt = prompt::claude_prompt(Some(&place), team.as_ref(), self.role);
         // Keep one source inode alive for the lifetime of the view namespace.
         // Unlinking a bind-mounted source makes the target pathname disappear
@@ -2313,7 +2307,7 @@ impl ClaudeLoop {
         self.session_id = Uuid::new_v4();
         self.host
             .claude_rewind(
-                UnixMillis::now(),
+                rho_agent_types::UnixMs::now(),
                 None,
                 Some(ClaudeRewind {
                     source_session_id,
@@ -2476,7 +2470,7 @@ impl ClaudeLoop {
                     partial: partial.clone(),
                     error: Cow::Owned(error.to_string()),
                     retrying: false,
-                    at: UnixMillis::now(),
+                    at: rho_agent_types::UnixMs::now(),
                 })
                 .await?;
         }
@@ -3059,7 +3053,6 @@ mod tests {
             kind: InputKind::Message {
                 content: (*text("claude-normalized text")).clone(),
             },
-            delivery: MessageDelivery::Immediate,
             at: rho_agent_types::UnixMs(0),
         });
         assert!(promote_queued_user_message(&mut state));

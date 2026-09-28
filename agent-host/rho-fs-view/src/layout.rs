@@ -1,20 +1,17 @@
-//! The agent filesystem view: a private mount namespace whose root is a
-//! fresh tmpfs holding only what an agent works with — `/nix/store`, a
-//! generated `/etc`, an empty `$HOME`, the workset directory at `/src`, and
-//! the read-only clone-store root at its host path.
+//! The agent filesystem view: a private mount namespace with the host root,
+//! the workset mounted at `/src`, and the clone-store root mounted read-only.
 //!
 //! This is a layout, not a sandbox: everything runs as the invoking user,
 //! and no security boundary is claimed.
 
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use anyhow::{Context as _, bail, ensure};
+use anyhow::{Context as _, ensure};
 
-/// Where the workset directory appears to an agent, in every mode.
+/// Where the workset directory appears to an agent.
 pub const MOUNT_ROOT: &str = "/src";
 
 /// What a namespace mounts: the workset directory at the visible root, and
@@ -31,128 +28,10 @@ pub struct Mounts {
     pub store_socket: Option<PathBuf>,
 }
 
-/// The nix daemon's socket; bound into the view when the host has one, and
-/// `NIX_REMOTE=daemon` then points the agent's nix at it.
-pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
-
-/// Host-derived files captured before the namespace is constructed.
-#[derive(Clone, Debug)]
-pub struct HostEtc {
-    pub resolv_conf: Vec<u8>,
-    pub localtime: Option<PathBuf>,
-}
-
-impl HostEtc {
-    pub fn discover() -> anyhow::Result<Self> {
-        let resolv_conf = fs::read("/etc/resolv.conf").context("read host /etc/resolv.conf")?;
-        let localtime = resolve_store_path("/etc/localtime")?;
-        Ok(Self {
-            resolv_conf,
-            localtime,
-        })
-    }
-}
-
-fn resolve_store_path(path: impl AsRef<Path>) -> anyhow::Result<Option<PathBuf>> {
-    let path = path.as_ref();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let resolved = path
-        .canonicalize()
-        .with_context(|| format!("resolve {}", path.display()))?;
-    ensure!(
-        resolved.starts_with("/nix/store"),
-        "{} resolves outside /nix/store: {}",
-        path.display(),
-        resolved.display()
-    );
-    Ok(Some(resolved))
-}
-
-#[derive(Clone, Debug)]
-pub struct FsViewConfig {
-    pub home_skeleton: Option<PathBuf>,
-    pub mounts: Mounts,
-    pub host_etc: HostEtc,
-    /// The base userland (`crate::AGENT_BASE`): shebang targets, the CA
-    /// bundle and the flake registry come from it.
-    pub base: PathBuf,
-    /// The shared persistent cache, mounted read-write as `~/.cache`.
-    pub cache: Option<PathBuf>,
-    /// The workset's state directory, mounted read-write at its host path
-    /// (nix GC roots).
-    pub workset_state: Option<PathBuf>,
-    /// rho-devshell-builder's shared cache, mounted read-write at its host
-    /// path: the GC roots of cached shells live in it.
-    pub devshell_cache: Option<PathBuf>,
-    /// The directory holding this process's own executable when it lies
-    /// outside `/nix/store` (a cargo build), bound read-only at its host
-    /// path so a development agent host can launch its sibling sidecars.
-    pub own_binaries: Option<PathBuf>,
-}
-
-impl FsViewConfig {
-    pub fn new(mounts: Mounts) -> anyhow::Result<Self> {
-        Ok(Self {
-            home_skeleton: None,
-            mounts,
-            host_etc: HostEtc::discover()?,
-            base: PathBuf::from(crate::AGENT_BASE),
-            cache: None,
-            workset_state: None,
-            devshell_cache: None,
-            own_binaries: own_binaries_dir()?,
-        })
-    }
-}
-
-fn own_binaries_dir() -> anyhow::Result<Option<PathBuf>> {
-    let exe = std::env::current_exe()
-        .and_then(|exe| exe.canonicalize())
-        .context("locate own executable")?;
-    Ok(exe
-        .parent()
-        .filter(|dir| !dir.starts_with("/nix/store"))
-        .map(Path::to_owned))
-}
-
-pub struct FsViewBuilder {
-    config: FsViewConfig,
-}
-
-impl FsViewBuilder {
-    pub fn new(config: FsViewConfig) -> anyhow::Result<Self> {
-        validate_mounts(&config.mounts)?;
-        if let Some(skeleton) = &config.home_skeleton {
-            ensure!(
-                skeleton.is_dir(),
-                "HOME skeleton is not a directory: {}",
-                skeleton.display()
-            );
-        }
-        Ok(Self { config })
-    }
-
-    /// Builds the generated filesystem at `root` in the current mount
-    /// namespace. This does not unshare, pivot the caller's root, or change
-    /// its environment; the caller must already hold mount capability in
-    /// the current user namespace.
-    pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
-        build_filesystem(&self.config, root)
-    }
-
-    /// Pivots the calling thread's mount namespace into a root produced by
-    /// [`Self::build_in_place`], detaching the host root.
-    pub fn pivot_into(&self, root: &Path) -> anyhow::Result<()> {
-        pivot_into(root)
-    }
-}
-
-/// Exposed mode: the full host view as the invoking user, plus the workset
-/// directory mounted over the host's permanently empty `/src` stub and the
-/// store root made read-only. Environment, `$HOME`, and every other host
-/// path stay exactly as they are.
+/// The full host view as the invoking user, plus the workset directory mounted
+/// over the host's permanently empty `/src` stub and the store root made
+/// read-only. Environment, `$HOME`, and every other host path stay exactly as
+/// they are.
 pub struct ExposedBuilder {
     mounts: Mounts,
 }
@@ -248,161 +127,6 @@ pub fn unshare_fs_attributes() -> anyhow::Result<()> {
         .map(|_| ())
 }
 
-fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
-    // The root is one fresh tmpfs; /home/agent, /tmp, /src, and /dev are plain
-    // directories on it rather than mounts of their own.
-    mount_fs(
-        Some(OsStr::new("tmpfs")),
-        root,
-        Some("tmpfs"),
-        libc::MS_NOSUID | libc::MS_NODEV,
-        Some("mode=0755"),
-    )?;
-    for dir in [
-        "nix/store",
-        "etc",
-        "bin",
-        "usr/bin",
-        "home/agent",
-        "tmp",
-        "proc",
-        "dev",
-        "src",
-        "old-root",
-    ] {
-        fs::create_dir_all(root.join(dir)).with_context(|| format!("create /{dir}"))?;
-    }
-    bind(Path::new("/nix/store"), &root.join("nix/store"), true)?;
-    // The nix daemon's socket, so `nix` in the view builds through it.
-    let nix_socket = Path::new(NIX_DAEMON_SOCKET);
-    if nix_socket.exists() {
-        let target = host_path_in(root, nix_socket);
-        fs::create_dir_all(target.parent().expect("socket has a directory"))?;
-        fs::File::create(&target).context("create nix daemon socket mount point")?;
-        bind(nix_socket, &target, false)?;
-    }
-    // Shebang targets: the two paths scripts hardcode. Everything else on
-    // PATH comes from the base and the agent's profile.
-    symlink(config.base.join("bin/sh"), root.join("bin/sh")).context("link /bin/sh")?;
-    symlink(config.base.join("bin/env"), root.join("usr/bin/env")).context("link /usr/bin/env")?;
-    // The pid namespace is the host's, so a fresh procfs mount is not
-    // permitted here; the host's proc view is the correct one anyway.
-    bind(Path::new("/proc"), &root.join("proc"), false)?;
-    write_etc(config, root)?;
-
-    fs::set_permissions(root.join("home/agent"), fs::Permissions::from_mode(0o700))?;
-    if let Some(skeleton) = &config.home_skeleton {
-        copy_tree(skeleton, &root.join("home/agent"))?;
-    }
-    // The XDG directories the environment names; some tools fail rather
-    // than create them.
-    for dir in [".config", ".local/state", ".local/share", ".cache"] {
-        fs::create_dir_all(root.join("home/agent").join(dir))
-            .with_context(|| format!("create ~/{dir}"))?;
-    }
-    if let Some(cache) = &config.cache {
-        bind(cache, &root.join("home/agent/.cache"), false)?;
-    }
-    if let Some(state) = &config.workset_state {
-        let target = host_path_in(root, state);
-        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-        bind(state, &target, false)?;
-    }
-    if let Some(cache) = &config.devshell_cache {
-        fs::create_dir_all(cache).with_context(|| format!("create {}", cache.display()))?;
-        let target = host_path_in(root, cache);
-        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-        bind(cache, &target, false)?;
-    }
-    // A development executable may live below ~/.cache. Install it after
-    // the cache/state mounts so those mounts cannot cover its executable.
-    if let Some(dir) = &config.own_binaries {
-        let target = host_path_in(root, dir);
-        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-        bind(dir, &target, true)?;
-    }
-    fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
-    build_dev(root)?;
-    mount_in_place(&config.mounts, root)?;
-    Ok(())
-}
-
-fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
-    let etc = root.join("etc");
-    let (agent_uid, agent_gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    fs::write(
-        etc.join("passwd"),
-        format!(
-            "root:x:0:0:root:/root:/bin/sh\nagent:x:{agent_uid}:{agent_gid}:rho agent:/home/agent:/bin/sh\n"
-        ),
-    )?;
-    fs::write(
-        etc.join("group"),
-        format!("root:x:0:\nagent:x:{agent_gid}:\n"),
-    )?;
-    fs::write(etc.join("resolv.conf"), &config.host_etc.resolv_conf)?;
-    fs::write(etc.join("hosts"), "127.0.0.1 localhost\n::1 localhost\n")?;
-    fs::write(
-        etc.join("nsswitch.conf"),
-        "passwd: files\ngroup: files\nhosts: files dns\n",
-    )?;
-    let ca_bundle = config.base.join("etc/ssl/certs/ca-bundle.crt");
-    if ca_bundle.exists() {
-        fs::create_dir_all(etc.join("ssl/certs"))?;
-        symlink(ca_bundle, etc.join("ssl/certs/ca-certificates.crt"))?;
-    }
-    if let Some(localtime) = &config.host_etc.localtime {
-        symlink(localtime, etc.join("localtime"))?;
-    }
-    fs::create_dir_all(etc.join("nix"))?;
-    fs::write(
-        etc.join("nix/nix.conf"),
-        "experimental-features = nix-command flakes\n",
-    )?;
-    // `nixpkgs` pinned to the revision Rho is built from, so installs
-    // share the base's closure and need no lookup of what is newest.
-    let registry = config.base.join("etc/nix/registry.json");
-    if registry.exists() {
-        symlink(registry, etc.join("nix/registry.json"))?;
-    }
-    // Git's behaviour; identity is environment.
-    fs::write(
-        etc.join("gitconfig"),
-        "[core]\n\tpager = cat\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n",
-    )?;
-    // The nixpkgs bash reads these itself (SYS_BASHRC).
-    fs::write(etc.join("bashrc"), "PS1='agent:\\w\\$ '\n")?;
-    fs::write(etc.join("profile"), "[ -r /etc/bashrc ] && . /etc/bashrc\n")?;
-    Ok(())
-}
-
-fn build_dev(root: &Path) -> anyhow::Result<()> {
-    let dev = root.join("dev");
-    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
-        let target = dev.join(name);
-        fs::File::create(&target)?;
-        bind(&Path::new("/dev").join(name), &target, false)?;
-    }
-    fs::create_dir(dev.join("pts"))?;
-    mount_fs(
-        Some(OsStr::new("devpts")),
-        &dev.join("pts"),
-        Some("devpts"),
-        libc::MS_NOSUID | libc::MS_NOEXEC,
-        Some("newinstance,ptmxmode=0666,mode=0620"),
-    )?;
-    symlink("pts/ptmx", dev.join("ptmx"))?;
-    // The process's own descriptors, as every distribution's /dev has
-    // them: bash's `<(...)` opens /dev/fd/N, and tools read /dev/stdin.
-    symlink("/proc/self/fd", dev.join("fd"))?;
-    for (name, fd) in [("stdin", 0), ("stdout", 1), ("stderr", 2)] {
-        symlink(format!("/proc/self/fd/{fd}"), dev.join(name))?;
-    }
-    fs::create_dir(dev.join("shm"))?;
-    fs::set_permissions(dev.join("shm"), fs::Permissions::from_mode(0o1777))?;
-    Ok(())
-}
-
 /// Mounts a validated workset below `root` in the current mount namespace:
 /// the workset directory at [`MOUNT_ROOT`], the store root read-only at its
 /// host path, and the socket at its host path.
@@ -429,40 +153,6 @@ pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
 /// Where the host path `path` lands below the namespace root being built.
 fn host_path_in(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
-}
-
-pub(crate) fn pivot_into(root: &Path) -> anyhow::Result<()> {
-    let root_c = cstring(root)?;
-    let old = cstring(&root.join("old-root"))?;
-    cvt(unsafe { libc::syscall(libc::SYS_pivot_root, root_c.as_ptr(), old.as_ptr()) as i32 })
-        .context("pivot_root")?;
-    cvt(unsafe { libc::chdir(c"/".as_ptr()) }).context("chdir /")?;
-    cvt(unsafe { libc::umount2(c"/old-root".as_ptr(), libc::MNT_DETACH) })
-        .context("detach host root")?;
-    fs::remove_dir("/old-root").context("remove old root mount point")?;
-    Ok(())
-}
-
-fn copy_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = target.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.is_dir() {
-            fs::create_dir(&to)?;
-            fs::set_permissions(&to, fs::Permissions::from_mode(metadata.mode()))?;
-            copy_tree(&from, &to)?;
-        } else if metadata.file_type().is_symlink() {
-            symlink(fs::read_link(&from)?, &to)?;
-        } else if metadata.is_file() {
-            fs::copy(&from, &to)?;
-            fs::set_permissions(&to, fs::Permissions::from_mode(metadata.mode()))?;
-        } else {
-            bail!("unsupported skeleton entry: {}", from.display());
-        }
-    }
-    Ok(())
 }
 
 fn bind(source: &Path, target: &Path, readonly: bool) -> anyhow::Result<()> {

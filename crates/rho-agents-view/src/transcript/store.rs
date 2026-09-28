@@ -138,7 +138,7 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{MessageDelivery, UnixMs};
+    use rho_agent_types::UnixMs;
 
     use super::*;
 
@@ -150,7 +150,6 @@ mod tests {
         TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
-            delivery: MessageDelivery::Immediate,
             at: UnixMs(at),
         }
     }

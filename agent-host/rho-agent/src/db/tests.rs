@@ -306,6 +306,54 @@ async fn quota_history_deduplicates_unchanged_samples() {
     );
 }
 
+#[tokio::test]
+async fn quota_sequences_preserve_timestamp_collisions_and_latest_time_baseline() {
+    let db = RhoDb::in_memory();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let sample = |auth_namespace: Option<&str>, at, used_percent| QuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: QuotaModel::GPT,
+        auth_namespace: auth_namespace.map(str::to_owned),
+        observed_at: UnixMs(at),
+        used_percent,
+        reset_at_unix: Some(200),
+    };
+    assert!(write.record_quota_observation(sample(None, 10, 10)));
+    assert!(write.record_quota_observation(sample(Some(""), 10, 20)));
+    assert!(write.record_quota_observation(sample(Some("work"), 10, 30)));
+    assert!(write.record_quota_observation(sample(Some("work"), 10, 31)));
+    // Last write is older: newest timestamp remains the dedup/baseline source.
+    assert!(write.record_quota_observation(sample(Some("work"), 5, 5)));
+    assert!(!write.record_quota_observation(sample(Some("work"), 11, 31)));
+    write.commit();
+
+    let all = db.read().quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(all.len(), 5);
+    assert_eq!(
+        all.iter().filter(|s| s.observed_at == UnixMs(10)).count(),
+        4
+    );
+    assert!(
+        all.iter()
+            .any(|s| s.auth_namespace.is_none() && s.used_percent == 10)
+    );
+    assert!(
+        all.iter()
+            .any(|s| s.auth_namespace.as_deref() == Some("") && s.used_percent == 20)
+    );
+    let baseline = db.read().quota_observations(QuotaModel::GPT, UnixMs(12));
+    assert_eq!(baseline.len(), 3);
+    assert_eq!(
+        baseline
+            .iter()
+            .find(|s| s.auth_namespace.as_deref() == Some("work"))
+            .unwrap()
+            .used_percent,
+        31
+    );
+}
+
 #[test]
 fn agent_roles_resolve_the_current_model_matrix() {
     let profile = |intelligence| AgentRole::Engineer { intelligence }.session_profile();
@@ -401,7 +449,6 @@ pub(crate) fn test_workspace() -> Place {
     Place {
         workset: "0123456789ab".into(),
         cwd: "/src/rho".into(),
-        mode: Default::default(),
         origin: None,
     }
 }
@@ -453,42 +500,6 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
     let record = db.read().get_agent(agent_id);
     assert_eq!(record.config.runtime, AgentRuntime::Claude { session_id });
     assert_eq!(record.config.claude_rewind, None);
-}
-
-#[tokio::test]
-async fn a_mode_change_folds_into_the_agents_place() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        test_workspace(),
-        AgentRole::default(),
-        AgentRole::default().session_profile(),
-        test_agent_runtime(),
-        crate::log::AgentOrigin::User,
-    );
-    write.commit();
-    let before = db.read().get_agent(agent_id).config.place.clone();
-    assert_eq!(before.mode, WorksetMode::View);
-
-    let mut write = db.write().await;
-    write.set_workset_mode(&before.workset, WorksetMode::Exposed);
-    write.commit();
-    let after = db.read().get_agent(agent_id).config.place.clone();
-    assert_eq!(after.mode, WorksetMode::Exposed);
-    // Only the mode moved: the workset and directory are the same place.
-    assert_eq!(
-        Place {
-            mode: WorksetMode::View,
-            ..after
-        },
-        before
-    );
 }
 
 #[tokio::test]
@@ -568,6 +579,208 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
+async fn one_hop_migrates_hidden_modes_wakes_and_quota_without_changing_journal() {
+    #[derive(senax_encoder::Encode)]
+    struct LegacyPlace {
+        workset: String,
+        cwd: camino::Utf8PathBuf,
+        mode: crate::log::LegacyWorksetMode,
+        origin: Option<camino::Utf8PathBuf>,
+    }
+    #[derive(senax_encoder::Encode)]
+    enum LegacyCreated {
+        Created {
+            role: AgentRole,
+            binding: SessionBinding,
+            runtime: AgentRuntime,
+            place: LegacyPlace,
+            spawned_by: crate::log::AgentSpawnedBy,
+            spawn_name: Option<String>,
+            created_at: UnixMs,
+            parent: Option<AgentId>,
+        },
+    }
+    let db = RhoDb::in_memory();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    let first = write
+        .open_table(AGENT_LOG)
+        .get(&(agent, 0))
+        .unwrap()
+        .value()
+        .into_owned();
+    let AgentEvent::Created {
+        role,
+        binding,
+        runtime,
+        place,
+        spawned_by,
+        spawn_name,
+        created_at,
+        parent,
+    } = first
+    else {
+        panic!("missing creation")
+    };
+    write.open_table(AGENT_LOG).insert(
+        &(agent, 0),
+        SenValue::borrowed(&LegacyCreated::Created {
+            role,
+            binding,
+            runtime,
+            place: LegacyPlace {
+                workset: place.workset,
+                cwd: place.cwd,
+                mode: crate::log::LegacyWorksetMode::View,
+                origin: place.origin,
+            },
+            spawned_by,
+            spawn_name,
+            created_at,
+            parent,
+        }),
+    );
+    let mode = |at, mode| AgentEvent::ModeChanged {
+        mode,
+        at: UnixMs(at),
+    };
+    write.append_agent_event(agent, &mode(2, crate::log::LegacyWorksetMode::View));
+    write.rewind_agent(UnixMs(3), agent, AgentEventPos::new(1));
+    write.append_agent_event(agent, &mode(4, crate::log::LegacyWorksetMode::Exposed));
+    let wake = |trigger| crate::WakeFacts {
+        trigger,
+        events: vec![],
+        foreground_running: 2,
+        background_running: 3,
+        tools_suppressed: true,
+        checkin_at: Some(UnixMs(9)),
+    };
+    write.append_agent_event(
+        agent,
+        &AgentEvent::Transcript {
+            uuid: uuid::Uuid::new_v4(),
+            line: crate::TranscriptLine::User {
+                text: "hello".into(),
+            },
+            at: UnixMs(5),
+            wake: Some(wake(WakeTrigger::Interrupt)),
+        },
+    );
+    write.append_agent_event(
+        agent,
+        &AgentEvent::ClaudeOutput {
+            batch: crate::ClaudeOutputBatch {
+                id: uuid::Uuid::new_v4(),
+                outputs: vec![],
+                wake: wake(WakeTrigger::ContextRotation),
+                at: UnixMs(6),
+            },
+        },
+    );
+    let sample = |auth_namespace: Option<&str>, percent| QuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: QuotaModel::GPT,
+        auth_namespace: auth_namespace.map(str::to_owned),
+        observed_at: UnixMs(7),
+        used_percent: percent,
+        reset_at_unix: None,
+    };
+    // Historical keys order by model/time. Distinct keys carry colliding
+    // *original* timestamps (old writers bumped the key only).
+    for (key_at, observation) in [
+        (7, sample(None, 10)),
+        (8, sample(Some(""), 20)),
+        (9, sample(Some(""), 21)),
+    ] {
+        write.open_table(OLD_QUOTA_OBSERVATIONS).insert(
+            &QuotaObservationKey {
+                model: QuotaModel::GPT,
+                observed_at: key_at,
+            },
+            SenValue::borrowed(&observation),
+        );
+    }
+    write
+        .open_table(FORMAT)
+        .insert(&(), &PREVIOUS_AGENT_DB_FORMAT.to_owned());
+    write.commit();
+    let original_journal = db
+        .read()
+        .journal_since(Seq(0), 99)
+        .into_iter()
+        .map(|(seq, _, pos, _)| (seq, pos))
+        .collect::<Vec<_>>();
+    prepare(&db).await;
+    let read = db.read();
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    assert!(!read.has_table("quota_observations_by_model_time"));
+    assert_eq!(
+        read.journal_since(Seq(0), 99)
+            .into_iter()
+            .map(|(seq, _, pos, _)| (seq, pos))
+            .collect::<Vec<_>>(),
+        original_journal
+    );
+    for (pos, text, at) in [(1, "view", 2), (3, "exposed", 4)] {
+        match read.agent_event(agent, AgentEventPos::new(pos)).unwrap() {
+            AgentEvent::Entry(crate::entry::Entry::Sent {
+                at: actual,
+                text: body,
+                ..
+            }) => {
+                assert_eq!(actual, UnixMs(at));
+                assert!(body.contains(text));
+            }
+            other => panic!("mode was not normalized: {other:?}"),
+        }
+    }
+    match read.agent_event(agent, AgentEventPos::new(4)).unwrap() {
+        AgentEvent::Transcript {
+            wake: Some(wake), ..
+        } => {
+            assert_eq!(wake.trigger, WakeTrigger::User);
+            assert_eq!(wake.foreground_running, 2);
+        }
+        other => panic!("transcript wake was not normalized: {other:?}"),
+    }
+    match read.agent_event(agent, AgentEventPos::new(5)).unwrap() {
+        AgentEvent::ClaudeOutput { batch } => {
+            assert_eq!(batch.wake.trigger, WakeTrigger::Asked);
+            assert_eq!(batch.wake.background_running, 3);
+        }
+        other => panic!("output wake was not normalized: {other:?}"),
+    }
+    let quotas = read.quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(quotas.len(), 3);
+    assert!(quotas.iter().all(|sample| sample.observed_at == UnixMs(7)));
+    assert_eq!(
+        quotas
+            .iter()
+            .filter(|sample| sample.auth_namespace.as_deref() == Some(""))
+            .count(),
+        2
+    );
+    assert_eq!(read.get_agent(agent).next, AgentEventPos::new(6));
+    assert_eq!(
+        read.get_agent(agent).place().cwd,
+        camino::Utf8Path::new("/src/rho")
+    );
+    assert!(
+        matches!(read.agent_event(agent, AgentEventPos::ZERO), Some(AgentEvent::Created { place, .. }) if place.workset == test_workspace().workset)
+    );
+    drop(read);
+    let points = savepoints(&db).await;
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].1.as_deref(), Some("b7e91ac4->a3f26d91"));
+    prepare(&db).await;
+    assert_eq!(savepoints(&db).await.len(), 1);
+}
+
+#[tokio::test]
 async fn current_agent_db_format_is_accepted_on_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -580,7 +793,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format 7f24a9d3, this build expects b7e91ac4")]
+#[should_panic(expected = "database format 7f24a9d3, this build expects a3f26d91")]
 async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -591,7 +804,7 @@ async fn init_agent_tables_rejects_older_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format deadbeef, this build expects b7e91ac4")]
+#[should_panic(expected = "database format deadbeef, this build expects a3f26d91")]
 async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -907,64 +1120,6 @@ async fn deleting_an_agent_removes_every_row_it_owns() {
 }
 
 #[tokio::test]
-async fn deletion_removes_membership_but_retains_the_workset_mode_after_restart() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("rho.redb");
-    let db = RhoDb::open(&path);
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let first = create(&mut write, None, None);
-    let second = create(&mut write, None, None);
-    let workset = test_workspace().workset;
-    write.commit();
-
-    assert_eq!(delete_agents(&db, &[first]).await, [(first, 1)]);
-    assert_eq!(db.read().workset_agents(&workset), [second]);
-    let mut write = db.write().await;
-    assert_eq!(
-        write.set_workset_mode(&workset, WorksetMode::Exposed),
-        [second]
-    );
-    write.commit();
-    assert_eq!(
-        db.read().get_agent(second).place().mode,
-        WorksetMode::Exposed
-    );
-    assert_eq!(delete_agents(&db, &[second]).await, [(second, 2)]);
-    drop(db);
-
-    let reopened = RhoDb::open(&path);
-    assert!(reopened.read().workset_agents(&workset).is_empty());
-    assert_eq!(
-        reopened.read().workset_mode(&workset),
-        Some(Some(WorksetMode::Exposed))
-    );
-    let mut write = reopened.write().await;
-    write.init_agent_tables();
-    let replacement = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(3),
-        replacement,
-        None,
-        Place {
-            workset: workset.clone(),
-            mode: WorksetMode::Exposed,
-            ..test_workspace()
-        },
-        AgentRole::default(),
-        AgentRole::default().session_profile(),
-        test_agent_runtime(),
-        AgentOrigin::User,
-    );
-    write.commit();
-    assert_eq!(reopened.read().workset_agents(&workset), [replacement]);
-    assert_eq!(
-        reopened.read().workset_mode(&workset),
-        Some(Some(WorksetMode::Exposed))
-    );
-}
-
-#[tokio::test]
 async fn the_journal_names_every_row_in_write_order() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -1034,7 +1189,14 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
                 status: rho_agent_types::ToolOutputStatus::Success,
             },
         )],
-        wake: crate::WakeFacts::interrupt(),
+        wake: crate::WakeFacts {
+            trigger: crate::log::WakeTrigger::User,
+            events: Vec::new(),
+            foreground_running: 0,
+            background_running: 0,
+            tools_suppressed: false,
+            checkin_at: None,
+        },
         at: UnixMs(2),
     };
     let first_batch_id = batch.id;
@@ -1097,71 +1259,6 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
             .read()
             .agent_pending_claude_output(agent_id),
         None
-    );
-}
-
-#[tokio::test]
-async fn workset_modes_are_independent_and_transition_only_their_members() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("rho.redb");
-    let db = RhoDb::open(&path);
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let mut ids = Vec::new();
-    for (workset, mode) in [
-        ("first", WorksetMode::View),
-        ("second", WorksetMode::Exposed),
-        ("first", WorksetMode::View),
-    ] {
-        let id = write.alloc_agent_id();
-        write.create_agent(
-            UnixMs(1),
-            id,
-            None,
-            Place {
-                workset: workset.into(),
-                mode,
-                ..test_workspace()
-            },
-            AgentRole::default(),
-            AgentRole::default().session_profile(),
-            test_agent_runtime(),
-            AgentOrigin::User,
-        );
-        ids.push(id);
-    }
-    write.commit();
-    assert_eq!(
-        db.read().workset_mode("first"),
-        Some(Some(WorksetMode::View))
-    );
-    assert_eq!(
-        db.read().workset_mode("second"),
-        Some(Some(WorksetMode::Exposed))
-    );
-    let mut write = db.write().await;
-    let mut first_members = vec![ids[0], ids[2]];
-    first_members.sort();
-    assert_eq!(
-        write.set_workset_mode("first", WorksetMode::Exposed),
-        first_members
-    );
-    write.commit();
-    drop(db);
-    let reopened = RhoDb::open(&path);
-    let read = reopened.read();
-    assert_eq!(read.workset_mode("first"), Some(Some(WorksetMode::Exposed)));
-    assert_eq!(read.workset_agents("first"), first_members);
-    assert_eq!(read.workset_agents("second"), vec![ids[1]]);
-    assert_eq!(
-        ids.iter()
-            .map(|id| read.get_agent(*id).place().mode)
-            .collect::<Vec<_>>(),
-        [
-            WorksetMode::Exposed,
-            WorksetMode::Exposed,
-            WorksetMode::Exposed
-        ]
     );
 }
 

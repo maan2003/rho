@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, MessageDelivery, Place, PresentationField, Seq, TurnEdge, UnixMs,
+    AgentId, AgentPos, AgentRole, Place, PresentationField, Seq, TurnEdge, UnixMs,
 };
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
@@ -68,7 +68,6 @@ impl UiStoryEvent {
             Self::UserMessage { text, at } => TranscriptEvent::Message {
                 from: None,
                 text,
-                delivery: MessageDelivery::Immediate,
                 at,
             },
             Self::TurnStarted { at } => TranscriptEvent::Turn {

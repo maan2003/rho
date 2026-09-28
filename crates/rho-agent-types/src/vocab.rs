@@ -106,16 +106,6 @@ impl AgentRole {
     }
 }
 
-/// Historical queued-input delivery annotation, retained for decoding old
-/// records and drawing old transcript queues. Live sends have no lane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum MessageDelivery {
-    /// Historical immediate/steering lane.
-    Immediate,
-    /// Historical next-request lane.
-    NextRequest,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
 pub enum ContentPart {
     Text {

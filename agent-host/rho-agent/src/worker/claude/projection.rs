@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rho_agent_types::transcript::{
-    ProviderSpecificData, StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolResult,
-    ToolType,
+    ExecId, ProviderSpecificData, StreamingContextItem, ToolName, ToolOutput, ToolResult, ToolType,
 };
 use rho_agent_types::{ToolOutputStatus, UnixMs};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, StreamingResponse};
@@ -150,7 +149,7 @@ impl ClaudeStreamItem {
                 arguments,
             } => StreamingContextItem::ToolCall {
                 provider_specific: Box::new(ClaudeProviderSpecificData),
-                id: ToolCallId::try_from(id.as_str())?,
+                id: ExecId::try_from(id.as_str())?,
                 name: ToolName::try_from(name.as_str())?,
                 tool_type: ToolType::Function,
                 arguments: arguments.as_str().into(),
@@ -374,7 +373,7 @@ fn tool_result(
         other => serde_json::to_string(other)?,
     };
     Ok(ToolResult {
-        call_id: ToolCallId::try_from(tool_use_id)?,
+        call_id: ExecId::try_from(tool_use_id)?,
         tool_type: ToolType::Function,
         body: ToolOutput {
             full_output: None,

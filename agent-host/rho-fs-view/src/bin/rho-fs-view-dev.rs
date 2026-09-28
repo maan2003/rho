@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use rho_fs_view::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_fs_view::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 fn main() -> anyhow::Result<()> {
     let incoming = std::env::args_os().collect::<Vec<_>>();
@@ -29,8 +29,6 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut src = None;
     let mut state = None;
-    let mut skeleton = None;
-    let mut exposed = false;
     let mut store = false;
     let mut command = Vec::new();
     while let Some(arg) = args.next() {
@@ -39,13 +37,9 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         let value = match arg.to_str() {
-            Some("--src" | "--state" | "--skeleton") => args
+            Some("--src" | "--state") => args
                 .next()
                 .with_context(|| format!("missing value for {}", arg.to_string_lossy()))?,
-            Some("--exposed") => {
-                exposed = true;
-                continue;
-            }
             Some("--store") => {
                 store = true;
                 continue;
@@ -59,31 +53,18 @@ fn main() -> anyhow::Result<()> {
         match arg.to_str().unwrap() {
             "--src" => src = Some(PathBuf::from(value)),
             "--state" => state = Some(PathBuf::from(value)),
-            "--skeleton" => skeleton = Some(PathBuf::from(value)),
             _ => unreachable!(),
         }
     }
     let src = std::path::absolute(src.context("--src is required")?)?;
     let state = std::path::absolute(state.context("--state is required")?)?;
-    let mut command = if command.is_empty() {
+    let command = if command.is_empty() {
         vec![
             std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("bash")),
             OsString::from("-l"),
         ]
     } else {
         command
-    };
-    let mode = if exposed {
-        anyhow::ensure!(
-            skeleton.is_none(),
-            "--skeleton makes no sense in exposed mode: the host home is used as-is"
-        );
-        Mode::Exposed
-    } else {
-        command[0] = resolve_program(&command[0])?.into_os_string();
-        Mode::View {
-            home_skeleton: skeleton,
-        }
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -101,13 +82,7 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         let workset = worksets.adopt(&src)?;
-        let mount_root = tempfile::tempdir()?;
-        let layout = rho_fs_view::WorksetLayout::new(
-            &workset,
-            mode,
-            camino::Utf8PathBuf::from_path_buf(mount_root.path().to_owned())
-                .map_err(|_| anyhow::anyhow!("non-UTF8 mount root"))?,
-        )?;
+        let layout = rho_fs_view::WorksetLayout::new(&workset)?;
         let mut description = tempfile::NamedTempFile::new()?;
         std::io::Write::write_all(
             &mut description,
@@ -127,28 +102,5 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn usage() {
-    eprintln!(
-        "usage: rho-fs-view-dev [--exposed] [--store] --src PATH --state PATH [--skeleton PATH] [-- COMMAND ...]"
-    );
-}
-
-fn resolve_program(program: &std::ffi::OsStr) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(program);
-    let candidate = if path.components().count() > 1 {
-        path
-    } else {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(&path))
-            .find(|candidate| candidate.is_file())
-            .with_context(|| format!("command not found: {}", program.to_string_lossy()))?
-    };
-    let resolved = candidate
-        .canonicalize()
-        .with_context(|| format!("resolve command {}", candidate.display()))?;
-    anyhow::ensure!(
-        resolved.starts_with("/nix/store"),
-        "command resolves outside /nix/store and will not exist in the view: {}",
-        resolved.display()
-    );
-    Ok(resolved)
+    eprintln!("usage: rho-fs-view-dev [--store] --src PATH --state PATH [-- COMMAND ...]");
 }

@@ -4,13 +4,13 @@
 
 use std::time::Duration;
 
-use rho_agent_types::transcript::{ToolCall, ToolCallId, ToolName, ToolType};
-use rho_fs_view::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_agent_types::transcript::{ExecId, ToolCall, ToolName, ToolType};
+use rho_fs_view::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
-        id: ToolCallId::try_from("call-1").unwrap(),
+        id: ExecId::try_from("call-1").unwrap(),
         name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).unwrap(),
         tool_type: ToolType::Function,
         arguments: serde_json::json!({ "command": command }).to_string(),
@@ -72,16 +72,7 @@ async fn run() -> anyhow::Result<()> {
         started.elapsed()
     );
 
-    let mount_root = temp.path().join("mount");
-    std::fs::create_dir(&mount_root)?;
-    let layout = rho_fs_view::WorksetLayout::new(
-        &workset,
-        Mode::View {
-            home_skeleton: None,
-        },
-        camino::Utf8PathBuf::from_path_buf(mount_root)
-            .map_err(|_| anyhow::anyhow!("non-UTF8 root"))?,
-    )?;
+    let layout = rho_fs_view::WorksetLayout::new(&workset)?;
     let path = temp.path().join("layout");
     std::fs::write(
         &path,

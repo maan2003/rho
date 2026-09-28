@@ -11,25 +11,13 @@
 
 use std::sync::Arc;
 
+use rho_agent::inference::{CacheKey, Call, Carry, Response, Step};
+pub(crate) use rho_agent::inference::{Event, Retryable};
 use serde_json::value::RawValue;
 mod adapter;
 
-use senax_encoder::{Decode, Encode};
-
 mod openai;
 pub use openai::InferenceSession;
-
-/// A temporary provider failure. The runtime owns backoff and retry admission.
-#[derive(Debug)]
-pub struct Retryable(pub String);
-
-impl std::fmt::Display for Retryable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Retryable {}
 
 pub fn is_retryable(error: &anyhow::Error) -> bool {
     use tokio_tungstenite::tungstenite::Error;
@@ -110,57 +98,28 @@ impl Request {
     }
 }
 
-/// Stable per agent, so the provider can reuse its cache across steps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct CacheKey(u128);
-
-impl CacheKey {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().as_u128())
-    }
-
-    pub fn from_u128(key: u128) -> Self {
-        Self(key)
-    }
-
-    pub(crate) fn wire_uuid(self, base_url: &str, client_secret: [u8; 32]) -> uuid::Uuid {
-        use std::hash::Hasher;
-        let mut bytes = [0; 16];
-        for (part, tag) in bytes
-            .chunks_mut(8)
-            .zip([b"rho-step-cache:v1:0", b"rho-step-cache:v1:1"])
-        {
-            let mut hash = fnv::FnvHasher::default();
-            for input in [
-                &tag[..],
-                &self.0.to_le_bytes(),
-                base_url.as_bytes(),
-                &client_secret,
-            ] {
-                hash.write(input);
-            }
-            part.copy_from_slice(&hash.finish().to_be_bytes());
+/// Scope an agent cache identity to its endpoint and credential.
+fn wire_uuid(key: CacheKey, base_url: &str, client_secret: [u8; 32]) -> uuid::Uuid {
+    use std::hash::Hasher;
+    let mut bytes = [0; 16];
+    for (part, tag) in bytes
+        .chunks_mut(8)
+        .zip([b"rho-step-cache:v1:0", b"rho-step-cache:v1:1"])
+    {
+        let mut hash = fnv::FnvHasher::default();
+        for input in [
+            &tag[..],
+            &key.0.to_le_bytes(),
+            base_url.as_bytes(),
+            &client_secret,
+        ] {
+            hash.write(input);
         }
-        bytes[6] = (bytes[6] & 0x0f) | 0x80;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        uuid::Uuid::from_bytes(bytes)
+        part.copy_from_slice(&hash.finish().to_be_bytes());
     }
-
-    fn uuid(self) -> uuid::Uuid {
-        uuid::Uuid::from_u128(self.0)
-    }
-}
-
-impl Default for CacheKey {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for CacheKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.uuid().fmt(f)
-    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
 }
 
 #[derive(Clone, Debug)]
@@ -178,40 +137,6 @@ pub enum Item {
 
 pub use rho_agent::inference::{Image, Usage};
 
-/// One model response.
-#[derive(Clone, Debug)]
-pub struct Step {
-    /// Continuation token, only when all output can be safely replayed.
-    pub response_id: Option<String>,
-    /// The `exec` call, if it made one.
-    pub call: Option<Call>,
-    /// Text outside the call. Not delivered to anyone.
-    pub prose: String,
-    pub carry: Carry,
-    pub usage: Usage,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Call {
-    id: String,
-    pub code: String,
-}
-
-#[cfg(test)]
-impl Call {
-    pub fn new(id: impl Into<String>, code: String) -> Self {
-        Self {
-            id: id.into(),
-            code,
-        }
-    }
-
-    /// Identity for read-only transcript presentation, not runtime pairing.
-    pub fn display_id(&self) -> &str {
-        self.id.as_str()
-    }
-}
-
 /// An opaque provider pairing with an execution's output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CallResult {
@@ -226,11 +151,7 @@ impl CallResult {
     }
 }
 
-/// Provider view of the agent's opaque replay record. The JSON remains shared.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct Carry(rho_agent::inference::Carry);
-
-/// The wrapper is ours; each item is still the provider's original JSON slice.
+/// Replay wrapper metadata surrounds each verbatim provider JSON item.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Replay<'a> {
     #[serde(default, borrow)]
@@ -252,105 +173,86 @@ struct Prepared<'a> {
     compaction: Option<usize>,
     calls: Vec<(String, bool)>,
 }
-impl Carry {
-    fn replay(&self) -> Replay<'_> {
-        serde_json::from_str(self.0.data().get()).expect("provider replay record")
-    }
-    fn prepared(&self) -> Prepared<'_> {
-        let replay = self.replay();
-        let mut prepared = Prepared {
-            items: Vec::new(),
-            compaction: None,
-            calls: Vec::new(),
-        };
-        let mut called = false;
-        for item in replay.items {
-            let meta: ItemMeta<'_> =
-                serde_json::from_str(item.get()).expect("provider item metadata");
-            let call = matches!(meta.kind.as_ref(), "custom_tool_call" | "function_call");
-            if call && replay.single_exec && called {
-                continue;
-            }
-            called |= call;
-            if meta.kind == "compaction" {
-                prepared.compaction = Some(prepared.items.len());
-                prepared.calls.clear();
-            }
-            if call && let Some(id) = meta.call_id {
-                prepared
-                    .calls
-                    .push((id.into(), meta.kind == "function_call"));
-            }
-            prepared.items.push(item);
+fn replay(carry: &Carry) -> Replay<'_> {
+    serde_json::from_str(carry.data().get()).expect("provider replay record")
+}
+fn prepared(carry: &Carry) -> Prepared<'_> {
+    let replay = replay(carry);
+    let mut prepared = Prepared {
+        items: Vec::new(),
+        compaction: None,
+        calls: Vec::new(),
+    };
+    let mut called = false;
+    for item in replay.items {
+        let meta: ItemMeta<'_> = serde_json::from_str(item.get()).expect("provider item metadata");
+        let call = matches!(meta.kind.as_ref(), "custom_tool_call" | "function_call");
+        if call && replay.single_exec && called {
+            continue;
         }
-        prepared
-    }
-    fn from_raw_items(items: Vec<Box<RawValue>>, single_exec: bool) -> Self {
-        let mut calls = Vec::new();
-        let mut compacted = false;
-        for item in &items {
-            let meta: ItemMeta<'_> =
-                serde_json::from_str(item.get()).expect("completed item metadata");
-            compacted |= meta.kind == "compaction";
-            if matches!(meta.kind.as_ref(), "custom_tool_call" | "function_call")
-                && (!single_exec || calls.is_empty())
-                && let Some(id) = meta.call_id
-            {
-                #[derive(serde::Deserialize)]
-                struct Code {
-                    input: Option<String>,
-                    arguments: Option<String>,
-                }
-                let code: Code = serde_json::from_str(item.get()).expect("completed call");
-                calls.push(rho_agent::inference::Call::new(
-                    id,
-                    code.input.or(code.arguments).unwrap_or_default(),
-                ));
-            }
+        called |= call;
+        if meta.kind == "compaction" {
+            prepared.compaction = Some(prepared.items.len());
+            prepared.calls.clear();
         }
-        Self(rho_agent::inference::Carry::new(
-            Replay {
-                items: items.iter().map(|item| &**item).collect(),
-                single_exec,
-                ..Default::default()
-            },
-            calls,
-            compacted,
-        ))
+        if call && let Some(id) = meta.call_id {
+            prepared
+                .calls
+                .push((id.into(), meta.kind == "function_call"));
+        }
+        prepared.items.push(item);
     }
-    #[cfg(test)]
-    fn from_openai_values(items: Vec<serde_json::Value>) -> Self {
-        Self::from_raw_items(
-            items
-                .iter()
-                .map(|item| serde_json::value::to_raw_value(item).unwrap())
-                .collect(),
-            false,
-        )
+    prepared
+}
+fn from_raw_items(items: Vec<Box<RawValue>>, single_exec: bool) -> Carry {
+    let mut calls = Vec::new();
+    let mut compacted = false;
+    for item in &items {
+        let meta: ItemMeta<'_> = serde_json::from_str(item.get()).expect("completed item metadata");
+        compacted |= meta.kind == "compaction";
+        if matches!(meta.kind.as_ref(), "custom_tool_call" | "function_call")
+            && (!single_exec || calls.is_empty())
+            && let Some(id) = meta.call_id
+        {
+            #[derive(serde::Deserialize)]
+            struct Code {
+                input: Option<String>,
+                arguments: Option<String>,
+            }
+            let code: Code = serde_json::from_str(item.get()).expect("completed call");
+            calls.push(rho_agent::inference::Call::new(
+                id,
+                code.input.or(code.arguments).unwrap_or_default(),
+            ));
+        }
     }
+    Carry::new(
+        Replay {
+            items: items.iter().map(|item| &**item).collect(),
+            single_exec,
+            ..Default::default()
+        },
+        calls,
+        compacted,
+    )
+}
+#[cfg(test)]
+fn from_openai_values(items: Vec<serde_json::Value>) -> Carry {
+    from_raw_items(
+        items
+            .iter()
+            .map(|item| serde_json::value::to_raw_value(item).unwrap())
+            .collect(),
+        false,
+    )
 }
 pub(crate) fn display_results(
     carry: &rho_agent::inference::Carry,
     text: &str,
     images: &[Image],
 ) -> Vec<CallResult> {
-    Carry(carry.clone()).reply(text, images)
+    reply(carry, text, images)
 }
-
-/// Ordered events for one exchange. Dropping the receiver cancels the exchange.
-#[derive(Debug)]
-pub enum Event {
-    Call {
-        carry: Carry,
-    },
-    Code(String),
-    Completed(Step),
-    /// No input was sent. The caller must load its full active context.
-    NeedsContext,
-    Failed(anyhow::Error),
-}
-
-pub type Response = tokio::sync::mpsc::UnboundedReceiver<Event>;
 
 /// Observations for the account owner. Acknowledgment preserves policy ordering
 /// before completing a response or using a fallback route.
@@ -376,77 +278,60 @@ impl std::fmt::Display for RateLimited {
 }
 impl std::error::Error for RateLimited {}
 
-impl Carry {
-    #[cfg(test)]
-    fn from_openai_items(items: Vec<String>) -> Self {
-        Self::from_raw_items(
-            items
-                .into_iter()
-                .map(|item| RawValue::from_string(item).unwrap())
-                .collect(),
-            false,
-        )
-    }
-    fn has_compaction(&self) -> bool {
-        self.0.has_compaction()
-    }
-    #[cfg(test)]
-    fn call_ids(&self) -> Vec<String> {
-        self.prepared()
-            .calls
+#[cfg(test)]
+fn from_openai_items(items: Vec<String>) -> Carry {
+    from_raw_items(
+        items
             .into_iter()
-            .map(|(id, _)| id)
-            .collect()
-    }
-    #[cfg(test)]
-    fn has_call(&self) -> bool {
-        !self.call_ids().is_empty()
-    }
-    #[cfg(test)]
-    fn import_response(response: Carry, calls: Vec<Call>) -> Self {
-        Self(rho_agent::inference::Carry::new(
-            response.0.data(),
-            calls
-                .into_iter()
-                .map(|c| rho_agent::inference::Call::new(c.id, c.code))
-                .collect(),
-            response.has_compaction(),
-        ))
-    }
-    #[cfg(test)]
-    fn display_calls(&self) -> Vec<rho_agent::inference::Call> {
-        self.0.display_calls()
-    }
-    fn reply(&self, text: &str, images: &[Image]) -> Vec<CallResult> {
-        self.prepared()
-            .calls
-            .into_iter()
-            .map(|(id, function)| CallResult {
-                id,
-                function,
-                text: text.to_owned(),
-                images: images.to_vec(),
-            })
-            .collect()
-    }
-    #[cfg(test)]
-    fn with_code(&self, code: String) -> Call {
-        Call::new(self.call_ids().last().unwrap().as_str(), code)
-    }
-    fn bare(call: Call) -> Self {
-        let display = rho_agent::inference::Call::new(call.id.as_str(), call.code.clone());
-        Self(rho_agent::inference::Carry::new(
-            serde_json::json!({
-                "items":[{
-                    "type":"custom_tool_call", "id":format!("ctc_{}",call.id),
-                    "call_id":call.id.as_str(), "name":EXEC,"input":call.code
-                }],
-                "pending_exec":true
-            }),
-            vec![display],
-            false,
-        ))
-    }
+            .map(|item| RawValue::from_string(item).unwrap())
+            .collect(),
+        false,
+    )
+}
+#[cfg(test)]
+fn call_ids(carry: &Carry) -> Vec<String> {
+    prepared(carry)
+        .calls
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+#[cfg(test)]
+fn has_call(carry: &Carry) -> bool {
+    !call_ids(carry).is_empty()
+}
+#[cfg(test)]
+fn import_response(response: Carry, calls: Vec<Call>) -> Carry {
+    Carry::new(response.data(), calls, response.has_compaction())
+}
+fn reply(carry: &Carry, text: &str, images: &[Image]) -> Vec<CallResult> {
+    prepared(carry)
+        .calls
+        .into_iter()
+        .map(|(id, function)| CallResult {
+            id,
+            function,
+            text: text.to_owned(),
+            images: images.to_vec(),
+        })
+        .collect()
+}
+#[cfg(test)]
+fn with_code(carry: &Carry, code: String) -> Call {
+    Call::new(call_ids(carry).last().unwrap().as_str(), code)
+}
+fn bare(call: Call) -> Carry {
+    Carry::new(
+        serde_json::json!({
+            "items":[{
+                "type":"custom_tool_call", "id":format!("ctc_{}",call.display_id()),
+                "call_id":call.display_id(), "name":EXEC,"input":call.code
+            }],
+            "pending_exec":true
+        }),
+        vec![call],
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -458,27 +343,28 @@ mod retry_tests {
 
     #[test]
     fn display_code_does_not_create_a_provider_call() {
-        let carry = Carry::import_response(
-            Carry::from_openai_items(vec![]),
+        let carry = import_response(
+            from_openai_items(vec![]),
             vec![Call::new("evicted", "print('old code')".into())],
         );
-        assert!(!carry.has_call());
-        assert!(carry.reply("new output", &[]).is_empty());
-        assert!(carry.prepared().items.is_empty());
+        assert!(!has_call(&carry));
+        assert!(reply(&carry, "new output", &[]).is_empty());
+        assert!(prepared(&carry).items.is_empty());
         assert_eq!(carry.display_calls()[0].code, "print('old code')");
         let bytes = senax_encoder::encode(&carry).unwrap();
         let decoded: Carry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
         assert_eq!(decoded.display_calls()[0].display_id(), "evicted");
-        assert!(!decoded.has_call());
+        assert!(!has_call(&decoded));
     }
 
     #[test]
     fn opaque_stream_carry_pairs_partial_code_and_output() {
-        let carry = Carry::bare(Call::new("provider-stream-7", String::new()));
-        let partial = carry.with_code("print('admitted')".into());
+        let carry = bare(Call::new("provider-stream-7", String::new()));
+        let partial = with_code(&carry, "print('admitted')".into());
         assert_eq!(partial.code, "print('admitted')");
-        let persisted = Carry::bare(partial);
-        let results = persisted.reply(
+        let persisted = bare(partial);
+        let results = reply(
+            &persisted,
             "printed",
             &[Image {
                 media_type: "image/png".into(),
@@ -497,21 +383,21 @@ mod retry_tests {
             && result.images[0].data == [9, 2, 6]));
         assert_eq!(request.items().len(), 1);
 
-        let compacted = Carry::from_openai_items(vec![
+        let compacted = from_openai_items(vec![
             r#"{"type":"compaction","encrypted_content":"summary"}"#.into(),
         ]);
-        assert!(compacted.reply("no old call", &[]).is_empty());
+        assert!(reply(&compacted, "no old call", &[]).is_empty());
     }
 
     #[test]
     fn reply_pairs_only_calls_retained_after_compaction() {
-        let first = Carry::from_openai_items(vec![
+        let first = from_openai_items(vec![
             r#"{"type":"custom_tool_call","call_id":"removed","input":"old()"}"#.into(),
             r#"{"type":"compaction","encrypted_content":"summary"}"#.into(),
             r#"{"type":"custom_tool_call","call_id":"retained-a","input":"a()"}"#.into(),
             r#"{"type":"custom_tool_call","call_id":"retained-b","input":"b()"}"#.into(),
         ]);
-        let replies = first.reply("multi-call output", &[]);
+        let replies = reply(&first, "multi-call output", &[]);
         assert_eq!(
             replies
                 .iter()
@@ -574,17 +460,16 @@ mod context_tests {
 
     #[test]
     fn replay_json_is_shared_across_clones() {
-        let carry = Carry::from_openai_values(vec![serde_json::json!({
+        let carry = from_openai_values(vec![serde_json::json!({
             "type":"custom_tool_call","call_id":"c","input":"pass"
         })]);
         let cloned = carry.clone();
-        assert!(std::ptr::eq(carry.0.data(), cloned.0.data()));
+        assert!(std::ptr::eq(carry.data(), cloned.data()));
         let bytes = senax_encoder::encode(&carry).unwrap();
         let restored: Carry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
-        assert_eq!(restored.call_ids(), ["c".to_owned()]);
+        assert_eq!(call_ids(&restored), ["c".to_owned()]);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(restored.0.data().get()).unwrap()["items"][0]
-                ["input"],
+            serde_json::from_str::<serde_json::Value>(restored.data().get()).unwrap()["items"][0]["input"],
             "pass"
         );
     }
@@ -598,7 +483,7 @@ mod context_tests {
                     text: "discard".repeat(10000),
                     images: vec![],
                 },
-                Item::Step(Carry::from_openai_items(vec![
+                Item::Step(from_openai_items(vec![
                     r#"{"type":"compaction","encrypted_content":"summary"}"#.into(),
                 ])),
                 Item::User {
@@ -615,9 +500,9 @@ mod context_tests {
     #[test]
     fn wire_cache_identity_is_endpoint_and_credential_scoped() {
         let key = CacheKey::from_u128(19);
-        let id = key.wire_uuid("https://one", [1; 32]);
-        assert_eq!(id, key.wire_uuid("https://one", [1; 32]));
-        assert_ne!(id, key.wire_uuid("https://two", [1; 32]));
-        assert_ne!(id, key.wire_uuid("https://one", [2; 32]));
+        let id = wire_uuid(key, "https://one", [1; 32]);
+        assert_eq!(id, wire_uuid(key, "https://one", [1; 32]));
+        assert_ne!(id, wire_uuid(key, "https://two", [1; 32]));
+        assert_ne!(id, wire_uuid(key, "https://one", [2; 32]));
     }
 }

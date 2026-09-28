@@ -10,9 +10,7 @@ use redb::TableDefinition;
 use redb_derive::{Key, Value as RedbValue};
 #[cfg(test)]
 use rho_agent_types::{AdvisorIntelligence, EngineerIntelligence};
-use rho_agent_types::{
-    AgentId, AgentIdDomain, AgentRole, AgentWant, Place, Seq, TurnEdge, WorksetMode,
-};
+use rho_agent_types::{AgentId, AgentIdDomain, AgentRole, AgentWant, Place, Seq, TurnEdge, UnixMs};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -25,7 +23,7 @@ use crate::journal::{Feed, Journal, LogAppended};
 use crate::log::{
     AgentConfig, AgentEventPos, AgentHead, AgentOrigin, AgentRuntime, AgentSpawnedBy,
     AgentUsageBucket, AgentUsageModel, ClaudeRewind, ContextBoundary, NativeRecovery,
-    SessionBinding, UnixMillis, usage_model_of,
+    SessionBinding, WakeTrigger, usage_model_of,
 };
 
 mod native;
@@ -46,14 +44,6 @@ const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_log");
 /// Current heads, derived from the log in the same transaction as every append.
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> = TableDefinition::new("agent_heads");
-/// The workset's authoritative mode. `None` marks legacy mixed-mode members
-/// until an explicit ChangeMode resolves them.
-const WORKSET_MODES: TableDefinition<String, Sen<Option<WorksetMode>>> =
-    TableDefinition::new("workset_modes");
-/// Membership changes only at creation; ordered by workset for mode
-/// transitions.
-const WORKSET_AGENTS: TableDefinition<(String, AgentId), ()> =
-    TableDefinition::new("workset_agents");
 /// The order every append landed in, across agents: `seq -> (agent, pos)`,
 /// written in the same transaction as the row it names. What a client
 /// follows to stay current.
@@ -62,8 +52,14 @@ const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("jour
 /// came from and one past the last line copied. Written with the rows.
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
-const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
+/// Legacy timestamp key, read only during the one-hop migration.
+const OLD_QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
+/// Model, namespace presence, namespace text, per-namespace sequence.
+const QUOTA_OBSERVATIONS: TableDefinition<
+    (QuotaModel, u8, String, u64),
+    Sen<QuotaObservationRecord>,
+> = TableDefinition::new("quota_observations_by_model_namespace_sequence");
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct AgentUsageKey {
     agent_id: AgentId,
@@ -89,7 +85,8 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "b7e91ac4";
+const CURRENT_AGENT_DB_FORMAT: &str = "a3f26d91";
+const PREVIOUS_AGENT_DB_FORMAT: &str = "b7e91ac4";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -144,7 +141,7 @@ pub struct QuotaObservationRecord {
     /// The host-local OAuth namespace for ChatGPT observations. Claude and
     /// legacy observations are unscoped.
     pub auth_namespace: Option<String>,
-    pub observed_at: UnixMillis,
+    pub observed_at: UnixMs,
     pub used_percent: u8,
     pub reset_at_unix: Option<i64>,
 }
@@ -190,10 +187,6 @@ pub trait AgentReadTxnExt {
     fn list_agent_ids(&self) -> Vec<AgentId>;
     /// Every agent's fold: the whole store. For conversions and tools.
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
-    /// `None` means an unclaimed workset; `Some(None)` means legacy mixed
-    /// modes.
-    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>>;
-    fn workset_agents(&self, workset: &str) -> Vec<AgentId>;
     /// Who spawned an agent, read from its creation alone.
     fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId>;
     /// The agent that spawned this one: its parent, or the Engineer that
@@ -242,14 +235,10 @@ pub trait AgentReadTxnExt {
     ) -> Vec<(Seq, AgentId, AgentEventPos, AgentEvent<'static>)>;
     /// Samples for one model, bounded to the horizon plus its preceding
     /// baseline.
-    fn quota_observations(
-        &self,
-        model: QuotaModel,
-        since: UnixMillis,
-    ) -> Vec<QuotaObservationRecord>;
-    fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
+    fn quota_observations(&self, model: QuotaModel, since: UnixMs) -> Vec<QuotaObservationRecord>;
+    fn agent_usage(&self, agent_id: AgentId, since: UnixMs) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
-    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
+    fn global_agent_usage(&self, since: UnixMs) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
     /// The Claude account agents run on, which is the default account until
     /// someone switches it.
     fn claude_account(&self) -> String;
@@ -272,9 +261,6 @@ pub trait AgentWriteTxnExt {
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
 
     fn alloc_agent_id(&mut self) -> AgentId;
-    /// Changes the mode and all member projections in the same transaction.
-    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId>;
-
     /// Applies an update only when its source is still visible. The
     /// returned cache is the acknowledged source of truth for a sidecar
     /// session; `None` means its result was made stale by a rewind.
@@ -282,18 +268,13 @@ pub trait AgentWriteTxnExt {
     /// Takes back history from `to` on: told at a new position, so what
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`). Returns where it was told.
-    fn rewind_agent(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        to: AgentEventPos,
-    ) -> AgentEventPos;
+    fn rewind_agent(&mut self, now: UnixMs, agent_id: AgentId, to: AgentEventPos) -> AgentEventPos;
 
-    fn tell_turn(&mut self, now: UnixMillis, agent_id: AgentId, edge: TurnEdge);
+    fn tell_turn(&mut self, now: UnixMs, agent_id: AgentId, edge: TurnEdge);
 
     fn tell_wants(
         &mut self,
-        now: UnixMillis,
+        now: UnixMs,
         agent_id: AgentId,
         want: AgentWant,
         summary: Option<String>,
@@ -324,7 +305,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
     /// binding's default.
     fn create_agent(
         &mut self,
-        now: UnixMillis,
+        now: UnixMs,
         agent_id: AgentId,
         spawn_name: Option<String>,
         place: Place,
@@ -340,7 +321,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
 impl AgentProfileWriteTxnExt for WriteTxn {
     fn create_agent(
         &mut self,
-        now: UnixMillis,
+        now: UnixMs,
         agent_id: AgentId,
         spawn_name: Option<String>,
         place: Place,
@@ -391,7 +372,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             &AgentEvent::RoleChanged {
                 role,
                 binding: Some(binding),
-                at: UnixMillis::now(),
+                at: UnixMs::now(),
             },
         );
     }
@@ -438,20 +419,6 @@ impl AgentReadTxnExt for ReadTxn {
         self.open_table(AGENT_HEADS)
             .iter()
             .map(|(id, head)| (id.value(), head.value().into_owned()))
-            .collect()
-    }
-
-    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>> {
-        self.open_table(WORKSET_MODES)
-            .get(&workset.to_owned())
-            .map(|value| value.value().into_owned())
-    }
-
-    fn workset_agents(&self, workset: &str) -> Vec<AgentId> {
-        let workset = workset.to_owned();
-        self.open_table(WORKSET_AGENTS)
-            .range((workset.clone(), AgentId::MIN)..=(workset, AgentId::MAX))
-            .map(|(key, _)| key.value().1)
             .collect()
     }
 
@@ -623,26 +590,22 @@ impl AgentReadTxnExt for ReadTxn {
             .collect()
     }
 
-    fn quota_observations(
-        &self,
-        model: QuotaModel,
-        since: UnixMillis,
-    ) -> Vec<QuotaObservationRecord> {
+    fn quota_observations(&self, model: QuotaModel, since: UnixMs) -> Vec<QuotaObservationRecord> {
         let table = self.open_table(QUOTA_OBSERVATIONS);
         let mut before = BTreeMap::<Option<String>, QuotaObservationRecord>::new();
         let mut observations = Vec::new();
-        for (_, value) in table.range(
-            QuotaObservationKey {
-                model,
-                observed_at: 0,
-            }..=QuotaObservationKey {
-                model,
-                observed_at: u64::MAX,
-            },
-        ) {
+        for (_, value) in table
+            .range((model, 0, String::new(), 0)..)
+            .take_while(|(key, _)| key.value().0 == model)
+        {
             let observation = value.value().into_owned();
             if observation.observed_at < since {
-                before.insert(observation.auth_namespace.clone(), observation);
+                let old = before
+                    .entry(observation.auth_namespace.clone())
+                    .or_insert_with(|| observation.clone());
+                if observation.observed_at >= old.observed_at {
+                    *old = observation;
+                }
             } else {
                 observations.push(observation);
             }
@@ -652,7 +615,7 @@ impl AgentReadTxnExt for ReadTxn {
         observations
     }
 
-    fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket> {
+    fn agent_usage(&self, agent_id: AgentId, since: UnixMs) -> Vec<AgentUsageBucket> {
         self.open_table(AGENT_USAGE_BUCKETS)
             .range(
                 AgentUsageKey {
@@ -681,7 +644,7 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or_else(|| rho_claude::accounts::DEFAULT_ACCOUNT.to_owned())
     }
 
-    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)> {
+    fn global_agent_usage(&self, since: UnixMs) -> Vec<(AgentUsageModel, AgentUsageBucket)> {
         self.open_table(GLOBAL_AGENT_USAGE)
             .range(
                 GlobalAgentUsageKey {
@@ -705,8 +668,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_LOG);
         self.open_table(AGENT_HEADS);
         self.open_table(native::NATIVE_CURSORS);
-        self.open_table(WORKSET_MODES);
-        self.open_table(WORKSET_AGENTS);
         self.open_table(JOURNAL);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(QUOTA_OBSERVATIONS);
@@ -764,23 +725,6 @@ impl AgentWriteTxnExt for WriteTxn {
         };
         self.open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
-        if pos == AgentEventPos::ZERO {
-            let place = head.place();
-            let previous = self
-                .open_table(WORKSET_MODES)
-                .get(&place.workset)
-                .map(|value| value.value().into_owned());
-            assert!(
-                previous.is_none() || previous == Some(Some(place.mode)),
-                "new agents must use the workset's filesystem mode"
-            );
-            if previous.is_none() {
-                self.open_table(WORKSET_MODES)
-                    .insert(&place.workset, SenValue::borrowed(&Some(place.mode)));
-            }
-            self.open_table(WORKSET_AGENTS)
-                .insert(&(place.workset.clone(), agent_id), &());
-        }
         let seq = {
             let mut journal = self.open_table(JOURNAL);
             let seq = journal
@@ -812,7 +756,7 @@ impl AgentWriteTxnExt for WriteTxn {
             &AgentEvent::RoleChanged {
                 role,
                 binding: None,
-                at: UnixMillis::now(),
+                at: UnixMs::now(),
             },
         );
     }
@@ -822,7 +766,7 @@ impl AgentWriteTxnExt for WriteTxn {
             agent_id,
             &AgentEvent::RuntimeRebound {
                 change: crate::RuntimeChange::PromptCacheKey(key),
-                at: UnixMillis::now(),
+                at: UnixMs::now(),
             },
         );
     }
@@ -832,7 +776,7 @@ impl AgentWriteTxnExt for WriteTxn {
             agent_id,
             &AgentEvent::RuntimeRebound {
                 change: crate::RuntimeChange::ClaudeRewindPending(rewind),
-                at: UnixMillis::now(),
+                at: UnixMs::now(),
             },
         );
     }
@@ -842,30 +786,9 @@ impl AgentWriteTxnExt for WriteTxn {
             agent_id,
             &AgentEvent::RuntimeRebound {
                 change: crate::RuntimeChange::ClaudeRewound { session_id },
-                at: UnixMillis::now(),
+                at: UnixMs::now(),
             },
         );
-    }
-
-    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId> {
-        let workset_key = workset.to_owned();
-        let ids = self
-            .open_table(WORKSET_AGENTS)
-            .range((workset_key.clone(), AgentId::MIN)..=(workset_key.clone(), AgentId::MAX))
-            .map(|(key, _)| key.value().1)
-            .collect::<Vec<_>>();
-        for id in &ids {
-            self.append_agent_event(
-                *id,
-                &AgentEvent::ModeChanged {
-                    mode,
-                    at: UnixMillis::now(),
-                },
-            );
-        }
-        self.open_table(WORKSET_MODES)
-            .insert(&workset_key, SenValue::borrowed(&Some(mode)));
-        ids
     }
 
     fn alloc_agent_id(&mut self) -> AgentId {
@@ -874,12 +797,7 @@ impl AgentWriteTxnExt for WriteTxn {
             .expect("agent id counter exceeds prefix-id capacity")
     }
 
-    fn rewind_agent(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        to: AgentEventPos,
-    ) -> AgentEventPos {
+    fn rewind_agent(&mut self, now: UnixMs, agent_id: AgentId, to: AgentEventPos) -> AgentEventPos {
         assert!(
             to != AgentEventPos::ZERO,
             "an agent's creation cannot be rewound away"
@@ -891,13 +809,13 @@ impl AgentWriteTxnExt for WriteTxn {
         self.append_agent_event(agent_id, &AgentEvent::Rewound { to, at: now })
     }
 
-    fn tell_turn(&mut self, now: UnixMillis, agent_id: AgentId, edge: TurnEdge) {
+    fn tell_turn(&mut self, now: UnixMs, agent_id: AgentId, edge: TurnEdge) {
         self.append_agent_event(agent_id, &AgentEvent::Turn { edge, at: now });
     }
 
     fn tell_wants(
         &mut self,
-        now: UnixMillis,
+        now: UnixMs,
         agent_id: AgentId,
         want: AgentWant,
         summary: Option<String>,
@@ -933,34 +851,34 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
-        let mut key = QuotaObservationKey {
-            model: observation.model,
-            observed_at: observation.observed_at.0,
-        };
+        let namespace = observation.auth_namespace.clone().unwrap_or_default();
+        let present = u8::from(observation.auth_namespace.is_some());
+        let start = (observation.model, present, namespace.clone(), 0);
+        let end = (observation.model, present, namespace.clone(), u64::MAX);
         let mut table = self.open_table(QUOTA_OBSERVATIONS);
-        let unchanged = table
-            .range(
-                QuotaObservationKey {
-                    model: observation.model,
-                    observed_at: 0,
-                }..=QuotaObservationKey {
-                    model: observation.model,
-                    observed_at: u64::MAX,
-                },
-            )
-            .rev()
-            .map(|(_, value)| value.value().into_owned())
-            .find(|old| old.auth_namespace == observation.auth_namespace)
-            .is_some_and(|old| quota_observation_unchanged(&old, &observation));
-        if unchanged {
+        let records = table.range(start..=end);
+        let mut next_sequence = 0;
+        let mut latest_by_time = None;
+        for (key, value) in records {
+            next_sequence = key.value().3 + 1;
+            let sample: QuotaObservationRecord = value.value().into_owned();
+            if latest_by_time
+                .as_ref()
+                .is_none_or(|old: &QuotaObservationRecord| sample.observed_at >= old.observed_at)
+            {
+                latest_by_time = Some(sample);
+            }
+        }
+        if latest_by_time
+            .as_ref()
+            .is_some_and(|old| quota_observation_unchanged(old, &observation))
+        {
             return false;
         }
-        // Different namespaces can be observed in the same millisecond. Keep
-        // the legacy fixed-width key compatible while avoiding replacement.
-        while table.get(&key).is_some() {
-            key.observed_at = key.observed_at.saturating_add(1);
-        }
-        table.insert(&key, SenValue::borrowed(&observation));
+        table.insert(
+            &(observation.model, present, namespace, next_sequence),
+            SenValue::borrowed(&observation),
+        );
         true
     }
 
@@ -1198,7 +1116,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.config.binding = *binding;
             }
         }
-        AgentEvent::ModeChanged { mode, .. } => head.config.place.mode = *mode,
+        AgentEvent::ModeChanged { .. } => {} // Only decoded until the migration rewrites it.
         // An empty notice is nothing to say (what the old `WorkdirAdded`
         // rows became).
         AgentEvent::Notice { text, .. } => {
@@ -1257,7 +1175,12 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
 /// remain available for explicit rollback or deletion.
 pub async fn prepare(db: &rho_db::RhoDb) {
     let read = db.read();
-    let unstamped = !read.has_table("format") || read.open_table(FORMAT).get(&()).is_none();
+    let stored = if read.has_table("format") {
+        read.open_table(FORMAT).get(&()).map(|value| value.value())
+    } else {
+        None
+    };
+    let unstamped = stored.is_none();
     if unstamped
         && ["agent_log", "agent_heads", "counters"]
             .iter()
@@ -1269,7 +1192,17 @@ pub async fn prepare(db: &rho_db::RhoDb) {
              or remove the local rho database if you do not need the saved agents."
         );
     }
+    let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
+    let needs_savepoint = stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT)
+        && (!read.has_table("recovery_savepoints")
+            || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
+    if needs_savepoint {
+        db.persistent_savepoint(|write, id| {
+            write.open_table(RECOVERY).insert(&hop, &id);
+        })
+        .await;
+    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -1356,21 +1289,6 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
         write.open_table(AGENT_USAGE_TOTALS).remove(&agent_id);
     }
 
-    // Deletion also handles heads this build cannot decode. Inspect only the
-    // index keys rather than reading an agent head to discover its workset.
-    let mut members = write.open_table(WORKSET_AGENTS);
-    let keys = members
-        .iter()
-        .map(|(key, _)| key.value())
-        .filter(|(_, id)| doomed.contains(id))
-        .collect::<Vec<_>>();
-    for key in &keys {
-        members.remove(key);
-    }
-    drop(members);
-    // Mode belongs to the workset, not its agents. Retain it even when the
-    // last member is deleted so future creation cannot silently change it.
-
     let mut journal = write.open_table(JOURNAL);
     let seqs = journal
         .iter()
@@ -1443,13 +1361,11 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
 }
 
 fn assert_agent_db_format(write: &mut WriteTxn) {
-    let mut format = write.open_table(FORMAT);
-    let stored = format.get(&()).map(|value| value.value());
-    match stored {
-        None => {
-            format.insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
-        }
-        Some(current) if current == CURRENT_AGENT_DB_FORMAT => {}
+    let stored = write.open_table(FORMAT).get(&()).map(|value| value.value());
+    match stored.as_deref() {
+        None => {}
+        Some(CURRENT_AGENT_DB_FORMAT) => return,
+        Some(PREVIOUS_AGENT_DB_FORMAT) => migrate_agent_db(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \
@@ -1457,6 +1373,142 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
              the local rho database if you do not need the saved agents."
         ),
     }
+    write
+        .open_table(FORMAT)
+        .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
+}
+
+/// One-hop migration from b7e91ac4. Remove this after active stores have
+/// opened once with the new format; the recovery savepoint remains usable.
+fn migrate_agent_db(write: &mut WriteTxn) {
+    let keys = write
+        .open_table(AGENT_LOG)
+        .iter()
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let mut event = write
+            .open_table(AGENT_LOG)
+            .get(&key)
+            .unwrap()
+            .value()
+            .into_owned();
+        match &mut event {
+            AgentEvent::ModeChanged { mode, at } => {
+                let label = match mode {
+                    crate::log::LegacyWorksetMode::View => "view",
+                    crate::log::LegacyWorksetMode::Exposed => "exposed",
+                };
+                event = AgentEvent::Entry(crate::entry::Entry::Sent {
+                    at: *at,
+                    id: crate::entry::MessageId::new(),
+                    to: crate::entry::Party::Human,
+                    text: format!("Workset filesystem changed to {label} mode."),
+                });
+            }
+            AgentEvent::Transcript {
+                wake: Some(wake), ..
+            } => normalize_wake(wake),
+            AgentEvent::ClaudeOutput { batch } => normalize_wake(&mut batch.wake),
+            _ => {}
+        }
+        write
+            .open_table(AGENT_LOG)
+            .insert(&key, SenValue::borrowed(&event));
+    }
+    let heads = write
+        .open_table(AGENT_HEADS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect::<Vec<_>>();
+    for (key, head) in heads {
+        write
+            .open_table(AGENT_HEADS)
+            .insert(&key, SenValue::borrowed(&head));
+    }
+    let keys = write
+        .open_table(AGENT_USAGE_BUCKETS)
+        .iter()
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let value = write
+            .open_table(AGENT_USAGE_BUCKETS)
+            .get(&key)
+            .unwrap()
+            .value()
+            .into_owned();
+        write
+            .open_table(AGENT_USAGE_BUCKETS)
+            .insert(&key, SenValue::borrowed(&value));
+    }
+    let totals = write
+        .open_table(AGENT_USAGE_TOTALS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect::<Vec<_>>();
+    for (key, value) in totals {
+        write
+            .open_table(AGENT_USAGE_TOTALS)
+            .insert(&key, SenValue::borrowed(&value));
+    }
+    let keys = write
+        .open_table(GLOBAL_AGENT_USAGE)
+        .iter()
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let value = write
+            .open_table(GLOBAL_AGENT_USAGE)
+            .get(&key)
+            .unwrap()
+            .value()
+            .into_owned();
+        write
+            .open_table(GLOBAL_AGENT_USAGE)
+            .insert(&key, SenValue::borrowed(&value));
+    }
+    // The old key orders by model and timestamp. Keep that order for each
+    // namespace's new sequence, including colliding timestamp samples.
+    let keys = write
+        .open_table(OLD_QUOTA_OBSERVATIONS)
+        .iter()
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let observation = write
+            .open_table(OLD_QUOTA_OBSERVATIONS)
+            .get(&key)
+            .unwrap()
+            .value()
+            .into_owned();
+        let namespace = observation.auth_namespace.clone().unwrap_or_default();
+        let present = u8::from(observation.auth_namespace.is_some());
+        let mut table = write.open_table(QUOTA_OBSERVATIONS);
+        let sequence = table
+            .range(
+                (observation.model, present, namespace.clone(), 0)
+                    ..=(observation.model, present, namespace.clone(), u64::MAX),
+            )
+            .next_back()
+            .map(|(key, _)| key.value().3 + 1)
+            .unwrap_or(0);
+        table.insert(
+            &(observation.model, present, namespace, sequence),
+            SenValue::borrowed(&observation),
+        );
+    }
+    write.delete_table("quota_observations_by_model_time");
+    write.delete_table("workset_modes");
+    write.delete_table("workset_agents");
+}
+
+fn normalize_wake(wake: &mut crate::log::WakeFacts) {
+    wake.trigger = match wake.trigger {
+        WakeTrigger::Interrupt => WakeTrigger::User,
+        WakeTrigger::ContextRotation => WakeTrigger::Asked,
+        other => other,
+    };
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

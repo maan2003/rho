@@ -8,7 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq, WorksetMode, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -201,9 +201,6 @@ pub struct NewAgent {
     /// Where the agent's working copy starts (including which repo, for
     /// the modes that need one).
     pub start: StartMode,
-    /// How the agent sees the filesystem around its workset: a minimal
-    /// generated root, or the host.
-    pub mode: WorksetMode,
     pub content: Option<Vec<ContentPart>>,
 }
 
@@ -220,12 +217,6 @@ pub enum AgentCommand {
     ChangeRole {
         agent_id: AgentId,
         role: AgentRole,
-    },
-    /// How the agent sees the filesystem from now on. Its loop restarts
-    /// in the new view, so the Python notebook's state is lost.
-    ChangeMode {
-        agent_id: AgentId,
-        mode: WorksetMode,
     },
     Cancel {
         agent_id: AgentId,
@@ -251,7 +242,6 @@ impl AgentCommand {
             Self::Send { agent_id, .. }
             | Self::Compact { agent_id, .. }
             | Self::ChangeRole { agent_id, .. }
-            | Self::ChangeMode { agent_id, .. }
             | Self::Cancel { agent_id }
             | Self::Rewind { agent_id, .. }
             | Self::Continue { agent_id }

@@ -74,9 +74,9 @@ pub(crate) struct PolicyCall {
 }
 
 impl Accounts {
-    /// Applies provider-owned database migrations without starting runtime
-    /// work.
-    pub async fn migrate(db: &RhoDb) -> anyhow::Result<()> {
+    /// Initializes provider-owned tables or validates their format without
+    /// starting runtime work.
+    pub async fn init(db: &RhoDb) -> anyhow::Result<()> {
         accounts::init(db).await
     }
 
@@ -85,7 +85,7 @@ impl Accounts {
     }
 
     pub async fn new_with_config(db: RhoDb, config: InferenceConfig) -> anyhow::Result<Self> {
-        Self::migrate(&db).await?;
+        Self::init(&db).await?;
         let accounts = Arc::new(AccountManager::open(db.clone()).await);
         let production_chatgpt =
             &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL;

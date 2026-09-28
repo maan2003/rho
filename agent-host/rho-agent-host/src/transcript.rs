@@ -157,10 +157,7 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             }),
             at: *at,
         },
-        AgentEvent::ModeChanged { mode, at } => TranscriptEvent::ModeChanged {
-            mode: *mode,
-            at: *at,
-        },
+        AgentEvent::ModeChanged { .. } => return None,
         AgentEvent::Notice { text, .. } if text.is_empty() => return None,
         AgentEvent::Notice { text, at } => TranscriptEvent::Notice {
             text: text.to_string(),
@@ -665,7 +662,6 @@ pub fn queued_item(input: &QueuedInput) -> QueuedItem {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            delivery: input.delivery,
         },
         InputKind::Compaction => QueuedItem::Compaction,
     }

@@ -32,10 +32,7 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
-use rho_agents_client::create::{
-    StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
-    parse_workset_mode,
-};
+use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
 use rho_agents_client::protocol::{AgentCommand, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
@@ -447,7 +444,6 @@ impl Workspace {
                 None,
                 None,
                 None,
-                None,
             );
             let visualization_client = self
                 .agents_for(agent_id)
@@ -752,7 +748,6 @@ impl Workspace {
                             Some(fields.workdir),
                             Some(fields.role),
                             Some(fields.start),
-                            Some(fields.filesystem),
                         ),
                     ));
                 }),
@@ -2418,13 +2413,6 @@ impl Workspace {
                 return;
             }
         };
-        let mode = match parse_workset_mode(&self.draft_model.read(cx).filesystem_text(cx)) {
-            Ok(mode) => mode,
-            Err(message) => {
-                self.refuse_draft(&message, cx);
-                return;
-            }
-        };
         self.awaiting_draft_agent = Some(host);
         // `n a` chose an area, and that is where the agent is filed; an
         // ordinary draft has none and starts at the root.
@@ -2435,7 +2423,6 @@ impl Workspace {
         let reply = agents.call(NewAgent {
             role,
             start,
-            mode,
             content: Some(content),
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -2500,7 +2487,6 @@ impl Workspace {
                 view.set_workdir_text(&label, cx);
                 view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
                 view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-                view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
             });
             self.select_agent(Some(agent_id), window, cx);
         }
@@ -2722,73 +2708,6 @@ impl Workspace {
             },
             cx,
         );
-    }
-
-    pub(crate) fn cmd_change_agent_mode(
-        &mut self,
-        mode: rho_agent_types::WorksetMode,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent_id) = self.subject_agent_or_notice("change-filesystem", window, cx) else {
-            return;
-        };
-        if !self.require_agent_online(agent_id, cx) {
-            return;
-        }
-        self.send_to_agent(agent_id, AgentCommand::ChangeMode { agent_id, mode }, cx);
-        self.notice_on(
-            Some(&agent_id),
-            &format!(
-                "filesystem set to {}: the agent restarts in it, and its notebook starts over",
-                mode_label(mode)
-            ),
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    /// `space a f`: which filesystem the agent works in, `view` or
-    /// `exposed`. The current one is named in the prompt.
-    pub(crate) fn prompt_change_agent_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.subject_agent_or_notice("change-filesystem", window, cx) else {
-            return;
-        };
-        let current = self
-            .registry
-            .agent_place(agent_id)
-            .map(|place| place.mode)
-            .unwrap_or_default();
-        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_ascii_lowercase();
-            crate::commands::filesystem_field_candidates("")
-                .into_iter()
-                .filter(|candidate| candidate.value.contains(&needle))
-                .map(|mut candidate| {
-                    if candidate.value == mode_label(current) {
-                        candidate.description = format!("{} (now)", candidate.description);
-                    }
-                    candidate
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                match parse_workset_mode(&input) {
-                    Ok(mode) => workspace.cmd_change_agent_mode(mode, window, cx),
-                    Err(message) => workspace.notice_on(
-                        None,
-                        &format!("change-filesystem: {message}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            },
-        );
-        self.open_prompt("filesystem:", complete, on_submit, window, cx);
     }
 
     pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3803,9 +3722,8 @@ impl Workspace {
     }
 
     /// Ctrl-Tab cycles the value the cursor is on: the role, the start
-    /// field's mode (on top of → join), or the filesystem (view →
-    /// exposed). Elsewhere in the draft it does nothing, there being no
-    /// value to cycle.
+    /// field's mode (on top of → join). Elsewhere in the draft it does nothing,
+    /// there being no value to cycle.
     fn cycle_draft_value(&mut self, cx: &mut Context<Self>) {
         if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
@@ -3816,9 +3734,6 @@ impl Workspace {
                     view.set_role_text(next, cx);
                 } else if view.cursor_in_start_field(&editor, cx) {
                     view.cycle_start_mode(cx);
-                } else if view.cursor_in_filesystem_field(&editor, cx) {
-                    let next = cycle_workset_mode_text(&view.filesystem_text(cx));
-                    view.set_filesystem_text(next, cx);
                 }
             });
         }
@@ -5852,7 +5767,6 @@ impl Workspace {
             Command::Version => self.cmd_version(cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
-            Command::AgentMode => self.prompt_change_agent_mode(window, cx),
             Command::VerdictName => self.cmd_verdict_name(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
             Command::AgentRewind => self.cmd_rewind(1, window, cx),
@@ -6728,7 +6642,6 @@ impl Workspace {
             view.clear_attachments(cx);
             view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
             view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-            view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -6904,15 +6817,6 @@ impl Workspace {
     pub(crate) fn cursor_in_draft_start_field_for_test(&self, cx: &mut Context<Self>) -> bool {
         self.focused_draft_editor()
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_start_field(&editor, cx))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cursor_in_draft_filesystem_field_for_test(&self, cx: &mut Context<Self>) -> bool {
-        self.focused_draft_editor().is_some_and(|editor| {
-            self.draft_model
-                .read(cx)
-                .cursor_in_filesystem_field(&editor, cx)
-        })
     }
 
     #[cfg(test)]
@@ -7782,14 +7686,6 @@ impl Workspace {
             }
             let _ = this.update(cx, |this, _| this.duration_timer = None);
         }));
-    }
-}
-
-/// How a filesystem mode reads in a prompt: the draft field's words.
-fn mode_label(mode: rho_agent_types::WorksetMode) -> &'static str {
-    match mode {
-        rho_agent_types::WorksetMode::View => "view",
-        rho_agent_types::WorksetMode::Exposed => "exposed",
     }
 }
 

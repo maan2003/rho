@@ -8,7 +8,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, MessageDelivery};
+use rho_agent_types::AgentId;
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
@@ -62,9 +62,8 @@ impl Span {
 }
 
 /// Coarse block classification used for separators and transcript turn
-/// boundaries. Immediate queued messages render like user messages and open
-/// a turn right away; queued/steering placeholders render like user messages
-/// but stay inside the current live turn until delivery.
+/// boundaries. Queued messages stay inside the current live turn until
+/// delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     User,
@@ -134,10 +133,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
             BlockKind::Response { working: true }
         }
-        UiBlock::QueuedMessage { delivery, .. } => match delivery {
-            MessageDelivery::Immediate => BlockKind::User,
-            MessageDelivery::NextRequest => BlockKind::QueuedUser,
-        },
+        UiBlock::QueuedMessage { .. } => BlockKind::QueuedUser,
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
 }
@@ -369,11 +365,7 @@ pub fn render_block_with_agent_labels(
             gutter_span = Some(spans.len());
             spans.push(Span::new(format!("{text}\n\n"), StyleClass::AgentMessage));
         }
-        UiBlock::QueuedMessage {
-            text,
-            delivery,
-            sender,
-        } => {
+        UiBlock::QueuedMessage { text, sender } => {
             if text.is_empty() {
                 return invisible(kind);
             }
@@ -393,17 +385,11 @@ pub fn render_block_with_agent_labels(
                     StyleClass::UserMessage
                 },
             ));
-            let label = match delivery {
-                MessageDelivery::Immediate => None,
-                MessageDelivery::NextRequest => Some(" (queued)"),
-            };
-            if let Some(label) = label {
-                inlay = Some(InlaySpec {
-                    span_index: spans.len(),
-                    content: InlayContent::Label(label),
-                });
-                spans.push(Span::new("", StyleClass::SystemInfo));
-            }
+            inlay = Some(InlaySpec {
+                span_index: spans.len(),
+                content: InlayContent::Label(" (queued)"),
+            });
+            spans.push(Span::new("", StyleClass::SystemInfo));
             spans.push(Span::new("\n\n", StyleClass::Default));
         }
     }
@@ -1066,23 +1052,52 @@ mod tests {
     }
 
     #[test]
-    fn only_immediate_queued_messages_are_turn_users() {
-        assert_eq!(
-            block_kind(&UiBlock::QueuedMessage {
-                text: "now".to_owned(),
-                delivery: MessageDelivery::Immediate,
-                sender: None,
-            }),
-            BlockKind::User
-        );
-        assert_eq!(
-            block_kind(&UiBlock::QueuedMessage {
-                text: "later".to_owned(),
-                delivery: MessageDelivery::NextRequest,
-                sender: None,
-            }),
-            BlockKind::QueuedUser
-        );
+    fn queued_messages_do_not_open_turns_until_delivered() {
+        let sender = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        for sender in [None, Some(sender)] {
+            assert_eq!(
+                block_kind(&UiBlock::QueuedMessage {
+                    text: "waiting".into(),
+                    sender
+                }),
+                BlockKind::QueuedUser,
+            );
+            let queued = render_block_with_agent_labels(
+                &UiBlock::QueuedMessage {
+                    text: "waiting".into(),
+                    sender,
+                },
+                None,
+                0,
+                &|_| "peer".into(),
+            );
+            assert_eq!(
+                queued.inlay.unwrap().content,
+                InlayContent::Label(" (queued)")
+            );
+            assert!(queued.spans.iter().any(|span| span.text == "waiting"
+                && span.class
+                    == if sender.is_some() {
+                        StyleClass::AgentMessage
+                    } else {
+                        StyleClass::UserMessage
+                    }));
+            let delivered = match sender {
+                Some(sender) => UiBlock::AgentMessage {
+                    sender,
+                    text: "waiting".into(),
+                },
+                None => UiBlock::UserMessage {
+                    text: "waiting".into(),
+                },
+            };
+            assert_eq!(block_kind(&delivered), BlockKind::User);
+            assert!(
+                render_block_with_agent_labels(&delivered, None, 0, &|_| "peer".into())
+                    .inlay
+                    .is_none()
+            );
+        }
     }
 
     /// Composition is lazy, so visibility is answered from the block
@@ -1127,12 +1142,10 @@ mod tests {
             },
             UiBlock::QueuedMessage {
                 text: "queued".to_owned(),
-                delivery: MessageDelivery::NextRequest,
                 sender: None,
             },
             UiBlock::QueuedMessage {
                 text: String::new(),
-                delivery: MessageDelivery::NextRequest,
                 sender: None,
             },
         ];

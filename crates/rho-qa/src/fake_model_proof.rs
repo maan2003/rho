@@ -210,7 +210,6 @@ async fn run_async(args: Args) -> Result<()> {
                 repo: repo.clone(),
                 revset: "HEAD".into(),
             },
-            mode: rho_agent_types::WorksetMode::View,
             content: Some(prompt(index, 0)),
         });
     }

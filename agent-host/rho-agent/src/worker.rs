@@ -28,20 +28,13 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         startup.version == protocol::VERSION,
         "workset protocol mismatch"
     );
-    let mut config_home = startup.claude.config_home().to_owned();
-    if matches!(startup.layout.mode, rho_fs_view::Mode::View { .. }) {
-        if let Ok(home) = std::env::var("HOME")
-            && let Ok(relative) = config_home.strip_prefix(&home)
-        {
-            config_home = camino::Utf8Path::new(rho_fs_view::AGENT_HOME).join(relative);
-        }
-    }
+    let config_home = startup.claude.config_home().to_owned();
     unsafe {
         startup.layout.build()?;
     }
     startup.claude = rho_claude::namespace::install_sources(
         &startup.claude,
-        startup.layout.staging_root(),
+        std::path::Path::new("/"),
         startup.layout.state.as_std_path(),
         config_home,
     )?;

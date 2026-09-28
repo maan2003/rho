@@ -1,7 +1,7 @@
 //! How a client draws an agent: the block list and status it folds from
 //! the mirror and the live tail. Nothing here crosses the wire.
 
-use rho_agent_types::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::protocol::transcript::{ArgumentsFormat, TextPhase};
@@ -63,7 +63,6 @@ pub enum UiBlock {
     /// `AgentMessage`) block at delivery. Always trails the transcript.
     QueuedMessage {
         text: String,
-        delivery: MessageDelivery,
         /// The sending agent; `None` for the user.
         sender: Option<rho_agent_types::AgentId>,
     },

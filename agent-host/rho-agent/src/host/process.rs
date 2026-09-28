@@ -22,7 +22,6 @@ pub struct Process {
         Arc<Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
     pub(crate) next: Arc<AtomicU64>,
     pub(crate) closed: watch::Receiver<bool>,
-    pub(crate) mode: rho_agent_types::WorksetMode,
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -146,23 +145,6 @@ impl Process {
         let _ = self.closed.clone().wait_for(|closed| *closed).await;
     }
 
-    // The caller holds exclusive workset admission.
-    pub(crate) async fn no_sessions(&self) -> anyhow::Result<bool> {
-        use workset::{Action, Message, Reply};
-        for action in [Action::TerminalList, Action::ShellList] {
-            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match self
-                .request(id, Message::Action { id, action }, None)
-                .await?
-            {
-                Reply::Terminals(entries) if entries.is_empty() => {}
-                Reply::Shells(entries) if entries.is_empty() => {}
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
-    }
-
     pub fn stop(&self) {
         if let Some(stop) = self.stop.lock().expect("poison").take() {
             let _ = stop.send(());
@@ -172,17 +154,10 @@ impl Process {
     pub(crate) async fn start(
         pool: &Arc<crate::host::pool::AgentPool>,
         workset: &rho_fs_view::Workset,
-        mode: rho_agent_types::WorksetMode,
         claude: rho_claude::accounts::ClaudePaths,
         admission: Arc<tokio::sync::RwLock<()>>,
     ) -> anyhow::Result<Arc<Self>> {
-        let root = tempfile::Builder::new().prefix("rho-workset-").tempdir()?;
-        let layout = rho_fs_view::WorksetLayout::new(
-            workset,
-            rho_fs_view::Mode::from_workset_mode(mode),
-            camino::Utf8PathBuf::from_path_buf(root.path().to_owned())
-                .map_err(|_| anyhow::anyhow!("non-UTF8 workset mount root"))?,
-        )?;
+        let layout = rho_fs_view::WorksetLayout::new(workset)?;
         let startup = Startup {
             version: protocol::VERSION,
             layout,
@@ -352,8 +327,6 @@ impl Process {
             // Cancelled callers cannot release admission before an enqueued
             // operation replies or the execution process has actually exited.
             pending_close.lock().expect("poison").clear();
-            // Mountpoint cleanup remains in the agent host's host-root frame.
-            drop(root);
             closed.send_replace(true);
         });
         let sender = connection.await.context("workset startup failed")?;
@@ -375,7 +348,6 @@ impl Process {
             agents,
             next: Arc::new(AtomicU64::new(1)),
             closed: closed_rx,
-            mode,
             stop: Mutex::new(Some(stop)),
         }))
     }

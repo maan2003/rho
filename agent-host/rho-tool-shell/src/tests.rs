@@ -1,5 +1,5 @@
 use rho_agent_types::ToolOutputStatus;
-use rho_agent_types::transcript::{ToolCall, ToolCallId, ToolName, ToolType};
+use rho_agent_types::transcript::{ExecId, ToolCall, ToolName, ToolType};
 use rho_fs_view::PathOverrides;
 
 use super::*;
@@ -14,7 +14,7 @@ fn test_tools(timeout_secs: u64) -> ShellTools {
 
 fn shell_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
-        id: ToolCallId::try_from("call-1").unwrap(),
+        id: ExecId::try_from("call-1").unwrap(),
         name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).unwrap(),
         tool_type: ToolType::Function,
         arguments: arguments.to_string(),
@@ -23,7 +23,7 @@ fn shell_call(arguments: serde_json::Value) -> ToolCall {
 
 fn patch_call(arguments: impl Into<String>) -> ToolCall {
     ToolCall {
-        id: ToolCallId::try_from("call-1").unwrap(),
+        id: ExecId::try_from("call-1").unwrap(),
         name: ToolName::try_from(APPLY_PATCH_TOOL_NAME).unwrap(),
         tool_type: ToolType::Custom,
         arguments: arguments.into(),
@@ -93,7 +93,7 @@ async fn write_stdin_continues_a_running_process() {
     );
     let result = tools
         .call(ToolCall {
-            id: ToolCallId::try_from("call-2").unwrap(),
+            id: ExecId::try_from("call-2").unwrap(),
             name: ToolName::try_from(WRITE_STDIN_TOOL_NAME).unwrap(),
             tool_type: ToolType::Function,
             arguments: json!({"session_id": 1, "chars": "hello\n"}).to_string(),
@@ -141,7 +141,7 @@ async fn an_empty_poll_returns_as_soon_as_the_process_says_something() {
         let started = std::time::Instant::now();
         let result = tools
             .call(ToolCall {
-                id: ToolCallId::try_from(format!("poll-{expected}").as_str()).unwrap(),
+                id: ExecId::try_from(format!("poll-{expected}").as_str()).unwrap(),
                 name: ToolName::try_from(WRITE_STDIN_TOOL_NAME).unwrap(),
                 tool_type: ToolType::Function,
                 // A tiny yield is raised to the poll floor, so this returns on

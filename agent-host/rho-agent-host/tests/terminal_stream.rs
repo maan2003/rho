@@ -107,7 +107,6 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
                     repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
                     revset: "@".to_owned(),
                 },
-                mode: rho_agent_types::WorksetMode::View,
                 content: None,
             },
         ),

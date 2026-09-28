@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use redb_derive::{Key, Value as RedbValue};
 use rho_agent_types::transcript::{MessageSender, PendingInferenceResponse};
 use rho_agent_types::{
-    AdvisorIntelligence, AgentId, AgentRole, AgentWant, ContentPart, EngineerIntelligence,
-    MessageDelivery, Place, TurnEdge, UnixMs, WorksetMode,
+    AdvisorIntelligence, AgentId, AgentRole, AgentWant, ContentPart, EngineerIntelligence, Place,
+    TurnEdge, UnixMs,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -166,10 +166,6 @@ impl From<rho_agent_types::AgentPos> for AgentEventPos {
 /// position, not the position where this update happens to be recorded. That
 /// distinction makes a late result harmless after rewind.
 
-/// The title and activity a reader sees, and what seeds a fresh Luna turn.
-
-pub type UnixMillis = UnixMs;
-
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
 /// first and reaches the head through the fold.
@@ -184,7 +180,7 @@ pub struct AgentConfig {
     /// The name the spawner gave. A generated title is never made for an
     /// agent that has one, and it always beats a generated title.
     pub spawn_name: Option<String>,
-    pub created_at: UnixMillis,
+    pub created_at: UnixMs,
     /// A message-only Claude rewind whose destination transcript has not yet
     /// been durably materialized and verified. The old runtime remains
     /// authoritative until then.
@@ -213,7 +209,7 @@ pub struct AgentHead {
     pub user_interacted: bool,
     /// What a `Notice` said, until a user message has carried it.
     pub pending_notice: Option<String>,
-    pub last_turn_ended: Option<UnixMillis>,
+    pub last_turn_ended: Option<UnixMs>,
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
 }
@@ -557,10 +553,10 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
-    /// The agent now sees the filesystem this way: the same workset and
-    /// directory, entered in the other mode at its next load.
+    /// Temporary decoder for a historical mode change, rewritten by the
+    /// agent database migration to a sent annotation.
     ModeChanged {
-        mode: WorksetMode,
+        mode: LegacyWorksetMode,
         #[senax(default)]
         at: UnixMs,
     },
@@ -605,6 +601,14 @@ pub enum AgentEvent<'a> {
     Entry(entry::Entry),
 }
 
+/// Temporary decoder for the removed filesystem mode, until the one-hop
+/// agent database migration has been run on active stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum LegacyWorksetMode {
+    View,
+    Exposed,
+}
+
 /// Leased notebook contributions transferred to durable host ownership before
 /// contacting Claude Code. A handoff does not prove remote consumption.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -635,20 +639,6 @@ pub struct WakeFacts {
     pub tools_suppressed: bool,
     /// When the model's check-in was due, if its turn had one.
     pub checkin_at: Option<UnixMs>,
-}
-
-impl WakeFacts {
-    /// Historical interrupt wake; retained for decoding old logs.
-    pub fn interrupt() -> Self {
-        Self {
-            trigger: WakeTrigger::Interrupt,
-            events: Vec::new(),
-            foreground_running: 0,
-            background_running: 0,
-            tools_suppressed: false,
-            checkin_at: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -715,7 +705,6 @@ pub enum RuntimeChange {
 pub struct QueuedInput {
     pub source: MessageSender,
     pub kind: InputKind,
-    pub delivery: MessageDelivery,
     pub at: UnixMs,
 }
 
@@ -763,7 +752,7 @@ pub struct TranscriptCall {
 
 #[cfg(test)]
 mod encoding_tests {
-    use rho_agent_types::{AgentWant, TurnEdge, UnixMs, WorksetMode};
+    use rho_agent_types::{AgentWant, TurnEdge, UnixMs};
     use senax_encoder::{Decoder as _, Encoder as _};
 
     use super::*;
@@ -797,7 +786,7 @@ mod encoding_tests {
                 at: UnixMs(15),
             },
             AgentEvent::ModeChanged {
-                mode: WorksetMode::Exposed,
+                mode: LegacyWorksetMode::Exposed,
                 at: UnixMs(16),
             },
             AgentEvent::Transcript {

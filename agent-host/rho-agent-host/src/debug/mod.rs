@@ -93,9 +93,6 @@ enum DebugCommand {
         repo: camino::Utf8PathBuf,
         #[arg(long, default_value = "@")]
         revset: String,
-        /// See the host filesystem rather than a generated root.
-        #[arg(long)]
-        exposed: bool,
         /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
         /// user's agent host.
         #[arg(long = "socket-path")]
@@ -141,18 +138,12 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             role,
             repo,
             revset,
-            exposed,
             socket_path,
             text,
         } => {
             let call = rho_agents_client::protocol::NewAgent {
                 role: parse_role(&role)?,
                 start: rho_agents_client::protocol::StartMode::NewOn { repo, revset },
-                mode: if exposed {
-                    rho_agent_types::WorksetMode::Exposed
-                } else {
-                    rho_agent_types::WorksetMode::View
-                },
                 content: Some(vec![rho_agent_types::ContentPart::Text { text }]),
             };
             let agent_id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
@@ -219,7 +210,6 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let place = rho_agent_types::Place {
         workset: workset.id().to_owned(),
         cwd: rho_fs_view::MOUNT_ROOT.into(),
-        mode: rho_agent_types::WorksetMode::View,
         origin: None,
     };
     let surface = rho_agent::render_agent_surface(&workset, &place, role)?;
@@ -664,7 +654,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
-    Accounts::migrate(db).await?;
+    Accounts::init(db).await?;
     rho_agent::db::prepare(db).await;
     Ok(())
 }

@@ -13,7 +13,6 @@ camino.workspace = true
 dirs.workspace = true
 libc.workspace = true
 rho-git.workspace = true
-rho-agent-types.workspace = true
 tokio.workspace = true
 senax-encoder.workspace = true
 tempfile.workspace = true

@@ -105,8 +105,8 @@ paths and per-agent cwd, not host-side view descriptors or path translation.
 Commands inherit the process environment, with explicit command overrides and
 per-directory devshell additions. Normal execution inherits the namespace. Claude launcher children alone clone it to install
 private provider overlays; no generic agent namespace or setup thread is needed.
-Mode changes exclude new admission, require settled agents and no live sessions,
-then drain and replace the whole workset execution.
+The namespace exposes the host filesystem, with the workset mounted at `/src`;
+there is no alternate filesystem mode.
 
 Agent retirement requires the runtime's serialized permission and fences new
 admission; coalesced observations are not authority. Activation and retirement

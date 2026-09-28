@@ -32,7 +32,7 @@ use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event, Image, Inference, InferenceSession, Request, Response, Step,
 };
-use crate::log::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime, UnixMillis};
+use crate::log::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime};
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::shared::mailroom::{Mailroom, Outbound};
 use crate::worker::shared::wake::{Decision, Facts};
@@ -747,7 +747,7 @@ impl Agent {
             .collect::<Vec<_>>();
         anyhow::ensure!(!humans.is_empty(), "nothing to rewind");
         let to = humans[humans.len().saturating_sub(turns as usize)];
-        self.host.rewind(UnixMillis::now(), to).await?;
+        self.host.rewind(rho_agent_types::UnixMs::now(), to).await?;
         let (_, recovery, entries) = self.host.native_history(None).await?;
         self.context = context::Context::restore(&entries);
         self.continuation = None;
@@ -935,12 +935,9 @@ impl Agent {
 
     async fn instructions(&mut self) -> anyhow::Result<Arc<str>> {
         let team = self.host.team().await?;
-        let (role, mode) = {
-            let head = self.head.read().expect("poison");
-            (head.config.role, head.config.place.mode)
-        };
+        let role = self.head.read().expect("poison").config.role;
         Ok(prompt::prompt(
-            &prompt::WorksetPrompt::new(&self.cwd, mode),
+            &prompt::WorksetPrompt::new(&self.cwd),
             team.as_ref(),
             role,
         ))
@@ -1412,7 +1409,7 @@ impl Agent {
                 })
             };
             self.flush().await?;
-            self.host.turn(UnixMillis::now(), edge).await?;
+            self.host.turn(rho_agent_types::UnixMs::now(), edge).await?;
             if !working {
                 self.host.settled().await?;
             }

@@ -1008,6 +1008,54 @@ fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
     );
 }
 
+/// A pending send remains visibly queued for either sender; replacing it
+/// with the acknowledged message removes the label and opens a delivered turn.
+#[gpui::test]
+fn queued_human_and_peer_messages_change_to_delivered_blocks(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let peer = agent(2);
+    let queued = |sender: Option<AgentId>| UiBlock::QueuedMessage {
+        text: if sender.is_some() {
+            "peer update"
+        } else {
+            "my update"
+        }
+        .into(),
+        sender,
+    };
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(
+            vec![user("initial"), assistant("working", None)],
+            vec![queued(None), queued(Some(peer))],
+        ),
+    );
+    let pending = display_text(&workspace, cx);
+    assert!(pending.contains("my update (queued)"), "{pending:?}");
+    assert!(pending.contains("peer update (queued)"), "{pending:?}");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(
+            vec![
+                user("initial"),
+                assistant("working", None),
+                user("my update"),
+                agent_message(peer, "peer update"),
+            ],
+            vec![],
+        ),
+    );
+    let delivered = display_text(&workspace, cx);
+    assert!(delivered.contains("my update"), "{delivered:?}");
+    assert!(delivered.contains("peer update"), "{delivered:?}");
+    assert!(!delivered.contains("(queued)"), "{delivered:?}");
+}
+
 #[gpui::test]
 fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -2882,7 +2930,6 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
                         place: Place {
                             workset: "0123456789ab".to_owned(),
                             cwd: "/src/rho".into(),
-                            mode: Default::default(),
                             origin: Some("/tmp/rho".into()),
                         },
                         ..ui_head(agent_id)
@@ -4722,7 +4769,6 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
         place: rho_agent_types::Place {
             workset: "0123456789ab".into(),
             cwd: "/src/tmp".into(),
-            mode: Default::default(),
             origin: None,
         },
         spawned_by: story::UiSpawnedBy::Direct,
@@ -5012,14 +5058,7 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         })
         .expect("open a new-agent draft");
 
-    // From the body, backwards is the filesystem row, then the start row,
-    // then the role row.
-    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.cursor_in_draft_filesystem_field_for_test(cx));
-        })
-        .expect("filesystem row");
+    // From the body, backwards is the start row, then the role row.
     cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {

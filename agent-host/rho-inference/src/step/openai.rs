@@ -13,13 +13,14 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use rho_agent::inference::{CacheKey, Continuation, Retryable};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::{
-    Call, CallResult, Carry, EXEC, Event, Image, Item, Observation, Request, Response, Step, Usage,
+    Call, CallResult, EXEC, Event, Image, Item, Observation, Request, Response, Step, Usage,
 };
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::responses::{DialRoute, QuotaUpdate, ws};
@@ -51,7 +52,7 @@ struct Connection {
     auth: crate::ResolvedAuth,
     route: DialRoute,
     opened: tokio::time::Instant,
-    cache_key: super::CacheKey,
+    cache_key: CacheKey,
     previous: Option<Previous>,
     ping: tokio::time::Interval,
 }
@@ -73,7 +74,7 @@ impl Connection {
                         Some(at) => tokio::time::sleep_until(at).await,
                         None => std::future::pending().await,
                     }
-                } => return Err(super::Retryable("the provider went quiet".into()).into()),
+                } => return Err(Retryable("the provider went quiet".into()).into()),
                 _ = self.ping.tick() => self.socket.send(WsMessage::Ping(Vec::new().into())).await?,
                 message = self.socket.next() => return Ok(message.transpose()?),
             }
@@ -147,7 +148,7 @@ impl InferenceSession {
                     text: input,
                     images: vec![],
                 }],
-                super::CacheKey::new(),
+                CacheKey::new(),
             ),
             selected,
             auth,
@@ -287,11 +288,13 @@ impl Session {
         if let Some(previous) = previous {
             body.fields["previous_response_id"] = Value::String(previous.id);
         }
-        body.fields["prompt_cache_key"] = request
-            .cache_key
-            .wire_uuid(&self.base_url, connection.auth.client_secret)
-            .to_string()
-            .into();
+        body.fields["prompt_cache_key"] = super::wire_uuid(
+            request.cache_key,
+            &self.base_url,
+            connection.auth.client_secret,
+        )
+        .to_string()
+        .into();
         if !tools {
             body.input.remove(0);
         }
@@ -302,7 +305,7 @@ impl Session {
         let (mut step, response_id, complete_replay) =
             self.read_response(connection, &start.events).await?;
         if tools && complete_replay && !step.carry.has_compaction() {
-            step.response_id = response_id.clone();
+            step.continuation = response_id.clone().map(Continuation::new);
             connection.previous = response_id.map(|id| Previous {
                 id,
                 instructions: request.instructions.clone(),
@@ -313,7 +316,7 @@ impl Session {
 
     async fn connect(
         &self,
-        cache_key: super::CacheKey,
+        cache_key: CacheKey,
         selected: crate::SelectedAuth,
         resolved: crate::ResolvedAuth,
         mut route: DialRoute,
@@ -321,11 +324,7 @@ impl Session {
         crate::ensure_crypto_provider();
         let request = ws::request(
             &self.base_url,
-            Some(
-                &cache_key
-                    .wire_uuid(&self.base_url, resolved.client_secret)
-                    .to_string(),
-            ),
+            Some(&super::wire_uuid(cache_key, &self.base_url, resolved.client_secret).to_string()),
             &resolved,
         )?;
         let mut connected = ws::connect(request, route).await;
@@ -344,8 +343,7 @@ impl Session {
             let request = ws::request(
                 &self.base_url,
                 Some(
-                    &cache_key
-                        .wire_uuid(&self.base_url, resolved.client_secret)
+                    &super::wire_uuid(cache_key, &self.base_url, resolved.client_secret)
                         .to_string(),
                 ),
                 &resolved,
@@ -386,7 +384,7 @@ impl Session {
         let mut streaming: Option<(String, Value)> = None;
         loop {
             let message = connection.next(Some(deadline)).await?.ok_or_else(|| {
-                super::Retryable("the provider closed the connection mid-response".into())
+                Retryable("the provider closed the connection mid-response".into())
             })?;
             let text = match message {
                 WsMessage::Text(text) => text,
@@ -395,7 +393,7 @@ impl Session {
                     continue;
                 }
                 WsMessage::Close(frame) => {
-                    return Err(super::Retryable(format!(
+                    return Err(Retryable(format!(
                         "the provider closed the connection: {frame:?}"
                     ))
                     .into());
@@ -431,7 +429,7 @@ impl Session {
                 let completed: Completion = serde_json::from_str(&text)?;
                 let count = items.len();
                 let answer = step(items, &completed.response.usage);
-                let complete_replay = answer.carry.prepared().items.len() == count;
+                let complete_replay = super::prepared(&answer.carry).items.len() == count;
                 return Ok((answer, completed.response.id, complete_replay));
             }
             let event: Value = serde_json::from_str(&text)?;
@@ -446,10 +444,10 @@ impl Session {
                         event["output_index"].clone(),
                     ));
                     let _ = events.send(Event::Call {
-                        carry: Carry::bare(Call {
-                            id: item["call_id"].as_str().unwrap_or_default().to_owned(),
-                            code: String::new(),
-                        }),
+                        carry: super::bare(Call::new(
+                            item["call_id"].as_str().unwrap_or_default(),
+                            String::new(),
+                        )),
                     });
                 }
                 "response.custom_tool_call_input.delta"
@@ -495,7 +493,7 @@ impl Session {
                         )
                     });
                     if retryable {
-                        return Err(super::Retryable(format!("provider error: {error}")).into());
+                        return Err(Retryable(format!("provider error: {error}")).into());
                     }
                     bail!("provider error: {error}");
                 }
@@ -542,7 +540,7 @@ impl Session {
         for item in request.items.iter() {
             match item {
                 Item::Step(carry) => {
-                    let prepared = carry.prepared();
+                    let prepared = super::prepared(carry);
                     input.extend(
                         prepared
                             .items
@@ -643,13 +641,10 @@ fn step(items: Vec<Box<RawValue>>, usage: &Value) -> Step {
             }
         }
     }
-    let carry = Carry::from_raw_items(items, true);
-    let call = carry.0.display_calls().into_iter().next().map(|call| Call {
-        id: call.display_id().to_owned(),
-        code: call.code,
-    });
+    let carry = super::from_raw_items(items, true);
+    let call = carry.display_calls().into_iter().next();
     Step {
-        response_id: None,
+        continuation: None,
         call,
         prose,
         carry,
@@ -795,7 +790,7 @@ mod tests {
                     Event::NeedsContext => return Err(anyhow::anyhow!("needs context")),
                     Event::Failed(error) => {
                         if self.policy.retryable(&error, &selected).await {
-                            return Err(super::super::Retryable(error.to_string()).into());
+                            return Err(Retryable(error.to_string()).into());
                         }
                         return Err(error);
                     }
@@ -824,7 +819,7 @@ mod tests {
                 text: "run".into(),
                 images: vec![],
             }],
-            super::super::CacheKey::from_u128(19),
+            CacheKey::from_u128(19),
         )
     }
 
@@ -901,14 +896,14 @@ mod tests {
         assert_eq!(answer.prose, "hi!");
         assert_eq!(answer.call.as_ref().unwrap().code, "print(7)");
         assert!(
-            answer.response_id.is_none(),
+            answer.continuation.is_none(),
             "filtered response cannot use server continuation"
         );
         let entry = rho_agent::entry::Entry::Step {
             at: rho_agent_types::UnixMs(9),
             exec: Some("print(7)".into()),
             prose: answer.prose,
-            carry: answer.carry.0,
+            carry: answer.carry,
             usage: None,
         };
         let bytes = senax_encoder::encode(&entry).unwrap();
@@ -916,8 +911,7 @@ mod tests {
         let rho_agent::entry::Entry::Step { carry, .. } = decoded else {
             panic!()
         };
-        let carry = Carry(carry);
-        let stored = carry.replay();
+        let stored = super::super::replay(&carry);
         assert_eq!(
             stored.items.len(),
             ITEMS.len(),
@@ -926,7 +920,7 @@ mod tests {
         for (actual, expected) in stored.items.iter().zip(ITEMS) {
             assert_eq!(actual.get(), expected, "persisted item bytes changed");
         }
-        let results = carry.reply("seven", &[]);
+        let results = super::super::reply(&carry, "seven", &[]);
         let mut replay = vec![Item::Step(carry)];
         replay.extend(results.into_iter().map(Item::Result));
         infer(&session, full(replay)).await;
@@ -939,7 +933,7 @@ mod tests {
         const SUMMARY: &str =
             r#"{ "type":"compaction", "encrypted_content":"a\u002bb", "future":2e3 }"#;
         const TAIL: &str = r#"{ "type":"future", "payload": [1,  4] }"#;
-        let carry = Carry::from_raw_items(
+        let carry = super::super::from_raw_items(
             [OLD, SUMMARY, TAIL]
                 .into_iter()
                 .map(|s| RawValue::from_string(s.into()).unwrap())
@@ -977,7 +971,7 @@ mod tests {
                     images: vec![],
                 },
             ],
-            super::super::CacheKey::from_u128(17),
+            CacheKey::from_u128(17),
         ));
         assert_eq!(body["input"][0]["tools"][0]["name"], "exec");
         assert_eq!(body["input"][1]["content"][0]["text"], "instructions");
@@ -1003,11 +997,11 @@ mod tests {
                     text: "discard".into(),
                     images: vec![],
                 },
-                Item::Step(Carry::from_openai_items(vec![
+                Item::Step(super::super::from_openai_items(vec![
                     json!({"type":"compaction","id":"old","encrypted_content":"old-key"})
                         .to_string(),
                 ])),
-                Item::Step(Carry::from_openai_items(vec![
+                Item::Step(super::super::from_openai_items(vec![
                     json!({"type":"reasoning","id":"discard"}).to_string(),
                     latest.to_string(),
                     json!({"type":"message","id":"keep"}).to_string(),
@@ -1018,7 +1012,7 @@ mod tests {
                 },
                 Item::CompactionTrigger,
             ],
-            super::super::CacheKey::from_u128(17),
+            CacheKey::from_u128(17),
         );
         let body = local_model().body(&request);
         assert_eq!(
@@ -1046,11 +1040,11 @@ mod tests {
             .collect(),
             &json!({"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}),
         );
-        assert_eq!(answer.call.unwrap().id.as_str(), "first");
+        assert_eq!(answer.call.unwrap().display_id(), "first");
         assert_eq!(answer.prose, "prose");
         assert_eq!(answer.usage.cached_tokens, 4);
-        assert_eq!(answer.carry.call_ids(), ["first".to_owned()]);
-        let items = answer.carry.prepared().items;
+        assert_eq!(super::super::call_ids(&answer.carry), ["first".to_owned()]);
+        let items = super::super::prepared(&answer.carry).items;
         assert_eq!(items.len(), 3);
         assert_eq!(
             serde_json::from_str::<Value>(items[2].get()).unwrap()["call_id"],
@@ -1110,7 +1104,7 @@ mod tests {
                 .step(&request(), &mut |event| match event {
                     Event::Call { carry } => stream.push(format!(
                         "id:{}",
-                        carry.with_code(String::new()).display_id()
+                        super::super::with_code(&carry, String::new()).display_id()
                     )),
                     Event::Code(code) => stream.push(code),
                     _ => unreachable!(),
@@ -1252,18 +1246,14 @@ mod tests {
     }
 
     fn full(items: Vec<Item>) -> Request {
-        Request::new(
-            "instructions".into(),
-            items,
-            super::super::CacheKey::from_u128(19),
-        )
+        Request::new("instructions".into(), items, CacheKey::from_u128(19))
     }
 
     fn delta(previous: &str, items: Vec<Item>) -> Request {
         Request::continuation(
             "instructions".into(),
             items,
-            super::super::CacheKey::from_u128(19),
+            CacheKey::from_u128(19),
             previous.into(),
         )
     }
@@ -1330,7 +1320,14 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let session = session(host, addr);
         let answer = infer(&session, full(vec![user("first")])).await;
-        assert_eq!(answer.response_id.as_deref(), Some("r1"));
+        assert_eq!(
+            answer
+                .continuation
+                .clone()
+                .map(|id| id.into_token())
+                .as_deref(),
+            Some("r1")
+        );
         // Caller discards the old response; continuation needs only its ID.
         drop(answer);
         tokio::time::timeout(Duration::from_secs(5), pong_rx)
@@ -1354,7 +1351,7 @@ mod tests {
         )
         .await;
         assert!(
-            answer.response_id.is_none(),
+            answer.continuation.is_none(),
             "compaction requires full replay"
         );
         infer(
@@ -1443,7 +1440,15 @@ mod tests {
             full(vec![user("different prefix"), Item::Step(first.carry)]),
         )
         .await;
-        let mut changed = delta(second.response_id.as_deref().unwrap(), vec![user("next")]);
+        let mut changed = delta(
+            second
+                .continuation
+                .clone()
+                .map(|id| id.into_token())
+                .as_deref()
+                .unwrap(),
+            vec![user("next")],
+        );
         changed.instructions = "changed".into();
         let error = session
             .step(&changed, &mut |_| panic!("must load full context"))
@@ -1519,12 +1524,7 @@ mod tests {
             };
             selected.account_id = resolved.account_id.clone();
             let connection = openai
-                .connect(
-                    super::super::CacheKey::from_u128(1),
-                    selected,
-                    resolved,
-                    DialRoute::Dns,
-                )
+                .connect(CacheKey::from_u128(1), selected, resolved, DialRoute::Dns)
                 .await
                 .unwrap();
             (openai, connection)
@@ -1575,8 +1575,16 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let session = session(host, addr);
         let answer = infer(&session, full(vec![user("first")])).await;
-        let mut request = delta(answer.response_id.as_deref().unwrap(), vec![user("next")]);
-        request.cache_key = super::super::CacheKey::from_u128(99);
+        let mut request = delta(
+            answer
+                .continuation
+                .clone()
+                .map(|id| id.into_token())
+                .as_deref()
+                .unwrap(),
+            vec![user("next")],
+        );
+        request.cache_key = CacheKey::from_u128(99);
         let error = session.step(&request, &mut |_| {}).await.unwrap_err();
         assert_eq!(error.to_string(), "needs context");
         request.previous_response_id = None;
@@ -1649,7 +1657,7 @@ mod tests {
             .start(full(vec![user("third")]), selected, auth);
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(5), third.recv()).await.unwrap(),
-            Some(Event::Completed(Step {response_id: Some(id), ..})) if id == "r3"
+            Some(Event::Completed(Step {continuation: Some(id), ..})) if id.clone().into_token() == "r3"
         ));
         finish_seen.await.unwrap();
         drop(third);

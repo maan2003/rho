@@ -140,7 +140,6 @@ impl World {
                 place: rho_agent_types::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
-                    mode: Default::default(),
                     origin: None,
                 },
                 spawned_by: SpawnedBy::Direct,

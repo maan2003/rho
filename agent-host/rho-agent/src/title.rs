@@ -201,7 +201,14 @@ mod tests {
                 text: "retained notebook output".into(),
             },
             at: UnixMs(1),
-            wake: Some(crate::WakeFacts::interrupt()),
+            wake: Some(crate::WakeFacts {
+                trigger: crate::WakeTrigger::User,
+                events: Vec::new(),
+                foreground_running: 0,
+                background_running: 0,
+                tools_suppressed: false,
+                checkin_at: None,
+            }),
         };
         assert_eq!(
             first_task_text(&[report], "real Claude task").as_deref(),
