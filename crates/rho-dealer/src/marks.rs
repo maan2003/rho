@@ -64,6 +64,17 @@ impl NodeMarks {
     }
 }
 
+/// Nodes the user put away together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pile {
+    /// The name the user gave it; `None` for everything snoozed.
+    pub name: Option<String>,
+    pub nodes: Vec<NodeId>,
+    /// When the first of an unnamed pile comes back by itself. A named pile
+    /// comes back only when opened.
+    pub back: Option<Timestamp>,
+}
+
 /// Every entry and note revision this device holds, folded by node.
 #[derive(Default)]
 pub struct Marks {
@@ -155,6 +166,7 @@ impl Marks {
             let entry = &self.entries[id];
             match &entry.fact {
                 Fact::Snooze { .. }
+                | Fact::Piled { .. }
                 | Fact::Todo { .. }
                 | Fact::Deadline { .. }
                 | Fact::Settled { .. }
@@ -224,6 +236,41 @@ impl Marks {
         self.nodes
             .iter()
             .filter(|(node, marks)| matches!(node, NodeId::Note(_)) && !marks.deleted)
+    }
+
+    /// What the user put away and can open: each named pile with its nodes,
+    /// oldest first, and last the unnamed one, whatever is snoozed past
+    /// `now`, soonest back first.
+    pub fn piles(&self, now: Timestamp) -> Vec<Pile> {
+        let mut named: BTreeMap<&str, Vec<(Timestamp, &NodeId)>> = BTreeMap::new();
+        let mut snoozed = Vec::new();
+        for (node, marks) in &self.nodes {
+            let facts = marks.facts();
+            if marks.deleted || facts.muted() {
+                continue;
+            }
+            if let Some((pile, at)) = facts.pile() {
+                named.entry(pile).or_default().push((at.timestamp(), node));
+            } else if let Some(snooze) = facts.snooze().filter(|snooze| snooze.until > now) {
+                snoozed.push((snooze.until, node));
+            }
+        }
+        let pile = |name: Option<&str>, mut nodes: Vec<(Timestamp, &NodeId)>| {
+            nodes.sort();
+            Pile {
+                name: name.map(str::to_owned),
+                back: name.is_none().then(|| nodes[0].0),
+                nodes: nodes.into_iter().map(|(_, node)| node.clone()).collect(),
+            }
+        };
+        let mut piles: Vec<Pile> = named
+            .into_iter()
+            .map(|(name, nodes)| pile(Some(name), nodes))
+            .collect();
+        if !snoozed.is_empty() {
+            piles.push(pile(None, snoozed));
+        }
+        piles
     }
 
     /// Every label that is not deleted, with its full path.

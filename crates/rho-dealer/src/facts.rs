@@ -146,6 +146,13 @@ pub enum Fact {
     Retract {
         of: EntryId,
     },
+    /// Put away on a pile the user named, until they open it: nothing from
+    /// the source brings it back. Last, as a later variant: entries decode
+    /// by variant order.
+    Piled {
+        node: NodeId,
+        pile: String,
+    },
 }
 
 impl Fact {
@@ -153,6 +160,7 @@ impl Fact {
     pub fn node(&self) -> Option<NodeId> {
         match self {
             Self::Snooze { node, .. }
+            | Self::Piled { node, .. }
             | Self::Todo { node, .. }
             | Self::Deadline { node, .. }
             | Self::Settled { node, .. }
@@ -256,10 +264,9 @@ impl<'a> Facts<'a> {
             .unwrap_or(false)
     }
 
-    /// The last snooze, unless something since took it back. It may be
-    /// over already: a snooze that ended still says when the node came
-    /// back.
-    pub fn snooze(self) -> Option<Snooze> {
+    /// The last snooze or pile, unless something since took it back: a
+    /// todo, done, a mute, or the other one said after it.
+    fn put_away_last(self) -> Option<&'a Entry> {
         let live = self.since_cleared();
         let from = live
             .iter()
@@ -268,13 +275,30 @@ impl<'a> Facts<'a> {
         live[from..]
             .iter()
             .rev()
-            .find_map(|entry| match &entry.fact {
-                Fact::Snooze { until, .. } => Some(Snooze {
-                    set: entry.at.clone(),
-                    until: until.resolve(&entry.at),
-                }),
-                _ => None,
-            })
+            .find(|entry| matches!(entry.fact, Fact::Snooze { .. } | Fact::Piled { .. }))
+    }
+
+    /// The last snooze, unless something since took it back. It may be
+    /// over already: a snooze that ended still says when the node came
+    /// back.
+    pub fn snooze(self) -> Option<Snooze> {
+        let entry = self.put_away_last()?;
+        match &entry.fact {
+            Fact::Snooze { until, .. } => Some(Snooze {
+                set: entry.at.clone(),
+                until: until.resolve(&entry.at),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The pile the node is on, and when it was put there.
+    pub fn pile(self) -> Option<(&'a str, &'a Zoned)> {
+        let entry = self.put_away_last()?;
+        match &entry.fact {
+            Fact::Piled { pile, .. } => Some((pile.as_str(), &entry.at)),
+            _ => None,
+        }
     }
 
     pub fn todo(self) -> Option<Todo> {
@@ -304,9 +328,11 @@ impl<'a> Facts<'a> {
             })
     }
 
-    /// Muted, or snoozed past `now`: the user put it away.
+    /// Muted, snoozed past `now`, or on a pile: the user put it away.
     pub fn put_away(self, now: Timestamp) -> bool {
-        self.muted() || self.snooze().is_some_and(|snooze| snooze.until > now)
+        self.muted()
+            || self.snooze().is_some_and(|snooze| snooze.until > now)
+            || self.pile().is_some()
     }
 
     /// How many times the user has snoozed the node, ever.

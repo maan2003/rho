@@ -82,7 +82,7 @@ pub(crate) struct Undo {
 }
 
 /// The verdicts a card can take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Dealt with: everything the source has said so far is handled.
     Done,
@@ -93,6 +93,16 @@ pub(crate) enum Verdict {
     /// Handled here, and on the user's plate until done: from `start`, or
     /// from now.
     Todo { start: Option<Until> },
+    /// Out of the way on the named pile, until the user opens it.
+    Pile(String),
+}
+
+/// The pile a pull deals from instead of the hand, and what this sitting
+/// already passed over in it.
+pub(crate) struct OpenPile {
+    /// `None` for everything snoozed.
+    pub(crate) name: Option<String>,
+    pub(crate) passed: std::collections::HashSet<NodeId>,
 }
 
 pub(crate) struct Attention {
@@ -101,6 +111,7 @@ pub(crate) struct Attention {
     device: Device,
     pub(crate) marks: Marks,
     pub(crate) skips: Skips,
+    pub(crate) open_pile: Option<OpenPile>,
     cache: RefCell<Cache>,
     undo: Vec<Undo>,
     next_undo: u64,
@@ -138,6 +149,7 @@ impl Attention {
                 device,
                 marks,
                 skips: Skips::default(),
+                open_pile: None,
                 cache: RefCell::default(),
                 undo: Vec::new(),
                 next_undo: 0,
@@ -584,7 +596,7 @@ impl Workspace {
         // Slack keeps its own cursor too, moved here, so Slack's own apps
         // agree.
         if let NodeId::Slack(unit) = node
-            && !matches!(verdict, Verdict::Snooze(_))
+            && !matches!(verdict, Verdict::Snooze(_) | Verdict::Pile(_))
         {
             slack_cursors.extend(self.advance_slack_cursor(unit, None, cx));
             if verdict == Verdict::Mute {
@@ -600,6 +612,7 @@ impl Workspace {
             Verdict::Mute => Fact::Mute { node },
             Verdict::Snooze(until) => Fact::Snooze { node, until },
             Verdict::Todo { start } => Fact::Todo { node, start, seen },
+            Verdict::Pile(pile) => Fact::Piled { node, pile },
         };
         let takeback = self.write_marks(vec![fact.into()], cx);
         Some(Undo {

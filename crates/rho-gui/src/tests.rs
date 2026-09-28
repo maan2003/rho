@@ -5748,6 +5748,75 @@ fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut TestAppContext) {
+    use rho_dealer::NodeId;
+    let workspace = test_workspace(cx);
+    let (first, second, other) = (agent(711), agent(712), agent(713));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(first), ui_head(second), ui_head(other)], 714),
+                window,
+                cx,
+            );
+            for agent_id in [first, second, other] {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story_wanting(agent_id, UnixMs(100)),
+                    window,
+                    cx,
+                );
+            }
+            let dealt = |workspace: &mut Workspace, cx: &mut gpui::Context<Workspace>| {
+                workspace
+                    .hand(cx)
+                    .cards
+                    .into_iter()
+                    .map(|card| card.node)
+                    .collect::<Vec<_>>()
+            };
+            for agent_id in [second, first] {
+                workspace.take_verdict(
+                    &NodeId::Agent(agent_id),
+                    crate::attention::Verdict::Pile("ask ada".into()),
+                    cx,
+                );
+            }
+            assert_eq!(dealt(workspace, cx), vec![NodeId::Agent(other)]);
+
+            workspace.attention.open_pile = Some(crate::attention::OpenPile {
+                name: Some("ask ada".into()),
+                passed: Default::default(),
+            });
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(NodeId::Agent(second)),
+                "the pile deals the card put on it first, not the hand's top"
+            );
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(NodeId::Agent(first))
+            );
+            workspace.pull_card(window, cx);
+            assert!(workspace.attention.open_pile.is_none(), "the pile ran out");
+            assert!(workspace.home_in_view());
+            assert_eq!(
+                workspace.attention.marks.piles(jiff::Timestamp::now())[0]
+                    .nodes
+                    .len(),
+                2,
+                "passing over a card leaves it on the pile"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn toggling_a_label_twice_restores_the_note_and_find_uses_its_path(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace

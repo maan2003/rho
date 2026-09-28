@@ -1466,6 +1466,24 @@ impl Workspace {
                 }
             })
             .collect();
+        let local = jiff::Zoned::now();
+        rows.piles = self
+            .attention
+            .marks
+            .piles(now)
+            .into_iter()
+            .map(|pile| crate::home::PileRow {
+                count: pile.nodes.len(),
+                back: pile.back.map_or_else(String::new, |back| {
+                    let back = back.to_zoned(local.time_zone().clone());
+                    match back.date() == local.date() {
+                        true => format!("next back {}", back.strftime("%H:%M")),
+                        false => format!("next back {}", back.strftime("%a %-d %b %H:%M")),
+                    }
+                }),
+                name: pile.name,
+            })
+            .collect();
         rows
     }
 
@@ -1483,6 +1501,14 @@ impl Workspace {
                 self.select_agent_inner(Some(agent_id), true, window, cx);
                 return;
             }
+            crate::home::HomeTarget::Pile(name) => {
+                self.attention.open_pile = Some(crate::attention::OpenPile {
+                    name,
+                    passed: Default::default(),
+                });
+                self.pull_card(window, cx);
+                return;
+            }
             crate::home::HomeTarget::None => return,
         };
         let card = self.card_for(&wanted, cx);
@@ -1491,6 +1517,8 @@ impl Workspace {
     }
 
     fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Going home is leaving the pile.
+        self.attention.open_pile = None;
         if self.active_surface().key == SurfaceKey::Home {
             // Already home: the key shows what the reader was reading, the
             // way closing the overview used to reveal it again. Home was
@@ -5736,6 +5764,7 @@ impl Workspace {
             VerdictAction::Undo => self.undo_verdict(window, cx),
             VerdictAction::Pull => self.pull_card(window, cx),
             VerdictAction::WrongCard => self.verdict_wrong_card(window, cx),
+            VerdictAction::Pile => self.verdict_pile(window, cx),
             VerdictAction::Snooze(None) => {
                 self.deal_snooze(SnoozeUnit::Days, None, window, cx);
             }
@@ -6177,6 +6206,10 @@ impl Workspace {
                 Some(now + rho_dealer::curve::SKIP_FADE),
             );
         }
+        if self.attention.open_pile.is_some() {
+            self.pull_from_pile(in_view.map(|card| card.node), window, cx);
+            return;
+        }
         let Some(card) = self
             .hand(cx)
             .top(in_view.as_ref().map(|card| &card.node))
@@ -6196,6 +6229,97 @@ impl Workspace {
         };
         self.journal_deal(rho_journal::DealTrigger::Pull, Some(&card.node), cx);
         self.open_card(card, window, cx);
+        self.invalidate_dealer_signals(cx);
+    }
+
+    /// `p`: the card goes on a pile the user names, a new one or one they
+    /// already have, and stays there until they open it from Home.
+    pub(crate) fn verdict_pile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.deal_card_is_target(cx) {
+            self.echo("pile: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        }
+        let complete = std::rc::Rc::new(|workspace: &Workspace, needle: &str, _: &gpui::App| {
+            let needle = needle.trim().to_lowercase();
+            workspace
+                .attention
+                .marks
+                .piles(jiff::Timestamp::now())
+                .into_iter()
+                .filter_map(|pile| {
+                    let name = pile.name?;
+                    name.to_lowercase()
+                        .contains(&needle)
+                        .then(|| crate::minibuffer::Candidate {
+                            description: format!("{} on it", pile.nodes.len()),
+                            value: name,
+                        })
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let pile = input.trim().to_owned();
+                if pile.is_empty() {
+                    return;
+                }
+                let verb = format!("piled ({pile})");
+                if !workspace.submit_verdict(
+                    None,
+                    crate::attention::Verdict::Pile(pile),
+                    rho_journal::DealerVerdict::Defer,
+                    rho_journal::PhoneVerdict::Defer,
+                    verb,
+                    window,
+                    cx,
+                ) {
+                    workspace.echo("pile: nothing to put away", StyleClass::SystemInfo, cx);
+                }
+            },
+        );
+        self.open_prompt("pile:", complete, on_submit, window, cx);
+    }
+
+    /// A pull while a pile is open: its next card, oldest put away first,
+    /// skipping what this sitting passed over. An emptied pile closes and
+    /// lands on Home.
+    fn pull_from_pile(
+        &mut self,
+        in_view: Option<rho_dealer::NodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let piles = self.attention.marks.piles(jiff::Timestamp::now());
+        let Some(open) = self.attention.open_pile.as_mut() else {
+            return;
+        };
+        open.passed.extend(in_view);
+        let name = open.name.clone().unwrap_or_else(|| "later".to_owned());
+        let left: Vec<rho_dealer::NodeId> = piles
+            .into_iter()
+            .find(|pile| pile.name == open.name)
+            .map(|pile| pile.nodes)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|node| !open.passed.contains(node))
+            .collect();
+        let Some(node) = left.first().cloned() else {
+            self.attention.open_pile = None;
+            self.echo(&format!("{name}: nothing more"), StyleClass::SystemInfo, cx);
+            self.open_home(window, cx);
+            return;
+        };
+        let card = self.card_for(&node, cx);
+        self.journal_deal(rho_journal::DealTrigger::Pull, Some(&node), cx);
+        self.open_card(card, window, cx);
+        self.echo(
+            &format!("{name} · {} more", left.len() - 1),
+            StyleClass::SystemInfo,
+            cx,
+        );
         self.invalidate_dealer_signals(cx);
     }
 

@@ -56,16 +56,29 @@ pub(crate) struct RunningRow {
     pub last_line: String,
 }
 
+/// One pile the user put cards on: Enter deals from it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PileRow {
+    /// `None` for everything snoozed, shown as `later`.
+    pub name: Option<String>,
+    pub count: usize,
+    /// When the first of it comes back by itself, in words; empty for a
+    /// named pile, which comes back only when opened.
+    pub back: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct HomeRows {
     /// The top of the queue above the cutoff: a preview, not the queue.
     pub next: Vec<HomeRow>,
     pub running: Vec<RunningRow>,
+    /// Every pile, all of them: a pile nobody sees is where cards go to die.
+    pub piles: Vec<PileRow>,
 }
 
 impl HomeRows {
     pub fn is_empty(&self) -> bool {
-        self.next.is_empty() && self.running.is_empty()
+        self.next.is_empty() && self.running.is_empty() && self.piles.is_empty()
     }
 }
 
@@ -80,6 +93,7 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
     HomeRows {
         next: cards.iter().take(HOME_CAP).map(row).collect(),
         running: Vec::new(),
+        piles: Vec::new(),
     }
 }
 
@@ -118,6 +132,8 @@ pub(crate) fn running_elapsed_label(facts: &rho_agents_client::AgentFacts, now_m
 pub(crate) enum HomeTarget {
     Card(NodeId),
     Agent(AgentId),
+    /// A pile, dealt from on Enter; `None` is everything snoozed.
+    Pile(Option<String>),
     /// A section heading or the empty line: nothing to open.
     None,
 }
@@ -129,6 +145,7 @@ enum HomeKey {
     Section(&'static str),
     Card(NodeId),
     Agent(AgentId),
+    Pile(Option<String>),
     Empty,
 }
 
@@ -313,6 +330,30 @@ impl HomeView {
             let topics = column_of(self.rows.running.iter().map(|row| row.topic.as_str()));
             for row in &self.rows.running {
                 items.push(running_line(row, column, topics));
+            }
+        }
+        if !self.rows.piles.is_empty() {
+            items.push(section("piles"));
+            let name = |row: &PileRow| row.name.clone().unwrap_or_else(|| "later".to_owned());
+            let column = column_of(
+                self.rows
+                    .piles
+                    .iter()
+                    .map(|row| row.name.as_deref().unwrap_or("later")),
+            );
+            for row in &self.rows.piles {
+                let name = name(row);
+                let count = row.count.to_string();
+                let (text, styles) = columns(&[
+                    (name.as_str(), HomeClass::Title, column),
+                    (count.as_str(), HomeClass::Label, 3),
+                    (row.back.as_str(), HomeClass::Muted, 0),
+                ]);
+                items.push(
+                    Item::new(HomeKey::Pile(row.name.clone()), text)
+                        .with_styles(styles)
+                        .with_lines(vec![HomeTarget::Pile(row.name.clone())]),
+                );
             }
         }
         items

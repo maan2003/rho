@@ -5,8 +5,9 @@ What `rank` must make of a history. Each row is a scenario test in
 for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
-Home shows two sections: **next**, every card by priority until it fades
-below the floor, and **running**, the agents at work.
+Home shows three sections: **next**, every card by priority until it fades
+below the floor, **running**, the agents at work, and **piles**, what the
+user put away, which they open to be dealt from it.
 
 ## Agents
 
@@ -32,6 +33,14 @@ below the floor, and **running**, the agents at work.
 | Z4 | Snoozed, then the user wrote to the agent | the snooze holds, but a reply within 1h of the user's message comes through |
 | Z5 | Snoozed, then the other side wrote | a direct message, or a thread of 3 people or fewer: a small bump per message when it comes back; nothing for other threads and agents |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
+
+## Piles
+
+| # | History and facts | Card |
+|---|---|---|
+| P1 | Put on a named pile | nothing, whatever its source says, until the user opens the pile |
+| P2 | Then a todo, done, a mute, a snooze or another pile | off the pile; as that says |
+| P3 | The piles | named ones by name, each oldest first; then one unnamed pile of everything snoozed, soonest back first |
 
 ## Todos and deadlines
 

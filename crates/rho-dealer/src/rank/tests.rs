@@ -703,6 +703,102 @@ fn z6_every_snooze_is_kept() {
 
 // Todos and deadlines
 
+fn pile(w: &mut World, node: &NodeId, pile: &str) {
+    w.tell(Fact::Piled {
+        node: node.clone(),
+        pile: pile.into(),
+    });
+}
+
+#[test]
+fn p1_a_card_on_a_pile_stays_there_whatever_its_source_says() {
+    let mut w = world();
+    let d = w.dm("D1", "U1");
+    let a = w.agent("a");
+    w.asks(&a);
+    pile(&mut w, &d, "ask ada");
+    pile(&mut w, &a, "ask ada");
+    w.pass(mins(1));
+    w.post("D1", None, "U1", "still there?");
+    w.writes_to(&a);
+    w.starts(&a);
+    w.pass(mins(5));
+    w.asks(&a);
+    w.pass(SignedDuration::from_hours(24 * 30));
+    assert_eq!(
+        w.hand(),
+        "",
+        "a reply within the hour does not come through"
+    );
+    let (_, trace) = w.traced();
+    assert_eq!(trace.nodes[&d].outcome, "no card: on the pile ask ada");
+}
+
+#[test]
+fn p2_a_todo_done_or_a_snooze_takes_the_card_off_its_pile() {
+    let mut w = world();
+    let n = note(&mut w, "n");
+    w.todo(&n, None);
+    pile(&mut w, &n, "friday");
+    assert_eq!(w.hand(), "");
+    w.snooze(&n, hours(1));
+    assert_eq!(
+        w.marks.get(&n).facts().pile(),
+        None,
+        "the snooze replaced it"
+    );
+    w.pass(hours(2));
+    assert_eq!(w.hand(), "n · todo · 2.0h", "back as the todo it was");
+
+    let d = w.dm("D2", "U2");
+    pile(&mut w, &d, "friday");
+    w.done(&d);
+    assert_eq!(w.marks.get(&d).facts().pile(), None);
+}
+
+#[test]
+fn p3_the_piles_are_named_oldest_first_and_then_everything_snoozed() {
+    let mut w = world();
+    let a = w.dm("D1", "U1");
+    let b = w.dm("D2", "U2");
+    let c = w.dm("D3", "U3");
+    let later = w.dm("D4", "U4");
+    let sooner = w.dm("D5", "U5");
+    let over = w.dm("D6", "U6");
+    let muted = w.dm("D7", "U7");
+    pile(&mut w, &b, "on laptop");
+    w.pass(mins(1));
+    pile(&mut w, &a, "on laptop");
+    pile(&mut w, &c, "ask ada");
+    pile(&mut w, &muted, "ask ada");
+    w.say(&muted, Said::Mute);
+    w.snooze(&later, hours(3));
+    w.snooze(&sooner, hours(2));
+    w.snooze(&over, mins(1));
+    w.pass(mins(2));
+    let now = w.now.timestamp();
+    let piles = w.marks.piles(now);
+    let shown: Vec<(Option<&str>, Vec<&NodeId>)> = piles
+        .iter()
+        .map(|pile| (pile.name.as_deref(), pile.nodes.iter().collect()))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            (Some("ask ada"), vec![&c]),
+            (Some("on laptop"), vec![&b, &a]),
+            (None, vec![&sooner, &later]),
+        ]
+    );
+    assert_eq!(
+        piles[0].back, None,
+        "a named pile comes back only when opened"
+    );
+    let sooner_until = w.marks.get(&sooner).facts().snooze().unwrap().until;
+    assert_eq!(piles[2].back, Some(sooner_until));
+    assert!(sooner_until < w.marks.get(&later).facts().snooze().unwrap().until);
+}
+
 fn note(w: &mut World, name: &str) -> NodeId {
     let node = NodeId::Note(uuid::Uuid::new_v4());
     w.write_note(&node, name, false);

@@ -475,6 +475,12 @@ fn rank_into(
             }
             continue;
         }
+        if let Some((pile, _)) = held.facts().pile() {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.outcome(&node, format!("no card: on the pile {pile}"));
+            }
+            continue;
+        }
         // A snooze on a Slack room holds every thread in it too.
         let room = match &node {
             NodeId::Slack(unit) if unit.thread.is_some() => Some(NodeId::Slack(SlackUnit {

@@ -169,6 +169,7 @@ pub(crate) enum VerdictAction {
     Undo,
     Pull,
     WrongCard,
+    Pile,
     /// A unit from the snooze menu. `None` is the bare `s` that has always
     /// meant a day whatever the count.
     Snooze(Option<crate::workspace::SnoozeUnit>),
@@ -193,6 +194,7 @@ pub(crate) fn verdict_menu() -> Menu {
             "snooze the room…",
             MenuAction::Verdict(VerdictAction::RoomSnooze),
         )
+        .item("p", "pile…", MenuAction::Verdict(VerdictAction::Pile))
         .item("t", "todo", MenuAction::Verdict(VerdictAction::Todo))
         .item("f", "file…", MenuAction::Verdict(VerdictAction::File))
         .item("n", "name…", MenuAction::Command(Command::VerdictName))
