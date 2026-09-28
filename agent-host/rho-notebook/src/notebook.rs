@@ -68,17 +68,7 @@ pub struct Report {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 enum Entry {
     Source(Vec<SourceUpdate>),
-    Text {
-        text: String,
-        images: Vec<Image>,
-    },
-    /// Temporary reader for reports written before text contributions were
-    /// named.
-    #[senax(rename = "Imported")]
-    LegacyText {
-        text: String,
-        images: Vec<Image>,
-    },
+    Text { text: String, images: Vec<Image> },
 }
 
 /// The presentation sent to the model.
@@ -100,18 +90,6 @@ impl Report {
         }
         Self {
             entries: vec![Entry::Text { text, images }],
-        }
-    }
-
-    /// Temporary database rewrite; remove with the old text decoder.
-    pub fn migrate_text(&mut self) {
-        for entry in &mut self.entries {
-            if let Entry::LegacyText { text, images } = entry {
-                *entry = Entry::Text {
-                    text: std::mem::take(text),
-                    images: std::mem::take(images),
-                };
-            }
         }
     }
 
@@ -141,10 +119,6 @@ impl Report {
         for entry in &self.entries {
             match entry {
                 Entry::Text {
-                    text,
-                    images: entry_images,
-                }
-                | Entry::LegacyText {
                     text,
                     images: entry_images,
                 } => {
@@ -957,33 +931,6 @@ mod report_tests {
             "Output:\nnext\n[17 more bytes; call more_output() again for the next page]"
         ));
         assert_eq!(report.render().text, text);
-    }
-
-    #[test]
-    fn migration_rewrites_old_text_tag_without_changing_content() {
-        #[derive(senax_encoder::Encode)]
-        enum OldEntry {
-            Imported { text: String, images: Vec<Image> },
-        }
-        #[derive(senax_encoder::Encode)]
-        struct OldReport {
-            entries: Vec<OldEntry>,
-        }
-        let bytes = senax_encoder::encode(&OldReport {
-            entries: vec![OldEntry::Imported {
-                text: "distinct old output".into(),
-                images: vec![image(7), image(2)],
-            }],
-        })
-        .unwrap();
-        let mut report: Report = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
-        report.migrate_text();
-        let expected = Report::from_text("distinct old output".into(), vec![image(7), image(2)]);
-        assert_eq!(report, expected);
-        assert_eq!(
-            senax_encoder::encode(&report).unwrap(),
-            senax_encoder::encode(&expected).unwrap()
-        );
     }
 
     #[test]

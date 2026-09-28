@@ -1035,7 +1035,6 @@ impl Agent {
             why,
             report,
             compact: self.compaction.pending,
-            imported: None,
         })
         .await?;
         self.restarted = false;

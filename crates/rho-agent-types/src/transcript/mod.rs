@@ -1,4 +1,4 @@
-//! Shared Claude stream/tool shapes and temporary native-history decoders.
+//! Shared Claude stream/tool shapes.
 //! Native inference executes through its own step API.
 
 use std::sync::Arc;
@@ -10,11 +10,9 @@ use serde_json::Value;
 use crate::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 
 mod append_string;
-mod legacy;
 mod util;
 
 pub use self::append_string::{AStr, AppendString, Diff};
-pub use self::legacy::OpenAiResponsesProviderData;
 use self::util::validated_string_type;
 
 senax_encoder::declare_senax_tagged_trait!(

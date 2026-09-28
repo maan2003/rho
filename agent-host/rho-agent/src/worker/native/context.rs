@@ -167,7 +167,6 @@ mod tests {
             at: UnixMs(9),
             why: Wake::Notify,
             compact: false,
-            imported: None,
             report: Report {
                 notices: vec![RequestNotice::Restarted],
                 notebook: rho_notebook::Report::from_text(

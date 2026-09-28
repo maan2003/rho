@@ -28,11 +28,7 @@ use crate::log::{
     SessionBinding, UnixMillis, usage_model_of,
 };
 
-mod entries_migration;
-mod history_migration;
-pub(crate) mod legacy;
 mod native;
-mod reports_migration;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -95,18 +91,6 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 const CURRENT_AGENT_DB_FORMAT: &str = "b7e91ac4";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
-
-struct AgentDbMigration {
-    from: &'static str,
-    to: &'static str,
-    migrate: fn(&mut WriteTxn),
-}
-
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "dc371fa2",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: history_migration::migrate,
-}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -715,9 +699,7 @@ impl AgentReadTxnExt for ReadTxn {
 
 impl AgentWriteTxnExt for WriteTxn {
     fn init_agent_tables(&mut self) {
-        // Migrations run before typed opens because a migration may rewrite
-        // tables whose stored types no longer match the current definitions.
-        migrate_agent_db_format(self);
+        assert_agent_db_format(self);
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
@@ -1122,18 +1104,11 @@ impl Hidden {
     }
 }
 
-/// The fold of one agent's rows, hidden ones included; `None` when the
-/// log does not begin with a creation (no such agent).
-/// A user message in the log: the row that carries a pending notice to
-/// the agent, whichever runtime wrote it.
+/// A user message in the log: the row that carries a pending notice.
 fn carries_notice(event: &AgentEvent<'_>) -> bool {
     matches!(
         event,
-        AgentEvent::Accepted(crate::QueuedInput {
-            source: rho_agent_types::transcript::MessageSender::User,
-            kind: crate::InputKind::Message { .. },
-            ..
-        }) | AgentEvent::Transcript {
+        AgentEvent::Transcript {
             line: crate::TranscriptLine::User { .. },
             ..
         } | AgentEvent::Entry(crate::entry::Entry::Received {
@@ -1141,25 +1116,6 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
             ..
         })
     )
-}
-
-fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) -> Option<AgentHead> {
-    let mut head: Option<AgentHead> = None;
-    for (pos, event) in all {
-        match &mut head {
-            None => {
-                if !matches!(event, AgentEvent::Created { .. }) {
-                    return None;
-                }
-                head = Some(created_head(&event, pos));
-            }
-            Some(head) => {
-                fold_agent_head(head, &event);
-                head.next = pos.next();
-            }
-        }
-    }
-    head
 }
 
 fn created_head(event: &AgentEvent<'_>, pos: AgentEventPos) -> AgentHead {
@@ -1285,43 +1241,20 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             head.user_interacted = true;
             head.pending_notice = None;
         }
-        AgentEvent::Accepted(_)
-        | AgentEvent::Cleared { .. }
-        | AgentEvent::Wants { .. }
+        AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
         | AgentEvent::ClaudeOutput { .. }
         | AgentEvent::ClaudeOutputHandedOff { .. }
         | AgentEvent::ClaudeExecAdmitted { .. }
         | AgentEvent::ExecObserved { .. }
-        | AgentEvent::Native(_)
-        | AgentEvent::LegacyEntry(_)
         | AgentEvent::Failed { .. }
         | AgentEvent::Entry(_)
         | AgentEvent::Transcript { .. } => {}
     }
 }
 
-/// The hop the store would make on open, if its format is behind.
-pub fn pending_migration(read: &rho_db::ReadTxn) -> Option<(&'static str, &'static str)> {
-    if !read.has_table("format") {
-        return None;
-    }
-    let format = read
-        .open_table(FORMAT)
-        .get(&())
-        .map(|value| value.value())?;
-    if format == CURRENT_AGENT_DB_FORMAT {
-        return None;
-    }
-    AGENT_DB_MIGRATIONS
-        .iter()
-        .find(|migration| migration.from == format)
-        .map(|migration| (migration.from, migration.to))
-}
-
-/// Opens the store for use: a savepoint first when a migration is due,
-/// so the store can be put back if the migrated build turns out wrong,
-/// then the tables and the migration itself.
+/// Opens the current-format agent store. Existing recovery savepoints
+/// remain available for explicit rollback or deletion.
 pub async fn prepare(db: &rho_db::RhoDb) {
     let read = db.read();
     let unstamped = !read.has_table("format") || read.open_table(FORMAT).get(&()).is_none();
@@ -1336,27 +1269,10 @@ pub async fn prepare(db: &rho_db::RhoDb) {
              or remove the local rho database if you do not need the saved agents."
         );
     }
-    let pending = pending_migration(&read);
     drop(read);
-    if let Some((from, to)) = pending {
-        let key = format!("{from}->{to}");
-        let id = db
-            .persistent_savepoint(|write, id| {
-                write.open_table(RECOVERY).insert(&key, &id);
-            })
-            .await;
-        eprintln!(
-            "rho-agent: savepoint {id} taken before migrating the store {from} -> {to}; \
-             `rho debug rollback` puts it back"
-        );
-    }
     let mut write = db.write().await;
     write.init_agent_tables();
-    let started = std::time::Instant::now();
     write.commit();
-    if started.elapsed() > std::time::Duration::from_secs(1) {
-        eprintln!("rho-agent: store committed in {:?}", started.elapsed());
-    }
 }
 
 /// Every persistent savepoint in the store, with the migration hop it
@@ -1526,33 +1442,21 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
     Ok(hop)
 }
 
-fn migrate_agent_db_format(write: &mut WriteTxn) {
-    let current = CURRENT_AGENT_DB_FORMAT;
-    let mut format = {
-        let table = write.open_table(FORMAT);
-        table
-            .get(&())
-            .map(|value| value.value())
-            .unwrap_or_else(|| current.to_owned())
-    };
-
-    while format != current {
-        let Some(migration) = AGENT_DB_MIGRATIONS
-            .iter()
-            .find(|migration| migration.from == format)
-        else {
-            panic!(
-                "this rho agent database was written by an older or different rho version \
-                 (database format {format}, this build expects {current}). \
-                 Restore a compatible rho build, or remove \
-                 the local rho database if you do not need the saved agents."
-            );
-        };
-        (migration.migrate)(write);
-        format = migration.to.to_owned();
+fn assert_agent_db_format(write: &mut WriteTxn) {
+    let mut format = write.open_table(FORMAT);
+    let stored = format.get(&()).map(|value| value.value());
+    match stored {
+        None => {
+            format.insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
+        }
+        Some(current) if current == CURRENT_AGENT_DB_FORMAT => {}
+        Some(other) => panic!(
+            "this rho agent database was written by an older or different rho version \
+             (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \
+             Restore a compatible rho build, or remove \
+             the local rho database if you do not need the saved agents."
+        ),
     }
-
-    write.open_table(FORMAT).insert(&(), &current.to_owned());
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

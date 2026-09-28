@@ -681,7 +681,6 @@ impl ClaudeLoop {
                     ..Default::default()
                 },
                 compact: false,
-            imported: None,
             }).await?;
             self.entry(Entry::Notice {
                 at,
@@ -1189,7 +1188,6 @@ impl ClaudeLoop {
                             ..Default::default()
                         },
                         compact: false,
-            imported: None,
                     }).await?;
                 }
                 if self.awaiting {
@@ -1755,7 +1753,6 @@ impl ClaudeLoop {
                                 ..Default::default()
                             },
                             compact: false,
-                            imported: None,
                         })
                         .await?;
                     }
@@ -2012,7 +2009,6 @@ impl ClaudeLoop {
                                 ..Default::default()
                             },
                             compact: false,
-                            imported: None,
                         })
                         .await?;
                         self.observe_exec(
@@ -2941,7 +2937,6 @@ mod tests {
                 ..Default::default()
             },
             compact: false,
-            imported: None,
         };
         let entries = vec![
             received(1, Party::Human, 1),
@@ -3023,7 +3018,6 @@ mod tests {
                 ..Default::default()
             },
             compact: false,
-            imported: None,
         });
         let (_, deferred, uncertain) = recover_receipts(accounted);
         assert!(

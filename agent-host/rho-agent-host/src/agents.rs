@@ -394,10 +394,7 @@ async fn send_journal_from(
             .filter_map(|(seq, agent_id, pos, event)| {
                 let prior_carry = matches!(
                     event,
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
-                        imported: None,
-                        ..
-                    })
+                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent { .. })
                 )
                 .then(|| db.read().agent_input_carry(agent_id, pos))
                 .flatten();

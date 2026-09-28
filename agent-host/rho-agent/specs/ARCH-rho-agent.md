@@ -23,8 +23,7 @@ crate, not separate build targets.
 The append-only agent log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
-inference. Historical rows are normalized into the same format by a temporary migration;
-normal replay has no historical input mode. Claude Code instead owns its session, history, and compaction; Rho
+inference. Historical rows use the same format; normal replay has no historical input mode. Claude Code instead owns its session, history, and compaction; Rho
 records bounded transcript observations, execution admission, output ownership,
 and timing, and controls its worker-local MCP server.
 

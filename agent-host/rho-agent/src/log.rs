@@ -11,10 +11,10 @@ use rho_agent_types::{
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
+use crate::entry;
 use crate::entry::CompactionState;
 use crate::inference::PromptCacheKey;
 use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use crate::{db, entry};
 
 pub const AGENT_USAGE_BUCKET_MS: u64 = 5 * 60 * 1_000;
 
@@ -479,12 +479,6 @@ pub struct NativeRecovery {
 /// events on the agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
-    /// An input entered a queue: user text, mail, or a `/compact`. It becomes
-    /// context when a later `Sent` carries it.
-    Accepted(QueuedInput),
-    Cleared {
-        at: UnixMs,
-    },
     /// A turn started or stopped: the edge both runtimes cross.
     Turn {
         edge: TurnEdge,
@@ -599,10 +593,6 @@ pub enum AgentEvent<'a> {
         call: rho_agent_types::transcript::ExecCall,
         at: UnixMs,
     },
-    /// Temporary decoder until the remaining historical rows are rewritten.
-    Native(db::legacy::NativeEvent),
-    #[senax(rename = "Entry")]
-    LegacyEntry(db::legacy::Entry),
     ClaudeOutput {
         batch: ClaudeOutputBatch,
     },
@@ -613,15 +603,6 @@ pub enum AgentEvent<'a> {
     /// One of the Rho runtime's own rows.
     #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
-}
-
-/// Historical notes-preparation transitions, retained for transcript decoding.
-/// New eviction boundaries are `ContextBlock::ToolHistoryEvicted` items.
-/// Indices refer to full history, never to the provider projection.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum ContextChange {
-    Marked { retain_from: u64 },
-    Preparing { retain_from: u64, repair: bool },
 }
 
 /// Leased notebook contributions transferred to durable host ownership before
@@ -716,21 +697,6 @@ pub enum WakeKind {
     Failed,
 }
 
-impl AgentEvent<'_> {
-    /// Whether this is a message the user typed, in either generation of
-    /// the log: what a rewind counts turns by.
-    pub fn is_user_message(&self) -> bool {
-        matches!(
-            self,
-            Self::Accepted(QueuedInput {
-                source: MessageSender::User,
-                kind: InputKind::Message { .. },
-                ..
-            })
-        )
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum RuntimeChange {
     /// A message-only Claude rewind whose destination transcript has not
@@ -744,8 +710,7 @@ pub enum RuntimeChange {
     PromptCacheKey(crate::inference::PromptCacheKey),
 }
 
-/// One input waiting to reach the model. Persisted verbatim inside
-/// [`AgentEvent::Accepted`], so the live queue and the log share one shape.
+/// One input in the live Claude queue waiting to reach the model.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct QueuedInput {
     pub source: MessageSender,
@@ -798,11 +763,7 @@ pub struct TranscriptCall {
 
 #[cfg(test)]
 mod encoding_tests {
-    use rho_agent_types::transcript::MessageSender;
-    use rho_agent_types::{
-        AgentId, AgentIdDomain, AgentWant, ContentPart, MessageDelivery, TurnEdge, UnixMs,
-        WorksetMode,
-    };
+    use rho_agent_types::{AgentWant, TurnEdge, UnixMs, WorksetMode};
     use senax_encoder::{Decoder as _, Encoder as _};
 
     use super::*;
@@ -810,31 +771,12 @@ mod encoding_tests {
     #[test]
     fn log_events_roundtrip_through_senax() {
         let events = vec![
-            AgentEvent::Accepted(QueuedInput {
-                source: MessageSender::Agent {
-                    id: AgentId::from_counter(3, &AgentIdDomain(9)).unwrap(),
-                },
-                kind: InputKind::Message {
-                    content: vec![ContentPart::Text {
-                        text: "mail".to_owned(),
-                    }],
-                },
-                delivery: MessageDelivery::NextRequest,
-                at: UnixMs(7),
-            }),
-            AgentEvent::Accepted(QueuedInput {
-                source: MessageSender::User,
-                kind: InputKind::Compaction,
-                delivery: MessageDelivery::NextRequest,
-                at: UnixMs(8),
-            }),
             AgentEvent::Entry(entry::Entry::Received {
                 at: UnixMs(9),
                 id: entry::MessageId(41),
                 from: entry::Party::Human,
                 body: vec![entry::Block::Text("current log".into())],
             }),
-            AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {
                 edge: TurnEdge::Ended(rho_agent_types::TurnOutcome::Errored {
                     message: "boom".to_owned(),
@@ -854,7 +796,6 @@ mod encoding_tests {
                 to: crate::log::AgentEventPos::new(3),
                 at: UnixMs(15),
             },
-            AgentEvent::Cleared { at: UnixMs(0) },
             AgentEvent::ModeChanged {
                 mode: WorksetMode::Exposed,
                 at: UnixMs(16),

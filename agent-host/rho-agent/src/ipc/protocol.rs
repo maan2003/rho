@@ -7,7 +7,7 @@ use senax_encoder::{Decode, Encode};
 use crate::AgentEvent;
 use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(crate) const VERSION: u32 = 17;
+pub(crate) const VERSION: u32 = 18;
 
 #[derive(Encode, Decode)]
 pub(crate) struct Bootstrap {

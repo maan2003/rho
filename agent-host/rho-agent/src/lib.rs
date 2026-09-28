@@ -36,8 +36,8 @@ pub struct RenderedAgentSurface {
 }
 
 pub use log::{
-    AgentEvent, ClaudeOutputBatch, ContextChange, InputKind, QueuedInput, RuntimeChange,
-    TranscriptCall, TranscriptLine, WakeEvent, WakeFacts, WakeKind, WakeTrigger,
+    AgentEvent, ClaudeOutputBatch, InputKind, QueuedInput, RuntimeChange, TranscriptCall,
+    TranscriptLine, WakeEvent, WakeFacts, WakeKind, WakeTrigger,
 };
 pub use rho_agents_client::protocol::transcript::{
     InferenceState, RuntimeState, StreamingResponse,

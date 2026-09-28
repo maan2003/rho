@@ -177,8 +177,6 @@ pub enum Entry {
         why: Wake,
         report: Report,
         compact: bool,
-        /// Temporary migration input; current-format rows always contain None.
-        imported: Option<Carry>,
     },
     Received {
         at: UnixMs,

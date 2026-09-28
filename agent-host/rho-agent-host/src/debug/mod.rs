@@ -640,8 +640,17 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let read = db.read();
     let agents = read.list_agents();
     let mut events = 0usize;
-    for (agent_id, _) in &agents {
-        events += read.agent_events(*agent_id).1.len();
+    // Check physical rows too: a later rewind must not hide an obsolete decoder.
+    for (agent_id, head) in &agents {
+        for pos in 0..head.next.pos {
+            anyhow::ensure!(
+                read.agent_event(*agent_id, rho_agent::log::AgentEventPos::new(pos))
+                    .is_some(),
+                "missing physical event {}:{pos}",
+                agent_id.encoded(),
+            );
+            events += 1;
+        }
     }
 
     let mut output = String::new();

@@ -10,7 +10,7 @@ use rho_agent::log::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model
 use rho_agent::{AgentEvent, InputKind, QueuedInput};
 #[cfg(test)]
 use rho_agent_types::UnixMs;
-use rho_agent_types::transcript::{AStr, MessageSender, StreamingContextItem, ToolType};
+use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
 use rho_agent_types::{ContentPart, PresentationField};
 use rho_agents_client::protocol::transcript::{
     ArgumentsFormat, Item, QueuedItem, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
@@ -46,20 +46,8 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
 /// left behind. Pure, per event; the position is the raw event's own.
 /// `None` for rows that say nothing a client uses.
 pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<TranscriptEvent> {
-    let message =
-        |sender: &MessageSender, content: &[rho_agent_types::ContentPart], delivery, at| {
-            TranscriptEvent::Message {
-                from: match sender {
-                    MessageSender::User => None,
-                    MessageSender::Agent { id } => Some(*id),
-                },
-                text: rho_agent_types::transcript::text_content(content),
-                delivery,
-                at,
-            }
-        };
     Some(match event {
-        AgentEvent::TitleAttempted { .. } | AgentEvent::Native(_) | AgentEvent::LegacyEntry(_) => {
+        AgentEvent::TitleAttempted { .. } => {
             return None;
         }
         AgentEvent::Titled { title, at } => TranscriptEvent::Presented {
@@ -74,15 +62,6 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             milestone: *milestone,
             at: *at,
         },
-        AgentEvent::Accepted(QueuedInput {
-            source,
-            kind,
-            delivery,
-            at,
-        }) => match kind {
-            InputKind::Message { content } => message(source, content, *delivery, *at),
-            InputKind::Compaction => TranscriptEvent::CompactionRequested { at: *at },
-        },
         AgentEvent::Failed {
             partial,
             error,
@@ -94,7 +73,6 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             retrying: *retrying,
             at: *at,
         },
-        AgentEvent::Cleared { at } => TranscriptEvent::QueueCleared { at: *at },
         AgentEvent::RuntimeRebound { .. }
         | AgentEvent::ClaudeExecAdmitted { .. }
         | AgentEvent::ClaudeOutput { .. }
@@ -391,7 +369,6 @@ mod tests {
                 ..Default::default()
             },
             compact: true,
-            imported: None,
         });
         let projected = strip(&event, Some(&prior)).unwrap();
         assert_eq!(
