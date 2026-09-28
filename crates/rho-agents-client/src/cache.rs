@@ -73,6 +73,11 @@ const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
 const OUTBOX: TableDefinition<(AgentId, u64), Sen<Outgoing>> =
     TableDefinition::new("gui_agent_outbox_v1");
 
+/// What the user is writing to each agent and has not sent. Sending moves
+/// it to the outbox in the same write, so a message is never in both or
+/// in neither.
+const DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_draft_v1");
+
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
 const RETIRED_TABLES: [&str; 25] = [
@@ -180,7 +185,10 @@ enum Write {
     },
     Verdict(AgentId, Verdict),
     /// A message kept until its host takes it, or `None` once it has.
+    /// A new one was the agent's draft, which goes with it.
     Outgoing(AgentId, u64, Option<Outgoing>),
+    /// An agent's draft as it stands; empty drops it.
+    Draft(AgentId, String),
     /// Digests folded again at startup, from rows already held.
     Digests(Vec<(AgentId, AgentSnapshot)>),
     /// Everything heard from a host, gone: its agent host has another
@@ -265,6 +273,7 @@ impl Mirror {
                 write.open_table(VERDICTS);
             }
             write.open_table(OUTBOX);
+            write.open_table(DRAFTS);
             for table in RETIRED_TABLES {
                 write.delete_table(table);
             }
@@ -398,6 +407,19 @@ impl Mirror {
         self.send(Write::Outgoing(agent_id, id, outgoing));
     }
 
+    pub fn write_draft(&self, agent_id: AgentId, text: String) {
+        self.send(Write::Draft(agent_id, text));
+    }
+
+    pub fn read_drafts(&self) -> Vec<(AgentId, String)> {
+        self.db
+            .read()
+            .open_table(DRAFTS)
+            .iter()
+            .map(|(key, value)| (key.value(), value.value().to_owned()))
+            .collect()
+    }
+
     pub fn read_outbox(&self) -> Vec<(AgentId, u64, Outgoing)> {
         self.db
             .read()
@@ -510,15 +532,21 @@ fn apply(
                 .open_table(VERDICTS)
                 .insert(&agent_id, SenValue::borrowed(&verdict));
         }
-        Write::Outgoing(agent_id, id, outgoing) => {
-            let mut table = transaction.open_table(OUTBOX);
-            match outgoing {
-                Some(outgoing) => {
-                    table.insert(&(agent_id, id), SenValue::borrowed(&outgoing));
-                }
-                None => {
-                    table.remove(&(agent_id, id));
-                }
+        Write::Outgoing(agent_id, id, Some(outgoing)) => {
+            transaction
+                .open_table(OUTBOX)
+                .insert(&(agent_id, id), SenValue::borrowed(&outgoing));
+            transaction.open_table(DRAFTS).remove(&agent_id);
+        }
+        Write::Outgoing(agent_id, id, None) => {
+            transaction.open_table(OUTBOX).remove(&(agent_id, id));
+        }
+        Write::Draft(agent_id, text) => {
+            let mut table = transaction.open_table(DRAFTS);
+            if text.is_empty() {
+                table.remove(&agent_id);
+            } else {
+                table.insert(&agent_id, &text.as_str());
             }
         }
         Write::Digests(digests) => {
@@ -664,6 +692,19 @@ pub fn write_outgoing(agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
     }
 }
 
+pub fn write_draft(agent_id: AgentId, text: String) {
+    if let Some(mirror) = global().as_ref() {
+        mirror.write_draft(agent_id, text);
+    }
+}
+
+pub fn read_drafts() -> Vec<(AgentId, String)> {
+    global()
+        .as_ref()
+        .map(Mirror::read_drafts)
+        .unwrap_or_default()
+}
+
 pub fn read_outbox() -> Vec<(AgentId, u64, Outgoing)> {
     global()
         .as_ref()
@@ -796,6 +837,36 @@ mod tests {
         }
         let mirror = Mirror::open(dir.path()).expect("reopen");
         assert_eq!(mirror.read_outbox(), [(mine, 41, outgoing("waiting"))]);
+    }
+
+    /// A draft outlives a restart, and sending it takes it away in the
+    /// same write that keeps the message.
+    #[test]
+    fn a_draft_outlives_a_restart_until_it_is_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sent, kept) = (agent_id(1), agent_id(2));
+        {
+            let mirror = Mirror::open(dir.path()).expect("open");
+            mirror.write_draft(sent, "half a thought".into());
+            mirror.write_draft(kept, "first".into());
+            mirror.write_draft(kept, "second".into());
+            mirror.write_outgoing(
+                sent,
+                1,
+                Some(Outgoing {
+                    at: rho_agent_types::UnixMs(5),
+                    content: vec![rho_agent_types::ContentPart::Text {
+                        text: "half a thought".into(),
+                    }],
+                }),
+            );
+            mirror.flush();
+        }
+        let mirror = Mirror::open(dir.path()).expect("reopen");
+        assert_eq!(mirror.read_drafts(), [(kept, "second".to_owned())]);
+        mirror.write_draft(kept, String::new());
+        mirror.flush();
+        assert!(mirror.read_drafts().is_empty());
     }
 
     /// What the GUI comes up holding after a restart: the host's cursor,

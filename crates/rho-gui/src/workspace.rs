@@ -240,6 +240,9 @@ pub struct Workspace {
     transcripts: rho_agents_view::Transcripts,
     /// What the user wrote that no host has taken yet.
     outbox: rho_agents_client::outbox::Outbox,
+    /// What the user is writing to each agent, kept on disk as it is
+    /// typed: a restart or an evicted view puts it back.
+    drafts: HashMap<AgentId, String>,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -469,6 +472,9 @@ impl Workspace {
                                 workspace.finish_initial_agent_load(*agent_id, view, cx);
                             }
                         }
+                        rho_agents_view::agent_view::AgentModelEvent::DraftEdited(agent_id) => {
+                            workspace.draft_edited(*agent_id, loaded_model, cx);
+                        }
                         rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                             if workspace
                                 .active_transcript()
@@ -482,6 +488,9 @@ impl Workspace {
             ));
             if view == TranscriptView::Conversation {
                 self.refresh_view_status(&agent_id, &model, cx);
+                if let Some(text) = self.drafts.get(&agent_id) {
+                    model.update(cx, |model, cx| model.set_prompt_text(text, cx));
+                }
                 self.models.insert(agent_id, model.clone());
             } else {
                 self.activity_models.insert(agent_id, model.clone());
@@ -895,6 +904,9 @@ impl Workspace {
             active: ActiveAgents::default(),
             transcripts: rho_agents_view::Transcripts::default(),
             outbox: rho_agents_client::outbox::Outbox::load(),
+            drafts: rho_agents_client::cache::read_drafts()
+                .into_iter()
+                .collect(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -2361,6 +2373,21 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Keeps what the user is writing to an agent. Every edit goes to the
+    /// writer thread, which folds a burst of them into one commit.
+    fn draft_edited(&mut self, agent_id: AgentId, model: &Entity<AgentModel>, cx: &App) {
+        let text = model.read(cx).prompt_text(cx);
+        if self.drafts.get(&agent_id).map_or("", String::as_str) == text {
+            return;
+        }
+        if text.is_empty() {
+            self.drafts.remove(&agent_id);
+        } else {
+            self.drafts.insert(agent_id, text.clone());
+        }
+        rho_agents_client::cache::write_draft(agent_id, text);
     }
 
     fn show_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
@@ -3941,6 +3968,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.notice_on(agent_id, text, StyleClass::SystemInfo, cx);
+    }
+
+    /// The agent's view made again, as after an eviction.
+    #[cfg(test)]
+    pub(crate) fn remake_agent_model_for_test(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AgentModel> {
+        self.models.remove(&agent_id);
+        self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx)
+            .0
     }
 
     #[cfg(test)]

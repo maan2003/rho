@@ -1109,6 +1109,44 @@ fn queued_human_and_peer_messages_change_to_delivered_blocks(cx: &mut TestAppCon
 /// host fails keeps them, and the next try is the same messages under the
 /// same ids; only an answer takes them off the transcript.
 #[gpui::test]
+fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(741);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 742),
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("half a thought", window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let remade = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                let model = workspace.remake_agent_model_for_test(agent_id, window, cx);
+                model.read(cx).prompt_text(cx)
+            })
+            .unwrap()
+    };
+    assert_eq!(remade(cx), "half a thought");
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert_eq!(remade(cx), "", "a sent draft is not written again");
+}
+
+#[gpui::test]
 fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
     use rho_agents_client::protocol::{AgentCommand, Request};
