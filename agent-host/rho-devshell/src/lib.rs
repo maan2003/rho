@@ -338,7 +338,7 @@ pub enum Event {
 }
 
 /// How many of one outcome, and how long they took.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
     pub count: u64,
     pub total_ms: u64,
@@ -353,8 +353,17 @@ impl Timing {
     }
 }
 
-/// The daemon's counts of [`Event`]s since `since` (Unix seconds).
-#[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+/// An [`Event`] as the daemon logs it: when (Unix milliseconds) and in
+/// which flake's directory.
+#[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct Record {
+    pub at_ms: u64,
+    pub flake: String,
+    pub event: Event,
+}
+
+/// Counts of [`Event`]s since `since` (Unix seconds).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub since: u64,
     pub hit: Timing,
@@ -366,7 +375,18 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn record(&mut self, event: Event) {
+    pub fn of<'a>(records: impl IntoIterator<Item = &'a Record>) -> Self {
+        let mut stats = Self::default();
+        for (n, record) in records.into_iter().enumerate() {
+            if n == 0 {
+                stats.since = record.at_ms / 1000;
+            }
+            stats.record(record.event);
+        }
+        stats
+    }
+
+    fn record(&mut self, event: Event) {
         match event {
             Event::Hit { ms } => self.hit.add(ms),
             Event::Miss { ms, stale: false } => self.miss.add(ms),
@@ -732,10 +752,11 @@ impl Resolver {
             });
             (kept.resolved.clone(), report)
         };
+        let dir = flake.dir.clone();
         if let (Some(uses), Some(cache), Some(id)) = (report, self.cache.clone(), resolved.id) {
             let pin = self.pin_command(&resolved.env_store_path);
             tokio::spawn(async move {
-                let _ = cache.record(Event::Kept { uses }).await;
+                let _ = cache.record(&dir, Event::Kept { uses }).await;
                 if let Ok(false) = cache.used(id).await
                     && let Ok(false) = pinned(pin).await
                 {

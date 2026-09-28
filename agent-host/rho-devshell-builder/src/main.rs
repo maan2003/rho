@@ -136,7 +136,7 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
     let client = dir.filter(|_| cache).map(Client::new);
     let record = |event: fn(u64) -> Event| {
         if let Some(client) = &client {
-            let _ = runtime.block_on(client.record(event(started.elapsed().as_millis() as u64)));
+            let _ = runtime.block_on(client.record(&flake.dir, event(started.elapsed().as_millis() as u64)));
         }
     };
     let mut key = flake.key()?;
