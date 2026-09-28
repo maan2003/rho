@@ -1385,16 +1385,17 @@ impl Workspace {
         let now = jiff::Timestamp::now();
         let hand = self.hand(cx).cards;
         let registry = &self.registry;
-        // The name the user gave it, with the handle beside it to tell two
-        // of the same name apart — the same label a transcript tab carries,
-        // because a card and the surface it opens are the same agent and
-        // were reading as two.
-        let mut rows = crate::home::split_hand(&hand, |card| {
-            crate::home::card_title(card, |agent_id| {
-                registry.agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
-            })
-        });
-        let now_ms = now.as_millisecond();
+        // The name and where it is filed. Home is a glance: the handle is
+        // left to the transcript, and only an agent with no name shows it.
+        let name = |agent_id| {
+            registry.agent_name_with_labels(
+                agent_id,
+                registry
+                    .agent_display_name(agent_id)
+                    .map_or_else(|| registry.agent_id_label(agent_id), str::to_owned),
+            )
+        };
+        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
         // An agent working for another agent belongs to it and is not the
         // reader's to watch; only the ones the reader manages are listed.
         // Nor one the user put away. A running turn decides how loudly an
@@ -1403,7 +1404,7 @@ impl Workspace {
         // either back. This list read neither, which is why muting or
         // snoozing a working agent did nothing a reader could see until
         // the turn ended.
-        let mut running = self
+        let running = self
             .registry
             .known_agents()
             .copied()
@@ -1424,44 +1425,17 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
         // Sorted by what the row shows, or the order is of something the
-        // reader cannot see.
-        running.sort_by_key(|agent_id| self.registry.agent_display_label(*agent_id));
-        rows.running = running
+        // reader cannot see. Only the name: what it is doing is in the
+        // transcript, and Home says only that it is.
+        let mut running = running
             .into_iter()
-            .map(|agent_id| {
-                let facts = self.registry.agent_facts(agent_id);
-                crate::home::RunningRow {
-                    agent_id,
-                    // The name, then where the user filed it: two agents
-                    // doing the same thing in different places read as two
-                    // rows rather than as one name said twice.
-                    name: self.registry.agent_name_with_labels(
-                        agent_id,
-                        self.registry.agent_display_label(agent_id),
-                    ),
-                    // Where it is filed, not the whole path: the row is
-                    // about the agent, and the leaf is what names the work.
-                    topic: self
-                        .node_context(&rho_dealer::NodeId::Agent(agent_id), cx)
-                        .split(", ")
-                        .next()
-                        .and_then(|path| path.rsplit('/').next())
-                        .unwrap_or_default()
-                        .to_owned(),
-                    elapsed: if facts.runtime.is_some() {
-                        String::new()
-                    } else {
-                        crate::home::running_elapsed_label(&facts, now_ms)
-                    },
-                    last_line: crate::attention::agent_status_label(
-                        &facts,
-                        self.registry.agent_activity(agent_id),
-                        chrono::Local::now().fixed_offset(),
-                    )
-                    .unwrap_or_default(),
-                }
+            .map(|agent_id| crate::home::RunningRow {
+                agent_id,
+                name: name(agent_id),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        running.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.running = running;
         let local = jiff::Zoned::now();
         rows.piles = self
             .attention

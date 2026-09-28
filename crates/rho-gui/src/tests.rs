@@ -19,6 +19,7 @@ use rho_agents_client::state::{
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
+mod agent_status;
 mod call_punctuation;
 mod editor_shutdown;
 mod elision_block_geometry;
@@ -35,7 +36,6 @@ mod prose_buffers;
 mod record_anchors;
 mod removing_a_turn_after_growth;
 mod row_spacing;
-mod running_turn_elapsed;
 mod scene_walk;
 pub(super) mod story;
 mod syntax_parsed_in_frame;
@@ -5513,7 +5513,7 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext) {
+fn running_home_row_is_the_name_alone(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(777);
     workspace
@@ -5523,6 +5523,7 @@ fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
+                        generated_title: Some("flaky-ci".to_owned()),
                         activity: Some("reading tests".to_owned()),
                         turn_running: true,
                         ..ui_head(agent_id)
@@ -5550,10 +5551,9 @@ fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext
         .unwrap();
     cx.run_until_parked();
     let text = home_text(&workspace, cx);
-    assert!(
-        text.contains("responding · reading tests"),
-        "home text: {text:?}"
-    );
+    // The status and the handle are the transcript's to say; Home only
+    // says that it runs.
+    assert_eq!(text.lines().collect::<Vec<_>>(), ["running", "  flaky-ci"]);
 }
 
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
