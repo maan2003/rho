@@ -982,6 +982,54 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_agents_status_line_sits_above_the_draft(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    let say = |activity: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        let activity = activity.to_owned();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    ready_with(
+                        vec![story::UiAgentHead {
+                            activity: Some(activity),
+                            ..ui_head(agent_id)
+                        }],
+                        2,
+                    ),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    // Said before the transcript opens, and shown when it does.
+    say("reading tests", &workspace, cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        state(vec![user("question")], vec![assistant("answer", None)]),
+    );
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("answer\n\nreading tests\n\nWrite a message…"),
+        "{text:?}"
+    );
+    // A new status replaces the old one rather than adding a line.
+    say("fixing the build", &workspace, cx);
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("answer\n\nfixing the build\n\nWrite a message…")
+            && !text.contains("reading tests"),
+        "{text:?}"
+    );
+}
+
+#[gpui::test]
 fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(

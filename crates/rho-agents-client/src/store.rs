@@ -70,11 +70,12 @@ impl FrameSummary {
 }
 
 /// One agent's transcript: the fold, the live tail, what the user has not
-/// yet sent, and the three composed.
+/// yet sent, the agent's status line, and the four composed.
 struct Layered {
     fold: UiAgentState,
     tail: Tail,
     unsent: Vec<Arc<UiBlock>>,
+    status: Option<Arc<UiBlock>>,
     state: UiAgentState,
     committed_tools: std::collections::HashSet<String>,
 }
@@ -115,6 +116,7 @@ impl Layered {
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
         self.state.blocks.extend(self.unsent.iter().cloned());
+        self.state.blocks.extend(self.status.iter().cloned());
         self.state.status = match self.tail.runtime.as_ref() {
             Some(RuntimeState {
                 inference: InferenceState::Responding,
@@ -216,6 +218,7 @@ pub struct AgentStore {
     /// Kept apart from `states` so a transcript forgotten and opened
     /// again still shows what waits to be sent.
     unsent: HashMap<AgentId, Vec<Arc<UiBlock>>>,
+    status: HashMap<AgentId, Arc<UiBlock>>,
 }
 
 impl AgentStore {
@@ -297,6 +300,24 @@ impl AgentStore {
         self.change(agent_id, true, |layered| layered.unsent = unsent)
     }
 
+    /// What the agent says it is doing, or `None` once it stops saying.
+    pub fn set_status(&mut self, agent_id: AgentId, text: Option<String>) -> FrameSummary {
+        let status = text
+            .filter(|text| !text.is_empty())
+            .map(|text| Arc::new(UiBlock::Status { text }));
+        if self.status.get(&agent_id) == status.as_ref() {
+            return FrameSummary::nothing();
+        }
+        match &status {
+            Some(block) => self.status.insert(agent_id, block.clone()),
+            None => self.status.remove(&agent_id),
+        };
+        if !self.states.contains_key(&agent_id) {
+            return FrameSummary::nothing();
+        }
+        self.change(agent_id, true, |layered| layered.status = status)
+    }
+
     /// Drop ephemeral status and response when transport is lost.
     pub fn disconnect(&mut self, agent_id: AgentId) -> FrameSummary {
         self.change(agent_id, true, |layered| {
@@ -318,10 +339,12 @@ impl AgentStore {
 
     fn layered(&mut self, agent_id: AgentId) -> &mut Layered {
         let unsent = &self.unsent;
+        let status = &self.status;
         self.states.entry(agent_id).or_insert_with(|| Layered {
             fold: empty_state(),
             tail: Tail::default(),
             unsent: unsent.get(&agent_id).cloned().unwrap_or_default(),
+            status: status.get(&agent_id).cloned(),
             state: empty_state(),
             committed_tools: Default::default(),
         })

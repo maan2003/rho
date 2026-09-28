@@ -1788,6 +1788,9 @@ impl Workspace {
                 self.loaded(host, agents, verdicts);
                 let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
                 self.push_agent_marks(&agents);
+                for agent_id in &agents {
+                    self.show_status(*agent_id, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
@@ -1812,6 +1815,9 @@ impl Workspace {
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
+                for agent_id in &changed {
+                    self.show_status(*agent_id, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 // Status is workspace chrome, not part of the transcript editor.
                 if matches!(
@@ -2359,10 +2365,18 @@ impl Workspace {
 
     fn show_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let texts = self.outbox.texts(agent_id);
-        let summary = self
-            .transcripts
-            .apply(agent_id, TranscriptFrame::Unsent(texts))
-            .summary;
+        self.show(agent_id, TranscriptFrame::Unsent(texts), cx);
+    }
+
+    /// The agent's status line, at the end of its transcript.
+    fn show_status(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let text = self.registry.agent_activity(agent_id).map(str::to_owned);
+        self.show(agent_id, TranscriptFrame::Status(text), cx);
+    }
+
+    /// Lands a frame the client makes itself on the agent's open views.
+    fn show(&mut self, agent_id: AgentId, frame: TranscriptFrame, cx: &mut Context<Self>) {
+        let summary = self.transcripts.apply(agent_id, frame).summary;
         if let Some(view) = self.models.get(&agent_id).cloned() {
             self.sync_agent_model(agent_id, &view, summary, false, cx);
         }
@@ -7430,10 +7444,8 @@ impl Workspace {
         let state = agent_in_view
             .filter(|_| echo.is_none())
             .and_then(|agent_id| {
-                let facts = self.registry.agent_facts(agent_id);
-                crate::attention::agent_status_label(
-                    &facts,
-                    self.registry.agent_activity(agent_id),
+                crate::attention::agent_state_label(
+                    &self.registry.agent_facts(agent_id),
                     chrono::Local::now().fixed_offset(),
                 )
             });

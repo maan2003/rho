@@ -133,7 +133,9 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
             BlockKind::Response { working: true }
         }
-        UiBlock::QueuedMessage { .. } | UiBlock::Unsent { .. } => BlockKind::QueuedUser,
+        UiBlock::QueuedMessage { .. } | UiBlock::Unsent { .. } | UiBlock::Status { .. } => {
+            BlockKind::QueuedUser
+        }
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
 }
@@ -153,7 +155,8 @@ pub fn block_visible(block: &UiBlock) -> bool {
         | UiBlock::Notice { text }
         | UiBlock::AgentMessage { text, .. }
         | UiBlock::QueuedMessage { text, .. }
-        | UiBlock::Unsent { text } => !text.is_empty(),
+        | UiBlock::Unsent { text }
+        | UiBlock::Status { text } => !text.is_empty(),
     }
 }
 
@@ -405,6 +408,14 @@ pub fn render_block_with_agent_labels(
                 content: InlayContent::Label(" (unsent)"),
             });
             spans.push(Span::new("", StyleClass::SystemInfo));
+            spans.push(Span::new("\n\n", StyleClass::Default));
+        }
+        UiBlock::Status { text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            spans.push(Span::new(text.clone(), StyleClass::SystemInfo));
             spans.push(Span::new("\n\n", StyleClass::Default));
         }
     }

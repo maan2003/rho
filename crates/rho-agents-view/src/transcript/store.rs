@@ -25,6 +25,8 @@ pub enum TranscriptFrame {
     Folded(rho_agents_client::fold::FoldDelta),
     /// What the user wrote that no host has taken yet, whole.
     Unsent(Vec<String>),
+    /// What the agent says it is doing, if anything.
+    Status(Option<String>),
 }
 
 /// What a frame did, for a caller deciding what to redraw.
@@ -127,6 +129,7 @@ impl Transcripts {
             TranscriptFrame::Fold(state) => (self.store.set_fold(agent_id, state), false),
             TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
             TranscriptFrame::Unsent(texts) => (self.store.set_unsent(agent_id, texts), false),
+            TranscriptFrame::Status(text) => (self.store.set_status(agent_id, text), false),
         };
         let usage_changed =
             usage_before.as_ref() != self.store.get(&agent_id).map(|state| &state.usage);
