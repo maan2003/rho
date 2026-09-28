@@ -52,10 +52,6 @@ impl TranscriptView {
                     label,
                 );
                 rendered.kind = block_kind(block);
-                rendered.spans.insert(
-                    rendered.spans.len() - 1,
-                    Span::new("draft\n", StyleClass::StatusRunning),
-                );
                 return rendered;
             }
             render_block_with_agent_labels(block, previous, now_ms, label)
@@ -1037,9 +1033,19 @@ mod tests {
         assert!(TranscriptView::Conversation.visible(&draft));
         assert!(!TranscriptView::Activity.visible(&draft));
         let conversation = TranscriptView::Conversation.render(&draft, None, 0, &label);
-        assert_eq!(text_of(&conversation.spans), "draft\nHello\n");
+        assert_eq!(text_of(&conversation.spans), "Hello\n");
         assert!(conversation.markdown);
-        assert_eq!(conversation.spans[0].class, StyleClass::StatusRunning);
+        assert_eq!(conversation.spans[0].class, StyleClass::Default);
+        let sent = TranscriptView::Conversation.render(
+            &UiBlock::MessageSent {
+                to: None,
+                text: "Hello".into(),
+            },
+            None,
+            0,
+            &label,
+        );
+        assert_eq!(conversation.spans, sent.spans);
         let activity = TranscriptView::Activity.render(&source, None, 0, &label);
         assert!(text_of(&activity.spans).contains("human.send('Hello')"));
         assert!(!text_of(&activity.spans).contains("draft"));
