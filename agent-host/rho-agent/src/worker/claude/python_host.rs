@@ -254,8 +254,9 @@ impl PythonHost {
         }
         let sources = self.notebook.facts();
         let mut facts = self.progress.facts(
-            Some(&self.notebook),
-            self.latest.as_ref().map(|(_, cell)| cell),
+            &sources,
+            self.notebook.checkin(),
+            self.latest.as_ref().map(|(_, cell)| cell.facts()),
         );
         facts.human = user_oldest_at;
         facts.agent = agent_oldest_at;

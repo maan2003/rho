@@ -1110,10 +1110,24 @@ impl Agent {
     }
 
     fn facts(&self) -> anyhow::Result<Facts> {
-        let notebook = self.progress.process_facts(
-            self.notebook.as_ref(),
-            self.cell.as_ref().map(|latest| &latest.cell),
-        )?;
+        let sources = self
+            .notebook
+            .as_ref()
+            .map(NotebookSide::facts)
+            .transpose()?
+            .unwrap_or_default();
+        let wait = self
+            .notebook
+            .as_ref()
+            .map(NotebookSide::checkin)
+            .transpose()?
+            .unwrap_or(wake::DEFAULT_CHECKIN);
+        let latest = self
+            .cell
+            .as_ref()
+            .map(|latest| latest.cell.facts())
+            .transpose()?;
+        let notebook = self.progress.facts(&sources, wait, latest);
         Ok(Facts {
             // The cell that ended the turn returns to nobody.
             finished: notebook.finished.filter(|_| !self.progress.ended),

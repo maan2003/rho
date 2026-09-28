@@ -791,13 +791,17 @@ async fn code_fragments_wait_for_a_publication_frame() {
         rho_agents_client::protocol::transcript::Item::ToolCall { arguments, .. }
         if arguments.ends_with("# final\n"))
     );
-    agent.stream(&mut streaming, (None, "human.send('Hel".into()));
+    agent
+        .stream(&mut streaming, (None, "human.send('Hel".into()))
+        .unwrap();
     assert_eq!(agent.status.read().unwrap().draft, None);
-    agent.publish_stream(streaming.as_ref(), false);
+    agent.publish_stream(streaming.as_ref(), false).unwrap();
     assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hel"));
-    agent.stream(&mut streaming, (None, "lo')\n".into()));
+    agent
+        .stream(&mut streaming, (None, "lo')\n".into()))
+        .unwrap();
     assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hel"));
-    agent.publish_stream(streaming.as_ref(), false);
+    agent.publish_stream(streaming.as_ref(), false).unwrap();
     assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hello"));
     agent.shutdown().await.unwrap();
 }
