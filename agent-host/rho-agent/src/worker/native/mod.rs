@@ -1355,8 +1355,12 @@ impl Agent {
             *self.status.write().expect("poison") = self.status();
         } else {
             // Notebook and mail events publish runtime independently. A code
-            // frame only changes this response; don't scan retained sources.
-            self.status.write().expect("poison").response = self.response();
+            // frame changes the response and its derived draft, not runtime.
+            let response = self.response();
+            let draft = self.draft();
+            let mut status = self.status.write().expect("poison");
+            status.response = response;
+            status.draft = draft;
         }
         self.host.published();
     }
@@ -1375,6 +1379,21 @@ impl Agent {
                 })
                 .collect(),
         })
+    }
+
+    fn draft(&self) -> Option<String> {
+        self.cell
+            .as_ref()
+            .filter(|latest| {
+                !latest.published && (self.responding || latest.cell.facts().finished.is_none())
+            })
+            .and_then(|latest| {
+                super::shared::python_preview::tool_preview(
+                    "exec",
+                    &latest.call.code,
+                    ArgumentsFormat::Text,
+                )
+            })
     }
 
     /// What a reader sees, built from the loop's own state.
@@ -1417,19 +1436,7 @@ impl Agent {
                 archived: self.archived,
             },
             response: self.response(),
-            draft: self
-                .cell
-                .as_ref()
-                .filter(|latest| {
-                    !latest.published && (self.responding || latest.cell.facts().finished.is_none())
-                })
-                .and_then(|latest| {
-                    super::shared::python_preview::tool_preview(
-                        "exec",
-                        &latest.call.code,
-                        ArgumentsFormat::Text,
-                    )
-                }),
+            draft: self.draft(),
             queued: self.unread.len(),
         }
     }
