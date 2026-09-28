@@ -1651,6 +1651,7 @@ impl ClaudeLoop {
             team.as_ref(),
             Some(&self.host),
             Some(&self.mailroom),
+            false,
         );
         let notify = Arc::new(tokio::sync::Notify::new());
         let notebook = rho_notebook::Notebook::new(shell, exports, Arc::clone(&notify))

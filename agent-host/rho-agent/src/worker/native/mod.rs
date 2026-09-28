@@ -943,6 +943,7 @@ impl Agent {
                 team.as_ref(),
                 Some(&self.host),
                 Some(&self.mailroom),
+                true,
             );
             let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
                 .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
