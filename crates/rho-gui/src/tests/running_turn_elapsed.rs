@@ -121,3 +121,35 @@ fn retry_and_failure_status_override_archived_or_running_tasks() {
         Some("errored")
     );
 }
+
+#[test]
+fn agent_status_keeps_runtime_state_and_tracks_replacement_or_clear() {
+    use rho_agents_client::protocol::transcript::{InferenceState, RuntimeState};
+
+    let now = chrono::DateTime::from_timestamp_millis(1_757_000_000_000)
+        .unwrap()
+        .fixed_offset();
+    let facts = AgentFacts {
+        runtime: Some(RuntimeState {
+            inference: InferenceState::Responding,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::attention::agent_status_label(&facts, Some("reading tests"), now).as_deref(),
+        Some("responding · reading tests")
+    );
+    assert_eq!(
+        crate::attention::agent_status_label(&facts, Some("checking build"), now).as_deref(),
+        Some("responding · checking build")
+    );
+    assert_eq!(
+        crate::attention::agent_status_label(&facts, None, now).as_deref(),
+        Some("responding")
+    );
+    assert_eq!(
+        crate::attention::agent_status_label(&facts, Some(""), now).as_deref(),
+        Some("responding")
+    );
+}

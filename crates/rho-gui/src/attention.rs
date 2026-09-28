@@ -1035,6 +1035,21 @@ impl Workspace {
     }
 }
 
+/// The agent's own latest status beside its runtime state. The runtime
+/// still explains retries and waits; the agent says what it is doing.
+pub(crate) fn agent_status_label(
+    facts: &rho_agents_client::AgentFacts,
+    activity: Option<&str>,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Option<String> {
+    let state = agent_state_label(facts, now);
+    match (state, activity.filter(|text| !text.is_empty())) {
+        (Some(state), Some(activity)) => Some(format!("{state} · {activity}")),
+        (None, Some(activity)) => Some(activity.to_owned()),
+        (state, None) => state,
+    }
+}
+
 /// What an agent is doing, for the status line: how long its turn has run,
 /// or how its last turn ended and how long ago.
 pub(crate) fn agent_state_label(

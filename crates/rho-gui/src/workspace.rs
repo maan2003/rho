@@ -1451,18 +1451,12 @@ impl Workspace {
                     } else {
                         crate::home::running_elapsed_label(&facts, now_ms)
                     },
-                    last_line: if facts.runtime.is_some() {
-                        crate::attention::agent_state_label(
-                            &facts,
-                            chrono::Local::now().fixed_offset(),
-                        )
-                        .unwrap_or_default()
-                    } else {
-                        self.registry
-                            .agent_activity(agent_id)
-                            .unwrap_or_default()
-                            .to_owned()
-                    },
+                    last_line: crate::attention::agent_status_label(
+                        &facts,
+                        self.registry.agent_activity(agent_id),
+                        chrono::Local::now().fixed_offset(),
+                    )
+                    .unwrap_or_default(),
                 }
             })
             .collect();
@@ -1843,6 +1837,13 @@ impl Workspace {
                 // already have a name.
                 self.push_agent_marks(&changed);
                 self.invalidate_dealer_signals(cx);
+                // Status is workspace chrome, not part of the transcript editor.
+                if matches!(
+                    self.active_surface().key,
+                    SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if changed.contains(&id)
+                ) {
+                    cx.notify();
+                }
             }
             rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
@@ -7489,7 +7490,11 @@ impl Workspace {
             .filter(|_| echo.is_none())
             .and_then(|agent_id| {
                 let facts = self.registry.agent_facts(agent_id);
-                crate::attention::agent_state_label(&facts, chrono::Local::now().fixed_offset())
+                crate::attention::agent_status_label(
+                    &facts,
+                    self.registry.agent_activity(agent_id),
+                    chrono::Local::now().fixed_offset(),
+                )
             });
         let state = state.map(|state| div().text_color(cx.theme().status().warning).child(state));
         let left = echo.map_or_else(

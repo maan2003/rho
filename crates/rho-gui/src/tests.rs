@@ -5381,6 +5381,50 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
         .unwrap();
 }
 
+#[gpui::test]
+fn running_home_row_shows_agent_status_with_live_runtime(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(777);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        activity: Some("reading tests".to_owned()),
+                        turn_running: true,
+                        ..ui_head(agent_id)
+                    }],
+                    778,
+                ),
+                window,
+                cx,
+            );
+            workspace.handle_model_event(
+                HostId::default(),
+                rho_agents_client::model::ModelMsg::Runtime {
+                    agent_id,
+                    state: rho_agents_client::protocol::transcript::RuntimeState {
+                        inference:
+                            rho_agents_client::protocol::transcript::InferenceState::Responding,
+                        ..Default::default()
+                    },
+                },
+                window,
+                cx,
+            );
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = home_text(&workspace, cx);
+    assert!(
+        text.contains("responding · reading tests"),
+        "home text: {text:?}"
+    );
+}
+
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
     workspace
         .update(cx, |workspace, _, cx| {
