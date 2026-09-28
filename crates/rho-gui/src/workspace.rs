@@ -6239,9 +6239,13 @@ impl Workspace {
             self.echo("pile: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
-        let complete = std::rc::Rc::new(|workspace: &Workspace, needle: &str, _: &gpui::App| {
-            let needle = needle.trim().to_lowercase();
-            workspace
+        // Enter takes the highlighted row, so a name that is only part of
+        // an existing pile's gets its own row to start a new pile with. It
+        // comes last: a near miss lands on the pile that exists.
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let typed = input.trim();
+            let needle = typed.to_lowercase();
+            let mut candidates: Vec<crate::minibuffer::Candidate> = workspace
                 .attention
                 .marks
                 .piles(jiff::Timestamp::now())
@@ -6255,7 +6259,18 @@ impl Workspace {
                             value: name,
                         })
                 })
-                .collect()
+                .collect();
+            if !typed.is_empty()
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate.value.to_lowercase() == needle)
+            {
+                candidates.push(crate::minibuffer::Candidate {
+                    value: typed.to_owned(),
+                    description: "new pile".to_owned(),
+                });
+            }
+            candidates
         });
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
@@ -6281,6 +6296,7 @@ impl Workspace {
             },
         );
         self.open_prompt("pile:", complete, on_submit, window, cx);
+        self.set_prompt_complete_whole_input();
     }
 
     /// A pull while a pile is open: its next card, oldest put away first,

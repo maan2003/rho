@@ -5816,6 +5816,89 @@ fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut Test
         .unwrap();
 }
 
+/// The pile prompt's enter takes the highlighted row. A name with spaces
+/// is one name, not a last word to complete, and a name that is only part
+/// of an existing pile's can still start a new pile.
+#[gpui::test]
+fn the_pile_prompt_completes_whole_names_and_still_starts_new_piles(cx: &mut TestAppContext) {
+    use rho_dealer::NodeId;
+    let workspace = test_workspace(cx);
+    let (held, first, second) = (agent(721), agent(722), agent(723));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(held), ui_head(first), ui_head(second)], 724),
+                window,
+                cx,
+            );
+            for agent_id in [held, first, second] {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story_wanting(agent_id, UnixMs(100)),
+                    window,
+                    cx,
+                );
+            }
+            workspace.take_verdict(
+                &NodeId::Agent(held),
+                crate::attention::Verdict::Pile("ask ada".into()),
+                cx,
+            );
+        })
+        .unwrap();
+    let mut piled = Vec::new();
+    for typed in ["ask a", "ada"] {
+        let dealt = workspace
+            .update(cx, |workspace, window, cx| {
+                // A verdict deals the next card itself, so only the
+                // first needs pulling.
+                if workspace.current_deal_card_for_test(cx).is_none() {
+                    workspace.pull_card(window, cx);
+                }
+                let dealt = workspace.current_deal_card_for_test(cx).unwrap().0;
+                workspace.verdict_pile(window, cx);
+                let minibuffer = workspace.minibuffer.as_mut().expect("pile asks for a name");
+                minibuffer.set_input(typed.to_owned(), window, cx);
+                dealt
+            })
+            .unwrap();
+        cx.run_until_parked();
+        if typed == "ada" {
+            // "ask ada" matches too and is highlighted first; the new pile
+            // is the last row, one step up from the top.
+            cx.dispatch_action(*workspace, crate::MinibufferPrevious);
+        }
+        cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+        cx.run_until_parked();
+        piled.push(dealt);
+    }
+    workspace
+        .update(cx, |workspace, _, _| {
+            let piles: Vec<(Option<String>, Vec<NodeId>)> = workspace
+                .attention
+                .marks
+                .piles(jiff::Timestamp::now())
+                .into_iter()
+                .map(|pile| (pile.name, pile.nodes))
+                .collect();
+            assert_eq!(
+                piles,
+                vec![
+                    (Some("ada".into()), vec![piled[1].clone()]),
+                    (
+                        Some("ask ada".into()),
+                        vec![NodeId::Agent(held), piled[0].clone()]
+                    ),
+                ],
+                "\"ask a\" finishes to the pile; \"ada\" starts its own"
+            );
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn toggling_a_label_twice_restores_the_note_and_find_uses_its_path(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
