@@ -112,12 +112,13 @@ Run independent inspections in one exec, without gather or await:
     command("rg -n 'TODO' src")
 
 Await the handle when later code needs completion. Returns metadata, not stdout; never raises.
-await handle → {id: int, exit_code: int | None}
+Reading exit_code handles the command's failure, so that failure does not wake you.
+await handle → CommandExit(id: int, exit_code: int | None)
 
 Await only the dependency; the next command starts without awaiting its output:
 
     check = await command("cargo check")
-    if check["exit_code"] == 0:
+    if check.exit_code == 0:
         command("cargo test")
 
 Send input to a running command. It never reads; more_output does that.
@@ -1425,7 +1426,7 @@ mod tests {
         assert!(!prompt.contains(".reply()"));
         assert!(prompt.contains("Task.from_session_id(session_id: int) → Task"));
         assert!(!prompt.contains("suppress_tool_wakeups"));
-        assert!(prompt.contains("await handle → {id: int, exit_code: int | None}"));
+        assert!(prompt.contains("await handle → CommandExit(id: int, exit_code: int | None)"));
         assert!(prompt.contains("returns a persistent command handle"));
         let execution = prompt
             .split("## Acting and talking")
@@ -1600,7 +1601,7 @@ mod tests {
                 r#"web.run(search_query=[{"q": "search terms"}])"#,
                 r#"web.run(open=[{"ref_id": "https://example.com"}])"#,
                 "    command(\"git diff --stat\")\n    command(\"rg -n 'TODO' src\")",
-                "    check = await command(\"cargo check\")\n    if check[\"exit_code\"] == 0:",
+                "    check = await command(\"cargo check\")\n    if check.exit_code == 0:",
             ] {
                 assert!(prompt.contains(example), "{example}");
             }

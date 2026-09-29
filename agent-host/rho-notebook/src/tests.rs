@@ -336,6 +336,47 @@ async fn unclaimed_failure_reports_once_after_twenty_seconds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reading_a_failed_commands_exit_code_takes_its_failure() {
+    let (notebook, wake) = notebook();
+    let failed = || {
+        notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command && f.finished.is_some_and(|end| end.failed))
+    };
+    // Awaited but its exit code unread: still a failure.
+    let cell = notebook.run("exit = await command('exit 3')\nprint(exit)".into());
+    finished(&wake, &cell).await;
+    assert!(failed());
+    let text = notebook.report().unwrap().render().text;
+    assert!(
+        text.contains("CommandExit(id=") && text.contains("exit_code=3)"),
+        "{text}"
+    );
+    assert!(!failed(), "a delivered failure is spent");
+
+    // A watcher that reads the exit code handles it itself.
+    let cell = notebook.run(
+        "import asyncio\nasync def watch():\n    if (await command('exit 4')).exit_code != 0:\n        print('down')\nt = asyncio.create_task(watch())"
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    until(&wake, || {
+        notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command && f.finished.is_some())
+    })
+    .await;
+    until(&wake, || {
+        notebook.facts().iter().any(|f| f.output_since.is_some())
+    })
+    .await;
+    assert!(!failed());
+    assert!(notebook.report().unwrap().render().text.contains("down"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
     let (notebook, wake) = notebook();
     let cell = notebook.run(
@@ -371,7 +412,7 @@ async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
 #[tokio::test(flavor = "multi_thread")]
 async fn command_handle_and_await_result_use_scrambled_session_id() {
     let (notebook, wake) = notebook();
-    let cell = notebook.run("job = command('exit 7')\nprint(job.id, (await job)['id'])".into());
+    let cell = notebook.run("job = command('exit 7')\nprint(job.id, (await job).id)".into());
     finished(&wake, &cell).await;
     let command = notebook
         .facts()

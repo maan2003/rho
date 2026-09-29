@@ -129,6 +129,7 @@ pub(crate) fn command(
     let inbox = Arc::clone(&shared.inbox);
     let wake = Arc::clone(&shared.wake);
     let shared_for_work = Arc::clone(shared);
+    let ended = Arc::clone(&job);
     let registered = register(
         shared,
         &cell,
@@ -173,7 +174,7 @@ pub(crate) fn command(
             wake.notify_one();
             result
         },
-        move |result| inbox.post(Message::Done(reply, exit_reply(id, result))),
+        move |result| inbox.post(Message::Done(reply, exit_reply(ended, result))),
     );
     if let Err(error) = registered {
         shared.sources.lock().unwrap().remove(&id);
@@ -186,14 +187,47 @@ pub(crate) fn command(
 }
 
 /// How a command ended, as awaiting its handle returns it.
-fn exit_reply(id: SourceId, result: Result<CommandExit, String>) -> Reply {
-    Ok(result.unwrap_or(CommandExit {
-        id: id.session(),
+fn exit_reply(job: Arc<Source>, result: Result<CommandExit, String>) -> Reply {
+    let exit = result.unwrap_or(CommandExit {
+        id: job.id.session(),
         exit_code: None,
-    }))
-    .map(|exit| {
-        Box::new(move |py: Python<'_>| Ok(exit.into_pyobject(py)?.into_any().unbind())) as Build
-    })
+    });
+    Ok(
+        Box::new(move |py: Python<'_>| {
+            Ok(Exit { exit, job }.into_pyobject(py)?.into_any().unbind())
+        }) as Build,
+    )
+}
+
+/// What awaiting a command returns.
+#[pyclass(frozen, name = "CommandExit")]
+struct Exit {
+    exit: CommandExit,
+    job: Arc<Source>,
+}
+
+#[pymethods]
+impl Exit {
+    #[getter]
+    fn id(&self) -> u32 {
+        self.exit.id.get()
+    }
+
+    /// Reading it takes the failure: the reader handles it, so it wakes
+    /// nobody, though the command's end is still reported.
+    #[getter]
+    fn exit_code(&self) -> Option<i32> {
+        self.job.state.lock().unwrap().checked = true;
+        self.exit.exit_code
+    }
+
+    fn __repr__(&self) -> String {
+        let code = self
+            .exit
+            .exit_code
+            .map_or("None".into(), |code| code.to_string());
+        format!("CommandExit(id={}, exit_code={code})", self.exit.id.get())
+    }
 }
 
 /// Send input to a running command. The write is queued on the command at
@@ -309,7 +343,7 @@ impl Command {
                             break Err(error.to_string());
                         }
                     };
-                    inbox.post(Message::Done(reply, exit_reply(job.id, result)));
+                    inbox.post(Message::Done(reply, exit_reply(job, result)));
                 });
                 result.insert(future).clone_ref(py)
             }

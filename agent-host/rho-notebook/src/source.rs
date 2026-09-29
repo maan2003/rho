@@ -8,8 +8,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rho_agent_types::UnixMs;
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 use senax_encoder::{Decode, Encode};
@@ -71,19 +69,6 @@ pub(crate) struct CommandExit {
     pub(crate) exit_code: Option<i32>,
 }
 
-impl<'py> IntoPyObject<'py> for CommandExit {
-    type Target = PyDict;
-    type Output = Bound<'py, PyDict>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let exit = PyDict::new(py);
-        exit.set_item("id", self.id.get())?;
-        exit.set_item("exit_code", self.exit_code)?;
-        Ok(exit)
-    }
-}
-
 pub(crate) struct Source {
     pub(crate) id: SourceId,
     pub(crate) identity: Uuid,
@@ -125,6 +110,8 @@ pub(crate) struct State {
     pub(crate) announced: bool,
     pub(crate) finished: Option<UnixMs>,
     pub(crate) failed: bool,
+    /// A command whose exit code someone read: its failure wakes nobody.
+    pub(crate) checked: bool,
     /// A call's error, or a command's failure to run.
     pub(crate) error: Option<String>,
     /// Its end has been reported.
@@ -207,6 +194,7 @@ impl Source {
                 announced: false,
                 finished: None,
                 failed: false,
+                checked: false,
                 error: None,
                 delivered: false,
                 log,
@@ -388,7 +376,7 @@ impl Source {
             returned: state.cell.returned,
             finished: state.finished.map(|at| End {
                 at,
-                failed: state.failed,
+                failed: state.failed && !state.checked,
             }),
             delivered: state.delivered,
         }
@@ -612,7 +600,8 @@ pub struct SourceFacts {
 pub struct End {
     pub at: UnixMs,
     /// A raise, a non-zero or missing exit code, a cancellation, or a host
-    /// call that returned an error.
+    /// call that returned an error. A command's is not, once its exit code
+    /// is read.
     pub failed: bool,
 }
 
