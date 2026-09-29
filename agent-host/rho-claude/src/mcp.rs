@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 pub const SERVER_NAME: &str = "py";
 pub const TOOL_NAME: &str = "exec";
 
-/// How long Claude Code lets one exec call stay open. Above the longest
-/// check-in a cell can ask for (an hour) with room for the patience around
-/// it, so the CLI never fails a call the boundary is holding on purpose.
-pub const EXEC_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long Claude Code lets one exec call stay open. The boundary answers
+/// an open call a minute before this whatever the check-in, so the CLI never
+/// fails a call it is holding on purpose.
+pub const EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 24 * 60 * 60);
 
 const EXEC_DESCRIPTION: &str = "Run Python in Rho's persistent notebook. Returns once the cell \
 has something worth reporting (it returned, produced output, a check-in fired, or a message \
