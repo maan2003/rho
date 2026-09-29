@@ -663,8 +663,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         ));
         (shutdown, task)
     });
-    let resume_path = state_dir.join(RESUME_AFTER_RESTART);
-    tokio::spawn(resume_after_restart(services.clone(), resume_path.clone()));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
@@ -678,8 +676,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             }
             result = &mut shutdown => {
                 result?;
-                services.stopping.store(true, Ordering::Relaxed);
-                stop_executions(&services, &resume_path).await;
                 if let Some((shutdown, listener)) = iroh_listener.take() {
                     let _ = shutdown.send(());
                     listener.await.context("close iroh listener")?;
@@ -740,84 +736,6 @@ async fn reexec(services: &Services) -> anyhow::Error {
     }
     services.pool.resume().await;
     error
-}
-
-/// Agents that were working when this agent host was told to stop, one id
-/// per line, for the next one to wake.
-const RESUME_AFTER_RESTART: &str = "resume-after-restart";
-
-/// A stop someone asked for (a deploy, say) is a chosen restart: the agents
-/// it interrupted carry on after it. A crash writes nothing, so a crash is
-/// still never a reason to send
-/// (`DECISION-a-restart-does-not-resume-by-itself`).
-async fn record_resume_after_restart(services: &Services, path: &Utf8Path) {
-    let agents = services.pool.unsettled().await;
-    let text: String = agents.iter().map(|id| id.encoded() + "\n").collect();
-    if let Err(error) = std::fs::write(path, text) {
-        eprintln!("rho-agent-host: could not record agents to resume in {path}: {error}");
-    }
-}
-
-/// How long stopping may take: draining the agents (each workset gives
-/// up on a request at 50s) and then the workset processes. systemd's default
-/// stop timeout is 90s.
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Drains every agent, so requests in flight end and each log is flushed,
-/// then stops every workset process, as idle eviction does, rather than
-/// leaving them to die with this one. Under `KillMode=mixed` only this
-/// process is signalled, so the workers are still there to drain.
-async fn stop_executions(services: &Services, resume_path: &Utf8Path) {
-    let stop = async {
-        services.pool.drain().await;
-        // After the drain: an agent whose request ended in a final answer
-        // is done, and only those still at work are woken.
-        record_resume_after_restart(services, resume_path).await;
-        let stops = services
-            .pool
-            .executions()
-            .await
-            .into_iter()
-            .map(|process| async move { process.shutdown().await });
-        futures::future::join_all(stops).await;
-    };
-    if tokio::time::timeout(STOP_TIMEOUT, stop).await.is_err() {
-        eprintln!("rho-agent-host: still stopping after {STOP_TIMEOUT:?}; exiting anyway");
-    }
-}
-
-/// Wakes the agents the last agent host recorded on its way down. The record
-/// is removed first, so an agent host that dies waking them does not wake
-/// them again.
-async fn resume_after_restart(services: Arc<Services>, path: Utf8PathBuf) {
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if let Err(error) = std::fs::remove_file(&path) {
-        eprintln!("rho-agent-host: not resuming agents, {path} stays: {error}");
-        return;
-    }
-    for id in text.lines().filter(|line| !line.is_empty()) {
-        let Ok(agent_id) = AgentId::from_encoded(id) else {
-            eprintln!("rho-agent-host: not resuming unknown agent id {id}");
-            continue;
-        };
-        let command = rho_agents_client::protocol::AgentCommand::Send {
-            agent_id,
-            messages: vec![rho_agents_client::protocol::UserMessage {
-                id: rho_agent::entry::MessageId::new().0,
-                content: vec![ContentPart::Text {
-                    text: "The agent host was stopped on purpose (for example to deploy a new \
-                           rho) while you were working, and has started again. Continue your \
-                           task."
-                        .to_owned(),
-                }],
-            }],
-        };
-        if let Err(error) = agents::handle_agent_command(&services, command).await {
-            eprintln!("rho-agent-host: could not resume {id}: {error:#}");
-        }
-    }
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {
@@ -1108,9 +1026,6 @@ struct Services {
     git_transport: GitTransportBroker,
     /// At most one GUI owns the voice session's microphone and playback.
     voice_lease: Arc<TokioMutex<()>>,
-    /// Set once this agent host starts stopping: agents are draining, and
-    /// none is created or loaded or told anything new.
-    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Services {
@@ -1139,17 +1054,8 @@ impl Services {
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
-            stopping: std::sync::atomic::AtomicBool::new(false),
         };
         Ok(registry)
-    }
-
-    fn refuse_while_stopping(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.stopping.load(Ordering::Relaxed),
-            "the agent host is stopping; try again once it is back"
-        );
-        Ok(())
     }
 
     fn auth_state(&self) -> AuthState {
@@ -1170,7 +1076,6 @@ impl Services {
         role: AgentRole,
         start: StartMode,
     ) -> anyhow::Result<(AgentId, AgentClient)> {
-        self.refuse_while_stopping()?;
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 // The agent record is committed before its workset is cloned
@@ -1247,7 +1152,6 @@ impl Services {
     }
 
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, AgentClient, bool)> {
-        self.refuse_while_stopping()?;
         self.pool.load(agent_id).await
     }
 }

@@ -86,9 +86,6 @@ pub struct AgentPool {
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
-    /// Set by [`AgentPool::drain`]: the agent host is stopping, and a worker
-    /// that goes away now was let go rather than lost.
-    draining: std::sync::atomic::AtomicBool,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
     /// Which agents each connection is looking at; the union is the live
@@ -148,7 +145,6 @@ impl AgentPool {
             worksets,
             claude,
             agents: Mutex::new(HashMap::new()),
-            draining: std::sync::atomic::AtomicBool::new(false),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
@@ -481,40 +477,6 @@ impl AgentPool {
             self.touch(agent_id);
         }
         agent
-    }
-
-    /// Loaded agents mid-turn or with input waiting.
-    pub async fn unsettled(&self) -> Vec<AgentId> {
-        self.agents
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, agent)| !agent.settled())
-            .map(|(agent_id, _)| *agent_id)
-            .collect()
-    }
-
-    /// Drains every loaded agent at once; see [`AgentClient::drain`].
-    pub async fn drain(&self) {
-        self.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let agents = self
-            .agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent_id, agent)| (*agent_id, agent.clone()))
-            .collect::<Vec<_>>();
-        let drains = agents.into_iter().map(|(agent_id, agent)| async move {
-            if let Err(error) = agent.drain().await {
-                eprintln!("rho-agent: drain {}: {error:#}", agent_id.encoded());
-            }
-        });
-        futures::future::join_all(drains).await;
-    }
-
-    pub(crate) fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether any client is looking at this agent right now. Read by the

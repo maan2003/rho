@@ -211,13 +211,6 @@ impl AgentClient {
     pub fn head(&self) -> crate::log::AgentHead {
         self.0.services.db.read().get_agent(self.0.services.agent)
     }
-    /// Lets the request in flight end and freezes the agent with its log
-    /// flushed; see `Agent::drain`. Errs if the request outlived the
-    /// workset's deadline.
-    pub async fn drain(&self) -> anyhow::Result<()> {
-        self.request(Control::Drain).await
-    }
-
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
         self.request(Control::Retire).await
     }

@@ -187,19 +187,6 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?
     }
 
-    /// Waits for the response in flight, if any, to end, then freezes the
-    /// loop with its log flushed. Work still running is left to die with
-    /// the process.
-    pub(crate) async fn drain(&self) -> anyhow::Result<()> {
-        let (reply, drained) = oneshot::channel();
-        self.control
-            .send(Control::Drain(reply))
-            .map_err(|_| anyhow::anyhow!("agent loop is closed"))?;
-        drained
-            .await
-            .map_err(|_| anyhow::anyhow!("agent loop is closed"))
-    }
-
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -247,7 +234,6 @@ impl AgentHandle {
 /// landed: after its row is on disk, not after the model has seen it.
 enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
-    Drain(oneshot::Sender<()>),
     Received {
         id: MessageId,
         from: Party,
@@ -342,7 +328,6 @@ pub(crate) struct Agent {
     status: Arc<RwLock<AgentStatus>>,
     head: Arc<RwLock<AgentHead>>,
     name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
-    draining: Option<oneshot::Sender<()>>,
     /// Whether the last published state counted as a running turn, so the
     /// turn's edges are told once each.
     working: bool,
@@ -415,7 +400,6 @@ impl Agent {
             wake: Arc::new(Notify::new()),
             status: Arc::clone(&status),
             head: Arc::clone(&head),
-            draining: None,
             working: false,
             archived: recovery.archived,
             fresh: false,
@@ -487,14 +471,6 @@ impl Agent {
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         loop {
             self.writer.check()?;
-            if self.draining.is_some() && !self.responding {
-                self.publish().await?;
-                self.flush().await?;
-                let _ = self.draining.take().expect("checked above").send(());
-                // Frozen like a retired loop; the driver cancels this future
-                // when the agent host lets go.
-                std::future::pending::<()>().await;
-            }
             // A cell can archive itself as it completes. Apply what it sent
             // before deciding whether its completion warrants a wake.
             self.drain_outbox().await?;
@@ -507,9 +483,7 @@ impl Agent {
                 ))
                 .await?;
             }
-            let decision = if self.draining.is_some() {
-                Decision::Later(None)
-            } else if let Some(backoff) = &self.backoff {
+            let decision = if let Some(backoff) = &self.backoff {
                 if backoff.at <= UnixMs::now() {
                     Decision::Now(Wake::Prose)
                 } else {
@@ -581,7 +555,6 @@ impl Agent {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));
                 }
             }
-            Control::Drain(reply) => self.draining = Some(reply),
             Control::TellTail => self.host.tell_tail(),
             Control::Received {
                 id,

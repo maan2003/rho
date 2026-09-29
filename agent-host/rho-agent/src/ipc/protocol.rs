@@ -22,7 +22,6 @@ pub(crate) struct Bootstrap {
 #[derive(Encode, Decode)]
 pub(crate) enum Control {
     Retire,
-    Drain,
     User {
         id: crate::entry::MessageId,
         content: Vec<rho_agent_types::ContentPart>,
