@@ -83,10 +83,17 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "e3a95c07";
+const CURRENT_AGENT_DB_FORMAT: &str = "1f34dc6c";
 /// Exposed-only worksets, before waits had a start and a stop.
 const WORKSETS_AGENT_DB_FORMAT: &str = "a3f26d91";
+/// The format immediately before the PR monitor tables were retired.
+const PR_MONITOR_AGENT_DB_FORMAT: &str = "e3a95c07";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
+
+fn remove_pr_monitor_tables(write: &mut WriteTxn) {
+    write.delete_table("pr_watches");
+    write.delete_table("pr_feedback");
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1186,7 +1193,7 @@ pub async fn prepare(db: &rho_db::RhoDb) {
     }
     let from = stored.as_deref().unwrap_or_default();
     let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
-    let needs_savepoint = from == WORKSETS_AGENT_DB_FORMAT
+    let needs_savepoint = matches!(from, WORKSETS_AGENT_DB_FORMAT | PR_MONITOR_AGENT_DB_FORMAT)
         && (!read.has_table("recovery_savepoints")
             || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
@@ -1358,7 +1365,11 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
-        Some(WORKSETS_AGENT_DB_FORMAT) => awaiting_migration::migrate(write),
+        Some(WORKSETS_AGENT_DB_FORMAT) => {
+            awaiting_migration::migrate(write);
+            remove_pr_monitor_tables(write);
+        }
+        Some(PR_MONITOR_AGENT_DB_FORMAT) => remove_pr_monitor_tables(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \

@@ -1,5 +1,5 @@
 //! The `rho` command, run on an agent host: tools agents call from their
-//! shell (PRs, visualizations, the Wayland session, evaluations) and the
+//! shell (visualizations, the Wayland session, evaluations) and the
 //! plumbing around the host (auth, Claude accounts, iroh trust, debug and
 //! protocol logs). The host itself is the `rho-agent-host` binary.
 
@@ -16,7 +16,7 @@ use rho_rpc::protocol::client::Client as UiClient;
 use rho_rpc::protocol::{Answer, Call, client};
 
 mod eval;
-mod pr;
+mod github;
 mod visualization;
 mod wayland;
 
@@ -62,7 +62,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
-        Command::Pr(args) => pr::run(args).await,
+        Command::Github(args) => github::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
@@ -163,7 +163,7 @@ enum Command {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    Pr(PrArgs),
+    Github(GithubArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Wayland(wayland::WaylandArgs),
@@ -189,7 +189,7 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    Pr(PrArgs),
+    Github(GithubArgs),
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
@@ -267,11 +267,11 @@ pub(crate) enum IrohCommand {
 }
 
 #[derive(Clone, clap::Args)]
-pub(crate) struct PrArgs {
+pub(crate) struct GithubArgs {
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
     #[command(subcommand)]
-    command: PrCliCommand,
+    command: GithubCommand,
 }
 
 #[derive(Clone, clap::Args)]
@@ -281,56 +281,9 @@ pub(crate) struct RecordVisualizationArgs {
 }
 
 #[derive(Clone, Subcommand)]
-pub(crate) enum PrCliCommand {
-    /// Install the GitHub token used for PR, Actions, and constrained Git
-    /// operations.
+pub(crate) enum GithubCommand {
+    /// Install the host-held GitHub token used by Octo.
     Init,
-    /// Create a draft pull request.
-    Create {
-        #[arg(short = 'H', long)]
-        head: String,
-        #[arg(short = 'B', long)]
-        base: Option<String>,
-        #[arg(short = 't', long)]
-        title: String,
-        #[arg(short = 'b', long)]
-        body: String,
-    },
-    /// Fetch the current PR, CI, and review snapshot.
-    Status { url: String },
-    /// Edit a pull request's title, description, or base branch.
-    Edit {
-        url: String,
-        #[arg(short = 'B', long)]
-        base: Option<String>,
-        #[arg(short = 't', long)]
-        title: Option<String>,
-        #[arg(short = 'b', long, alias = "description")]
-        body: Option<String>,
-    },
-    /// Add a PR comment or reply to an inline review comment.
-    Comment {
-        url: String,
-        /// Numeric GitHub inline review-comment ID from `rho pr comments`.
-        #[arg(long)]
-        reply_comment: Option<u64>,
-        #[arg(short = 'b', long)]
-        body: String,
-    },
-    /// List PR comments and their replyable GitHub IDs.
-    Comments { url: String },
-    /// Show CI checks for a pull request, optionally until they complete.
-    Checks {
-        url: String,
-        #[arg(long)]
-        watch: bool,
-        #[arg(long, default_value_t = 10)]
-        interval: u64,
-    },
-    /// Rerun failed jobs in a GitHub Actions workflow run.
-    Rerun { url: String, run_id: u64 },
-    /// Download and extract logs for a GitHub Actions workflow run.
-    Logs { url: String, run_id: u64 },
 }
 
 #[derive(Clone, clap::Args)]
@@ -351,7 +304,7 @@ impl Args {
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
-            CliCommand::Pr(args) => Command::Pr(args),
+            CliCommand::Github(args) => Command::Github(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Wayland(args) => Command::Wayland(args),

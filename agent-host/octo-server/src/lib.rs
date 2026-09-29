@@ -1,8 +1,8 @@
 //! Embedded Octo GitHub helper server.
 //!
 //! Rho runs this in-process on a host-owned Unix socket. GitHub tokens are
-//! supplied by the agent host from its sealed RAM-only platform secret store; Octo
-//! never receives them via argv/env or persists them to disk.
+//! supplied by the agent host from its sealed RAM-only platform secret store;
+//! Octo never receives them via argv/env or persists them to disk.
 
 use std::sync::Arc;
 
@@ -14,7 +14,6 @@ use tokio::net::UnixListener;
 mod api;
 mod error;
 mod state;
-mod types;
 
 use state::AppState;
 pub use state::TokenProvider;
@@ -31,9 +30,8 @@ pub fn router(token_provider: TokenProvider, github_api_url: Url) -> Router {
     });
 
     Router::new()
-        .merge(api::ci::router())
         .merge(api::git::router())
-        .merge(api::pr::router())
+        .merge(api::gh::router())
         .with_state(state)
 }
 

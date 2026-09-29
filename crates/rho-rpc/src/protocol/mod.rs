@@ -75,9 +75,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/36";
+pub const IROH_ALPN: &[u8] = b"rho/ui/37";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP34";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP35";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,10 +141,6 @@ impl RuntimePaths {
 
     pub fn browser_socket(&self) -> std::path::PathBuf {
         self.directory.join("rho-browser.sock")
-    }
-
-    pub fn pr_logs(&self) -> std::path::PathBuf {
-        self.directory.join("pr-logs")
     }
 
     pub fn host_lock(&self) -> std::path::PathBuf {
@@ -626,7 +622,6 @@ mod tests {
             paths.browser_socket(),
             paths.directory().join("rho-browser.sock")
         );
-        assert_eq!(paths.pr_logs(), paths.directory().join("pr-logs"));
         assert_eq!(
             paths.host_lock(),
             paths.directory().join(".rho-agent-host.lock")

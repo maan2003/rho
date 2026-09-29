@@ -12,7 +12,7 @@ libc.workspace = true
 pyo3.workspace = true
 rho-agent-types.workspace = true
 rho-tool-shell.workspace = true
-senax-encoder.workspace = true
+senax-encoder = { workspace = true, features = ["uuid"] }
 uuid.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "rt", "macros", "time"] }

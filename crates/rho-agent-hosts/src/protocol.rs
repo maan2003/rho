@@ -60,7 +60,6 @@ rho_rpc::calls! {
         /// Answered with where the copy is, in a directory of its own
         /// beside the database; the copy is the caller's to delete.
         Snapshot(Snapshot) -> camino::Utf8PathBuf;
-        Pr(Pr) -> PrOutput;
     }
 }
 
@@ -126,19 +125,6 @@ pub struct IrohRevoke {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot;
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Pr {
-    pub agent_id: Option<String>,
-    pub command: PrCommand,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct PrOutput {
-    pub output: String,
-    pub data: Vec<u8>,
-    pub is_error: bool,
-}
-
 /// Maximum encoded GUI performance snapshot accepted by the agent host.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -170,56 +156,6 @@ pub struct GitTransportRequest {
     pub planned_refs: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum PrCommand {
-    Create {
-        owner: String,
-        repo: String,
-        head: String,
-        base: String,
-        title: String,
-        body: String,
-        review_bots: Vec<String>,
-    },
-    Subscribe {
-        url: String,
-        replay_existing: bool,
-        review_bots: Vec<String>,
-    },
-    Status {
-        url: String,
-    },
-    List,
-    Stop {
-        url: String,
-    },
-    Comment {
-        url: String,
-        reply_comment: Option<u64>,
-        body: String,
-    },
-    Comments {
-        url: String,
-    },
-    Checks {
-        url: String,
-    },
-    Rerun {
-        url: String,
-        run_id: u64,
-    },
-    Logs {
-        url: String,
-        run_id: u64,
-    },
-    Edit {
-        url: String,
-        base: Option<String>,
-        title: Option<String>,
-        body: Option<String>,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use rho_rpc::protocol::{self, Protocol, ProtocolOpen};
@@ -239,16 +175,6 @@ mod tests {
     #[test]
     fn requests_round_trip() {
         for request in [
-            Pr {
-                agent_id: Some("eng-abcd".into()),
-                command: PrCommand::Edit {
-                    url: "https://github.com/acme/widgets/pull/1".into(),
-                    base: Some("release".into()),
-                    title: Some("Better title".into()),
-                    body: Some("Better summary".into()),
-                },
-            }
-            .into(),
             GitTransportPolicy {
                 host: "github.com".to_owned(),
             }
