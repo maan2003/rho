@@ -485,7 +485,47 @@ impl HostProfiler {
     }
 }
 
+/// How long each phase of starting up or handing over took, for the log.
+struct Phases {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    done: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl Phases {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            start: now,
+            last: now,
+            done: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.done.push((phase, now - self.last));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Phases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ms (",
+            self.last.duration_since(self.start).as_millis()
+        )?;
+        for (index, (phase, took)) in self.done.iter().enumerate() {
+            let separator = if index == 0 { "" } else { ", " };
+            write!(f, "{separator}{phase} {} ms", took.as_millis())?;
+        }
+        write!(f, ")")
+    }
+}
+
 pub async fn run(args: HostArgs) -> anyhow::Result<()> {
+    let mut phases = Phases::new();
     let handoff = args.handoff.as_deref().map(Handoff::decode).transpose()?;
     let platform_secrets = match handoff.as_ref().and_then(|handoff| handoff.secrets) {
         Some(fd) => PlatformSecrets::handed(fd)?,
@@ -544,6 +584,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     }
     apply_host_directories(&mut user_environment, &state_dir, &claude);
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
+    phases.mark("environment");
 
     let db = RhoDb::open(db_path);
     let inference = match args.openai_base_url {
@@ -556,6 +597,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         }
         None => Accounts::new(db.clone()).await?,
     };
+    phases.mark("database");
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path
@@ -592,12 +634,14 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             .await?
         }
     };
+    phases.mark("worksets");
     run_devshell_daemon(&worksets);
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
                 .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
+        phases.mark("iroh");
         Some((listener, auth))
     } else {
         None
@@ -613,6 +657,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     .await;
     if let Some(handoff) = handoff {
         pool.adopt(handoff.workers).await;
+        phases.mark("adopt");
     }
     let services = Arc::new(
         Services::new(
@@ -653,26 +698,45 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mut iroh_listener = iroh.map(|(listener, _)| {
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(run_iroh_listener(
-            services.clone(),
-            listener,
-            iroh_auth.clone(),
-            stopped,
-        ));
-        (shutdown, task)
-    });
+    let start_iroh = {
+        let services = services.clone();
+        let iroh_auth = iroh_auth.clone();
+        move |listener| {
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_iroh_listener(
+                services.clone(),
+                listener,
+                iroh_auth.clone(),
+                stopped,
+            ));
+            (shutdown, task)
+        }
+    };
+    let iroh_enabled = iroh.is_some();
+    let mut iroh_listener = iroh.map(|(listener, _)| start_iroh(listener));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
         .context("register SIGUSR2 handler")?;
+    phases.mark("services");
+    eprintln!("rho-agent-host: ready in {phases}");
 
     loop {
         tokio::select! {
             _ = upgrade.recv() => {
-                let error = reexec(&services).await;
+                let error = reexec(&services, &mut iroh_listener).await;
                 eprintln!("rho-agent-host: re-exec failed, carrying on: {error:#}");
+                if iroh_enabled && iroh_listener.is_none() {
+                    match rho_rpc::AuthenticatedIrohListener::bind(
+                        services.db.clone(),
+                        rho_rpc::protocol::IROH_ALPN,
+                    )
+                    .await
+                    {
+                        Ok((listener, _)) => iroh_listener = Some(start_iroh(listener)),
+                        Err(error) => eprintln!("rho-agent-host: iroh stays down: {error:#}"),
+                    }
+                }
             }
             result = &mut shutdown => {
                 result?;
@@ -701,23 +765,49 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
 /// the pid: the workset processes, still its children, are handed over with
 /// their agents, Python and commands running. Returns only on failure, with
 /// everything carrying on here.
-async fn reexec(services: &Services) -> anyhow::Error {
+async fn reexec(
+    services: &Services,
+    iroh: &mut Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )>,
+) -> anyhow::Error {
     use std::os::unix::process::CommandExt as _;
+    let mut phases = Phases::new();
     let workers = match services.pool.hand_over().await {
         Ok(workers) => workers,
         Err(error) => return error,
     };
+    phases.mark("hand over");
     let error = async {
         services.pool.flush_agent_usage(None).await;
+        phases.mark("usage");
         let secrets = services
             .platform_secrets
             .current_store()
             .map(|store| store.hand())
             .transpose()?;
         let handoff = Handoff { workers, secrets }.encode()?;
+        let _settled = services.db.settle().await?;
+        phases.mark("database");
+        // Peers hear their connections close rather than wait out the idle
+        // timeout.
+        if let Some((shutdown, listener)) = iroh.take() {
+            let _ = shutdown.send(());
+            if tokio::time::timeout(std::time::Duration::from_secs(5), listener)
+                .await
+                .is_err()
+            {
+                eprintln!("rho-agent-host: iroh still closing after 5s; re-executing anyway");
+            }
+            phases.mark("iroh");
+        }
         let mut args = std::env::args_os();
         let program = args.next().context("no argv[0]")?;
-        eprintln!("rho-agent-host: re-executing {}", program.to_string_lossy());
+        eprintln!(
+            "rho-agent-host: re-executing {} after {phases}",
+            program.to_string_lossy()
+        );
         // The systemd fd store's fds were claimed, so its numbers are stale.
         Err::<(), _>(anyhow::Error::from(
             std::process::Command::new(program)

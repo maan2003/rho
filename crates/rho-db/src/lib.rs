@@ -299,8 +299,16 @@ impl RhoDb {
             std::fs::create_dir_all(parent).expect("create rho-db parent directory");
         }
 
+        let repairing = std::sync::atomic::AtomicBool::new(false);
+        let shown = path.display().to_string();
         let database = Database::builder()
             .set_cache_size(CACHE_SIZE)
+            .set_repair_callback(move |_| {
+                // Slow enough on a large file to explain a slow start.
+                if !repairing.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("rho-db: repairing {shown}, which was not closed cleanly");
+                }
+            })
             .create(path)
             .expect("open rho-db");
 
@@ -333,18 +341,24 @@ impl RhoDb {
         &self.path
     }
 
-    /// Copy the database to `dest` as it stands after its latest commit, in
-    /// a state that reopens at once. A copy of an open file otherwise reads
-    /// as a crash, and redb repairs one by walking every page to verify
-    /// checksums and rebuild its allocator: minutes on a large database.
-    /// Holding the write lock, an empty quick-repair commit records the
-    /// allocator state, and nothing commits after it until the file is
-    /// cloned.
-    pub async fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
+    /// Leaves the file in a state that reopens at once, and commits nothing
+    /// more until the guard drops. Opened while this process still has it
+    /// open, as a copy or by the program this one execs, the file otherwise
+    /// reads as a crash, and redb repairs one by walking every page to verify
+    /// checksums and rebuild its allocator: minutes on a large database. An
+    /// empty quick-repair commit records the allocator state.
+    pub async fn settle(&self) -> anyhow::Result<OwnedMutexGuard<()>> {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
         let mut write = self.database.begin_write()?;
         write.set_quick_repair(true);
         write.commit()?;
+        Ok(guard)
+    }
+
+    /// Copy the database to `dest` as it stands after its latest commit, in
+    /// a state that reopens at once; see [`RhoDb::settle`].
+    pub async fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
+        let guard = self.settle().await?;
         let (source, dest) = (Arc::clone(&self.path), dest.to_owned());
         tokio::task::spawn_blocking(move || clone_file(&source, &dest)).await??;
         drop(guard);
