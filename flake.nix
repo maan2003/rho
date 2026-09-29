@@ -390,6 +390,26 @@
               dependencies = [ fastcore fasttransport ];
               doCheck = false;
             };
+            # xdir/ls for exploring notebook objects; packaged from a pinned
+            # upstream revision instead of copying the Python sources here.
+            pythonLs = ps.buildPythonPackage {
+              pname = "python-ls";
+              version = "unstable-2026-03-07";
+              src = pkgs.fetchFromGitHub {
+                owner = "gabrielcnr";
+                repo = "python-ls";
+                rev = "e84e0c27514708f997ad4fb27b1b0cf56fdac4fe";
+                hash = "sha256-DwTTaXJF9IJ/F1LyWLWo29rzOe4xdaM8GU9ysKrSlXA=";
+              };
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/python_ls"
+                cp python_ls/*.py "$out/${pkgs.python3.sitePackages}/python_ls/"
+                runHook postInstall
+              '';
+            };
             ghapi = ps.buildPythonPackage {
               pname = "ghapi";
               version = "2.1.5-rho";
@@ -406,7 +426,7 @@
               doCheck = false;
             };
           in
-          [ ps.pyyaml ps.httpx ghapi ]
+          [ ps.pyyaml ps.httpx ghapi pythonLs ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 

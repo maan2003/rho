@@ -56,6 +56,25 @@ print("ghapi import ready")"#
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_ls_xdir_is_available_in_the_notebook() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        r#"from python_ls import xdir
+class Example:
+    @property
+    def token(self):
+        raise RuntimeError("inspecting a property must not execute it")
+assert xdir(Example(), "token") == ["token"]
+assert xdir({"status": {"failure_code": 3}, "state": "pending"},
+            "fail", depth=2) == ["['status']['failure_code']"]
+print("xdir ready")"#
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "xdir ready");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cell_that_ends_first_speaks_plainly() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("print(6 * 7)".into());
