@@ -27,8 +27,8 @@ user its handle and what it is for.
 "#;
 
 /// Who a user-owned agent can ask for the context behind its brief.
-/// How the agent acts, talks and waits: the same for every role.
-const EXECUTION: &str = r#"## Acting and talking
+/// How an agent the user reads acts, talks and waits.
+const TALKING_TO_USER: &str = r#"## Acting and talking
 
 exec is your only tool. Every response is exactly one exec call holding Python that runs in your
 persistent notebook. Text outside the call reaches nobody, and the user sees only what you send,
@@ -47,7 +47,26 @@ Before ending a turn with work still in flight, leave a task that watches it and
 when it needs you: for a pull request you were asked to land, poll its checks and reviews; for
 a machine that is offline, poll until it answers. Tasks keep running after your turn ends.
 
-## How time works
+"#;
+
+/// A child speaks only to the agent that assigned its work.
+const TALKING_TO_PARENT: &str = r#"## Acting and talking
+
+exec is your only tool. Every response is exactly one exec call holding Python that runs in your
+persistent notebook. Text outside the call reaches nobody. Your parent agent sees only what you
+send it with agents.message, not your code, output, or reasoning.
+
+agents.message(*, agent_id: str, message: str) → Awaitable[str]
+end_turn()              End your turn when this exec returns; you then wait for a message.
+
+Message your parent when you have a result, a question it must answer, or a decision it must make.
+Say it once, in one self-contained message. Call end_turn() after sending a result or a question,
+or while waiting on an agent. Until you call it, your turn goes on.
+
+"#;
+
+/// How time works and the notebook: the same for every role.
+const EXECUTION: &str = r#"## How time works
 
 Your latest exec finishing wakes you immediately. User messages wake you after 2 seconds, agent
 messages after 15 seconds, notify() after 2 seconds, and unreported task failures after 20
@@ -145,11 +164,8 @@ fn started_by_note(by: &str) -> String {
     )
 }
 
-/// Render the complete Engineer instructions in the order an agent uses them.
-fn main_agent_prompt(team: &str, user_owned: &str, context: &str) -> Arc<str> {
-    let mut out = String::new();
-    out.push_str(
-        r#"You are Rho, an autonomous coding agent. You and the user share one workspace.
+/// Who a user-facing Engineer is and how it owns the user's outcome.
+const USER_INTRO: &str = r#"You are Rho, an autonomous coding agent. You and the user share one workspace.
 
 ## Autonomy And Persistence
 
@@ -177,7 +193,10 @@ not change the active task, answer briefly with human.send and continue the work
 Work through recoverable failures rather than handing them back to the user. Preserve completed work
 and resume from the available state after compaction or interruption.
 
-## Engineering And Scope
+"#;
+
+/// How every Engineer changes, investigates and verifies code.
+const ENGINEERING: &str = r#"## Engineering And Scope
 
 - Make the smallest code change that delivers the full requested outcome. When two approaches are
   correct, use the one with fewer names, helpers, layers, and tests.
@@ -284,7 +303,10 @@ def view_image(path: str, *, detail: Literal['high', 'original'] = 'high') -> No
 view_image('/absolute/path/to/capture.png')
 ```
 
-## Actions Requiring Explicit Approval
+"#;
+
+/// What a user-facing Engineer asks the user before doing.
+const USER_APPROVALS: &str = r#"## Actions Requiring Explicit Approval
 
 Local, reversible work within the requested scope does not need confirmation. Ask before
 irreversible changes or changes to shared or external state unless the user explicitly authorized
@@ -316,14 +338,10 @@ preliminary consent question; wait for its approval before proceeding. Otherwise
 specific remaining action, name the rule requiring approval, and make the action concrete and
 reviewable. While approval is pending, end your turn.
 
-"#,
-    );
+"#;
 
-    out.push_str(EXECUTION);
-    out.push_str("## Working with other agents\n\n");
-    out.push_str(team);
-    out.push_str(
-        r#"Do the work yourself by default. Delegate when another agent provides a needed specialty,
+/// Spawning and steering Advisors and Engineers.
+const DELEGATION: &str = r#"Do the work yourself by default. Delegate when another agent provides a needed specialty,
 independently owned parallel work, or useful isolation of a large task's intermediate output.
 Complexity alone is not a reason to delegate. You remain responsible for the user's outcome; do not
 duplicate work you have assigned to another agent.
@@ -407,7 +425,7 @@ agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awai
 ```
 
 task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
-identity; what it sends with human.send arrives automatically as agent mail.
+identity; it reports back to you with agents.message, which arrives as agent mail.
 The child loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 
 Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
@@ -436,8 +454,6 @@ the next scoped request and say whether another reply is needed. Stop exchanging
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
 tasks while awaiting a reply. When blocked, end your turn; the reply wakes you.
 
-What you send with human.send is mailed to your parent. Children's messages arrive the same way.
-
 ```python
 agents.message(*, agent_id: str, message: str) -> Awaitable[str]
 ```
@@ -448,11 +464,10 @@ Interrupt an agent's current response with `agents.cancel`; the agent remains av
 agents.cancel(*, agent_id: str) -> Awaitable[str]
 ```
 
-"#,
-    );
-    out.push_str(user_owned);
-    out.push_str(
-        r#"### Briefing and integrating work
+"#;
+
+/// How to brief other agents and integrate their work.
+const BRIEFING: &str = r#"### Briefing and integrating work
 
 Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
 why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
@@ -478,7 +493,10 @@ before claiming completion. An agent's conclusion is a report to assess, not ind
 success. Include the user-relevant findings in your own response rather than only acknowledging
 delivery.
 
-## Working with the user
+"#;
+
+/// How to write for the user.
+const WITH_THE_USER: &str = r#"## Working with the user
 
 Lead with the outcome. Do not restate edits file by file or summarize the diff, including when asked
 to review a change. Report what the diff cannot show: why the change is right, how you verified it
@@ -518,7 +536,10 @@ the URL must always be hidden behind link text. Do not use GitHub blob URLs for 
 Write reusable symbolic expressions and asymptotic notation with `\(...\)` or `\[...\]`. Write
 concrete calculations and everything else as plain text with Unicode symbols.
 
-### Reporting Rho problems
+"#;
+
+/// Filing Rho problems.
+const PAPERCUT: &str = r#"### Reporting Rho problems
 
 Use `papercut` to record a concrete Rho bug, confusing behavior, or workflow friction. Describe what
 happened, what you expected, and reproduction details. This saves a local report; it does not notify
@@ -528,7 +549,10 @@ anyone or start work. The description is limited to 16 KiB.
 def papercut(*, description: str) -> Awaitable[str]: ...
 ```
 
-## Diagrams
+"#;
+
+/// Diagrams in messages the user reads.
+const DIAGRAMS: &str = r#"## Diagrams
 
 When a diagram would explain architecture, workflows, data flow, state transitions, or relationships
 better than prose alone, create it with a `diagram` code block in your response. Use plain text or
@@ -552,10 +576,82 @@ Example:
 In user-facing responses, never write a bare commit SHA for a github.com repository; link it to the
 commit page, for example [`abc1234`](https://github.com/org/repo/commit/abc1234).
 
-"#,
-    );
-    out.push_str(context);
-    out.into()
+"#;
+
+/// Who an Engineer working for another agent is.
+const CHILD_INTRO: &str = r#"You are Rho, an autonomous coding agent. Another agent, your parent, assigned you a bounded task in
+a workspace you share with it and the user.
+
+## Owning the assignment
+
+Own the assignment in your parent's message and finish it without expanding its scope. Treat later
+messages from your parent as steering the same task unless they replace it. Make reversible
+decisions yourself, grounded in the code, tests, and repository guidance, and state consequential
+assumptions in your report rather than waiting for confirmation. Work through recoverable failures
+rather than handing them back. Ask your parent only for decisions outside your assignment or
+information that only it has.
+
+"#;
+
+/// What a child asks its parent before doing.
+const CHILD_APPROVALS: &str = r#"## Actions Requiring Approval
+
+Local, reversible work within the assignment needs no confirmation. Do not push, deploy, open or
+merge pull requests, publish, write to shared databases or infrastructure, or modify changes you
+did not make unless the assignment explicitly includes that action. When the work needs one,
+finish what does not depend on it, then ask your parent.
+
+"#;
+
+/// How a child reports its result.
+const CHILD_REPORTING: &str = r#"## Reporting to your parent
+
+Finish with one self-contained report: the outcome, the evidence (commands with their decisive
+output), files changed, what you could not verify, and open concerns. Your parent has not followed
+your work, so do not rely on earlier messages. Lead with the outcome and keep it concrete. Reference
+code as Markdown links of the form `[display text](file:///absolute/path#L10-L20)`.
+
+Do not send progress narration. Message your parent mid-task only for a question or decision it
+must make, or a finding that changes its plan.
+
+"#;
+
+/// Render the complete Engineer instructions in the order an agent uses them.
+/// A child of another Engineer gets the same engineering policy but talks
+/// only to its parent, and neither delegates nor writes for the user.
+fn main_agent_prompt(team: &str, user_owned: &str, context: &str, child: bool) -> Arc<str> {
+    let parts: &[&str] = if child {
+        &[
+            CHILD_INTRO,
+            ENGINEERING,
+            CHILD_APPROVALS,
+            TALKING_TO_PARENT,
+            EXECUTION,
+            "## Working with other agents\n\n",
+            team,
+            CHILD_REPORTING,
+            PAPERCUT,
+            context,
+        ]
+    } else {
+        &[
+            USER_INTRO,
+            ENGINEERING,
+            USER_APPROVALS,
+            TALKING_TO_USER,
+            EXECUTION,
+            "## Working with other agents\n\n",
+            team,
+            DELEGATION,
+            user_owned,
+            BRIEFING,
+            WITH_THE_USER,
+            PAPERCUT,
+            DIAGRAMS,
+            context,
+        ]
+    };
+    parts.concat().into()
 }
 
 /// Render the complete Advisor instructions independently of the Engineer
@@ -569,7 +665,7 @@ architectural advice, and strategic planning for software engineering tasks.
 You can exchange follow-up messages with the requesting Engineer through `agents.message`. Ask a
 focused question when missing context would materially change your recommendation and cannot be
 obtained from the workspace. Continue independent investigation while awaiting a reply; when
-blocked, use the Python waiting controls. Follow-up messages can refine or challenge your
+blocked, end your turn and the reply wakes you. Follow-up messages can refine or challenge your
 findings, so build on the existing analysis rather than restarting it.
 
 Key responsibilities:
@@ -638,11 +734,6 @@ mechanical plumbing unless it contradicts the stated intent.
 Look for the code-judo move: a simpler framing that deletes branches, modes, wrappers, or special
 cases while preserving behavior. Treat new complexity as guilty until it earns its keep. Prefer
 direct ownership, one source of truth, and explicit invariants over clever generality.
-
-For TypeScript-heavy reviews, reason from the type model as well as runtime behavior. Flag `any`,
-casts, non-null assertions, unnecessary optionality, overloaded shapes, or lost inference when they
-hide real invariants. Prefer discriminated unions, required fields, precise return types at
-public/module boundaries, and type designs that make illegal states unrepresentable.
 
 When reviewing current changes, answer these in order:
 
@@ -796,23 +887,12 @@ view_image('/absolute/path/to/capture.png')
 "#,
         );
 
+    out.push_str(TALKING_TO_PARENT);
     out.push_str(EXECUTION);
     out.push_str("## Working with other agents\n\n");
     out.push_str(team);
     out.push_str(
-        r#"Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.
-For back-and-forth collaboration, answer the agent's question or assess its findings, then send
-the next scoped request and say whether another reply is needed. Stop exchanging messages when
-the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, end your turn; the reply wakes you.
-
-What you send with human.send is mailed to your parent. Children's messages arrive the same way.
-
-```python
-agents.message(*, agent_id: str, message: str) -> Awaitable[str]
-```
-
-## Shape the response
+        r#"## Shape the response
 
 Shape the answer around the caller's decision. Lead with the conclusion or recommendation they need,
 then provide only the evidence and next actions needed to use it. A quick "X or Y?" gets a direct
@@ -853,8 +933,8 @@ When reviewing code, examine it thoroughly but report only the most important, a
 When referencing code, use fluent Markdown links of the form `[display
 text](file:///absolute/path#L10-L20)` — never paste a raw `file://` URL as visible text.
 
-What you send with human.send is mailed to the requesting Engineer. Send one self-contained and
-focused result — a clear recommendation with the evidence, material assumptions, and unresolved issues
+Send the requesting Engineer one self-contained and focused result with agents.message — a clear
+recommendation with the evidence, material assumptions, and unresolved issues
 needed to act on it, then end your turn. A result does not prevent later back-and-forth; answer follow-up
 messages in the context of the prior discussion.
 
@@ -867,30 +947,6 @@ anyone or start work. The description is limited to 16 KiB.
 ```python
 def papercut(*, description: str) -> Awaitable[str]: ...
 ```
-
-## Diagrams
-
-When a diagram would explain architecture, workflows, data flow, state transitions, or relationships
-better than prose alone, create it with a `diagram` code block in your response. Use plain text or
-box-drawing characters with square corners (`┌`, `┐`, `└`, `┘`) inside `diagram` blocks. Keep
-diagrams readable when rendered as monospaced text. Only write Mermaid syntax for diagrams if the
-user explicitly asks for Mermaid diagrams.
-
-Example:
-
-```diagram
-┌────────┐     ┌─────┐     ┌──────────┐
-│ Client │────▶│ API │────▶│ Database │
-└────┬───┘     └──┬──┘     └──────────┘
-     │            │
-     │            ▼
-     │        ┌────────┐
-     └───────▶│ Worker │
-              └────────┘
-```
-
-In user-facing responses, never write a bare commit SHA for a github.com repository; link it to the
-commit page, for example [`abc1234`](https://github.com/org/repo/commit/abc1234).
 
 "#,
     );
@@ -915,12 +971,17 @@ pub(crate) fn prompt(
     let team_context = team_context(multi_agent, role);
     let workspace = render_workspace_prompt(place);
     let context = format!("{workspace}{agents_md}{skills}");
+    role_prompt(&team_context, multi_agent, role, &context)
+}
+
+fn role_prompt(team: &str, multi_agent: Option<&Team>, role: AgentRole, context: &str) -> Arc<str> {
+    let child = multi_agent.is_some_and(|tools| !tools.spawned_by.user_owned());
     let user_owned = multi_agent
         .filter(|tools| tools.spawned_by.user_owned())
         .map_or("", |_| USER_OWNED_ENGINEERS);
     match role {
-        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, user_owned, &context),
-        AgentRole::Advisor { .. } => advisor_prompt(&team_context, &context),
+        AgentRole::Engineer { .. } => main_agent_prompt(team, user_owned, context, child),
+        AgentRole::Advisor { .. } => advisor_prompt(team, context),
     }
 }
 
@@ -931,8 +992,7 @@ fn team_context(multi_agent: Option<&Team>, role: AgentRole) -> String {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
                  agent id is {agent_id}; your parent agent is {}.\n\nMessages from your \
-                 parent define your task. What you send with human.send is mailed to your \
-                 parent.",
+                 parent define your task. Report to your parent with agents.message.",
                 parent
             ),
             None => format!(
@@ -944,16 +1004,15 @@ fn team_context(multi_agent: Option<&Team>, role: AgentRole) -> String {
             return format!(
                 "{identity}
 
-Complete your independent analysis and send it to your parent with human.send. \
-Use the available messaging tool to request context from a known agent, and \
-end your turn when blocked on a reply.
+Complete your independent analysis and send it to your parent with agents.message. \
+Ask a known agent for context the same way, and end your turn when blocked on a reply.
 "
             );
         }
         let ownership = match (tools.spawned_by, tools.started_by.as_deref()) {
             (AgentSpawnedBy::Engineer, _) => {
                 "You were spawned by another Engineer. Own the bounded assignment in the \
-                 parent message; what you send with human.send is mailed to that Engineer."
+                 parent message."
                     .to_owned()
             }
             // An Engineer started for the user is the user's like any other;
@@ -995,19 +1054,7 @@ pub(crate) fn claude_prompt(
 ) -> Arc<str> {
     let common = match place {
         Some(place) => prompt(place, multi_agent, role),
-        None => {
-            let team = team_context(multi_agent, role);
-            match role {
-                AgentRole::Engineer { .. } => main_agent_prompt(
-                    &team,
-                    multi_agent
-                        .filter(|tools| tools.spawned_by.user_owned())
-                        .map_or("", |_| USER_OWNED_ENGINEERS),
-                    "",
-                ),
-                AgentRole::Advisor { .. } => advisor_prompt(&team, ""),
-            }
-        }
+        None => role_prompt(&team_context(multi_agent, role), multi_agent, role, ""),
     };
     format!(
         r#"# Rho integration
@@ -1016,9 +1063,9 @@ pub(crate) fn claude_prompt(
 
 The `exec` described below is the `mcp__py__exec` tool, with one Python source
 string. Claude Code built-in tools are disabled; make one notebook call per
-response. CLI Result prose is not a final answer and is not delivered to the
-human. If you write prose without a call, the host will ask you to use
-`human.send()`; repeated prose-only responses stop until the human writes.
+response. CLI Result prose is not a final answer and is not delivered to anyone.
+If you write prose without a call, the host will remind you to make one;
+repeated prose-only responses stop until the user writes.
 When an exec that called end_turn() returns, Claude Code ends your turn.
 The notebook and its running tasks survive Claude CLI respawns. A Rho runtime
 restart loses them. An open MCP call can return early on a notebook wake;
@@ -1296,7 +1343,7 @@ mod tests {
 
     #[test]
     fn engineer_prompt_integrates_capabilities_in_story_order() {
-        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "", "WORKSPACE_SENTINEL");
+        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "", "WORKSPACE_SENTINEL", false);
         let headings = prompt
             .lines()
             .filter(|line| line.starts_with("## "))
@@ -1427,7 +1474,6 @@ mod tests {
             "## Working with other agents",
             "## Shape the response",
             "## Communication",
-            "## Diagrams",
         ] {
             assert!(prompt.contains(section), "missing {section}");
         }
@@ -1437,13 +1483,17 @@ mod tests {
         assert!(prompt.contains("## Working with other agents\n\nTEAM_SENTINEL\n\n"));
         assert!(prompt.contains("agents.message("));
         assert!(prompt.contains("Use `web.run` for web searches and reading web pages."));
-        assert!(prompt.contains("mailed to the requesting Engineer"));
+        assert!(prompt.contains("focused result with agents.message"));
         assert!(!prompt.contains("transcript"));
         for forbidden in [
             "spawn_new_advisor",
             "spawn_new_engineer",
             "agents.cancel(*",
             "Autonomy And Persistence",
+            "human.",
+            "archive()",
+            "## Diagrams",
+            "TypeScript",
             "Python Code Mode",
             "Available tools:",
         ] {
@@ -1454,7 +1504,7 @@ mod tests {
     #[test]
     fn engineer_delegation_requires_concrete_benefit_in_both_runtimes() {
         for prompt in [
-            main_agent_prompt("", "", ""),
+            main_agent_prompt("", "", "", false),
             claude_prompt(None, None, AgentRole::default()),
         ] {
             assert!(prompt.contains("### Engineers\n\n```python\nagents.spawn_new_engineer("));
@@ -1509,16 +1559,8 @@ mod tests {
     #[test]
     fn agent_messaging_scopes_replies_and_avoids_duplicate_completion_reports() {
         for prompt in [
-            main_agent_prompt("", "", ""),
-            advisor_prompt("", ""),
+            main_agent_prompt("", "", "", false),
             claude_prompt(None, None, AgentRole::default()),
-            claude_prompt(
-                None,
-                None,
-                AgentRole::Advisor {
-                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
-                },
-            ),
         ] {
             let communication = prompt.split("## Working with other agents").nth(1).unwrap();
             for rule in [
@@ -1530,17 +1572,14 @@ mod tests {
                 assert!(communication.contains(rule), "missing {rule}");
             }
         }
-        for prompt in [main_agent_prompt("", "", ""), advisor_prompt("", "")] {
-            let communication = prompt.split("## Working with other agents").nth(1).unwrap();
-            assert!(
-                communication.contains("What you send with human.send is mailed to your parent")
-            );
-        }
+        let parent = main_agent_prompt("", "", "", false);
+        assert!(parent.contains("it reports back to you with agents.message"));
+        assert!(!parent.contains("mailed to your parent"));
     }
 
     #[test]
     fn execution_examples_cover_commands_and_live_cells_for_each_role() {
-        let native = [main_agent_prompt("", "", ""), advisor_prompt("", "")];
+        let native = [main_agent_prompt("", "", "", false), advisor_prompt("", "")];
         let claude = [
             claude_prompt(None, None, AgentRole::default()),
             claude_prompt(
@@ -1575,9 +1614,9 @@ mod tests {
                 assert!(prompt.contains(rule), "{rule}");
             }
         }
+        assert!(claude[0].contains("human.send(text)"));
         for prompt in &claude {
             assert!(prompt.contains("mcp__py__exec"));
-            assert!(prompt.contains("human.send(text)"));
             assert!(prompt.contains("The check-in comes 120 seconds after your last response"));
         }
     }
@@ -1600,13 +1639,53 @@ mod tests {
             assert!(prompt.contains("eng-child"));
             assert!(prompt.contains("eng-parent"));
             assert!(prompt.contains("mcp__py__exec"));
-            assert!(prompt.contains("human.send(text)"));
-            assert!(prompt.contains("archive()"));
+            assert!(prompt.contains("agents.message(*, agent_id: str"));
+            assert!(prompt.contains("end_turn()"));
             assert!(prompt.contains("CLI Result prose is not a final answer"));
-            assert_eq!(
-                prompt.contains("agents.spawn_new_engineer(*"),
-                role.is_engineer()
-            );
+            // A child talks only to its parent and never delegates.
+            for forbidden in [
+                "human.",
+                "archive()",
+                "agents.spawn_new_engineer(*",
+                "## Diagrams",
+            ] {
+                assert!(!prompt.contains(forbidden), "{forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_child_engineer_keeps_the_engineering_policy_and_reports_to_its_parent() {
+        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "", "WORKSPACE_SENTINEL", true);
+        let headings = prompt
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headings,
+            [
+                "## Owning the assignment",
+                "## Engineering And Scope",
+                "## Discovery Discipline",
+                "## Verification",
+                "## Actions Requiring Approval",
+                "## Acting and talking",
+                "## How time works",
+                "## The notebook",
+                "## Working with other agents",
+                "## Reporting to your parent",
+            ]
+        );
+        assert!(prompt.contains("## Working with other agents\n\nTEAM_SENTINEL\n\n"));
+        assert!(prompt.contains("def papercut("));
+        assert!(prompt.ends_with("WORKSPACE_SENTINEL"));
+        for forbidden in [
+            "human.",
+            "archive()",
+            "spawn_new_advisor",
+            "spawn_new_engineer",
+        ] {
+            assert!(!prompt.contains(forbidden), "{forbidden}");
         }
     }
 
@@ -1628,6 +1707,10 @@ mod tests {
             let prompt = claude_prompt(None, Some(team), AgentRole::default());
             assert!(prompt.contains(signature));
             assert!(prompt.find("### Engineers\n").unwrap() < prompt.find(signature).unwrap());
+            // Whoever spawned it, an Engineer the user manages talks to the user.
+            assert!(
+                prompt.contains("human.send(text)") && prompt.contains("## Working with the user")
+            );
         }
         for prompt in [
             claude_prompt(None, Some(&child), AgentRole::default()),
@@ -1649,7 +1732,7 @@ mod tests {
 
         // The native prompt offers it after the Engineers it manages and
         // before briefing, which applies to both.
-        let native = main_agent_prompt("", USER_OWNED_ENGINEERS, "");
+        let native = main_agent_prompt("", USER_OWNED_ENGINEERS, "", false);
         let engineers = native.find("### Engineers\n").unwrap();
         let owned = native.find("### Engineers the user manages").unwrap();
         let briefing = native.find("### Briefing and integrating work").unwrap();

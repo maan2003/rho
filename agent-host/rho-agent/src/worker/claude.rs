@@ -2086,7 +2086,7 @@ impl ClaudeLoop {
                         return Ok(());
                     }
                     let content = if correction {
-                        vec![ContentPart::Text { text: "Your last response had no exec call. Text outside a call reaches nobody: speak with human.send().".into() }]
+                        vec![ContentPart::Text { text: "Your last response had no exec call. Text outside a call reaches nobody.".into() }]
                     } else if drained.is_empty() && self.pending_output.is_none() {
                         vec![ContentPart::Text {
                             text: "Check-in: nothing new.".into(),

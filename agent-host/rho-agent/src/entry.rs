@@ -153,7 +153,7 @@ impl RequestNotice {
                 "Your response was cut off while you were writing its cell; only the code shown ran. Carry on from the notebook's state without replaying it."
             }
             Self::PreviousResponseHadNoExec => {
-                "Your last response had no exec call. Text outside a call reaches nobody: speak with human.send()."
+                "Your last response had no exec call. Text outside a call reaches nobody."
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
