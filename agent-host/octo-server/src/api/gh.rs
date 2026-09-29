@@ -1,32 +1,54 @@
-//! Selected ghapi REST operations. The Unix socket and its input are untrusted.
-use std::collections::BTreeMap;
+//! Selected ghapi REST operations. Agents never send a GitHub token.
 use std::sync::Arc;
 
-use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use futures_util::StreamExt as _;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::state::AppState;
 
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/repos/{owner}/{repo}/pulls", get(proxy).post(proxy))
-        .route("/repos/{owner}/{repo}/pulls/{number}", get(proxy))
-        .route("/repos/{owner}/{repo}/issues", get(proxy))
-        .route("/repos/{owner}/{repo}/issues/{number}", get(proxy))
-        .route("/repos/{owner}/{repo}/commits/{ref}/status", get(proxy))
-        .route("/repos/{owner}/{repo}/commits/{ref}/check-runs", get(proxy))
+        .route(
+            "/repos/{owner}/{repo}/pulls",
+            get(list_pulls).post(create_pull),
+        )
+        .route("/repos/{owner}/{repo}/pulls/{number}", get(get_pull))
+        .route("/repos/{owner}/{repo}/issues", get(list_issues))
+        .route("/repos/{owner}/{repo}/issues/{number}", get(get_issue))
+        .route(
+            "/repos/{owner}/{repo}/commits/{ref}/status",
+            get(get_status),
+        )
+        .route(
+            "/repos/{owner}/{repo}/commits/{ref}/check-runs",
+            get(list_checks),
+        )
+        .layer(DefaultBodyLimit::disable())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    state: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckQuery {
+    page: Option<u32>,
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DraftPr {
     title: String,
@@ -39,6 +61,104 @@ struct DraftPr {
     maintainer_can_modify: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct User {
+    login: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Branch {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Pull {
+    number: u64,
+    html_url: String,
+    title: String,
+    body: Option<String>,
+    state: String,
+    draft: bool,
+    head: Branch,
+    base: Branch,
+    user: Option<User>,
+    created_at: String,
+    updated_at: String,
+    merged_at: Option<String>,
+    mergeable: Option<bool>,
+    mergeable_state: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Label {
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IssuePull {
+    html_url: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Issue {
+    number: u64,
+    html_url: String,
+    title: String,
+    body: Option<String>,
+    state: String,
+    user: Option<User>,
+    labels: Vec<Label>,
+    pull_request: Option<IssuePull>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CommitStatus {
+    context: String,
+    state: String,
+    description: Option<String>,
+    target_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CombinedStatus {
+    state: String,
+    statuses: Vec<CommitStatus>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckRun {
+    id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckRuns {
+    total_count: u64,
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Deserialize)]
+struct GitHubError {
+    message: String,
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"message":"GitHub operation unavailable through Octo"})),
+    )
+        .into_response()
+}
+
 fn allowed_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -47,123 +167,22 @@ fn allowed_segment(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
 }
 
-fn parse_path(path: &str) -> Option<Vec<String>> {
-    let mut result = Vec::new();
-    for part in path.strip_prefix('/')?.split('/') {
-        // Reject escapes, including encoded separators, rather than relying on
-        // the URL library and the policy parser to normalize them identically.
-        if !allowed_segment(part) {
-            return None;
-        }
-        result.push(part.to_owned());
-    }
-    Some(result)
-}
-
-fn text(s: &str, max: usize) -> bool {
-    s.len() <= max && !s.contains('\0')
-}
-
-fn title(s: &str) -> bool {
-    text(s, 256) && !s.trim().is_empty()
-}
-
-fn reference(s: &str) -> bool {
-    text(s, 255) && !s.is_empty() && !s.chars().any(char::is_control)
-}
-
-fn number(s: &str) -> bool {
-    s.parse::<u64>().is_ok_and(|v| v > 0)
-}
-
-fn commit_sha(s: &str) -> bool {
+fn sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn parse_query_params(uri: &Uri, keys: &[&str]) -> Option<BTreeMap<String, String>> {
-    let mut params = BTreeMap::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
-        if !keys.contains(&key.as_ref()) || params.contains_key(key.as_ref()) {
-            return None;
-        }
-        let value = value.into_owned();
-        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
-            return None;
-        }
-        let value = match key.as_ref() {
-            "state" if matches!(value.as_str(), "open" | "closed" | "all") => value,
-            "page" => value.parse::<u32>().ok().filter(|n| *n > 0)?.to_string(),
-            "per_page" => value
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (1..=100).contains(n))?
-                .to_string(),
-            _ => return None,
-        };
-        params.insert(key.into_owned(), value);
-    }
-    Some(params)
-}
-
-fn rest_operation(
-    method: &Method,
-    parts: &[&str],
-    bytes: &[u8],
-    uri: &Uri,
-) -> Option<(BTreeMap<String, String>, Option<Value>)> {
-    let (keys, body) = match (method, parts) {
-        (&Method::GET, ["repos", _, _, "pulls" | "issues"]) => {
-            (&["state", "page", "per_page"][..], None)
-        }
-        (&Method::GET, ["repos", _, _, "pulls" | "issues", n]) if number(n) => (&[][..], None),
-        (&Method::GET, ["repos", _, _, "commits", sha, "status"]) if commit_sha(sha) => {
-            (&[][..], None)
-        }
-        (&Method::GET, ["repos", _, _, "commits", sha, "check-runs"]) if commit_sha(sha) => {
-            (&["page", "per_page"][..], None)
-        }
-        (&Method::POST, ["repos", _, _, "pulls"]) => {
-            let pr: DraftPr = serde_json::from_slice(bytes).ok()?;
-            if !pr.draft
-                || !title(&pr.title)
-                || !reference(&pr.head)
-                || !reference(&pr.base)
-                || pr.body.as_deref().is_some_and(|body| !text(body, 65536))
-            {
-                return None;
-            }
-            (&[][..], Some(serde_json::to_value(pr).ok()?))
-        }
-        _ => return None,
-    };
-    if body.is_none() && !bytes.is_empty() {
-        return None;
-    }
-    Some((parse_query_params(uri, keys)?, body))
-}
-
-fn forbidden(message: &str) -> Response {
-    (StatusCode::FORBIDDEN, Json(json!({"message":message}))).into_response()
-}
-
-pub async fn proxy(
-    State(state): State<Arc<AppState>>,
+// Only the token and explicitly understood input enter the upstream request.
+// Only fields represented by T come back to the agent.
+async fn github<T: DeserializeOwned + Serialize>(
+    state: Arc<AppState>,
     method: Method,
-    uri: Uri,
-    _headers: HeaderMap,
-    body: Body,
+    path: &[&str],
+    query: &[(&str, String)],
+    body: Option<DraftPr>,
 ) -> Response {
-    let Some(parts) = parse_path(uri.path()) else {
-        return forbidden("GitHub operation unavailable through Octo");
-    };
-    let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
-    let bytes = match to_bytes(body, MAX_REQUEST_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
-    let Some((params, body)) = rest_operation(&method, &parts, &bytes, &uri) else {
-        return forbidden("GitHub operation unavailable through Octo");
-    };
+    if !path.iter().all(|part| allowed_segment(part)) {
+        return forbidden();
+    }
     let token = match state.get_token().await {
         Ok(token) => token,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -172,11 +191,10 @@ pub async fn proxy(
     url.path_segments_mut()
         .expect("GitHub API base is hierarchical")
         .clear()
-        .extend(&parts);
-    url.set_query(None);
-    if !params.is_empty() {
+        .extend(path);
+    if !query.is_empty() {
         url.query_pairs_mut()
-            .extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
     }
     let mut request = state
         .client
@@ -192,15 +210,13 @@ pub async fn proxy(
         Ok(response) => response,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    // The explicit operations here do not require redirects. Never follow an
-    // unvalidated Location with the host's token.
+    // Following redirects could disclose the host's token to another origin.
     if upstream.status().is_redirection() {
         return StatusCode::BAD_GATEWAY.into_response();
     }
     let status = upstream.status();
-    let mut response_headers = HeaderMap::new();
+    let mut headers = HeaderMap::new();
     for name in [
-        "content-type",
         "link",
         "etag",
         "x-ratelimit-remaining",
@@ -208,21 +224,181 @@ pub async fn proxy(
         "x-ratelimit-reset",
     ] {
         if let Some(value) = upstream.headers().get(name) {
-            response_headers.insert(name, value.clone());
+            headers.insert(name, value.clone());
         }
     }
-    let mut received = 0_usize;
-    let stream = upstream.bytes_stream().map(move |part| {
-        let part = part.map_err(std::io::Error::other)?;
-        received = received.saturating_add(part.len());
-        if received > 48 * 1024 * 1024 {
-            return Err(std::io::Error::other(
-                "GitHub response exceeded the 48 MiB proxy limit",
-            ));
-        }
-        Ok(part)
-    });
-    (status, response_headers, Body::from_stream(stream)).into_response()
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    if !status.is_success() {
+        let message = serde_json::from_slice::<GitHubError>(&bytes)
+            .map(|error| error.message)
+            .unwrap_or_else(|_| "GitHub request failed".into());
+        return (status, Json(json!({"message":message}))).into_response();
+    }
+    match serde_json::from_slice::<T>(&bytes) {
+        Ok(value) => (status, headers, Json(value)).into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+fn list_params(query: ListQuery) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    if let Some(state) = query.state {
+        params.push(("state", state));
+    }
+    if let Some(page) = query.page {
+        params.push(("page", page.to_string()));
+    }
+    if let Some(per_page) = query.per_page {
+        params.push(("per_page", per_page.to_string()));
+    }
+    params
+}
+
+fn check_params(query: CheckQuery) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    if let Some(page) = query.page {
+        params.push(("page", page.to_string()));
+    }
+    if let Some(per_page) = query.per_page {
+        params.push(("per_page", per_page.to_string()));
+    }
+    params
+}
+
+async fn list_pulls(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    github::<Vec<Pull>>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "pulls"],
+        &list_params(query),
+        None,
+    )
+    .await
+}
+
+async fn get_pull(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github::<Pull>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "pulls", &number],
+        &[],
+        None,
+    )
+    .await
+}
+
+async fn create_pull(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    uri: Uri,
+    body: Result<Json<DraftPr>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(pr)) = body else {
+        return forbidden();
+    };
+    if uri.query().is_some() || !pr.draft {
+        return forbidden();
+    }
+    github::<Pull>(
+        state,
+        Method::POST,
+        &["repos", &owner, &repo, "pulls"],
+        &[],
+        Some(pr),
+    )
+    .await
+}
+
+async fn list_issues(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    github::<Vec<Issue>>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "issues"],
+        &list_params(query),
+        None,
+    )
+    .await
+}
+
+async fn get_issue(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github::<Issue>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "issues", &number],
+        &[],
+        None,
+    )
+    .await
+}
+
+async fn get_status(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, sha)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !self::sha(&sha) {
+        return forbidden();
+    }
+    github::<CombinedStatus>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "commits", &sha, "status"],
+        &[],
+        None,
+    )
+    .await
+}
+
+async fn list_checks(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, sha)): Path<(String, String, String)>,
+    query: Result<Query<CheckQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !self::sha(&sha) {
+        return forbidden();
+    }
+    github::<CheckRuns>(
+        state,
+        Method::GET,
+        &["repos", &owner, &repo, "commits", &sha, "check-runs"],
+        &check_params(query),
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -230,65 +406,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::routing::any;
+    use serde_json::Value;
 
     use super::*;
 
+    fn pull() -> serde_json::Value {
+        json!({
+            "number":42, "html_url":"https://github.com/acme/widgets/pull/42",
+            "title":"Fix", "body":null, "state":"open", "draft":true,
+            "head":{"ref":"rho/fix","sha":"a".repeat(40)},
+            "base":{"ref":"main","sha":"b".repeat(40)},
+            "user":{"login":"alice"}, "created_at":"2025-01-01T00:00:00Z",
+            "updated_at":"2025-01-02T00:00:00Z", "merged_at":null,
+            "ignored":"not relayed"
+        })
+    }
+
+    fn issue() -> serde_json::Value {
+        json!({
+            "number":12, "html_url":"https://github.com/acme/widgets/issues/12",
+            "title":"Bug", "body":"details", "state":"open",
+            "user":{"login":"alice"}, "labels":[{"name":"bug"}],
+            "created_at":"2025-01-01T00:00:00Z", "updated_at":"2025-01-02T00:00:00Z",
+            "ignored":"not relayed"
+        })
+    }
+
     #[test]
-    fn ghapi_paths_and_draft_creation_are_only_rest_operations() {
-        assert!(parse_path("/repos/acme/widgets/%2e%2e").is_none());
-        let pulls = &["repos", "acme", "widgets", "pulls"];
-        let query: Uri = "/repos/acme/widgets/pulls?state=open&per_page=100&page=2"
-            .parse()
-            .unwrap();
-        assert!(rest_operation(&Method::GET, pulls, b"", &query).is_some());
-        for q in [
-            "state=other",
-            "per_page=101",
-            "page=0",
-            "page=1&page=2",
-            "head=branch",
-        ] {
-            let uri: Uri = format!("/repos/acme/widgets/pulls?{q}").parse().unwrap();
-            assert!(
-                rest_operation(&Method::GET, pulls, b"", &uri).is_none(),
-                "{q}"
-            );
+    fn path_segments_cannot_escape_the_selected_route() {
+        for segment in ["..", ".", "main/secret", "main%2Fsecret"] {
+            assert!(!allowed_segment(segment));
         }
-        let uri: Uri = "/repos/acme/widgets/pulls".parse().unwrap();
-        assert!(
-            rest_operation(
-                &Method::POST,
-                pulls,
-                br#"{"title":"Draft","head":"rho/change","base":"main","draft":true}"#,
-                &uri
-            )
-            .is_some()
-        );
-        for body in [
-            br#"{"title":"Draft","head":"rho/change","base":"main","draft":false}"#.as_slice(),
-            br#"{"title":"Draft","head":"rho/change","base":"main"}"#,
-            br#"{"title":"Draft","head":"rho/change","base":"main","draft":true,"state":"open"}"#,
-        ] {
-            assert!(rest_operation(&Method::POST, pulls, body, &uri).is_none());
-        }
-        assert!(
-            rest_operation(
-                &Method::PATCH,
-                &["repos", "acme", "widgets", "pulls", "12"],
-                br#"{"title":"Changed"}"#,
-                &uri
-            )
-            .is_none()
-        );
-        assert!(
-            rest_operation(
-                &Method::GET,
-                &["repos", "acme", "widgets", "pulls", "12", "files"],
-                b"",
-                &uri
-            )
-            .is_none()
-        );
+        assert!(allowed_segment("rho.fix"));
+        assert!(!sha("main"));
+        assert!(sha(&"a".repeat(40)));
     }
 
     #[tokio::test]
@@ -309,7 +460,7 @@ mod tests {
                     assert_eq!(request["title"], "Fix");
                     assert_eq!(request["head"], "rho/fix");
                     assert_eq!(request["base"], "main");
-                    (StatusCode::CREATED, Json(json!({"number":42,"draft":true})))
+                    (StatusCode::CREATED, Json(pull()))
                 }
             },
         ));
@@ -362,44 +513,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(response.json::<Value>().await.unwrap()["number"], 42);
+        let result = response.json::<Value>().await.unwrap();
+        assert_eq!(result["number"], 42);
+        assert!(result.get("ignored").is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         proxy_task.abort();
         upstream_task.abort();
     }
 
-    #[test]
-    fn commit_status_reads_require_sha_and_bounded_queries() {
-        let sha = "0123456789abcdef0123456789abcdef01234567";
-        let status = ["repos", "acme", "widgets", "commits", sha, "status"];
-        let checks = ["repos", "acme", "widgets", "commits", sha, "check-runs"];
-        let uri: Uri = format!("/repos/acme/widgets/commits/{sha}/status")
-            .parse()
+    #[tokio::test]
+    async fn read_handlers_relay_only_understood_fields() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let upstream = axum::Router::new().fallback(any(move |uri: Uri| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                let result = match uri.path() {
+                    "/repos/acme/widgets/pulls" => {
+                        assert_eq!(uri.query(), Some("state=all&page=2"));
+                        json!([pull()])
+                    }
+                    "/repos/acme/widgets/pulls/42" => pull(),
+                    "/repos/acme/widgets/issues" => json!([issue()]),
+                    "/repos/acme/widgets/issues/12" => issue(),
+                    "/repos/acme/widgets/issues/999" => json!({"number":999}),
+                    other => panic!("unexpected GitHub path {other}"),
+                };
+                Json(result)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let path = format!("{base}/repos/acme/widgets");
+        for (suffix, field, value) in [
+            ("pulls?state=all&page=2", "title", "Fix"),
+            ("pulls/42", "title", "Fix"),
+            ("issues", "body", "details"),
+            ("issues/12", "body", "details"),
+        ] {
+            let response = client.get(format!("{path}/{suffix}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+            let body = response.json::<Value>().await.unwrap();
+            let item = if body.is_array() { &body[0] } else { &body };
+            assert_eq!(item[field], value, "{suffix}");
+            assert!(item.get("ignored").is_none(), "{suffix}");
+        }
+        for suffix in [
+            "pulls?unexpected=x",
+            "pulls?page=2&page=3",
+            "issues/0",
+            "pulls/00",
+            "pulls/../../users",
+        ] {
+            let status = client
+                .get(format!("{path}/{suffix}"))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_ne!(status, StatusCode::OK, "{suffix}");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        let response = client
+            .get(format!("{path}/issues/999"))
+            .send()
+            .await
             .unwrap();
-        assert!(rest_operation(&Method::GET, &status, b"", &uri).is_some());
-        assert!(rest_operation(&Method::GET, &status, b"body", &uri).is_none());
-        assert!(rest_operation(&Method::HEAD, &status, b"", &uri).is_none());
-        assert!(rest_operation(&Method::POST, &status, b"", &uri).is_none());
-        let query: Uri = format!("{uri}?per_page=100&page=2").parse().unwrap();
-        assert!(rest_operation(&Method::GET, &status, b"", &query).is_none());
-        let (params, _) = rest_operation(&Method::GET, &checks, b"", &query).unwrap();
-        assert_eq!(params["page"], "2");
-        assert_eq!(params["per_page"], "100");
-        for query in ["page=0", "per_page=101", "page=2&page=3", "filter=latest"] {
-            let uri: Uri = format!("/repos/acme/widgets/commits/{sha}/check-runs?{query}")
-                .parse()
-                .unwrap();
-            assert!(
-                rest_operation(&Method::GET, &checks, b"", &uri).is_none(),
-                "{query}"
-            );
-        }
-        for ref_name in ["main", "..", "0123456789abcdef0123456789abcdef0123456g"] {
-            let parts = ["repos", "acme", "widgets", "commits", ref_name, "status"];
-            assert!(rest_operation(&Method::GET, &parts, b"", &uri).is_none());
-        }
-        assert!(parse_path("/repos/acme/widgets/commits/%2e%2e/status").is_none());
-        assert!(parse_path("/repos/acme/widgets/commits/main%2Fsecret/status").is_none());
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -423,7 +614,15 @@ mod tests {
                                 && uri.query() == Some("page=2&per_page=99")
                     );
                     assert!(body.is_empty());
-                    let mut response = (StatusCode::OK, "{\"state\":\"success\"}").into_response();
+                    let result = if uri.path().ends_with("/status") {
+                        json!({"state":"success","statuses":[{"context":"build","state":"success"}],
+                               "ignored":"not relayed"})
+                    } else {
+                        json!({"total_count":1, "check_runs":[{"id":17,"name":"build",
+                            "status":"completed","conclusion":"success",
+                            "started_at":null,"completed_at":null}],"ignored":"not relayed"})
+                    };
+                    let mut response = (StatusCode::OK, Json(result)).into_response();
                     response.headers_mut().insert(
                         "x-ratelimit-remaining",
                         axum::http::HeaderValue::from_static("4900"),
@@ -461,14 +660,16 @@ mod tests {
                 "4900"
             );
             assert_eq!(response.headers().get("x-ratelimit-limit").unwrap(), "5000");
-            assert_eq!(response.text().await.unwrap(), "{\"state\":\"success\"}");
+            let body = response.json::<Value>().await.unwrap();
+            assert!(body.get("ignored").is_none());
+            if suffix == "status" {
+                assert_eq!(body["statuses"][0]["context"], "build");
+            } else {
+                assert_eq!(body["check_runs"][0]["id"], 17);
+            }
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-        for suffix in [
-            "status?page=2",
-            "check-runs?per_page=101",
-            "check-runs?page=0",
-        ] {
+        for suffix in ["status?page=2"] {
             assert_eq!(
                 client
                     .get(format!("{path}/{suffix}"))
