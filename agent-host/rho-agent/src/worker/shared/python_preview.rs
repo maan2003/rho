@@ -82,7 +82,24 @@ fn preview_from_start(
                 .children(&mut cursor)
                 .find(|child| child.kind() == "string_end")
         });
-    let content_end = string_end.map_or(source.len(), |end| end.start_byte());
+    // An unfinished triple-quoted string may already contain one or two
+    // closing quotes. Treat them as a pending delimiter, not body text, and
+    // complete only the missing quotes in the repaired parse.
+    let pending_quotes = if string_end.is_none() && closing.len() == 3 {
+        let count = source[start.end_byte()..]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == quote)
+            .count()
+            .min(2);
+        let preceding = &source[..source.len() - count];
+        (preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0)
+            .then_some(count)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let content_end = string_end.map_or(source.len() - pending_quotes, |end| end.start_byte());
     let interpolation = is_fstring
         .then(|| first_interpolation(&source[start.end_byte()..content_end]))
         .flatten()
@@ -105,7 +122,7 @@ fn preview_from_start(
     {
         format!("\\{closing})")
     } else {
-        format!("{closing})")
+        format!("{})", &closing[pending_quotes..])
     };
     let repaired = format!("{prefix}{suffix}");
     let tree = parser.parse(&repaired, None)?;
@@ -508,6 +525,81 @@ mod tests {
                 expected,
                 "{source:?}"
             );
+        }
+    }
+
+    #[test]
+    fn all_prefixes_after_visible_text_keep_draft() {
+        let cases = [
+            "import asyncio\nawait asyncio.sleep(10)\nhuman.send(\"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\")",
+            "human.send('Hello, world!')",
+            "human.send(\"One line\\nThe next!\")",
+            "human.send('first' + ' second' + ' third')",
+        ];
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        for source in cases {
+            let mut seen = false;
+            for (i, _) in source
+                .char_indices()
+                .chain(std::iter::once((source.len(), '\0')))
+            {
+                let prefix = &source[..i];
+                let current = preview(&mut parser, prefix);
+                if current.is_some() {
+                    seen = true;
+                }
+                if seen {
+                    assert!(current.is_some(), "lost draft at {prefix:?}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn partially_closed_triple_quote_keeps_body_without_delimiter() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        for source in [
+            "human.send(\"\"\"Hello\"",
+            "human.send(\"\"\"Hello\"\"",
+            "human.send(\"\"\"Hello\"\"\")",
+            "human.send('''Hello'",
+            "human.send('''Hello''",
+            "human.send('''Hello''')",
+        ] {
+            assert_eq!(
+                preview(&mut parser, source).as_deref(),
+                Some("Hello"),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
+        let source = "human.send(\"\"\"First line\nSecond line with \"quotes\".\"\"\")";
+        let arguments = serde_json::json!({"source": source}).to_string();
+        let mut visible = false;
+        for (i, _) in arguments
+            .char_indices()
+            .chain(std::iter::once((arguments.len(), '\0')))
+        {
+            let prefix = &arguments[..i];
+            let draft = tool_preview(
+                "mcp__py__exec",
+                prefix,
+                rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
+            );
+            if draft.is_some() {
+                visible = true;
+            }
+            if visible {
+                assert!(draft.is_some(), "lost Claude draft at {prefix:?}");
+            }
         }
     }
 }
