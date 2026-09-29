@@ -390,8 +390,23 @@
               dependencies = [ fastcore fasttransport ];
               doCheck = false;
             };
+            ghapi = ps.buildPythonPackage {
+              pname = "ghapi";
+              version = "2.1.5-rho";
+              src = ./agent-host/rho-notebook/src/ghapi;
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/ghapi"
+                cp *.py "$out/${pkgs.python3.sitePackages}/ghapi/"
+                runHook postInstall
+              '';
+              dependencies = [ fastcore fastspec fasttransport ];
+              doCheck = false;
+            };
           in
-          [ ps.pyyaml ps.httpx fastcore fastspec fasttransport ]
+          [ ps.pyyaml ps.httpx ghapi ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 

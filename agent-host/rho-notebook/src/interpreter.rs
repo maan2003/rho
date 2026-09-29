@@ -105,47 +105,6 @@ pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
             let sys_path = py.import("sys")?.getattr("path")?;
             sys_path.call_method1("insert", (0, env!("RHO_PYTHON_SITE_PACKAGES")))?;
             sys_path.call_method1("insert", (0, ""))?;
-            // The selected upstream ghapi sources live in the binary, not on
-            // the agent's filesystem. Register the package before its relative
-            // imports, so `from ghapi.all import GhApi` is ordinary Python.
-            let modules = py.import("sys")?.getattr("modules")?;
-            let package = PyModule::new(py, "ghapi")?;
-            package.setattr("__path__", Vec::<String>::new())?;
-            modules.set_item("ghapi", &package)?;
-            for (name, filename, source) in [
-                (
-                    "ghapi.gh_spec",
-                    c"ghapi/gh_spec.py",
-                    pyo3::ffi::c_str!(include_str!("ghapi/gh_spec.py")),
-                ),
-                (
-                    "ghapi.core",
-                    c"ghapi/core.py",
-                    pyo3::ffi::c_str!(include_str!("ghapi/core.py")),
-                ),
-                (
-                    "ghapi.all",
-                    c"ghapi/all.py",
-                    pyo3::ffi::c_str!(include_str!("ghapi/all.py")),
-                ),
-            ] {
-                let module = PyModule::from_code(
-                    py,
-                    source,
-                    filename,
-                    std::ffi::CString::new(name)?.as_c_str(),
-                )?;
-                modules.set_item(name, &module)?;
-                package.setattr(name.rsplit('.').next().unwrap(), &module)?;
-            }
-            let init = PyModule::from_code(
-                py,
-                pyo3::ffi::c_str!(include_str!("ghapi/__init__.py")),
-                c"ghapi/__init__.py",
-                c"ghapi",
-            )?;
-            package.setattr("GhApi", init.getattr("GhApi")?)?;
-            package.setattr("APIError", init.getattr("APIError")?)?;
             PyModule::from_code(
                 py,
                 pyo3::ffi::c_str!(include_str!("kernel.py")),

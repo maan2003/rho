@@ -11,8 +11,7 @@ only metadata for the issue and pull-request operations needed here, and
 the two status endpoints. `all.py` exports that selection, not all upstream
 helpers.
 
-Octo validates each request independently. The supported package is
-embedded in the notebook interpreter; it is not installed for standalone
-Python or exposed as unrestricted GitHub API access. The upstream client
-depends on `fastcore`, `fastspec`, and `fasttransport`, packaged by Nix in
-`flake.nix` rather than copied here.
+Octo validates each request independently. The selected package and its `fastcore`, `fastspec`, and `fasttransport` dependencies
+are installed in the Nix Python site-packages closure. The notebook uses that
+closure; standalone Python must use the same environment. This does not expose
+unrestricted GitHub API access: Octo still validates every request.

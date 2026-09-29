@@ -38,8 +38,10 @@ async fn finished(wake: &Notify, cell: &CellHandle) {
 async fn selected_ghapi_sources_are_importable_in_the_notebook() {
     let (notebook, wake) = notebook();
     let cell = notebook.run(
-        r#"from ghapi.all import GhApi
+        r#"import ghapi, sys
+from ghapi.all import GhApi
 from ghapi.core import CheckRun
+assert ghapi.__file__.startswith(sys.path[1] + "/ghapi/"), ghapi.__file__
 assert GhApi.__module__ == "ghapi.core"
 assert CheckRun(id=8, name="build", status="completed", conclusion="success",
                 started_at=None, completed_at=None).name == "build"
