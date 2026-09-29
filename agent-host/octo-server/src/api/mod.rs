@@ -1,3 +1,2 @@
-pub mod ci;
+pub mod gh;
 pub mod git;
-pub mod pr;

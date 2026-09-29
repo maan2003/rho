@@ -402,9 +402,6 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arc-swap"
@@ -3483,17 +3480,6 @@ name = "derive-where"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9724,21 +9710,19 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
- "octo-types",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "octo-types"
 version = "0.1.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "oid-registry"
@@ -12580,7 +12564,6 @@ dependencies = [
  "moq-net",
  "notify",
  "octo-server",
- "octo-types",
  "prefix-id",
  "redb",
  "reqwest 0.12.28",
@@ -12601,7 +12584,6 @@ dependencies = [
  "rho-iroh-auth",
  "rho-ledger-server",
  "rho-openai-realtime",
- "rho-pr-monitor",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
@@ -12827,7 +12809,6 @@ dependencies = [
  "tracing",
  "wayland-client",
  "wayland-protocols-wlr",
- "zip 2.4.2",
 ]
 
 [[package]]
@@ -13286,30 +13267,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
-]
-
-[[package]]
-name = "rho-pr-monitor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-util",
- "octo-types",
- "rand 0.8.7",
- "redb",
- "reqwest 0.12.28",
- "rho-agent",
- "rho-agent-types",
- "rho-db",
- "rustls",
- "senax-encoder",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -17967,7 +17924,7 @@ dependencies = [
  "reqwest 0.12.28",
  "scratch",
  "semver",
- "zip 0.6.6",
+ "zip",
 ]
 
 [[package]]
@@ -19631,24 +19588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zip"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "thiserror 2.0.19",
- "time",
- "zopfli",
-]
-
-[[package]]
 name = "zlib-rs"
 version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19669,18 +19608,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zopfli"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
-dependencies = [
- "bumpalo",
- "crc32fast",
- "log",
- "simd-adler32",
-]
 
 [[package]]
 name = "zstd"

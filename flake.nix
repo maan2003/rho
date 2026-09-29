@@ -347,10 +347,52 @@
           paths = buildPaths;
         };
 
-        pythonPackages = pkgs.python3.withPackages (ps: [
-          ps.pyyaml
-          ps.httpx
-        ]);
+        # The selected ghapi sources use upstream's OpenAPI operation machinery.
+        # Package its Python dependencies without vendoring their repositories.
+        pythonPackages = pkgs.python3.withPackages (
+          ps:
+          let
+            fastcore = ps.buildPythonPackage {
+              pname = "fastcore";
+              version = "2.2.23";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fastcore";
+                version = "2.2.23";
+                hash = "sha256-2IFuQOZXla2iHIBGip5Ni8Pr8SMD+3FRT85zDP9mdO4=";
+              };
+              build-system = [ ps.setuptools ];
+              doCheck = false;
+            };
+            fasttransport = ps.buildPythonPackage {
+              pname = "fasttransport";
+              version = "0.0.2";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fasttransport";
+                version = "0.0.2";
+                hash = "sha256-aG7l2KVLMUVwTO1prt28YykHbNyEHfD//xFh+T021Xk=";
+              };
+              build-system = [ ps.setuptools ];
+              dependencies = [ fastcore ps.httpx2 ];
+              doCheck = false;
+            };
+            fastspec = ps.buildPythonPackage {
+              pname = "fastspec";
+              version = "0.2.5";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fastspec";
+                version = "0.2.5";
+                hash = "sha256-pdMq/4osnf19szO5SxEm8/99D+DGGuVNo/IZc5KvP/o=";
+              };
+              build-system = [ ps.setuptools ];
+              dependencies = [ fastcore fasttransport ];
+              doCheck = false;
+            };
+          in
+          [ ps.pyyaml ps.httpx fastcore fastspec fasttransport ]
+        );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
         # Evaluation in rho-devshell-builder records what the evaluator

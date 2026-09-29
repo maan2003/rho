@@ -35,6 +35,25 @@ async fn finished(wake: &Notify, cell: &CellHandle) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn selected_ghapi_sources_are_importable_in_the_notebook() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        r#"from ghapi.all import GhApi
+from ghapi.core import CheckRun
+assert GhApi.__module__ == "ghapi.core"
+assert CheckRun(id=8, name="build", status="completed", conclusion="success",
+                started_at=None, completed_at=None).name == "build"
+print("ghapi import ready")"#
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    assert_eq!(
+        notebook.report().unwrap().render().text,
+        "ghapi import ready"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cell_that_ends_first_speaks_plainly() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("print(6 * 7)".into());

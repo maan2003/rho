@@ -130,6 +130,15 @@ fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
     Ok(environment)
 }
 
+fn strip_github_environment(environment: &mut Vec<(OsString, OsString)>) {
+    environment.retain(|(name, _)| {
+        !matches!(
+            name.to_str(),
+            Some("GH_TOKEN" | "GITHUB_TOKEN" | "GH_HOST" | "GH_CONFIG_DIR")
+        )
+    });
+}
+
 fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> anyhow::Result<()> {
     let count = environment
         .iter()
@@ -457,6 +466,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         rho_rpc::protocol::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
+    // A login shell may carry GitHub credentials and gh configuration.
+    // Agents use only Octo's host-held token.
+    strip_github_environment(&mut user_environment);
     configure_octo_git_transport(&mut user_environment)?;
     if let Some(endpoint) = &args.anthropic_base_url {
         let parsed = url::Url::parse(endpoint).context("parse Anthropic base URL")?;
@@ -547,7 +559,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             claude.clone(),
             user_environment,
             platform_secrets,
-            runtime.paths.octo_socket(),
         )
         .await?,
     );
@@ -974,8 +985,6 @@ struct Services {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    /// Stateless PR, CI, review, and comment operations.
-    pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
     /// Marked whenever a quota observation lands; every agents session
@@ -1003,11 +1012,8 @@ impl Services {
         claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_fs_view::UserEnvironment,
         platform_secrets: PlatformSecrets,
-        octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
-        let pr_monitor =
-            rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let ledger = rho_ledger_server::LedgerServer::open(db.clone()).await;
         let registry = Self {
@@ -1018,7 +1024,6 @@ impl Services {
             visualizations,
             inference,
             machine_seed,
-            pr_monitor,
             platform_secrets,
             quota: tokio::sync::watch::channel(()).0,
             user_environment,
@@ -1365,8 +1370,27 @@ mod tests {
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
         PlatformSecrets, configure_octo_git_transport, prepare_image_content,
-        start_runtime_sockets, validate_image_content,
+        start_runtime_sockets, strip_github_environment, validate_image_content,
     };
+
+    #[test]
+    fn github_credentials_and_gh_config_do_not_enter_agent_environment() {
+        let mut environment = [
+            ("GH_TOKEN", "ambient-gh-token"),
+            ("GITHUB_TOKEN", "ambient-github-token"),
+            ("GH_HOST", "enterprise.example"),
+            ("GH_CONFIG_DIR", "/tmp/gh"),
+            ("PATH", "/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        strip_github_environment(&mut environment);
+        assert_eq!(
+            environment,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin"))]
+        );
+    }
 
     #[tokio::test]
     async fn explicit_socket_keeps_runtime_files_beside_it() {
@@ -1382,7 +1406,6 @@ mod tests {
         assert!(paths.octo_socket().exists());
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
-        assert!(!paths.pr_logs().exists());
         assert_eq!(
             std::fs::read_dir(runtime.path())
                 .unwrap()

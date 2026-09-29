@@ -1,126 +1,20 @@
 use super::*;
 
 #[test]
-fn top_level_pr_init_parses() {
-    let args = Args::try_parse(["pr".to_owned(), "init".to_owned()].into_iter()).unwrap();
+fn github_init_parses() {
+    let args = Args::try_parse(["github", "init"].into_iter().map(str::to_owned)).unwrap();
     assert!(matches!(
         args.command,
-        super::Command::Pr(super::PrArgs {
-            command: super::PrCliCommand::Init,
+        Command::Github(GithubArgs {
+            command: GithubCommand::Init,
             ..
         })
     ));
 }
 
 #[test]
-fn pr_comment_parses() {
-    let args = Args::try_parse(
-        [
-            "pr",
-            "comment",
-            "https://github.com/acme/widgets/pull/1",
-            "--reply-comment",
-            "7",
-            "--body",
-            "addressed",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    )
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        super::Command::Pr(super::PrArgs {
-            command: super::PrCliCommand::Comment {
-                url,
-                reply_comment: Some(reply_comment),
-                body,
-            },
-            ..
-        }) if url == "https://github.com/acme/widgets/pull/1"
-            && reply_comment == 7
-            && body == "addressed"
-    ));
-}
-
-#[test]
-fn pr_comments_parses() {
-    let args = Args::try_parse(
-        ["pr", "comments", "https://github.com/acme/widgets/pull/1"]
-            .into_iter()
-            .map(str::to_owned),
-    )
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        super::Command::Pr(super::PrArgs {
-            command: super::PrCliCommand::Comments { url },
-            ..
-        }) if url == "https://github.com/acme/widgets/pull/1"
-    ));
-}
-
-#[test]
-fn pr_edit_parses_title_and_description() {
-    let args = Args::try_parse(
-        [
-            "pr",
-            "edit",
-            "https://github.com/acme/widgets/pull/1",
-            "--base",
-            "release",
-            "--title",
-            "Better title",
-            "--description",
-            "Better summary",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    )
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        super::Command::Pr(super::PrArgs {
-            command: super::PrCliCommand::Edit {
-                url,
-                base: Some(base),
-                title: Some(title),
-                body: Some(body),
-            },
-            ..
-        }) if url == "https://github.com/acme/widgets/pull/1"
-            && base == "release"
-            && title == "Better title"
-            && body == "Better summary"
-    ));
-}
-
-#[test]
-fn pr_checks_parses_watch_interval() {
-    let args = Args::try_parse(
-        [
-            "pr",
-            "checks",
-            "https://github.com/acme/widgets/pull/1",
-            "--watch",
-            "--interval",
-            "5",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    )
-    .unwrap();
-    assert!(matches!(
-        args.command,
-        super::Command::Pr(super::PrArgs {
-            command: super::PrCliCommand::Checks {
-                url,
-                watch: true,
-                interval: 5,
-            },
-            ..
-        }) if url == "https://github.com/acme/widgets/pull/1"
-    ));
+fn pr_commands_are_not_available() {
+    assert!(Args::try_parse(["pr", "status"].into_iter().map(str::to_owned)).is_err());
 }
 
 #[test]
