@@ -33,28 +33,34 @@ pub fn router() -> Router<Arc<AppState>> {
         .layer(DefaultBodyLimit::disable())
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<u32>,
-    per_page: Option<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CheckQuery {
-    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     per_page: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DraftPr {
+struct CheckQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatePullRequest {
     title: String,
     head: String,
     base: String,
-    draft: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,14 +177,30 @@ fn sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// Only the token and explicitly understood input enter the upstream request.
-// Only fields represented by T come back to the agent.
-async fn github<T: DeserializeOwned + Serialize>(
+// Only route handlers select the path, query, and typed body.
+async fn github_get<T: DeserializeOwned + Serialize, Q: Serialize>(
+    state: Arc<AppState>,
+    path: &[&str],
+    query: Option<Q>,
+) -> Response {
+    github::<T, (), Q>(state, Method::GET, path, query, None).await
+}
+
+async fn github_post<T: DeserializeOwned + Serialize, B: Serialize>(
+    state: Arc<AppState>,
+    path: &[&str],
+    body: B,
+) -> Response {
+    github::<T, B, ()>(state, Method::POST, path, None, Some(body)).await
+}
+
+// Only the host's token and fields represented by T cross the boundary.
+async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
     state: Arc<AppState>,
     method: Method,
     path: &[&str],
-    query: &[(&str, String)],
-    body: Option<DraftPr>,
+    query: Option<Q>,
+    body: Option<B>,
 ) -> Response {
     if !path.iter().all(|part| allowed_segment(part)) {
         return forbidden();
@@ -192,10 +214,6 @@ async fn github<T: DeserializeOwned + Serialize>(
         .expect("GitHub API base is hierarchical")
         .clear()
         .extend(path);
-    if !query.is_empty() {
-        url.query_pairs_mut()
-            .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
-    }
     let mut request = state
         .client
         .request(method, url)
@@ -203,6 +221,9 @@ async fn github<T: DeserializeOwned + Serialize>(
         .header("User-Agent", "octo-gh")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("Accept", "application/vnd.github+json");
+    if let Some(query) = query {
+        request = request.query(&query);
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -243,31 +264,6 @@ async fn github<T: DeserializeOwned + Serialize>(
     }
 }
 
-fn list_params(query: ListQuery) -> Vec<(&'static str, String)> {
-    let mut params = Vec::new();
-    if let Some(state) = query.state {
-        params.push(("state", state));
-    }
-    if let Some(page) = query.page {
-        params.push(("page", page.to_string()));
-    }
-    if let Some(per_page) = query.per_page {
-        params.push(("per_page", per_page.to_string()));
-    }
-    params
-}
-
-fn check_params(query: CheckQuery) -> Vec<(&'static str, String)> {
-    let mut params = Vec::new();
-    if let Some(page) = query.page {
-        params.push(("page", page.to_string()));
-    }
-    if let Some(per_page) = query.per_page {
-        params.push(("per_page", per_page.to_string()));
-    }
-    params
-}
-
 async fn list_pulls(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
@@ -276,14 +272,7 @@ async fn list_pulls(
     let Ok(Query(query)) = query else {
         return forbidden();
     };
-    github::<Vec<Pull>>(
-        state,
-        Method::GET,
-        &["repos", &owner, &repo, "pulls"],
-        &list_params(query),
-        None,
-    )
-    .await
+    github_get::<Vec<Pull>, _>(state, &["repos", &owner, &repo, "pulls"], Some(query)).await
 }
 
 async fn get_pull(
@@ -294,36 +283,22 @@ async fn get_pull(
     if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
         return forbidden();
     }
-    github::<Pull>(
-        state,
-        Method::GET,
-        &["repos", &owner, &repo, "pulls", &number],
-        &[],
-        None,
-    )
-    .await
+    github_get::<Pull, ()>(state, &["repos", &owner, &repo, "pulls", &number], None).await
 }
 
 async fn create_pull(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     uri: Uri,
-    body: Result<Json<DraftPr>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<CreatePullRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(Json(pr)) = body else {
         return forbidden();
     };
-    if uri.query().is_some() || !pr.draft {
+    if uri.query().is_some() {
         return forbidden();
     }
-    github::<Pull>(
-        state,
-        Method::POST,
-        &["repos", &owner, &repo, "pulls"],
-        &[],
-        Some(pr),
-    )
-    .await
+    github_post::<Pull, _>(state, &["repos", &owner, &repo, "pulls"], pr).await
 }
 
 async fn list_issues(
@@ -334,14 +309,7 @@ async fn list_issues(
     let Ok(Query(query)) = query else {
         return forbidden();
     };
-    github::<Vec<Issue>>(
-        state,
-        Method::GET,
-        &["repos", &owner, &repo, "issues"],
-        &list_params(query),
-        None,
-    )
-    .await
+    github_get::<Vec<Issue>, _>(state, &["repos", &owner, &repo, "issues"], Some(query)).await
 }
 
 async fn get_issue(
@@ -352,14 +320,7 @@ async fn get_issue(
     if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
         return forbidden();
     }
-    github::<Issue>(
-        state,
-        Method::GET,
-        &["repos", &owner, &repo, "issues", &number],
-        &[],
-        None,
-    )
-    .await
+    github_get::<Issue, ()>(state, &["repos", &owner, &repo, "issues", &number], None).await
 }
 
 async fn get_status(
@@ -370,11 +331,9 @@ async fn get_status(
     if uri.query().is_some() || !self::sha(&sha) {
         return forbidden();
     }
-    github::<CombinedStatus>(
+    github_get::<CombinedStatus, ()>(
         state,
-        Method::GET,
         &["repos", &owner, &repo, "commits", &sha, "status"],
-        &[],
         None,
     )
     .await
@@ -391,12 +350,10 @@ async fn list_checks(
     if !self::sha(&sha) {
         return forbidden();
     }
-    github::<CheckRuns>(
+    github_get::<CheckRuns, _>(
         state,
-        Method::GET,
         &["repos", &owner, &repo, "commits", &sha, "check-runs"],
-        &check_params(query),
-        None,
+        Some(query),
     )
     .await
 }
@@ -443,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draft_creation_uses_host_token_and_does_not_forward_other_writes() {
+    async fn pull_creation_uses_host_token_and_does_not_forward_other_writes() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let upstream = axum::Router::new().fallback(any(
@@ -456,11 +413,12 @@ mod tests {
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
                     assert!(headers.get("x-client-secret").is_none());
                     let request: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(request["draft"], true);
                     assert_eq!(request["title"], "Fix");
                     assert_eq!(request["head"], "rho/fix");
                     assert_eq!(request["base"], "main");
-                    (StatusCode::CREATED, Json(pull()))
+                    let mut result = pull();
+                    result["draft"] = request.get("draft").cloned().unwrap_or(Value::Bool(false));
+                    (StatusCode::CREATED, Json(result))
                 }
             },
         ));
@@ -476,9 +434,8 @@ mod tests {
         let client = reqwest::Client::new();
         let path = format!("{base}/repos/acme/widgets/pulls");
         for request in [
-            json!({"title":"Fix","head":"rho/fix","base":"main","draft":false}),
-            json!({"title":"Fix","head":"rho/fix","base":"main"}),
             json!({"title":"Fix","head":"rho/fix","base":"main","draft":true,"state":"open"}),
+            json!({"title":"Fix","head":"rho/fix","base":"main","draft":"yes"}),
         ] {
             let response = client.post(&path).json(&request).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -516,7 +473,21 @@ mod tests {
         let result = response.json::<Value>().await.unwrap();
         assert_eq!(result["number"], 42);
         assert!(result.get("ignored").is_none());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for (request, expected_draft) in [
+            (
+                json!({"title":"Fix","head":"rho/fix","base":"main","draft":false}),
+                false,
+            ),
+            (json!({"title":"Fix","head":"rho/fix","base":"main"}), false),
+        ] {
+            let response = client.post(&path).json(&request).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["draft"],
+                expected_draft
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         proxy_task.abort();
         upstream_task.abort();
     }

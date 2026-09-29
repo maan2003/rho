@@ -42,9 +42,9 @@ The notebook's copied upstream ghapi code exposes only these REST operations:
 `pulls.create`, `repos.get_combined_status_for_ref`, and
 `checks.list_for_ref`; `api.pr_status(number)` reads the PR's head and
 combines legacy statuses with check runs. `GhApi(owner, repo)` sets
-defaults, not permissions. Pass `draft=True` explicitly on creation;
-Octo rejects normal PRs. Provide the actual base branch rather than
-assuming `main`.
+defaults, not permissions. `draft=True` creates a draft; omit `draft`
+or pass `draft=False` for a normal PR. Provide the actual base branch
+rather than assuming `main`.
 
 ```python
 from ghapi.all import GhApi

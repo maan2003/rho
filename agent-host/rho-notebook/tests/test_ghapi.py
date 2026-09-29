@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ghapi.all import APIError, GhApi
+from ghapi.all import GhApi
 
 
 class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
@@ -23,10 +23,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 body = await reader.readexactly(int(headers.get("content-length", 0)))
                 requests.append((method, path, headers, body))
                 status = "200 OK"
-                if method == "POST" and json.loads(body).get("draft") is False:
-                    status = "403 Forbidden"
-                    result = {"message": "only draft pull requests are available"}
-                elif path.endswith("/pulls/17"):
+                if path.endswith("/pulls/17"):
                     result = {"head": {"sha": "a" * 40}}
                 elif path.endswith("/status"):
                     result = {"state": "pending", "statuses": [{"context": "legacy", "state": "success"}]}
@@ -41,7 +38,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 elif "/issues?" in path:
                     result = [{"number": 42}]
                 else:
-                    result = {"number": 18, "draft": True}
+                    result = {"number": 18, "draft": json.loads(body).get("draft", False)} if method == "POST" else {"number": 18}
                 payload = json.dumps(result).encode()
                 writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
                              f"X-RateLimit-Remaining: 4900\r\nX-RateLimit-Limit: 5000\r\n"
@@ -68,10 +65,12 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(all("authorization" not in headers for _, _, headers, _ in requests))
                         self.assertEqual(requests[3][1].rsplit("page=", 1)[-1], "1")
                         self.assertEqual(requests[4][1].rsplit("page=", 1)[-1], "2")
-                        with self.assertRaises(APIError) as denied:
-                            await api.pulls.create(head="fix", base="main", title="Fix", draft=False)
-                        self.assertEqual(denied.exception.status_code, 403)
+                        normal = await api.pulls.create(head="fix", base="main", title="Fix", draft=False)
+                        self.assertIs(normal.draft, False)
                         self.assertIs(json.loads(requests[-1][3])["draft"], False)
+                        implicit = await api.pulls.create(head="fix", base="main", title="Fix")
+                        self.assertIs(implicit.draft, False)
+                        self.assertNotIn("draft", json.loads(requests[-1][3]))
                         with self.assertRaises(ValueError):
                             api("https://api.github.com/repos/acme/widget/issues")
                         with self.assertRaises(TypeError):
