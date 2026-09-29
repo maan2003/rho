@@ -470,12 +470,6 @@ impl Agent {
     }
 
     fn restore_unread(&mut self, entries: &[Entry]) {
-        self.mailroom.read(
-            self.unread
-                .iter()
-                .filter(|(_, from, _)| *from == Party::Human)
-                .count() as u64,
-        );
         self.unread.clear();
         for entry in entries {
             match entry {
@@ -484,11 +478,6 @@ impl Agent {
                     !report.messages.contains(id) && !report.acknowledged.contains(id)
                 }),
                 _ => {}
-            }
-        }
-        for (_, from, _) in &self.unread {
-            if *from == Party::Human {
-                self.mailroom.received();
             }
         }
     }
@@ -813,10 +802,9 @@ impl Agent {
             if self.archived && !self.responding {
                 self.fresh_notebook(at).await?;
             }
-            self.mailroom.received();
+            // The human's message ends a wait it answers.
+            self.awaiting = false;
             self.stopped = None;
-        } else {
-            self.mailroom.agent_received();
         }
         if let Some(backoff) = &mut self.backoff {
             backoff.at = at;
@@ -888,17 +876,13 @@ impl Agent {
                 })
                 .await
             }
-            Outbound::Awaiting => {
-                self.awaiting = true;
-                self.append(Entry::AwaitingHuman { at }).await
-            }
-            // The human's message already ends a wait it answers.
-            Outbound::StoppedAwaiting { answered } => {
-                self.awaiting = false;
-                if answered {
+            Outbound::EndTurn => {
+                self.progress.ended = true;
+                if self.awaiting {
                     return Ok(());
                 }
-                self.append(Entry::StoppedAwaitingHuman { at }).await
+                self.awaiting = true;
+                self.append(Entry::AwaitingHuman { at }).await
             }
         }
     }
@@ -916,6 +900,8 @@ impl Agent {
             self.cell.as_ref().map(|latest| &latest.cell),
         );
         Facts {
+            // The cell that ended the turn returns to nobody.
+            finished: notebook.finished.filter(|_| !self.progress.ended),
             human: self
                 .unread
                 .iter()
@@ -1026,11 +1012,6 @@ impl Agent {
             self.progress.told_returned = true;
         }
         let messages = std::mem::take(&mut self.unread);
-        let humans = messages
-            .iter()
-            .filter(|(_, from, _)| *from == Party::Human)
-            .count();
-        self.mailroom.read(humans as u64);
         report.messages = messages.into_iter().map(|(id, _, _)| id).collect();
         let manual_only = why == Wake::Compaction && report.is_empty();
         if report.is_empty() && !manual_only {
@@ -1061,6 +1042,7 @@ impl Agent {
         .await?;
         self.restarted = false;
         self.rewound = false;
+        self.progress.ended = false;
         if let Some(notebook) = &self.notebook {
             notebook.reset_checkin();
         }

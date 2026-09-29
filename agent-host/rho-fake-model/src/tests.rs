@@ -287,7 +287,7 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
         .as_str()
         .unwrap();
     assert!(code.contains("human.send("));
-    assert!(code.contains("await human.reply()"));
+    assert!(code.contains("end_turn()"));
     assert!(code.contains("clarify"));
     clarifying.shutdown().await.unwrap();
 }
@@ -382,7 +382,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
             );
         } else {
             assert!(code.contains("human.send("));
-            assert!(code.contains("await human.reply()"));
+            assert!(code.contains("end_turn()"));
         }
     }
     let metrics = server.metrics();

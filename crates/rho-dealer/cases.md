@@ -26,7 +26,7 @@ user put away, which they open to be dealt from it.
 ## Notebook agents
 
 A Rho agent speaks only through its notebook: `human.send()` is what it
-tells the user, and `await human.reply()` parks it on them. A1–A9 are
+tells the user, and `end_turn()` parks it on them. A1–A9 are
 agents that speak by ending a turn.
 
 | # | History and facts | Card |

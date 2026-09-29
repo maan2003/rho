@@ -126,6 +126,7 @@ impl PythonHost {
         self.progress.told_returned = false;
         self.progress.last_response = Some(now);
         self.progress.prose = 0;
+        self.progress.ended = false;
         self.pending = Some(PendingExec {
             request_id,
             rpc_id,
@@ -178,6 +179,16 @@ impl PythonHost {
         }
     }
 
+    /// The open exec ends the turn: its answer tells the CLI to stop, and
+    /// the idle model is woken only by news.
+    pub(crate) fn end_turn(&mut self) {
+        self.progress.ended = true;
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.progress.ended
+    }
+
     pub(crate) fn prose_correction(&self) -> bool {
         self.progress.prose > 0 && self.progress.prose < Progress::MAX_PROSE
     }
@@ -196,7 +207,7 @@ impl PythonHost {
     }
 
     pub(crate) fn checkin_at(&self) -> Option<UnixMs> {
-        if self.stopped || self.progress.prose >= Progress::MAX_PROSE {
+        if self.stopped || self.progress.prose >= Progress::MAX_PROSE || self.progress.ended {
             None
         } else {
             self.progress
@@ -529,6 +540,52 @@ mod tests {
             host.decide(true, None, Some(UnixMs(0)), false, false, UnixMs(100_000)),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
         ));
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ended_turn_still_answers_its_call_then_wakes_only_for_news() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path());
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(1),
+                "call".try_into().unwrap(),
+                "print('done')".into(),
+                UnixMs(10_000),
+            )
+            .is_none()
+        );
+        host.end_turn();
+        let wake = settle(&mut host).await;
+        assert_eq!(wake.trigger, WakeTrigger::Finished);
+        assert!(host.answer_pending().is_some());
+        assert!(host.ended(), "the answer carries the end of the turn");
+        host.acknowledge();
+        host.turn_ended(UnixMs(11_000), true);
+        assert_eq!(host.checkin_at(), None);
+        assert!(matches!(
+            host.decide(true, None, None, false, false, UnixMs(1_000_000)),
+            Boundary::No { recheck: None }
+        ));
+        assert!(matches!(
+            host.decide(true, None, Some(UnixMs(12_000)), false, false, UnixMs(1_000_000)),
+            Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
+        ));
+        // The next exec is a new turn.
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(2),
+                "next".try_into().unwrap(),
+                "pass".into(),
+                UnixMs(20_000),
+            )
+            .is_none()
+        );
+        assert!(!host.ended());
+        assert_eq!(host.checkin_at(), Some(UnixMs(140_000)));
         host.shutdown().await.unwrap();
     }
 

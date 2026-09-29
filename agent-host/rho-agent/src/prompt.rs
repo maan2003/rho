@@ -36,12 +36,16 @@ not your code, output, or reasoning.
 
 human.send(text)        Send the user a message.
 human.status(text)      Set your one-line status, replacing the last one.
-await human.reply()     Wait for the user's next message; it arrives in your next report.
-await agents.reply()    Wait for the next agent message; it arrives in your next report.
+end_turn()              End your turn when this exec returns; you then wait on the user.
 archive()               Shut down the notebook and stay quiet until the user writes.
 
-Send when you have a result, question, or decision for the user. Say it once, plainly. While any
-task awaits human.reply(), you are waiting on the user. There is no stop apart from archive().
+Send when you have a result, question, or decision for the user. Say it once, plainly. Call
+end_turn() when you are done or blocked on someone: after sending a result, a question, or a
+request for approval, or while waiting on an agent. Until you call it, your turn goes on.
+
+Before ending a turn with work still in flight, leave a task that watches it and calls notify()
+when it needs you: for a pull request you were asked to land, poll its checks and reviews; for
+a machine that is offline, poll until it answers. Tasks keep running after your turn ends.
 
 ## How time works
 
@@ -50,9 +54,11 @@ messages after 15 seconds, notify() after 2 seconds, and unreported task failure
 seconds. A message received while you are responding starts waiting when your response ends.
 Other tasks finishing successfully do not wake you. Every wake carries all pending output.
 
-The check-in comes 120 seconds after your last response, even while you await a reply. Each
-response resets it; the latest set_max_wait(seconds) from any task wins, without an upper limit.
-For long waits, call set_max_wait(86400) before await human.reply() or await agents.reply().
+The check-in comes 120 seconds after your last response. Each response resets it; the latest
+set_max_wait(seconds) from any task wins, without an upper limit.
+
+After end_turn(), only messages, notify(), and task failures wake you; neither the exec
+returning nor the check-in does.
 
 notify(value: object, *, max_tokens: int = 2000) → None
 set_max_wait(seconds: int) → None
@@ -303,12 +309,12 @@ steps within the agreed scope, destination, and audience. A separate release, de
 effect, or disclosure of private data needs its own authorization. Permission to push does not
 authorize manually triggering a deployment.
 
-Send the result when the requested outcome is complete, then await human.reply(). If approval is
+Send the result when the requested outcome is complete, then end_turn(). If approval is
 required, first finish the work that does not depend on it. For an authorized action that requires
 an access grant or tool confirmation, initiate that approval mechanism directly without a
 preliminary consent question; wait for its approval before proceeding. Otherwise, ask for the
 specific remaining action, name the rule requiring approval, and make the action concrete and
-reviewable. While approval is pending, await human.reply().
+reviewable. While approval is pending, end your turn.
 
 "#,
     );
@@ -428,7 +434,7 @@ Use `agents.message` to send findings, questions, or a scoped next action to an 
 For back-and-forth collaboration, answer the agent's question or assess its findings, then send
 the next scoped request and say whether another reply is needed. Stop exchanging messages when
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, await agents.reply().
+tasks while awaiting a reply. When blocked, end your turn; the reply wakes you.
 
 What you send with human.send is mailed to your parent. Children's messages arrive the same way.
 
@@ -482,7 +488,7 @@ Keep human.status current with what you are doing, so the user can follow ongoin
 messages. Use human.send for what the user should read: a consequential assumption, a finding,
 a change in direction, a question, or the result. Do not send routine progress narration.
 
-After asking a question, await human.reply() rather than guessing, unless other work does not
+After asking a question, end your turn rather than guessing, unless other work does not
 depend on the answer.
 
 A result message must be fully self-contained: the user should never need to read earlier messages
@@ -798,7 +804,7 @@ view_image('/absolute/path/to/capture.png')
 For back-and-forth collaboration, answer the agent's question or assess its findings, then send
 the next scoped request and say whether another reply is needed. Stop exchanging messages when
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, await agents.reply().
+tasks while awaiting a reply. When blocked, end your turn; the reply wakes you.
 
 What you send with human.send is mailed to your parent. Children's messages arrive the same way.
 
@@ -849,7 +855,7 @@ text](file:///absolute/path#L10-L20)` — never paste a raw `file://` URL as vis
 
 What you send with human.send is mailed to the requesting Engineer. Send one self-contained and
 focused result — a clear recommendation with the evidence, material assumptions, and unresolved issues
-needed to act on it, then await agents.reply(). A result does not prevent later back-and-forth; answer follow-up
+needed to act on it, then end your turn. A result does not prevent later back-and-forth; answer follow-up
 messages in the context of the prior discussion.
 
 ### Reporting Rho problems
@@ -940,7 +946,7 @@ fn team_context(multi_agent: Option<&Team>, role: AgentRole) -> String {
 
 Complete your independent analysis and send it to your parent with human.send. \
 Use the available messaging tool to request context from a known agent, and \
-await agents.reply() when blocked on a reply.
+end your turn when blocked on a reply.
 "
             );
         }
@@ -1013,6 +1019,7 @@ string. Claude Code built-in tools are disabled; make one notebook call per
 response. CLI Result prose is not a final answer and is not delivered to the
 human. If you write prose without a call, the host will ask you to use
 `human.send()`; repeated prose-only responses stop until the human writes.
+When an exec that called end_turn() returns, Claude Code ends your turn.
 The notebook and its running tasks survive Claude CLI respawns. A Rho runtime
 restart loses them. An open MCP call can return early on a notebook wake;
 continue from the existing state rather than running its source again.
@@ -1367,7 +1374,8 @@ mod tests {
         assert!(!prompt.contains("commentary"));
         assert!(prompt.contains("Every response is exactly one exec call"));
         assert!(prompt.contains("human.send(text)"));
-        assert!(prompt.contains("await human.reply()"));
+        assert!(prompt.contains("end_turn()"));
+        assert!(!prompt.contains(".reply()"));
         assert!(prompt.contains("Task.from_session_id(session_id: int) → Task"));
         assert!(!prompt.contains("suppress_tool_wakeups"));
         assert!(prompt.contains("await handle → {id: int, exit_code: int | None}"));
@@ -1561,7 +1569,7 @@ mod tests {
         for prompt in &native {
             for rule in [
                 "Your latest exec finishing wakes you immediately",
-                "set_max_wait(86400) before await human.reply()",
+                "After end_turn(), only messages, notify(), and task failures wake you",
                 "asyncio.create_task(coro)",
             ] {
                 assert!(prompt.contains(rule), "{rule}");

@@ -25,8 +25,9 @@ use crate::worker::host_client::HostClient;
 use crate::worker::image_tool::{ImageTools, ViewImageArgs};
 
 /// The shell, and the notebook globals Rho answers itself (images,
-/// collaboration, web search, papercuts, and the mailroom's `human` and
-/// `archive` when there is one). Unavailable services export nothing.
+/// collaboration, web search, papercuts, and the mailroom's `human`,
+/// `archive` and `end_turn` when there is one). Unavailable services export
+/// nothing.
 pub(crate) fn host_tools(
     cwd: &camino::Utf8Path,
     role: AgentRole,
@@ -58,7 +59,7 @@ pub(crate) fn host_tools(
         },
     )];
     if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
-        exports.push(agents(role, Arc::clone(agent_host), mailroom.cloned()));
+        exports.push(agents(role, Arc::clone(agent_host)));
     }
     if let Some(inference) = inference {
         exports.push(Export::new(
@@ -112,20 +113,16 @@ fn ask(
 }
 
 /// `agents`: collaboration. Engineers may also start and stop others.
-fn agents(role: AgentRole, agent_host: AgentHost, mailroom: Option<Arc<Mailroom>>) -> Export {
+fn agents(role: AgentRole, agent_host: AgentHost) -> Export {
     let agents = Agents { agent_host };
     Export::build("agents", move |py| {
-        let inner = match role {
+        Ok(match role {
             AgentRole::Engineer { .. } => {
                 let engineer = PyClassInitializer::from(agents).add_subclass(EngineerAgents);
                 Py::new(py, engineer)?.into_any()
             }
             AgentRole::Advisor { .. } => Py::new(py, agents)?.into_any(),
-        };
-        match &mailroom {
-            Some(mailroom) => mailroom.agents(py, inner),
-            None => Ok(inner),
-        }
+        })
     })
 }
 
