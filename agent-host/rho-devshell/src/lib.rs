@@ -607,8 +607,7 @@ struct Kept {
     subscription: rho_watch::Subscription,
     /// When the daemon last heard the entry was used.
     reported: Instant,
-    /// Uses since then, reported with it; those of a process that exits
-    /// first go uncounted.
+    /// Uses since then, logged with the report or when the shell is dropped.
     uses: u64,
 }
 
@@ -742,7 +741,10 @@ impl Resolver {
             if !matches!(kept.subscription.changed(), Ok(false))
                 || !Path::new(&kept.resolved.env_store_path).exists()
             {
+                let uses = kept.uses;
                 shells.remove(&slot);
+                drop(shells);
+                self.record_kept(flake, uses);
                 return None;
             }
             kept.uses += 1;
@@ -752,11 +754,10 @@ impl Resolver {
             });
             (kept.resolved.clone(), report)
         };
-        let dir = flake.dir.clone();
         if let (Some(uses), Some(cache), Some(id)) = (report, self.cache.clone(), resolved.id) {
+            self.record_kept(flake, uses);
             let pin = self.pin_command(&resolved.env_store_path);
             tokio::spawn(async move {
-                let _ = cache.record(&dir, Event::Kept { uses }).await;
                 if let Ok(false) = cache.used(id).await
                     && let Ok(false) = pinned(pin).await
                 {
@@ -765,6 +766,17 @@ impl Resolver {
             });
         }
         Some(resolved)
+    }
+
+    /// Log `uses` of `flake`'s kept shell, once it is reported used or
+    /// dropped. Those of a process that exits before either go unlogged.
+    fn record_kept(&self, flake: &Flake, uses: u64) {
+        if let (Some(cache), true) = (self.cache.clone(), uses > 0) {
+            let dir = flake.dir.clone();
+            tokio::spawn(async move {
+                let _ = cache.record(&dir, Event::Kept { uses }).await;
+            });
+        }
     }
 
     async fn resolve_now(&self, flake: &Flake) -> Result<(Resolved, Vec<u8>)> {
@@ -823,7 +835,7 @@ impl Resolver {
                 subscription
             }
         };
-        hot.shells.lock().unwrap().insert(
+        let replaced = hot.shells.lock().unwrap().insert(
             slot(flake),
             Kept {
                 resolved,
@@ -832,6 +844,9 @@ impl Resolver {
                 uses: 0,
             },
         );
+        if let Some(replaced) = replaced {
+            self.record_kept(flake, replaced.uses);
+        }
     }
 
     async fn subscribe(&self, hot: &Hot, watch: Watch) -> Option<(Watch, rho_watch::Subscription)> {

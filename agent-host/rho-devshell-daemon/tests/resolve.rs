@@ -103,7 +103,7 @@ async fn observations_decide_hits() {
     let store = Arc::new(
         rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone()).await,
     );
-    tokio::spawn(store.serve().unwrap());
+    tokio::spawn(store.clone().serve().unwrap());
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     std::fs::write(
@@ -170,10 +170,26 @@ async fn observations_decide_hits() {
     let start = std::time::Instant::now();
     assert_eq!(watched.resolve(&flake).await.unwrap().0.id, Some(first));
     assert!(start.elapsed() < std::time::Duration::from_millis(50), "kept: {:?}", start.elapsed());
+    for _ in 0..2 {
+        watched.resolve(&flake).await.unwrap();
+    }
     // `maybe` is untracked now: data "two" without it is a new shell.
     std::fs::write(repo.join("data.txt"), "two").unwrap();
     let changed = watched.resolve(&flake).await.unwrap().0.id.unwrap();
     assert!(![first, tracked, edited].contains(&changed), "a watched read changed");
+    // The dropped shell's uses are logged, within the minute between reports.
+    let kept = || async {
+        let records = store.records().await;
+        records.iter().map(|r| match r.event {
+            rho_devshell::Event::Kept { uses } if r.flake == flake.dir.display().to_string() => uses,
+            _ => 0,
+        }).sum::<u64>()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while kept().await < 3 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(kept().await, 3, "three kept uses logged when the shell was dropped");
 
     // A flake that does not evaluate fails with what to watch.
     let good = std::fs::read_to_string(repo.join("flake.nix")).unwrap();
