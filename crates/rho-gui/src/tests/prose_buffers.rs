@@ -97,3 +97,84 @@ fn an_unclosed_fence_does_not_reach_the_next_turn(cx: &mut TestAppContext) {
         "the next turn's markup was read as the fence's contents: {text:?}"
     );
 }
+
+/// A hidden source and its growing message must not replace the visible
+/// buffer every frame; Activity still needs the newest source.
+#[gpui::test]
+fn streaming_message_edits_its_buffer_in_place(cx: &mut TestAppContext) {
+    use rho_agents_client::protocol::transcript::{
+        ArgumentsFormat, InferenceState, Item, Live, RuntimeState, StreamingResponse,
+    };
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        state(vec![user("question")], vec![]),
+    );
+    let live = |source: &str, draft: &str| Live::Snapshot {
+        state: RuntimeState {
+            inference: InferenceState::Responding,
+            ..Default::default()
+        },
+        response: Some(StreamingResponse {
+            id: "response".into(),
+            items: vec![Item::ToolCall {
+                id: "exec".into(),
+                name: "exec".into(),
+                arguments: source.into(),
+                format: ArgumentsFormat::Text,
+            }],
+        }),
+        draft: Some(draft.into()),
+    };
+    let apply = |workspace: &gpui::WindowHandle<super::Workspace>,
+                 cx: &mut TestAppContext,
+                 source,
+                 draft| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.live_transcript_for_test(agent_id, live(source, draft), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    apply(&workspace, cx, "human.send('Hel", "Hel");
+    let message_buffer = |workspace: &gpui::WindowHandle<super::Workspace>,
+                          cx: &mut TestAppContext| {
+        let editor = super::active_editor(workspace, cx);
+        workspace
+            .update(cx, |_, _, cx| {
+                editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .all_buffers()
+                    .into_iter()
+                    .find(|buffer| buffer.read(cx).text().contains("Hel"))
+                    .expect("draft buffer")
+                    .read(cx)
+                    .remote_id()
+            })
+            .unwrap()
+    };
+    let before = message_buffer(&workspace, cx);
+    apply(&workspace, cx, "human.send('Hello", "Hello");
+    assert_eq!(
+        message_buffer(&workspace, cx),
+        before,
+        "streaming replaced the message buffer"
+    );
+    assert!(display_text(&workspace, cx).contains("Hello"));
+    apply(&workspace, cx, "human.send('Hello\\nworld", "Hello\nworld");
+    assert_eq!(
+        message_buffer(&workspace, cx),
+        before,
+        "a line break replaced the draft buffer"
+    );
+    assert!(display_text(&workspace, cx).contains("Hello\nworld"));
+    super::open_activity(&workspace, cx);
+    assert!(display_text(&workspace, cx).contains("human.send('Hello\\nworld"));
+}

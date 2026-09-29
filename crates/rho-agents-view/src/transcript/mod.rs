@@ -773,13 +773,23 @@ impl TranscriptModel {
     ) -> bool {
         let block_index = match incremental {
             IncrementalUpdate::AssistantText { index }
+            | IncrementalUpdate::MessageDraft { index }
             | IncrementalUpdate::ReasoningText { index }
             | IncrementalUpdate::Tool { index } => index,
         };
         let Some(index) = block_index.checked_sub(self.uncomposed) else {
             return false;
         };
-        if index != first_changed || index >= self.records.len() {
+        if index >= self.records.len() || index < first_changed {
+            return false;
+        }
+        if index != first_changed
+            && (!matches!(incremental, IncrementalUpdate::MessageDraft { .. })
+                || self.view != TranscriptView::Conversation
+                || self.records[first_changed..index]
+                    .iter()
+                    .any(|record| record.visible))
+        {
             return false;
         }
         self.resplice_block(index, block_index, now_ms, cx)

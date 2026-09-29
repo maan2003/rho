@@ -31,6 +31,7 @@ pub struct FrameSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IncrementalUpdate {
     AssistantText { index: usize },
+    MessageDraft { index: usize },
     ReasoningText { index: usize },
     Tool { index: usize },
 }
@@ -389,6 +390,7 @@ impl AgentStore {
         match &mut summary.incremental {
             Some(
                 IncrementalUpdate::AssistantText { index }
+                | IncrementalUpdate::MessageDraft { index }
                 | IncrementalUpdate::ReasoningText { index }
                 | IncrementalUpdate::Tool { index },
             ) => *index += from,
@@ -455,6 +457,9 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
             UiBlock::AssistantMessage { .. } => Some(IncrementalUpdate::AssistantText {
                 index: first_changed,
             }),
+            UiBlock::MessageDraft { .. } => Some(IncrementalUpdate::MessageDraft {
+                index: first_changed,
+            }),
             UiBlock::Reasoning { .. } => Some(IncrementalUpdate::ReasoningText {
                 index: first_changed,
             }),
@@ -463,7 +468,24 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
             }),
             _ => None,
         })
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            // The source changes with its preview. Conversation hides the
+            // tool, so only the draft needs an edit; Activity will reject
+            // this hint and update its visible tool instead.
+            let draft = first_changed + 1;
+            (old.len() == new.len()
+                && draft < new.len()
+                && matches!(
+                    (&*old[first_changed], &*new[first_changed]),
+                    (UiBlock::Tool(_), UiBlock::Tool(_))
+                )
+                && matches!(&*old[draft], UiBlock::MessageDraft { .. })
+                && matches!(&*new[draft], UiBlock::MessageDraft { .. })
+                && old[draft] != new[draft]
+                && old[draft + 1..] == new[draft + 1..])
+                .then_some(IncrementalUpdate::MessageDraft { index: draft })
+        });
     FrameSummary {
         first_changed_block: Some(first_changed),
         incremental,
@@ -659,6 +681,44 @@ mod tests {
         );
         assert!(blocks(&store).is_empty());
         assert_eq!(store.get(&agent()).unwrap().status, UiAgentStatus::Idle);
+    }
+
+    #[test]
+    fn growing_draft_targets_its_block_when_the_tool_source_also_changes() {
+        let mut store = AgentStore::default();
+        let live = |source: &str, draft: &str| Live::Snapshot {
+            state: RuntimeState {
+                inference: InferenceState::Responding,
+                ..Default::default()
+            },
+            response: Some(StreamingResponse {
+                id: "response".into(),
+                items: vec![Item::ToolCall {
+                    id: "call".into(),
+                    name: "exec".into(),
+                    arguments: source.into(),
+                    format: ArgumentsFormat::Text,
+                }],
+            }),
+            draft: Some(draft.into()),
+        };
+        store.apply_live(agent(), live("human.send('Hel", "Hel"));
+        assert_eq!(
+            store.apply_live(agent(), live("human.send('Hello", "Hello")),
+            FrameSummary {
+                first_changed_block: Some(0),
+                incremental: Some(IncrementalUpdate::MessageDraft { index: 1 }),
+            },
+            "the tool changes too, but Conversation hides it"
+        );
+        assert_eq!(
+            store.apply_live(agent(), live("human.send('Hello')", "Hello")),
+            FrameSummary {
+                first_changed_block: Some(0),
+                incremental: Some(IncrementalUpdate::Tool { index: 0 }),
+            },
+            "Activity must still update the tool if only its source changes"
+        );
     }
 
     #[test]

@@ -4946,6 +4946,17 @@ impl Workspace {
         self.focus_active_surface(window, cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn live_transcript_for_test(
+        &mut self,
+        agent_id: AgentId,
+        live: rho_agents_client::protocol::transcript::Live,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
+    }
+
     /// A transcript handed in whole, for a test that drives the view
     /// without a mirror to fold. Not an event: `rho-agent-hosts` carries what a
     /// agent host said, and no agent host says this.
