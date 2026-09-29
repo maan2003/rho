@@ -24,6 +24,10 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_pull).patch(update_pull),
         )
         .route(
+            "/repos/{owner}/{repo}/pulls/{number}/review-decision",
+            get(get_review_decision),
+        )
+        .route(
             "/repos/{owner}/{repo}/pulls/{number}/files",
             get(list_files),
         )
@@ -185,6 +189,8 @@ struct ReviewCommentsQuery {
 #[serde(deny_unknown_fields)]
 struct EditPull {
     #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
@@ -213,6 +219,9 @@ struct CreatePullRequest {
 #[derive(Serialize, Deserialize)]
 struct User {
     login: String,
+    id: Option<u64>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -236,6 +245,7 @@ struct Pull {
     created_at: String,
     updated_at: String,
     merged_at: Option<String>,
+    merged: Option<bool>,
     mergeable: Option<bool>,
     mergeable_state: Option<String>,
 }
@@ -270,6 +280,7 @@ struct IssueComment {
     html_url: String,
     body: Option<String>,
     user: Option<User>,
+    author_association: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -281,6 +292,7 @@ struct Review {
     body: Option<String>,
     state: String,
     user: Option<User>,
+    author_association: Option<String>,
     submitted_at: Option<String>,
     commit_id: Option<String>,
 }
@@ -291,6 +303,7 @@ struct ReviewComment {
     html_url: String,
     body: String,
     user: Option<User>,
+    author_association: Option<String>,
     path: String,
     diff_hunk: String,
     line: Option<u64>,
@@ -298,6 +311,7 @@ struct ReviewComment {
     side: Option<String>,
     commit_id: String,
     in_reply_to_id: Option<u64>,
+    pull_request_review_id: Option<u64>,
     created_at: String,
     updated_at: String,
 }
@@ -629,6 +643,101 @@ async fn github_logs(state: Arc<AppState>, path: &[&str], content_type: &'static
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+}
+
+#[derive(Serialize)]
+struct ReviewDecision {
+    review_decision: String,
+}
+
+#[derive(Deserialize)]
+struct GraphQlResult {
+    data: Option<GraphQlData>,
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlData {
+    repository: Option<GraphQlRepository>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GraphQlPull>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlPull {
+    #[serde(rename = "reviewDecision")]
+    review_decision: Option<String>,
+}
+
+async fn get_review_decision(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some()
+        || !allowed_segment(&owner)
+        || !allowed_segment(&repo)
+        || !positive(&number)
+    {
+        return forbidden();
+    }
+    let Ok(number) = number.parse::<i32>() else {
+        return forbidden();
+    };
+    if number <= 0 {
+        return forbidden();
+    }
+    let token = match state.get_token().await {
+        Ok(token) => token,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut url = state.github_api_url.clone();
+    url.set_path("/graphql");
+    let upstream = match state.client.post(url)
+        .bearer_auth(token)
+        .header("User-Agent", "octo-gh")
+        .header("Accept", "application/vnd.github+json")
+        .json(&json!({
+            "query": "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewDecision } } }",
+            "variables": {"owner":owner, "repo":repo, "number":number}
+        }))
+        .send().await
+    {
+        Ok(response) => response,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let status = upstream.status();
+    if status.is_redirection() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    if !status.is_success() {
+        return github_error(status, &bytes);
+    }
+    let Ok(result) = serde_json::from_slice::<GraphQlResult>(&bytes) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    if result.errors.is_some() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let Some(pull) = result
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repo| repo.pull_request)
+    else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    Json(ReviewDecision {
+        review_decision: pull.review_decision.unwrap_or_else(|| "NONE".into()),
+    })
+    .into_response()
 }
 
 async fn list_files(
@@ -1091,6 +1200,99 @@ mod tests {
             "created_at":"2025-01-01T00:00:00Z", "updated_at":"2025-01-02T00:00:00Z",
             "ignored":"not relayed"
         })
+    }
+
+    #[tokio::test]
+    async fn base_edit_and_review_decision_project_only_selected_fields() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let upstream = axum::Router::new().fallback(any(move |method: Method, uri: Uri, headers: HeaderMap, body: String| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
+                let input: Value = serde_json::from_str(&body).unwrap();
+                match (method, uri.path()) {
+                    (Method::PATCH, "/repos/acme/widgets/pulls/42") => {
+                        assert_eq!(input, json!({"base":"release/next"}));
+                        let mut result = pull();
+                        result["base"]["ref"] = json!("release/next");
+                        result["merged"] = json!(false);
+                        (StatusCode::OK, Json(result)).into_response()
+                    }
+                    (Method::POST, "/graphql") => {
+                        assert_eq!(input["variables"]["owner"], "acme");
+                        assert_eq!(input["variables"]["repo"], "widgets");
+                        assert!(input["query"].as_str().unwrap().contains("reviewDecision"));
+                        let result = match input["variables"]["number"].as_u64().unwrap() {
+                            42 => json!({"data":{"repository":{"pullRequest":{
+                                "reviewDecision":"REVIEW_REQUIRED","ignored":"hidden"}}},"ignored":"hidden"}),
+                            43 => json!({"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}),
+                            44 => json!({"errors":[{"message":"Permission denied"}]}),
+                            _ => panic!("unexpected number"),
+                        };
+                        (StatusCode::OK, Json(result)).into_response()
+                    }
+                    _ => panic!("unexpected request {uri}"),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://{}/repos/acme/widgets/pulls/42",
+            listener.local_addr().unwrap()
+        );
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .patch(&base)
+                .json(&json!({"base":"release/next","state":"closed"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let edit = client
+            .patch(&base)
+            .json(&json!({"base":"release/next"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(edit.status(), StatusCode::OK);
+        let edit: Value = edit.json().await.unwrap();
+        assert_eq!(edit["base"]["ref"], "release/next");
+        assert_eq!(edit["merged"], false);
+        assert!(edit.get("ignored").is_none());
+        let decision = client
+            .get(format!("{base}/review-decision"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(decision.status(), StatusCode::OK);
+        assert_eq!(
+            decision.json::<Value>().await.unwrap(),
+            json!({"review_decision":"REVIEW_REQUIRED"})
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/review-decision?query=x"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -1576,7 +1778,7 @@ mod tests {
                             (StatusCode::OK, json!([{
                                 "id":22,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-22",
                                 "body":"Changes requested","state":"CHANGES_REQUESTED",
-                                "user":{"login":"reviewer"},"submitted_at":"2025-01-01T00:00:00Z",
+                                "user":{"login":"reviewer","id":9,"type":"Bot"},"author_association":"MEMBER","submitted_at":"2025-01-01T00:00:00Z",
                                 "commit_id":"a".repeat(40),"ignored":"not relayed"
                             }]))
                         }
@@ -1587,9 +1789,16 @@ mod tests {
                                 "body":"Fix this line","user":{"login":"reviewer"},
                                 "path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@",
                                 "line":7,"original_line":6,"side":"RIGHT",
-                                "commit_id":"a".repeat(40),"in_reply_to_id":null,
+                                "commit_id":"a".repeat(40),"in_reply_to_id":null,"pull_request_review_id":22,"author_association":"COLLABORATOR",
                                 "created_at":"2025-01-01T00:00:00Z",
                                 "updated_at":"2025-01-01T00:00:00Z","ignored":"not relayed"
+                            }, {
+                                "id":34,"html_url":"https://github.com/acme/widgets/pull/42#discussion_r34",
+                                "body":"Follow-up","user":{"login":"other","id":10,"type":"User"},
+                                "path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@",
+                                "line":7,"original_line":6,"side":"RIGHT",
+                                "commit_id":"a".repeat(40),"in_reply_to_id":33,"pull_request_review_id":22,
+                                "created_at":"2025-01-02T00:00:00Z","updated_at":"2025-01-02T00:00:00Z"
                             }]))
                         }
                         (Method::POST, "/repos/acme/widgets/issues/42/comments") => {
@@ -1651,10 +1860,23 @@ mod tests {
                 "src/lib.rs",
             ),
         ] {
-            let response = client.get(url).send().await.unwrap();
+            let response = client.get(&url).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            let item = response.json::<Value>().await.unwrap()[0].clone();
+            let body = response.json::<Value>().await.unwrap();
+            let item = &body[0];
             assert_eq!(item[field], value);
+            if url.contains("/reviews") {
+                assert_eq!(item["user"]["type"], "Bot");
+                assert_eq!(item["user"]["id"], 9);
+                assert_eq!(item["author_association"], "MEMBER");
+            }
+            if url.contains("/pulls/42/comments?") {
+                assert_eq!(item["pull_request_review_id"], 22);
+                assert_eq!(item["author_association"], "COLLABORATOR");
+                assert_eq!(body[1]["in_reply_to_id"], 33);
+                assert_eq!(body[1]["pull_request_review_id"], 22);
+                assert_eq!(body[1]["user"]["id"], 10);
+            }
             assert!(item.get("ignored").is_none());
         }
         for (url, body, expected_id) in [

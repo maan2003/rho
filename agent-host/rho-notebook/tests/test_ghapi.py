@@ -91,7 +91,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     headers[key.lower()] = value.strip()
                 body = await reader.readexactly(int(headers.get("content-length", 0)))
                 requests.append((method, path, json.loads(body) if body else None))
-                result = [{"id": 7}] if method == "GET" else {"id": 8}
+                result = ({"review_decision": "APPROVED"} if path.endswith("/review-decision")
+                          else [{"id": 7}] if method == "GET" else {"id": 8})
                 payload = json.dumps(result).encode()
                 writer.write(
                     f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -106,6 +107,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     async with server:
                         api = GhApi("acme", "widget")
                         await api.pulls.update(17, title="New title", body="New description")
+                        await api.pulls.update(17, base="release/next")
+                        self.assertEqual((await api.pulls.review_decision(17)).review_decision, "APPROVED")
                         await api.issues.list_comments(17, page=2, per_page=5)
                         await api.pulls.list_reviews(17, page=3)
                         await api.pulls.list_review_comments(17, page=4)
@@ -122,6 +125,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     ("PATCH", "/repos/acme/widget/pulls/17", {
                         "title": "New title", "body": "New description"
                     }),
+                    ("PATCH", "/repos/acme/widget/pulls/17", {"base": "release/next"}),
+                    ("GET", "/repos/acme/widget/pulls/17/review-decision", None),
                     ("GET", "/repos/acme/widget/issues/17/comments?page=2&per_page=5", None),
                     ("GET", "/repos/acme/widget/pulls/17/reviews?page=3", None),
                     ("GET", "/repos/acme/widget/pulls/17/comments?page=4", None),

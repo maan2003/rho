@@ -37,7 +37,7 @@ branch update does not require creating a PR.
 
 ## Use ghapi
 
-The notebook's selected ghapi code exposes PR list/get/create and title/body
+The notebook's selected ghapi code exposes PR list/get/create and base/title/body
 update; issue list/get; PR reviews and inline review comments; issue/PR
 conversation comments; an inline review-comment reply; and combined commit
 status/check runs; PR files, check-run details and annotations, Actions runs
@@ -57,6 +57,11 @@ pr = await api.pulls.create(
 status = await api.pr_status(pr.number)
 ```
 
+For the overall review verdict, `api.pulls.review_decision(number)` reads
+GitHub GraphQL's `reviewDecision` through a fixed Octo query and returns
+`.review_decision` (`NONE` when null). This is an Octo-selected ghapi method,
+not an upstream GitHub REST endpoint. Reviews include reviewer ID, type, and
+association; inline comments include their review ID and parent reply ID.
 For feedback, poll `api.issues.list_comments(number)` for conversation
 comments, `api.pulls.list_reviews(number)` for review verdicts, and
 `api.pulls.list_review_comments(number)` for inline threads. Use

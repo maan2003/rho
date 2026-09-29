@@ -7,9 +7,10 @@ Copied from [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5, commit
 decoding, owner/repo overrides, and `pr_status`/`check_status` presentation. `check_status` fetches all
 check-run pages instead of treating the first page as the whole verdict. The constructor and request transport are adapted to use the host's Octo
 Unix socket without Python-side GitHub credentials. `gh_spec.py` contains
-only metadata for the supported issue/PR reads, PR title/body edits,
+only metadata for the supported issue/PR reads, PR base/title/body edits,
 conversation comments, reviews, inline-thread replies, commit status,
-PR files, check details and annotations, Actions runs and jobs, job and run
+PR files, review metadata and an Octo-only GraphQL-backed review-decision read,
+check details and annotations, Actions runs and jobs, job and run
 log downloads, and job/failed-jobs/whole-run reruns. `all.py` exports
 that selection, not all upstream helpers.
 
