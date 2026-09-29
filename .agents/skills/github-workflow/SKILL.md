@@ -5,9 +5,9 @@ description: Deliver code through GitHub pull requests using Rho's ghapi noteboo
 
 # GitHub workflow
 
-Use `ghapi` in Rho's Python notebook for GitHub API calls. The stock `gh`
-CLI and `rho pr` are not GitHub clients here. Octo owns the host-held token;
-neither Python nor shell commands receive it. If credentials are missing,
+Use `ghapi` in Rho's Python notebook for GitHub API calls. Octo owns the
+host-held token; neither Python nor shell commands receive it. If credentials
+are missing,
 ask the user to run the interactive administrative setup `rho github init`.
 Never request the token in the agent conversation or switch credentials,
 remotes, or API hosts.
@@ -65,7 +65,7 @@ association; inline comments include their review ID and parent reply ID.
 For feedback, poll `api.issues.list_comments(number)` for conversation
 comments, `api.pulls.list_reviews(number)` for review verdicts, and
 `api.pulls.list_review_comments(number)` for inline threads. Use
-`api.pulls.update(number, title=..., body=...)` to correct a PR's metadata.
+`api.pulls.update(number, base=..., title=..., body=...)` to correct a PR's metadata.
 Use `api.issues.create_comment(number, body=...)` for a top-level conversation
 reply, or `api.pulls.create_reply_for_review_comment(number, comment_id, body=...)`
 to reply in an existing inline thread. Re-check the thread before retrying an
