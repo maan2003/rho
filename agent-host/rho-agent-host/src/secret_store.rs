@@ -64,6 +64,20 @@ impl SecretStore {
         serde_json::from_slice(&buf).context("decoding secrets memfd")
     }
 
+    /// Leaves the memfd open across an exec and returns its number.
+    pub fn hand(&self) -> std::io::Result<i32> {
+        rustix::io::fcntl_setfd(&self.memfd, rustix::io::FdFlags::empty())?;
+        Ok(self.memfd.as_raw_fd())
+    }
+
+    /// Closes the memfd on exec again, as it is by default.
+    pub fn keep(&self) -> std::io::Result<()> {
+        Ok(rustix::io::fcntl_setfd(
+            &self.memfd,
+            rustix::io::FdFlags::CLOEXEC,
+        )?)
+    }
+
     /// Reclaim a stashed store from systemd's fd store by `FDNAME`.
     ///
     /// Returns `Ok(None)` when not running under systemd, when `$LISTEN_PID`

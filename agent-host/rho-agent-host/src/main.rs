@@ -12,6 +12,7 @@ fn main() {
     init_tracing();
     rho_agent_host::configure_embedded_environment();
     let mut host_args = args.agent_host;
+    host_args.handoff = rho_agent_host::take_handoff();
     let result = (|| {
         let profiler = rho_agent_host::HostProfiler::start(&mut host_args)?;
         let runtime = tokio::runtime::Runtime::new()?;

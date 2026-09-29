@@ -264,6 +264,88 @@ impl AgentPool {
         Ok(started)
     }
 
+    /// Pauses every workset process for a re-executed agent host to take
+    /// over and describes them for it; see [`crate::host::Process::pause`].
+    /// If any does not pause in time, all carry on and this errs.
+    pub async fn hand_over(&self) -> anyhow::Result<Vec<crate::host::Handed>> {
+        let slots = self
+            .processes
+            .lock()
+            .await
+            .iter()
+            .map(|(workset, slot)| (workset.clone(), slot.clone()))
+            .collect::<Vec<_>>();
+        let mut processes = Vec::new();
+        for (workset, slot) in slots {
+            if let Some(process) = slot
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .filter(|process| !*process.closed.borrow())
+            {
+                processes.push((workset, process.clone()));
+            }
+        }
+        let paused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::try_join_all(processes.iter().map(|(_, process)| process.pause())),
+        )
+        .await
+        .context("workset processes did not pause")
+        .flatten();
+        let handed = paused.and_then(|_| {
+            processes
+                .iter()
+                .map(|(workset, process)| Ok(process.hand(workset.clone())?))
+                .collect()
+        });
+        if handed.is_err() {
+            for (_, process) in &processes {
+                process.resume();
+            }
+        }
+        handed
+    }
+
+    /// Undoes a [`AgentPool::hand_over`] whose exec failed.
+    pub async fn resume(&self) {
+        for process in self.executions().await {
+            process.resume();
+        }
+    }
+
+    /// Takes over the workset processes, and their agents, that the agent
+    /// host this one re-executed handed over.
+    pub async fn adopt(self: &Arc<Self>, handed: Vec<crate::host::Handed>) {
+        for handed in handed {
+            if let Err(error) = self.adopt_process(&handed).await {
+                eprintln!("rho-agent: not taking over {}: {error:#}", handed.workset);
+            }
+        }
+    }
+
+    async fn adopt_process(self: &Arc<Self>, handed: &crate::host::Handed) -> anyhow::Result<()> {
+        let slot = self.execution_slot(&handed.workset).await;
+        let process = crate::host::Process::adopt(self, handed, slot.admission.clone()).await?;
+        *slot.process.lock().await = Some(process.clone());
+        for &agent_id in &handed.agents {
+            match AgentClient::adopt(self, agent_id, process.clone()).await {
+                Ok(agent) => {
+                    agent.tell_tail();
+                    self.agents.lock().await.insert(agent_id, agent);
+                    self.touch(agent_id);
+                }
+                Err(error) => eprintln!(
+                    "rho-agent: not taking over {}: {error:#}",
+                    agent_id.encoded()
+                ),
+            }
+        }
+        process.resume();
+        Ok(())
+    }
+
     pub fn worksets(&self) -> &Arc<Worksets> {
         &self.worksets
     }

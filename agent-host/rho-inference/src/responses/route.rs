@@ -169,7 +169,11 @@ impl RouteSelection {
 
 impl RouteSelector {
     pub(crate) fn new(db: Option<RhoDb>) -> Self {
-        let (selected, _) = watch::channel(RouteSelection::default());
+        // Revision floor: see `crate::revision_floor`.
+        let (selected, _) = watch::channel(RouteSelection {
+            revision: crate::revision_floor(),
+            ..Default::default()
+        });
         Self { selected, db }
     }
 

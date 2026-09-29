@@ -236,6 +236,19 @@ impl PlatformSecrets {
         secrets
     }
 
+    /// The store a predecessor left open at `fd`.
+    fn handed(fd: i32) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the predecessor left this fd open for us and nothing else
+        // claims it.
+        let store =
+            secret_store::SecretStore::from_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        store.keep()?;
+        let secrets = Self::default();
+        *secrets.store.lock().expect("platform secrets lock") = Some(Arc::new(store));
+        Ok(secrets)
+    }
+
     fn current_store(&self) -> Option<Arc<secret_store::SecretStore>> {
         self.store.lock().expect("platform secrets lock").clone()
     }
@@ -370,8 +383,51 @@ pub fn configure_embedded_environment() {
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
+/// What a re-executed agent host inherits from its predecessor, in
+/// [`HANDOFF_ENV`] as hex.
+#[derive(senax_encoder::Encode, senax_encoder::Decode)]
+struct Handoff {
+    workers: Vec<rho_agent::host::Handed>,
+    /// The platform secrets memfd, left open across exec.
+    secrets: Option<i32>,
+}
+
+const HANDOFF_ENV: &str = "RHO_HANDOFF";
+
+/// Takes a predecessor's handoff out of the environment, so no child
+/// inherits it. Must run before the Tokio runtime starts, for the same
+/// reason as [`configure_embedded_environment`].
+pub fn take_handoff() -> Option<String> {
+    let handoff = std::env::var(HANDOFF_ENV).ok();
+    // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
+    unsafe { std::env::remove_var(HANDOFF_ENV) };
+    handoff
+}
+
+impl Handoff {
+    fn decode(hex: &str) -> anyhow::Result<Self> {
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|at| {
+                u8::from_str_radix(hex.get(at..at + 2).context("odd hex")?, 16).map_err(Into::into)
+            })
+            .collect::<anyhow::Result<Vec<u8>>>()?;
+        senax_encoder::decode(&mut bytes::Bytes::from(bytes))
+            .map_err(|error| anyhow::anyhow!("decode handoff: {error}"))
+    }
+
+    fn encode(&self) -> anyhow::Result<String> {
+        let bytes = senax_encoder::encode(self)
+            .map_err(|error| anyhow::anyhow!("encode handoff: {error}"))?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct HostArgs {
+    /// A predecessor's handoff; see [`take_handoff`].
+    #[arg(skip)]
+    pub handoff: Option<String>,
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
@@ -430,7 +486,11 @@ impl HostProfiler {
 }
 
 pub async fn run(args: HostArgs) -> anyhow::Result<()> {
-    let platform_secrets = PlatformSecrets::from_fd_store();
+    let handoff = args.handoff.as_deref().map(Handoff::decode).transpose()?;
+    let platform_secrets = match handoff.as_ref().and_then(|handoff| handoff.secrets) {
+        Some(fd) => PlatformSecrets::handed(fd)?,
+        None => PlatformSecrets::from_fd_store(),
+    };
     let runtime = start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
 
     // The agent host's own cwd must never matter: agents each carry their own
@@ -551,6 +611,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         claude.clone(),
     )
     .await;
+    if let Some(handoff) = handoff {
+        pool.adopt(handoff.workers).await;
+    }
     let services = Arc::new(
         Services::new(
             db,
@@ -604,9 +667,15 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     tokio::spawn(resume_after_restart(services.clone(), resume_path.clone()));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        .context("register SIGUSR2 handler")?;
 
     loop {
         tokio::select! {
+            _ = upgrade.recv() => {
+                let error = reexec(&services).await;
+                eprintln!("rho-agent-host: re-exec failed, carrying on: {error:#}");
+            }
             result = &mut shutdown => {
                 result?;
                 services.stopping.store(true, Ordering::Relaxed);
@@ -630,6 +699,47 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Replaces this agent host with whatever binary its path now names, keeping
+/// the pid: the workset processes, still its children, are handed over with
+/// their agents, Python and commands running. Returns only on failure, with
+/// everything carrying on here.
+async fn reexec(services: &Services) -> anyhow::Error {
+    use std::os::unix::process::CommandExt as _;
+    let workers = match services.pool.hand_over().await {
+        Ok(workers) => workers,
+        Err(error) => return error,
+    };
+    let error = async {
+        services.pool.flush_agent_usage(None).await;
+        let secrets = services
+            .platform_secrets
+            .current_store()
+            .map(|store| store.hand())
+            .transpose()?;
+        let handoff = Handoff { workers, secrets }.encode()?;
+        let mut args = std::env::args_os();
+        let program = args.next().context("no argv[0]")?;
+        eprintln!("rho-agent-host: re-executing {}", program.to_string_lossy());
+        // The systemd fd store's fds were claimed, so its numbers are stale.
+        Err::<(), _>(anyhow::Error::from(
+            std::process::Command::new(program)
+                .args(args)
+                .env(HANDOFF_ENV, handoff)
+                .env_remove("LISTEN_PID")
+                .env_remove("LISTEN_FDS")
+                .env_remove("LISTEN_FDNAMES")
+                .exec(),
+        ))
+    }
+    .await
+    .unwrap_err();
+    if let Some(store) = services.platform_secrets.current_store() {
+        let _ = store.keep();
+    }
+    services.pool.resume().await;
+    error
 }
 
 /// Agents that were working when this agent host was told to stop, one id

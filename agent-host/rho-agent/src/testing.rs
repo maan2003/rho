@@ -32,6 +32,22 @@ impl Endpoint {
             .await
     }
 }
+/// A host-side route for `incoming`, each packet with its own in-flight
+/// token.
+pub(crate) fn route(
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<transport::Packet>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(transport::Packet, std::sync::Arc<()>)> {
+    let (route, routed) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(packet) = incoming.recv().await {
+            if route.send((packet, std::sync::Arc::new(()))).is_err() {
+                break;
+            }
+        }
+    });
+    routed
+}
+
 pub fn pair() -> (Endpoint, Endpoint) {
     let (left, right) = tokio::net::UnixStream::pair().unwrap();
     fn endpoint(socket: tokio::net::UnixStream) -> Endpoint {
@@ -73,7 +89,7 @@ pub(crate) fn services_pair(
     ));
     tokio::spawn(async move {
         let _ = services
-            .serve(server.sender, server.port, server.incoming)
+            .serve(server.sender, server.port, route(server.incoming))
             .await;
     });
     client.host()

@@ -33,14 +33,27 @@ impl Packet {
     }
 }
 
-struct Outgoing {
-    packet: Packet,
-    _permit: OwnedSemaphorePermit,
+enum Outgoing {
+    Packet {
+        packet: Packet,
+        _permit: OwnedSemaphorePermit,
+    },
+    /// Everything queued before this has been written; hold the rest until
+    /// [`Gate::Resume`].
+    Hold(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Ahead of the queue: stop or restart writing it.
+enum Gate {
+    /// Write `packet` now, then nothing from the queue until [`Gate::Resume`].
+    Pause(Packet),
+    Resume,
 }
 
 #[derive(Clone)]
 pub(crate) struct Sender {
     queue: mpsc::UnboundedSender<Outgoing>,
+    gate: mpsc::UnboundedSender<Gate>,
     slots: Arc<Semaphore>,
 }
 
@@ -59,11 +72,35 @@ impl Sender {
             .await
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         self.queue
-            .send(Outgoing {
+            .send(Outgoing::Packet {
                 packet: Packet { port, bytes },
                 _permit: permit,
             })
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    /// Writes everything sent so far and then holds the queue until
+    /// [`Sender::resume`]; returns once held, between frames.
+    pub async fn hold(&self) -> io::Result<()> {
+        let (held, written) = tokio::sync::oneshot::channel();
+        self.queue
+            .send(Outgoing::Hold(held))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        written.await.map_err(|_| io::ErrorKind::BrokenPipe.into())
+    }
+
+    /// Write `bytes` ahead of anything queued, then hold the queue until
+    /// [`Sender::resume`]. Sends meanwhile wait in the queue, in order.
+    pub fn pause(&self, port: Port, bytes: Bytes) -> io::Result<()> {
+        self.gate
+            .send(Gate::Pause(Packet { port, bytes }))
+            .map_err(|_| io::ErrorKind::BrokenPipe.into())
+    }
+
+    pub fn resume(&self) -> io::Result<()> {
+        self.gate
+            .send(Gate::Resume)
+            .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
     pub fn close(&self) {
@@ -74,6 +111,8 @@ impl Sender {
 struct Writer {
     socket: tokio::net::unix::OwnedWriteHalf,
     incoming: mpsc::UnboundedReceiver<Outgoing>,
+    gate: mpsc::UnboundedReceiver<Gate>,
+    paused: bool,
     slots: Arc<Semaphore>,
 }
 
@@ -85,20 +124,48 @@ impl Drop for Writer {
 
 impl Writer {
     async fn run(&mut self) -> io::Result<()> {
-        while let Some(outgoing) = self.incoming.recv().await {
-            let mut bytes = bytes::BytesMut::new();
-            senax_encoder::encode_to(&outgoing.packet, &mut bytes)
-                .map_err(|_| io::Error::other("encode workset message"))?;
-            if bytes.len() > MAX_FRAME_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "oversized workset frame",
-                ));
+        loop {
+            let outgoing = tokio::select! {
+                biased;
+                gate = self.gate.recv() => match gate {
+                    Some(Gate::Pause(packet)) => {
+                        self.paused = true;
+                        self.write(&packet).await?;
+                        continue;
+                    }
+                    Some(Gate::Resume) => {
+                        self.paused = false;
+                        continue;
+                    }
+                    None => return Ok(()),
+                },
+                outgoing = self.incoming.recv(), if !self.paused => match outgoing {
+                    Some(outgoing) => outgoing,
+                    None => return Ok(()),
+                },
+            };
+            match outgoing {
+                Outgoing::Packet { packet, .. } => self.write(&packet).await?,
+                Outgoing::Hold(held) => {
+                    self.paused = true;
+                    let _ = held.send(());
+                }
             }
-            self.socket.write_u32(bytes.len() as u32).await?;
-            self.socket.write_all(&bytes).await?;
         }
-        Ok(())
+    }
+
+    async fn write(&mut self, packet: &Packet) -> io::Result<()> {
+        let mut bytes = bytes::BytesMut::new();
+        senax_encoder::encode_to(packet, &mut bytes)
+            .map_err(|_| io::Error::other("encode workset message"))?;
+        if bytes.len() > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "oversized workset frame",
+            ));
+        }
+        self.socket.write_u32(bytes.len() as u32).await?;
+        self.socket.write_all(&bytes).await
     }
 }
 
@@ -130,14 +197,18 @@ pub(crate) fn connect(
 ) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
     let (mut reader, writer) = socket.into_split();
     let (queue, incoming) = mpsc::unbounded_channel();
+    let (gate, gates) = mpsc::unbounded_channel();
     let slots = Arc::new(Semaphore::new(MAX_MESSAGES));
     let sender = Sender {
         queue,
+        gate,
         slots: slots.clone(),
     };
     let mut writer = Writer {
         socket: writer,
         incoming,
+        gate: gates,
+        paused: false,
         slots,
     };
     let writer = tokio::spawn(async move { writer.run().await });
@@ -211,6 +282,52 @@ mod tests {
         writing.await.unwrap().unwrap();
         drop(peer);
         peer_writing.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pause_writes_its_packet_first_and_holds_the_rest_until_resumed() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (sender, _reader, _writing) = connect(left);
+        let (_peer, mut receiver, _peer_writing) = connect(right);
+        // Hold the writer while the queue fills, so the pause jumps it.
+        sender
+            .pause(Port::Workset, Bytes::from_static(b"first pause"))
+            .unwrap();
+        sender
+            .send(Port::Shell(1), Bytes::from_static(b"held"))
+            .await
+            .unwrap();
+        sender
+            .pause(Port::Workset, Bytes::from_static(b"paused"))
+            .unwrap();
+        assert_eq!(receiver.next().await.unwrap().bytes, b"first pause"[..]);
+        assert_eq!(receiver.next().await.unwrap().bytes, b"paused"[..]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.next())
+                .await
+                .is_err()
+        );
+        sender.resume().unwrap();
+        assert_eq!(receiver.next().await.unwrap().bytes, b"held"[..]);
+
+        // A hold writes what was sent before it and nothing after.
+        sender
+            .send(Port::Shell(1), Bytes::from_static(b"before"))
+            .await
+            .unwrap();
+        sender.hold().await.unwrap();
+        sender
+            .send(Port::Shell(1), Bytes::from_static(b"after"))
+            .await
+            .unwrap();
+        assert_eq!(receiver.next().await.unwrap().bytes, b"before"[..]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.next())
+                .await
+                .is_err()
+        );
+        sender.resume().unwrap();
+        assert_eq!(receiver.next().await.unwrap().bytes, b"after"[..]);
     }
 
     #[tokio::test]

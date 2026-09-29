@@ -128,7 +128,7 @@ impl Services {
         self: Arc<Self>,
         writer: crate::ipc::transport::Sender,
         port: crate::ipc::transport::Port,
-        mut incoming: mpsc::UnboundedReceiver<crate::ipc::transport::Packet>,
+        mut incoming: mpsc::UnboundedReceiver<(crate::ipc::transport::Packet, Arc<()>)>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             let mut commands = self
@@ -137,7 +137,8 @@ impl Services {
                 .expect("poison")
                 .take()
                 .expect("one agent host connection");
-            let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
+            // A reply carries its request's in-flight token until written.
+            let (outgoing, mut messages) = mpsc::channel::<(Message<'static>, Option<Arc<()>>)>(32);
             let mut calls = JoinSet::new();
             let result = tokio::select! {
                 result = async {
@@ -146,11 +147,11 @@ impl Services {
                         // services: cancelling read_exact between its header and
                         // payload would corrupt the channel.
                         let frame = async {
-                            let bytes = incoming.recv().await.context("agent port closed")?;
-                            Ok::<_, anyhow::Error>(protocol::decode(&bytes.bytes)?)
+                            let (packet, inflight) = incoming.recv().await.context("agent port closed")?;
+                            Ok::<_, anyhow::Error>((protocol::decode(&packet.bytes)?, inflight))
                         };
                         tokio::pin!(frame);
-                        let message = loop {
+                        let (message, inflight) = loop {
                             tokio::select! {
                                 biased;
                                 Some(completed) = calls.join_next(), if !calls.is_empty() => {
@@ -206,7 +207,7 @@ impl Services {
                                 Ok(reply) => reply,
                                 Err(error) => Reply::Error(error.to_string()),
                             };
-                            outgoing.send(Message::Reply { id, body: reply }).await
+                            outgoing.send((Message::Reply { id, body: reply }, Some(inflight))).await
                                 .map_err(|_| anyhow::anyhow!("agent connection closed"))
                         });
                     }
@@ -218,9 +219,9 @@ impl Services {
                         let message = tokio::select! {
                             biased;
                             message = messages.recv() => message,
-                            message = commands.recv() => message,
+                            message = commands.recv() => message.map(|message| (message, None)),
                         };
-                        let Some(message) = message else { return Ok(()); };
+                        let Some((message, _inflight)) = message else { return Ok(()); };
                         writer.send(port, protocol::encode(&message)?).await?;
                     }
                 } => result,
@@ -241,7 +242,7 @@ impl Services {
         &self,
         id: u64,
         request: Request<'static>,
-        outgoing: &mpsc::Sender<Message<'static>>,
+        outgoing: &mpsc::Sender<(Message<'static>, Option<Arc<()>>)>,
     ) -> anyhow::Result<Reply> {
         let reply = match request {
             Request::Team => {
@@ -329,7 +330,7 @@ impl Services {
                     .start(&self.db, agent, &input, move |result| async move {
                         crate::title::finish(&db, agent, result).await;
                         let head = db.read().get_agent(agent);
-                        let _ = outgoing.send(Message::Named(head)).await;
+                        let _ = outgoing.send((Message::Named(head), None)).await;
                     })
                     .await;
                 Reply::Head(self.db.read().get_agent(agent))
@@ -359,10 +360,13 @@ impl Services {
                     let size = senax_encoder::encode(&row)?.len();
                     if bytes + size > 1024 * 1024 && !batch.is_empty() {
                         outgoing
-                            .send(Message::HistoryBatch {
-                                id,
-                                rows: std::mem::take(&mut batch),
-                            })
+                            .send((
+                                Message::HistoryBatch {
+                                    id,
+                                    rows: std::mem::take(&mut batch),
+                                },
+                                None,
+                            ))
                             .await?;
                         bytes = 0;
                     }
@@ -371,7 +375,7 @@ impl Services {
                 }
                 if !batch.is_empty() {
                     outgoing
-                        .send(Message::HistoryBatch { id, rows: batch })
+                        .send((Message::HistoryBatch { id, rows: batch }, None))
                         .await?;
                 }
                 match native {
@@ -522,7 +526,7 @@ mod tests {
         let server = tokio::spawn(services.clone().serve(
             server.sender,
             server.port,
-            server.incoming,
+            crate::testing::route(server.incoming),
         ));
         let host = client.host();
         let locked = db.write().await;

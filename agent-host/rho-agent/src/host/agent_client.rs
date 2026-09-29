@@ -52,6 +52,27 @@ impl AgentClient {
             place.cwd
         );
         let process = pool.process(&place).await?;
+        Self::connect(pool, agent, process, Some(place.cwd)).await
+    }
+
+    /// Takes over an agent already running in `process`, handed over by the
+    /// agent host this one re-executed. It is ready already; the successor
+    /// learns its status once it tells its tail.
+    pub(crate) async fn adopt(
+        pool: &Arc<crate::host::pool::AgentPool>,
+        agent: AgentId,
+        process: Arc<crate::host::Process>,
+    ) -> anyhow::Result<Self> {
+        Self::connect(pool, agent, process, None).await
+    }
+
+    /// `cwd` bootstraps a new agent in the worker.
+    async fn connect(
+        pool: &Arc<crate::host::pool::AgentPool>,
+        agent: AgentId,
+        process: Arc<crate::host::Process>,
+        cwd: Option<camino::Utf8PathBuf>,
+    ) -> anyhow::Result<Self> {
         let services = Arc::new(Services::new(
             pool.db().clone(),
             pool.inference().clone(),
@@ -80,19 +101,23 @@ impl AgentClient {
             closed: closed_rx.clone(),
             process_closed: process.closed.clone(),
         }));
+        if cwd.is_none() {
+            services.ready.send_replace(true);
+        }
         let ready = services.ready.subscribe();
-        let cwd = place.cwd;
         tokio::spawn(async move {
             let mut service = tokio::spawn({
                 let services = services.clone();
                 let sender = process.sender.clone();
                 async move {
-                    sender
-                        .send(
-                            port,
-                            protocol::encode(&Message::Bootstrap(Bootstrap { cwd }))?,
-                        )
-                        .await?;
+                    if let Some(cwd) = cwd {
+                        sender
+                            .send(
+                                port,
+                                protocol::encode(&Message::Bootstrap(Bootstrap { cwd }))?,
+                            )
+                            .await?;
+                    }
                     services.serve(sender, port, receiver).await
                 }
             });

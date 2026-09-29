@@ -64,12 +64,17 @@ uuid.workspace = true
 
 [dev-dependencies]
 moq-net.workspace = true
+rho-fake-model.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 rho-shell.workspace = true
 senax-encoder.workspace = true
 
 [[test]]
 name = "terminal_stream"
+harness = false
+
+[[test]]
+name = "reexec"
 harness = false
 
 [[test]]
