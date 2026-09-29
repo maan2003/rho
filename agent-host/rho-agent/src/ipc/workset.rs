@@ -56,12 +56,6 @@ pub(crate) enum Message {
     Attach { id: u64, port: Port, attach: Attach },
     Reply { id: u64, body: Reply },
     Detach(Port),
-    /// The agent host is handing over to its successor: write `Paused` and
-    /// then nothing until `Resume`.
-    Pause,
-    /// The worker's last frame before a handoff.
-    Paused,
-    Resume,
 }
 
 pub(crate) fn encode<T: senax_encoder::Encoder>(value: &T) -> anyhow::Result<bytes::Bytes> {

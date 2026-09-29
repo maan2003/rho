@@ -237,6 +237,8 @@ pub trait InferenceHost: Send + Sync {
     fn serve_policy(
         &self,
         sender: PolicySender,
-        incoming: mpsc::Receiver<Vec<u8>>,
+        // Each request comes with an in-flight token to drop once its reply
+        // is sent.
+        incoming: mpsc::Receiver<(Vec<u8>, Arc<()>)>,
     ) -> BoxFuture<'static, anyhow::Result<()>>;
 }

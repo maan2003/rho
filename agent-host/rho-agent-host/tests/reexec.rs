@@ -191,14 +191,16 @@ async fn work_outlives_reexec(
     assert_eq!(terminals.len(), 1, "the terminal survived: {terminals:?}");
     assert_eq!(children(host), workers, "the same workset processes");
 
+    // The job finished on either side of the exec; the replayed screen or
+    // what follows shows it.
     let mut stream = open_terminal(socket_path, agent_id, false).await?;
+    wait_for_line(&mut stream, "job-done").await?;
     write_frame(
         &mut stream,
         &TermClientFrame::Input(b"echo \"$kept\"-after\r".to_vec()),
     )
     .await?;
     wait_for_line(&mut stream, "shell-state-after").await?;
-    wait_for_line(&mut stream, "job-done").await?;
 
     // Each round's command checks the count the one before left and then
     // bumps it, so a tool call lost or run twice across the exec stops the

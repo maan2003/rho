@@ -6,7 +6,7 @@ use bytes::Bytes;
 use senax_encoder::{Decode, Encode};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 const MAX_MESSAGES: usize = 32;
 // Agent append messages can exceed the public RPC frame limit.
@@ -20,7 +20,7 @@ pub(crate) enum Port {
     Shell(u64),
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Clone, Debug, Encode, Decode)]
 pub(crate) struct Packet {
     pub(crate) port: Port,
     pub(crate) bytes: Bytes,
@@ -43,11 +43,11 @@ enum Outgoing {
     Hold(tokio::sync::oneshot::Sender<()>),
 }
 
-/// Ahead of the queue: stop or restart writing it.
+/// Ahead of the queue, for a held writer.
 enum Gate {
-    /// Write `packet` now, then nothing from the queue until [`Gate::Resume`].
-    Pause(Packet),
     Resume,
+    /// A copy of everything still queued, which stays queued.
+    Queued(tokio::sync::oneshot::Sender<Vec<Packet>>),
 }
 
 #[derive(Clone)]
@@ -89,12 +89,13 @@ impl Sender {
         written.await.map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
-    /// Write `bytes` ahead of anything queued, then hold the queue until
-    /// [`Sender::resume`]. Sends meanwhile wait in the queue, in order.
-    pub fn pause(&self, port: Port, bytes: Bytes) -> io::Result<()> {
+    /// What a held writer has yet to write.
+    pub async fn queued(&self) -> io::Result<Vec<Packet>> {
+        let (taken, packets) = tokio::sync::oneshot::channel();
         self.gate
-            .send(Gate::Pause(Packet { port, bytes }))
-            .map_err(|_| io::ErrorKind::BrokenPipe.into())
+            .send(Gate::Queued(taken))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        packets.await.map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
     pub fn resume(&self) -> io::Result<()> {
@@ -113,6 +114,8 @@ struct Writer {
     incoming: mpsc::UnboundedReceiver<Outgoing>,
     gate: mpsc::UnboundedReceiver<Gate>,
     paused: bool,
+    /// Queued packets a hold looked at, written before the rest.
+    backlog: std::collections::VecDeque<Outgoing>,
     slots: Arc<Semaphore>,
 }
 
@@ -128,9 +131,19 @@ impl Writer {
             let outgoing = tokio::select! {
                 biased;
                 gate = self.gate.recv() => match gate {
-                    Some(Gate::Pause(packet)) => {
-                        self.paused = true;
-                        self.write(&packet).await?;
+                    Some(Gate::Queued(taken)) => {
+                        while let Ok(outgoing) = self.incoming.try_recv() {
+                            self.backlog.push_back(outgoing);
+                        }
+                        let _ = taken.send(
+                            self.backlog
+                                .iter()
+                                .filter_map(|outgoing| match outgoing {
+                                    Outgoing::Packet { packet, .. } => Some(packet.clone()),
+                                    Outgoing::Hold(_) => None,
+                                })
+                                .collect(),
+                        );
                         continue;
                     }
                     Some(Gate::Resume) => {
@@ -139,6 +152,7 @@ impl Writer {
                     }
                     None => return Ok(()),
                 },
+                outgoing = async { self.backlog.pop_front() }, if !self.paused && !self.backlog.is_empty() => outgoing.expect("backlog"),
                 outgoing = self.incoming.recv(), if !self.paused => match outgoing {
                     Some(outgoing) => outgoing,
                     None => return Ok(()),
@@ -171,6 +185,10 @@ impl Writer {
 
 pub(crate) struct Receiver {
     incoming: mpsc::Receiver<io::Result<Packet>>,
+    /// Whether the reader starts another frame.
+    reading: watch::Sender<bool>,
+    /// Whether the reader is stopped between frames.
+    parked: watch::Receiver<bool>,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::AbortHandle,
 }
@@ -190,10 +208,53 @@ impl Receiver {
             .await
             .unwrap_or_else(|| Err(io::ErrorKind::UnexpectedEof.into()))
     }
+
+    /// Stops reading between frames and returns what was read but not yet
+    /// received; the rest stays in the socket until [`Receiver::resume`].
+    pub async fn stop(&mut self) -> io::Result<Vec<Packet>> {
+        self.reading.send_replace(false);
+        let mut read = Vec::new();
+        let mut parked = self.parked.clone();
+        // Receive while waiting: the reader may be blocked on a full channel.
+        loop {
+            tokio::select! {
+                biased;
+                result = parked.wait_for(|parked| *parked) => {
+                    result.map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                    break;
+                }
+                packet = self.incoming.recv() => {
+                    read.push(packet.unwrap_or_else(|| Err(io::ErrorKind::UnexpectedEof.into()))?);
+                }
+            }
+        }
+        while let Ok(packet) = self.incoming.try_recv() {
+            read.push(packet?);
+        }
+        Ok(read)
+    }
+
+    pub fn resume(&self) {
+        self.reading.send_replace(true);
+    }
 }
 
 pub(crate) fn connect(
     socket: UnixStream,
+) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
+    open(socket, true)
+}
+
+/// [`connect`], with the reader stopped until [`Receiver::resume`].
+pub(crate) fn connect_stopped(
+    socket: UnixStream,
+) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
+    open(socket, false)
+}
+
+fn open(
+    socket: UnixStream,
+    reading: bool,
 ) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
     let (mut reader, writer) = socket.into_split();
     let (queue, incoming) = mpsc::unbounded_channel();
@@ -209,14 +270,33 @@ pub(crate) fn connect(
         incoming,
         gate: gates,
         paused: false,
+        backlog: Default::default(),
         slots,
     };
     let writer = tokio::spawn(async move { writer.run().await });
     let (received, incoming) = mpsc::channel(MAX_MESSAGES);
+    let (reading, mut read) = watch::channel(reading);
+    let (parking, parked) = watch::channel(false);
     let reader = tokio::spawn(async move {
         loop {
+            // Between frames: a stop takes effect here, never mid-frame.
+            let first = tokio::select! {
+                biased;
+                _ = async { read.wait_for(|read| !*read).await.is_ok() } => {
+                    parking.send_replace(true);
+                    if read.wait_for(|read| *read).await.map(|_| ()).is_err() {
+                        break;
+                    }
+                    parking.send_replace(false);
+                    continue;
+                }
+                // One byte is all or nothing, so losing this race reads nothing.
+                first = reader.read_u8() => first,
+            };
             let result = async {
-                let length = reader.read_u32().await? as usize;
+                let mut length = [first?, 0, 0, 0];
+                reader.read_exact(&mut length[1..]).await?;
+                let length = u32::from_be_bytes(length) as usize;
                 if length > MAX_FRAME_LEN {
                     return Err(io::Error::other("oversized workset frame"));
                 }
@@ -239,6 +319,8 @@ pub(crate) fn connect(
     });
     let receiver = Receiver {
         incoming,
+        reading,
+        parked,
         reader,
         writer: writer.abort_handle(),
     };
@@ -285,32 +367,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pause_writes_its_packet_first_and_holds_the_rest_until_resumed() {
+    async fn a_hold_writes_what_came_before_and_hands_over_the_rest() {
         let (left, right) = UnixStream::pair().unwrap();
         let (sender, _reader, _writing) = connect(left);
         let (_peer, mut receiver, _peer_writing) = connect(right);
-        // Hold the writer while the queue fills, so the pause jumps it.
-        sender
-            .pause(Port::Workset, Bytes::from_static(b"first pause"))
-            .unwrap();
-        sender
-            .send(Port::Shell(1), Bytes::from_static(b"held"))
-            .await
-            .unwrap();
-        sender
-            .pause(Port::Workset, Bytes::from_static(b"paused"))
-            .unwrap();
-        assert_eq!(receiver.next().await.unwrap().bytes, b"first pause"[..]);
-        assert_eq!(receiver.next().await.unwrap().bytes, b"paused"[..]);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), receiver.next())
-                .await
-                .is_err()
-        );
-        sender.resume().unwrap();
-        assert_eq!(receiver.next().await.unwrap().bytes, b"held"[..]);
-
-        // A hold writes what was sent before it and nothing after.
         sender
             .send(Port::Shell(1), Bytes::from_static(b"before"))
             .await
@@ -326,8 +386,58 @@ mod tests {
                 .await
                 .is_err()
         );
+        let queued = sender.queued().await.unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|packet| &packet.bytes[..])
+                .collect::<Vec<_>>(),
+            [&b"after"[..]]
+        );
+        // Looking does not reorder: the looked-at packet still goes first.
+        sender
+            .send(Port::Shell(1), Bytes::from_static(b"later"))
+            .await
+            .unwrap();
         sender.resume().unwrap();
         assert_eq!(receiver.next().await.unwrap().bytes, b"after"[..]);
+        assert_eq!(receiver.next().await.unwrap().bytes, b"later"[..]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_reader_hands_over_what_it_read_and_leaves_the_rest() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (sender, _reader, _writing) = connect(left);
+        let (_peer, mut receiver, _peer_writing) = connect(right);
+        // More than the reader's channel holds, so it is blocked mid-stream.
+        let frame = |index: usize| Bytes::from(format!("{index}:{}", "x".repeat(index * 997)));
+        for index in 0..40 {
+            sender.send(Port::Shell(1), frame(index)).await.unwrap();
+        }
+        let mut seen = vec![receiver.next().await.unwrap().bytes];
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        seen.extend(
+            receiver
+                .stop()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|packet| packet.bytes),
+        );
+        for index in 40..45 {
+            sender.send(Port::Shell(1), frame(index)).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.next())
+                .await
+                .is_err(),
+            "a stopped reader reads nothing more"
+        );
+        receiver.resume();
+        while seen.len() < 45 {
+            seen.push(receiver.next().await.unwrap().bytes);
+        }
+        assert_eq!(seen, (0..45).map(frame).collect::<Vec<_>>());
     }
 
     #[tokio::test]

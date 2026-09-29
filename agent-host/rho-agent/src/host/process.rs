@@ -29,6 +29,20 @@ pub struct Handed {
     pub(crate) agents: Vec<rho_agent_types::AgentId>,
     /// GUI attachments; their clients did not survive the exec.
     pub(crate) ports: Vec<transport::Port>,
+    /// Frames read from the worker but not yet handled, first to handle.
+    pub(crate) deferred: Vec<transport::Packet>,
+    /// Frames for the worker not yet written, first to write.
+    pub(crate) unwritten: Vec<transport::Packet>,
+}
+
+/// A handoff step, taken by the router between frames.
+enum Handoff {
+    /// Set new requests aside instead of starting them.
+    Defer,
+    /// Stop reading the connection.
+    Stop(oneshot::Sender<anyhow::Result<()>>),
+    /// Handle what was set aside and read on.
+    Resume,
 }
 
 pub struct Process {
@@ -36,8 +50,9 @@ pub struct Process {
     version: u32,
     /// The connection, kept for a handoff.
     socket: std::os::fd::OwnedFd,
-    /// Counts `Paused` frames read.
-    paused: watch::Receiver<u64>,
+    handoff: mpsc::UnboundedSender<Handoff>,
+    /// Frames a handoff set aside; see [`Handoff::Defer`].
+    deferred: Arc<Mutex<Vec<transport::Packet>>>,
     /// Cloned into every packet in flight; see [`AgentRoute`].
     inflight: Arc<()>,
     admission: Arc<tokio::sync::RwLock<()>>,
@@ -180,36 +195,43 @@ impl Process {
         }
     }
 
-    /// Readies the connection for a handoff: the worker writes nothing more,
-    /// everything it wrote has been handled and answered, and every answer
-    /// has been written. Undo with [`Process::resume`].
-    pub(crate) async fn pause(&self) -> anyhow::Result<()> {
-        let mut paused = self.paused.clone();
-        let seen = *paused.borrow_and_update();
-        anyhow::ensure!(
-            self.commands.send(workset::Message::Pause).is_ok(),
-            "workset process closed"
-        );
-        paused.wait_for(|count| *count > seen).await?;
-        while Arc::strong_count(&self.inflight) > 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        // Whatever is sent after this stays queued and dies with the exec,
-        // as it would in a crash; no frame is cut short.
-        self.sender.hold().await?;
-        Ok(())
+    /// Starts a handoff: requests the worker sends from now on are set
+    /// aside, while answers the host is waiting for still arrive.
+    pub(crate) fn defer(&self) {
+        let _ = self.handoff.send(Handoff::Defer);
     }
 
+    /// Whether every request the host started for the worker has its reply
+    /// queued.
+    pub(crate) fn idle(&self) -> bool {
+        Arc::strong_count(&self.inflight) == 1
+    }
+
+    /// Stops reading between frames; what is unread stays in the socket.
+    pub(crate) async fn stop_reading(&self) -> anyhow::Result<()> {
+        let (stopped, done) = oneshot::channel();
+        anyhow::ensure!(
+            self.handoff.send(Handoff::Stop(stopped)).is_ok(),
+            "workset process closed"
+        );
+        done.await.context("workset process closed")?
+    }
+
+    /// Undoes a handoff: handles what was set aside and carries on.
     pub(crate) fn resume(&self) {
         let _ = rustix::io::fcntl_setfd(&self.socket, rustix::io::FdFlags::CLOEXEC);
         let _ = self.sender.resume();
-        let _ = self.commands.send(workset::Message::Resume);
+        let _ = self.handoff.send(Handoff::Resume);
     }
 
-    /// What a successor needs to take this process over. Only after
-    /// [`Process::pause`]; clears `CLOEXEC` on the connection.
-    pub(crate) fn hand(&self, workset: String) -> std::io::Result<Handed> {
+    /// What a successor needs to take this process over, once it is idle
+    /// and not reading. Holds the writer between frames and clears
+    /// `CLOEXEC` on the connection.
+    pub(crate) async fn hand(&self, workset: String) -> anyhow::Result<Handed> {
         use std::os::fd::AsRawFd as _;
+        // Whatever is sent after this stays queued; no frame is cut short.
+        self.sender.hold().await?;
+        let unwritten = self.sender.queued().await?;
         let fd = self.socket.as_raw_fd();
         rustix::io::fcntl_setfd(&self.socket, rustix::io::FdFlags::empty())?;
         Ok(Handed {
@@ -232,6 +254,8 @@ impl Process {
                 .keys()
                 .copied()
                 .collect(),
+            deferred: self.deferred.lock().expect("poison").clone(),
+            unwritten,
         })
     }
 
@@ -274,10 +298,21 @@ impl Process {
             .context("start rho-agent-worker companion")?;
         drop(command);
         let worker = Worker::open(child.id())?;
-        Self::connect(pool, server, worker, Some(startup), 1, admission).await
+        Self::connect(
+            pool.inference(),
+            server,
+            worker,
+            Some(startup),
+            1,
+            Vec::new(),
+            admission,
+        )
+        .await
     }
 
     /// Takes over a workset process from the agent host this one re-executed.
+    /// It reads nothing until [`Process::resume`], once its agents are
+    /// adopted.
     pub(crate) async fn adopt(
         pool: &Arc<crate::host::pool::AgentPool>,
         handed: &Handed,
@@ -299,7 +334,22 @@ impl Process {
                 protocol::VERSION
             );
         }
-        let process = Self::connect(pool, socket, worker, None, handed.next, admission).await?;
+        let process = Self::connect(
+            pool.inference(),
+            socket,
+            worker,
+            None,
+            handed.next,
+            handed.deferred.clone(),
+            admission,
+        )
+        .await?;
+        for packet in &handed.unwritten {
+            process
+                .sender
+                .send(packet.port, packet.bytes.clone())
+                .await?;
+        }
         for port in &handed.ports {
             let _ = process.commands.send(workset::Message::Detach(*port));
         }
@@ -307,22 +357,25 @@ impl Process {
     }
 
     async fn connect(
-        pool: &Arc<crate::host::pool::AgentPool>,
+        inference: &crate::inference::Accounts,
         server: std::os::unix::net::UnixStream,
         worker: Worker,
         startup: Option<Startup>,
         next: u64,
+        deferred: Vec<transport::Packet>,
         admission: Arc<tokio::sync::RwLock<()>>,
     ) -> anyhow::Result<Arc<Self>> {
         let pid = worker.pid;
         let version = startup
             .as_ref()
             .map_or(protocol::VERSION, |startup| startup.version);
-        let handoff = std::os::fd::OwnedFd::from(server.try_clone()?);
+        let handoff_socket = std::os::fd::OwnedFd::from(server.try_clone()?);
         let disconnect = server.try_clone()?;
         server.set_nonblocking(true)?;
         let mut socket = tokio::net::UnixStream::from_std(server)?;
-        let (counted, paused) = watch::channel(0u64);
+        let adopted = startup.is_none();
+        let deferred = Arc::new(Mutex::new(deferred));
+        let (handoff, mut steps) = mpsc::unbounded_channel();
         let inflight = Arc::new(());
         let token = Arc::downgrade(&inflight);
         let (stop, stopped) = oneshot::channel();
@@ -336,7 +389,8 @@ impl Process {
         let (commands, mut command_rx) = mpsc::unbounded_channel();
         let routing_commands = commands.clone();
         let routes = agents.clone();
-        let inference = pool.inference().clone();
+        let set_aside = deferred.clone();
+        let inference = inference.clone();
         // The supervisor owns the child before any cancellable bootstrap I/O.
         let (connected, connection) = oneshot::channel();
         tokio::spawn(async move {
@@ -348,7 +402,11 @@ impl Process {
                     socket.write_u32(bytes.len().try_into()?).await?;
                     socket.write_all(&bytes).await?;
                 }
-                let (sender, mut receiver, mut writer) = transport::connect(socket);
+                let (sender, mut receiver, mut writer) = if adopted {
+                    transport::connect_stopped(socket)
+                } else {
+                    transport::connect(socket)
+                };
                 let _ = connected.send(sender.clone());
                 let (policy_incoming, policy_messages) = mpsc::channel(32);
                 let policy_sender: crate::inference::PolicySender = Arc::new({
@@ -381,10 +439,13 @@ impl Process {
                         Ok::<(), anyhow::Error>(())
                     } => result,
                     result = async {
-                        loop {
-                            let packet = receiver.next().await?;
+                        let route = |packet: transport::Packet, deferring: bool| -> anyhow::Result<()> {
                             match packet.port {
                                 transport::Port::Agent(id) => {
+                                    if deferring && matches!(protocol::decode(&packet.bytes)?, protocol::Message::Request { .. }) {
+                                        set_aside.lock().expect("poison").push(packet);
+                                        return Ok(());
+                                    }
                                     let routes = routes.lock().expect("poison");
                                     if let Some(route) = routes.get(&id) {
                                         // Retirement can close this receiver before unregistering.
@@ -396,11 +457,12 @@ impl Process {
                                         workset::Message::Reply { id, body } => {
                                             if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send(body); }
                                         }
-                                        workset::Message::Policy(message) => {
-                                            policy_incoming.try_send(message).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
+                                        // A worker's policy frames are all requests.
+                                        workset::Message::Policy(_) if deferring => {
+                                            set_aside.lock().expect("poison").push(packet);
                                         }
-                                        workset::Message::Paused => {
-                                            counted.send_modify(|count| *count += 1);
+                                        workset::Message::Policy(message) => {
+                                            policy_incoming.try_send((message, token.upgrade().unwrap_or_default())).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
                                         }
                                         _ => anyhow::bail!("unexpected workset reply"),
                                     }
@@ -415,6 +477,36 @@ impl Process {
                                         let _ = routing_commands.send(workset::Message::Detach(port));
                                     }
                                 }
+                            }
+                            Ok(())
+                        };
+                        let mut deferring = false;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                Some(step) = steps.recv() => match step {
+                                    Handoff::Defer => deferring = true,
+                                    Handoff::Stop(stopped) => {
+                                        let result = async {
+                                            for packet in receiver.stop().await? {
+                                                route(packet, true)?;
+                                            }
+                                            Ok(())
+                                        }.await;
+                                        let failed = result.as_ref().err().map(|error: &anyhow::Error| anyhow::anyhow!("{error:#}"));
+                                        let _ = stopped.send(result);
+                                        if let Some(error) = failed { return Err(error); }
+                                    }
+                                    Handoff::Resume => {
+                                        deferring = false;
+                                        let set_aside = std::mem::take(&mut *set_aside.lock().expect("poison"));
+                                        for packet in set_aside {
+                                            route(packet, false)?;
+                                        }
+                                        receiver.resume();
+                                    }
+                                },
+                                packet = receiver.next() => route(packet?, deferring)?,
                             }
                         }
                         #[allow(unreachable_code)] Ok::<(), anyhow::Error>(())
@@ -463,8 +555,9 @@ impl Process {
         Ok(Arc::new(Self {
             pid,
             version,
-            socket: handoff,
-            paused,
+            socket: handoff_socket,
+            handoff,
+            deferred,
             inflight,
             admission,
             commands,
@@ -517,5 +610,97 @@ impl Worker {
     fn kill(&self) {
         let _ =
             rustix::process::pidfd_send_signal(self.pidfd.get_ref(), rustix::process::Signal::KILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use rho_agent_types::{AgentId, AgentIdDomain};
+
+    use super::*;
+    use crate::ipc::protocol::{Message, Request};
+
+    fn frame(message: &Message<'_>) -> Bytes {
+        protocol::encode(message).unwrap()
+    }
+
+    /// Answers keep arriving while new requests wait, so a request that
+    /// waits on another worker can finish; the successor then handles the
+    /// requests set aside before what the worker wrote after the stop.
+    #[tokio::test]
+    async fn a_handoff_sets_requests_aside_for_the_successor_in_order() {
+        let (host_end, worker_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        worker_end.set_nonblocking(true).unwrap();
+        let (worker, _worker_receiver, _worker_writing) =
+            transport::connect(tokio::net::UnixStream::from_std(worker_end).unwrap());
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let inference = crate::inference::testing::accounts();
+        let agent = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        let port = transport::Port::Agent(agent);
+        let request = |id| {
+            frame(&Message::Request {
+                id,
+                body: Request::Head,
+            })
+        };
+        let answer = frame(&Message::Controlled { id: 9, error: None });
+
+        let old = Process::connect(
+            &inference,
+            host_end.try_clone().unwrap(),
+            Worker::open(child.id()).unwrap(),
+            None,
+            1,
+            Vec::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let (route, mut routed) = mpsc::unbounded_channel();
+        old.agents.lock().unwrap().insert(agent, route);
+        old.resume();
+        worker.send(port, request(1)).await.unwrap();
+        let (first, started) = routed.recv().await.unwrap();
+        assert_eq!(first.bytes, request(1));
+
+        old.defer();
+        worker.send(port, request(2)).await.unwrap();
+        worker.send(port, answer.clone()).await.unwrap();
+        worker.send(port, request(3)).await.unwrap();
+        let (arrived, _) = routed.recv().await.unwrap();
+        assert_eq!(arrived.bytes, answer, "answers are not set aside");
+        assert!(!old.idle(), "request 1 is still being handled");
+        drop(started);
+        assert!(old.idle());
+        old.stop_reading().await.unwrap();
+        worker.send(port, request(4)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(routed.try_recv().is_err(), "nothing new is started");
+        let handed = old.hand("workset".into()).await.unwrap();
+
+        let new = Process::connect(
+            &inference,
+            host_end,
+            Worker::open(child.id()).unwrap(),
+            None,
+            handed.next,
+            handed.deferred,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let (route, mut routed) = mpsc::unbounded_channel();
+        new.agents.lock().unwrap().insert(agent, route);
+        new.resume();
+        for id in 2..=4 {
+            let (packet, _) = routed.recv().await.unwrap();
+            assert_eq!(packet.bytes, request(id));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

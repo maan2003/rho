@@ -264,9 +264,12 @@ impl AgentPool {
         Ok(started)
     }
 
-    /// Pauses every workset process for a re-executed agent host to take
-    /// over and describes them for it; see [`crate::host::Process::pause`].
-    /// If any does not pause in time, all carry on and this errs.
+    /// Readies every workset process for a re-executed agent host to take
+    /// over and describes them for it. The host sets new worker requests
+    /// aside and keeps reading until every request it started, anywhere,
+    /// is answered: one may wait on a frame from another workset. Then it
+    /// stops reading at a frame boundary. If that takes too long, all carry
+    /// on and this errs.
     pub async fn hand_over(&self) -> anyhow::Result<Vec<crate::host::Handed>> {
         let slots = self
             .processes
@@ -287,19 +290,32 @@ impl AgentPool {
                 processes.push((workset, process.clone()));
             }
         }
-        let paused = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            futures::future::try_join_all(processes.iter().map(|(_, process)| process.pause())),
-        )
+        let idle = || async {
+            while !processes.iter().all(|(_, process)| process.idle()) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        for (_, process) in &processes {
+            process.defer();
+        }
+        let handed = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            idle().await;
+            futures::future::try_join_all(
+                processes.iter().map(|(_, process)| process.stop_reading()),
+            )
+            .await?;
+            // What was read before the stop may have been routed since.
+            idle().await;
+            futures::future::try_join_all(
+                processes
+                    .iter()
+                    .map(|(workset, process)| process.hand(workset.clone())),
+            )
+            .await
+        })
         .await
-        .context("workset processes did not pause")
+        .context("workset processes did not settle")
         .flatten();
-        let handed = paused.and_then(|_| {
-            processes
-                .iter()
-                .map(|(workset, process)| Ok(process.hand(workset.clone())?))
-                .collect()
-        });
         if handed.is_err() {
             for (_, process) in &processes {
                 process.resume();

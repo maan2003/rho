@@ -301,17 +301,6 @@ pub(crate) async fn run(
                     W::Detach(port) => {
                         execution.clients.lock().expect("poison").remove(&port);
                     }
-                    W::Pause => {
-                        let paused = workset::encode(&W::Paused).expect("encode pause");
-                        if let Err(error) = sender.pause(Port::Workset, paused) {
-                            break Err(error.into());
-                        }
-                    }
-                    W::Resume => {
-                        if let Err(error) = sender.resume() {
-                            break Err(error.into());
-                        }
-                    }
                     _ => break Err(anyhow::anyhow!("unexpected workset control")),
                 }
                 continue;
