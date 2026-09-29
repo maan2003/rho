@@ -36,9 +36,12 @@ to the host being replaced and may not speak to the deployer's host.
   pending request into one deploy.
 - For `gui:` the reply comes when the new GUI is installed on the phone;
   the user reopens rho when ready. Nothing on your host restarts.
-- For `host:` and `both:`, end your turn after asking. The deploy restarts
-  the host you run on: it lets requests in flight finish (up to 50s), then
-  stops, and wakes the agents that were still at work. Running commands and Python state do not survive.
+- For `host:` and `both:`, end your turn after asking. The deployer
+  usually re-executes the host you run on in place: it finishes requests in
+  flight, then swaps its binary, and your workset keeps running commands and
+  Python state. Your workset keeps its old worker code until it restarts.
+  A protocol change needs a full restart instead: it kills every workset,
+  with its running commands and Python state, and wakes no one by itself.
 - The deployer's reply wakes you: either the rev now running, or that it
   rolled back and why, with the log lines it judged by. After a rollback, the
   fix is yours; land it and ask again.
