@@ -52,7 +52,7 @@ fn sol_binding_is_the_medium_engineer() {
         effort: ReasoningEffort::High,
         fast_mode: false,
     });
-    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt6Sol));
+    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt61Sol));
     assert_eq!(
         binding.agent_role(),
         AgentRole::Engineer {

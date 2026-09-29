@@ -1468,7 +1468,7 @@ fn inference_session(
     let billed = match model {
         InferenceModel::Gpt6Astra => crate::log::AgentUsageModel::ASTRA,
         InferenceModel::Gpt6Luna => crate::log::AgentUsageModel::LUNA,
-        InferenceModel::Gpt6Sol => crate::log::AgentUsageModel::GPT,
+        InferenceModel::Gpt61Sol => crate::log::AgentUsageModel::GPT,
     };
     Ok((inference.session(profile, model), billed.name().to_owned()))
 }
