@@ -1,4 +1,6 @@
-//! A stable client identity sealed to the user's security key by WebAuthn PRF.
+//! A stable client identity sealed to the user's security key by WebAuthn's hmac-secret
+//! extension (`hmacCreateSecret`/`hmacGetSecret`, touch only; PRF would make the platform
+//! ask the key's PIN each time).
 //! Only the credential id, never the derived secret, is stored on disk.
 
 use std::collections::HashMap;
@@ -15,7 +17,7 @@ use serde_json::{Value, json};
 use zbus::zvariant::{OwnedValue, Value as BusValue};
 
 const RP_ID: &str = "gui.rho.dev";
-const SALT: &[u8] = b"rho iroh identity v1";
+const SALT: &[u8; 32] = b"rho iroh identity v1 (32 bytes)!";
 const IDENTITY: TableDefinition<(), Sen<Credential>> = TableDefinition::new("rho_fido_identity_v1");
 static DB: OnceLock<RhoDb> = OnceLock::new();
 static ENDPOINT: tokio::sync::OnceCell<iroh::Endpoint> = tokio::sync::OnceCell::const_new();
@@ -89,7 +91,7 @@ fn creation_request() -> Value {
         "challenge": random_challenge(),
         "pubKeyCredParams": [{"type": "public-key", "alg": -8}, {"type": "public-key", "alg": -7}],
         "authenticatorSelection": {"residentKey": "discouraged", "userVerification": "discouraged"},
-        "extensions": {"prf": {}}
+        "extensions": {"hmacCreateSecret": true}
     })
 }
 
@@ -99,7 +101,7 @@ fn assertion_request(credential: &Credential) -> Value {
         "rpId": credential.rp_id,
         "allowCredentials": [{"type": "public-key", "id": URL_SAFE_NO_PAD.encode(&credential.id)}],
         "userVerification": "discouraged",
-        "extensions": {"prf": {"eval": {"first": URL_SAFE_NO_PAD.encode(SALT)}}}
+        "extensions": {"hmacGetSecret": {"salt1": URL_SAFE_NO_PAD.encode(SALT)}}
     })
 }
 
@@ -116,8 +118,8 @@ fn decode_field(response: &Value, path: &[&str]) -> anyhow::Result<Vec<u8>> {
 
 fn parse_creation(response: &Value) -> anyhow::Result<Vec<u8>> {
     ensure!(
-        response.pointer("/clientExtensionResults/prf/enabled") == Some(&json!(true)),
-        "security key does not support WebAuthn PRF (hmac-secret)"
+        response.pointer("/clientExtensionResults/hmacCreateSecret") == Some(&json!(true)),
+        "security key does not support hmac-secret"
     );
     let id = decode_field(
         response,
@@ -134,11 +136,11 @@ fn parse_creation(response: &Value) -> anyhow::Result<Vec<u8>> {
 fn parse_assertion(response: &Value) -> anyhow::Result<[u8; 32]> {
     let bytes = decode_field(
         response,
-        &["clientExtensionResults", "prf", "results", "first"],
+        &["clientExtensionResults", "hmacGetSecret", "output1"],
     )?;
     bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("WebAuthn PRF output must be 32 bytes"))
+        .map_err(|_| anyhow::anyhow!("hmac-secret output must be 32 bytes"))
 }
 
 async fn portal(method: &str, request: &Value) -> anyhow::Result<Value> {
@@ -204,7 +206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creation_fields_and_prf_capability() {
+    fn creation_fields_and_hmac_secret_capability() {
         let request = creation_request();
         assert_eq!(request["rp"], json!({"id":"gui.rho.dev", "name":"rho"}));
         assert_eq!(request["user"]["name"], "rho");
@@ -231,19 +233,19 @@ mod tests {
             request["authenticatorSelection"],
             json!({"residentKey":"discouraged","userVerification":"discouraged"})
         );
-        assert_eq!(request["extensions"], json!({"prf":{}}));
-        let valid = json!({"rawId":"AQID", "clientExtensionResults":{"prf":{"enabled":true}}});
+        assert_eq!(request["extensions"], json!({"hmacCreateSecret":true}));
+        let valid = json!({"rawId":"AQID", "clientExtensionResults":{"hmacCreateSecret":true}});
         assert_eq!(parse_creation(&valid).unwrap(), vec![1, 2, 3]);
         assert_eq!(
             parse_creation(
-                &json!({"id":"BAUG", "clientExtensionResults":{"prf":{"enabled":true}}})
+                &json!({"id":"BAUG", "clientExtensionResults":{"hmacCreateSecret":true}})
             )
             .unwrap(),
             vec![4, 5, 6]
         );
         assert!(
             parse_creation(
-                &json!({"rawId":"AQID", "clientExtensionResults":{"prf":{"enabled":false}}})
+                &json!({"rawId":"AQID", "clientExtensionResults":{"hmacCreateSecret":false}})
             )
             .is_err()
         );
@@ -262,8 +264,8 @@ mod tests {
         );
         assert_eq!(request["userVerification"], "discouraged");
         assert_eq!(
-            request["extensions"]["prf"]["eval"]["first"],
-            "cmhvIGlyb2ggaWRlbnRpdHkgdjE"
+            request["extensions"]["hmacGetSecret"]["salt1"],
+            "cmhvIGlyb2ggaWRlbnRpdHkgdjEgKDMyIGJ5dGVzKSE"
         );
         assert_eq!(
             URL_SAFE_NO_PAD
@@ -273,14 +275,14 @@ mod tests {
             32
         );
         let bytes = [19_u8; 32];
-        let response = json!({"clientExtensionResults":{"prf":{"results":{"first": URL_SAFE_NO_PAD.encode(bytes)}}}});
+        let response = json!({"clientExtensionResults":{"hmacGetSecret":{"output1": URL_SAFE_NO_PAD.encode(bytes)}}});
         assert_eq!(
             iroh::SecretKey::from_bytes(&parse_assertion(&response).unwrap()).public(),
             iroh::SecretKey::from_bytes(&bytes).public()
         );
         assert!(
             parse_assertion(
-                &json!({"clientExtensionResults":{"prf":{"results":{"first":"AQID"}}}})
+                &json!({"clientExtensionResults":{"hmacGetSecret":{"output1":"AQID"}}})
             )
             .is_err()
         );
