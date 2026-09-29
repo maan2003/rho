@@ -19,9 +19,28 @@ pub fn router() -> Router<Arc<AppState>> {
             "/repos/{owner}/{repo}/pulls",
             get(list_pulls).post(create_pull),
         )
-        .route("/repos/{owner}/{repo}/pulls/{number}", get(get_pull))
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}",
+            get(get_pull).patch(update_pull),
+        )
         .route("/repos/{owner}/{repo}/issues", get(list_issues))
         .route("/repos/{owner}/{repo}/issues/{number}", get(get_issue))
+        .route(
+            "/repos/{owner}/{repo}/issues/{number}/comments",
+            get(list_issue_comments).post(create_issue_comment),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}/reviews",
+            get(list_reviews),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}/comments",
+            get(list_review_comments),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies",
+            axum::routing::post(reply_to_review_comment),
+        )
         .route(
             "/repos/{owner}/{repo}/commits/{ref}/status",
             get(get_status),
@@ -51,6 +70,56 @@ struct CheckQuery {
     page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueCommentsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewCommentsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditPull {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentBody {
+    body: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,6 +186,44 @@ struct Issue {
     user: Option<User>,
     labels: Vec<Label>,
     pull_request: Option<IssuePull>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IssueComment {
+    id: u64,
+    html_url: String,
+    body: Option<String>,
+    user: Option<User>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Review {
+    id: u64,
+    html_url: String,
+    body: Option<String>,
+    state: String,
+    user: Option<User>,
+    submitted_at: Option<String>,
+    commit_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReviewComment {
+    id: u64,
+    html_url: String,
+    body: String,
+    user: Option<User>,
+    path: String,
+    diff_hunk: String,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    side: Option<String>,
+    commit_id: String,
+    in_reply_to_id: Option<u64>,
     created_at: String,
     updated_at: String,
 }
@@ -192,6 +299,14 @@ async fn github_post<T: DeserializeOwned + Serialize, B: Serialize>(
     body: B,
 ) -> Response {
     github::<T, B, ()>(state, Method::POST, path, None, Some(body)).await
+}
+
+async fn github_patch<T: DeserializeOwned + Serialize, B: Serialize>(
+    state: Arc<AppState>,
+    path: &[&str],
+    body: B,
+) -> Response {
+    github::<T, B, ()>(state, Method::PATCH, path, None, Some(body)).await
 }
 
 // Only the host's token and fields represented by T cross the boundary.
@@ -301,6 +416,21 @@ async fn create_pull(
     github_post::<Pull, _>(state, &["repos", &owner, &repo, "pulls"], pr).await
 }
 
+async fn update_pull(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+    body: Result<Json<EditPull>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(edit)) = body else {
+        return forbidden();
+    };
+    if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github_patch::<Pull, _>(state, &["repos", &owner, &repo, "pulls", &number], edit).await
+}
+
 async fn list_issues(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
@@ -321,6 +451,115 @@ async fn get_issue(
         return forbidden();
     }
     github_get::<Issue, ()>(state, &["repos", &owner, &repo, "issues", &number], None).await
+}
+
+async fn list_issue_comments(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    query: Result<Query<IssueCommentsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github_get::<Vec<IssueComment>, _>(
+        state,
+        &["repos", &owner, &repo, "issues", &number, "comments"],
+        Some(query),
+    )
+    .await
+}
+
+async fn create_issue_comment(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+    body: Result<Json<CommentBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(comment)) = body else {
+        return forbidden();
+    };
+    if uri.query().is_some() || !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github_post::<IssueComment, _>(
+        state,
+        &["repos", &owner, &repo, "issues", &number, "comments"],
+        comment,
+    )
+    .await
+}
+
+async fn list_reviews(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github_get::<Vec<Review>, _>(
+        state,
+        &["repos", &owner, &repo, "pulls", &number, "reviews"],
+        Some(query),
+    )
+    .await
+}
+
+async fn list_review_comments(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    query: Result<Query<ReviewCommentsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !number.parse::<u64>().is_ok_and(|number| number > 0) {
+        return forbidden();
+    }
+    github_get::<Vec<ReviewComment>, _>(
+        state,
+        &["repos", &owner, &repo, "pulls", &number, "comments"],
+        Some(query),
+    )
+    .await
+}
+
+async fn reply_to_review_comment(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number, comment_id)): Path<(String, String, String, String)>,
+    uri: Uri,
+    body: Result<Json<CommentBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(reply)) = body else {
+        return forbidden();
+    };
+    if uri.query().is_some()
+        || !number.parse::<u64>().is_ok_and(|number| number > 0)
+        || !comment_id.parse::<u64>().is_ok_and(|id| id > 0)
+    {
+        return forbidden();
+    }
+    github_post::<ReviewComment, _>(
+        state,
+        &[
+            "repos",
+            &owner,
+            &repo,
+            "pulls",
+            &number,
+            "comments",
+            &comment_id,
+            "replies",
+        ],
+        reply,
+    )
+    .await
 }
 
 async fn get_status(
@@ -453,12 +692,12 @@ mod tests {
         assert_eq!(
             client
                 .patch(format!("{path}/42"))
-                .json(&json!({"title":"Changed"}))
+                .json(&json!({"state":"closed"}))
                 .send()
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::METHOD_NOT_ALLOWED
+            StatusCode::FORBIDDEN
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let response = client
@@ -560,6 +799,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn edits_and_feedback_use_only_selected_methods_fields_and_threads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let upstream = axum::Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: String| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
+                    assert!(headers.get("x-client-secret").is_none());
+                    let request = (!body.is_empty()).then(|| serde_json::from_str::<Value>(&body).unwrap());
+                    let (status, result) = match (method, uri.path()) {
+                        (Method::PATCH, "/repos/acme/widgets/pulls/42") => {
+                            assert_eq!(request.unwrap(), json!({"title":"New","body":"Updated"}));
+                            (StatusCode::OK, pull())
+                        }
+                        (Method::GET, "/repos/acme/widgets/issues/42/comments") => {
+                            assert_eq!(uri.query(), Some("page=2&per_page=5"));
+                            (StatusCode::OK, json!([{
+                                "id":11,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-11",
+                                "body":"Please fix","user":{"login":"reviewer"},
+                                "created_at":"2025-01-01T00:00:00Z",
+                                "updated_at":"2025-01-01T00:00:00Z","ignored":"not relayed"
+                            }]))
+                        }
+                        (Method::GET, "/repos/acme/widgets/pulls/42/reviews") => {
+                            assert_eq!(uri.query(), Some("page=3"));
+                            (StatusCode::OK, json!([{
+                                "id":22,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-22",
+                                "body":"Changes requested","state":"CHANGES_REQUESTED",
+                                "user":{"login":"reviewer"},"submitted_at":"2025-01-01T00:00:00Z",
+                                "commit_id":"a".repeat(40),"ignored":"not relayed"
+                            }]))
+                        }
+                        (Method::GET, "/repos/acme/widgets/pulls/42/comments") => {
+                            assert_eq!(uri.query(), Some("sort=created&direction=asc&page=4"));
+                            (StatusCode::OK, json!([{
+                                "id":33,"html_url":"https://github.com/acme/widgets/pull/42#discussion_r33",
+                                "body":"Fix this line","user":{"login":"reviewer"},
+                                "path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@",
+                                "line":7,"original_line":6,"side":"RIGHT",
+                                "commit_id":"a".repeat(40),"in_reply_to_id":null,
+                                "created_at":"2025-01-01T00:00:00Z",
+                                "updated_at":"2025-01-01T00:00:00Z","ignored":"not relayed"
+                            }]))
+                        }
+                        (Method::POST, "/repos/acme/widgets/issues/42/comments") => {
+                            assert_eq!(request.unwrap(), json!({"body":"Thanks"}));
+                            (StatusCode::CREATED, json!({
+                                "id":44,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-44",
+                                "body":"Thanks","user":{"login":"agent"},
+                                "created_at":"2025-01-01T00:00:00Z",
+                                "updated_at":"2025-01-01T00:00:00Z","ignored":"not relayed"
+                            }))
+                        }
+                        (Method::POST, "/repos/acme/widgets/pulls/42/comments/33/replies") => {
+                            assert_eq!(request.unwrap(), json!({"body":"Fixed"}));
+                            (StatusCode::CREATED, json!({
+                                "id":55,"html_url":"https://github.com/acme/widgets/pull/42#discussion_r55",
+                                "body":"Fixed","user":{"login":"agent"},
+                                "path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@",
+                                "line":7,"original_line":6,"side":"RIGHT",
+                                "commit_id":"a".repeat(40),"in_reply_to_id":33,
+                                "created_at":"2025-01-01T00:00:00Z",
+                                "updated_at":"2025-01-01T00:00:00Z","ignored":"not relayed"
+                            }))
+                        }
+                        (method, path) => panic!("unexpected upstream request {method} {path}"),
+                    };
+                    (status, Json(result))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let pr = format!("{base}/repos/acme/widgets/pulls/42");
+        let issue = format!("{base}/repos/acme/widgets/issues/42/comments");
+
+        let edit = client
+            .patch(&pr)
+            .bearer_auth("untrusted")
+            .header("x-client-secret", "untrusted")
+            .json(&json!({"title":"New","body":"Updated"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(edit.status(), StatusCode::OK);
+        assert!(edit.json::<Value>().await.unwrap().get("ignored").is_none());
+        for (url, field, value) in [
+            (format!("{issue}?page=2&per_page=5"), "body", "Please fix"),
+            (format!("{pr}/reviews?page=3"), "state", "CHANGES_REQUESTED"),
+            (
+                format!("{pr}/comments?sort=created&direction=asc&page=4"),
+                "path",
+                "src/lib.rs",
+            ),
+        ] {
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let item = response.json::<Value>().await.unwrap()[0].clone();
+            assert_eq!(item[field], value);
+            assert!(item.get("ignored").is_none());
+        }
+        for (url, body, expected_id) in [
+            (issue.clone(), "Thanks", 44),
+            (format!("{pr}/comments/33/replies"), "Fixed", 55),
+        ] {
+            let response = client
+                .post(url)
+                .json(&json!({"body":body}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let item = response.json::<Value>().await.unwrap();
+            assert_eq!(item["id"], expected_id);
+            if expected_id == 55 {
+                assert_eq!(item["in_reply_to_id"], 33);
+            }
+            assert!(item.get("ignored").is_none());
+        }
+        for response in [
+            client
+                .patch(&pr)
+                .json(&json!({"state":"closed"}))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .post(format!("{pr}/reviews"))
+                .json(&json!({"event":"APPROVE"}))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .post(format!("{pr}/comments"))
+                .json(&json!({"body":"new review"}))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .post(&issue)
+                .json(&json!({"body":"ok","state":"closed"}))
+                .send()
+                .await
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::METHOD_NOT_ALLOWED
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
         proxy_task.abort();
         upstream_task.abort();
     }

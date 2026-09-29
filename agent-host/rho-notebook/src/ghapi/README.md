@@ -7,8 +7,9 @@ Copied from [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5, commit
 decoding, owner/repo overrides, and `pr_status`/`check_status` presentation. `check_status` fetches all
 check-run pages instead of treating the first page as the whole verdict. The constructor and request transport are adapted to use the host's Octo
 Unix socket without Python-side GitHub credentials. `gh_spec.py` contains
-only metadata for the issue and pull-request operations needed here, and
-the two status endpoints. `all.py` exports that selection, not all upstream
+only metadata for the supported issue/PR reads, PR title/body edits,
+conversation comments, reviews, inline-thread replies, and the two status
+endpoints. `all.py` exports that selection, not all upstream
 helpers.
 
 Octo validates each request independently. The selected package and its `fastcore`, `fastspec`, and `fasttransport` dependencies
