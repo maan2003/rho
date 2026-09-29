@@ -46,6 +46,8 @@ reruns. `api.pr_status(number)` reads the PR head and combines
 legacy statuses with check runs. `GhApi(owner, repo)` sets defaults, not
 permissions. `draft=True` creates a draft; omit `draft` or pass `draft=False`
 for a normal PR. Provide the actual base branch rather than assuming `main`.
+For interactive API discovery, `from python_ls import xdir` provides
+searchable object attributes in the notebook.
 
 ```python
 from ghapi.all import GhApi
