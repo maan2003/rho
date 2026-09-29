@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -22,6 +22,42 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/repos/{owner}/{repo}/pulls/{number}",
             get(get_pull).patch(update_pull),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}/files",
+            get(list_files),
+        )
+        .route("/repos/{owner}/{repo}/check-runs/{id}", get(get_check))
+        .route(
+            "/repos/{owner}/{repo}/check-runs/{id}/annotations",
+            get(list_annotations),
+        )
+        .route("/repos/{owner}/{repo}/actions/runs", get(list_runs))
+        .route("/repos/{owner}/{repo}/actions/runs/{id}", get(get_run))
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{id}/jobs",
+            get(list_jobs),
+        )
+        .route("/repos/{owner}/{repo}/actions/jobs/{id}", get(get_job))
+        .route(
+            "/repos/{owner}/{repo}/actions/jobs/{id}/logs",
+            get(job_logs),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{id}/logs",
+            get(run_logs),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
+            axum::routing::post(rerun_job),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{id}/rerun",
+            axum::routing::post(rerun_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs",
+            axum::routing::post(rerun_failed),
         )
         .route("/repos/{owner}/{repo}/issues", get(list_issues))
         .route("/repos/{owner}/{repo}/issues/{number}", get(get_issue))
@@ -79,6 +115,44 @@ struct PageQuery {
     page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobsQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RerunOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_debug_logging: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobRerunOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_debug_logging: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_debugger: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,12 +325,95 @@ struct CheckRun {
     started_at: Option<String>,
     completed_at: Option<String>,
     html_url: Option<String>,
+    details_url: Option<String>,
+    output: Option<CheckOutput>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckOutput {
+    title: Option<String>,
+    summary: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CheckRuns {
     total_count: u64,
     check_runs: Vec<CheckRun>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PullFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    changes: u64,
+    patch: Option<String>,
+    previous_filename: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Annotation {
+    path: String,
+    start_line: u64,
+    end_line: u64,
+    annotation_level: String,
+    message: String,
+    title: Option<String>,
+    raw_details: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkflowRun {
+    id: u64,
+    name: Option<String>,
+    head_sha: String,
+    head_branch: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    html_url: String,
+    run_number: u64,
+    run_attempt: u64,
+    workflow_id: u64,
+    event: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkflowRuns {
+    total_count: u64,
+    workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JobStep {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    number: u64,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkflowJob {
+    id: u64,
+    run_id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    steps: Option<Vec<JobStep>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkflowJobs {
+    total_count: u64,
+    jobs: Vec<WorkflowJob>,
 }
 
 #[derive(Deserialize)]
@@ -309,20 +466,19 @@ async fn github_patch<T: DeserializeOwned + Serialize, B: Serialize>(
     github::<T, B, ()>(state, Method::PATCH, path, None, Some(body)).await
 }
 
-// Only the host's token and fields represented by T cross the boundary.
-async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
+async fn github_request<B: Serialize, Q: Serialize>(
     state: Arc<AppState>,
     method: Method,
     path: &[&str],
     query: Option<Q>,
     body: Option<B>,
-) -> Response {
+) -> Result<reqwest::Response, Response> {
     if !path.iter().all(|part| allowed_segment(part)) {
-        return forbidden();
+        return Err(forbidden());
     }
     let token = match state.get_token().await {
         Ok(token) => token,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
     };
     let mut url = state.github_api_url.clone();
     url.path_segments_mut()
@@ -344,7 +500,22 @@ async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
     }
     let upstream = match request.send().await {
         Ok(response) => response,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => return Err(StatusCode::BAD_GATEWAY.into_response()),
+    };
+    Ok(upstream)
+}
+
+// Only the host's token and fields represented by T cross the boundary.
+async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
+    state: Arc<AppState>,
+    method: Method,
+    path: &[&str],
+    query: Option<Q>,
+    body: Option<B>,
+) -> Response {
+    let upstream = match github_request(state, method, path, query, body).await {
+        Ok(response) => response,
+        Err(error) => return error,
     };
     // Following redirects could disclose the host's token to another origin.
     if upstream.status().is_redirection() {
@@ -368,15 +539,309 @@ async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     if !status.is_success() {
-        let message = serde_json::from_slice::<GitHubError>(&bytes)
-            .map(|error| error.message)
-            .unwrap_or_else(|_| "GitHub request failed".into());
-        return (status, Json(json!({"message":message}))).into_response();
+        return github_error(status, &bytes);
     }
     match serde_json::from_slice::<T>(&bytes) {
         Ok(value) => (status, headers, Json(value)).into_response(),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+fn github_error(status: StatusCode, bytes: &[u8]) -> Response {
+    let message = serde_json::from_slice::<GitHubError>(bytes)
+        .map(|error| error.message)
+        .unwrap_or_else(|_| "GitHub request failed".into());
+    (status, Json(json!({"message":message}))).into_response()
+}
+
+fn positive(id: &str) -> bool {
+    id.parse::<u64>().is_ok_and(|id| id > 0)
+}
+
+async fn github_empty_post<B: Serialize>(
+    state: Arc<AppState>,
+    path: &[&str],
+    body: Option<B>,
+) -> Response {
+    let upstream = match github_request::<B, ()>(state, Method::POST, path, None, body).await {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    let status = upstream.status();
+    if status != StatusCode::CREATED {
+        if status.is_redirection() || status.is_success() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+        return github_error(status, &bytes);
+    }
+    StatusCode::CREATED.into_response()
+}
+
+// GitHub redirects to a short-lived download URL; never pass its URL or token
+// to the agent.
+async fn github_logs(state: Arc<AppState>, path: &[&str], content_type: &'static str) -> Response {
+    let upstream =
+        match github_request::<(), ()>(state.clone(), Method::GET, path, None, None).await {
+            Ok(response) => response,
+            Err(error) => return error,
+        };
+    if upstream.status() != StatusCode::FOUND {
+        let status = upstream.status();
+        if status.is_redirection() || status.is_success() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+        return github_error(status, &bytes);
+    }
+    let Some(location) = upstream
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    // The production API uses HTTPS. Tests use an HTTP loopback API.
+    if url.scheme() != state.github_api_url.scheme()
+        || url.host_str().is_none()
+        || !matches!(url.scheme(), "https" | "http")
+    {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let downloaded = match state.client.get(url).send().await {
+        Ok(response) => response,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    if !downloaded.status().is_success() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let bytes = match downloaded.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+}
+
+async fn list_files(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !positive(&number) {
+        return forbidden();
+    }
+    github_get::<Vec<PullFile>, _>(
+        state,
+        &["repos", &owner, &repo, "pulls", &number, "files"],
+        Some(query),
+    )
+    .await
+}
+
+async fn get_check(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_get::<CheckRun, ()>(state, &["repos", &owner, &repo, "check-runs", &id], None).await
+}
+
+async fn list_annotations(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !positive(&id) {
+        return forbidden();
+    }
+    github_get::<Vec<Annotation>, _>(
+        state,
+        &["repos", &owner, &repo, "check-runs", &id, "annotations"],
+        Some(query),
+    )
+    .await
+}
+
+async fn list_runs(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    query: Result<Query<RunsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if query.head_sha.as_deref().is_some_and(|sha| !self::sha(sha)) {
+        return forbidden();
+    }
+    github_get::<WorkflowRuns, _>(
+        state,
+        &["repos", &owner, &repo, "actions", "runs"],
+        Some(query),
+    )
+    .await
+}
+
+async fn get_run(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_get::<WorkflowRun, ()>(
+        state,
+        &["repos", &owner, &repo, "actions", "runs", &id],
+        None,
+    )
+    .await
+}
+
+async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    query: Result<Query<JobsQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !positive(&id) {
+        return forbidden();
+    }
+    github_get::<WorkflowJobs, _>(
+        state,
+        &["repos", &owner, &repo, "actions", "runs", &id, "jobs"],
+        Some(query),
+    )
+    .await
+}
+
+async fn get_job(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_get::<WorkflowJob, ()>(
+        state,
+        &["repos", &owner, &repo, "actions", "jobs", &id],
+        None,
+    )
+    .await
+}
+
+async fn job_logs(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_logs(
+        state,
+        &["repos", &owner, &repo, "actions", "jobs", &id, "logs"],
+        "text/plain; charset=utf-8",
+    )
+    .await
+}
+
+async fn run_logs(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_logs(
+        state,
+        &["repos", &owner, &repo, "actions", "runs", &id, "logs"],
+        "application/zip",
+    )
+    .await
+}
+
+async fn rerun_job(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+    body: Result<Option<Json<JobRerunOptions>>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(body) = body else { return forbidden() };
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_empty_post(
+        state,
+        &["repos", &owner, &repo, "actions", "jobs", &id, "rerun"],
+        body.map(|Json(v)| v),
+    )
+    .await
+}
+
+async fn rerun_run(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+    body: Result<Option<Json<RerunOptions>>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(body) = body else { return forbidden() };
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_empty_post(
+        state,
+        &["repos", &owner, &repo, "actions", "runs", &id, "rerun"],
+        body.map(|Json(v)| v),
+    )
+    .await
+}
+
+async fn rerun_failed(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, id)): Path<(String, String, String)>,
+    uri: Uri,
+    body: Result<Option<Json<RerunOptions>>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(body) = body else { return forbidden() };
+    if uri.query().is_some() || !positive(&id) {
+        return forbidden();
+    }
+    github_empty_post(
+        state,
+        &[
+            "repos",
+            &owner,
+            &repo,
+            "actions",
+            "runs",
+            &id,
+            "rerun-failed-jobs",
+        ],
+        body.map(|Json(v)| v),
+    )
+    .await
 }
 
 async fn list_pulls(
@@ -626,6 +1091,283 @@ mod tests {
             "created_at":"2025-01-01T00:00:00Z", "updated_at":"2025-01-02T00:00:00Z",
             "ignored":"not relayed"
         })
+    }
+
+    #[tokio::test]
+    async fn inspection_and_reruns_use_selected_routes_and_projected_responses() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let upstream = axum::Router::new().fallback(any(move |method: Method, uri: Uri, headers: HeaderMap, body: String| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
+                assert!(!body.contains("unapproved"));
+                let path = uri.path();
+                let base = "/repos/acme/widgets/";
+                assert!(path.starts_with(base));
+                let suffix = &path[base.len()..];
+                let (status, response) = match (method, suffix) {
+                    (Method::GET, "pulls/42/files") => (StatusCode::OK, json!([{
+                        "filename":"src/a.rs","status":"modified","additions":3,"deletions":1,"changes":4,
+                        "patch":"@@ -1 +1 @@","ignored":"private"
+                    }])),
+                    (Method::GET, "check-runs/7") => (StatusCode::OK, json!({
+                        "id":7,"name":"build","status":"completed","conclusion":"failure",
+                        "output":{"title":"Failed","summary":"compiler error","text":"details","ignored":"private"},
+                        "ignored":"private"
+                    })),
+                    (Method::GET, "check-runs/7/annotations") => (StatusCode::OK, json!([{
+                        "path":"src/a.rs","start_line":8,"end_line":8,"annotation_level":"failure",
+                        "message":"wrong type","ignored":"private"
+                    }])),
+                    (Method::GET, "actions/runs") => (StatusCode::OK, json!({
+                        "total_count":1,"workflow_runs":[{
+                            "id":11,"name":"CI","head_sha":"a".repeat(40),"status":"completed",
+                            "conclusion":"failure","html_url":"https://github.com/acme/widgets/actions/runs/11",
+                            "run_number":2,"run_attempt":1,"workflow_id":3,"event":"push",
+                            "created_at":"2025-01-01","updated_at":"2025-01-02","ignored":"private"
+                        }]
+                    })),
+                    (Method::GET, "actions/runs/11") => (StatusCode::OK, json!({
+                        "id":11,"name":"CI","head_sha":"a".repeat(40),"status":"completed",
+                        "conclusion":"failure","html_url":"https://github.com/acme/widgets/actions/runs/11",
+                        "run_number":2,"run_attempt":1,"workflow_id":3,"event":"push",
+                        "created_at":"2025-01-01","updated_at":"2025-01-02"
+                    })),
+                    (Method::GET, "actions/runs/11/jobs") => (StatusCode::OK, json!({
+                        "total_count":1,"jobs":[{"id":12,"run_id":11,"name":"test",
+                        "status":"completed","conclusion":"failure","steps":[{
+                        "name":"cargo test","status":"completed","conclusion":"failure","number":2
+                        }],"ignored":"private"}]
+                    })),
+                    (Method::GET, "actions/jobs/12") => (StatusCode::OK, json!({
+                        "id":12,"run_id":11,"name":"test","status":"completed","conclusion":"failure"
+                    })),
+                    (Method::POST, "actions/runs/11/rerun" | "actions/runs/11/rerun-failed-jobs" | "actions/jobs/12/rerun") => {
+                        if !body.is_empty() {
+                            assert_eq!(serde_json::from_str::<Value>(&body).unwrap(),
+                                if suffix == "actions/jobs/12/rerun" {
+                                    json!({"enable_debug_logging":true,"enable_debugger":true})
+                                } else { json!({"enable_debug_logging":true}) });
+                        }
+                        (StatusCode::CREATED, json!({}))
+                    }
+                    _ => panic!("unexpected {suffix}"),
+                };
+                (status, Json(response))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://{}/repos/acme/widgets",
+            listener.local_addr().unwrap()
+        );
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (suffix, check) in [
+            ("pulls/42/files?page=2", "filename"),
+            ("check-runs/7", "output"),
+            ("check-runs/7/annotations?per_page=3", "message"),
+            (
+                "actions/runs?head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&page=2",
+                "workflow_runs",
+            ),
+            ("actions/runs/11", "head_sha"),
+            ("actions/runs/11/jobs?filter=latest&page=2", "jobs"),
+            ("actions/jobs/12", "name"),
+        ] {
+            let response = client.get(format!("{base}/{suffix}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{suffix}");
+            let response: Value = response.json().await.unwrap();
+            assert!(
+                response.get(check).is_some() || response[0].get(check).is_some(),
+                "{suffix}"
+            );
+            assert!(response.get("ignored").is_none(), "{suffix}");
+        }
+        for suffix in [
+            "actions/runs/11/rerun",
+            "actions/runs/11/rerun-failed-jobs",
+            "actions/jobs/12/rerun",
+        ] {
+            let body = if suffix.contains("jobs/12/") {
+                json!({"enable_debug_logging":true,"enable_debugger":true})
+            } else {
+                json!({"enable_debug_logging":true})
+            };
+            assert_eq!(
+                client
+                    .post(format!("{base}/{suffix}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/{suffix}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/{suffix}?unexpected=1"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/{suffix}"))
+                    .json(&json!({"unapproved":true}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for suffix in [
+            "actions/runs/0",
+            "actions/jobs/0",
+            "check-runs/0",
+            "pulls/0/files",
+            "actions/runs?head_sha=main",
+            "actions/runs?actor=anyone",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{base}/{suffix}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            client
+                .delete(format!("{base}/actions/runs/11/logs"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 13);
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn log_download_follows_signed_url_without_token_or_redirecting_again() {
+        // Use an independent signed-download listener: the API's Location cannot depend
+        // on its request URI.
+        let download =
+            axum::Router::new().fallback(any(|headers: HeaderMap, uri: Uri| async move {
+                assert!(headers.get("authorization").is_none());
+                match uri.path() {
+                    "/job" => (StatusCode::OK, "job log".as_bytes().to_vec()),
+                    "/run" => (StatusCode::OK, b"PK\x03\x04archive".to_vec()),
+                    _ => (StatusCode::NOT_FOUND, vec![]),
+                }
+            }));
+        let download_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let download_base = format!("http://{}", download_listener.local_addr().unwrap());
+        let download_task =
+            tokio::spawn(async move { axum::serve(download_listener, download).await.unwrap() });
+        let upstream = axum::Router::new().fallback(any(move |uri: Uri, headers: HeaderMap| {
+            let download_base = download_base.clone();
+            async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
+                let target = if uri.path().ends_with("jobs/12/logs") {
+                    "job"
+                } else {
+                    "run"
+                };
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, format!("{download_base}/{target}"))],
+                    "",
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://{}/repos/acme/widgets/actions",
+            listener.local_addr().unwrap()
+        );
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (suffix, content_type, bytes) in [
+            (
+                "jobs/12/logs",
+                "text/plain; charset=utf-8",
+                b"job log".as_slice(),
+            ),
+            (
+                "runs/11/logs",
+                "application/zip",
+                b"PK\x03\x04archive".as_slice(),
+            ),
+        ] {
+            let response = client.get(format!("{base}/{suffix}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+        }
+        proxy_task.abort();
+        upstream_task.abort();
+        download_task.abort();
+    }
+
+    #[tokio::test]
+    async fn log_download_rejects_unsafe_redirect_targets() {
+        let upstream = axum::Router::new().fallback(any(|headers: HeaderMap| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
+            (
+                StatusCode::FOUND,
+                [(header::LOCATION, "file:///etc/passwd")],
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let router = crate::router(Arc::new(|| Ok("host-secret".to_owned())), upstream_url);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let response = reqwest::Client::new()
+            .get(format!("{base}/repos/acme/widgets/actions/jobs/12/logs"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.text().await.unwrap().contains("passwd"));
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[test]

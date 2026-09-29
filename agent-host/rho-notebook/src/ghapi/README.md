@@ -8,9 +8,10 @@ decoding, owner/repo overrides, and `pr_status`/`check_status` presentation. `ch
 check-run pages instead of treating the first page as the whole verdict. The constructor and request transport are adapted to use the host's Octo
 Unix socket without Python-side GitHub credentials. `gh_spec.py` contains
 only metadata for the supported issue/PR reads, PR title/body edits,
-conversation comments, reviews, inline-thread replies, and the two status
-endpoints. `all.py` exports that selection, not all upstream
-helpers.
+conversation comments, reviews, inline-thread replies, commit status,
+PR files, check details and annotations, Actions runs and jobs, job and run
+log downloads, and job/failed-jobs/whole-run reruns. `all.py` exports
+that selection, not all upstream helpers.
 
 Octo validates each request independently. The selected package and its `fastcore`, `fastspec`, and `fasttransport` dependencies
 are installed in the Nix Python site-packages closure. The notebook uses that

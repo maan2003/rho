@@ -130,6 +130,74 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_actions_inspection_logs_and_all_rerun_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requests = []
+
+            async def serve(reader, writer):
+                method, path, _ = (await reader.readline()).decode().split()
+                headers = {}
+                while line := (await reader.readline()).decode().strip():
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+                body = await reader.readexactly(int(headers.get("content-length", 0)))
+                requests.append((method, path, json.loads(body) if body else None, headers))
+                if path.endswith("/logs"):
+                    content_type = "text/plain" if "/jobs/" in path else "application/zip"
+                    payload = b"failure at step 3\n" if "/jobs/" in path else b"PK\x03\x04archive"
+                    status = "200 OK"
+                elif method == "POST":
+                    content_type, payload, status = "application/json", b"", "201 Created"
+                else:
+                    content_type, payload, status = "application/json", b'{"id": 9}', "200 OK"
+                writer.write(
+                    f"HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n"
+                    f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+                writer.close()
+
+            server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
+            try:
+                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                    async with server:
+                        api = GhApi("acme", "widget")
+                        await api.pulls.list_files(17, per_page=20)
+                        await api.checks.get(7)
+                        await api.checks.list_annotations(7, page=2)
+                        await api.actions.list_workflow_runs_for_repo(head_sha="a"*40, page=3)
+                        await api.actions.get_workflow_run(11)
+                        await api.actions.list_jobs_for_workflow_run(11, filter="all")
+                        await api.actions.get_job_for_workflow_run(12)
+                        self.assertEqual(await api.actions.download_job_logs_for_workflow_run(12),
+                                         "failure at step 3\n")
+                        self.assertEqual(await api.actions.download_workflow_run_logs(11),
+                                         b"PK\x03\x04archive")
+                        await api.actions.re_run_workflow(11, enable_debug_logging=True)
+                        await api.actions.re_run_workflow_failed_jobs(11)
+                        await api.actions.re_run_job_for_workflow_run(12, enable_debugger=True)
+            finally:
+                server.close()
+                await server.wait_closed()
+            self.assertEqual(
+                [(method, path, body) for method, path, body, _ in requests],
+                [
+                    ("GET", "/repos/acme/widget/pulls/17/files?per_page=20", None),
+                    ("GET", "/repos/acme/widget/check-runs/7", None),
+                    ("GET", "/repos/acme/widget/check-runs/7/annotations?page=2", None),
+                    ("GET", "/repos/acme/widget/actions/runs?head_sha="+"a"*40+"&page=3", None),
+                    ("GET", "/repos/acme/widget/actions/runs/11", None),
+                    ("GET", "/repos/acme/widget/actions/runs/11/jobs?filter=all", None),
+                    ("GET", "/repos/acme/widget/actions/jobs/12", None),
+                    ("GET", "/repos/acme/widget/actions/jobs/12/logs", None),
+                    ("GET", "/repos/acme/widget/actions/runs/11/logs", None),
+                    ("POST", "/repos/acme/widget/actions/runs/11/rerun", {"enable_debug_logging": True}),
+                    ("POST", "/repos/acme/widget/actions/runs/11/rerun-failed-jobs", {}),
+                    ("POST", "/repos/acme/widget/actions/jobs/12/rerun", {"enable_debugger": True}),
+                ],
+            )
+            self.assertTrue(all("authorization" not in headers for _, _, _, headers in requests))
+
 
 
 if __name__ == "__main__":
