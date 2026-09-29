@@ -162,6 +162,7 @@ async fn drive_claude(
 
 pub(crate) async fn run(
     socket: UnixStream,
+    requests: UnixStream,
     startup: protocol::Startup,
     factory: crate::inference::WorkerFactory,
 ) -> anyhow::Result<()> {
@@ -169,6 +170,7 @@ pub(crate) async fn run(
 
     use transport::Port;
     let (sender, mut receiver, mut writer) = transport::connect(socket);
+    let (requests, mut answers, mut requests_writer) = transport::connect(requests);
     let agents: Arc<
         std::sync::Mutex<
             HashMap<
@@ -184,7 +186,7 @@ pub(crate) async fn run(
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let policy_sender: crate::inference::PolicySender = Arc::new({
-        let sender = sender.clone();
+        let sender = requests.clone();
         move |bytes| {
             let sender = sender.clone();
             Box::pin(async move {
@@ -217,12 +219,14 @@ pub(crate) async fn run(
     let mut tasks = tokio::task::JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = 'connection: loop {
-        let receive = receiver.next();
-        tokio::pin!(receive);
         let packet = loop {
-            tokio::select! {
+            let packet = tokio::select! {
                 _ = term.recv() => break 'connection Ok(()),
                 result = &mut writer => break 'connection match result {
+                    Ok(result) => result.map_err(anyhow::Error::from),
+                    Err(error) => Err(error.into()),
+                },
+                result = &mut requests_writer => break 'connection match result {
                     Ok(result) => result.map_err(anyhow::Error::from),
                     Err(error) => Err(error.into()),
                 },
@@ -230,11 +234,15 @@ pub(crate) async fn run(
                     if let Err(error) = result { break 'connection Err(error.into()); }
                     continue;
                 }
-                packet = &mut receive => match packet {
-                    Ok(packet) => break packet,
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break 'connection Ok(()),
-                    Err(error) => break 'connection Err(error.into()),
-                },
+                packet = receiver.next() => packet,
+                packet = answers.next() => packet,
+            };
+            match packet {
+                Ok(packet) => break packet,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    break 'connection Ok(());
+                }
+                Err(error) => break 'connection Err(error.into()),
             }
         };
         let agent = match packet.port {
@@ -337,7 +345,13 @@ pub(crate) async fn run(
         agents.lock().expect("poison").insert(agent, incoming);
         let agents = agents.clone();
         let sender = sender.clone();
-        let host = HostClient::connect(sender.clone(), packet.port, messages, next.clone());
+        let host = HostClient::connect(
+            sender.clone(),
+            requests.clone(),
+            packet.port,
+            messages,
+            next.clone(),
+        );
         let claude = startup.claude.clone();
         let inference = inference.clone();
         tasks.spawn(async move {
@@ -381,7 +395,9 @@ pub(crate) async fn run(
     while tasks.join_next().await.is_some() {}
     tokio::join!(execution.terminals.shutdown(), execution.shells.shutdown());
     sender.close();
+    requests.close();
     writer.abort();
+    requests_writer.abort();
     result
 }
 
@@ -394,4 +410,16 @@ pub(crate) fn control_socket() -> anyhow::Result<std::os::unix::net::UnixStream>
     rustix::stdio::dup2_stdin(null)?;
     let socket = std::os::unix::net::UnixStream::from(channel);
     Ok(socket)
+}
+
+/// Claims the inherited [`protocol::REQUESTS_FD`] before any child can
+/// inherit it. Must run before the runtime starts threads.
+pub(crate) fn requests_socket() -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: the agent host passes the connection at this fd, and nothing
+    // else in this process claims it.
+    let channel = unsafe { std::os::fd::OwnedFd::from_raw_fd(protocol::REQUESTS_FD) };
+    rustix::io::fcntl_setfd(&channel, rustix::io::FdFlags::CLOEXEC)
+        .context("inherit agent request channel")?;
+    Ok(std::os::unix::net::UnixStream::from(channel))
 }

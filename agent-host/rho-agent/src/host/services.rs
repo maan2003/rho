@@ -127,6 +127,7 @@ impl Services {
     pub(crate) fn serve(
         self: Arc<Self>,
         writer: crate::ipc::transport::Sender,
+        requests: crate::ipc::transport::Sender,
         port: crate::ipc::transport::Port,
         mut incoming: mpsc::UnboundedReceiver<(crate::ipc::transport::Packet, Arc<()>)>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
@@ -222,6 +223,11 @@ impl Services {
                             message = commands.recv() => message.map(|message| (message, None)),
                         };
                         let Some((message, _inflight)) = message else { return Ok(()); };
+                        // Answers to the worker's requests return on their connection.
+                        let writer = match message {
+                            Message::Reply { .. } | Message::HistoryBatch { .. } => &requests,
+                            _ => &writer,
+                        };
                         writer.send(port, protocol::encode(&message)?).await?;
                     }
                 } => result,
@@ -524,6 +530,7 @@ mod tests {
         ));
         let (client, server) = crate::testing::pair();
         let server = tokio::spawn(services.clone().serve(
+            server.sender.clone(),
             server.sender,
             server.port,
             crate::testing::route(server.incoming),

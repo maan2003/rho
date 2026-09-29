@@ -49,6 +49,10 @@ struct Publication {
 /// handle. Dropping the last handle closes the socket and its reader task.
 pub(crate) struct HostClient {
     outgoing: mpsc::Sender<bytes::Bytes>,
+    /// Requests go on their own connection; see
+    /// [`crate::ipc::protocol::REQUESTS_FD`].
+    requests: crate::ipc::transport::Sender,
+    port: crate::ipc::transport::Port,
     controls: Mutex<Option<mpsc::UnboundedReceiver<(u64, Control)>>>,
     waiters: Waiters,
     next: Arc<AtomicU64>,
@@ -81,6 +85,7 @@ impl std::error::Error for StoreError {}
 impl HostClient {
     pub(crate) fn connect(
         writer: crate::ipc::transport::Sender,
+        requests: crate::ipc::transport::Sender,
         port: crate::ipc::transport::Port,
         mut incoming: mpsc::UnboundedReceiver<crate::ipc::transport::Packet>,
         next: Arc<AtomicU64>,
@@ -208,6 +213,8 @@ impl HostClient {
         Arc::new(Self {
             controls: Mutex::new(Some(control_rx)),
             outgoing,
+            requests,
+            port,
             waiters,
             next,
             stop: Mutex::new(Some(stop)),
@@ -311,8 +318,8 @@ impl HostClient {
             id,
             waiters: self.waiters.clone(),
         };
-        self.outgoing
-            .send(encode(&Message::Request { id, body })?)
+        self.requests
+            .send(self.port, encode(&Message::Request { id, body })?)
             .await
             .map_err(|_| anyhow::anyhow!("agent service connection closed"))?;
         match response

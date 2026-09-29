@@ -16,6 +16,7 @@ use crate::ipc::protocol;
 pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<()> {
     use std::io::Read as _;
     let mut socket = runtime::control_socket()?;
+    let requests = runtime::requests_socket()?;
     let mut length = [0; 4];
     socket.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -45,11 +46,18 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         .install_default()
         .map_err(|_| anyhow::anyhow!("workset TLS provider already initialized"))?;
     socket.set_nonblocking(true)?;
+    requests.set_nonblocking(true)?;
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
         .block_on(async {
-            runtime::run(tokio::net::UnixStream::from_std(socket)?, startup, factory).await
+            runtime::run(
+                tokio::net::UnixStream::from_std(socket)?,
+                tokio::net::UnixStream::from_std(requests)?,
+                startup,
+                factory,
+            )
+            .await
         })
 }

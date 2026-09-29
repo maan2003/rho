@@ -109,6 +109,7 @@ impl AgentClient {
             let mut service = tokio::spawn({
                 let services = services.clone();
                 let sender = process.sender.clone();
+                let requests = process.requests.clone();
                 async move {
                     if let Some(cwd) = cwd {
                         sender
@@ -118,7 +119,7 @@ impl AgentClient {
                             )
                             .await?;
                     }
-                    services.serve(sender, port, receiver).await
+                    services.serve(sender, requests, port, receiver).await
                 }
             });
             let (expected, done, error) = tokio::select! {

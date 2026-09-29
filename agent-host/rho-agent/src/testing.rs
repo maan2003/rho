@@ -10,6 +10,7 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn host(self) -> std::sync::Arc<HostClient> {
         HostClient::connect(
+            self.sender.clone(),
             self.sender,
             self.port,
             self.incoming,
@@ -89,7 +90,12 @@ pub(crate) fn services_pair(
     ));
     tokio::spawn(async move {
         let _ = services
-            .serve(server.sender, server.port, route(server.incoming))
+            .serve(
+                server.sender.clone(),
+                server.sender,
+                server.port,
+                route(server.incoming),
+            )
             .await;
     });
     client.host()

@@ -265,11 +265,11 @@ impl AgentPool {
     }
 
     /// Readies every workset process for a re-executed agent host to take
-    /// over and describes them for it. The host sets new worker requests
-    /// aside and keeps reading until every request it started, anywhere,
-    /// is answered: one may wait on a frame from another workset. Then it
-    /// stops reading at a frame boundary. If that takes too long, all carry
-    /// on and this errs.
+    /// over and describes them for it. The host stops reading worker
+    /// requests and keeps reading everything else until every request it
+    /// started, anywhere, is answered: one may wait on a frame from another
+    /// workset. Then it stops reading altogether. If that takes too long,
+    /// all carry on and this errs.
     pub async fn hand_over(&self) -> anyhow::Result<Vec<crate::host::Handed>> {
         let slots = self
             .processes
@@ -295,17 +295,16 @@ impl AgentPool {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         };
-        for (_, process) in &processes {
-            process.defer();
-        }
         let handed = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            futures::future::try_join_all(
+                processes.iter().map(|(_, process)| process.stop_requests()),
+            )
+            .await?;
             idle().await;
             futures::future::try_join_all(
                 processes.iter().map(|(_, process)| process.stop_reading()),
             )
             .await?;
-            // What was read before the stop may have been routed since.
-            idle().await;
             futures::future::try_join_all(
                 processes
                     .iter()
