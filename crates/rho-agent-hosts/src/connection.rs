@@ -53,7 +53,7 @@ fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
     (delay * 2).min(MAX_RECONNECT_DELAY)
 }
 
-use crate::{AttachTarget, Dialer, HostId, HostStream};
+use crate::{AttachTarget, Dialer, HostId, HostStream, IrohAccess};
 
 /// A connection event tagged with the agent host it came from. Every attached
 /// host feeds the same channel, so the workspace handles one ordered stream
@@ -300,6 +300,16 @@ async fn supervise(
             delay = INITIAL_RECONNECT_DELAY;
             reconnecting = false;
         }
+        // Enrollment already reported its code and waited for approval.
+        // Keep that reason visible and do not add reconnect backoff.
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<EnrollmentPending>())
+        {
+            reconnecting = false;
+            delay = INITIAL_RECONNECT_DELAY;
+            continue;
+        }
         let reason = result
             .err()
             .map(|error| format!("{error:#}"))
@@ -355,11 +365,9 @@ async fn run(
         }
         AttachTarget::Iroh {
             endpoint_id,
-            ssh_destination,
-            remote_rho,
+            access,
         } => {
-            let (connection, endpoint) =
-                connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
+            let (connection, endpoint) = connect_iroh(endpoint_id, &access, events).await?;
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             tokio::spawn(async move { uni.receive_uni().await });
@@ -847,32 +855,71 @@ async fn client_endpoint() -> anyhow::Result<iroh::Endpoint> {
         .cloned()
 }
 
+#[derive(Debug)]
+struct EnrollmentPending;
+
+impl std::fmt::Display for EnrollmentPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("iroh enrollment awaiting approval")
+    }
+}
+impl std::error::Error for EnrollmentPending {}
+
 async fn connect_iroh(
     host_id: iroh::EndpointId,
-    ssh_destination: &str,
-    remote_rho: &str,
+    access: &IrohAccess,
+    events: &EventSink,
 ) -> anyhow::Result<(iroh::endpoint::Connection, iroh::Endpoint)> {
-    // The native client's identity intentionally lives only as long as this
-    // process. Each agent host can trust it in memory via an existing SSH login.
-    let endpoint = client_endpoint().await?;
-    tracing::info!(
-        destination = ssh_destination,
-        "trusting ephemeral iroh client over SSH"
-    );
-    trust_in_memory_over_ssh(ssh_destination, remote_rho, endpoint.id()).await?;
-    tracing::info!(
-        destination = ssh_destination,
-        "ephemeral iroh client trusted over SSH"
-    );
+    let endpoint = match access {
+        IrohAccess::Ssh {
+            ssh_destination,
+            remote_rho,
+        } => {
+            let endpoint = client_endpoint().await?;
+            tracing::info!(
+                destination = ssh_destination,
+                "trusting ephemeral iroh client over SSH"
+            );
+            trust_in_memory_over_ssh(ssh_destination, remote_rho, endpoint.id()).await?;
+            tracing::info!(
+                destination = ssh_destination,
+                "ephemeral iroh client trusted over SSH"
+            );
+            endpoint
+        }
+        IrohAccess::Fido => crate::fido::endpoint()
+            .await
+            .context("security key identity")?,
+    };
     let connection = endpoint
         .connect(host_id, rho_rpc::protocol::IROH_ALPN)
         .await
         .context("connect to agent host over iroh")?;
-    anyhow::ensure!(
-        rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await?
-            == rho_iroh_auth::ClientAuthResult::Approved,
-        "agent host did not approve SSH-trusted iroh client"
-    );
+    match rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await? {
+        rho_iroh_auth::ClientAuthResult::Approved => {}
+        rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code)
+            if matches!(access, IrohAccess::Fido) =>
+        {
+            events.unbounded_send(ConnEvent::Disconnected(format!(
+                "enroll this rho on the host: rho iroh approve {code}"
+            )))?;
+            // The server closes after our auth ack. Keep the per-connection code
+            // visible long enough for approval, without racing a new code.
+            let closed = CLOSED.notified();
+            let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            if !closing() {
+                tokio::select! {
+                    _ = async {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
+                        tokio::time::sleep_until(retry_at).await;
+                    } => {}
+                    _ = closed => {}
+                }
+            }
+            return Err(EnrollmentPending.into());
+        }
+        _ => anyhow::bail!("agent host did not approve iroh client"),
+    }
     Ok((connection, endpoint))
 }
 

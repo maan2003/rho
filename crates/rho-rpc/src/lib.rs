@@ -44,9 +44,15 @@ const IROH_SERVER_SECRET: redb::TableDefinition<(), &[u8; 32]> =
 /// incoming agent-stream credit and qlog policy.
 #[cfg(feature = "native-client")]
 pub async fn bind_ephemeral_iroh_client() -> anyhow::Result<iroh::Endpoint> {
+    bind_iroh_client(iroh::SecretKey::generate()).await
+}
+
+/// Binds a client endpoint with a caller-owned, stable identity.
+#[cfg(feature = "native-client")]
+pub async fn bind_iroh_client(secret: iroh::SecretKey) -> anyhow::Result<iroh::Endpoint> {
     install_crypto_provider()?;
     iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(iroh::SecretKey::generate())
+        .secret_key(secret)
         .transport_config(
             iroh::endpoint::QuicTransportConfig::builder()
                 .max_concurrent_uni_streams(1024u32.into())
@@ -55,7 +61,7 @@ pub async fn bind_ephemeral_iroh_client() -> anyhow::Result<iroh::Endpoint> {
         )
         .bind()
         .await
-        .context("bind ephemeral iroh client endpoint")
+        .context("bind iroh client endpoint")
 }
 
 /// Performs the mandatory raw, bounded authentication exchange before any

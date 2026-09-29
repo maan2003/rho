@@ -16,6 +16,8 @@ pub mod protocol;
 #[cfg(feature = "client")]
 pub mod connection;
 #[cfg(feature = "client")]
+pub mod fido;
+#[cfg(feature = "client")]
 pub mod hosts;
 #[cfg(feature = "client")]
 pub mod saved;
@@ -54,8 +56,7 @@ pub enum AttachTarget {
     Unix(std::path::PathBuf),
     Iroh {
         endpoint_id: iroh::EndpointId,
-        ssh_destination: String,
-        remote_rho: String,
+        access: IrohAccess,
     },
 }
 
@@ -66,10 +67,28 @@ impl AttachTarget {
         match self {
             Self::Unix(path) => path.display().to_string(),
             Self::Iroh {
-                ssh_destination, ..
+                access: IrohAccess::Ssh {
+                    ssh_destination, ..
+                },
+                ..
             } => format!("iroh via {ssh_destination}"),
+            Self::Iroh {
+                access: IrohAccess::Fido,
+                ..
+            } => "iroh via security key".to_owned(),
         }
     }
+}
+
+/// How the remote endpoint learns to trust this client's iroh identity.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+pub enum IrohAccess {
+    Ssh {
+        ssh_destination: String,
+        remote_rho: String,
+    },
+    Fido,
 }
 
 /// One agent host to attach: the short name it is known by in this client, and
@@ -85,27 +104,33 @@ pub struct HostSpec {
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
     /// the attach prompt: `<name>=unix:<socket>` or
-    /// `<name>=iroh:<endpoint-id>@<ssh-destination>`.
+    /// `<name>=iroh:<endpoint-id>[@<ssh-destination>]`.
     pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
         let (name, target) = text
             .trim()
             .split_once('=')
-            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>@<ssh-dest>")?;
+            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>[@<ssh-dest>]")?;
         if name.is_empty() {
             return Err("host name is empty".to_owned());
         }
         let target = match target.split_once(':') {
             Some(("unix", path)) => AttachTarget::Unix(std::path::PathBuf::from(path)),
             Some(("iroh", rest)) => {
-                let (endpoint_id, ssh_destination) = rest
-                    .split_once('@')
-                    .ok_or("iroh targets are <endpoint-id>@<ssh-dest>")?;
+                let (endpoint_id, access) = match rest.split_once('@') {
+                    Some((id, destination)) => (
+                        id,
+                        IrohAccess::Ssh {
+                            ssh_destination: destination.to_owned(),
+                            remote_rho: remote_rho.to_owned(),
+                        },
+                    ),
+                    None => (rest, IrohAccess::Fido),
+                };
                 AttachTarget::Iroh {
                     endpoint_id: endpoint_id
                         .parse()
                         .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
-                    ssh_destination: ssh_destination.to_owned(),
-                    remote_rho: remote_rho.to_owned(),
+                    access,
                 }
             }
             _ => return Err(format!("unknown host target scheme in `{target}`")),
@@ -181,5 +206,24 @@ impl HostSink for DroppedSink {
 
     fn is_closed(&self) -> bool {
         false
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn iroh_access_forms_keep_the_same_endpoint() {
+        let id = iroh::SecretKey::from([7; 32]).public();
+        let fido = HostSpec::parse(&format!("fern=iroh:{id}"), "/opt/rho").unwrap();
+        assert_eq!(fido.name, "fern");
+        assert!(
+            matches!(fido.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Fido } if endpoint_id == id)
+        );
+        let ssh = HostSpec::parse(&format!("fern=iroh:{id}@other-host"), "/opt/rho").unwrap();
+        assert!(
+            matches!(ssh.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Ssh { ssh_destination, remote_rho } } if endpoint_id == id && ssh_destination == "other-host" && remote_rho == "/opt/rho")
+        );
     }
 }

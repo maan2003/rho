@@ -12611,20 +12611,24 @@ name = "rho-agent-hosts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "camino",
  "futures",
  "iroh",
  "octo-types",
+ "rand 0.8.7",
  "redb",
  "rho-agent-hosts",
  "rho-db",
  "rho-iroh-auth",
  "rho-rpc",
  "senax-encoder",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "zbus",
 ]
 
 [[package]]

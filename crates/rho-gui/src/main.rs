@@ -307,6 +307,7 @@ fn run() -> Result<()> {
     if let Err(error) = rho_agents_client::cache::init(db.clone()) {
         tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the agent host");
     }
+    rho_agent_hosts::fido::init(db.clone());
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
     let local_socket = specs.iter().find_map(|spec| match &spec.target {

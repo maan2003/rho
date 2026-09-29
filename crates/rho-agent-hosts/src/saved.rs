@@ -11,7 +11,7 @@ use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
-use crate::{AttachTarget, HostSpec};
+use crate::{AttachTarget, HostSpec, IrohAccess};
 
 const SAVED: TableDefinition<(), Sen<SavedHosts>> = TableDefinition::new("rho_hosts_saved_v1");
 
@@ -39,6 +39,9 @@ enum SavedTarget {
         ssh_destination: String,
         remote_rho: String,
     },
+    IrohFido {
+        endpoint_id: String,
+    },
 }
 
 impl SavedHost {
@@ -49,12 +52,19 @@ impl SavedHost {
             },
             AttachTarget::Iroh {
                 endpoint_id,
-                ssh_destination,
-                remote_rho,
-            } => SavedTarget::Iroh {
-                endpoint_id: endpoint_id.to_string(),
-                ssh_destination: ssh_destination.clone(),
-                remote_rho: remote_rho.clone(),
+                access,
+            } => match access {
+                IrohAccess::Ssh {
+                    ssh_destination,
+                    remote_rho,
+                } => SavedTarget::Iroh {
+                    endpoint_id: endpoint_id.to_string(),
+                    ssh_destination: ssh_destination.clone(),
+                    remote_rho: remote_rho.clone(),
+                },
+                IrohAccess::Fido => SavedTarget::IrohFido {
+                    endpoint_id: endpoint_id.to_string(),
+                },
             },
         };
         Self {
@@ -74,8 +84,16 @@ impl SavedHost {
                 endpoint_id: endpoint_id
                     .parse()
                     .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
-                ssh_destination,
-                remote_rho,
+                access: IrohAccess::Ssh {
+                    ssh_destination,
+                    remote_rho,
+                },
+            },
+            SavedTarget::IrohFido { endpoint_id } => AttachTarget::Iroh {
+                endpoint_id: endpoint_id
+                    .parse()
+                    .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
+                access: IrohAccess::Fido,
             },
         };
         Ok(HostSpec {
@@ -142,8 +160,10 @@ mod tests {
             name: name.to_owned(),
             target: AttachTarget::Iroh {
                 endpoint_id: secret.public(),
-                ssh_destination: "fern".to_owned(),
-                remote_rho: "/opt/rho/bin/rho".to_owned(),
+                access: IrohAccess::Ssh {
+                    ssh_destination: "fern".to_owned(),
+                    remote_rho: "/opt/rho/bin/rho".to_owned(),
+                },
             },
         }
     }
@@ -153,9 +173,14 @@ mod tests {
             AttachTarget::Unix(path) => format!("unix:{}", path.display()),
             AttachTarget::Iroh {
                 endpoint_id,
-                ssh_destination,
-                remote_rho,
-            } => format!("iroh:{endpoint_id}@{ssh_destination} via {remote_rho}"),
+                access,
+            } => match access {
+                IrohAccess::Ssh {
+                    ssh_destination,
+                    remote_rho,
+                } => format!("iroh:{endpoint_id}@{ssh_destination} via {remote_rho}"),
+                IrohAccess::Fido => format!("iroh:{endpoint_id} via security key"),
+            },
         };
         format!("{}={target}", spec.name)
     }
@@ -171,6 +196,13 @@ mod tests {
         let specs = vec![
             iroh_spec("fern"),
             HostSpec {
+                name: "fido".to_owned(),
+                target: AttachTarget::Iroh {
+                    endpoint_id: iroh::SecretKey::from([9; 32]).public(),
+                    access: IrohAccess::Fido,
+                },
+            },
+            HostSpec {
                 name: "local".to_owned(),
                 target: AttachTarget::Unix("/run/user/1000/rho/rho.sock".into()),
             },
@@ -183,15 +215,43 @@ mod tests {
         );
 
         // A detach rewrites the whole row; nothing of the old set lingers.
-        save(&db, &specs[1..]);
+        save(&db, &specs[2..]);
         assert_eq!(
             load(&db).iter().map(describe).collect::<Vec<_>>(),
-            vec![describe(&specs[1])]
+            vec![describe(&specs[2])]
         );
         save(&db, &[]);
         assert!(
             load(&db).is_empty(),
             "detaching the last host saves an empty set"
+        );
+    }
+    #[test]
+    fn legacy_ssh_row_decodes_after_new_variant_is_added() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(db_dir.path()).unwrap();
+        // The existing persisted enum discriminant must remain the SSH variant.
+        let id = iroh::SecretKey::from([3; 32]).public();
+        let old = SavedHosts {
+            hosts: vec![SavedHost {
+                name: "legacy".into(),
+                target: SavedTarget::Iroh {
+                    endpoint_id: id.to_string(),
+                    ssh_destination: "older-host".into(),
+                    remote_rho: "/bin/rho".into(),
+                },
+            }],
+        };
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            write
+                .open_table(SAVED)
+                .insert(&(), SenValue::borrowed(&old));
+            write.commit();
+        });
+        assert_eq!(
+            load(&db).iter().map(describe).collect::<Vec<_>>(),
+            [format!("legacy=iroh:{id}@older-host via /bin/rho")]
         );
     }
 }
