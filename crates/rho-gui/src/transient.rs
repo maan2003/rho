@@ -111,6 +111,7 @@ pub(crate) enum Command {
     SlackMessageDelete(rho_slack::types::Ts),
     SlackMessageReact(rho_slack::types::Ts),
     SlackMessageCopyLink(rho_slack::types::Ts),
+    SlackMessageCopyText(rho_slack::types::Ts),
     SlackMessageForward(rho_slack::types::Ts),
     // Hosts.
     HostsList,
@@ -401,6 +402,11 @@ pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageA
         "r",
         "react…",
         MenuAction::Command(Command::SlackMessageReact(ts.clone())),
+    );
+    menu = menu.item(
+        "y",
+        "copy text",
+        MenuAction::Command(Command::SlackMessageCopyText(ts.clone())),
     );
     if actions.can_copy_link {
         menu = menu.item(

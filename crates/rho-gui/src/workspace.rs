@@ -5867,6 +5867,7 @@ impl Workspace {
             Command::SlackMessageDelete(ts) => self.confirm_slack_delete_message(ts, window, cx),
             Command::SlackMessageReact(ts) => self.slack_react_at(ts, window, cx),
             Command::SlackMessageCopyLink(ts) => self.slack_copy_message_link(ts, cx),
+            Command::SlackMessageCopyText(ts) => self.slack_copy_message_text(ts, cx),
             Command::SlackMessageForward(ts) => self.prompt_slack_forward_message(ts, window, cx),
             Command::SlackMarkReadBefore => self.prompt_slack_mark_read_before(window, cx),
             Command::SlackMarkUnread => self.slack_mark_unread(window, cx),

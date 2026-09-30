@@ -1141,6 +1141,15 @@ impl ConversationView {
             .update(cx, |session, cx| session.delete_message(&source, ts, cx))
     }
 
+    /// A message's text as the reader would type it, for copying.
+    pub fn message_text(&self, ts: &Ts, cx: &mut Context<Self>) -> Option<String> {
+        let message = self
+            .shown_messages(cx)
+            .into_iter()
+            .find(|message| &message.ts == ts)?;
+        Some(self.session.read(cx).model().decode(&message.text))
+    }
+
     pub fn message_link(&mut self, ts: Ts, cx: &mut Context<Self>) -> Task<anyhow::Result<String>> {
         let source = self.source.clone();
         self.session

@@ -1657,6 +1657,20 @@ impl Workspace {
         );
     }
 
+    pub(crate) fn slack_copy_message_text(&mut self, ts: Ts, cx: &mut gpui::Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let Some(text) = view
+            .clone()
+            .update(cx, |view, cx| view.message_text(&ts, cx))
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.echo("slack: message text copied", StyleClass::SystemInfo, cx);
+    }
+
     pub(crate) fn slack_copy_message_link(&mut self, ts: Ts, cx: &mut gpui::Context<Self>) {
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;

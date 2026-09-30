@@ -3909,6 +3909,46 @@ async fn copy_message_link_writes_the_server_permalink(cx: &mut TestAppContext) 
     );
 }
 
+/// A touch screen has no text selection, so the message menu copies what
+/// the reader would have typed rather than the wire escapes.
+#[gpui::test]
+async fn copy_message_text_writes_the_typed_form(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "510.000321", "user": "UD", "text": "<@UA> see <#C2>"
+        }),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId("C1".into())),
+                window,
+                cx,
+            );
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()));
+        })
+        .unwrap();
+    let mut copied = None;
+    for _ in 0..100 {
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.slack_copy_message_text(rho_slack::types::Ts("510.000321".into()), cx)
+            })
+            .unwrap();
+        copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        if copied.as_deref() != Some("unchanged") {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(copied.as_deref(), Some("@ada see #random"));
+}
+
 /// The keyboard path must honor the broadcast setting without a Send button.
 #[gpui::test]
 async fn slack_keyboard_send_honors_broadcast_toggle(cx: &mut TestAppContext) {
