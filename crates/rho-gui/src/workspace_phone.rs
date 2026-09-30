@@ -190,7 +190,15 @@ impl PhoneUi {
 
     pub(super) fn update_mode(&mut self, window: &Window) -> PhoneModeChange {
         let was_enabled = self.enabled;
-        self.enabled = self.forced || window.viewport_size().width <= PHONE_MAX_WIDTH;
+        let size = window.viewport_size();
+        // A narrow window is a phone; a phone turned on its side is still
+        // one, so once on, the short side decides. A short desktop window
+        // never was a phone and stays the desk.
+        let short_side = match was_enabled {
+            true => size.width.min(size.height),
+            false => size.width,
+        };
+        self.enabled = self.forced || short_side <= PHONE_MAX_WIDTH;
         PhoneModeChange {
             enabled: self.enabled,
             entered: self.enabled && !was_enabled,
@@ -510,6 +518,11 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn phone_feed_for_test(&mut self, cx: &mut Context<Self>) -> bool {
         self.phone.enabled && self.phone.stack.is_empty() && self.open_card_in_view(cx).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_enabled_for_test(&self) -> bool {
+        self.phone.enabled
     }
 
     #[cfg(test)]

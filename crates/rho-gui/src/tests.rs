@@ -6784,3 +6784,21 @@ fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_phone_on_its_side_stays_a_phone_but_a_short_desk_window_does_not_become_one(
+    cx: &mut TestAppContext,
+) {
+    let workspace = test_workspace(cx);
+    let phone_after = |width: f32, height: f32, cx: &mut TestAppContext| {
+        cx.simulate_window_resize(*workspace, size(px(width), px(height)));
+        next_frame(cx, workspace);
+        workspace
+            .update(cx, |workspace, _, _| workspace.phone_enabled_for_test())
+            .unwrap()
+    };
+    assert!(!phone_after(1200., 500., cx), "a short desk window");
+    assert!(phone_after(400., 800., cx), "a phone upright");
+    assert!(phone_after(800., 400., cx), "the same phone on its side");
+    assert!(!phone_after(1200., 800., cx), "a desk window again");
+}
