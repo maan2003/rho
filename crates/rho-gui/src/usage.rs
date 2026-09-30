@@ -14,7 +14,7 @@
 //! behind a pixel. When the window changes width the summary is built again,
 //! which is a resize and not a frame.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use collections::HashMap;
 use gpui::prelude::*;
@@ -216,6 +216,13 @@ pub(crate) struct UsageView {
     /// width, so a taller screen gets a taller picture and not a strip's
     /// worth of chart with a screen of blank under it.
     height: Pixels,
+    /// Where the chart block was last drawn, written by the block and read
+    /// when the screen is laid out.
+    chart_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// The chart height that brings the block's bottom to the screen's,
+    /// which is less than the window by whatever frames the screen (the
+    /// phone's title and bottom bar) and by however the header wrapped.
+    fitted_height: Option<Pixels>,
     series: Series,
     summary: Option<Arc<Summary>>,
     block: Option<editor::display_map::CustomBlockId>,
@@ -240,7 +247,9 @@ impl UsageView {
             chart: Chart::RateLimit,
             days: 7,
             columns: columns_for(window),
-            height: height_for(window),
+            height: height_for(window.viewport_size().height),
+            chart_bounds: Arc::default(),
+            fitted_height: None,
             series: Series::None,
             summary: None,
             block: None,
@@ -394,6 +403,7 @@ impl UsageView {
         };
         let old = self.block.take();
         let self_height = self.height;
+        let chart_bounds = self.chart_bounds.clone();
         // Below the last line of the header, so the words come first and the
         // picture under them, the way a menu block sits under its row.
         let block = self.editor.update(cx, |editor, cx| {
@@ -405,7 +415,11 @@ impl UsageView {
                 snapshot.anchor_before(snapshot.len())
             };
             editor
-                .insert_blocks([chart_block(anchor, summary, self_height)], None, cx)
+                .insert_blocks(
+                    [chart_block(anchor, summary, self_height, chart_bounds)],
+                    None,
+                    cx,
+                )
                 .into_iter()
                 .next()
         });
@@ -413,6 +427,7 @@ impl UsageView {
     }
 
     fn remove_block(&mut self, cx: &mut Context<Self>) {
+        *self.chart_bounds.lock().unwrap() = None;
         if let Some(block) = self.block.take() {
             self.editor.update(cx, |editor, cx| {
                 editor.remove_blocks(std::iter::once(block).collect(), None, cx);
@@ -427,17 +442,42 @@ impl gpui::Render for UsageView {
         // changes. A chart reduced for a narrower window would draw a
         // coarser line for as long as the screen stayed open otherwise.
         let columns = columns_for(window);
-        let height = height_for(window);
+        let height = self
+            .fitted_height
+            .unwrap_or_else(|| height_for(window.viewport_size().height));
         if columns != self.columns || height != self.height {
             self.columns = columns;
             self.height = height;
             self.rebuild(cx);
         }
+        let this = cx.entity().downgrade();
         div()
             .key_context("RhoUsage")
+            .relative()
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())
+            .child(
+                canvas(
+                    move |screen, _, cx| {
+                        let _ = this.update(cx, |view, cx| {
+                            // The block drew before this, in the same frame.
+                            let fitted = match *view.chart_bounds.lock().unwrap() {
+                                Some(chart) => view.height + (screen.bottom() - chart.bottom()),
+                                None => height_for(screen.size.height),
+                            }
+                            .max(MIN_CHART_HEIGHT);
+                            if (fitted - view.height).abs() >= px(1.) {
+                                view.fitted_height = Some(fitted);
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
     }
 }
 
@@ -451,8 +491,8 @@ fn columns_for(window: &Window) -> usize {
 /// How tall to draw the chart: what the screen has left under the header.
 /// The charts used to be a strip along the bottom and were sized for one;
 /// a screen of their own is the point of the change, so they take it.
-fn height_for(window: &Window) -> Pixels {
-    (window.viewport_size().height - CHART_CHROME).max(MIN_CHART_HEIGHT)
+fn height_for(screen_height: Pixels) -> Pixels {
+    (screen_height - CHART_CHROME).max(MIN_CHART_HEIGHT)
 }
 
 fn backfill_note(approximate: bool) -> &'static str {
@@ -468,6 +508,7 @@ fn chart_block(
     anchor: multi_buffer::Anchor,
     summary: Arc<Summary>,
     height: Pixels,
+    bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 ) -> editor::display_map::BlockProperties<multi_buffer::Anchor> {
     editor::display_map::BlockProperties {
         placement: editor::display_map::BlockPlacement::Below(anchor),
@@ -485,7 +526,19 @@ fn chart_block(
             // gpui's default — a black one, in the buffer's absence of a
             // font. Everything the chart draws in words hangs off this.
             let text_style = cx.editor_style.text.clone();
-            render_chart(&summary, height, &text_style, cx.app).into_any_element()
+            let bounds = bounds.clone();
+            div()
+                .relative()
+                .child(render_chart(&summary, height, &text_style, cx.app))
+                .child(
+                    canvas(
+                        move |drawn, _, _| *bounds.lock().unwrap() = Some(drawn),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .into_any_element()
         }),
         priority: 1,
     }
@@ -724,7 +777,8 @@ fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> An
 fn legend_row(legend: &[rho_agents_client::usage::Legend], cx: &App) -> gpui::Div {
     div()
         .flex()
-        .gap_4()
+        .flex_wrap()
+        .gap_x_4()
         .px_2()
         .children(legend.iter().map(|entry| {
             div()

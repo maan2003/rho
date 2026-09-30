@@ -746,7 +746,9 @@ fn model_cost(series: &[crate::protocol::AgentUsageSeries], model: &str, since: 
         .flat_map(|series| &series.buckets)
         .filter(|bucket| bucket.bucket_start_ms >= since)
         .map(|bucket| bucket_cost_usd(bucket, model))
-        .sum()
+        // Not `sum`: an empty float sum is -0.0, which a legend prints as
+        // `$-0.00` for a model that was never used.
+        .fold(0.0, |total, cost| total + cost)
 }
 
 /// What a bucket cost, at the provider's posted rates per million tokens.
@@ -828,6 +830,27 @@ mod tests {
             7,
         );
         assert!(points.last().unwrap().1[0] > 0.0);
+    }
+
+    #[test]
+    fn an_unused_model_costs_zero_dollars_not_minus_zero() {
+        let usage = vec![crate::protocol::AgentUsageSeries {
+            model: "astra".to_owned(),
+            buckets: vec![crate::protocol::AgentUsageBucket {
+                bucket_start_ms: 10 * HOUR_MS,
+                input_tokens: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            }],
+        }];
+        let cost = cost_summary(&usage, 7, 40 * HOUR_MS, 100);
+        let labels = cost
+            .legend
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"fable $0.00"), "{labels:?}");
+        assert!(labels.contains(&"astra $10.00"), "{labels:?}");
     }
 
     #[test]

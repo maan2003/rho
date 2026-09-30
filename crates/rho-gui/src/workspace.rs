@@ -3159,6 +3159,11 @@ impl Workspace {
             ],
             cx,
         );
+        self.echo(
+            &format!("project `{path_name}` added"),
+            StyleClass::SystemInfo,
+            cx,
+        );
     }
 
     pub(crate) fn cmd_project_remove(&mut self, path: String, cx: &mut Context<Self>) {
@@ -3183,6 +3188,11 @@ impl Workspace {
                 };
                 self.write_marks(
                     vec![rho_dealer::facts::Fact::Repository { label, url: None }.into()],
+                    cx,
+                );
+                self.echo(
+                    &format!("project `{name}` removed"),
+                    StyleClass::SystemInfo,
                     cx,
                 );
             }
@@ -3545,9 +3555,9 @@ impl Workspace {
                         crate::commands::Candidate {
                             value: name.clone(),
                             description: if disabled {
-                                "disabled account"
+                                "disabled · picking enables it"
                             } else {
-                                "enabled account"
+                                "enabled · picking disables it"
                             }
                             .to_owned(),
                         }
