@@ -156,7 +156,7 @@ class _CheckStatus(AttrDict):
 async def check_status(self:GhApi, ref:str):
     """Combined commit status and check-run results for a commit SHA.
 
-    Octo accepts a 40-character commit SHA as `ref`. Display the result bare for the check-run verdict and all run/status rows. `.state` comes only from legacy commit statuses and can be pending even when every Actions check passed. `.check_runs` and `.statuses` retain the structured rows.
+    Accepts a commit SHA, branch name or tag name as `ref`. Display the result bare for the check-run verdict and all run/status rows. `.state` comes only from legacy commit statuses and can be pending even when every Actions check passed. `.check_runs` and `.statuses` retain the structured rows.
     """
     combined = await self.repos.get_combined_status_for_ref(ref)
     checks = await self.checks.list_for_ref(ref, per_page=100, page=1)

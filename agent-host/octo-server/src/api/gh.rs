@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -82,21 +82,57 @@ pub fn router() -> Router<Arc<AppState>> {
             axum::routing::post(reply_to_review_comment),
         )
         .route(
-            "/repos/{owner}/{repo}/commits/{ref}/status",
-            get(get_status),
-        )
-        .route(
-            "/repos/{owner}/{repo}/commits/{ref}/check-runs",
-            get(list_checks),
+            "/repos/{owner}/{repo}/commits/{*reference}",
+            get(get_commit),
         )
         .layer(DefaultBodyLimit::disable())
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListQuery {
+struct PullsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_page: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuesQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    milestone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mentioned: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_field_values: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,9 +143,17 @@ struct ListQuery {
 #[serde(deny_unknown_fields)]
 struct CheckQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
+    check_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,13 +167,34 @@ struct PageQuery {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RunQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_pull_requests: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
-    head_sha: Option<String>,
+    actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_pull_requests: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_suite_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,6 +259,10 @@ struct EditPull {
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintainer_can_modify: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -205,8 +274,11 @@ struct CommentBody {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePullRequest {
-    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
     head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_repo: Option<String>,
     base: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft: Option<bool>,
@@ -214,6 +286,8 @@ struct CreatePullRequest {
     body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     maintainer_can_modify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -487,7 +561,12 @@ async fn github_request<B: Serialize, Q: Serialize>(
     query: Option<Q>,
     body: Option<B>,
 ) -> Result<reqwest::Response, Response> {
-    if !path.iter().all(|part| allowed_segment(part)) {
+    // Url encodes each item as one segment, including slashes and percent signs.
+    // Reject empty/dot components rather than letting them change the route.
+    if !path
+        .iter()
+        .all(|part| part.split('/').all(|part| !matches!(part, "" | "." | "..")))
+    {
         return Err(forbidden());
     }
     let token = match state.get_token().await {
@@ -811,15 +890,18 @@ async fn list_runs(
 async fn get_run(
     State(state): State<Arc<AppState>>,
     Path((owner, repo, id)): Path<(String, String, String)>,
-    uri: Uri,
+    query: Result<Query<RunQuery>, QueryRejection>,
 ) -> Response {
-    if uri.query().is_some() || !positive(&id) {
+    let Ok(Query(query)) = query else {
+        return forbidden();
+    };
+    if !positive(&id) {
         return forbidden();
     }
-    github_get::<WorkflowRun, ()>(
+    github_get::<WorkflowRun, _>(
         state,
         &["repos", &owner, &repo, "actions", "runs", &id],
-        None,
+        Some(query),
     )
     .await
 }
@@ -956,7 +1038,7 @@ async fn rerun_failed(
 async fn list_pulls(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
-    query: Result<Query<ListQuery>, QueryRejection>,
+    query: Result<Query<PullsQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(query)) = query else {
         return forbidden();
@@ -984,7 +1066,7 @@ async fn create_pull(
     let Ok(Json(pr)) = body else {
         return forbidden();
     };
-    if uri.query().is_some() {
+    if uri.query().is_some() || (pr.title.is_none() && pr.issue.is_none()) {
         return forbidden();
     }
     github_post::<Pull, _>(state, &["repos", &owner, &repo, "pulls"], pr).await
@@ -1008,7 +1090,7 @@ async fn update_pull(
 async fn list_issues(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
-    query: Result<Query<ListQuery>, QueryRejection>,
+    query: Result<Query<IssuesQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(query)) = query else {
         return forbidden();
@@ -1136,39 +1218,32 @@ async fn reply_to_review_comment(
     .await
 }
 
-async fn get_status(
+async fn get_commit(
     State(state): State<Arc<AppState>>,
-    Path((owner, repo, sha)): Path<(String, String, String)>,
+    Path((owner, repo, tail)): Path<(String, String, String)>,
     uri: Uri,
 ) -> Response {
-    if uri.query().is_some() || !self::sha(&sha) {
-        return forbidden();
-    }
-    github_get::<CombinedStatus, ()>(
-        state,
-        &["repos", &owner, &repo, "commits", &sha, "status"],
-        None,
-    )
-    .await
-}
-
-async fn list_checks(
-    State(state): State<Arc<AppState>>,
-    Path((owner, repo, sha)): Path<(String, String, String)>,
-    query: Result<Query<CheckQuery>, QueryRejection>,
-) -> Response {
-    let Ok(Query(query)) = query else {
+    // The client preserves slashes in refs, so capture the ref and endpoint
+    // together.
+    let Some((reference, endpoint)) = tail.rsplit_once('/') else {
         return forbidden();
     };
-    if !self::sha(&sha) {
-        return forbidden();
+    let path = ["repos", &owner, &repo, "commits", reference, endpoint];
+    match endpoint {
+        "status" => {
+            let Ok(Query(query)) = Query::<PageQuery>::try_from_uri(&uri) else {
+                return forbidden();
+            };
+            github_get::<CombinedStatus, _>(state, &path, Some(query)).await
+        }
+        "check-runs" => {
+            let Ok(Query(query)) = Query::<CheckQuery>::try_from_uri(&uri) else {
+                return forbidden();
+            };
+            github_get::<CheckRuns, _>(state, &path, Some(query)).await
+        }
+        _ => forbidden(),
     }
-    github_get::<CheckRuns, _>(
-        state,
-        &["repos", &owner, &repo, "commits", &sha, "check-runs"],
-        Some(query),
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -1214,7 +1289,11 @@ mod tests {
                 let input: Value = serde_json::from_str(&body).unwrap();
                 match (method, uri.path()) {
                     (Method::PATCH, "/repos/acme/widgets/pulls/42") => {
-                        assert_eq!(input, json!({"base":"release/next"}));
+                        if input["state"] == "closed" {
+                            assert_eq!(input, json!({"base":"release/next","state":"closed","maintainer_can_modify":false}));
+                        } else {
+                            assert_eq!(input, json!({"state":"open","maintainer_can_modify":true}));
+                        }
                         let mut result = pull();
                         result["base"]["ref"] = json!("release/next");
                         result["merged"] = json!(false);
@@ -1253,7 +1332,7 @@ mod tests {
         assert_eq!(
             client
                 .patch(&base)
-                .json(&json!({"base":"release/next","state":"closed"}))
+                .json(&json!({"base":"release/next","unexpected":true}))
                 .send()
                 .await
                 .unwrap()
@@ -1262,7 +1341,7 @@ mod tests {
         );
         let edit = client
             .patch(&base)
-            .json(&json!({"base":"release/next"}))
+            .json(&json!({"base":"release/next","state":"closed","maintainer_can_modify":false}))
             .send()
             .await
             .unwrap();
@@ -1271,6 +1350,16 @@ mod tests {
         assert_eq!(edit["base"]["ref"], "release/next");
         assert_eq!(edit["merged"], false);
         assert!(edit.get("ignored").is_none());
+        assert_eq!(
+            client
+                .patch(&base)
+                .json(&json!({"state":"open","maintainer_can_modify":true}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         let decision = client
             .get(format!("{base}/review-decision"))
             .send()
@@ -1290,7 +1379,7 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         proxy_task.abort();
         upstream_task.abort();
     }
@@ -1323,20 +1412,24 @@ mod tests {
                         "path":"src/a.rs","start_line":8,"end_line":8,"annotation_level":"failure",
                         "message":"wrong type","ignored":"private"
                     }])),
-                    (Method::GET, "actions/runs") => (StatusCode::OK, json!({
+                    (Method::GET, "actions/runs") => {
+                        assert_eq!(uri.query(), Some("actor=alice&branch=release%2Fnext&event=pull_request&status=failure&page=2&per_page=11&created=2026-09-01..2026-09-29&exclude_pull_requests=false&check_suite_id=17&head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+                        (StatusCode::OK, json!({
                         "total_count":1,"workflow_runs":[{
                             "id":11,"name":"CI","head_sha":"a".repeat(40),"status":"completed",
                             "conclusion":"failure","html_url":"https://github.com/acme/widgets/actions/runs/11",
                             "run_number":2,"run_attempt":1,"workflow_id":3,"event":"push",
                             "created_at":"2025-01-01","updated_at":"2025-01-02","ignored":"private"
                         }]
-                    })),
-                    (Method::GET, "actions/runs/11") => (StatusCode::OK, json!({
+                    }))},
+                    (Method::GET, "actions/runs/11") => {
+                        assert_eq!(uri.query(), Some("exclude_pull_requests=true"));
+                        (StatusCode::OK, json!({
                         "id":11,"name":"CI","head_sha":"a".repeat(40),"status":"completed",
                         "conclusion":"failure","html_url":"https://github.com/acme/widgets/actions/runs/11",
                         "run_number":2,"run_attempt":1,"workflow_id":3,"event":"push",
                         "created_at":"2025-01-01","updated_at":"2025-01-02"
-                    })),
+                    }))},
                     (Method::GET, "actions/runs/11/jobs") => (StatusCode::OK, json!({
                         "total_count":1,"jobs":[{"id":12,"run_id":11,"name":"test",
                         "status":"completed","conclusion":"failure","steps":[{
@@ -1378,10 +1471,10 @@ mod tests {
             ("check-runs/7", "output"),
             ("check-runs/7/annotations?per_page=3", "message"),
             (
-                "actions/runs?head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&page=2",
+                "actions/runs?actor=alice&branch=release%2Fnext&event=pull_request&status=failure&page=2&per_page=11&created=2026-09-01..2026-09-29&exclude_pull_requests=false&check_suite_id=17&head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "workflow_runs",
             ),
-            ("actions/runs/11", "head_sha"),
+            ("actions/runs/11?exclude_pull_requests=true", "head_sha"),
             ("actions/runs/11/jobs?filter=latest&page=2", "jobs"),
             ("actions/jobs/12", "name"),
         ] {
@@ -1449,7 +1542,10 @@ mod tests {
             "check-runs/0",
             "pulls/0/files",
             "actions/runs?head_sha=main",
-            "actions/runs?actor=anyone",
+            "actions/runs?unexpected=anyone",
+            "actions/runs?exclude_pull_requests=maybe",
+            "actions/runs/11?exclude_pull_requests=maybe",
+            "actions/runs/11?actor=alice",
         ] {
             assert_eq!(
                 client
@@ -1596,7 +1692,15 @@ mod tests {
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
                     assert!(headers.get("x-client-secret").is_none());
                     let request: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(request["title"], "Fix");
+                    if let Some(issue) = request.get("issue") {
+                        assert_eq!(issue, 19);
+                        assert!(request.get("title").is_none());
+                    } else {
+                        assert_eq!(request["title"], "Fix");
+                    }
+                    if let Some(head_repo) = request.get("head_repo") {
+                        assert_eq!(head_repo, "other-widgets");
+                    }
                     assert_eq!(request["head"], "rho/fix");
                     assert_eq!(request["base"], "main");
                     let mut result = pull();
@@ -1619,6 +1723,8 @@ mod tests {
         for request in [
             json!({"title":"Fix","head":"rho/fix","base":"main","draft":true,"state":"open"}),
             json!({"title":"Fix","head":"rho/fix","base":"main","draft":"yes"}),
+            json!({"head":"rho/fix","base":"main"}),
+            json!({"issue":"nineteen","head":"rho/fix","base":"main"}),
         ] {
             let response = client.post(&path).json(&request).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1636,7 +1742,7 @@ mod tests {
         assert_eq!(
             client
                 .patch(format!("{path}/42"))
-                .json(&json!({"state":"closed"}))
+                .json(&json!({"unexpected":true}))
                 .send()
                 .await
                 .unwrap()
@@ -1662,6 +1768,11 @@ mod tests {
                 false,
             ),
             (json!({"title":"Fix","head":"rho/fix","base":"main"}), false),
+            (
+                json!({"title":"Fix","head":"rho/fix","head_repo":"other-widgets","base":"main"}),
+                false,
+            ),
+            (json!({"issue":19,"head":"rho/fix","base":"main"}), false),
         ] {
             let response = client.post(&path).json(&request).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1670,7 +1781,7 @@ mod tests {
                 expected_draft
             );
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
         proxy_task.abort();
         upstream_task.abort();
     }
@@ -1685,11 +1796,14 @@ mod tests {
                 seen.fetch_add(1, Ordering::Relaxed);
                 let result = match uri.path() {
                     "/repos/acme/widgets/pulls" => {
-                        assert_eq!(uri.query(), Some("state=all&page=2"));
+                        assert_eq!(uri.query(), Some("state=all&head=alice%3Arho%2Ffix&base=release%2Fnext&sort=updated&direction=asc&page=2&per_page=7"));
                         json!([pull()])
                     }
                     "/repos/acme/widgets/pulls/42" => pull(),
-                    "/repos/acme/widgets/issues" => json!([issue()]),
+                    "/repos/acme/widgets/issues" => {
+                        assert_eq!(uri.query(), Some("milestone=none&state=closed&assignee=alice&type=Bug&creator=bob&mentioned=carol&issue_field_values=priority%3AUrgent&labels=bug%2Cui&sort=updated&direction=asc&since=2026-09-01T12%3A34%3A56Z&page=3&per_page=9"));
+                        json!([issue()])
+                    },
                     "/repos/acme/widgets/issues/12" => issue(),
                     "/repos/acme/widgets/issues/999" => json!({"number":999}),
                     other => panic!("unexpected GitHub path {other}"),
@@ -1709,9 +1823,17 @@ mod tests {
         let client = reqwest::Client::new();
         let path = format!("{base}/repos/acme/widgets");
         for (suffix, field, value) in [
-            ("pulls?state=all&page=2", "title", "Fix"),
+            (
+                "pulls?state=all&head=alice%3Arho%2Ffix&base=release%2Fnext&sort=updated&direction=asc&page=2&per_page=7",
+                "title",
+                "Fix",
+            ),
             ("pulls/42", "title", "Fix"),
-            ("issues", "body", "details"),
+            (
+                "issues?milestone=none&state=closed&assignee=alice&type=Bug&creator=bob&mentioned=carol&issue_field_values=priority%3AUrgent&labels=bug%2Cui&sort=updated&direction=asc&since=2026-09-01T12%3A34%3A56Z&page=3&per_page=9",
+                "body",
+                "details",
+            ),
             ("issues/12", "body", "details"),
         ] {
             let response = client.get(format!("{path}/{suffix}")).send().await.unwrap();
@@ -1723,6 +1845,8 @@ mod tests {
         }
         for suffix in [
             "pulls?unexpected=x",
+            "pulls?labels=bug",
+            "issues?head=alice",
             "pulls?page=2&page=3",
             "issues/0",
             "pulls/00",
@@ -1900,7 +2024,7 @@ mod tests {
         for response in [
             client
                 .patch(&pr)
-                .json(&json!({"state":"closed"}))
+                .json(&json!({"unexpected":true}))
                 .send()
                 .await
                 .unwrap(),
@@ -1946,13 +2070,22 @@ mod tests {
                     assert_eq!(method, Method::GET);
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer host-secret");
                     assert!(headers.get("x-client-secret").is_none());
-                    assert!(
-                        uri.path() == format!("/repos/acme/widgets/commits/{sha}/status")
-                            && uri.query().is_none()
-                            || uri.path()
-                                == format!("/repos/acme/widgets/commits/{sha}/check-runs")
-                                && uri.query() == Some("page=2&per_page=99")
-                    );
+                    let tail = uri.path().strip_prefix("/repos/acme/widgets/commits/").unwrap();
+                    let (reference, endpoint) = tail.rsplit_once('/').unwrap();
+                    assert!(matches!(endpoint, "status" | "check-runs"));
+                    if reference == sha {
+                        assert_eq!(uri.query(), Some(if endpoint == "status" {
+                            "page=3&per_page=7"
+                        } else {
+                            "check_name=unit+tests&status=completed&filter=all&page=2&per_page=99&app_id=23"
+                        }));
+                    } else {
+                        // Slash-containing refs must remain one encoded upstream segment.
+                        assert!(matches!(reference, "main" | "heads%2Frho%2Ffix"
+                            | "tags%2Frelease%2Fv1.2+rc" | "rho%2F%E4%BF%AE%E6%AD%A3"
+                            | "rho%2F50%25complete" | "rho%2Ffix%252Fother"), "{reference}");
+                        assert!(uri.query().is_none());
+                    }
                     assert!(body.is_empty());
                     let result = if uri.path().ends_with("/status") {
                         json!({"state":"success","statuses":[{"context":"build","state":"success"}],
@@ -1986,7 +2119,10 @@ mod tests {
         let proxy_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
         let path = format!("{base}/repos/acme/widgets/commits/{sha}");
-        for suffix in ["status", "check-runs?page=2&per_page=99"] {
+        for suffix in [
+            "status?page=3&per_page=7",
+            "check-runs?check_name=unit+tests&status=completed&filter=all&page=2&per_page=99&app_id=23",
+        ] {
             let response = client
                 .get(format!("{path}/{suffix}"))
                 .bearer_auth("untrusted")
@@ -2002,14 +2138,58 @@ mod tests {
             assert_eq!(response.headers().get("x-ratelimit-limit").unwrap(), "5000");
             let body = response.json::<Value>().await.unwrap();
             assert!(body.get("ignored").is_none());
-            if suffix == "status" {
+            if suffix.starts_with("status") {
                 assert_eq!(body["statuses"][0]["context"], "build");
             } else {
                 assert_eq!(body["check_runs"][0]["id"], 17);
             }
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        for suffix in ["status?page=2"] {
+        for reference in [
+            "main",
+            "heads/rho/fix",
+            "heads%2Frho%2Ffix",
+            "tags/release/v1.2%2Brc",
+            "rho/%E4%BF%AE%E6%AD%A3",
+            "rho/50%25complete",
+            "rho/fix%252Fother",
+        ] {
+            for endpoint in ["status", "check-runs"] {
+                let response = client
+                    .get(format!(
+                        "{base}/repos/acme/widgets/commits/{reference}/{endpoint}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{reference}/{endpoint}");
+                let result = response.json::<Value>().await.unwrap();
+                if endpoint == "status" {
+                    assert_eq!(result["statuses"][0]["context"], "build");
+                } else {
+                    assert_eq!(result["check_runs"][0]["id"], 17);
+                }
+            }
+        }
+        for suffix in [
+            "rho%2F..%2Fsecret/status",
+            "heads%2F.%2Ffix/check-runs",
+            "rho%2F%2Ffix/status",
+            "main/files",
+            "main/status?filter=all",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{base}/repos/acme/widgets/commits/{suffix}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "{suffix}"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 16);
+        for suffix in ["status?unexpected=2"] {
             assert_eq!(
                 client
                     .get(format!("{path}/{suffix}"))
@@ -2038,7 +2218,7 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 16);
         proxy_task.abort();
         upstream_task.abort();
     }

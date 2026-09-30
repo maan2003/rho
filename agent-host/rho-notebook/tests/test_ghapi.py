@@ -1,10 +1,12 @@
 """Exercise the selected upstream ghapi code against an Octo-shaped Unix socket."""
 import asyncio
+import inspect
 import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from ghapi.all import GhApi
 
@@ -71,6 +73,11 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                         implicit = await api.pulls.create(head="fix", base="main", title="Fix")
                         self.assertIs(implicit.draft, False)
                         self.assertNotIn("draft", json.loads(requests[-1][3]))
+                        branch_status = await api.check_status("heads/rho/fix")
+                        self.assertEqual(len(branch_status.check_runs), 101)
+                        self.assertIn("**failure**", repr(branch_status))
+                        self.assertIn("/commits/heads/rho/fix/status", requests[-3][1])
+                        self.assertIn("/commits/heads/rho/fix/check-runs", requests[-2][1])
                         with self.assertRaises(ValueError):
                             api("https://api.github.com/repos/acme/widget/issues")
                         with self.assertRaises(TypeError):
@@ -78,6 +85,107 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 server.close()
                 await server.wait_closed()
+
+    async def test_complete_upstream_parameters_are_forwarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requests = []
+
+            async def serve(reader, writer):
+                method, path, _ = (await reader.readline()).decode().split()
+                headers = {}
+                while line := (await reader.readline()).decode().strip():
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+                body = await reader.readexactly(int(headers.get("content-length", 0)))
+                requests.append((method, path, json.loads(body) if body else None))
+                payload = b'{"number": 42}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+                writer.close()
+
+            server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
+            try:
+                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                    async with server:
+                        api = GhApi("acme", "widget")
+                        self.assertEqual(inspect.signature(api.pulls.list).parameters["sort"].default,
+                                         "created")
+                        self.assertEqual(inspect.signature(api.checks.list_for_ref).parameters["filter"].default,
+                                         "latest")
+                        await api.pulls.list(state="closed", head="alice:rho/fix", base="release/next",
+                                             sort="updated", direction="asc", per_page=7, page=2)
+                        await api.pulls.list(query_={"sort": "updated", "direction": "desc"})
+                        await api.issues.list_for_repo(
+                            milestone="none", state="closed", assignee="alice", type="Bug",
+                            creator="bob", mentioned="carol", issue_field_values="priority:Urgent",
+                            labels="bug,ui", sort="updated", direction="asc",
+                            since="2026-09-01T12:34:56Z", per_page=9, page=3,
+                        )
+                        await api.checks.list_for_ref("a"*40, check_name="unit tests",
+                                                     status="completed", filter="all",
+                                                     app_id=23, per_page=99, page=2)
+                        await api.repos.get_combined_status_for_ref("a"*40, per_page=7, page=3)
+                        await api.actions.list_workflow_runs_for_repo(
+                            actor="alice", branch="release/next", event="pull_request", status="failure",
+                            created="2026-09-01..2026-09-29", exclude_pull_requests=False,
+                            check_suite_id=17, head_sha="a"*40, per_page=11, page=2,
+                        )
+                        await api.actions.get_workflow_run(11, exclude_pull_requests=True)
+                        await api.pulls.create(head="rho/fix", head_repo="other-widgets",
+                                               base="main", issue=19)
+                        await api.pulls.update(42, state="closed", maintainer_can_modify=False)
+                        await api.pulls.update(42, state="open", maintainer_can_modify=True)
+                        await api.repos.get_combined_status_for_ref("main")
+                        await api.checks.list_for_ref("heads/rho/fix")
+                        await api.repos.get_combined_status_for_ref("tags/release/v1.2+rc")
+                        await api.checks.list_for_ref("rho/修正")
+                        await api.repos.get_combined_status_for_ref("rho/50%complete")
+                        await api.checks.list_for_ref("rho/fix%2Fother")
+            finally:
+                server.close()
+                await server.wait_closed()
+
+            expected_queries = [
+                {"state": ["closed"], "head": ["alice:rho/fix"], "base": ["release/next"],
+                 "sort": ["updated"], "direction": ["asc"], "per_page": ["7"], "page": ["2"]},
+                {"sort": ["updated"], "direction": ["desc"]},
+                {"milestone": ["none"], "state": ["closed"], "assignee": ["alice"], "type": ["Bug"],
+                 "creator": ["bob"], "mentioned": ["carol"], "issue_field_values": ["priority:Urgent"],
+                 "labels": ["bug,ui"], "sort": ["updated"], "direction": ["asc"],
+                 "since": ["2026-09-01T12:34:56Z"], "per_page": ["9"], "page": ["3"]},
+                {"check_name": ["unit tests"], "status": ["completed"], "filter": ["all"],
+                 "app_id": ["23"], "per_page": ["99"], "page": ["2"]},
+                {"per_page": ["7"], "page": ["3"]},
+                {"actor": ["alice"], "branch": ["release/next"], "event": ["pull_request"],
+                 "status": ["failure"], "created": ["2026-09-01..2026-09-29"],
+                 "exclude_pull_requests": ["false"], "check_suite_id": ["17"], "head_sha": ["a"*40],
+                 "per_page": ["11"], "page": ["2"]},
+                {"exclude_pull_requests": ["true"]},
+            ]
+            self.assertEqual(len(requests), 16)
+            for (_, path, body), expected in zip(requests, expected_queries):
+                self.assertEqual(parse_qs(urlsplit(path).query), expected)
+                self.assertIsNone(body)
+            self.assertEqual(requests[7], ("POST", "/repos/acme/widget/pulls", {
+                "head": "rho/fix", "head_repo": "other-widgets", "base": "main", "issue": 19,
+            }))
+            self.assertEqual(requests[8], ("PATCH", "/repos/acme/widget/pulls/42", {
+                "state": "closed", "maintainer_can_modify": False,
+            }))
+            self.assertEqual(requests[9], ("PATCH", "/repos/acme/widget/pulls/42", {
+                "state": "open", "maintainer_can_modify": True,
+            }))
+            self.assertEqual([path for _, path, _ in requests[10:]], [
+                "/repos/acme/widget/commits/main/status",
+                "/repos/acme/widget/commits/heads/rho/fix/check-runs",
+                "/repos/acme/widget/commits/tags/release/v1.2%2Brc/status",
+                "/repos/acme/widget/commits/rho/%E4%BF%AE%E6%AD%A3/check-runs",
+                "/repos/acme/widget/commits/rho/50%25complete/status",
+                "/repos/acme/widget/commits/rho/fix%252Fother/check-runs",
+            ])
 
     async def test_edit_and_feedback_methods_use_selected_paths_and_bodies(self):
         with tempfile.TemporaryDirectory() as directory:
