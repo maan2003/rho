@@ -1311,6 +1311,24 @@ impl Consumer {
 		}
 	}
 
+	/// Watch producer abort even after the cursor drained or the producer finished.
+	/// Detached transport buffers still belong to this generation until acknowledged.
+	pub(crate) fn poll_aborted(&self, waiter: &kio::Waiter) -> Poll<Error> {
+		match &self.inner {
+			ConsumerKind::Plain(plain) => {
+				match plain
+					.state
+					.poll(waiter, |state| state.abort.clone().map_or(Poll::Pending, Poll::Ready))
+				{
+					Poll::Ready(Ok(err)) => Poll::Ready(err),
+					Poll::Ready(Err(state)) => state.abort.clone().map_or(Poll::Pending, Poll::Ready),
+					Poll::Pending => Poll::Pending,
+				}
+			}
+			ConsumerKind::Spliced(spliced) => spliced.poll_aborted(waiter),
+		}
+	}
+
 	/// Mark the group as still being read, so a slow batch drain does not expire it.
 	pub fn keep_alive(&self) {
 		if let ConsumerKind::Plain(plain) = &self.inner {

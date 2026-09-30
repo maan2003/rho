@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 6;
 pub const MAX_HEADER: u64 = 65536;
 pub const MAX_DIMENSION: u32 = 4096;
 pub const SOCKET_ENV: &str = "RHO_DESKTOP_SOCKET";
@@ -77,7 +77,7 @@ mod tests {
             r#"{"type":"capture","output":"headless-1"}"#
         );
         assert_eq!(
-            serde_json::from_str::<Request>(r#"{"type":"hello","version":4}"#).unwrap(),
+            serde_json::from_str::<Request>(r#"{"type":"hello","version":6}"#).unwrap(),
             Request::Hello { version: VERSION }
         );
     }
@@ -85,20 +85,23 @@ mod tests {
     fn progress_round_trips_without_conflating_pipeline_stages() {
         let input = Input::Feedback(Feedback {
             received: Some(FrameId {
-                group: 9,
+                epoch: 9,
                 timestamp_us: 81_000,
             }),
             decoded: Some(FrameId {
-                group: 8,
+                epoch: 8,
                 timestamp_us: 72_000,
             }),
             presented: Some(FrameId {
-                group: 8,
+                epoch: 8,
                 timestamp_us: 63_000,
             }),
             decode_us: 19_000,
             lag_us: 47_000,
             recover: true,
+            recovery_id: 3,
+            delivery_bps: 1_600_000,
+            rtt_us: 210_000,
         });
         assert_eq!(
             serde_json::from_slice::<Input>(&serde_json::to_vec(&input).unwrap()).unwrap(),
@@ -168,7 +171,8 @@ pub enum Input {
     )
 )]
 pub struct FrameId {
-    pub group: u64,
+    /// Timestamp of the root keyframe, independent of transport stream numbering.
+    pub epoch: u64,
     pub timestamp_us: u64,
 }
 
@@ -191,6 +195,15 @@ pub struct Feedback {
     pub decode_us: u64,
     pub lag_us: u64,
     pub recover: bool,
+    /// Identity of the current recovery request; repeated reports are
+    /// idempotent.
+    pub recovery_id: u64,
+    /// Estimated payload delivery rate, excluding source idle time; zero if
+    /// unknown.
+    pub delivery_bps: u64,
+    /// Current selected WAN path RTT, filled by the host before forwarding
+    /// locally.
+    pub rtt_us: u64,
 }
 
 /// Asynchronous viewer control errors. Media travels on separate MoQ streams.

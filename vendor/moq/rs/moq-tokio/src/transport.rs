@@ -34,8 +34,9 @@ type OpBox<T> = futures::future::BoxFuture<'static, T>;
 ///   copies the buffer it was first given; a caller that swaps buffers while the
 ///   write is pending would corrupt the stream. Every caller in this crate
 ///   retries with the same buffer.
-/// - `stop`, `reset`, and `finish` during an in-flight operation are deferred
-///   until that operation settles. If the stream is dropped before then, the
+/// - Send `reset` interrupts pending I/O and applies synchronously. Receive
+///   `stop` and send `finish` during an in-flight operation are deferred until
+///   that operation settles. If the stream is dropped before then, the
 ///   pending operation is finished on the tokio runtime and the deferred code
 ///   applied after it, so the peer still sees the real reason; only without a
 ///   runtime does the underlying transport's drop behavior (a reset or stop
@@ -204,7 +205,7 @@ where
 }
 
 /// The send half produced by [`Session`]: an async-interface stream adapted to the
-/// poll interface. See [`Session`] for the deferred `finish`/`reset` behavior.
+/// poll interface. See [`Session`] for the deferred `finish` behavior.
 pub struct SendStream<S: web_transport_trait::SendStream + 'static> {
 	// Same never-locked Mutex as [`Session`]'s slots: `get_mut` is free on an
 	// exclusive borrow, and the wrapper keeps the boxed future from stripping
@@ -213,7 +214,6 @@ pub struct SendStream<S: web_transport_trait::SendStream + 'static> {
 	// Deferred actions, applied when the in-flight operation settles.
 	priority: Option<u8>,
 	finish: bool,
-	reset: Option<u32>,
 	/// Whether `finish` or `reset` has been observed, so no further writes can
 	/// come and the closed() watch may safely take ownership of the stream.
 	terminal: bool,
@@ -253,7 +253,6 @@ impl<S: web_transport_trait::SendStream + 'static> SendStream<S> {
 			state: std::sync::Mutex::new(Some(SendState::Idle(stream))),
 			priority: None,
 			finish: false,
-			reset: None,
 			terminal: false,
 			completed: Bytes::new(),
 			interrupt: None,
@@ -264,10 +263,6 @@ impl<S: web_transport_trait::SendStream + 'static> SendStream<S> {
 	fn settle(&mut self, stream: &mut S) {
 		if let Some(order) = self.priority.take() {
 			stream.set_priority(order);
-		}
-		if let Some(code) = self.reset.take() {
-			self.finish = false;
-			stream.reset(code);
 		}
 		if std::mem::take(&mut self.finish) {
 			// A deferred finish has nowhere to report to; its failure surfaces
@@ -319,7 +314,6 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 							let mut rx = rx.fuse();
 							loop {
 								futures::select_biased! {
-									res = op => break Some(res),
 									cancel = rx => match cancel {
 										Ok(()) => break None,
 										// A dropped (unfired) sender must not interrupt;
@@ -327,6 +321,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 										// quiet and the write keeps driving.
 										Err(_) => continue,
 									},
+									res = op => break Some(res),
 								}
 							}
 						};
@@ -344,9 +339,8 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 						self.interrupt = None;
 						self.settle(&mut stream);
 						*self.state.get_mut().unwrap() = Some(SendState::Idle(stream));
-						// An interrupted write was abandoned for a reset, which
-						// settle just applied; the next iteration's write reports
-						// the stream state.
+						// reset reclaims an interrupted operation synchronously;
+						// ordinary polling only observes completed writes.
 						if let Some(res) = res {
 							res?;
 							// Reported through the reconciliation at the top of the
@@ -390,17 +384,27 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 
 	fn reset(&mut self, code: u32) {
 		self.terminal = true;
-		match self.state.get_mut().unwrap().as_mut() {
-			Some(SendState::Idle(stream)) => stream.reset(code),
-			_ => {
-				self.reset = Some(code);
-				// A reset discards the in-flight write's progress anyway, so
-				// cancel it rather than letting blocked I/O delay the code.
-				if let Some(tx) = self.interrupt.take() {
-					let _ = tx.send(());
-				}
-			}
+		self.completed = Bytes::new();
+		self.finish = false;
+		// Our operation futures always race I/O against this interrupt. Polling
+		// once after firing it returns ownership without polling obsolete I/O,
+		// so even a blocked write or FIN watch resets before this call returns.
+		if let Some(tx) = self.interrupt.take() {
+			let _ = tx.send(());
 		}
+		let mut stream = match self.state.get_mut().unwrap().take().expect("in-flight") {
+			SendState::Idle(stream) => stream,
+			SendState::Writing { mut fut, .. } | SendState::Closing(mut fut) => {
+				let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+				let Poll::Ready((stream, _)) = fut.as_mut().poll(&mut cx) else {
+					unreachable!("the fired interrupt must return stream ownership");
+				};
+				stream
+			}
+		};
+		self.priority = None;
+		stream.reset(code);
+		*self.state.get_mut().unwrap() = Some(SendState::Idle(stream));
 	}
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -427,11 +431,11 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 							let mut rx = rx.fuse();
 							loop {
 								futures::select_biased! {
-									res = op => break Some(res),
 									cancel = rx => match cancel {
 										Ok(()) => break None,
 										Err(_) => continue,
 									},
+									res = op => break Some(res),
 								}
 							}
 						};
@@ -456,8 +460,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 							// retry; poll_write's reconciliation reports these bytes
 							// instead of writing them a second time.
 							Some(Ok(())) => self.completed = chunk,
-							// Interrupted for a reset, applied by settle above; the
-							// next iteration starts the real closed watch.
+							// reset reclaims interrupted operations synchronously.
 							None => {}
 						}
 					}
@@ -471,9 +474,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 						self.interrupt = None;
 						self.settle(&mut stream);
 						*self.state.get_mut().unwrap() = Some(SendState::Idle(stream));
-						// An interrupted watch was abandoned for a late reset,
-						// which settle just applied; the next iteration watches
-						// the now-reset stream, which resolves promptly.
+						// reset reclaims an interrupted watch synchronously.
 						if let Some(res) = res {
 							return Poll::Ready(res);
 						}
@@ -486,53 +487,16 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 
 impl<S: web_transport_trait::SendStream + 'static> Drop for SendStream<S> {
 	fn drop(&mut self) {
-		match self.state.get_mut().unwrap().take() {
-			// Apply a deferred reset if the stream is idle.
-			Some(SendState::Idle(mut stream)) => {
-				if let Some(code) = self.reset.take() {
-					stream.reset(code);
-				}
-			}
-			// The stream lives inside the in-flight future; dropping it here
-			// would fire the backend's default drop behavior (a code-0 reset)
-			// and lose the deferred reset code or FIN the caller asked for. The
-			// peer uses that code to classify the abort (Old vs Cancel vs
-			// Evicted), so finish the operation on the runtime and apply the
-			// terminal action then. A deferred reset fired the interrupt when it
-			// was recorded, so the salvage task never waits on blocked I/O; a
-			// deferred finish lets the write complete first (the FIN follows the
-			// data). Without a runtime the default drop stands.
-			Some(SendState::Writing { fut, .. }) => {
-				let reset = self.reset.take();
-				let finish = std::mem::take(&mut self.finish);
-				if (reset.is_some() || finish)
-					&& let Ok(handle) = tokio::runtime::Handle::try_current()
-				{
-					handle.spawn(async move {
-						let (mut stream, _) = fut.await;
-						match reset {
-							Some(code) => stream.reset(code),
-							None => {
-								let _ = stream.finish();
-							}
-						}
-					});
-				}
-			}
-			Some(SendState::Closing(fut)) => {
-				let reset = self.reset.take();
-				if reset.is_some()
-					&& let Ok(handle) = tokio::runtime::Handle::try_current()
-				{
-					handle.spawn(async move {
-						let (mut stream, _) = fut.await;
-						if let Some(code) = reset {
-							stream.reset(code);
-						}
-					});
-				}
-			}
-			None => {}
+		// A deferred finish must follow the pending write. Resets already
+		// reclaim ownership synchronously and never need a background task.
+		if let Some(SendState::Writing { fut, .. }) = self.state.get_mut().unwrap().take()
+			&& self.finish
+			&& let Ok(handle) = tokio::runtime::Handle::try_current()
+		{
+			handle.spawn(async move {
+				let (mut stream, _) = fut.await;
+				let _ = stream.finish();
+			});
 		}
 	}
 }
@@ -988,11 +952,27 @@ mod tests {
 		// The late cancel: the reset applies without waiting for the ack, and
 		// the watch then resolves against the reset stream.
 		send.reset(9);
+		assert_eq!(fake.resets.lock().unwrap().as_slice(), &[9], "reset is synchronous");
 		let closed = send.poll_closed(&mut cx);
 		assert_eq!(fake.resets.lock().unwrap().as_slice(), &[9]);
 		// The re-armed watch on the reset stream is allowed to stay pending in
 		// this fake (it never acks); what matters is the reset went out.
 		let _ = closed;
+	}
+
+	#[test]
+	fn reset_discards_a_pending_write_even_when_it_becomes_writable() {
+		let fake = FakeSend::default();
+		fake.blocked.store(true, Ordering::SeqCst);
+		let mut send = SendStream::new(fake.clone());
+		assert!(send.poll_write(&mut cx(), b"obsolete").is_pending());
+		fake.blocked.store(false, Ordering::SeqCst);
+		send.reset(17);
+		assert_eq!(fake.resets.lock().unwrap().as_slice(), &[17]);
+		assert!(
+			fake.writes.lock().unwrap().is_empty(),
+			"cancel wins over newly writable I/O"
+		);
 	}
 
 	// The poll contract allows retrying a pending write with a SHORTER buffer;

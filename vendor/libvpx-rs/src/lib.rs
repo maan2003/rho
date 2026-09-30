@@ -575,6 +575,9 @@ pub struct EncoderConfig {
     /// エラー耐性モード (リアルタイム用途で有効)
     pub error_resilient: bool,
 
+    /// 自動キーフレーム挿入を有効にする。false でも明示的な要求は有効。
+    pub automatic_keyframes: bool,
+
     /// キーフレーム間隔 (フレーム数)
     pub keyframe_interval: Option<NonZeroUsize>,
 
@@ -602,6 +605,7 @@ impl EncoderConfig {
     /// - `lag_in_frames`: None
     /// - `threads`: None
     /// - `error_resilient`: false
+    /// - `automatic_keyframes`: true
     /// - `keyframe_interval`: None
     /// - `frame_drop_threshold`: None
     pub fn new(width: usize, height: usize, image_format: ImageFormat, codec: CodecConfig) -> Self {
@@ -621,6 +625,7 @@ impl EncoderConfig {
             lag_in_frames: None,
             threads: None,
             error_resilient: false,
+            automatic_keyframes: true,
             keyframe_interval: None,
             frame_drop_threshold: None,
             codec,
@@ -738,11 +743,32 @@ pub struct ArnrConfig {
     pub filter_type: i32,
 }
 
+/// フレーム間の参照管理
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ReferenceMode {
+    /// libvpx の通常の参照更新を使用する
+    #[default]
+    Automatic,
+    /// GOLDEN だけを参照し、必要な場合だけ GOLDEN を更新する。
+    ///
+    /// VP9 の error_resilient と先読みなしの設定が必要。
+    /// LAST / ALTREF と共有エントロピーは更新しない。`refresh: false` の
+    /// フレームは同じ GOLDEN の範囲内で省略・並べ替えできるが、GOLDEN を
+    /// 更新したフレームは順番にデコードする必要がある。キーフレームは
+    /// すべての参照を初期化する。
+    Golden {
+        /// 現在のフレームで GOLDEN を更新する
+        refresh: bool,
+    },
+}
+
 /// エンコード時のオプション
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncodeOptions {
     /// キーフレームを強制する
     pub force_keyframe: bool,
+    /// 参照フレームの使用・更新方法
+    pub references: ReferenceMode,
 }
 
 /// エンコーダー再設定パラメータ
@@ -996,6 +1022,11 @@ impl Encoder {
             .map_err(|_| invalid_param(FUNCTION, "width is out of range"))?;
         vpx_config.g_h = c_uint::try_from(encoder_config.height)
             .map_err(|_| invalid_param(FUNCTION, "height is out of range"))?;
+
+        // 画面共有では受信側の要求でのみ参照系列を更新できるようにする。
+        if !encoder_config.automatic_keyframes {
+            vpx_config.kf_mode = sys::vpx_kf_mode_VPX_KF_DISABLED;
+        }
 
         // プロファイル設定
         if let CodecConfig::Vp9(vp9_config) = &encoder_config.codec {
@@ -1453,10 +1484,35 @@ impl Encoder {
             EncodingDeadline::Realtime => sys::VPX_DL_REALTIME,
         };
 
+        if matches!(options.references, ReferenceMode::Golden { .. })
+            && (self.ctx.iface != unsafe { sys::vpx_codec_vp9_cx() }
+                || self.cfg.g_error_resilient == 0
+                || self.cfg.g_lag_in_frames != 0)
+        {
+            return Err(invalid_param(
+                "shiguredo_libvpx::Encoder::encode",
+                "golden references require VP9 error resilience and zero lookahead",
+            ));
+        }
+
         // フラグ設定
         let mut flags: sys::vpx_enc_frame_flags_t = 0;
         if options.force_keyframe {
             flags |= sys::VPX_EFLAG_FORCE_KF as sys::vpx_enc_frame_flags_t;
+        }
+
+        if let ReferenceMode::Golden { refresh } = options.references {
+            // NO_UPD_ENTROPY だけでは segmentation / loop filter の履歴は
+            // 切れない。上で検査した error_resilient が各フレームの過去状態を
+            // 初期化する (vp9_setup_past_independence)。
+            flags |= (sys::VP8_EFLAG_NO_REF_LAST
+                | sys::VP8_EFLAG_NO_REF_ARF
+                | sys::VP8_EFLAG_NO_UPD_LAST
+                | sys::VP8_EFLAG_NO_UPD_ARF
+                | sys::VP8_EFLAG_NO_UPD_ENTROPY) as sys::vpx_enc_frame_flags_t;
+            if !refresh {
+                flags |= sys::VP8_EFLAG_NO_UPD_GF as sys::vpx_enc_frame_flags_t;
+            }
         }
 
         let code = unsafe {
@@ -1671,18 +1727,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn golden_references_require_independent_vp9_frames() {
+        // 参照更新の抑制だけでは履歴依存を切れないため、コーデック・過去状態の
+        // 初期化・先読みの三条件を個別に検査する。
+        let mut vp8 = vp8_encoder_config(ImageFormat::I420);
+        vp8.error_resilient = true;
+        vp8.lag_in_frames = None;
+        let mut dependent = vp9_encoder_config(ImageFormat::I420);
+        dependent.lag_in_frames = None;
+        let mut delayed = vp9_encoder_config(ImageFormat::I420);
+        delayed.error_resilient = true;
+        delayed.lag_in_frames = NonZeroUsize::new(4);
+        let y = vec![73; 128 * 128];
+        let u = vec![121; 64 * 64];
+        let v = vec![197; 64 * 64];
+        for config in [vp8, dependent, delayed] {
+            let mut encoder = Encoder::new(config).expect("エンコーダーの生成に失敗");
+            let error = encoder
+                .encode(
+                    &ImageData::I420 {
+                        y: &y,
+                        u: &u,
+                        v: &v,
+                    },
+                    &EncodeOptions {
+                        references: ReferenceMode::Golden { refresh: false },
+                        ..Default::default()
+                    },
+                )
+                .expect_err("不適切な設定を受理した");
+            assert_eq!(
+                error.reason(),
+                Some("golden references require VP9 error resilience and zero lookahead")
+            );
+        }
+    }
+
+    #[test]
     fn init_vp8_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp8);
         assert!(Decoder::new(config).is_ok());
     }
 
     #[test]
     fn init_vp9_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp9);
         assert!(Decoder::new(config).is_ok());
     }
 
@@ -1718,9 +1807,7 @@ mod tests {
             123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 55, 128, 254,
             250, 215, 128,
         ];
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp8);
         let mut decoder = Decoder::new(config).expect("failed to create decoder");
         let mut decoded_count = 0;
 
@@ -1753,9 +1840,7 @@ mod tests {
             240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0, 103, 26, 154, 224, 98, 35, 126, 68,
             120, 240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0,
         ];
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp9);
         let mut decoder = Decoder::new(config).expect("failed to create decoder");
         let mut decoded_count = 0;
 
@@ -1824,6 +1909,7 @@ mod tests {
                 },
                 &EncodeOptions {
                     force_keyframe: false,
+                    ..Default::default()
                 },
             )
             .expect("failed to encode");
@@ -1859,6 +1945,7 @@ mod tests {
                 },
                 &EncodeOptions {
                     force_keyframe: false,
+                    ..Default::default()
                 },
             )
             .expect("failed to encode");
@@ -1889,6 +1976,7 @@ mod tests {
                 &ImageData::Nv12 { y: &y, uv: &uv },
                 &EncodeOptions {
                     force_keyframe: false,
+                    ..Default::default()
                 },
             )
             .expect("failed to encode");
@@ -1919,6 +2007,7 @@ mod tests {
                 &ImageData::Nv12 { y: &y, uv: &uv },
                 &EncodeOptions {
                     force_keyframe: false,
+                    ..Default::default()
                 },
             )
             .expect("failed to encode");
@@ -1948,6 +2037,7 @@ mod tests {
             &ImageData::Nv12 { y: &y, uv: &uv },
             &EncodeOptions {
                 force_keyframe: false,
+                ..Default::default()
             },
         );
         assert!(result.is_err());
@@ -1969,6 +2059,7 @@ mod tests {
             },
             &EncodeOptions {
                 force_keyframe: false,
+                ..Default::default()
             },
         );
         assert!(result.is_err());
@@ -2011,6 +2102,7 @@ mod tests {
                 &ImageData::I420 { y, u, v },
                 &EncodeOptions {
                     force_keyframe: false,
+                    ..Default::default()
                 },
             )
             .expect("failed to encode");

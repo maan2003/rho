@@ -2047,6 +2047,18 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 	fn poll_serve(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let mut cx = std::task::Context::from_waker(waiter.waker());
 		loop {
+			// Check before any transport work, including detached chunks and FIN
+			// acknowledgement waits. Finish is not abort: retained producers may
+			// invalidate a completed generation until its stream is acknowledged.
+			if !matches!(self.state, GroupState::Done)
+				&& let Poll::Ready(err) = self.group.poll_aborted(waiter)
+			{
+				match std::mem::replace(&mut self.state, GroupState::Done) {
+					GroupState::Serve { writer, .. } | GroupState::Closed { writer } => writer.abort(&err),
+					GroupState::Open | GroupState::Done => {}
+				}
+				return Poll::Ready(Err(err));
+			}
 			match &mut self.state {
 				GroupState::Open => {
 					if self.group.poll_expired(waiter) {
@@ -2090,6 +2102,9 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 					}
 					let res = 'serve: {
 						loop {
+							if let Poll::Ready(err) = self.group.poll_aborted(waiter) {
+								break 'serve Err(err);
+							}
 							match writer.poll_flush(&mut cx) {
 								Poll::Ready(Ok(())) => {}
 								Poll::Ready(Err(err)) => break 'serve Err(err),
@@ -2196,7 +2211,10 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 								Err(err) => return Poll::Ready(Err(err)),
 							}
 						}
-						Err(err) => return Poll::Ready(Err(err)),
+						Err(err) => {
+							writer.abort(&err);
+							return Poll::Ready(Err(err));
+						}
 					}
 				}
 				GroupState::Closed { writer } => {
@@ -3367,6 +3385,72 @@ mod tests {
 	use crate::lite::test_transport::SinkSession;
 	use crate::model::ProduceTest;
 	use futures::FutureExt;
+
+	#[tokio::test]
+	async fn producer_abort_cancels_open_detached_payload_and_finished_stream() {
+		use crate::lite::test_transport::{Log, SinkSend};
+		let version = Version::Draft17;
+		for phase in 0..3 {
+			let log = Log::default();
+			let track = track::Producer::new(std::sync::Arc::new(crate::broadcast::Info::default()), "state", None);
+			let mut producer = track.append_group().unwrap();
+			producer
+				.write_frame(crate::Timestamp::ZERO, b"obsolete".as_slice())
+				.unwrap();
+			producer.finish().unwrap();
+			let mut group = producer.consume();
+			group.read_frame().await.unwrap().unwrap();
+			assert!(group.read_frame().await.unwrap().is_none());
+			let header = ietf::GroupHeader {
+				track_alias: 0,
+				group_id: 0,
+				sub_group_id: 0,
+				publisher_priority: 0,
+				flags: ietf::GroupFlags::default(),
+			};
+			let mut serve = GroupServe::new(
+				SinkSession::new(log.clone()),
+				header,
+				0,
+				group,
+				None,
+				version,
+				GroupSlice::default(),
+			);
+			if phase > 0 {
+				let mut writer = Writer::new(SinkSend::new(log.clone()), version);
+				serve.state = if phase == 1 {
+					GroupState::Serve {
+						writer,
+						frame: None,
+						chunk: Some(bytes::Bytes::from_static(b"detached")),
+						batch: Box::new(frame::Buffer::new()),
+						batch_pos: 0,
+					}
+				} else {
+					writer.finish().unwrap();
+					GroupState::Closed { writer }
+				};
+			}
+			producer.abort(Error::Old).unwrap();
+			assert!(matches!(
+				kio::wait(|waiter| serve.poll_serve(waiter)).await,
+				Err(Error::Old)
+			));
+			assert!(
+				log.writes.lock().unwrap().is_empty(),
+				"no obsolete work in phase {phase}"
+			);
+			assert_eq!(
+				log.resets(),
+				if phase == 0 {
+					vec![]
+				} else {
+					vec![ietf::error::INTERNAL_ERROR]
+				}
+			);
+		}
+	}
 
 	async fn settle() {
 		tokio::time::sleep(Duration::from_millis(1)).await;

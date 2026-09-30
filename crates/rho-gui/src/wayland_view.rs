@@ -612,11 +612,11 @@ mod tests {
         let reported = Rc::new(Cell::new(0));
         window
             .update(cx, |_, window, _| {
-                for (group, timestamp_us) in [(2, 50), (2, 50), (1, 90), (2, 60)] {
+                for (epoch, timestamp_us) in [(2, 50), (2, 50), (1, 90), (2, 60)] {
                     let reported = reported.clone();
                     on_presented(
                         rho_desktop_proto::FrameId {
-                            group,
+                            epoch,
                             timestamp_us,
                         },
                         &painted,

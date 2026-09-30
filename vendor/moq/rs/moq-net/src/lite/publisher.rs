@@ -2423,6 +2423,18 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 	/// every failure as Cancel.
 	fn poll_serve(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		loop {
+			// Check before any transport work, including detached chunks and FIN
+			// acknowledgement waits. Finish is not abort: retained producers may
+			// invalidate a completed generation until its stream is acknowledged.
+			if !matches!(self.state, GroupState::Done)
+				&& let Poll::Ready(err) = self.group.poll_aborted(waiter)
+			{
+				match std::mem::replace(&mut self.state, GroupState::Done) {
+					GroupState::Serve { writer, .. } | GroupState::Closed { writer } => writer.abort(&err),
+					GroupState::Open | GroupState::Done => {}
+				}
+				return Poll::Ready(Err(err));
+			}
 			match &mut self.state {
 				GroupState::Open => {
 					if self.group.poll_expired(waiter) {
@@ -2493,6 +2505,9 @@ impl<S: crate::transport::poll::Session> GroupServe<S> {
 							break 'serve Err(Error::Cancel);
 						}
 						loop {
+							if let Poll::Ready(err) = self.group.poll_aborted(waiter) {
+								break 'serve Err(err);
+							}
 							match writer.poll_flush(&mut cx) {
 								Poll::Ready(Ok(())) => {}
 								Poll::Ready(Err(err)) => break 'serve Err(err),
@@ -2747,6 +2762,109 @@ mod serve_group_test {
 				i
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn finished_drained_group_abort_wakes_the_transport_watch() {
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "state", None);
+		let mut producer = track.append_group().unwrap();
+		producer.write_frame(Timestamp::ZERO, b"payload".as_slice()).unwrap();
+		producer.finish().unwrap();
+		let mut consumer = producer.consume();
+		consumer.read_frame().await.unwrap().unwrap();
+		assert!(consumer.read_frame().await.unwrap().is_none());
+		let watch = tokio::spawn(async move { kio::wait(|waiter| consumer.poll_aborted(waiter)).await });
+		tokio::task::yield_now().await;
+		assert!(!watch.is_finished(), "finish is not an abort");
+		producer.abort(Error::Old).unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(1), watch)
+				.await
+				.unwrap()
+				.unwrap(),
+			Error::Old
+		));
+	}
+
+	#[tokio::test]
+	async fn producer_abort_cancels_open_detached_payload_and_finished_stream() {
+		for phase in 0..3 {
+			let log = Log::default();
+			let session = SinkSession::new(log.clone());
+			let track_priority = kio::Producer::new(0u8);
+			let ctx = Subscription {
+				session,
+				id: 0,
+				track_name: "test".into(),
+				priority: PriorityQueue::default(),
+				track_priority: track_priority.consume(),
+				track_priority_seen: 0,
+				version: Version::Lite05,
+				timescale: Some(crate::Timescale::default()),
+			};
+			let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+			let mut producer = track.append_group().unwrap();
+			producer.write_frame(Timestamp::ZERO, b"obsolete".as_slice()).unwrap();
+			producer.finish().unwrap();
+			let mut consumer = producer.consume();
+			// A fully drained cursor ordinarily reads a clean end even after abort.
+			consumer.read_frame().await.unwrap().unwrap();
+			assert!(consumer.read_frame().await.unwrap().is_none());
+			let handle = ctx.priority.insert(Priority::new(0, 0, 0));
+			let mut serve = GroupServe::new(ctx, 0, 0, handle, consumer);
+			if phase > 0 {
+				let mut writer = Writer::new(SinkSend::new(log.clone()), Version::Lite05);
+				serve.state = if phase == 1 {
+					GroupState::Serve {
+						writer,
+						frame: None,
+						chunk: Some(bytes::Bytes::from_static(b"detached")),
+						batch: Box::new(frame::Buffer::new()),
+						batch_pos: 0,
+					}
+				} else {
+					writer.finish().unwrap();
+					GroupState::Closed { writer }
+				};
+			}
+			producer.abort(Error::Old).unwrap();
+			assert!(matches!(
+				kio::wait(|waiter| serve.poll_serve(waiter)).await,
+				Err(Error::Old)
+			));
+			assert!(
+				log.writes.lock().unwrap().is_empty(),
+				"no obsolete work in phase {phase}"
+			);
+			assert_eq!(
+				log.resets(),
+				if phase == 0 {
+					vec![]
+				} else {
+					vec![crate::StreamError::Old.to_code()]
+				}
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn fixed_publisher_uses_the_subscription_id() {
+		use crate::coding::Decode;
+		let log = Log::default();
+		let track = track::Producer::new(Arc::new(broadcast::Info::default()), "states", None);
+		let subscriber = track.subscribe(None);
+		let mut group = track.append_group().unwrap();
+		group.write_frame(Timestamp::ZERO, b"state".as_slice()).unwrap();
+		group.finish().unwrap();
+		let mut publish = Box::pin(publish_fixed(SinkSession::new(log.clone()), subscriber, 1));
+		assert!(futures::poll!(publish.as_mut()).is_pending());
+		let bytes = log.writes.lock().unwrap().clone();
+		let mut cursor = bytes.as_slice();
+		assert_eq!(
+			lite::DataType::decode(&mut cursor, Version::Lite05).unwrap(),
+			lite::DataType::Group
+		);
+		assert_eq!(lite::Group::decode(&mut cursor, Version::Lite05).unwrap().subscribe, 1);
 	}
 
 	#[tokio::test]
@@ -3276,16 +3394,17 @@ mod tests {
 	}
 }
 
-/// Serve an out-of-band agreed track using lite-05 GROUP streams only.
+/// Serve an out-of-band agreed track using lite-05 GROUP streams with its subscription id.
 /// The caller owns session authentication, track metadata, and cancellation.
 pub async fn publish_fixed<S: crate::transport::poll::Session + Unpin>(
 	session: S,
 	mut track: track::Subscriber,
+	id: u64,
 ) -> Result<(), Error> {
 	let priority = kio::Producer::new(0u8);
 	let ctx = Subscription {
 		session,
-		id: 0,
+		id,
 		track_name: track.name().into(),
 		priority: PriorityQueue::default(),
 		track_priority: priority.consume(),
@@ -3310,7 +3429,7 @@ pub async fn publish_fixed<S: crate::transport::poll::Session + Unpin>(
 				continue;
 			}
 			let sequence = group.sequence;
-			let handle = ctx.priority.insert(Priority::new(0, 0, sequence));
+			let handle = ctx.priority.insert(Priority::new(0, id, sequence));
 			children.push(GroupServe::new(ctx.clone(), sequence, 0, handle, group));
 		}
 	})

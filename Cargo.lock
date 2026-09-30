@@ -12882,6 +12882,7 @@ dependencies = [
  "moq-net",
  "moq-tokio",
  "qmux",
+ "rho-desktop-proto",
  "rho-rpc",
  "shiguredo_libvpx",
  "tokio",

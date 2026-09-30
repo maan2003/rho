@@ -2,6 +2,8 @@
 use anyhow::{Result, ensure};
 use shiguredo_libvpx as vpx;
 
+pub use crate::FrameKind;
+
 pub const MAX_PIXELS: usize = 4096 * 4096;
 
 #[cfg(feature = "encoder")]
@@ -13,7 +15,7 @@ pub struct Encoder {
 
 #[cfg(feature = "encoder")]
 pub struct Packet {
-    pub keyframe: bool,
+    pub kind: FrameKind,
     pub data: Vec<u8>,
 }
 
@@ -41,6 +43,9 @@ impl Encoder {
         config.cpu_used = Some(7);
         config.threads = std::num::NonZeroUsize::new(2);
         config.error_resilient = true;
+        // Startup and explicit recovery own reference-chain resets. Neither a
+        // wall-clock timer nor libvpx's frame-count default should force them.
+        config.automatic_keyframes = false;
         config.max_quantizer = 40;
         Ok(Self {
             inner: vpx::Encoder::new(config)?,
@@ -49,7 +54,7 @@ impl Encoder {
         })
     }
 
-    pub fn encode(&mut self, bgra: &[u8], keyframe: bool) -> Result<Vec<Packet>> {
+    pub fn encode(&mut self, bgra: &[u8], kind: FrameKind) -> Result<Vec<Packet>> {
         ensure!(
             bgra.len() == self.size.0 * self.size.1 * 4,
             "invalid BGRA frame length"
@@ -80,13 +85,22 @@ impl Encoder {
                 v: &self.planes[2],
             },
             &vpx::EncodeOptions {
-                force_keyframe: keyframe,
+                force_keyframe: kind == FrameKind::Key,
+                // Error resilience resets entropy, segmentation and loop-filter
+                // history. Only checkpoints change the durable GOLDEN pixels.
+                references: vpx::ReferenceMode::Golden {
+                    refresh: kind == FrameKind::Checkpoint,
+                },
             },
         )?;
         let mut packets = Vec::new();
         while let Some(frame) = self.inner.next_frame() {
             packets.push(Packet {
-                keyframe: frame.is_keyframe(),
+                kind: if frame.is_keyframe() {
+                    FrameKind::Key
+                } else {
+                    kind
+                },
                 data: frame.data().to_vec(),
             });
         }
@@ -187,6 +201,179 @@ mod tests {
     use super::*;
 
     #[test]
+    fn states_can_be_skipped_reordered_and_repeated_across_checkpoint_promotions() -> Result<()> {
+        let (w, h) = (257, 129);
+        let mut encoder = Encoder::new(w, h, 2_000_000)?;
+        let mut full = Decoder::new()?;
+        let mut checkpoints_only = Decoder::new()?;
+        let mut reordered = Decoder::new()?;
+        // Thin colored strokes, asymmetric rows and odd dimensions expose
+        // chroma, stride and stale segmentation/loop-filter history mistakes.
+        let mut pixels = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let color = if (x / 3 + y / 7) % 5 == 0 {
+                    [17, 210, 63, 255]
+                } else {
+                    [231, 29, 181, 255]
+                };
+                pixels.extend_from_slice(&color);
+            }
+        }
+        // Even a State request at startup must be reported as an actual Key.
+        let root = encoder.encode(&pixels, FrameKind::State)?.remove(0);
+        assert_eq!(root.kind, FrameKind::Key);
+        let expected = visible_planes(full.decode_planes(&root.data)?.unwrap());
+        assert_eq!(
+            visible_planes(checkpoints_only.decode_planes(&root.data)?.unwrap()),
+            expected
+        );
+        assert_eq!(
+            visible_planes(reordered.decode_planes(&root.data)?.unwrap()),
+            expected
+        );
+
+        for promotion in 0..8 {
+            let mut states = Vec::new();
+            for state in 0..9 {
+                let mut changed = pixels.clone();
+                // Motion touches an area different from the accumulated
+                // checkpoint edits. Each ordinary frame differs from its base.
+                for y in 51..113 {
+                    for x in 77..219 {
+                        if (x + state * 7 + y * 3) % 11 < 4 {
+                            let i = (y * w + x) * 4;
+                            changed[i..i + 4].copy_from_slice(&[
+                                ((x * 13 + promotion * 19) % 251) as u8,
+                                ((y * 29 + state * 23) % 253) as u8,
+                                ((x + y * 5 + state * 31) % 249) as u8,
+                                255,
+                            ]);
+                        }
+                    }
+                }
+                // Both directions of the lossy/lossless transition occur
+                // inside an epoch, not merely at keyframes.
+                encoder.quality(2_000_000, state % 3 == 1)?;
+                let packet = encoder.encode(&changed, FrameKind::State)?.remove(0);
+                assert_eq!(packet.kind, FrameKind::State);
+                // Profile 1, shown inter frame, error-resilient: the first
+                // byte is fixed and the next byte is refresh_frame_flags.
+                // Zero refresh proves no reference slot was changed.
+                assert_eq!(&packet.data[..2], &[0xa7, 0]);
+                let expected = visible_planes(full.decode_planes(&packet.data)?.unwrap());
+                states.push((packet, expected));
+            }
+            // No ordinary frame is needed by later ordinary frames. Decode
+            // newest first, then older frames, repetitions, and newest again.
+            for index in [8, 0, 5, 8, 2, 2, 7, 1, 8] {
+                let (packet, expected) = &states[index];
+                assert_eq!(
+                    visible_planes(reordered.decode_planes(&packet.data)?.unwrap()),
+                    *expected,
+                    "promotion {promotion}, reordered state {index}"
+                );
+            }
+
+            // Promotions retain previous checkpoint edits while changing a
+            // separate small region, encouraging a genuine predictive chain.
+            for y in 9..43 {
+                for x in (promotion * 23 + 3)..(promotion * 23 + 21) {
+                    let i = (y * w + x) * 4;
+                    pixels[i..i + 4].copy_from_slice(&[
+                        (31 + promotion * 23) as u8,
+                        (197 - promotion * 17) as u8,
+                        (55 + y * 3) as u8,
+                        255,
+                    ]);
+                }
+            }
+            encoder.quality(2_000_000, promotion % 2 == 0)?;
+            let checkpoint = encoder.encode(&pixels, FrameKind::Checkpoint)?.remove(0);
+            assert_eq!(
+                checkpoint.kind,
+                FrameKind::Checkpoint,
+                "promotion must not force a key"
+            );
+            let expected = visible_planes(full.decode_planes(&checkpoint.data)?.unwrap());
+            assert_eq!(
+                visible_planes(checkpoints_only.decode_planes(&checkpoint.data)?.unwrap()),
+                expected,
+                "promotion {promotion}, skipping every intervening state"
+            );
+            assert_eq!(
+                visible_planes(reordered.decode_planes(&checkpoint.data)?.unwrap()),
+                expected,
+                "promotion {promotion}, after reordered/repeated states"
+            );
+            // The newest state based on this new checkpoint must also match.
+            encoder.quality(2_000_000, promotion % 2 != 0)?;
+            let newest = encoder.encode(&pixels, FrameKind::State)?.remove(0);
+            assert_eq!(newest.kind, FrameKind::State);
+            let expected = visible_planes(full.decode_planes(&newest.data)?.unwrap());
+            assert_eq!(
+                visible_planes(reordered.decode_planes(&newest.data)?.unwrap()),
+                expected
+            );
+            // After the final promotion, a receiver that skipped *every*
+            // ordinary picture can immediately decode the newest B-state.
+            if promotion == 7 {
+                assert_eq!(
+                    visible_planes(checkpoints_only.decode_planes(&newest.data)?.unwrap()),
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn visible_planes(frame: RetainedFrame) -> [Vec<u8>; 3] {
+        std::array::from_fn(|p| {
+            frame
+                .plane(p)
+                .chunks(frame.stride(p))
+                .take(frame.height())
+                .flat_map(|row| row[..frame.width()].iter().copied())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn only_startup_and_requested_recovery_insert_keyframes() -> Result<()> {
+        let (w, h) = (47, 33);
+        let mut encoder = Encoder::new(w, h, 2_000_000)?;
+        let mut decoder = Decoder::new()?;
+        let mut pixels = vec![255; w * h * 4];
+        // Cross libvpx's usual frame-count keyframe boundary before requesting
+        // recovery. Scene changes must not silently recreate periodic groups.
+        for frame in 0..270 {
+            for y in 0..h {
+                for x in 0..w {
+                    let color = ((x * 17 + y * 31 + frame * 13) % 251) as u8;
+                    let i = (y * w + x) * 4;
+                    pixels[i..i + 3].copy_from_slice(&[color, color, color]);
+                }
+            }
+            let packets = encoder.encode(
+                &pixels,
+                if frame == 200 {
+                    FrameKind::Key
+                } else {
+                    FrameKind::State
+                },
+            )?;
+            assert_eq!(packets.len(), 1);
+            assert_eq!(
+                packets[0].kind == FrameKind::Key,
+                frame == 0 || frame == 200,
+                "frame {frame}"
+            );
+            assert!(decoder.decode(&packets[0].data)?.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn profile_one_preserves_color_in_bottom_half_and_predicts_frames() -> Result<()> {
         // Odd dimensions and alternating colored columns expose stride and
         // chroma-subsampling mistakes; different top/bottom halves expose a
@@ -211,10 +398,10 @@ mod tests {
         let mut encoder = Encoder::new(w, h, 8_000_000)?;
         encoder.quality(8_000_000, true)?;
         let mut decoder = Decoder::new()?;
-        for force in [true, false, true] {
-            let packets = encoder.encode(&pixels, force)?;
+        for kind in [FrameKind::Key, FrameKind::State, FrameKind::Key] {
+            let packets = encoder.encode(&pixels, kind)?;
             assert_eq!(packets.len(), 1);
-            assert_eq!(packets[0].keyframe, force);
+            assert_eq!(packets[0].kind, kind);
             let image = decoder.decode(&packets[0].data)?.unwrap();
             assert_eq!((image.width, image.height), (w, h));
             for (got, want) in image.bgra.iter().zip(&pixels) {
@@ -240,16 +427,32 @@ mod tests {
         let mut decoder = Decoder::new()?;
         for round in 0..2 {
             encoder.quality(128_000, false)?;
-            let motion = encoder.encode(&pixels, round == 0)?.remove(0);
+            let motion = encoder
+                .encode(
+                    &pixels,
+                    if round == 0 {
+                        FrameKind::Key
+                    } else {
+                        FrameKind::State
+                    },
+                )?
+                .remove(0);
             decoder.decode(&motion.data)?.unwrap();
             encoder.quality(128_000, true)?;
-            let refined = encoder.encode(&pixels, false)?.remove(0);
-            assert!(!refined.keyframe);
+            let refined = encoder.encode(&pixels, FrameKind::State)?.remove(0);
+            assert!(refined.kind == FrameKind::State);
             let image = decoder.decode(&refined.data)?.unwrap();
-            let max_error = image.bgra.iter().zip(&pixels)
+            let max_error = image
+                .bgra
+                .iter()
+                .zip(&pixels)
                 .map(|(got, want)| (*got as i16 - *want as i16).abs())
-                .max().unwrap();
-            assert!(max_error <= 2, "round {round}: maximum channel error {max_error}");
+                .max()
+                .unwrap();
+            assert!(
+                max_error <= 2,
+                "round {round}: maximum channel error {max_error}"
+            );
             // Exercise the transition back out of zero-quantizer refinement.
             pixels[..4].copy_from_slice(&[87, 87, 87, 255]);
         }
@@ -262,7 +465,7 @@ mod tests {
         let mut encoder = Encoder::new(width, height, 8_000_000)?;
         let mut decoder = Decoder::new()?;
         let pixels = vec![73u8; width * height * 4];
-        let first = encoder.encode(&pixels, true)?.remove(0);
+        let first = encoder.encode(&pixels, FrameKind::Key)?.remove(0);
         let frozen = decoder.decode_planes(&first.data)?.unwrap();
         let saved: Vec<_> = (0..3).map(|p| frozen.plane(p).to_vec()).collect();
         let mut allocations = std::collections::HashSet::new();
@@ -276,7 +479,16 @@ mod tests {
                     255,
                 ]);
             }
-            let packet = encoder.encode(&pixels, i % 7 == 0)?.remove(0);
+            let packet = encoder
+                .encode(
+                    &pixels,
+                    if i % 7 == 0 {
+                        FrameKind::Key
+                    } else {
+                        FrameKind::State
+                    },
+                )?
+                .remove(0);
             let frame = decoder.decode_planes(&packet.data)?.unwrap();
             allocations.insert(frame.plane(0).as_ptr() as usize);
             for p in 0..3 {
@@ -287,7 +499,7 @@ mod tests {
         for (width, height) in [(129, 71), (31, 19)] {
             let mut encoder = Encoder::new(width, height, 8_000_000)?;
             let packet = encoder
-                .encode(&vec![150; width * height * 4], true)?
+                .encode(&vec![150; width * height * 4], FrameKind::Key)?
                 .remove(0);
             let resized = decoder.decode_planes(&packet.data)?.unwrap();
             assert_eq!((resized.width(), resized.height()), (width, height));

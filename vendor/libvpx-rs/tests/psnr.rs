@@ -167,6 +167,7 @@ fn encode_frame(config: EncoderConfig, image: &ImageData) -> Vec<Vec<u8>> {
             image,
             &EncodeOptions {
                 force_keyframe: true,
+                ..Default::default()
             },
         )
         .expect("failed to encode");
@@ -184,7 +185,7 @@ fn encode_frame(config: EncoderConfig, image: &ImageData) -> Vec<Vec<u8>> {
 
 /// エンコード済みデータをデコードし、デコード結果を返す
 fn decode_frames(codec: DecoderCodec, packets: &[Vec<u8>]) -> DecodedI420 {
-    let config = DecoderConfig { codec };
+    let config = DecoderConfig::new(codec);
     let mut decoder = Decoder::new(config).expect("failed to create decoder");
 
     let mut result = None;

@@ -3565,11 +3565,11 @@ impl<S: crate::transport::poll::Session> kio::Task for FetchServeRun<S> {
 	}
 }
 
-/// Receive one out-of-band agreed lite-05 GROUP stream (subscription id zero).
+/// Receive one out-of-band agreed lite-05 GROUP stream, routed by subscription id.
 /// Each stream must start at the group head; cancellation aborts partial groups.
 pub async fn receive_fixed_group<R: crate::transport::poll::RecvStream>(
 	stream: R,
-	track: track::Producer,
+	tracks: &[track::Producer],
 	timescale: Timescale,
 ) -> Result<(), Error> {
 	let mut reader = Reader::new(stream, Version::Lite05);
@@ -3577,9 +3577,13 @@ pub async fn receive_fixed_group<R: crate::transport::poll::RecvStream>(
 		return Err(Error::Cancel);
 	}
 	let header = reader.decode::<lite::Group>().await?;
-	if header.subscribe != 0 || header.frame_start != 0 {
+	if header.frame_start != 0 {
 		return Err(Error::Cancel);
 	}
+	let track = usize::try_from(header.subscribe)
+		.ok()
+		.and_then(|id| tracks.get(id))
+		.ok_or(Error::Cancel)?;
 	let mut group = crate::recv::Group::new(track.create_group(group::Info {
 		sequence: header.sequence,
 	})?);
@@ -3600,6 +3604,41 @@ pub async fn receive_fixed_group<R: crate::transport::poll::RecvStream>(
 		Err(err) => {
 			let _ = group.abort(err.clone());
 			Err(err)
+		}
+	}
+}
+
+#[cfg(all(test, not(loom)))]
+mod fixed_group_test {
+	use super::*;
+	use crate::coding::Encode;
+	use crate::lite::test_transport::ScriptedSession;
+	use web_transport_trait::poll::Session as _;
+
+	#[tokio::test]
+	async fn rejects_unknown_subscription() {
+		let broadcast = crate::broadcast::Info::default().produce();
+		let tracks = [
+			broadcast.create_track("checkpoint", None).unwrap(),
+			broadcast.create_track("state", None).unwrap(),
+		];
+		for (subscribe, frame_start) in [(2, 0), ((1 << 62) - 1, 0)] {
+			let mut wire = Vec::new();
+			lite::DataType::Group.encode(&mut wire, Version::Lite05).unwrap();
+			lite::Group {
+				subscribe,
+				sequence: 0,
+				frame_start,
+			}
+			.encode(&mut wire, Version::Lite05)
+			.unwrap();
+			let mut session = ScriptedSession::new(wire);
+			let (_, stream) = std::future::poll_fn(|cx| session.poll_open_bi(cx)).await.unwrap();
+			let result = receive_fixed_group(stream, &tracks, Timescale::default()).await;
+			assert!(
+				matches!(result, Err(Error::Cancel)),
+				"{subscribe}:{frame_start}: {result:?}"
+			);
 		}
 	}
 }

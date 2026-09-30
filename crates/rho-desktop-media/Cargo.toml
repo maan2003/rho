@@ -11,6 +11,7 @@ decoder = ["dep:shiguredo_libvpx", "dep:yuv"]
 iroh = ["moq-tokio/shared-iroh"]
 
 [dependencies]
+rho-desktop-proto = { path = "../rho-desktop-proto" }
 anyhow = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "net", "time", "macros"] }

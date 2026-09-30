@@ -6,6 +6,8 @@ use anyhow::{Result, ensure};
 use bytes::Bytes;
 use moq_net::{group, origin, track};
 
+use crate::{FrameKind, Header};
+
 pub fn origin() -> origin::Producer {
     let mut config = origin::Config::default();
     config.pool = moq_net::cache::Pool::new(
@@ -66,11 +68,12 @@ fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin 
         let (mut send, mut recv) = transport.open_bi().await?;
         let video = async {
             let broadcast = origin.consume().request_broadcast("app").await?;
-            let track = broadcast.track("video")?.subscribe(None).await?;
-            let control = track.control();
+            let checkpoints = broadcast.track("video")?.subscribe(None).await?;
+            let states = broadcast.track("states")?.subscribe(None).await?;
+            let controls = [checkpoints.control(), states.control()];
             let floors = async {
                 loop {
-                    let mut floor = [0; 8];
+                    let mut floor = [0; 9];
                     let mut read = 0;
                     while read < floor.len() {
                         match recv.read(&mut floor[read..]).await? {
@@ -78,15 +81,17 @@ fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin 
                             Some(n) => read += n,
                         }
                     }
-                    control.update(
-                        control
-                            .subscription()
-                            .with_start(track::Position::group(u64::from_be_bytes(floor))),
-                    )?;
+                    let control = controls
+                        .get(floor[0] as usize)
+                        .ok_or_else(|| anyhow::anyhow!("invalid video track"))?;
+                    control.update(control.subscription().with_start(track::Position::group(
+                        u64::from_be_bytes(floor[1..].try_into().unwrap()),
+                    )))?;
                 }
             };
             tokio::select! {
-                result = moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), track) => Ok::<(), anyhow::Error>(result?),
+                result = moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), checkpoints, 0) => Ok::<(), anyhow::Error>(result?),
+                result = moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), states, 1) => Ok::<(), anyhow::Error>(result?),
                 result = floors => result,
             }
         };
@@ -130,15 +135,19 @@ fn fixed_subscribe<S: moq_net::web_transport_trait::Session + Send + Sync + Unpi
             if recv.read(&mut preface).await?.is_none() {
                 return Ok::<(), anyhow::Error>(());
             }
-            let mut track = video.track.clone();
+            let mut checkpoints = video.track.clone();
+            let mut states = video.states.clone();
             let floors = async {
                 loop {
-                    let subscription = track.subscription_changed().await?;
-                    let floor = subscription
-                        .and_then(|subscription| subscription.start)
-                        .map_or(0, |position| position.group);
-                    send.write_chunk(Bytes::copy_from_slice(&floor.to_be_bytes()))
-                        .await?;
+                    let (id, subscription) = tokio::select! {
+                        subscription = checkpoints.subscription_changed() => (0u8, subscription?),
+                        subscription = states.subscription_changed() => (1u8, subscription?),
+                    };
+                    let floor = subscription.and_then(|s| s.start).map_or(0, |p| p.group);
+                    let mut message = [0; 9];
+                    message[0] = id;
+                    message[1..].copy_from_slice(&floor.to_be_bytes());
+                    send.write_chunk(Bytes::copy_from_slice(&message)).await?;
                 }
             };
             let mut byte = [0];
@@ -154,9 +163,9 @@ fn fixed_subscribe<S: moq_net::web_transport_trait::Session + Send + Sync + Unpi
                 tokio::select! {
                     stream = receiver.accept_uni(), if groups.len() < 32 => {
                         let stream = stream?;
-                        let track = video.track.clone();
+                        let tracks = [video.track.clone(), video.states.clone()];
                         groups.spawn(async move {
-                            moq_net::receive_fixed_group(stream, track, moq_net::Timescale::MICRO).await
+                            moq_net::receive_fixed_group(stream, &tracks, moq_net::Timescale::MICRO).await
                         });
                     }
                     _ = groups.join_next(), if !groups.is_empty() => {}
@@ -199,35 +208,60 @@ fn fixed_session(future: impl Future<Output = Result<()>> + Send + 'static) -> S
     }
 }
 
-/// One keyframe-led group. Encoded dependent frames are never independently
-/// evicted: MoQ abandons whole old groups when fresher decodable data arrives.
+/// Checkpoints stay ordered in a keyframe-led group. Each ordinary state has
+/// its own stream and can be superseded without changing the reference chain.
 pub struct Video {
     pub track: track::Producer,
+    pub states: track::Producer,
     group: Option<group::Producer>,
+    state: Option<group::Producer>,
+    epoch: u64,
+    base: u64,
 }
 impl Video {
     pub fn new(broadcast: &moq_net::broadcast::Producer) -> Result<Self> {
-        let info = track::Info::default()
-            .with_max_age(Duration::from_millis(750))
-            .with_timescale(moq_net::Timescale::MICRO);
+        // Reliable checkpoints must not expire while a slow state is replaced.
+        let info = track::Info::default().with_timescale(moq_net::Timescale::MICRO);
         Ok(Self {
-            track: broadcast.create_track("video", Some(info))?,
+            track: broadcast.create_track("video", Some(info.clone()))?,
+            states: broadcast.create_track("states", Some(info))?,
             group: None,
+            state: None,
+            epoch: 0,
+            base: 0,
         })
     }
-    pub fn write(&mut self, keyframe: bool, timestamp: u64, data: Bytes) -> Result<()> {
+    pub fn write(&mut self, kind: FrameKind, timestamp: u64, data: Bytes) -> Result<()> {
         ensure!(data.len() <= crate::MAX_PACKET, "video packet too large");
-        if keyframe {
+        if kind == FrameKind::Key {
             if let Some(group) = self.group.take() {
-                group.finish()?;
+                group.abort(moq_net::Error::Old)?;
             }
             self.group = Some(self.track.append_group()?);
+            self.epoch = timestamp;
+            self.base = 0;
         }
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("video must start with a keyframe"))?;
-        group.write_frame(moq_net::Timestamp::from_micros(timestamp)?, data)?;
+        ensure!(self.epoch > 0, "video must start with a keyframe");
+        let header = Header {
+            kind,
+            epoch: self.epoch,
+            base: self.base,
+        };
+        let payload = header.pack(data);
+        let time = moq_net::Timestamp::from_micros(timestamp)?;
+        if let Some(state) = self.state.take() {
+            // Abort, even after finish: obsolete bytes need no retransmission.
+            state.abort(moq_net::Error::Old)?;
+        }
+        if kind == FrameKind::State {
+            let mut state = self.states.append_group()?;
+            state.write_frame(time, payload)?;
+            state.finish()?;
+            self.state = Some(state);
+        } else {
+            self.group.as_mut().unwrap().write_frame(time, payload)?;
+            self.base = timestamp;
+        }
         Ok(())
     }
 }
@@ -257,20 +291,108 @@ mod tests {
             video.track.used().await?;
             let remote = consumer.consume().request_broadcast("app").await?;
             let mut track = remote.track("video")?.subscribe(None).await?.ordered();
-            video.write(true, 17_000, Bytes::from_static(b"keyframe"))?;
-            video.write(false, 18_250, Bytes::from_static(b"dependent"))?;
+            video.write(FrameKind::Key, 17_000, Bytes::from_static(b"keyframe"))?;
+            video.write(
+                FrameKind::Checkpoint,
+                18_250,
+                Bytes::from_static(b"dependent"),
+            )?;
             let mut group = track.next_group().await?.unwrap();
             let first = group.read_frame().await?.unwrap();
             assert_eq!(first.timestamp, moq_net::Timestamp::from_micros(17_000)?);
-            assert_eq!(&first.payload[..], b"keyframe");
+            assert_eq!(&first.payload[Header::SIZE..], b"keyframe");
             let second = group.read_frame().await?.unwrap();
             assert_eq!(second.timestamp, moq_net::Timestamp::from_micros(18_250)?);
-            assert_eq!(&second.payload[..], b"dependent");
+            assert_eq!(&second.payload[Header::SIZE..], b"dependent");
             drop(receiving);
             // Keep the local model readers alive: the transport lifetime, not
             // their accidental destruction, must release compositor demand.
             video.track.unused().await?;
             sending.closed().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn latest_state_cancels_old_stream_without_losing_checkpoint_chain() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let source = origin();
+            let relay = origin();
+            let viewer = origin();
+            let broadcast = source.create_broadcast("app")?;
+            broadcast.announce(Default::default())?;
+            let mut video = Video::new(&broadcast)?;
+            let (a, b) = tokio::io::duplex(4096);
+            let (c, d) = tokio::io::duplex(4096);
+            let sessions = tokio::try_join!(
+                local_server(a, &source),
+                local_client(b, relay.clone()),
+                local_server(c, &relay),
+                local_client(d, viewer.clone()),
+            )?;
+            let remote = viewer.consume().request_broadcast("app").await?;
+            let mut checkpoints = remote.track("video")?.subscribe(None).await?.ordered();
+            let mut states = remote.track("states")?.subscribe(None).await?.ordered();
+            video.track.used().await?;
+            video.write(FrameKind::Key, 100, Bytes::from_static(b"A"))?;
+            let mut chain = checkpoints.next_group().await?.unwrap();
+            let (header, payload) = Header::unpack(chain.read_frame().await?.unwrap().payload)?;
+            assert_eq!(
+                header,
+                Header {
+                    kind: FrameKind::Key,
+                    epoch: 100,
+                    base: 0
+                }
+            );
+            assert_eq!(payload.as_ref(), b"A");
+
+            video.write(FrameKind::State, 200, Bytes::from(vec![17; 4_000_000]))?;
+            let mut stale = states.next_group().await?.unwrap();
+            // Obtaining the partial frame proves old work reached both relays.
+            let mut stale_frame = stale.next_frame().await?.unwrap();
+            video.write(FrameKind::State, 300, Bytes::from_static(b"latest A"))?;
+            let mut latest = states.next_group().await?.unwrap();
+            let (header, payload) = Header::unpack(latest.read_frame().await?.unwrap().payload)?;
+            assert_eq!(
+                header,
+                Header {
+                    kind: FrameKind::State,
+                    epoch: 100,
+                    base: 100
+                }
+            );
+            assert_eq!(payload.as_ref(), b"latest A");
+            assert!(
+                stale_frame.read_all().await.is_err(),
+                "obsolete transport must be aborted"
+            );
+
+            video.write(FrameKind::Checkpoint, 400, Bytes::from_static(b"B"))?;
+            video.write(FrameKind::State, 500, Bytes::from_static(b"latest B"))?;
+            let (header, payload) = Header::unpack(chain.read_frame().await?.unwrap().payload)?;
+            assert_eq!(
+                header,
+                Header {
+                    kind: FrameKind::Checkpoint,
+                    epoch: 100,
+                    base: 100
+                }
+            );
+            assert_eq!(payload.as_ref(), b"B");
+            let mut newest = states.next_group().await?.unwrap();
+            let (header, payload) = Header::unpack(newest.read_frame().await?.unwrap().payload)?;
+            assert_eq!(
+                header,
+                Header {
+                    kind: FrameKind::State,
+                    epoch: 100,
+                    base: 400
+                }
+            );
+            assert_eq!(payload.as_ref(), b"latest B");
+            drop(sessions);
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -315,9 +437,12 @@ mod tests {
             let _ = upstream_prefs.subscription_changed().await?;
             let remote = viewer.consume().request_broadcast("app").await?;
             let mut subscribed = remote.track("video")?.subscribe(None).await?.ordered();
-            video.write(true, 17_000, Bytes::from_static(b"old"))?;
+            video.write(FrameKind::Key, 17_000, Bytes::from_static(b"old"))?;
             let mut old = subscribed.next_group().await?.unwrap();
-            assert_eq!(&old.read_frame().await?.unwrap().payload[..], b"old");
+            assert_eq!(
+                &old.read_frame().await?.unwrap().payload[Header::SIZE..],
+                b"old"
+            );
 
             subscribed.control().update(
                 subscribed
@@ -361,11 +486,18 @@ mod tests {
             // Expiry at the consumed end reports EOF, even though the source
             // has not finished this group; there is no truncated unread frame.
             assert!(old.read_frame().await?.is_none());
-            video.write(false, 17_500, Bytes::from_static(b"superseded"))?;
+            video.write(
+                FrameKind::Checkpoint,
+                17_500,
+                Bytes::from_static(b"superseded"),
+            )?;
             assert!(old.read_frame().await?.is_none());
-            video.write(true, 18_000, Bytes::from_static(b"new"))?;
+            video.write(FrameKind::Key, 18_000, Bytes::from_static(b"new"))?;
             let mut fresh = subscribed.next_group().await?.unwrap();
-            assert_eq!(&fresh.read_frame().await?.unwrap().payload[..], b"new");
+            assert_eq!(
+                &fresh.read_frame().await?.unwrap().payload[Header::SIZE..],
+                b"new"
+            );
             drop((downstream, relay_output, relay_input, upstream));
             Ok::<(), anyhow::Error>(())
         })
@@ -467,18 +599,25 @@ mod tests {
             let publish_frames = async {
                 video.track.used().await?;
                 rpc_echo(&outgoing, "while video is subscribed").await?;
-                video.write(true, 17_000, Bytes::from_static(b"keyframe"))?;
-                video.write(false, 18_000, Bytes::from_static(b"dependent"))?;
+                video.write(FrameKind::Key, 17_000, Bytes::from_static(b"keyframe"))?;
+                video.write(
+                    FrameKind::Checkpoint,
+                    18_000,
+                    Bytes::from_static(b"dependent"),
+                )?;
                 drain.await?;
                 video.group.take().unwrap().abort(moq_net::Error::Old)?;
-                video.write(true, 19_000, Bytes::from_static(b"fresh"))?;
+                video.write(FrameKind::Key, 19_000, Bytes::from_static(b"fresh"))?;
                 Ok::<(), anyhow::Error>(())
             };
             let read_frames = async {
                 let mut group = subscribed.next_group().await?.unwrap();
-                assert_eq!(&group.read_frame().await?.unwrap().payload[..], b"keyframe");
                 assert_eq!(
-                    &group.read_frame().await?.unwrap().payload[..],
+                    &group.read_frame().await?.unwrap().payload[Header::SIZE..],
+                    b"keyframe"
+                );
+                assert_eq!(
+                    &group.read_frame().await?.unwrap().payload[Header::SIZE..],
                     b"dependent"
                 );
                 drained.send(()).unwrap();
@@ -491,7 +630,10 @@ mod tests {
                     "stale group: {stale:?}"
                 );
                 let mut group = subscribed.next_group().await?.unwrap();
-                assert_eq!(&group.read_frame().await?.unwrap().payload[..], b"fresh");
+                assert_eq!(
+                    &group.read_frame().await?.unwrap().payload[Header::SIZE..],
+                    b"fresh"
+                );
                 Ok::<(), anyhow::Error>(())
             };
             let (sent, read) = tokio::join!(publish_frames, read_frames);

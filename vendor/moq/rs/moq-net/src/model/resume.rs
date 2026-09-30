@@ -892,6 +892,28 @@ impl Group {
 		}
 	}
 
+	/// Observe logical cancellation and explicit supersession of the retained copy.
+	/// A route failure remains resumable; Old alone declares the group obsolete.
+	pub(crate) fn poll_aborted(&self, waiter: &kio::Waiter) -> Poll<Error> {
+		match self
+			.state
+			.poll(waiter, |state| state.abort.clone().map_or(Poll::Pending, Poll::Ready))
+		{
+			Poll::Ready(Ok(err)) => return Poll::Ready(err),
+			Poll::Ready(Err(state)) if state.abort.is_some() => {
+				return Poll::Ready(state.abort.clone().expect("checked above"));
+			}
+			_ => {}
+		}
+		if let Some(current) = &self.current
+			&& let Poll::Ready(err) = current.group.poll_aborted(waiter)
+			&& matches!(err, Error::Old | Error::Stream(crate::StreamError::Old))
+		{
+			return Poll::Ready(err);
+		}
+		Poll::Pending
+	}
+
 	/// The number of frames known on the current route copy, never below this
 	/// logical cursor's position.
 	pub(crate) fn frame_count(&self) -> usize {
@@ -3646,6 +3668,60 @@ mod test {
 		group.start_at(1).unwrap();
 		group.write_frame(Timestamp::ZERO, b"b1".to_vec()).unwrap();
 		assert_eq!(read(&mut reading), b"b1");
+	}
+
+	#[tokio::test]
+	async fn finished_spliced_group_watches_explicit_supersession() {
+		for err in [Error::Old, Error::Stream(crate::StreamError::Old)] {
+			let (track, source) = track_pair("state");
+			let mut resume = Producer::new();
+			resume.takeover(&source).unwrap();
+			let mut subscriber = resume.consume().subscribe(None);
+			let mut producer = track.append_group().unwrap();
+			producer.write_frame(Timestamp::ZERO, b"cached".as_slice()).unwrap();
+			producer.finish().unwrap();
+			let mut group = subscriber.recv_group().await.unwrap().unwrap();
+			assert_eq!(read(&mut group), b"cached");
+			assert!(group.read_frame().await.unwrap().is_none());
+			let watch = tokio::spawn(async move { kio::wait(|waiter| group.poll_aborted(waiter)).await });
+			tokio::task::yield_now().await;
+			assert!(!watch.is_finished());
+			producer.abort(err).unwrap();
+			let err = tokio::time::timeout(Duration::from_secs(1), watch)
+				.await
+				.unwrap()
+				.unwrap();
+			assert!(matches!(err, Error::Old | Error::Stream(crate::StreamError::Old)));
+		}
+	}
+
+	#[tokio::test]
+	async fn spliced_abort_watch_preserves_checkpoint_route_recovery() {
+		for failure in [Error::Dropped, Error::Cancel, Error::Stream(crate::StreamError::Cancel)] {
+			let (first, source) = track_pair("first");
+			let (second, replacement) = track_pair("replacement");
+			let mut resume = Producer::new();
+			resume.takeover(&source).unwrap();
+			let mut subscriber = resume.consume().subscribe(None);
+			let mut producer = first.create_group(0u64.into()).unwrap();
+			producer
+				.write_frame(Timestamp::ZERO, b"checkpoint-head".as_slice())
+				.unwrap();
+			let mut group = subscriber.recv_group().await.unwrap().unwrap();
+			assert_eq!(read(&mut group), b"checkpoint-head");
+			producer.abort(failure).unwrap();
+			assert!(group.poll_aborted(&kio::Waiter::noop()).is_pending());
+			assert!(group.read_frame().now_or_never().is_none(), "route failure parks");
+			resume.takeover(&replacement).unwrap();
+			let mut tail = second.create_group(0u64.into()).unwrap();
+			tail.start_at(1).unwrap();
+			tail.write_frame(Timestamp::ZERO, b"checkpoint-tail".as_slice())
+				.unwrap();
+			tail.finish().unwrap();
+			assert!(group.poll_aborted(&kio::Waiter::noop()).is_pending());
+			assert_eq!(read(&mut group), b"checkpoint-tail");
+			assert!(group.read_frame().await.unwrap().is_none());
+		}
 	}
 
 	/// A dead copy stalls only while a replacement can still arrive. Once the logical

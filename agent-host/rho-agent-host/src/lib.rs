@@ -1845,6 +1845,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use rho_desktop_proto::{Input, Packet, Request, Response};
+    // Admit media to QUIC in small paced pieces. RPC/input uses other streams
+    // and retains its priority; this does not replace QUIC congestion control.
+    transport.set_send_rate(250_000);
     let result = async {
         let agent = services.resolve_display_agent_id(&agent).await?;
         let process = services.pool.execution(agent).await?;
@@ -1883,8 +1886,18 @@ where
             );
             let from_gui = async {
                 loop {
-                    let (input, _) =
+                    let (mut input, _) =
                         rho_rpc::read_frame::<_, Input>(&mut reader, 64 * 1024).await?;
+                    if let Input::Feedback(feedback) = &mut input {
+                        feedback.rtt_us = transport.rtt().as_micros() as u64;
+                        if feedback.delivery_bps > 0 {
+                            // Drain slightly ahead of measured delivery, separately from
+                            // the source's reduced encoding target. New in-flight samples
+                            // can discover a faster path without idle padding traffic.
+                            let rate = feedback.delivery_bps.saturating_mul(11) / 80;
+                            transport.set_send_rate(rate.clamp(16_000, 2_500_000));
+                        }
+                    }
                     anyhow::ensure!(
                         matches!(
                             rho_desktop_proto::local::request(
@@ -1905,7 +1918,7 @@ where
                 let local = rho_desktop_media::media::SessionGuard(
                     rho_desktop_media::media::local_client(desktop.media, origin.clone()).await?,
                 );
-                let remote = rho_desktop_media::media::publish(transport, &origin).await?;
+                let remote = rho_desktop_media::media::publish(transport.clone(), &origin).await?;
                 tokio::select! {
                     error=local.0.closed()=>anyhow::bail!("desktop media closed: {error}"),
                     _=remote.closed()=>Ok::<(),anyhow::Error>(()),

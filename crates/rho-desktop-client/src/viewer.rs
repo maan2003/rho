@@ -1,16 +1,18 @@
 //! A live view of one of the host's desktops: VP9 over the host's media
-//! transport, input back on a stream of its own. Only decoded images are
-//! coalesced.
+//! transport, input back on a stream of its own. Checkpoints are ordered;
+//! disposable states are coalesced before decoding.
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::FutureExt;
 use rho_desktop_media::codec::{Decoder, RetainedFrame};
+use rho_desktop_media::{FrameKind, Header};
 use rho_desktop_proto::{Feedback, FrameId, Input};
 use rho_rpc::protocol::{Opened, read_frame, write_open};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 /// One decoded image: the YUV planes the decoder retained, which the
 /// renderer samples as they are.
@@ -37,33 +39,83 @@ impl Image {
     }
 }
 // The floor invalidates queued and in-progress decoding together. It advances
-// only by whole groups: a decoder never resumes halfway through a dependency
+// only by root epochs: a decoder never resumes halfway through a checkpoint
 // chain.
 #[derive(Default)]
 struct Progress {
     floor: AtomicU64,
     feedback: Mutex<Feedback>,
-    recovery_pending: AtomicBool,
+    recovery: Notify,
+    receipt: Mutex<Receipt>,
+}
+#[derive(Default)]
+struct Receipt {
+    reference: Option<(u64, u64)>,
+    state: Option<(FrameId, u64)>,
 }
 impl Progress {
     fn accepts(&self, id: FrameId) -> bool {
-        id.group >= self.floor.load(Ordering::Acquire)
+        id.epoch >= self.floor.load(Ordering::Acquire)
     }
-    fn recover(&self, floor: u64) {
+    fn recover(&self, epoch: u64, floor: u64) {
         let mut feedback = self.feedback.lock().unwrap();
+        if epoch < self.floor.load(Ordering::Acquire) {
+            return;
+        }
         self.floor.fetch_max(floor, Ordering::Release);
+        feedback.recovery_id += 1;
         feedback.recover = true;
-        self.recovery_pending.store(true, Ordering::Release);
+        self.recovery.notify_one();
     }
-    fn report(&self) -> Feedback {
-        let state = self.feedback.lock().unwrap();
-        let mut feedback = *state;
-        // Control is reliable: request once per failure, not once per tick
-        // until a network-delayed keyframe arrives. Repeated requests would
-        // keep superseding that keyframe and add more traffic to the backlog.
-        // Retain feedback.recover internally until reception for lag rebasing.
-        feedback.recover &= self.recovery_pending.swap(false, Ordering::AcqRel);
+    async fn invalidated(&self, epoch: u64) {
+        loop {
+            let notified = self.recovery.notified();
+            if epoch < self.floor.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    fn report(&self, rtt: Duration) -> Feedback {
+        let mut feedback = *self.feedback.lock().unwrap();
+        feedback.rtt_us = rtt.as_micros() as u64;
         feedback
+    }
+    fn received(&self, packet: &Encoded) {
+        let mut receipt = self.receipt.lock().unwrap();
+        let mut feedback = self.feedback.lock().unwrap();
+        if !self.accepts(packet.id) {
+            return;
+        }
+        match packet.header.kind {
+            FrameKind::Key => {
+                receipt.reference = Some((packet.header.epoch, packet.id.timestamp_us));
+                feedback.recover = false;
+            }
+            FrameKind::Checkpoint => {
+                receipt.reference = Some((packet.header.epoch, packet.id.timestamp_us));
+            }
+            FrameKind::State => {
+                if receipt.state.is_none_or(|(id, _)| packet.id > id) {
+                    receipt.state = Some((packet.id, packet.header.base));
+                }
+            }
+        }
+        // Other-stream states cannot acknowledge missing reliable checkpoints.
+        let safe = packet.header.kind != FrameKind::State
+            || receipt.reference == Some((packet.header.epoch, packet.header.base));
+        let mut received = safe.then_some(packet.id);
+        if let Some((state, base)) = receipt.state {
+            if receipt.reference == Some((state.epoch, base)) {
+                received = received.map(|id| id.max(state)).or(Some(state));
+            }
+        }
+        if let Some(id) = received {
+            if feedback.received.is_none_or(|previous| id > previous) {
+                feedback.received = Some(id);
+                feedback.lag_us = packet.lag_us;
+            }
+        }
     }
     fn presented(&self, id: FrameId, lag_us: u64) {
         let mut feedback = self.feedback.lock().unwrap();
@@ -75,6 +127,7 @@ impl Progress {
 }
 
 struct Encoded {
+    header: Header,
     id: FrameId,
     payload: bytes::Bytes,
     received_at: Instant,
@@ -84,13 +137,19 @@ struct Encoded {
 fn recover(
     subscription: &mut moq_net::track::Ordered,
     progress: &Progress,
-    group: u64,
+    sequence: u64,
+    epoch: u64,
 ) -> Result<()> {
-    let floor = group
+    progress.recover(
+        epoch,
+        epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("video epoch overflow"))?,
+    );
+    let floor = sequence
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("video group overflow"))?
         .max(subscription.latest().unwrap_or(0));
-    progress.recover(floor);
     subscription.set_groups(floor..);
     subscription.update(
         subscription
@@ -102,30 +161,108 @@ fn recover(
 
 fn decode_packets(
     mut decode: mpsc::Receiver<Encoded>,
+    mut states: watch::Receiver<Option<Arc<Encoded>>>,
     images: watch::Sender<Option<Arc<Image>>>,
     progress: Arc<Progress>,
     started: Instant,
     desktop_id: u64,
 ) -> Result<()> {
-    tracing::info!(
-        desktop_id,
-        elapsed_ms = started.elapsed().as_millis(),
-        "desktop decoder task started"
-    );
     let mut decoder = Decoder::new()?;
+    let mut reference = None;
+    let mut handled_state = None;
+    let mut states_open = true;
     let mut first = true;
-    while let Some(packet) = decode.blocking_recv() {
+    loop {
+        let packet = {
+            // Keep future-base bytes only in the watch slot, not in a second
+            // queue while checkpoints decode. Re-read its newest value each turn.
+            let candidate = states.borrow_and_update().clone().filter(|packet| {
+                handled_state != Some(packet.id)
+                    && progress.accepts(packet.id)
+                    && reference == Some((packet.header.epoch, packet.header.base))
+            });
+            match decode.try_recv() {
+                Ok(packet) => Arc::new(packet),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    if let Some(packet) = candidate {
+                        packet
+                    } else {
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if let Some(packet) = candidate {
+                        packet
+                    } else {
+                        let next = tokio::runtime::Handle::current().block_on(async {
+                            tokio::select! {
+                                biased;
+                                packet = decode.recv() => packet.map(Arc::new),
+                                changed = states.changed(), if states_open => {
+                                    if changed.is_err() { states_open = false; }
+                                    None
+                                }
+                            }
+                        });
+                        if let Some(packet) = next {
+                            packet
+                        } else {
+                            if decode.is_closed() && decode.is_empty() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        if packet.header.kind == FrameKind::State {
+            handled_state = Some(packet.id);
+        }
         if !progress.accepts(packet.id) {
             continue;
         }
+        let valid = match packet.header.kind {
+            FrameKind::Key => {
+                packet.header.base == 0 && packet.header.epoch == packet.id.timestamp_us
+            }
+            FrameKind::Checkpoint | FrameKind::State => {
+                reference == Some((packet.header.epoch, packet.header.base))
+                    && packet.id.timestamp_us > packet.header.base
+            }
+        };
         let decode_started = Instant::now();
-        if let Some(frame) = decoder.decode_planes(&packet.payload)? {
+        let frame = if valid {
+            decoder.decode_planes(&packet.payload)
+        } else {
+            Err(anyhow::anyhow!("missing video checkpoint"))
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!(desktop_id, ?packet.id, %error, "desktop decode recovery");
+                progress.recover(
+                    packet.id.epoch,
+                    packet
+                        .id
+                        .epoch
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("video epoch overflow"))?,
+                );
+                decoder = Decoder::new()?;
+                reference = None;
+                continue;
+            }
+        };
+        if packet.header.kind != FrameKind::State {
+            reference = Some((packet.header.epoch, packet.id.timestamp_us));
+        }
+        if let Some(frame) = frame {
             let mut feedback = progress.feedback.lock().unwrap();
-            // Recovery may have superseded this decode while VP9 was running.
             if !progress.accepts(packet.id) {
                 continue;
             }
-            feedback.decoded = Some(packet.id);
+            feedback.decoded = Some(feedback.decoded.map_or(packet.id, |id| id.max(packet.id)));
             feedback.decode_us = decode_started.elapsed().as_micros() as u64;
             if first {
                 tracing::info!(
@@ -134,6 +271,15 @@ fn decode_packets(
                     "desktop first frame decoded"
                 );
                 first = false;
+            }
+            // Needed checkpoints can be older than a state already displayed.
+            // Decode their reference update, but never regress the image.
+            if images
+                .borrow()
+                .as_ref()
+                .is_some_and(|image| image.id >= packet.id)
+            {
+                continue;
             }
             let planes = Arc::new(frame);
             images.send_replace(Some(Arc::new(Image {
@@ -147,7 +293,6 @@ fn decode_packets(
             })));
         }
     }
-
     Ok(())
 }
 
@@ -155,10 +300,14 @@ fn decode_packets(
 // matches the encoder's 2 Mbps target; complete keyframes calibrate it too.
 struct Delivery {
     bytes_per_second: f64,
+    measured: bool,
 }
 impl Default for Delivery {
     fn default() -> Self {
-        Self { bytes_per_second: 250_000.0 }
+        Self {
+            bytes_per_second: 250_000.0,
+            measured: false,
+        }
     }
 }
 impl Delivery {
@@ -166,30 +315,82 @@ impl Delivery {
         Duration::from_secs_f64(bytes as f64 / self.bytes_per_second)
             + (rtt * 4).max(Duration::from_millis(150))
     }
-    fn observe(&mut self, bytes: usize, elapsed: Duration, rtt: Duration) {
+    fn observe(&mut self, bytes: usize, elapsed: Duration, rtt: Duration) -> Option<u64> {
         // An already buffered frame says nothing about available bandwidth.
         // Tiny deltas are usually application/packet timing, not a bandwidth
         // sample; letting one loss-delayed delta set the rate would inflate
         // the next large frame's deadline arbitrarily.
-        if elapsed < rtt.max(Duration::from_millis(1)) || bytes < 16 * 1024 {
-            return;
+        if elapsed < rtt.max(Duration::from_millis(100)) || bytes < 16 * 1024 {
+            return None;
         }
         let rate = bytes as f64 / elapsed.as_secs_f64();
         // React immediately to a slower path; approach increases gradually.
-        self.bytes_per_second = rate.min(self.bytes_per_second * 0.75 + rate * 0.25);
+        self.bytes_per_second = if self.measured {
+            rate.min(self.bytes_per_second * 0.75 + rate * 0.25)
+        } else {
+            rate
+        };
+        self.measured = true;
+        Some((self.bytes_per_second * 8.0) as u64)
+    }
+}
+
+// Watch streaming progress with an independent cursor, then retain the complete
+// contiguous payload without copying every chunk into a second frame
+// allocation.
+async fn read_payload(
+    frame: &mut moq_net::frame::Consumer,
+    reliable: bool,
+    delivery: &mut Delivery,
+    progress: &Progress,
+    rtt: &impl Fn() -> Duration,
+) -> Result<bytes::Bytes, moq_net::Error> {
+    let mut observer = frame.clone();
+    // Drain pre-existing bytes before starting the bandwidth clock. A buffered
+    // frame and the idle interval before its header are not path measurements.
+    while let Some(chunk) = observer.read_chunk().now_or_never() {
+        if chunk?.is_none() {
+            return frame.read_all().await;
+        }
+    }
+    let mut sample_started = tokio::time::Instant::now();
+    let mut sample_bytes = 0;
+    loop {
+        // Reliable checkpoints recover only on no progress. Disposable states
+        // have no deadline: a final large state must finish unless superseded,
+        // otherwise its unacknowledged bytes could strand source admission.
+        let chunk = if reliable {
+            let until = tokio::time::Instant::now()
+                + delivery
+                    .budget(frame.size, rtt())
+                    .max(Duration::from_secs(3));
+            tokio::time::timeout_at(until, observer.read_chunk())
+                .await
+                .map_err(|_| moq_net::Error::Stream(moq_net::StreamError::DeliveryTimeout))??
+        } else {
+            observer.read_chunk().await?
+        };
+        let Some(chunk) = chunk else {
+            return frame.read_all().await;
+        };
+        sample_bytes += chunk.len();
+        if let Some(bps) = delivery.observe(sample_bytes, sample_started.elapsed(), rtt()) {
+            progress.feedback.lock().unwrap().delivery_bps = bps;
+            sample_bytes = 0;
+            sample_started = tokio::time::Instant::now();
+        }
     }
 }
 
 async fn receive_packets(
     origin: moq_net::origin::Producer,
     packets: mpsc::Sender<Encoded>,
+    states: watch::Sender<Option<Arc<Encoded>>>,
     progress: Arc<Progress>,
-    quality: watch::Sender<Option<Input>>,
     started: Instant,
     desktop_id: u64,
     rtt: impl Fn() -> Duration,
 ) -> Result<()> {
-    let mut delivery = Delivery::default();
     let mut announced = origin.consume().announced();
     loop {
         let update = announced
@@ -200,174 +401,212 @@ async fn receive_packets(
             break;
         }
     }
-    tracing::info!(
-        desktop_id,
-        elapsed_ms = started.elapsed().as_millis(),
-        "desktop video announced"
-    );
     let broadcast = origin.consume().request_broadcast("app").await?;
-    let track = broadcast.track("video")?;
-    let mut subscription = track.subscribe(None).await?.ordered();
+    let mut reliable = broadcast.track("video")?.subscribe(None).await?.ordered();
+    let mut disposable = broadcast.track("states")?.subscribe(None).await?.ordered();
     tracing::info!(
         desktop_id,
         elapsed_ms = started.elapsed().as_millis(),
         "desktop video subscribed"
     );
-    let mut rate = 2_000_000u32;
-    let mut sample = tokio::time::Instant::now();
-    let mut baseline: Option<i128> = None;
-    let clock = tokio::time::Instant::now();
-    let mut first_packet = true;
-
-    let mut next_group = subscription.next_group().await?;
-    let mut ended = false;
-    while let Some(mut group) = next_group.take() {
-        let sequence = group.sequence;
-        let mut first_in_group = true;
-        progress.floor.fetch_max(sequence, Ordering::Release);
-        subscription.update(
-            subscription
-                .subscription()
-                .with_start(moq_net::track::Position::group(sequence)),
-        )?;
-        // Every group begins with a keyframe, which resets references
-        // without destroying the decoder or its reusable frame pool.
-        loop {
-            let keyframe = first_in_group;
+    let checkpoints = async {
+        let mut delivery = Delivery::default();
+        let mut baseline: Option<i128> = None;
+        let clock = tokio::time::Instant::now();
+        let mut next = reliable.next_group().await?;
+        let mut ended = false;
+        while let Some(mut group) = next.take() {
+            let sequence = group.sequence;
+            let epoch = AtomicU64::new(0);
+            let mut base = 0;
+            reliable.update(
+                reliable
+                    .subscription()
+                    .with_start(moq_net::track::Position::group(sequence)),
+            )?;
+            loop {
+                let previous_base = base;
+                let read = async {
+                    let Some(mut frame) = group.next_frame().await? else {
+                        return Ok(None);
+                    };
+                    let timestamp = frame.timestamp.as_micros() as u64;
+                    if previous_base == 0 {
+                        epoch.store(timestamp, Ordering::Release);
+                    }
+                    if frame.size > (rho_desktop_media::MAX_PACKET + Header::SIZE) as u64 {
+                        anyhow::bail!("video packet too large");
+                    }
+                    let payload =
+                        read_payload(&mut frame, true, &mut delivery, &progress, &rtt).await?;
+                    let (header, payload) = Header::unpack(payload)?;
+                    anyhow::ensure!(
+                        if previous_base == 0 {
+                            header.kind == FrameKind::Key && header.epoch == timestamp
+                        } else {
+                            header.kind == FrameKind::Checkpoint
+                                && header.epoch == epoch.load(Ordering::Acquire)
+                                && header.base == previous_base
+                                && timestamp > previous_base
+                        },
+                        "invalid checkpoint chain"
+                    );
+                    let offset = clock.elapsed().as_micros() as i128 - timestamp as i128;
+                    if previous_base == 0 && progress.feedback.lock().unwrap().recover {
+                        baseline = Some(offset);
+                    }
+                    let baseline = baseline.get_or_insert(offset);
+                    *baseline = (*baseline).min(offset);
+                    Ok::<_, anyhow::Error>(Some(Encoded {
+                        header,
+                        id: FrameId {
+                            epoch: header.epoch,
+                            timestamp_us: timestamp,
+                        },
+                        payload,
+                        received_at: Instant::now(),
+                        lag_us: (offset - *baseline) as u64,
+                    }))
+                };
+                tokio::pin!(read);
+                let packet = tokio::select! {
+                    biased;
+                    _ = progress.invalidated(epoch.load(Ordering::Acquire)), if base != 0 => {
+                        recover(&mut reliable, &progress, sequence, epoch.load(Ordering::Acquire))?;
+                        break;
+                    }
+                    newer = reliable.next_group(), if !ended => {
+                        next = newer?;
+                        if next.is_some() { break; }
+                        ended = true;
+                        read.await
+                    }
+                    packet = &mut read => packet,
+                };
+                match packet {
+                    Ok(Some(packet)) => {
+                        if base == 0 {
+                            progress
+                                .floor
+                                .fetch_max(packet.header.epoch, Ordering::Release);
+                        }
+                        if !progress.accepts(packet.id) {
+                            break;
+                        }
+                        base = packet.id.timestamp_us;
+                        progress.received(&packet);
+                        // Backpressure decoding rather than dropping needed
+                        // checkpoints. A fresh root still preempts a full queue.
+                        tokio::select! {
+                            biased;
+                            newer = reliable.next_group(), if !ended => {
+                                next = newer?;
+                                if next.is_some() { break; }
+                                ended = true;
+                                packets.reserve().await?.send(packet);
+                            }
+                            _ = progress.invalidated(packet.id.epoch) => {
+                                recover(&mut reliable, &progress, sequence, packet.id.epoch)?;
+                                break;
+                            }
+                            permit = packets.reserve() => { permit?.send(packet); }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<moq_net::Error>(),
+                            Some(
+                                moq_net::Error::Old
+                                    | moq_net::Error::Stream(moq_net::StreamError::Old)
+                            )
+                        ) =>
+                    {
+                        // Explicit supersession already has a new root on its
+                        // way. Requesting another while it serializes is a storm.
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(desktop_id, sequence, %error, "desktop checkpoint recovery");
+                        recover(
+                            &mut reliable,
+                            &progress,
+                            sequence,
+                            epoch.load(Ordering::Acquire),
+                        )?;
+                        break;
+                    }
+                }
+            }
+            if next.is_none() && !ended {
+                next = reliable.next_group().await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let state_frames = async {
+        let mut delivery = Delivery::default();
+        let mut next = disposable.next_group().await?;
+        let mut ended = false;
+        while let Some(mut group) = next.take() {
             let read = async {
                 let Some(mut frame) = group.next_frame().await? else {
                     return Ok(None);
                 };
-                if frame.size > rho_desktop_media::MAX_PACKET as u64 {
-                    return Err(moq_net::Error::Cancel);
+                if frame.size > (rho_desktop_media::MAX_PACKET + Header::SIZE) as u64 {
+                    anyhow::bail!("state packet too large");
                 }
-                let timestamp = frame.timestamp;
-                // No deadline while waiting for a frame to be captured. Once
-                // its header arrives, allow serialization plus loss recovery.
-                // Newer groups can still preempt this read at any time.
-                let path_rtt = rtt();
-                let budget = delivery.budget(frame.size, path_rtt);
-                let started = tokio::time::Instant::now();
-                let payload = if keyframe {
-                    frame.read_all().await?
-                } else {
-                    tokio::time::timeout(budget, frame.read_all())
-                        .await
-                        .map_err(|_| {
-                            moq_net::Error::Stream(moq_net::StreamError::DeliveryTimeout)
-                        })??
-                };
-                delivery.observe(payload.len(), started.elapsed(), path_rtt);
-                Ok::<_, moq_net::Error>(Some((
-                    moq_net::frame::Frame { timestamp, payload },
-                    budget,
-                )))
+                let timestamp_us = frame.timestamp.as_micros() as u64;
+                let payload =
+                    read_payload(&mut frame, false, &mut delivery, &progress, &rtt).await?;
+                let (header, payload) = Header::unpack(payload)?;
+                anyhow::ensure!(
+                    header.kind == FrameKind::State && timestamp_us > header.base,
+                    "invalid disposable state"
+                );
+                Ok::<_, anyhow::Error>(Some(Encoded {
+                    header,
+                    id: FrameId {
+                        epoch: header.epoch,
+                        timestamp_us,
+                    },
+                    payload,
+                    received_at: Instant::now(),
+                    lag_us: 0,
+                }))
             };
             tokio::pin!(read);
-            let frame = tokio::select! {
+            let packet = tokio::select! {
                 biased;
-                newer = subscription.next_group(), if !ended => {
-                    next_group = newer?;
-                    if next_group.is_some() {
-                        // A new keyframe-led stream supersedes even an
-                        // unfinished frame in the old group.
-                        break;
-                    }
+                newer = disposable.next_group(), if !ended => {
+                    next = newer?;
+                    if next.is_some() { continue; }
                     ended = true;
                     read.await
                 }
-                frame = &mut read => frame,
+                packet = &mut read => packet,
             };
-            match frame {
-                Ok(Some((frame, budget))) => {
-                    if first_packet {
-                        tracing::info!(
-                            desktop_id,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            bytes = frame.payload.len(),
-                            "desktop first packet received"
-                        );
-                        first_packet = false;
-                    }
-                    let offset =
-                        clock.elapsed().as_micros() as i128 - frame.timestamp.as_micros() as i128;
-                    if first_in_group && progress.feedback.lock().unwrap().recover {
-                        // Rebase after a discontinuity; otherwise a changed
-                        // path/CPU baseline would request keyframes forever.
-                        baseline = Some(offset);
-                    }
-                    let base = baseline.get_or_insert(offset);
-                    *base = (*base).min(offset);
-                    let lag = offset - *base;
-                    if sample.elapsed() >= Duration::from_secs(1) {
-                        let congested = lag > budget.as_micros() as i128;
-                        rate = if congested {
-                            rate * 3 / 4
-                        } else {
-                            rate + rate / 20
-                        };
-                        rate = rate.clamp(128_000, 4_000_000);
-                        quality.send_replace(Some(Input::Quality {
-                            bitrate: rate,
-                            keyframe: false,
-                        }));
-                        sample = tokio::time::Instant::now();
-                    }
-                    let id = FrameId {
-                        group: sequence,
-                        timestamp_us: frame.timestamp.as_micros() as u64,
-                    };
-                    {
-                        let mut feedback = progress.feedback.lock().unwrap();
-                        feedback.received = Some(id);
-                        if first_in_group {
-                            feedback.recover = false;
-                        }
-                        feedback.lag_us = lag as u64;
-                    }
-                    // A fully delivered frame is useful even after a slow
-                    // transfer. Age alone must not discard the final static
-                    // refinement; newer groups already supersede old work.
-                    if packets
-                            .try_send(Encoded {
-                                id,
-                                payload: frame.payload,
-                                received_at: Instant::now(),
-                                lag_us: lag as u64,
-                            })
-                            .is_err()
-                    {
-                        recover(&mut subscription, &progress, sequence)?;
-                        break;
-                    }
-                    first_in_group = false;
-                }
-                Ok(None) => break,
-                Err(error)
-                    if matches!(
-                        error,
-                        moq_net::Error::Old
-                            | moq_net::Error::Evicted
-                            | moq_net::Error::Lagged
-                            | moq_net::Error::Stream(
-                                moq_net::StreamError::Old
-                                    | moq_net::StreamError::Evicted
-                                    | moq_net::StreamError::TooFarBehind
-                                    | moq_net::StreamError::DeliveryTimeout
-                            )
-                    ) =>
+            if let Ok(Some(packet)) = packet {
+                if progress.accepts(packet.id)
+                    && states
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|old| packet.id > old.id)
                 {
-                    recover(&mut subscription, &progress, sequence)?;
-                    break;
+                    progress.received(&packet);
+                    states.send_replace(Some(Arc::new(packet)));
                 }
-                Err(error) => return Err(error.into()),
-            };
+            }
+            // Cancellation/expiry of an optional state is normal. It never
+            // invalidates the reliable reference or requests another root key.
+            if next.is_none() && !ended {
+                next = disposable.next_group().await?;
+            }
         }
-        if next_group.is_none() && !ended {
-            next_group = subscription.next_group().await?;
-        }
-    }
-    Ok::<(), anyhow::Error>(())
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(checkpoints, state_frames)?;
+    Ok(())
 }
 
 pub struct Viewer {
@@ -467,29 +706,34 @@ async fn subscribe(
     let (errors, error_receive) = watch::channel(None);
     let (input, mut commands) = mpsc::channel(256);
     let progress = Arc::new(Progress::default());
-    let (quality, mut quality_updates) = watch::channel(None);
     let (motion, mut movement) = watch::channel(None);
     let (packets, decode) = mpsc::channel::<Encoded>(2);
+    let (states, state_decode) = watch::channel(None);
     let decoded = images.clone();
     let decoding = progress.clone();
     // Decode off the UI and Tokio IO workers; the renderer samples the
     // retained YUV planes.
     let decode_task = tokio::task::spawn_blocking(move || -> Result<()> {
-        decode_packets(decode, decoded, decoding, started, desktop_id)
+        decode_packets(decode, state_decode, decoded, decoding, started, desktop_id)
     });
     let task = tokio::spawn(async move {
-        let receive = receive_packets(
-            origin,
-            packets,
-            progress.clone(),
-            quality,
-            started,
-            desktop_id,
-            || connection.paths().iter()
+        let path_rtt = || {
+            connection
+                .paths()
+                .iter()
                 .filter(|path| path.is_selected())
                 .map(|path| path.rtt())
                 .max()
-                .unwrap_or(Duration::from_millis(100)),
+                .unwrap_or(Duration::from_millis(100))
+        };
+        let receive = receive_packets(
+            origin,
+            packets,
+            states,
+            progress.clone(),
+            started,
+            desktop_id,
+            path_rtt,
         );
         let control = async {
             let mut ticks = tokio::time::interval(Duration::from_millis(100));
@@ -503,12 +747,7 @@ async fn subscribe(
                         let Some((x,y))=*movement.borrow_and_update() else {continue};
                         Input::Move{x,y}
                     },
-                    changed=quality_updates.changed()=> {
-                        changed?;
-                        let Some(input)=quality_updates.borrow_and_update().clone() else {continue};
-                        input
-                    },
-                    _=ticks.tick()=> Input::Feedback(progress.report()),
+                    _=ticks.tick()=> Input::Feedback(progress.report(path_rtt())),
                 };
                 rho_rpc::write_frame(&mut writer, &input, 64 * 1024).await?;
             }
@@ -544,150 +783,164 @@ async fn subscribe(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use rho_desktop_media::codec::Encoder;
+
     use super::*;
 
-    fn id(group: u64, timestamp_us: u64) -> FrameId {
+    fn id(epoch: u64, timestamp_us: u64) -> FrameId {
         FrameId {
-            group,
+            epoch,
             timestamp_us,
         }
+    }
+    fn packet(kind: FrameKind, epoch: u64, base: u64, timestamp: u64, payload: Bytes) -> Encoded {
+        Encoded {
+            header: Header { kind, epoch, base },
+            id: id(epoch, timestamp),
+            payload,
+            received_at: Instant::now(),
+            lag_us: 0,
+        }
+    }
+    fn tracks(
+        broadcast: &moq_net::broadcast::Producer,
+    ) -> Result<(moq_net::track::Producer, moq_net::track::Producer)> {
+        let info = moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO);
+        Ok((
+            broadcast.create_track("video", Some(info.clone()))?,
+            broadcast.create_track("states", Some(info))?,
+        ))
+    }
+    fn write(group: &mut moq_net::group::Producer, packet: Encoded) -> Result<()> {
+        group.write_frame(
+            moq_net::Timestamp::from_micros(packet.id.timestamp_us)?,
+            packet.header.pack(packet.payload),
+        )?;
+        Ok(())
+    }
+    fn receive(
+        origin: moq_net::origin::Producer,
+        progress: Arc<Progress>,
+        capacity: usize,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        mpsc::Receiver<Encoded>,
+        watch::Receiver<Option<Arc<Encoded>>>,
+    ) {
+        let (packets, decode) = mpsc::channel(capacity);
+        let (states, state_decode) = watch::channel(None);
+        let task = tokio::spawn(receive_packets(
+            origin,
+            packets,
+            states,
+            progress,
+            Instant::now(),
+            0,
+            || Duration::from_millis(200),
+        ));
+        (task, decode, state_decode)
+    }
+    fn vp9(encoder: &mut Encoder, kind: FrameKind, color: [u8; 4]) -> Result<Bytes> {
+        let encoded = encoder.encode(&color.repeat(48 * 24), kind)?.remove(0);
+        assert_eq!(encoded.kind, kind);
+        Ok(encoded.data.into())
+    }
+    async fn image_at(
+        images: &mut watch::Receiver<Option<Arc<Image>>>,
+        timestamp: u64,
+    ) -> Result<Arc<Image>> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(image) = images.borrow_and_update().clone() {
+                    if image.id.timestamp_us == timestamp {
+                        return Ok(image);
+                    }
+                }
+                images.changed().await?;
+            }
+        })
+        .await?
     }
 
     #[test]
     fn delivery_budget_uses_size_rtt_and_unbuffered_goodput() {
         let mut delivery = Delivery::default();
-        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_millis(2400));
-        assert_eq!(delivery.budget(100_000, Duration::from_millis(400)), Duration::from_secs(2));
+        assert_eq!(
+            delivery.budget(400_000, Duration::from_millis(200)),
+            Duration::from_millis(2400)
+        );
+        assert_eq!(
+            delivery.budget(100_000, Duration::from_millis(400)),
+            Duration::from_secs(2)
+        );
         delivery.observe(250_000, Duration::from_secs(2), Duration::from_millis(200));
-        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_secs(4));
+        assert_eq!(
+            delivery.budget(400_000, Duration::from_millis(200)),
+            Duration::from_secs(4)
+        );
         delivery.observe(2_000_000, Duration::ZERO, Duration::from_millis(200));
         delivery.observe(100, Duration::from_secs(2), Duration::from_millis(200));
-        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_secs(4));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn slow_refinement_and_rtt_delayed_frame_arrive_before_stall_recovery() -> Result<()> {
-        let origin = rho_desktop_media::media::origin();
-        let broadcast = origin.create_broadcast("app")?;
-        broadcast.announce(Default::default())?;
-        let track = broadcast.create_track(
-            "video",
-            Some(moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO)),
-        )?;
-        let receiving_origin = rho_desktop_media::media::origin();
-        let (sender, receiver) = tokio::io::duplex(64 * 1024);
-        let (_publisher, _subscriber) = tokio::try_join!(
-            rho_desktop_media::media::local_server(sender, &origin),
-            rho_desktop_media::media::local_client(receiver, receiving_origin.clone()),
-        )?;
-        let (packets, mut received) = mpsc::channel(2);
-        let (quality, quality_updates) = watch::channel(None);
-        let progress = Arc::new(Progress::default());
-        let rtt = Arc::new(AtomicU64::new(200));
-        let path = rtt.clone();
-        let receiving = tokio::spawn(receive_packets(
-            receiving_origin, packets, progress.clone(), quality, Instant::now(), 0,
-            move || Duration::from_millis(path.load(Ordering::Relaxed)),
-        ));
-        track.used().await?;
-        let mut group = track.append_group()?;
-        group.write_frame(
-            moq_net::Timestamp::from_micros(10)?,
-            bytes::Bytes::from_static(b"key"),
-        )?;
-        assert_eq!(tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap().payload.as_ref(), b"key");
-        // A 400 KB refinement at 2 Mbps takes 1.6s, even without loss.
-        let mut refinement = group.create_frame(moq_net::frame::Info {
-            timestamp: moq_net::Timestamp::from_micros(20)?,
-            size: 400_000,
-        })?;
-        tokio::task::yield_now().await;
-        for _ in 0..16 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            refinement.write(bytes::Bytes::from(vec![37; 25_000]))?;
-        }
-        refinement.finish()?;
-        let packet = tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap();
-        assert_eq!(packet.id, id(group.sequence, 20));
-        assert_eq!(packet.payload.as_ref(), vec![37; 400_000]);
-        // An expected long serialization is not itself congestion.
-        assert_eq!(*quality_updates.borrow(), Some(Input::Quality {
-            bitrate: 2_100_000, keyframe: false,
-        }));
-        assert!(!progress.feedback.lock().unwrap().recover);
-
-        // A changed route has a longer RTT. A loss-delayed tiny frame is
-        // allowed to arrive; it must not poison the bandwidth estimate.
-        rtt.store(400, Ordering::Relaxed);
-        let mut delayed = group.create_frame(moq_net::frame::Info {
-            timestamp: moq_net::Timestamp::from_micros(30)?,
-            size: 100,
-        })?;
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        delayed.write(bytes::Bytes::from(vec![91; 100]))?;
-        delayed.finish()?;
-        assert_eq!(tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap().payload.as_ref(), vec![91; 100]);
-
-        // After completion, a static screen never times out.
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        assert!(!progress.feedback.lock().unwrap().recover);
-        // But a started frame that stops delivering still recovers, using
-        // this path's current 4-RTT allowance rather than the old 150ms.
-        let _stalled = group.create_frame(moq_net::frame::Info {
-            timestamp: moq_net::Timestamp::from_micros(40)?,
-            size: 100,
-        })?;
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1550)).await;
-        assert!(!progress.feedback.lock().unwrap().recover);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tokio::task::yield_now().await;
-        assert!(progress.feedback.lock().unwrap().recover);
-        receiving.abort();
-        Ok(())
+        assert_eq!(
+            delivery.budget(400_000, Duration::from_millis(200)),
+            Duration::from_secs(4)
+        );
     }
 
     #[test]
-    fn slow_recovery_requests_one_keyframe_not_one_per_report() {
+    fn future_state_receipt_cannot_acknowledge_missing_checkpoints() {
         let progress = Progress::default();
-        assert!(!progress.report().recover);
-        progress.recover(5);
-        assert!(progress.report().recover);
-        // Three seconds of feedback while the requested keyframe is in flight.
-        // Group announcements alone do not mean that it arrived or failed.
-        progress.floor.fetch_max(6, Ordering::Release);
-        progress.presented(id(6, 900), 220_000);
-        for _ in 0..30 {
-            let report = progress.report();
-            assert!(!report.recover);
-            assert_eq!(report.presented, Some(id(6, 900)));
-            assert_eq!(report.lag_us, 220_000);
-        }
-        // Keep recovery state until reception, for the lag rebase. Reporting
-        // must consume only the request, not pretend reception succeeded.
-        assert!(progress.feedback.lock().unwrap().recover);
-        progress.feedback.lock().unwrap().recover = false;
-        // A subsequent failure still requests a new keyframe even if no
-        // periodic report observed the intervening successful reception.
-        progress.recover(7);
-        assert!(progress.report().recover);
-        assert!(!progress.report().recover);
-        // If a periodic keyframe beats the next report, no request is needed.
-        progress.recover(8);
-        progress.feedback.lock().unwrap().recover = false;
-        assert!(!progress.report().recover);
-        progress.recover(9);
-        assert!(progress.report().recover);
+        progress.received(&packet(FrameKind::Key, 10, 0, 10, Bytes::new()));
+        progress.received(&packet(FrameKind::State, 10, 30, 40, Bytes::new()));
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 10)));
+        progress.received(&packet(FrameKind::Checkpoint, 10, 10, 20, Bytes::new()));
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 20)));
+        progress.received(&packet(FrameKind::Checkpoint, 10, 20, 30, Bytes::new()));
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 40)));
+        // Late old-base states cannot regress or falsely advance the frontier.
+        progress.received(&packet(FrameKind::State, 10, 10, 50, Bytes::new()));
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 40)));
+        progress.received(&packet(FrameKind::Key, 60, 0, 60, Bytes::new()));
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(60, 60)));
     }
 
     #[test]
-    fn recovery_invalidates_decode_and_late_presentation_by_group() {
+    fn recovery_reports_repeat_identity_until_a_new_root_arrives() {
+        let progress = Progress::default();
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 0);
+        progress.recover(4, 5);
+        for _ in 0..30 {
+            let report = progress.report(Duration::from_millis(200));
+            assert!(report.recover);
+            assert_eq!(report.recovery_id, 1);
+            assert_eq!(report.rtt_us, 200_000);
+        }
+        // Another observer of the same failed chain is not a new failure.
+        progress.recover(4, 9);
+        progress.recover(3, 4);
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 1);
+        // Reception, not group announcement or feedback reporting, clears it.
+        progress.floor.fetch_max(6, Ordering::Release);
+        assert!(progress.report(Duration::ZERO).recover);
+        progress.feedback.lock().unwrap().recover = false;
+        assert!(!progress.report(Duration::ZERO).recover);
+        progress.recover(6, 7);
+        let report = progress.report(Duration::from_millis(400));
+        assert!(report.recover);
+        assert_eq!(report.recovery_id, 2);
+        assert_eq!(report.rtt_us, 400_000);
+        // A failed replacement is distinct even while recovery is pending.
+        progress.recover(7, 8);
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 3);
+    }
+
+    #[test]
+    fn recovery_invalidates_decode_and_late_presentation_by_epoch() {
         let progress = Progress::default();
         progress.presented(id(3, 100), 15);
-        progress.recover(5);
+        progress.recover(4, 5);
         // A stale callback and an older recovery request cannot undo the floor.
-        progress.recover(4);
+        progress.recover(3, 4);
         progress.presented(id(4, 300), 900);
         assert!(!progress.accepts(id(4, 999)));
         assert!(progress.accepts(id(5, 301)));
@@ -703,65 +956,145 @@ mod tests {
         assert!(feedback.recover);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn arriving_checkpoints_outlive_initial_budget_and_report_in_flight_delivery()
+    -> Result<()> {
+        let origin = rho_desktop_media::media::origin();
+        let broadcast = origin.create_broadcast("app")?;
+        let (track, _states) = tracks(&broadcast)?;
+        broadcast.announce(Default::default())?;
+        let remote = rho_desktop_media::media::origin();
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (_publisher, _subscriber) = tokio::try_join!(
+            rho_desktop_media::media::local_server(server, &origin),
+            rho_desktop_media::media::local_client(client, remote.clone())
+        )?;
+        let progress = Arc::new(Progress::default());
+        let (receiving, mut received, _states) = receive(remote, progress.clone(), 2);
+        track.used().await?;
+        let mut group = track.append_group()?;
+        write(
+            &mut group,
+            packet(FrameKind::Key, 10, 0, 10, Bytes::from(vec![7; 100_000])),
+        )?;
+        assert_eq!(received.recv().await.unwrap().id, id(10, 10));
+        assert_eq!(progress.report(Duration::from_millis(200)).delivery_bps, 0);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut frame = group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(20)?,
+            size: 400_000 + Header::SIZE as u64,
+        })?;
+        // The buffered prefix and ten seconds of source idle are not goodput.
+        let header = Header {
+            kind: FrameKind::Checkpoint,
+            epoch: 10,
+            base: 10,
+        };
+        frame.write(header.pack(Bytes::from(vec![9; 40_000])))?;
+        tokio::task::yield_now().await;
+        for chunk in 0..8 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            frame.write(Bytes::from(vec![chunk; 45_000]))?;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let report = progress.report(Duration::from_millis(200));
+            assert!(!report.recover);
+            assert!(
+                (350_000..=370_000).contains(&report.delivery_bps),
+                "{report:?}"
+            );
+            if chunk < 7 {
+                assert_eq!(report.received, Some(id(10, 10)));
+            }
+        }
+        frame.finish()?;
+        let checkpoint = received.recv().await.unwrap();
+        assert_eq!(checkpoint.id, id(10, 20));
+        let expected: Vec<_> = vec![9; 40_000]
+            .into_iter()
+            .chain((0..8).flat_map(|chunk| vec![chunk; 45_000]))
+            .collect();
+        assert_eq!(checkpoint.payload.as_ref(), expected);
+        // Idle capture never times out, but a started checkpoint with no
+        // delivery has the same no-progress watchdog as its root key.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!progress.report(Duration::ZERO).recover);
+        let _stalled = group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(30)?,
+            size: 100,
+        })?;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2900)).await;
+        assert!(!progress.report(Duration::ZERO).recover);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(progress.report(Duration::ZERO).recover);
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 1);
+        assert_eq!(progress.floor.load(Ordering::Acquire), 11);
+        // A distinct stalled replacement creates a new request even while
+        // the previous recover flag is still set.
+        let mut replacement = track.append_group()?;
+        let _also_stalled = replacement.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(40)?,
+            size: 800_000,
+        })?;
+        tokio::task::yield_now().await;
+        // The replacement inherits the measured 45KB/s path, so its
+        // 800KB serialization + 4 RTTs is about 18.58s, not the old 4s.
+        tokio::time::sleep(Duration::from_secs(18)).await;
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 2);
+        receiving.abort();
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn newer_group_preempts_unfinished_old_frame() -> Result<()> {
+    async fn newer_root_preempts_unfinished_old_checkpoint() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(2), async {
             let origin = rho_desktop_media::media::origin();
             let broadcast = origin.create_broadcast("app")?;
+            let (track, _states) = tracks(&broadcast)?;
             broadcast.announce(Default::default())?;
-            let track = broadcast.create_track(
-                "video",
-                Some(moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO)),
-            )?;
-            let (packets, mut received) = mpsc::channel(2);
-            let (quality, _) = watch::channel(None);
             let progress = Arc::new(Progress::default());
-            let receiving = tokio::spawn(receive_packets(
-                origin,
-                packets,
-                progress.clone(),
-                quality,
-                Instant::now(),
-                0,
-                || Duration::from_millis(10),
-            ));
+            let (receiving, mut received, _) = receive(origin, progress.clone(), 2);
             track.used().await?;
             let mut old = track.append_group()?;
-            old.write_frame(
-                moq_net::Timestamp::from_micros(10)?,
-                bytes::Bytes::from_static(b"old key"),
+            write(
+                &mut old,
+                packet(FrameKind::Key, 10, 0, 10, Bytes::from_static(b"old")),
             )?;
-            assert_eq!(received.recv().await.unwrap().id, id(old.sequence, 10));
-            let old_sequence = old.sequence;
+            assert_eq!(received.recv().await.unwrap().id, id(10, 10));
             let mut partial = old.create_frame(moq_net::frame::Info {
                 timestamp: moq_net::Timestamp::from_micros(20)?,
                 size: 100,
             })?;
-            partial.write(bytes::Bytes::from_static(b"unfinished"))?;
-            let mut new = track.append_group()?;
-            new.write_frame(
-                moq_net::Timestamp::from_micros(30)?,
-                bytes::Bytes::from_static(b"new key"),
+            partial.write(
+                Header {
+                    kind: FrameKind::Checkpoint,
+                    epoch: 10,
+                    base: 10,
+                }
+                .pack(Bytes::from_static(b"unfinished")),
             )?;
-            let packet = received.recv().await.unwrap();
-            assert_eq!(packet.id, id(new.sequence, 30));
-            assert_eq!(packet.payload.as_ref(), b"new key");
-            assert!(!progress.accepts(id(old_sequence, 10)));
+            let mut fresh = track.append_group()?;
+            write(
+                &mut fresh,
+                packet(FrameKind::Key, 30, 0, 30, Bytes::from_static(b"fresh")),
+            )?;
+            assert_eq!(received.recv().await.unwrap().id, id(30, 30));
+            assert!(!progress.accepts(id(10, 20)));
             assert_eq!(
                 track.subscription().unwrap().start.unwrap().group,
-                new.sequence
+                fresh.sequence
             );
-            // An idle group is not a stalled frame.
-            tokio::time::sleep(Duration::from_millis(180)).await;
-            assert!(!progress.feedback.lock().unwrap().recover);
-            let _stalled = new.create_frame(moq_net::frame::Info {
-                timestamp: moq_net::Timestamp::from_micros(40)?,
-                size: 100,
-            })?;
-            while !progress.feedback.lock().unwrap().recover {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(progress.floor.load(Ordering::Acquire), packet.id.group + 1);
+            assert!(!progress.report(Duration::ZERO).recover);
             receiving.abort();
             Ok::<_, anyhow::Error>(())
         })
@@ -769,97 +1102,443 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_decoder_queue_abandons_dependencies_until_next_keyframe() -> Result<()> {
+    async fn full_decoder_queue_backpressures_without_dropping_checkpoints() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(2), async {
             let origin = rho_desktop_media::media::origin();
             let broadcast = origin.create_broadcast("app")?;
+            let (track, _states) = tracks(&broadcast)?;
             broadcast.announce(Default::default())?;
-            let track = broadcast.create_track(
-                "video",
-                Some(moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO)),
-            )?;
-            let (packets, mut received) = mpsc::channel(1);
-            let (quality, _) = watch::channel(None);
             let progress = Arc::new(Progress::default());
+            let (receiving, mut received, _) = receive(origin, progress.clone(), 1);
+            track.used().await?;
+            let mut group = track.append_group()?;
+            write(
+                &mut group,
+                packet(FrameKind::Key, 10, 0, 10, Bytes::from_static(b"key")),
+            )?;
+            write(
+                &mut group,
+                packet(
+                    FrameKind::Checkpoint,
+                    10,
+                    10,
+                    20,
+                    Bytes::from_static(b"first"),
+                ),
+            )?;
+            write(
+                &mut group,
+                packet(
+                    FrameKind::Checkpoint,
+                    10,
+                    20,
+                    30,
+                    Bytes::from_static(b"second"),
+                ),
+            )?;
+            while progress.report(Duration::ZERO).received != Some(id(10, 20)) {
+                tokio::task::yield_now().await;
+            }
+            assert!(!progress.report(Duration::ZERO).recover);
+            for timestamp in [10, 20, 30] {
+                assert_eq!(received.recv().await.unwrap().id, id(10, timestamp));
+            }
+            assert!(!progress.report(Duration::ZERO).recover);
+            receiving.abort();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_state_is_replaced_but_slow_final_state_finishes_without_recovery()
+    -> Result<()> {
+        let origin = rho_desktop_media::media::origin();
+        let broadcast = origin.create_broadcast("app")?;
+        let (track, states) = tracks(&broadcast)?;
+        broadcast.announce(Default::default())?;
+        let progress = Arc::new(Progress::default());
+        let remote = rho_desktop_media::media::origin();
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (_publisher, _subscriber) = tokio::try_join!(
+            rho_desktop_media::media::local_server(server, &origin),
+            rho_desktop_media::media::local_client(client, remote.clone())
+        )?;
+        let (receiving, mut received, mut latest) = receive(remote, progress.clone(), 2);
+        track.used().await?;
+        let mut reliable = track.append_group()?;
+        write(
+            &mut reliable,
+            packet(FrameKind::Key, 10, 0, 10, Bytes::from_static(b"key")),
+        )?;
+        received.recv().await.unwrap();
+        let mut old = states.append_group()?;
+        let mut partial = old.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(20)?,
+            size: 100,
+        })?;
+        partial.write(
+            Header {
+                kind: FrameKind::State,
+                epoch: 10,
+                base: 10,
+            }
+            .pack(Bytes::from_static(b"partial")),
+        )?;
+        tokio::task::yield_now().await;
+        partial.abort(moq_net::Error::Old)?;
+        let mut fresh = states.append_group()?;
+        write(
+            &mut fresh,
+            packet(FrameKind::State, 10, 10, 30, Bytes::from_static(b"fresh")),
+        )?;
+        latest.changed().await?;
+        assert_eq!(latest.borrow_and_update().as_ref().unwrap().id, id(10, 30));
+        let mut final_group = states.append_group()?;
+        let mut final_state = final_group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(50)?,
+            size: 400_000 + Header::SIZE as u64,
+        })?;
+        final_state.write(
+            Header {
+                kind: FrameKind::State,
+                epoch: 10,
+                base: 10,
+            }
+            .pack(Bytes::from(vec![9; 40_000])),
+        )?;
+        tokio::task::yield_now().await;
+        // Eight seconds is far beyond the initial 2.4s estimate. No newer
+        // group exists: silently timing this out would strand sender debt.
+        for chunk in 0..8 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            final_state.write(Bytes::from(vec![chunk; 45_000]))?;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(progress.report(Duration::ZERO).recovery_id, 0);
+            if chunk < 7 {
+                assert_eq!(latest.borrow().as_ref().unwrap().id, id(10, 30));
+                assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 30)));
+            }
+        }
+        final_state.finish()?;
+        latest.changed().await?;
+        let newest = latest.borrow().clone().unwrap();
+        assert_eq!(newest.id, id(10, 50));
+        let expected: Vec<_> = vec![9; 40_000]
+            .into_iter()
+            .chain((0..8).flat_map(|chunk| vec![chunk; 45_000]))
+            .collect();
+        assert_eq!(newest.payload.as_ref(), expected);
+        assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 50)));
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 0);
+        receiving.abort();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicitly_superseded_root_waits_for_slow_replacement_without_recovery_storm()
+    -> Result<()> {
+        let origin = rho_desktop_media::media::origin();
+        let broadcast = origin.create_broadcast("app")?;
+        let (track, _states) = tracks(&broadcast)?;
+        broadcast.announce(Default::default())?;
+        let remote = rho_desktop_media::media::origin();
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (_publisher, _subscriber) = tokio::try_join!(
+            rho_desktop_media::media::local_server(server, &origin),
+            rho_desktop_media::media::local_client(client, remote.clone())
+        )?;
+        let progress = Arc::new(Progress::default());
+        let (receiving, mut received, _) = receive(remote, progress.clone(), 2);
+        track.used().await?;
+        let mut old = track.append_group()?;
+        write(
+            &mut old,
+            packet(FrameKind::Key, 10, 0, 10, Bytes::from_static(b"old root")),
+        )?;
+        assert_eq!(received.recv().await.unwrap().id, id(10, 10));
+        old.abort(moq_net::Error::Old)?;
+        // Let Old arrive before announcing the replacement, to exercise the
+        // error path rather than only next_group's preemption branch.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(progress.report(Duration::ZERO).recovery_id, 0);
+        let mut fresh = track.append_group()?;
+        let mut frame = fresh.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(30)?,
+            size: 50_000 + Header::SIZE as u64,
+        })?;
+        frame.write(
+            Header {
+                kind: FrameKind::Key,
+                epoch: 30,
+                base: 0,
+            }
+            .pack(Bytes::new()),
+        )?;
+        for index in 0..5 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            frame.write(Bytes::from(vec![index + 1; 10_000]))?;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(progress.report(Duration::ZERO).recovery_id, 0);
+            assert!(!progress.report(Duration::ZERO).recover);
+        }
+        frame.finish()?;
+        let root = received.recv().await.unwrap();
+        assert_eq!(root.id, id(30, 30));
+        assert_eq!(
+            root.payload.as_ref(),
+            (1..=5).flat_map(|n| vec![n; 10_000]).collect::<Vec<_>>()
+        );
+        receiving.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decoder_retains_only_newest_future_state_and_decodes_every_checkpoint() -> Result<()> {
+        let mut encoder = Encoder::new(48, 24, 500_000)?;
+        let root = vp9(&mut encoder, FrameKind::Key, [37, 91, 203, 255])?;
+        let checkpoint1 = vp9(&mut encoder, FrameKind::Checkpoint, [150, 19, 71, 255])?;
+        let checkpoint2 = vp9(&mut encoder, FrameKind::Checkpoint, [7, 173, 44, 255])?;
+        let state = vp9(&mut encoder, FrameKind::State, [89, 13, 241, 255])?;
+        let mut expected = Decoder::new()?;
+        expected.decode_planes(&root)?;
+        expected.decode_planes(&checkpoint1)?;
+        expected.decode_planes(&checkpoint2)?;
+        let expected =
+            rho_desktop_media::codec::export_bgra(&expected.decode_planes(&state)?.unwrap())?.bgra;
+        let progress = Arc::new(Progress::default());
+        let (packets, decode) = mpsc::channel(2);
+        let (states, state_decode) = watch::channel(None);
+        let (images, mut received) = watch::channel(None);
+        let decoding = progress.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            decode_packets(decode, state_decode, images, decoding, Instant::now(), 0)
+        });
+        packets
+            .send(packet(FrameKind::Key, 100, 0, 100, root))
+            .await?;
+        image_at(&mut received, 100).await?;
+        // Invalid VP9 in a superseded future state must never reach libvpx.
+        states.send_replace(Some(Arc::new(packet(
+            FrameKind::State,
+            100,
+            300,
+            310,
+            Bytes::from_static(b"invalid superseded VP9"),
+        ))));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(received.borrow().as_ref().unwrap().id, id(100, 100));
+        assert!(!progress.report(Duration::ZERO).recover);
+        states.send_replace(Some(Arc::new(packet(
+            FrameKind::State,
+            100,
+            300,
+            320,
+            state,
+        ))));
+        packets
+            .send(packet(FrameKind::Checkpoint, 100, 100, 200, checkpoint1))
+            .await?;
+        packets
+            .send(packet(FrameKind::Checkpoint, 100, 200, 300, checkpoint2))
+            .await?;
+        let newest = image_at(&mut received, 320).await?;
+        assert_eq!(newest.export_bgra()?, expected);
+        assert_eq!(progress.report(Duration::ZERO).decoded, Some(id(100, 320)));
+        assert!(!progress.report(Duration::ZERO).recover);
+        // An old-base state is discarded, not decoded and not recovery-worthy.
+        states.send_replace(Some(Arc::new(packet(
+            FrameKind::State,
+            100,
+            100,
+            350,
+            Bytes::from_static(b"invalid obsolete VP9"),
+        ))));
+        drop(states);
+        drop(packets);
+        worker.await??;
+        assert!(!progress.report(Duration::ZERO).recover);
+        assert_eq!(received.borrow().as_ref().unwrap().id, id(100, 320));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn needed_checkpoint_decodes_without_regressing_newer_state_presentation() -> Result<()> {
+        let mut encoder = Encoder::new(48, 24, 500_000)?;
+        let root = vp9(&mut encoder, FrameKind::Key, [13, 77, 199, 255])?;
+        let state1 = vp9(&mut encoder, FrameKind::State, [179, 15, 38, 255])?;
+        let checkpoint = vp9(&mut encoder, FrameKind::Checkpoint, [67, 211, 92, 255])?;
+        let state2 = vp9(&mut encoder, FrameKind::State, [99, 35, 230, 255])?;
+        let mut expected = Decoder::new()?;
+        expected.decode_planes(&root)?;
+        expected.decode_planes(&checkpoint)?;
+        let expected =
+            rho_desktop_media::codec::export_bgra(&expected.decode_planes(&state2)?.unwrap())?.bgra;
+        let progress = Arc::new(Progress::default());
+        let (packets, decode) = mpsc::channel(2);
+        let (states, state_decode) = watch::channel(None);
+        let (images, mut received) = watch::channel(None);
+        let decoding = progress.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            decode_packets(decode, state_decode, images, decoding, Instant::now(), 0)
+        });
+        packets
+            .send(packet(FrameKind::Key, 100, 0, 100, root))
+            .await?;
+        image_at(&mut received, 100).await?;
+        states.send_replace(Some(Arc::new(packet(
+            FrameKind::State,
+            100,
+            100,
+            300,
+            state1,
+        ))));
+        let older = image_at(&mut received, 300).await?;
+        older.presented();
+        packets
+            .send(packet(FrameKind::Checkpoint, 100, 100, 200, checkpoint))
+            .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.changed())
+                .await
+                .is_err()
+        );
+        assert_eq!(received.borrow().as_ref().unwrap().id, id(100, 300));
+        states.send_replace(Some(Arc::new(packet(
+            FrameKind::State,
+            100,
+            200,
+            400,
+            state2,
+        ))));
+        let newest = image_at(&mut received, 400).await?;
+        assert_eq!(newest.export_bgra()?, expected);
+        newest.presented();
+        older.presented();
+        assert_eq!(
+            progress.report(Duration::ZERO).presented,
+            Some(id(100, 400))
+        );
+        drop(packets);
+        drop(states);
+        worker.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decoder_failure_cancels_idle_epoch_and_resumes_at_next_root() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let origin = rho_desktop_media::media::origin();
+            let broadcast = origin.create_broadcast("app")?;
+            let (track, _states) = tracks(&broadcast)?;
+            broadcast.announce(Default::default())?;
+            let progress = Arc::new(Progress::default());
+            let (packets, decode) = mpsc::channel(2);
+            let (states, state_decode) = watch::channel(None);
+            let (images, mut received) = watch::channel(None);
+            let decoding = progress.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                decode_packets(decode, state_decode, images, decoding, Instant::now(), 0)
+            });
             let receiving = tokio::spawn(receive_packets(
                 origin,
                 packets,
+                states,
                 progress.clone(),
-                quality,
                 Instant::now(),
                 0,
                 || Duration::from_millis(10),
             ));
             track.used().await?;
-            let mut old = track.append_group()?;
-            for timestamp in [10, 20] {
-                old.write_frame(
-                    moq_net::Timestamp::from_micros(timestamp)?,
-                    bytes::Bytes::from_static(b"old"),
-                )?;
-            }
-            while !progress.feedback.lock().unwrap().recover {
+            let mut failed = track.append_group()?;
+            write(
+                &mut failed,
+                packet(
+                    FrameKind::Key,
+                    10,
+                    0,
+                    10,
+                    Bytes::from_static(b"invalid VP9"),
+                ),
+            )?;
+            while track
+                .subscription()
+                .and_then(|subscription| subscription.start)
+                .is_none_or(|position| position.group <= failed.sequence)
+            {
                 tokio::task::yield_now().await;
             }
-            assert_eq!(progress.floor.load(Ordering::Acquire), old.sequence + 1);
-            let queued = received.recv().await.unwrap();
-            assert!(!progress.accepts(queued.id));
-            old.write_frame(
-                moq_net::Timestamp::from_micros(25)?,
-                bytes::Bytes::from_static(b"undecodable delta"),
+            assert_eq!(progress.report(Duration::ZERO).recovery_id, 1);
+            assert_eq!(progress.report(Duration::ZERO).received, Some(id(10, 10)));
+            write(
+                &mut failed,
+                packet(
+                    FrameKind::Checkpoint,
+                    10,
+                    10,
+                    20,
+                    Bytes::from_static(b"invalid abandoned VP9"),
+                ),
             )?;
-            let mut new = track.append_group()?;
-            new.write_frame(
-                moq_net::Timestamp::from_micros(30)?,
-                bytes::Bytes::from_static(b"recovery key"),
-            )?;
-            let packet = received.recv().await.unwrap();
-            assert_eq!(packet.id, id(new.sequence, 30));
-            assert_eq!(packet.payload.as_ref(), b"recovery key");
-            assert!(!progress.feedback.lock().unwrap().recover);
+            let mut encoder = Encoder::new(48, 24, 500_000)?;
+            let root = vp9(&mut encoder, FrameKind::Key, [37, 91, 203, 255])?;
+            let mut replacement = track.append_group()?;
+            write(&mut replacement, packet(FrameKind::Key, 30, 0, 30, root))?;
+            let image = image_at(&mut received, 30).await?;
+            assert_eq!(image.id, id(30, 30));
+            assert_eq!((image.width, image.height), (48, 24));
+            assert!(!progress.report(Duration::ZERO).recover);
             receiving.abort();
+            let _ = receiving.await;
+            worker.await??;
             Ok::<_, anyhow::Error>(())
         })
         .await?
     }
 
     #[tokio::test]
-    async fn decoder_skips_obsolete_queued_packets_and_restarts_at_keyframe() -> Result<()> {
+    async fn decoder_skips_obsolete_queued_packets_and_restarts_at_root() -> Result<()> {
         let progress = Arc::new(Progress::default());
-        progress.recover(7);
+        progress.recover(6, 7);
         let (packets, decode) = mpsc::channel(3);
-        let (images, receive) = watch::channel(None);
-        // Deliberately invalid VP9: decoding either obsolete packet must fail.
-        for timestamp_us in [10, 20] {
-            packets.try_send(Encoded {
-                id: id(6, timestamp_us),
-                payload: bytes::Bytes::from_static(b"obsolete invalid packet"),
-                received_at: Instant::now(),
-                lag_us: 0,
-            })?;
+        let (states, state_decode) = watch::channel(None);
+        let (images, received) = watch::channel(None);
+        for timestamp in [6, 20] {
+            packets.try_send(packet(
+                if timestamp == 6 {
+                    FrameKind::Key
+                } else {
+                    FrameKind::Checkpoint
+                },
+                6,
+                if timestamp == 6 { 0 } else { 6 },
+                timestamp,
+                Bytes::from_static(b"obsolete invalid VP9"),
+            ))?;
         }
-        let mut encoder = rho_desktop_media::codec::Encoder::new(48, 24, 500_000)?;
-        let bgra = [37, 91, 203, 255].repeat(48 * 24);
-        let keyframe = encoder.encode(&bgra, true)?.remove(0);
-        assert!(keyframe.keyframe);
-        packets.try_send(Encoded {
-            id: id(7, 30),
-            payload: keyframe.data.into(),
-            received_at: Instant::now(),
-            lag_us: 12,
-        })?;
+        let mut encoder = Encoder::new(48, 24, 500_000)?;
+        let root = vp9(&mut encoder, FrameKind::Key, [37, 91, 203, 255])?;
+        packets.try_send(packet(FrameKind::Key, 30, 0, 30, root))?;
         drop(packets);
-        let worker_progress = progress.clone();
+        drop(states);
+        let decoding = progress.clone();
         tokio::task::spawn_blocking(move || {
-            decode_packets(decode, images, worker_progress, Instant::now(), 0)
+            decode_packets(decode, state_decode, images, decoding, Instant::now(), 0)
         })
         .await??;
-        let image = receive.borrow().clone().expect("new keyframe decoded");
-        assert_eq!((image.width, image.height), (48, 24));
-        assert_eq!(image.id, id(7, 30));
-        assert_eq!(progress.feedback.lock().unwrap().decoded, Some(id(7, 30)));
+        let image = received.borrow().clone().unwrap();
+        assert_eq!(image.id, id(30, 30));
+        assert_eq!(progress.report(Duration::ZERO).decoded, Some(id(30, 30)));
         image.presented();
-        assert_eq!(progress.feedback.lock().unwrap().presented, Some(id(7, 30)));
+        assert_eq!(progress.report(Duration::ZERO).presented, Some(id(30, 30)));
         Ok(())
     }
 }
