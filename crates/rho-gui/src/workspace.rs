@@ -5188,6 +5188,9 @@ impl Workspace {
         if let Some(existing) = self.find_surface(|s| s.key == key) {
             return existing.clone();
         }
+        if let Some(peeked) = self.phone.peek_surface.take_if(|s| s.key == key) {
+            return peeked;
+        }
         let view = match &key {
             SurfaceKey::Draft => {
                 let model = self.draft_model.clone();

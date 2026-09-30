@@ -117,6 +117,15 @@ impl PhoneFlickGesture {
     }
 }
 
+/// What sits beyond the card in view, peeking in while it is dragged: the
+/// card a flick up deals, or what a flick down takes back.
+enum PhonePeek {
+    Card(Box<rho_dealer::Card>),
+    Home,
+    Pile,
+    Undo,
+}
+
 /// A card being answered from the feed: the card, and the surface its reply
 /// opened. Sending from that surface finishes the card.
 #[derive(Clone)]
@@ -132,6 +141,13 @@ pub(super) struct PhoneUi {
     touch_debug: bool,
     last_gesture: Option<String>,
     flick: Option<PhoneFlickGesture>,
+    /// The pages below and above the card in view, taken when a drag
+    /// starts. None on a side is the end of the feed there.
+    peek_next: Option<PhonePeek>,
+    peek_back: Option<PhonePeek>,
+    /// The next card's surface, built when a drag starts so that the page
+    /// rising into view is the one that lands. A deal takes it.
+    pub(super) peek_surface: Option<Surface>,
     drag_offset: Pixels,
     snap: Option<PhoneSnap>,
     next_snap_generation: u64,
@@ -158,6 +174,9 @@ impl PhoneUi {
             touch_debug: std::env::var("RHO_PHONE_TOUCH_DEBUG").is_ok_and(|value| value == "1"),
             last_gesture: None,
             flick: None,
+            peek_next: None,
+            peek_back: None,
+            peek_surface: None,
             drag_offset: Pixels::ZERO,
             snap: None,
             next_snap_generation: 1,
@@ -496,6 +515,13 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn phone_peek_next_for_test(&self) -> Option<rho_dealer::NodeId> {
+        match &self.phone.peek_next {
+            Some(PhonePeek::Card(card)) => Some(card.node.clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn phone_last_gesture_for_test(&self) -> Option<&str> {
         self.phone.last_gesture.as_deref()
     }
@@ -630,6 +656,144 @@ impl Workspace {
         })
     }
 
+    /// The pages beyond the card in view: below, the card a pull deals
+    /// (Home when there is none); above, the card a flick down takes back.
+    fn phone_peeks(
+        &mut self,
+        card: &rho_dealer::Card,
+        cx: &mut Context<Self>,
+    ) -> (Option<PhonePeek>, Option<PhonePeek>) {
+        let next = if self.attention.open_pile.is_some() {
+            PhonePeek::Pile
+        } else {
+            match self.hand(cx).top(Some(&card.node)) {
+                Some(next) => PhonePeek::Card(Box::new(next.clone())),
+                None => PhonePeek::Home,
+            }
+        };
+        let back = match self.phone.transitions.last() {
+            Some(PhoneTransition::Flick(card)) => Some(PhonePeek::Card(card.clone())),
+            Some(PhoneTransition::Verdict(sequence))
+                if self.attention.last_undo() == Some(*sequence) =>
+            {
+                Some(PhonePeek::Undo)
+            }
+            _ => None,
+        };
+        (Some(next), back)
+    }
+
+    /// The key a card's surface is filed under, for a card that opens as
+    /// an ordinary surface; a Slack card opens through its conversation.
+    fn phone_card_surface_key(node: &rho_dealer::NodeId) -> Option<SurfaceKey> {
+        match node {
+            rho_dealer::NodeId::Agent(agent_id) => Some(SurfaceKey::Transcript(*agent_id)),
+            rho_dealer::NodeId::Slack(_) => None,
+            node => Some(SurfaceKey::Note(node.clone())),
+        }
+    }
+
+    fn phone_open_surface(&self, key: &SurfaceKey) -> Option<&Surface> {
+        self.surfaces
+            .values()
+            .flatten()
+            .chain(&self.phone.peek_surface)
+            .find(|surface| &surface.key == key)
+    }
+
+    fn build_phone_peek_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(PhonePeek::Card(card)) = &self.phone.peek_next else {
+            return;
+        };
+        let Some(key) = Self::phone_card_surface_key(&card.node) else {
+            return;
+        };
+        if self.phone_open_surface(&key).is_none() {
+            self.phone.peek_surface = Some(self.make_surface(key, window, cx));
+        }
+    }
+
+    /// The page a drag by `dy` pulls into view.
+    fn phone_peek_toward(&self, dy: Pixels) -> Option<&PhonePeek> {
+        match dy < Pixels::ZERO {
+            true => self.phone.peek_next.as_ref(),
+            false => self.phone.peek_back.as_ref(),
+        }
+    }
+
+    /// A neighbouring page as it will look once it is in view: the card's
+    /// own surface when it is already open somewhere, else its title and
+    /// what it wants.
+    fn render_phone_peek(&self, peek: &PhonePeek, cx: &Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let note = |text: &str| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.text_muted)
+                .child(text.to_owned())
+                .into_any_element()
+        };
+        let (title, state, body) = match peek {
+            PhonePeek::Card(card) => {
+                let open = Self::phone_card_surface_key(&card.node)
+                    .and_then(|key| self.phone_open_surface(&key));
+                let body = match open {
+                    Some(surface) => div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(self.render_surface(surface))
+                        .into_any_element(),
+                    None => div()
+                        .flex_1()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .text_color(colors.text)
+                                .child(card.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.text_muted)
+                                .child(card.context.clone()),
+                        )
+                        .into_any_element(),
+                };
+                (Self::card_path(card), Some(card.label.clone()), body)
+            }
+            PhonePeek::Home => (
+                "home".to_owned(),
+                None,
+                match self.home_view() {
+                    Some(view) => div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(view)
+                        .into_any_element(),
+                    None => note("nothing needs attention"),
+                },
+            ),
+            PhonePeek::Pile => ("pile".to_owned(), None, note("the next card on the pile")),
+            PhonePeek::Undo => ("undo".to_owned(), None, note("let go to take the last verdict back")),
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(colors.editor_background)
+            .child(self.render_phone_title(title, state, cx))
+            .child(body)
+            .into_any_element()
+    }
+
     pub(super) fn phone_debug_touch(&mut self, event: &TouchEvent, cx: &mut Context<Self>) {
         match event.phase {
             TouchPhase::Started => {
@@ -673,7 +837,10 @@ impl Workspace {
                     && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
                     && self.minibuffer.is_none()
                 {
-                    let edge = if self.open_card_in_view(cx).is_some() {
+                    let edge = if let Some(card) = self.open_card_in_view(cx) {
+                        (self.phone.peek_next, self.phone.peek_back) =
+                            self.phone_peeks(&card, cx);
+                        self.build_phone_peek_surface(window, cx);
                         self.phone_deal_scroll_edge(cx)
                     } else {
                         PhoneScrollEdge::Both
@@ -703,10 +870,17 @@ impl Workspace {
                     self.phone.flick = None;
                 }
                 self.phone.drag_offset = if claims {
-                    self.phone
+                    let dy = self
+                        .phone
                         .flick
                         .as_ref()
-                        .map_or(Pixels::ZERO, |flick| flick.position.y - flick.start.y)
+                        .map_or(Pixels::ZERO, |flick| flick.position.y - flick.start.y);
+                    // At the end of the feed the card follows the finger
+                    // only a little, and springs back.
+                    match self.phone_peek_toward(dy).is_some() {
+                        true => dy,
+                        false => dy * 0.25,
+                    }
                 } else {
                     Pixels::ZERO
                 };
@@ -724,13 +898,19 @@ impl Workspace {
                     })?
                 });
                 self.phone.drag_offset = Pixels::ZERO;
+                let card_in_view = self.open_card_in_view(cx).is_some();
+                // A card with nothing beyond it in that direction stays.
+                let direction = direction.filter(|_| !card_in_view || self.phone_peek_toward(from).is_some());
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
-                    if self.open_card_in_view(cx).is_some() {
+                    if card_in_view {
+                        // A page is the screen above the bar: the neighbour
+                        // lands exactly where the card was.
+                        let page = window.viewport_size().height - TARGET_HEIGHT;
                         let to = match direction {
-                            rho_journal::PhoneFlickDirection::Up => -window.viewport_size().height,
-                            rho_journal::PhoneFlickDirection::Down => window.viewport_size().height,
+                            rho_journal::PhoneFlickDirection::Up => -page,
+                            rho_journal::PhoneFlickDirection::Down => page,
                         };
                         self.start_phone_snap(from, to, Some(direction), window, cx);
                     } else {
@@ -874,24 +1054,76 @@ impl Workspace {
             let header =
                 self.render_phone_title(Self::card_path(&card), Some(card.label.clone()), cx);
             let body = self.render_surface(&self.active_surface().clone());
-            let card = div()
+            let page = || div().absolute().left_0().size_full().flex().flex_col();
+            // The card and its neighbours are one strip, a page apart, that
+            // moves under the finger: the next card rises into view as the
+            // one in view leaves.
+            let mut strip = div()
+                .id("phone-deal-strip")
+                .absolute()
+                .left_0()
+                .size_full()
+                .child(
+                    page().top_0().child(header).child(
+                        div()
+                            .id("phone-deal-body")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .child(body),
+                    ),
+                );
+            let dragging = self.phone.drag_offset != Pixels::ZERO || self.phone.snap.is_some();
+            if dragging {
+                let colors = cx.theme().colors();
+                for (peek, top) in [
+                    (&self.phone.peek_next, gpui::relative(1.)),
+                    (&self.phone.peek_back, gpui::relative(-1.)),
+                ] {
+                    if let Some(peek) = peek {
+                        strip = strip.child(
+                            page()
+                                .top(top)
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                                .child(self.render_phone_peek(peek, cx)),
+                        );
+                    }
+                }
+            }
+            let strip = if let Some(snap) = self.phone.snap {
+                strip
+                    .with_animation(
+                        ("phone-card-snap", snap.generation),
+                        Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
+                        move |strip, delta| {
+                            let from = snap.from.as_f32();
+                            let to = snap.to.as_f32();
+                            strip.top(px(from + (to - from) * delta))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                strip.top(self.phone.drag_offset).into_any_element()
+            };
+            return div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.feed_focus)
                 .size_full()
-                .relative()
                 .flex()
                 .flex_col()
-                .child(header)
                 .child(
                     div()
-                        .id("phone-deal-body")
+                        .id("phone-deal-viewport")
                         .capture_touch(cx.listener(Self::phone_touch))
                         .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
+                        .relative()
                         .flex_1()
                         .min_h_0()
                         .w_full()
                         .overflow_hidden()
-                        .child(body),
+                        .child(strip),
                 )
                 // A question in the minibuffer is answered with ok and dropped
                 // with back, whatever it was asked over.
@@ -899,21 +1131,8 @@ impl Workspace {
                     self.render_phone_bar(cx)
                 } else {
                     self.render_phone_verdict_bar(cx)
-                });
-            return if let Some(snap) = self.phone.snap {
-                card.with_animation(
-                    ("phone-card-snap", snap.generation),
-                    Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
-                    move |card, delta| {
-                        let from = snap.from.as_f32();
-                        let to = snap.to.as_f32();
-                        card.top(px(from + (to - from) * delta))
-                    },
-                )
-                .into_any_element()
-            } else {
-                card.top(self.phone.drag_offset).into_any_element()
-            };
+                })
+                .into_any_element();
         }
         if self.phone.stack.is_empty() {
             let colors = cx.theme().colors();
@@ -1045,8 +1264,16 @@ impl Workspace {
         let before = self.open_card_in_view(cx).map(|card| card.node);
         let undo_before = self.attention.last_undo();
         run(self, window, cx);
-        cx.defer_in(window, move |this, _window, cx| {
+        cx.defer_in(window, move |this, window, cx| {
             let after = this.open_card_in_view(cx).map(|card| card.node);
+            if before.is_some() && after.is_some() && before != after && this.phone.stack.is_empty() {
+                // The next card rises into place, as it does under a flick;
+                // what was answered is gone, so nothing follows it down.
+                this.phone.peek_next = None;
+                this.phone.peek_back = None;
+                let page = window.viewport_size().height - TARGET_HEIGHT;
+                this.start_phone_snap(page, Pixels::ZERO, None, window, cx);
+            }
             if before.is_some() && before != after {
                 // A verdict that wrote a cell finished inside `run` and
                 // told the phone itself; what is left here is the one that

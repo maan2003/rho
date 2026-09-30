@@ -6369,6 +6369,61 @@ fn a_phone_flick_moves_from_one_dated_card_to_the_next(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn the_card_peeking_in_under_a_phone_drag_is_the_one_the_flick_lands_on(
+    cx: &mut TestAppContext,
+) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for title in ["First phone card", "Second phone card", "Third phone card"] {
+                let note = workspace.create_note(None, cx);
+                workspace.write_marks(vec![body(&note, title), said(&note, todo_now())], cx);
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    let touch = |phase, y: f32, millis| {
+        TouchEvent {
+            id: TouchId(1),
+            phase,
+            position: point(px(200.), px(y)),
+            timestamp: std::time::Duration::from_millis(millis),
+            ..Default::default()
+        }
+        .to_platform_input()
+    };
+    let (first, peeked) = cx
+        .update_window(*workspace, |_, window, cx| {
+            window.dispatch_event(touch(TouchPhase::Started, 600., 0), cx);
+            window.dispatch_event(touch(TouchPhase::Moved, 300., 80), cx);
+        })
+        .and_then(|_| {
+            workspace.update(cx, |workspace, _, cx| {
+                (
+                    workspace.current_deal_card_for_test(cx).unwrap().0,
+                    workspace.phone_peek_next_for_test(),
+                )
+            })
+        })
+        .unwrap();
+    let peeked = peeked.expect("a card peeks in below the one in view");
+    assert_ne!(peeked, first, "the card in view is not its own next page");
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Ended, 300., 100), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, peeked);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn the_new_note_and_agent_area_picker_files_at_the_label_in_view(cx: &mut TestAppContext) {
     use rho_dealer::NodeId;
     let workspace = test_workspace(cx);
