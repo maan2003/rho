@@ -6422,6 +6422,59 @@ fn the_card_peeking_in_under_a_phone_drag_is_the_one_the_flick_lands_on(cx: &mut
 }
 
 #[gpui::test]
+fn a_phone_drag_down_on_an_opened_screen_does_not_deal_behind_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for title in ["First phone card", "Second phone card"] {
+                let note = workspace.create_note(None, cx);
+                workspace.write_marks(vec![body(&note, title), said(&note, todo_now())], cx);
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.cmd_messages(window, cx)
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    // A finger dragging down arrives as precise scrolling; on the desk the
+    // same unconsumed scroll is the trackpad's deal gesture.
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: point(px(200.), px(400.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(60.))),
+                touch_phase: TouchPhase::Moved,
+                ..Default::default()
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.active_surface().key,
+                crate::pane::SurfaceKey::Messages
+            );
+            assert!(!workspace.phone_feed_for_test(cx));
+        })
+        .unwrap();
+    // A deal the reader asks for leaves the screen for the card.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.pull_card(window, cx);
+            assert!(workspace.phone_feed_for_test(cx));
+            assert!(workspace.phone_feed_is_active_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn the_new_note_and_agent_area_picker_files_at_the_label_in_view(cx: &mut TestAppContext) {
     use rho_dealer::NodeId;
     let workspace = test_workspace(cx);

@@ -460,13 +460,24 @@ impl Minibuffer {
             .bottom(px(56.))
             .occlude()
             .key_context("RhoMinibuffer")
+            // The prompt is a label over the field, as phone forms put it:
+            // beside it, a long prompt leaves no room to type.
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .pt_2()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .text_color(colors.text_muted)
+                    .child(self.prompt.trim_end().trim_end_matches(':').to_owned()),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .min_h(px(48.))
+                    .min_h(px(44.))
                     .px_3()
-                    .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
             .children(rows)

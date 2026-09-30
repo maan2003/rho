@@ -4326,7 +4326,7 @@ impl Workspace {
             gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled
         ) {
             self.deal_gesture_active = false;
-        } else if event.delta.precise() && !self.deal_gesture_active {
+        } else if event.delta.precise() && !self.deal_gesture_active && !self.phone.enabled {
             let delta = event.delta.pixel_delta(px(20.));
             if delta.y > px(12.) && delta.y.abs() > delta.x.abs() {
                 self.deal_gesture_active = true;

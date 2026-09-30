@@ -198,7 +198,10 @@ impl PhoneUi {
         }
     }
 
+    /// A dealt card is shown on the feed, so the reader leaves the stack
+    /// for it: the card in view is always the one the bar acts on.
     pub(super) fn show_feed(&mut self, context: ContextId, key: SurfaceKey) {
+        self.stack.clear();
         self.feed_surface = Some((context, key));
     }
 
