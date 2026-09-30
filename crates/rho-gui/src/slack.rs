@@ -1528,22 +1528,33 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.prompt_slack_attach_from("~/".to_owned(), window, cx);
+    }
+
+    /// The path prompt lists what is in the folder typed so far, so a file
+    /// can be found by tapping as well as by typing; picking a folder opens
+    /// it.
+    fn prompt_slack_attach_from(
+        &mut self,
+        folder: String,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         self.open_prompt(
             "attach file:",
             std::rc::Rc::new(|_: &Workspace, needle: &str, _: &gpui::App| {
-                let path = std::path::Path::new(needle.trim());
-                let description = match path.is_file() {
-                    true => "enter attaches it".to_owned(),
-                    false => "a path to a file".to_owned(),
-                };
-                vec![Candidate {
-                    value: needle.trim().to_owned(),
-                    description,
-                }]
+                attach_candidates(needle.trim())
             }),
-            std::rc::Rc::new(|workspace: &mut Workspace, input, _window, cx| {
-                let path = std::path::PathBuf::from(input.trim());
-                if !workspace.slack_attach_path(&path, cx) {
+            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
+                let typed = input.trim();
+                let path = expand_home(typed);
+                if path.is_dir() {
+                    let folder = match typed.ends_with('/') {
+                        true => typed.to_owned(),
+                        false => format!("{typed}/"),
+                    };
+                    workspace.prompt_slack_attach_from(folder, window, cx);
+                } else if !workspace.slack_attach_path(&path, cx) {
                     workspace.echo(
                         "slack: open a conversation first",
                         StyleClass::SystemInfo,
@@ -1554,6 +1565,11 @@ impl Workspace {
             window,
             cx,
         );
+        // A path has spaces in it, so completion replaces the whole input.
+        self.set_prompt_complete_whole_input();
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_input(folder, window, cx);
+        }
     }
 
     pub(crate) fn prompt_slack_message_actions(
@@ -3359,6 +3375,87 @@ pub(crate) fn model_unit(unit: &SlackUnit) -> Unit {
     }
 }
 
+/// `~/` is the reader's home, which is where a phone keeps its files.
+fn expand_home(typed: &str) -> std::path::PathBuf {
+    match (typed.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        _ => std::path::PathBuf::from(typed),
+    }
+}
+
+/// The entries of the typed folder that start with the typed name: the
+/// folder itself first, so enter on a bare folder does not pick something
+/// in it, then folders, then files, then the way up. Hidden entries show
+/// only once a `.` is typed.
+fn attach_candidates(typed: &str) -> Vec<Candidate> {
+    let (folder, prefix) = match typed.rfind('/') {
+        Some(slash) => typed.split_at(slash + 1),
+        None => ("", typed),
+    };
+    let listed = expand_home(if folder.is_empty() { "." } else { folder });
+    let Ok(entries) = std::fs::read_dir(&listed) else {
+        return vec![Candidate {
+            value: typed.to_owned(),
+            description: "a path to a file".to_owned(),
+        }];
+    };
+    let mut found: Vec<(bool, String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            // Followed, so a link to a folder opens like one.
+            let metadata = std::fs::metadata(entry.path()).ok()?;
+            Some((metadata.is_dir(), name, metadata.len()))
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        (a.1 != prefix)
+            .cmp(&(b.1 != prefix))
+            .then(b.0.cmp(&a.0))
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let mut candidates = Vec::new();
+    if prefix.is_empty() && !folder.is_empty() {
+        candidates.push(Candidate {
+            value: folder.to_owned(),
+            description: match found.len() {
+                1 => "this folder · 1 entry".to_owned(),
+                count => format!("this folder · {count} entries"),
+            },
+        });
+    }
+    candidates.extend(found.into_iter().map(|(is_dir, name, size)| Candidate {
+        value: format!("{folder}{name}{}", if is_dir { "/" } else { "" }),
+        description: if is_dir {
+            "folder".to_owned()
+        } else {
+            human_size(size)
+        },
+    }));
+    // Up keeps the folder as it was typed, `~` included, while there is
+    // a typed folder to go up to.
+    let trimmed = folder.trim_end_matches('/');
+    let up = match trimmed.rfind('/') {
+        Some(slash) if !trimmed.ends_with("..") => Some(trimmed[..=slash].to_owned()),
+        _ => listed.canonicalize().ok().and_then(|path| {
+            path.parent()
+                .map(|parent| format!("{}/", parent.display()).replace("//", "/"))
+        }),
+    };
+    if let Some(up) = up
+        && prefix.is_empty()
+    {
+        candidates.push(Candidate {
+            value: up,
+            description: "up a folder".to_owned(),
+        });
+    }
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::TestAppContext;
@@ -3689,5 +3786,43 @@ mod tests {
         };
         assert_eq!(key.channel.0, "C1");
         assert_eq!(key.thread_ts.0, "500.0");
+    }
+
+    #[test]
+    fn attach_candidates_list_the_typed_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = format!("{}/", root.path().display());
+        std::fs::create_dir(root.path().join("photos")).unwrap();
+        std::fs::write(root.path().join("a.txt"), "12345").unwrap();
+        std::fs::write(root.path().join("a.txt.bak"), "").unwrap();
+        std::fs::write(root.path().join(".hidden"), "").unwrap();
+        let values = |typed: &str| {
+            attach_candidates(typed)
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect::<Vec<_>>()
+        };
+        let parent = format!("{}/", root.path().parent().unwrap().display());
+        assert_eq!(
+            values(&folder),
+            [
+                folder.clone(),
+                format!("{folder}photos/"),
+                format!("{folder}a.txt"),
+                format!("{folder}a.txt.bak"),
+                parent,
+            ]
+        );
+        // An exact name comes first, so enter on it takes that file.
+        assert_eq!(
+            values(&format!("{folder}a.txt")),
+            [format!("{folder}a.txt"), format!("{folder}a.txt.bak")]
+        );
+        assert_eq!(values(&format!("{folder}.h")), [format!("{folder}.hidden")]);
+        assert_eq!(
+            values(&format!("{folder}photos/")).last(),
+            Some(&folder),
+            "up is the typed folder's own parent"
+        );
     }
 }

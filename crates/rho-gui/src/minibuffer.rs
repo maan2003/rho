@@ -164,6 +164,9 @@ pub struct Minibuffer {
 /// Candidate rows shown at once; the list scrolls the selection into this
 /// window rather than growing unbounded.
 const VISIBLE_CANDIDATES: usize = 8;
+/// A phone has no keys to move the selection, so its list scrolls under
+/// the finger instead, over this many rows at most.
+const PHONE_CANDIDATES: usize = 200;
 
 impl Minibuffer {
     pub fn prompt(&self) -> &str {
@@ -412,15 +415,11 @@ impl Minibuffer {
         cx: &Context<Workspace>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let window_start = self
-            .selected
-            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let rows = self
             .candidates
             .iter()
             .enumerate()
-            .skip(window_start)
-            .take(VISIBLE_CANDIDATES)
+            .take(PHONE_CANDIDATES)
             .map(|(index, candidate)| {
                 // A list row the way phones draw them: the value, and what
                 // it is in smaller type beneath, each with the full width.
@@ -480,7 +479,13 @@ impl Minibuffer {
                     .px_3()
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("phone-minibuffer-candidates")
+                    .max_h(px(400.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
             .into_any_element()
     }
 }
