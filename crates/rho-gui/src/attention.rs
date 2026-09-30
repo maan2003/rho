@@ -175,6 +175,13 @@ impl Attention {
         self.undo.pop()
     }
 
+    /// The card the last verdict was on: what undoing it would deal again.
+    pub(crate) fn last_undo_card(&self) -> Option<&NodeId> {
+        self.undo
+            .last()
+            .and_then(|undo| undo.card.as_ref().map(|(node, _)| node))
+    }
+
     #[cfg(test)]
     pub(crate) fn undo_len(&self) -> usize {
         self.undo.len()

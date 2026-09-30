@@ -5,9 +5,9 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, FocusHandle, Focusable as _, MouseButton,
-    MouseDownEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div, ease_out_quint,
-    px,
+    Animation, AnimationExt as _, AnyElement, App, Context, FocusHandle, Focusable as _,
+    MouseButton, MouseDownEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div,
+    ease_out_quint, px,
 };
 use theme::ActiveTheme as _;
 
@@ -15,6 +15,10 @@ use super::{ContextId, Surface, SurfaceKey, Workspace};
 
 const PHONE_MAX_WIDTH: Pixels = px(600.);
 const TARGET_HEIGHT: Pixels = px(56.);
+const PHONE_HEADER_HEIGHT: Pixels = px(48.);
+const PHONE_HEADER_BUTTON_WIDTH: Pixels = px(48.);
+/// The two buttons on the right of the title bar and the left padding.
+const PHONE_HEADER_BUTTONS_WIDTH: Pixels = px(108.);
 const FLICK_SLOP: f32 = 12.;
 const FLICK_COMMIT_VELOCITY: f32 = 900.;
 const SNAP_DURATION: std::time::Duration = std::time::Duration::from_millis(180);
@@ -165,6 +169,18 @@ pub(super) struct PhoneUi {
     /// has to be opened again; only a redraw has the window to do it.
     pub(super) feed_retry: bool,
     pub(super) feed_focus: FocusHandle,
+    /// Where a tap on rows went down, until it comes up.
+    pending_tap: Option<Point<Pixels>>,
+    /// The cards a flick would reach, read when the finger goes down so
+    /// the one being dragged toward can show under the feed card. `next`
+    /// is the dealer's next; `previous` is where a flick down would land.
+    peek: PhonePeek,
+}
+
+#[derive(Default)]
+struct PhonePeek {
+    next: Option<rho_dealer::Card>,
+    previous: Option<rho_dealer::Card>,
 }
 
 impl PhoneUi {
@@ -188,6 +204,8 @@ impl PhoneUi {
             stack: Vec::new(),
             feed_retry: false,
             feed_focus: cx.focus_handle(),
+            pending_tap: None,
+            peek: PhonePeek::default(),
         }
     }
 
@@ -258,7 +276,11 @@ pub(super) struct PhoneModeChange {
     exited: bool,
 }
 
+/// How far a finger may drift and still be a tap on the row it went down on.
+const TAP_SLOP: Pixels = px(8.);
 const PHONE_FONT_SCALE: f32 = 1.4;
+/// How long a phone toast stays: long enough to read and tap its undo.
+pub(super) const PHONE_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Touch is a plain-editor world: no Vim, no Helix, every editor accepts
 /// text directly. Applied on phone-mode entry and reverted on exit so a
@@ -285,6 +307,9 @@ impl Workspace {
                 cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
             }
             self.update_statuses(cx);
+            if let Some(home) = self.home_view() {
+                home.update(cx, |home, cx| home.set_narrow(true, cx));
+            }
             // Deferred: adjusting fonts and settings notifies observers,
             // which must not reenter the draw that detected the transition.
             cx.defer(|cx| {
@@ -309,6 +334,9 @@ impl Workspace {
             self.phone.drag_offset = Pixels::ZERO;
             self.phone.snap = None;
             self.update_statuses(cx);
+            if let Some(home) = self.home_view() {
+                home.update(cx, |home, cx| home.set_narrow(false, cx));
+            }
             cx.defer(|cx| {
                 theme_settings::reset_buffer_font_size(cx);
                 theme_settings::reset_ui_font_size(cx);
@@ -353,6 +381,11 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn phone_feed_is_active_for_test(&self) -> bool {
         self.phone_feed_is_active()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_composer_focused_for_test(&self, window: &Window, cx: &App) -> bool {
+        self.phone_composer_focused(window, cx)
     }
 
     /// Whether what is on screen is the feed card itself. A verdict closes
@@ -423,7 +456,7 @@ impl Workspace {
         self.active_context = context;
         self.show_history_surface(context, surface);
         self.sync_selection_to_focus(cx);
-        window.focus(&self.phone.feed_focus, cx);
+        self.focus_phone_feed(window, cx);
     }
 
     pub(crate) fn phone_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -553,6 +586,7 @@ impl Workspace {
                         PhoneScrollEdge::Both
                     };
                     self.phone.flick = Some(PhoneFlickGesture::new(event, edge));
+                    self.phone.peek = self.phone_peek(cx);
                 } else {
                     self.phone.flick = None;
                 }
@@ -577,10 +611,17 @@ impl Workspace {
                     self.phone.flick = None;
                 }
                 self.phone.drag_offset = if claims {
-                    self.phone
+                    let offset = self
+                        .phone
                         .flick
                         .as_ref()
-                        .map_or(Pixels::ZERO, |flick| flick.position.y - flick.start.y)
+                        .map_or(Pixels::ZERO, |flick| flick.position.y - flick.start.y);
+                    // Home is the last screen: nothing lies past it to pull up.
+                    if self.open_card_in_view(cx).is_none() {
+                        offset.max(Pixels::ZERO)
+                    } else {
+                        offset
+                    }
                 } else {
                     Pixels::ZERO
                 };
@@ -597,25 +638,99 @@ impl Workspace {
                         flick.committed_direction(window.viewport_size().height)
                     })?
                 });
+                // Nothing lies past Home, so a flick up there is a drag let go.
+                let direction = direction.filter(|direction| {
+                    *direction == rho_journal::PhoneFlickDirection::Down
+                        || self.open_card_in_view(cx).is_some()
+                });
                 self.phone.drag_offset = Pixels::ZERO;
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
-                    if self.open_card_in_view(cx).is_some() {
-                        let to = match direction {
-                            rho_journal::PhoneFlickDirection::Up => -window.viewport_size().height,
-                            rho_journal::PhoneFlickDirection::Down => window.viewport_size().height,
-                        };
-                        self.start_phone_snap(from, to, Some(direction), window, cx);
-                    } else {
-                        self.commit_phone_flick(direction, window, cx);
-                    }
+                    let to = match direction {
+                        rho_journal::PhoneFlickDirection::Up => -window.viewport_size().height,
+                        rho_journal::PhoneFlickDirection::Down => window.viewport_size().height,
+                    };
+                    self.start_phone_snap(from, to, Some(direction), window, cx);
                 } else if from != Pixels::ZERO {
                     self.start_phone_snap(from, Pixels::ZERO, None, window, cx);
                 }
             }
         }
         cx.notify();
+    }
+
+    /// What a flick from here would land on, read once per gesture: the
+    /// dealer ranks the world to answer, and a drag asks every frame.
+    fn phone_peek(&mut self, cx: &mut Context<Self>) -> PhonePeek {
+        let current = self.open_card_in_view(cx);
+        let next = self
+            .hand(cx)
+            .top(current.as_ref().map(|card| &card.node))
+            .cloned();
+        let previous = match self.phone.transitions.last() {
+            Some(PhoneTransition::Flick(card)) => Some((**card).clone()),
+            Some(PhoneTransition::Verdict(sequence))
+                if self.attention.last_undo() == Some(*sequence) =>
+            {
+                self.attention
+                    .last_undo_card()
+                    .cloned()
+                    .map(|node| self.card_for(&node, cx))
+            }
+            Some(PhoneTransition::Verdict(_)) | None => None,
+        };
+        PhonePeek { next, previous }
+    }
+
+    /// The card a drag is pulling in, drawn as its header and bar over an
+    /// empty body: the real surface opens when the flick lands, and this
+    /// is what makes the landing look like the card arriving rather than
+    /// appearing. The Home glance stands in when the queue is empty.
+    fn render_phone_peek(
+        &mut self,
+        card: Option<&rho_dealer::Card>,
+        text_style: &gpui::TextStyle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = cx.theme().colors();
+        let title = match card {
+            Some(card) => self.render_phone_card_title(card, text_style, window, cx),
+            None => div().child("home").into_any_element(),
+        };
+        let header = self.render_phone_header(false, title, cx);
+        let bar = card.map(|_| self.render_phone_verdict_bar(cx));
+        div()
+            .id("phone-peek-card")
+            .absolute()
+            .left_0()
+            .w_full()
+            .h(window.viewport_size().height)
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .bg(colors.editor_background),
+            )
+            .children(bar)
+    }
+
+    /// Where the peeked card sits for a feed card at `offset`: just below
+    /// the screen when the finger is pulling up, just above it when
+    /// pulling down. `None` when nothing is there to pull.
+    fn phone_peek_offset(&self, offset: Pixels, height: Pixels) -> Option<(Pixels, bool)> {
+        if offset < Pixels::ZERO {
+            Some((offset + height, true))
+        } else if offset > Pixels::ZERO && self.phone.peek.previous.is_some() {
+            Some((offset - height, false))
+        } else {
+            None
+        }
     }
 
     fn start_phone_snap(
@@ -648,9 +763,7 @@ impl Workspace {
                 if let Some(direction) = direction
                     && this.phone.enabled
                     && this.phone.stack.is_empty()
-                    && this
-                        .card_in_view(cx)
-                        .is_some_and(|card| Some(&card.node) == source.as_ref())
+                    && this.card_in_view(cx).map(|card| card.node) == source
                 {
                     this.commit_phone_flick(direction, window, cx);
                 }
@@ -729,7 +842,7 @@ impl Workspace {
             div()
                 .id("phone-touch-debug")
                 .absolute()
-                .top_2()
+                .top(PHONE_HEADER_HEIGHT + px(4.))
                 .right_2()
                 .px_2()
                 .py_1()
@@ -741,67 +854,156 @@ impl Workspace {
         })
     }
 
+    /// A card's two-line title: where it is, then what state it is in.
+    fn render_phone_card_title(
+        &self,
+        card: &rho_dealer::Card,
+        text_style: &gpui::TextStyle,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let label = card.label.clone();
+        let (breadcrumb, _) = {
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let font = text_style.font();
+            phone_deal_header_text(
+                &Self::card_path(card),
+                "",
+                window.viewport_size().width - PHONE_HEADER_BUTTONS_WIDTH,
+                |text| {
+                    window
+                        .text_system()
+                        .shape_line(
+                            text.into(),
+                            font_size,
+                            &[gpui::TextRun {
+                                len: text.len(),
+                                font: font.clone(),
+                                color: text_style.color,
+                                ..Default::default()
+                            }],
+                            None,
+                        )
+                        .width
+                },
+            )
+        };
+        let colors = cx.theme().colors();
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(colors.text)
+                    .child(breadcrumb),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(13.))
+                    .line_height(px(16.))
+                    .text_color(cx.theme().status().warning)
+                    .child(label),
+            );
+        title.into_any_element()
+    }
+
+    /// The feed screen under the finger: it follows a drag, and on release
+    /// it snaps home or off the screen while the card it pulled in slides
+    /// in behind it, so every flick is the same move a short video feed
+    /// makes.
+    fn render_phone_stage(
+        &mut self,
+        screen: gpui::Stateful<gpui::Div>,
+        text_style: &gpui::TextStyle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let height = window.viewport_size().height;
+        let stage = div().id("phone-feed-stage").size_full().relative();
+        if let Some(snap) = self.phone.snap {
+            let peek = self
+                .phone_peek_offset(snap.from + snap.to, height)
+                .map(|(_, forward)| {
+                    let card = match forward {
+                        true => self.phone.peek.next.clone(),
+                        false => self.phone.peek.previous.clone(),
+                    };
+                    let shift = if forward { height } else { -height };
+                    self.render_phone_peek(card.as_ref(), text_style, window, cx)
+                        .with_animation(
+                            ("phone-peek-snap", snap.generation),
+                            Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
+                            move |peek, delta| {
+                                let from = snap.from.as_f32();
+                                let to = snap.to.as_f32();
+                                peek.top(px(from + (to - from) * delta) + shift)
+                            },
+                        )
+                });
+            stage
+                .children(peek)
+                .child(screen.with_animation(
+                    ("phone-card-snap", snap.generation),
+                    Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
+                    move |screen, delta| {
+                        let from = snap.from.as_f32();
+                        let to = snap.to.as_f32();
+                        screen.top(px(from + (to - from) * delta))
+                    },
+                ))
+                .into_any_element()
+        } else {
+            let offset = self.phone.drag_offset;
+            let peek = self
+                .phone_peek_offset(offset, height)
+                .map(|(top, forward)| {
+                    let card = match forward {
+                        true => self.phone.peek.next.clone(),
+                        false => self.phone.peek.previous.clone(),
+                    };
+                    self.render_phone_peek(card.as_ref(), text_style, window, cx)
+                        .top(top)
+                });
+            stage
+                .children(peek)
+                .child(screen.top(offset))
+                .into_any_element()
+        }
+    }
+
+    /// Every phone screen is the same frame: a title bar, the surface, and
+    /// a bottom bar. The title bar carries the way around — back on a
+    /// stacked surface, the menu and the surface's own actions everywhere
+    /// — so the bottom bar never has to, and its slots never change what
+    /// they mean between one screen and the next.
     pub(super) fn render_phone_body(
         &mut self,
         text_style: &gpui::TextStyle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let composing = self.phone_composer_focused(window, cx);
         if self.phone.stack.is_empty()
             && let Some(card) = self.open_card_in_view(cx)
         {
+            let title = self.render_phone_card_title(&card, text_style, window, cx);
             let colors = cx.theme().colors();
-            let (breadcrumb, label) = {
-                let font_size = text_style.font_size.to_pixels(window.rem_size());
-                let font = text_style.font();
-                phone_deal_header_text(
-                    &Self::card_path(&card),
-                    &card.label,
-                    window.viewport_size().width,
-                    |text| {
-                        window
-                            .text_system()
-                            .shape_line(
-                                text.into(),
-                                font_size,
-                                &[gpui::TextRun {
-                                    len: text.len(),
-                                    font: font.clone(),
-                                    color: text_style.color,
-                                    ..Default::default()
-                                }],
-                                None,
-                            )
-                            .width
-                    },
-                )
-            };
-            let header = div()
-                .id("phone-deal-header")
-                .flex_none()
-                .h(px(32.))
-                .w_full()
-                .px_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(colors.border_variant)
-                .text_color(colors.text_muted)
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(breadcrumb),
-                )
-                .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
+            let header = self.render_phone_header(false, title, cx);
             let body = self.render_surface(&self.active_surface().clone());
+            let bar = if composing {
+                self.render_phone_composer_bar(cx)
+            } else {
+                self.render_phone_verdict_bar(cx)
+            };
             let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.feed_focus)
@@ -814,60 +1016,41 @@ impl Workspace {
                     div()
                         .id("phone-deal-body")
                         .capture_touch(cx.listener(Self::phone_touch))
+                        .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
+                        .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
                         .flex_1()
                         .min_h_0()
                         .w_full()
                         .overflow_hidden()
+                        .bg(colors.editor_background)
                         .child(body),
                 )
-                .child(self.render_phone_verdict_bar(cx));
-            return if let Some(snap) = self.phone.snap {
-                card.with_animation(
-                    ("phone-card-snap", snap.generation),
-                    Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
-                    move |card, delta| {
-                        let from = snap.from.as_f32();
-                        let to = snap.to.as_f32();
-                        card.top(px(from + (to - from) * delta))
-                    },
-                )
-                .into_any_element()
-            } else {
-                card.top(self.phone.drag_offset).into_any_element()
-            };
+                .child(bar);
+            return self.render_phone_stage(card, text_style, window, cx);
         }
         if self.phone.stack.is_empty() {
             let colors = cx.theme().colors();
-            return div()
+            // The header names what the reader is looking at, and with the
+            // queue empty that is Home, not the deal they have already
+            // flicked past.
+            let header =
+                self.render_phone_header(false, div().child("home").into_any_element(), cx);
+            let home = div()
                 .id("phone-feed-empty")
                 .track_focus(&self.phone.feed_focus)
                 .size_full()
+                .relative()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .id("phone-feed-empty-header")
-                        .h(px(32.))
-                        .w_full()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .text_color(colors.text_muted)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_menu(crate::transient::phone_root_menu(), window, cx);
-                        }))
-                        // The header names what the reader is looking at,
-                        // and with the queue empty that is Home, not the
-                        // deal they have already flicked past.
-                        .child("home"),
-                )
+                .child(header)
                 .child({
                     // Home is the card after the last deal: flick past the
                     // queue and the glance is what is left.
                     let body = div()
                         .id("phone-feed-empty-body")
                         .capture_touch(cx.listener(Self::phone_touch))
+                        .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
+                        .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
                         .flex_1()
                         .min_h_0()
                         .w_full();
@@ -881,33 +1064,16 @@ impl Workspace {
                             .child("nothing needs attention")
                             .into_any_element(),
                     }
-                })
-                .child(self.render_phone_bar(cx))
-                .into_any_element();
+                });
+            return self.render_phone_stage(home, text_style, window, cx);
         }
-        if let Some(surface) = self.phone_surface() {
-            div()
-                .id("phone-surface")
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .overflow_hidden()
-                        .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
-                        .child(self.render_surface(&surface)),
-                )
-                .child(self.render_phone_bar(cx))
-                .into_any_element()
-        } else {
-            div()
+        let Some(surface) = self.phone_surface() else {
+            return div()
                 .id("phone-dashboard")
                 .size_full()
                 .flex()
                 .flex_col()
+                .child(self.render_phone_header(true, div().into_any_element(), cx))
                 .child(
                     div()
                         .flex_1()
@@ -916,9 +1082,405 @@ impl Workspace {
                         .overflow_hidden()
                         .track_focus(&self.phone.feed_focus),
                 )
-                .child(self.render_phone_bar(cx))
-                .into_any_element()
+                .into_any_element();
+        };
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(self.surface_title(cx))
+            .into_any_element();
+        let header = self.render_phone_header(true, title, cx);
+        div()
+            .id("phone-surface")
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("phone-surface-body")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
+                    .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
+                    .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
+                    .child(self.render_surface(&surface)),
+            )
+            .children(composing.then(|| self.render_phone_composer_bar(cx)))
+            .into_any_element()
+    }
+
+    /// The title bar: back when there is something under this surface,
+    /// the title, then the menu and the surface's own actions. The two
+    /// buttons on the right are in the same place on every screen.
+    fn render_phone_header(
+        &self,
+        stacked: bool,
+        title: AnyElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let button = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .flex_none()
+                .h_full()
+                .w(PHONE_HEADER_BUTTON_WIDTH)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(22.))
+                .child(glyph)
+        };
+        div()
+            .id("phone-header")
+            .flex_none()
+            .h(PHONE_HEADER_HEIGHT)
+            .w_full()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .text_color(colors.text_muted)
+            .when(stacked, |header| {
+                header.child(
+                    button("phone-back", "‹")
+                        .on_click(cx.listener(|this, _, window, cx| this.phone_back(window, cx))),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .when(!stacked, |title| title.pl_3())
+                    .child(title),
+            )
+            .child(
+                button("phone-menu", "☰").on_click(cx.listener(|this, _, window, cx| {
+                    let subject = this.subject(window, cx);
+                    this.open_menu(crate::transient::phone_root_menu(&subject), window, cx);
+                })),
+            )
+            .child(
+                button("phone-more", "⋯").on_click(cx.listener(|this, _, window, cx| {
+                    this.open_phone_context_menu(window, cx);
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// Whether what is on screen is rows rather than text: a tap picks a
+    /// row, the way `enter` opens the one the cursor is on.
+    fn phone_surface_is_rows(&self) -> bool {
+        matches!(
+            self.active_surface().key,
+            SurfaceKey::Home
+                | SurfaceKey::SlackList
+                | SurfaceKey::SlackResults { .. }
+                | SurfaceKey::SlackInventory(_)
+                | SurfaceKey::Note(_)
+                | SurfaceKey::Draft
+        )
+    }
+
+    /// A tap in the draft: a header field asks its question as a prompt
+    /// with the same candidates the desktop completes from, since a phone
+    /// has no completion popup worth the name; the body takes the keyboard.
+    fn phone_draft_tap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.active_editor(cx);
+        window.focus(&editor.focus_handle(cx), cx);
+        let draft = self.draft_model.read(cx);
+        use rho_agents_view::draft::DraftModel;
+        type Apply = fn(&mut DraftModel, &str, &mut Context<DraftModel>);
+        let (prompt, complete, apply): (&str, crate::minibuffer::CandidateSource, Apply) = if draft
+            .cursor_in_start_field(&editor, cx)
+        {
+            (
+                "on top of:",
+                std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &App| {
+                    crate::commands::start_field_candidates(input, &workspace.live_agent_targets())
+                }),
+                |draft, text, cx| draft.set_start_text(text, cx),
+            )
+        } else if draft.cursor_in_role_field(&editor, cx) {
+            (
+                "role:",
+                std::rc::Rc::new(|_: &Workspace, input: &str, _: &App| {
+                    crate::commands::role_field_candidates(input)
+                }),
+                |draft, text, cx| draft.set_role_text(text, cx),
+            )
+        } else if draft.cursor_in_a_field(&editor, cx) {
+            (
+                "workdir:",
+                std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &App| {
+                    crate::commands::workdir_field_candidates(
+                        input,
+                        &workspace.hosts.workdir_table(),
+                    )
+                }),
+                |draft, text, cx| draft.set_workdir_text(text, cx),
+            )
+        } else {
+            return;
+        };
+        // The prompt starts empty so every choice is on offer; an empty
+        // answer keeps what the field already says.
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                if input.trim().is_empty() {
+                    return;
+                }
+                workspace
+                    .draft_model
+                    .update(cx, |draft, cx| apply(draft, input.trim(), cx));
+            },
+        );
+        self.open_prompt(prompt, complete, on_submit, window, cx);
+        self.set_prompt_complete_whole_input();
+    }
+
+    /// Puts the active editor's cursor under the finger. The editor would
+    /// do this for a mouse, but rho keeps click selection off in most
+    /// buffers, and a row list on the phone still has to know which row was
+    /// touched.
+    fn phone_place_cursor(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.active_editor(cx);
+        editor.update(cx, |editor, cx| {
+            if let Some((anchor, _, _)) =
+                editor.buffer_location_for_window_position(position, text::Bias::Left)
+            {
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| selections.select_anchor_ranges([anchor..anchor]),
+                );
+            }
+        });
+    }
+
+    /// A touch arrives as the click gpui makes of it, and the editor
+    /// underneath would take both kinds: a tap is swallowed where click
+    /// selection is off, and a long press is answered with a desktop
+    /// context menu. Both are caught on the way down instead. A long press
+    /// is the row's own menu, with the cursor moved onto the row first so
+    /// the menu is that row's; a tap on rows moves the cursor too and is
+    /// finished on the way up.
+    fn phone_pointer_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.phone.pending_tap = None;
+        if self.minibuffer.is_some() || self.menu_buffer.is_some() {
+            return;
         }
+        match event.button {
+            MouseButton::Right => {
+                cx.stop_propagation();
+                self.phone_place_cursor(event.position, window, cx);
+                cx.defer_in(window, |this, window, cx| this.phone_row_menu(window, cx));
+            }
+            MouseButton::Left if self.phone_surface_is_rows() => {
+                self.phone_place_cursor(event.position, window, cx);
+                self.phone.pending_tap = Some(event.position);
+            }
+            _ => {}
+        }
+    }
+
+    /// The tap that began on a row: `enter` on it, the same row the same
+    /// key opens. A finger that moved away is not a tap.
+    fn phone_pointer_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(down) = self.phone.pending_tap.take() else {
+            return;
+        };
+        if event.button != MouseButton::Left
+            || (event.position - down).magnitude() > TAP_SLOP.as_f32() as f64
+        {
+            return;
+        }
+        cx.defer_in(window, move |this, window, cx| {
+            match &this.active_surface().key {
+                SurfaceKey::Home => this.home_open_row(window, cx),
+                SurfaceKey::SlackList => this.slack_open_row(window, cx),
+                SurfaceKey::SlackResults { .. } | SurfaceKey::SlackInventory(_) => {
+                    this.slack_open_found(window, cx);
+                }
+                SurfaceKey::Note(_) => {
+                    this.note_open_row(window, cx);
+                }
+                SurfaceKey::Draft => this.phone_draft_tap(window, cx),
+                _ => {}
+            }
+            cx.notify();
+        });
+    }
+
+    /// A long press: the menu for the thing under the finger. A message
+    /// has its own; everything else answers with what `⋯` would.
+    fn phone_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.active_surface().view,
+            super::SurfaceView::SlackConversation(_)
+        ) && self.prompt_slack_message_actions(window, cx)
+        {
+            return;
+        }
+        // A Home row is a card: holding it asks for its verdicts.
+        if self.home_in_view()
+            && self.card_in_view(cx).is_some()
+            && self.open_verdict_transient(window, cx)
+        {
+            return;
+        }
+        self.open_phone_context_menu(window, cx);
+    }
+
+    /// `⋯`: what can be done with the thing on screen. The card in the
+    /// feed answers with the verdicts, an agent with its own menu, Slack
+    /// with Slack's; anything else gets the root menu, which reads the
+    /// subject and shows what applies.
+    fn open_phone_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phone.stack.is_empty()
+            && self.open_card_in_view(cx).is_some()
+            && self.open_verdict_transient(window, cx)
+        {
+            return;
+        }
+        let menu = match &self.active_surface().key {
+            SurfaceKey::Transcript(_) | SurfaceKey::Activity(_) => crate::transient::agent_menu(),
+            SurfaceKey::SlackList
+            | SurfaceKey::SlackResults { .. }
+            | SurfaceKey::SlackInventory(_)
+            | SurfaceKey::SlackConversation(_) => crate::transient::slack_menu(),
+            _ => {
+                let subject = self.subject(window, cx);
+                crate::transient::root_menu(&subject)
+            }
+        };
+        self.open_menu(menu, window, cx);
+    }
+
+    /// Whether the reader is typing into the surface: its editor has the
+    /// focus rather than the feed. The bottom bar becomes the composer's
+    /// while they are, on every kind of surface.
+    fn phone_composer_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.minibuffer.is_some() || self.menu_buffer.is_some() {
+            return false;
+        }
+        let (editor, in_composer) = match &self.active_surface().view {
+            super::SurfaceView::Draft { editor } => (editor.clone(), true),
+            super::SurfaceView::Transcript { model, editor } => (
+                editor.clone(),
+                model.read(cx).selection_in_prompt(editor, cx),
+            ),
+            super::SurfaceView::SlackConversation(view) => {
+                let view = view.read(cx);
+                (view.editor().clone(), view.selection_in_compose(cx))
+            }
+            _ => return false,
+        };
+        let focused = editor.focus_handle(cx).is_focused(window);
+        in_composer && focused
+    }
+
+    /// The feed takes the keyboard back, unless a prompt or a menu holds
+    /// it: what they asked is still being answered.
+    pub(super) fn focus_phone_feed(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.minibuffer.is_some() || self.menu_buffer.is_some() {
+            return;
+        }
+        window.focus(&self.phone.feed_focus, cx);
+    }
+
+    /// The echo, as a toast above the bar rather than a line the phone
+    /// has no room for. A verdict's toast carries its undo, so taking a
+    /// verdict back is one tap on the thing that announced it.
+    pub(super) fn render_phone_toast(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let echo = self.echo.as_ref()?;
+        if self.minibuffer.is_some() || self.menu_buffer.is_some() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let undo = match self.phone.transitions.last() {
+            Some(PhoneTransition::Verdict(sequence))
+                if self.attention.last_undo() == Some(*sequence) =>
+            {
+                Some(
+                    div()
+                        .id("phone-toast-undo")
+                        .cursor_pointer()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(colors.element_background)
+                        .text_color(colors.text_accent)
+                        .child("undo")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.undo_verdict(window, cx);
+                            cx.stop_propagation();
+                        })),
+                )
+            }
+            _ => None,
+        };
+        let text = echo.text().lines().next().unwrap_or_default().to_owned();
+        Some(
+            div()
+                .id("phone-toast")
+                .absolute()
+                .left_3()
+                .right_3()
+                .bottom(TARGET_HEIGHT + px(12.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(colors.elevated_surface_background)
+                .border_1()
+                .border_color(colors.border)
+                .text_color(text_style.color)
+                .font_family(text_style.font_family.clone())
+                .text_size(text_style.font_size)
+                .child(div().flex_1().min_w_0().overflow_hidden().child(text))
+                .children(undo)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.echo = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn phone_completed_verdict(&mut self, sequence: u64) {
@@ -981,135 +1543,29 @@ impl Workspace {
         });
     }
 
-    fn render_phone_verdict_bar(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let item = |id: &'static str, icon: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .h_full()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .text_color(colors.text_muted)
-                .child(div().text_size(px(18.)).child(icon))
-                .child(div().text_size(px(11.)).child(label))
-        };
+    fn phone_bar_item(
+        id: &'static str,
+        icon: &'static str,
+        label: &'static str,
+        colors: &theme::ThemeColors,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
-            .id("phone-verdict-bar")
-            .flex_none()
-            .h(TARGET_HEIGHT)
-            .w_full()
+            .id(id)
+            .cursor_pointer()
+            .h_full()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .items_stretch()
-            .border_t_1()
-            .border_color(colors.border_variant)
-            .child(
-                item("phone-verdict-done", "✓", "done").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            rho_journal::PhoneVerdict::Done,
-                            Box::new(crate::DealDone),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
-            )
-            .child(
-                item("phone-verdict-mute", "×", "mute").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            rho_journal::PhoneVerdict::Mute,
-                            Box::new(crate::DealMute),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
-            )
-            .child(
-                // Defer asks how long: the same question the `s` operator's
-                // unit answers on a keyboard.
-                item("phone-verdict-defer", "◷", "defer").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.open_menu(crate::transient::snooze_sheet(), window, cx);
-                    },
-                )),
-            )
-            .child(
-                item("phone-verdict-todo", "○", "todo").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            rho_journal::PhoneVerdict::Todo,
-                            Box::new(crate::DealTodo),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
-            )
-            .child(
-                item("phone-verdict-file", "⌂", "file").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            rho_journal::PhoneVerdict::File,
-                            Box::new(crate::DealFile),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
-            )
-            .child(
-                item("phone-verdict-reply", "↩", "reply").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            rho_journal::PhoneVerdict::Reply,
-                            Box::new(crate::DealReply),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
-            )
-            .into_any_element()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .text_color(colors.text_muted)
+            .child(div().text_size(px(22.)).line_height(px(24.)).child(icon))
+            .child(div().text_size(px(12.)).line_height(px(14.)).child(label))
     }
 
-    pub(super) fn render_phone_bar(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let item = |id: &'static str, icon: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .h_full()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .text_color(colors.text_muted)
-                .child(div().text_size(px(18.)).child(icon))
-                .child(div().text_size(px(11.)).child(label))
-        };
-        let primary = if self.phone_surface().is_some_and(|surface| {
-            matches!(
-                surface.key,
-                super::SurfaceKey::Draft
-                    | super::SurfaceKey::Transcript(_)
-                    | super::SurfaceKey::SlackConversation(_)
-            )
-        }) {
-            Some(
-                item("phone-send", "↑", "send")
-                    .on_click(cx.listener(|this, _, window, cx| this.phone_send(window, cx))),
-            )
-        } else {
-            None
-        };
+    fn phone_bar(colors: &theme::ThemeColors) -> gpui::Stateful<gpui::Div> {
         div()
             .id("phone-bottom-bar")
             .flex_none()
@@ -1119,16 +1575,88 @@ impl Workspace {
             .items_stretch()
             .border_t_1()
             .border_color(colors.border_variant)
+    }
+
+    /// The verdicts, under the card in the feed and nowhere else. The rest
+    /// of them — file, pile, name, wrong card, undo — are one tap further,
+    /// under `⋯`.
+    fn render_phone_verdict_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        Self::phone_bar(colors)
             .child(
-                item("phone-back", "‹", "back")
-                    .on_click(cx.listener(|this, _, window, cx| this.phone_back(window, cx))),
+                Self::phone_bar_item("phone-verdict-done", "✓", "done", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.dispatch_phone_verdict(
+                            rho_journal::PhoneVerdict::Done,
+                            Box::new(crate::DealDone),
+                            window,
+                            cx,
+                        );
+                    }),
+                ),
             )
             .child(
-                item("phone-menu", "☰", "menu").on_click(cx.listener(|this, _, window, cx| {
-                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
-                })),
+                Self::phone_bar_item("phone-verdict-mute", "×", "mute", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.dispatch_phone_verdict(
+                            rho_journal::PhoneVerdict::Mute,
+                            Box::new(crate::DealMute),
+                            window,
+                            cx,
+                        );
+                    }),
+                ),
             )
-            .children(primary)
+            .child(
+                // Defer asks how long: the same question the `s` operator's
+                // unit answers on a keyboard.
+                Self::phone_bar_item("phone-verdict-defer", "◷", "defer", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_menu(crate::transient::snooze_sheet(), window, cx);
+                    }),
+                ),
+            )
+            .child(
+                Self::phone_bar_item("phone-verdict-todo", "○", "todo", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.dispatch_phone_verdict(
+                            rho_journal::PhoneVerdict::Todo,
+                            Box::new(crate::DealTodo),
+                            window,
+                            cx,
+                        );
+                    }),
+                ),
+            )
+            .child(
+                Self::phone_bar_item("phone-verdict-more", "⋯", "more", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_verdict_transient(window, cx);
+                    }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The bar while the reader is writing: put the keyboard away, or
+    /// send. It replaces whatever bar the screen had, so a send is never
+    /// where a verdict was a moment ago while the keyboard is up.
+    fn render_phone_composer_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        Self::phone_bar(colors)
+            .child(
+                Self::phone_bar_item("phone-compose-done", "⌄", "keyboard", colors).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        window.focus(&this.phone.feed_focus, cx);
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                Self::phone_bar_item("phone-send", "↑", "send", colors)
+                    .text_color(colors.text_accent)
+                    .on_click(cx.listener(|this, _, window, cx| this.phone_send(window, cx))),
+            )
             .into_any_element()
     }
 
@@ -1137,24 +1665,16 @@ impl Workspace {
             self.minibuffer_confirm(window, cx);
             return;
         }
-        if self.phone.stack.is_empty() {
-            return;
-        }
-        let Some(surface) = self.phone_surface() else {
-            return;
-        };
-        match surface.key {
-            super::SurfaceKey::Draft | super::SurfaceKey::Transcript(_) => {
+        match &self.active_surface().view {
+            super::SurfaceView::Draft { .. } | super::SurfaceView::Transcript { .. } => {
                 self.submit_prompt(&crate::SubmitPrompt, window, cx)
             }
-            super::SurfaceKey::SlackConversation(_) => {
-                let super::SurfaceView::SlackConversation(view) = surface.view else {
-                    return;
-                };
+            super::SurfaceView::SlackConversation(view) => {
                 // The answer says what Slack made of it, which the journal
                 // wants and the phone has nowhere to put. Dropping it drops
                 // the answer, not the message: the write is detached inside
                 // `submit`.
+                let view = view.clone();
                 drop(view.update(cx, |view, cx| view.submit(cx)));
             }
             _ => {}

@@ -406,6 +406,9 @@ impl Minibuffer {
             .into_any_element()
     }
 
+    /// The prompt as a sheet: the question, a way out, and a way through,
+    /// all as targets a thumb can hit. It sits on the bottom edge, where
+    /// the on-screen keyboard leaves room for it.
     pub(crate) fn render_phone(
         &self,
         text_style: &gpui::TextStyle,
@@ -431,10 +434,19 @@ impl Minibuffer {
                     .w_full()
                     .min_h(px(48.))
                     .px_3()
-                    .child(div().child(candidate.value.clone()));
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(candidate.value.clone()),
+                    );
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
+                            .flex_none()
                             .text_color(colors.text_muted)
                             .child(candidate.description.clone()),
                     );
@@ -444,21 +456,74 @@ impl Minibuffer {
                 }
                 row.on_click(cx.listener(move |workspace, _, window, cx| {
                     workspace.phone_choose_minibuffer(index, window, cx);
+                    cx.stop_propagation();
                 }))
-            });
+            })
+            .collect::<Vec<_>>();
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .flex_none()
+                .min_w(px(64.))
+                .h(px(40.))
+                .px_3()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .child(label)
+        };
         bottom_strip(text_style, cx)
+            .id("phone-minibuffer")
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(48.))
+            .bottom_0()
+            .border_t_1()
+            .border_color(colors.border)
             .key_context("RhoMinibuffer")
+            .on_click(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .gap_2()
                     .min_h(px(48.))
                     .px_3()
-                    .child(div().child(self.prompt.clone()))
+                    .child(
+                        button("phone-minibuffer-cancel", "cancel")
+                            .text_color(colors.text_muted)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::MinibufferCancel), cx);
+                                cx.stop_propagation();
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(colors.text_muted)
+                            .child(self.prompt.clone()),
+                    )
+                    .child(
+                        button("phone-minibuffer-ok", "OK")
+                            .bg(colors.element_background)
+                            .text_color(colors.text_accent)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::MinibufferConfirm), cx);
+                                cx.stop_propagation();
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_h(px(44.))
+                    .px_3()
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
             .children(rows)

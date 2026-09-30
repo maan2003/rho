@@ -799,12 +799,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.open_slack_source_with(
-            source,
-            rho_journal::SurfaceShowMethod::Command,
-            window,
-            cx,
-        );
+        self.open_slack_source_with(source, rho_journal::SurfaceShowMethod::Command, window, cx);
     }
 
     /// `open_slack_source` with how the surface is shown: a dealt card

@@ -183,6 +183,9 @@ pub struct HomeView {
     transcript: Transcript<HomeKey, HomeClass, HomeTarget>,
     editor: Entity<Editor>,
     rows: HomeRows,
+    /// A phone-width Home: a card's title and label on their own lines,
+    /// since one line has room for neither.
+    narrow: bool,
 }
 
 impl HomeView {
@@ -223,6 +226,7 @@ impl HomeView {
             transcript: Transcript::new(buffer),
             editor,
             rows: HomeRows::default(),
+            narrow: false,
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // A Home nobody has told anything yet still answers the question.
@@ -250,6 +254,23 @@ impl HomeView {
             .line_meta(row, cx)
             .cloned()
             .unwrap_or(HomeTarget::None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_at_row_for_test(&self, row: u32, cx: &App) -> HomeTarget {
+        self.transcript
+            .line_meta(row, cx)
+            .cloned()
+            .unwrap_or(HomeTarget::None)
+    }
+
+    pub(crate) fn set_narrow(&mut self, narrow: bool, cx: &mut Context<Self>) {
+        if narrow == self.narrow {
+            return;
+        }
+        self.narrow = narrow;
+        let items = self.items();
+        self.reconcile(items, cx);
     }
 
     pub(crate) fn set_rows(&mut self, rows: HomeRows, cx: &mut Context<Self>) {
@@ -306,7 +327,10 @@ impl HomeView {
             items.push(section("next"));
             let column = column_of(self.rows.next.iter().map(|row| row.title.as_str()));
             for row in &self.rows.next {
-                items.push(card_line(row, column, HomeClass::Title));
+                items.push(match self.narrow {
+                    true => card_lines(row, HomeClass::Title),
+                    false => card_line(row, column, HomeClass::Title),
+                });
             }
         }
         if !self.rows.running.is_empty() {
@@ -393,16 +417,20 @@ fn line(key: HomeKey, text: &str, class: HomeClass) -> Item<HomeKey, HomeClass, 
     Item::new(key, text.to_owned()).with_styles(vec![(class, 0..text.len())])
 }
 
+fn card_label(row: &HomeRow) -> String {
+    match (row.skipped, row.label.is_empty()) {
+        (false, _) => row.label.clone(),
+        (true, true) => "skipped".to_owned(),
+        (true, false) => format!("{} · skipped", row.label),
+    }
+}
+
 fn card_line(
     row: &HomeRow,
     column: usize,
     title_class: HomeClass,
 ) -> Item<HomeKey, HomeClass, HomeTarget> {
-    let label = match (row.skipped, row.label.is_empty()) {
-        (false, _) => row.label.clone(),
-        (true, true) => "skipped".to_owned(),
-        (true, false) => format!("{} · skipped", row.label),
-    };
+    let label = card_label(row);
     let (text, styles) = columns(&[
         (row.title.as_str(), title_class, column),
         (label.as_str(), HomeClass::Label, 0),
@@ -410,6 +438,28 @@ fn card_line(
     Item::new(HomeKey::Card(row.card.clone()), text)
         .with_styles(styles)
         .with_lines(vec![HomeTarget::Card(row.card.clone())])
+}
+
+/// The same row on a phone: the title on one line and the label under it,
+/// both standing for the card, so the cursor on either opens it.
+fn card_lines(row: &HomeRow, title_class: HomeClass) -> Item<HomeKey, HomeClass, HomeTarget> {
+    let label = card_label(row);
+    let mut text = "  ".to_owned();
+    let title_start = text.len();
+    text.push_str(&row.title);
+    let title_end = text.len();
+    let mut styles = vec![(title_class, title_start..title_end)];
+    let mut lines = vec![HomeTarget::Card(row.card.clone())];
+    if !label.is_empty() {
+        text.push_str("\n    ");
+        let label_start = text.len();
+        text.push_str(&label);
+        styles.push((HomeClass::Label, label_start..text.len()));
+        lines.push(HomeTarget::Card(row.card.clone()));
+    }
+    Item::new(HomeKey::Card(row.card.clone()), text)
+        .with_styles(styles)
+        .with_lines(lines)
 }
 
 fn running_line(row: &RunningRow) -> Item<HomeKey, HomeClass, HomeTarget> {

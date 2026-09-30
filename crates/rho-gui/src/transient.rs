@@ -75,6 +75,10 @@ pub(crate) enum Command {
     Quit,
     /// Home, from the verdict menu's own `tab` row.
     Home,
+    /// Every agent the reader manages, to pick one from.
+    Agents,
+    /// Every command in every menu, by name.
+    Palette,
     AgentActivity,
     AgentConversation,
     // Slack.
@@ -606,15 +610,84 @@ pub(crate) fn agent_menu() -> Menu {
         )
 }
 
-pub(crate) fn phone_root_menu() -> Menu {
-    Menu::new("menu")
+/// `☰` on the phone: the same vocabulary as `space` on the desk, in the
+/// order a thumb wants it. Nothing the desk can do is missing; what the
+/// phone has buttons for — back, the verdicts — is not repeated here.
+pub(crate) fn phone_root_menu(subject: &Subject) -> Menu {
+    Menu::new("rho")
         .item(
-            "s",
-            "Slack",
-            MenuAction::Command(Command::SlackConversations),
+            "j",
+            "deal the top card",
+            MenuAction::Command(Command::PullCard),
         )
-        .item("a", "Agents", MenuAction::Open(MenuId::Agent))
-        .item("i", "Status", MenuAction::Open(MenuId::Status))
+        .item("tab", "home", MenuAction::Command(Command::Home))
+        .item("g", "agents…", MenuAction::Command(Command::Agents))
+        .when(
+            subject.has_agent(),
+            "a",
+            "this agent…",
+            MenuAction::Open(MenuId::Agent),
+        )
+        .item("n", "new…", MenuAction::Open(MenuId::New))
+        .item("shift-s", "slack…", MenuAction::Open(MenuId::Slack))
+        .item("shift-f", "find…", MenuAction::Command(Command::FindNode))
+        .item(
+            "shift-n",
+            "notes for this",
+            MenuAction::Command(Command::NotesForThis),
+        )
+        .when(
+            subject.has_made(),
+            "d",
+            "delete this",
+            MenuAction::Command(Command::DeleteMade),
+        )
+        .when(
+            subject.has_label(),
+            "r",
+            "rename/move label…",
+            MenuAction::Command(Command::MoveLabel),
+        )
+        .item(
+            "b",
+            "switch buffer…",
+            MenuAction::Command(Command::SwitchBuffer),
+        )
+        .item(":", "command…", MenuAction::Command(Command::Palette))
+        .item("f", "open file…", MenuAction::Command(Command::OpenFile))
+        .item("t", "terminal", MenuAction::Command(Command::Terminal))
+        .item(
+            "shift-t",
+            "new terminal",
+            MenuAction::Command(Command::NewTerminal),
+        )
+        .item(
+            "c",
+            "start/attach shell",
+            MenuAction::Command(Command::Shell),
+        )
+        .item(
+            "shift-c",
+            "close shell",
+            MenuAction::Command(Command::ShellClose),
+        )
+        .item("w", "agent desktop", MenuAction::Command(Command::Wayland))
+        .item("i", "input…", MenuAction::Open(MenuId::Input))
+        .item(
+            "m",
+            "voice microphone · mute/unmute",
+            MenuAction::Command(Command::Voice),
+        )
+        .item("l", "message log", MenuAction::Command(Command::MessageLog))
+        .item(
+            "shift-u",
+            "undo verdict",
+            MenuAction::Command(Command::UndoVerdict),
+        )
+        .item("p", "projects…", MenuAction::Open(MenuId::Projects))
+        .item("h", "hosts…", MenuAction::Open(MenuId::Hosts))
+        .item("s", "status…", MenuAction::Open(MenuId::Status))
+        .item("q", "quit", MenuAction::Command(Command::Quit))
 }
 
 /// The phone's answer to "how long": the times a thumb picks, where a
