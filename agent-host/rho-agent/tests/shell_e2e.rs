@@ -4,7 +4,6 @@
 //! thread, including the test harness's.
 
 use std::sync::Arc;
-#[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 
 use rho_agent::worker::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};

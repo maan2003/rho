@@ -1768,6 +1768,9 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
         process.fail_shutdown_reply(first_id);
+        // Resumed only once the failing reply is queued, so the worker exits
+        // on its own rather than after the kill grace.
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
         tokio::time::timeout(Duration::from_secs(10), shutdown)
             .await
             .unwrap()

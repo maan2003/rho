@@ -8,3 +8,10 @@ slow-timeout = { period = "5s", terminate-after = 1 }
 # beyond ten real seconds; MoQ cache expiry uses a wall clock.
 filter = 'package(rho-desktop-media) & test(actively_consumed_group_outlives_ten_seconds_of_cache_age)'
 slow-timeout = { period = "20s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# The native agent loop runs a real notebook against the wall clock: every
+# human message waits out its two-second wake debounce, and transient
+# failures back off 1+1+2+3 seconds.
+filter = 'package(rho-agent) & test(/^worker::native::tests::/)'
+slow-timeout = { period = "20s", terminate-after = 1 }

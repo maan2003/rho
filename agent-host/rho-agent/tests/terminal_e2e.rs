@@ -3,7 +3,6 @@
 //! identity user namespace must precede every thread.
 
 use std::sync::Arc;
-#[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 
 use rho_agent::worker::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
