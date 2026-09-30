@@ -517,14 +517,6 @@ fn forbidden() -> Response {
         .into_response()
 }
 
-fn allowed_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
-}
-
 fn sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -757,11 +749,7 @@ async fn get_review_decision(
     Path((owner, repo, number)): Path<(String, String, String)>,
     uri: Uri,
 ) -> Response {
-    if uri.query().is_some()
-        || !allowed_segment(&owner)
-        || !allowed_segment(&repo)
-        || !positive(&number)
-    {
+    if uri.query().is_some() || !positive(&number) {
         return forbidden();
     }
     let Ok(number) = number.parse::<i32>() else {
@@ -1300,11 +1288,15 @@ mod tests {
                         (StatusCode::OK, Json(result)).into_response()
                     }
                     (Method::POST, "/graphql") => {
-                        assert_eq!(input["variables"]["owner"], "acme");
-                        assert_eq!(input["variables"]["repo"], "widgets");
-                        assert!(input["query"].as_str().unwrap().contains("reviewDecision"));
+                        if input["variables"]["number"] == 45 {
+                            assert_eq!(input["variables"], json!({"owner":"acme\"","repo":"widgets/odd","number":45}));
+                        } else {
+                            assert_eq!(input["variables"]["owner"], "acme");
+                            assert_eq!(input["variables"]["repo"], "widgets");
+                        }
+                        assert_eq!(input["query"], "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewDecision } } }");
                         let result = match input["variables"]["number"].as_u64().unwrap() {
-                            42 => json!({"data":{"repository":{"pullRequest":{
+                            42 | 45 => json!({"data":{"repository":{"pullRequest":{
                                 "reviewDecision":"REVIEW_REQUIRED","ignored":"hidden"}}},"ignored":"hidden"}),
                             43 => json!({"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}),
                             44 => json!({"errors":[{"message":"Permission denied"}]}),
@@ -1370,6 +1362,19 @@ mod tests {
             decision.json::<Value>().await.unwrap(),
             json!({"review_decision":"REVIEW_REQUIRED"})
         );
+        let unusual_names = client
+            .get(format!(
+                "{}/repos/acme%22/widgets%2Fodd/pulls/45/review-decision",
+                base.split("/repos/").next().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unusual_names.status(), StatusCode::OK);
+        assert_eq!(
+            unusual_names.json::<Value>().await.unwrap(),
+            json!({"review_decision":"REVIEW_REQUIRED"})
+        );
         assert_eq!(
             client
                 .get(format!("{base}/review-decision?query=x"))
@@ -1379,7 +1384,7 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
         proxy_task.abort();
         upstream_task.abort();
     }
@@ -1669,11 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn path_segments_cannot_escape_the_selected_route() {
-        for segment in ["..", ".", "main/secret", "main%2Fsecret"] {
-            assert!(!allowed_segment(segment));
-        }
-        assert!(allowed_segment("rho.fix"));
+    fn workflow_head_sha_requires_a_commit_sha() {
         assert!(!sha("main"));
         assert!(sha(&"a".repeat(40)));
     }
