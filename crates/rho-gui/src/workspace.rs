@@ -4436,6 +4436,9 @@ impl Workspace {
         }
         // Home is not a card on the phone: it is what the feed shows when
         // there is nothing to deal, so it never joins the stack.
+        if self.phone.enabled {
+            self.phone_prose_font(&surface, cx);
+        }
         if self.phone.enabled && surface.key != SurfaceKey::Home {
             if method == rho_journal::SurfaceShowMethod::Deal {
                 self.phone
@@ -5891,6 +5894,18 @@ impl Workspace {
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::Agents => self.open_agents_list(window, cx),
             Command::Palette => self.open_command_palette(window, cx),
+            Command::CopySelection => {
+                self.active_editor(cx).update(cx, |editor, cx| {
+                    editor.copy(&editor::actions::Copy, window, cx);
+                });
+                self.echo("copied", StyleClass::SystemInfo, cx);
+            }
+            Command::SelectAll => {
+                self.active_editor(cx).update(cx, |editor, cx| {
+                    editor.select_all(&editor::actions::SelectAll, window, cx);
+                });
+            }
+            Command::PhoneMore => self.open_phone_context_menu(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
             Command::AgentActivity => self.open_agent_view(TranscriptView::Activity, window, cx),
             Command::AgentConversation => {
@@ -7977,8 +7992,14 @@ impl Render for Workspace {
                 .into_any_element();
         }
         let editor = self.active_editor(cx);
-        let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
+        let mut text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let phone = self.phone_mode(window, cx);
+        // The chrome reads in the surface's face on the desk, where that is
+        // always the buffer font. On the phone the surfaces differ, and the
+        // bars and sheets around them keep to the prose face.
+        if phone {
+            text_style.font_family = rho_window::style::PROSE_FONT_FAMILY.into();
+        }
         div()
             .id("rho-gui")
             .relative()
@@ -8407,7 +8428,7 @@ impl Render for Workspace {
                     // overlay to draw. Without this arm the phone opens a menu
                     // nobody can see — the buffer has no block on purpose.
                     (None, None) if phone && self.menu_buffer.is_some() => {
-                        self.render_phone_menu_sheet(&text_style, cx)
+                        self.render_phone_menu_sheet(&text_style, window.viewport_size().height, cx)
                     }
                     (None, None) => None,
                 },

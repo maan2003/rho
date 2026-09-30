@@ -536,6 +536,10 @@ impl TextStyle {
             self.strikethrough = Some(strikethrough);
         }
 
+        if let Some(font_family) = style.font_family {
+            self.font_family = SharedString::new_static(font_family);
+        }
+
         self
     }
 
@@ -598,6 +602,11 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// The font family, for a run set in a different face than the text
+    /// around it: code inside prose, say. A static name, so the style stays
+    /// `Copy`; a family read from settings is leaked once by its caller.
+    pub font_family: Option<&'static str>,
 }
 
 impl Eq for HighlightStyle {}
@@ -613,6 +622,7 @@ impl Hash for HighlightStyle {
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
+        self.font_family.hash(state);
     }
 }
 
@@ -905,6 +915,7 @@ impl From<TextStyle> for HighlightStyle {
 impl From<&TextStyle> for HighlightStyle {
     fn from(other: &TextStyle) -> Self {
         Self {
+            font_family: None,
             color: Some(other.color),
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
@@ -952,6 +963,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            font_family: other.font_family.or(self.font_family),
         }
     }
 }

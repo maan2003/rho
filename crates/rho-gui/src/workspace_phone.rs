@@ -6,8 +6,8 @@
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, FocusHandle, Focusable as _,
-    MouseButton, MouseDownEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div,
-    ease_out_quint, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase,
+    Window, div, ease_out_quint, px,
 };
 use theme::ActiveTheme as _;
 
@@ -23,6 +23,8 @@ const FLICK_SLOP: f32 = 12.;
 const FLICK_COMMIT_VELOCITY: f32 = 900.;
 const SNAP_DURATION: std::time::Duration = std::time::Duration::from_millis(180);
 const PHONE_DEAL_HEADER_FIXED_GUTTER: Pixels = px(24.);
+/// The share of the window a menu sheet may take.
+const SHEET_MAX_HEIGHT: f32 = 0.82;
 
 fn phone_deal_header_text(
     path: &str,
@@ -171,6 +173,16 @@ pub(super) struct PhoneUi {
     pub(super) feed_focus: FocusHandle,
     /// Where a tap on rows went down, until it comes up.
     pending_tap: Option<Point<Pixels>>,
+    /// A long press on prose is selecting: the finger extends what it
+    /// took, and lifting asks what to do with it.
+    selecting: bool,
+    /// Where the menu sheet's rows are scrolled to, so the foot can say
+    /// whether more lie below.
+    sheet_scroll: gpui::ScrollHandle,
+    /// The height the body was last drawn at. The keyboard takes the
+    /// bottom of the window, and the composer has to follow the cursor
+    /// up when it does.
+    viewport_height: Pixels,
     /// The cards a flick would reach, read when the finger goes down so
     /// the one being dragged toward can show under the feed card. `next`
     /// is the dealer's next; `previous` is where a flick down would land.
@@ -205,6 +217,9 @@ impl PhoneUi {
             feed_retry: false,
             feed_focus: cx.focus_handle(),
             pending_tap: None,
+            selecting: false,
+            sheet_scroll: gpui::ScrollHandle::new(),
+            viewport_height: Pixels::ZERO,
             peek: PhonePeek::default(),
         }
     }
@@ -307,6 +322,7 @@ impl Workspace {
                 cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
             }
             self.update_statuses(cx);
+            self.phone_prose_font_everywhere(cx);
             if let Some(home) = self.home_view() {
                 home.update(cx, |home, cx| home.set_narrow(true, cx));
             }
@@ -334,6 +350,7 @@ impl Workspace {
             self.phone.drag_offset = Pixels::ZERO;
             self.phone.snap = None;
             self.update_statuses(cx);
+            self.phone_prose_font_everywhere(cx);
             if let Some(home) = self.home_view() {
                 home.update(cx, |home, cx| home.set_narrow(false, cx));
             }
@@ -579,6 +596,9 @@ impl Workspace {
                     && self.phone.stack.is_empty()
                     && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
                     && self.minibuffer.is_none()
+                    // A sheet is open: the finger scrolls it, not the deal
+                    // under it.
+                    && self.menu_buffer.is_none()
                 {
                     let edge = if self.open_card_in_view(cx).is_some() {
                         self.phone_deal_scroll_edge(cx)
@@ -992,6 +1012,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composing = self.phone_composer_focused(window, cx);
+        let height = window.viewport_size().height;
+        if self.phone.viewport_height != height {
+            self.phone.viewport_height = height;
+            // The keyboard came up under the composer: the line being typed
+            // has to stay above it, wherever the window's new bottom is.
+            if composing {
+                self.active_editor(cx).update(cx, |editor, cx| {
+                    editor.request_autoscroll(editor::scroll::Autoscroll::fit(), cx);
+                });
+            }
+        }
         if self.phone.stack.is_empty()
             && let Some(card) = self.open_card_in_view(cx)
         {
@@ -1018,6 +1049,7 @@ impl Workspace {
                         .capture_touch(cx.listener(Self::phone_touch))
                         .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
                         .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
+                        .on_mouse_move(cx.listener(Self::phone_pointer_move))
                         .flex_1()
                         .min_h_0()
                         .w_full()
@@ -1051,6 +1083,7 @@ impl Workspace {
                         .capture_touch(cx.listener(Self::phone_touch))
                         .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
                         .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
+                        .on_mouse_move(cx.listener(Self::phone_pointer_move))
                         .flex_1()
                         .min_h_0()
                         .w_full();
@@ -1107,6 +1140,7 @@ impl Workspace {
                     .overflow_hidden()
                     .capture_any_mouse_down(cx.listener(Self::phone_pointer_down))
                     .capture_any_mouse_up(cx.listener(Self::phone_pointer_up))
+                    .on_mouse_move(cx.listener(Self::phone_pointer_move))
                     .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
                     .child(self.render_surface(&surface)),
             )
@@ -1189,6 +1223,57 @@ impl Workspace {
                 | SurfaceKey::Note(_)
                 | SurfaceKey::Draft
         )
+    }
+
+    /// Surfaces that are read: a long press on them selects the word under
+    /// the finger rather than asking for a row's menu.
+    fn phone_surface_is_prose(&self) -> bool {
+        matches!(
+            self.active_surface().key,
+            SurfaceKey::Transcript(_)
+                | SurfaceKey::Activity(_)
+                | SurfaceKey::SlackConversation(_)
+                | SurfaceKey::Note(_)
+                | SurfaceKey::Messages
+                | SurfaceKey::Draft
+                | SurfaceKey::File { .. }
+        )
+    }
+
+    /// The editor a surface reads in, if what it shows is prose: on the
+    /// phone that is set in the proportional face, which fits more of a
+    /// sentence on a narrow line. Home is the cards' titles, so it reads
+    /// the same way. Files are code and keep the buffer face, as do the
+    /// Slack lists, whose rows line up in columns; code inside prose keeps
+    /// it through its highlight.
+    pub(super) fn phone_prose_font(&self, surface: &Surface, cx: &mut App) {
+        let editor = match &surface.view {
+            super::SurfaceView::Note(editor) | super::SurfaceView::Messages(editor) => {
+                editor.clone()
+            }
+            super::SurfaceView::Draft { editor }
+            | super::SurfaceView::Transcript { editor, .. } => editor.clone(),
+            super::SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
+            super::SurfaceView::Home(view) => view.read(cx).editor().clone(),
+            _ => return,
+        };
+        let family = self
+            .phone
+            .enabled
+            .then(|| rho_window::style::PROSE_FONT_FAMILY.into());
+        editor.update(cx, |editor, _| {
+            editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                font_family: family,
+                ..Default::default()
+            });
+        });
+    }
+
+    fn phone_prose_font_everywhere(&self, cx: &mut App) {
+        let surfaces: Vec<Surface> = self.surfaces.values().flatten().cloned().collect();
+        for surface in &surfaces {
+            self.phone_prose_font(surface, cx);
+        }
     }
 
     /// A tap in the draft: a header field asks its question as a prompt
@@ -1296,6 +1381,20 @@ impl Workspace {
         match event.button {
             MouseButton::Right => {
                 cx.stop_propagation();
+                if self.phone_surface_is_prose() {
+                    // The finger is selecting now, not flicking.
+                    self.phone.flick = None;
+                    self.phone.drag_offset = Pixels::ZERO;
+                    let position = event.position;
+                    let selecting = self.active_editor(cx).update(cx, |editor, cx| {
+                        editor.begin_touch_selection(position, window, cx)
+                    });
+                    if selecting {
+                        self.phone.selecting = true;
+                        cx.notify();
+                        return;
+                    }
+                }
                 self.phone_place_cursor(event.position, window, cx);
                 cx.defer_in(window, |this, window, cx| this.phone_row_menu(window, cx));
             }
@@ -1307,14 +1406,44 @@ impl Workspace {
         }
     }
 
+    /// The finger that pressed long is still down and moving: the
+    /// selection follows it, a word at a time, the way a drag after a
+    /// double click does on the desk.
+    fn phone_pointer_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.phone.selecting || event.pressed_button != Some(MouseButton::Right) {
+            return;
+        }
+        let position = event.position;
+        self.active_editor(cx).update(cx, |editor, cx| {
+            editor.extend_touch_selection(position, window, cx);
+        });
+    }
+
     /// The tap that began on a row: `enter` on it, the same row the same
-    /// key opens. A finger that moved away is not a tap.
+    /// key opens. A finger that moved away is not a tap. The finger that
+    /// was selecting lifts: the selection is done and the sheet asks what
+    /// to do with it.
     fn phone_pointer_up(
         &mut self,
         event: &gpui::MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Right && std::mem::take(&mut self.phone.selecting) {
+            cx.stop_propagation();
+            self.active_editor(cx).update(cx, |editor, cx| {
+                editor.end_touch_selection(window, cx);
+            });
+            cx.defer_in(window, |this, window, cx| {
+                this.open_phone_selection_menu(window, cx)
+            });
+            return;
+        }
         let Some(down) = self.phone.pending_tap.take() else {
             return;
         };
@@ -1360,23 +1489,48 @@ impl Workspace {
         self.open_phone_context_menu(window, cx);
     }
 
+    /// What a selection can do, then what the message it is in can: a
+    /// Slack message's own actions follow on the same sheet, so holding a
+    /// message still reaches them.
+    fn open_phone_selection_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut menu = crate::transient::selection_menu();
+        if let super::SurfaceView::SlackConversation(view) = &self.active_surface().view
+            && let Some(actions) = view.clone().update(cx, |view, cx| view.message_actions(cx))
+        {
+            menu = menu.append(crate::transient::slack_message_menu(&actions));
+        }
+        self.open_menu(menu, window, cx);
+    }
+
     /// `⋯`: what can be done with the thing on screen. The card in the
     /// feed answers with the verdicts, an agent with its own menu, Slack
     /// with Slack's; anything else gets the root menu, which reads the
     /// subject and shows what applies.
-    fn open_phone_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_phone_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.phone.stack.is_empty()
             && self.open_card_in_view(cx).is_some()
             && self.open_verdict_transient(window, cx)
         {
             return;
         }
+        // The desk reaches every command with `:` from any menu; the phone
+        // has no key for that, so the subject's own menu ends with the row
+        // the root menu has.
+        let everything = |menu: crate::transient::Menu| {
+            menu.item(
+                ":",
+                "all commands…",
+                crate::transient::MenuAction::Command(crate::transient::Command::Palette),
+            )
+        };
         let menu = match &self.active_surface().key {
-            SurfaceKey::Transcript(_) | SurfaceKey::Activity(_) => crate::transient::agent_menu(),
+            SurfaceKey::Transcript(_) | SurfaceKey::Activity(_) => {
+                everything(crate::transient::agent_menu())
+            }
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackInventory(_)
-            | SurfaceKey::SlackConversation(_) => crate::transient::slack_menu(),
+            | SurfaceKey::SlackConversation(_) => everything(crate::transient::slack_menu()),
             _ => {
                 let subject = self.subject(window, cx);
                 crate::transient::root_menu(&subject)
@@ -1686,6 +1840,7 @@ impl Workspace {
     pub(super) fn render_phone_menu_sheet(
         &self,
         text_style: &gpui::TextStyle,
+        viewport_height: Pixels,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let crate::workspace::MenuSheet {
@@ -1694,6 +1849,13 @@ impl Workspace {
             has_back: has_parent,
         } = self.menu_sheet()?;
         let colors = cx.theme().colors();
+        // More rows than the sheet shows: say so at its foot until the
+        // reader has scrolled to the last one, or it is never found. The
+        // header is one row's height.
+        let scroll = &self.phone.sheet_scroll;
+        let overflows = TARGET_HEIGHT * (rows.len() + 1) as f32
+            > viewport_height * SHEET_MAX_HEIGHT
+            && -scroll.offset().y < scroll.max_offset().y - px(1.);
 
         let mut header = div()
             .flex()
@@ -1792,9 +1954,10 @@ impl Workspace {
                 .child(
                     div()
                         .id("phone-sheet")
-                        .max_h(gpui::relative(0.82))
+                        .max_h(gpui::relative(SHEET_MAX_HEIGHT))
                         .w_full()
-                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
                         .bg(background)
                         .text_color(text_style.color)
                         .font_family(text_style.font_family.clone())
@@ -1803,8 +1966,26 @@ impl Workspace {
                         .line_height(text_style.line_height)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(header)
-                        .children(rows),
+                        .child(
+                            div()
+                                .id("phone-sheet-rows")
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .overflow_y_scroll()
+                                .track_scroll(scroll)
+                                .child(header)
+                                .children(rows),
+                        )
+                        .children(overflows.then(|| {
+                            div()
+                                .id("phone-sheet-more")
+                                .w_full()
+                                .py_1()
+                                .text_center()
+                                .text_color(colors.text_muted)
+                                .child("⌄ more")
+                        })),
                 )
                 .into_any_element(),
         )

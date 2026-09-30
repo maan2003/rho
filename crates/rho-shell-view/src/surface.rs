@@ -828,6 +828,7 @@ fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle
         background = Some(old_foreground);
     }
     HighlightStyle {
+        font_family: None,
         color: Some(foreground),
         background_color: background,
         font_weight: style.bold.then_some(FontWeight::BOLD),

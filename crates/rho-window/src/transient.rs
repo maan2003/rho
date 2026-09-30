@@ -155,6 +155,13 @@ impl<A> Transient<A> {
         }
     }
 
+    /// The other menu's rows after this one's: a sheet that offers what a
+    /// selection can do and then what the message under it can.
+    pub fn append(mut self, other: Self) -> Self {
+        self.items.extend(other.items);
+        self
+    }
+
     fn push(
         mut self,
         key: impl Into<String>,

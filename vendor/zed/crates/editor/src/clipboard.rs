@@ -573,7 +573,7 @@ impl Editor {
         self.do_copy(true, cx);
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         self.do_copy(false, cx);
     }
 

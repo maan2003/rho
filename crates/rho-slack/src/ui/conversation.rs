@@ -31,6 +31,11 @@ use crate::mirror::{Draft, DraftFile};
 use crate::model::Model;
 use crate::session::{Session, Source, Update};
 use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
+
+/// The bundled buffer face, which code is set in whatever face the prose
+/// around it takes. The same name `rho-window` gives it; this crate does
+/// not see that one.
+const CODE_FONT_FAMILY: &str = "Rho Font";
 use crate::ui::{Class, Hooks, Span, crosses_day, day_label, lay_out};
 
 /// Custom inlay zero belongs to the composer; edit markers use subsequent ids.
@@ -2370,6 +2375,9 @@ impl ConversationView {
         let code_style = gpui::HighlightStyle {
             color: Some(colors.terminal_ansi_yellow.into()),
             background_color: Some(colors.element_background.into()),
+            // Code keeps the buffer face when the prose around it is set in
+            // another, as it is on a phone.
+            font_family: Some(CODE_FONT_FAMILY),
             ..Default::default()
         };
         let mention_style = gpui::HighlightStyle {
@@ -2464,6 +2472,15 @@ impl ConversationView {
                 cx,
             );
             editor.clear_row_highlights::<CodeBlockRows>();
+            editor.highlight_text(
+                editor::HighlightKey::SyntaxTreeView(usize::MAX - 606),
+                code_blocks.clone(),
+                gpui::HighlightStyle {
+                    font_family: Some(CODE_FONT_FAMILY),
+                    ..Default::default()
+                },
+                cx,
+            );
             for range in code_blocks {
                 editor.highlight_rows::<CodeBlockRows>(
                     range,
