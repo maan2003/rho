@@ -48,3 +48,8 @@ tokio = { workspace = true, features = ["sync", "io-util", "macros", "rt"], opti
 [dev-dependencies]
 # The tests exercise the client too.
 rho-shell-view = { path = ".", features = ["client"] }
+
+assets = { path = "../../vendor/zed/crates/assets" }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
+settings = { path = "../../vendor/zed/crates/settings" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }

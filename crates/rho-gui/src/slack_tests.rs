@@ -4669,3 +4669,138 @@ async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAp
         })
         .unwrap();
 }
+
+/// Sending from the pinned touch composer changes the root's reply chrome in
+/// the retained parent view as well as appending a message in the thread.
+#[gpui::test]
+async fn touch_thread_send_keeps_loaded_parent_block_geometry(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, ThreadKey, Ts};
+    cx.update(init_test_app);
+    cx.update(|cx| cx.set_global(rho_window::TouchMode(true)));
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_user_named("UD", "david", "David");
+    fake.add_user_named("UK", "keith", "Keith");
+    fake.add_group("G1", "mpdm-david--manmeet--keith-1", &["ME", "UD", "UK"]);
+    fake.add_emoji("forrest_gump_wave", "the fake serves its deterministic PNG");
+    fake.add_emoji_alias("wave_alias", "forrest_gump_wave");
+    let root = "1790247780.000000";
+    // The bounded reference G1 conversation: emoji folds, code/quote rows,
+    // reactions, images and enough retained Below blocks to expose the tail.
+    let fixture = r#"[
+{"ts":"1790247780.000000","user":"UD","text":"kicking this off :thumbsup: :forrest_gump_wave: alias :wave_alias:"},
+{"ts":"1790247840.000000","user":"UK","text":"*bold*, _italic_, ~struck~, `inline code`"},
+{"ts":"1790247960.000000","user":"UK","text":"```\nfn main() {\n    println!(\"hi\");\n}\n```"},
+{"ts":"1790248140.000000","user":"UD","text":"> the quote line\nand a list:\n- first\n- second\n1. numbered"},
+{"ts":"1790248320.000000","user":"UD","text":"docs are at <https://example.com/spec|the spec>, see <#C1|design>"},
+{"ts":"1790248440.000000","user":"UK","text":"<!here> and <!subteam^S1|@design-team> and <!date^1756800000^{date_short} at {time}|Sep 2 at 08:00>"},
+{"ts":"1790432400.000000","user":"UD","text":"can we settle the release date? <@ME>","reply_count":3,"reply_users_count":2,"latest_reply":"1790433660.000000","reply_users":["UK","ME"],"reactions":[{"name":"thumbsup","users":["UK","ME"],"count":2},{"name":"tada","users":["UD"],"count":1},{"name":"wave_alias","users":["UK"],"count":1}]},
+{"ts":"1790433660.000000","thread_ts":"1790432400.000000","user":"UK","subtype":"thread_broadcast","text":"settled: friday"},
+{"ts":"1790499720.000000","user":"UK","subtype":"channel_join","text":"<@UK> has joined the channel"},
+{"ts":"1790502000.000000","user":"UD","text":"here is the mock","files":[{"id":"F1","name":"image.png","title":"image.png","mimetype":"image/png","filetype":"png","size":225280,"url_private":"FAKE_BASE/files/image.png","original_w":320,"original_h":200,"thumb_64":"FAKE_BASE/thumbs/image.png"}]},
+{"ts":"1790502060.000000","user":"UD","text":"and the review deck","files":[{"id":"FPDF","name":"review.pdf","title":"review.pdf","mimetype":"application/pdf","filetype":"pdf","size":96,"url_private":"FAKE_BASE/files/FPDF/review.pdf"}]},
+{"ts":"1790502240.000000","user":"UD","text":"and one it never measured","files":[{"id":"F2","name":"tall.png","title":"tall.png","mimetype":"image/png","filetype":"png","size":196608,"url_private":"FAKE_BASE/files/tall.png"}]},
+{"ts":"1790698800.000000","bot_id":"B1","username":"deploybot","bot_profile":{"id":"B1","name":"deploybot","icons":{"image_48":"FAKE_BASE/avatars/botav.png"}},"text":"deploy finished","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*deploy finished* in 4m12s"}},{"type":"actions","block_id":"deploy","elements":[{"type":"button","action_id":"approve","value":"yes","text":{"type":"plain_text","text":"Approve"},"confirm":{"title":{"type":"plain_text","text":"Approve deployment?"},"text":{"type":"mrkdwn","text":"This sends approval to deploybot."},"confirm":{"type":"plain_text","text":"Approve"},"deny":{"type":"plain_text","text":"Cancel"}}},{"type":"overflow","action_id":"more","options":[{"text":{"type":"plain_text","text":"Retry"},"value":"retry"},{"text":{"type":"plain_text","text":"Cancel deploy"},"value":"cancel"}]},{"type":"datepicker","action_id":"schedule","placeholder":{"type":"plain_text","text":"Schedule"}},{"type":"users_select","action_id":"owner","placeholder":{"type":"plain_text","text":"Choose owner"}},{"type":"channels_select","action_id":"announce","placeholder":{"type":"plain_text","text":"Choose channel"}},{"type":"conversations_select","action_id":"destination","placeholder":{"type":"plain_text","text":"Choose destination"}},{"type":"external_select","action_id":"ticket","min_query_length":3,"placeholder":{"type":"plain_text","text":"Choose incident"}},{"type":"button","action_id":"open_details","text":{"type":"plain_text","text":"Add details"}},{"type":"button","action_id":"open_modal","text":{"type":"plain_text","text":"Deploy release"}}]}],"attachments":[{"title":"build #412","pretext":"pipeline","text":"all checks passed","fallback":"build #412 passed","fields":[{"title":"branch","value":"main","short":true},{"title":"duration","value":"4m12s","short":true}]}]},
+{"ts":"1790700060.000000","user":"UD","text":"<https://example.com/post|worth a read>","attachments":[{"is_msg_unfurl":true,"title":"Worth a read","text":"A long preview body that should never reach the buffer.","fallback":"Worth a read"}]},
+{"ts":"1790762400.000000","user":"UK","text":"morning! :wave:"},
+{"ts":"1790762520.000000","user":"UD","text":"<@ME> can you take the release notes today?"}
+]"#
+        .replace("FAKE_BASE", fake.api_base().trim_end_matches("/api"));
+    for message in serde_json::from_str::<Vec<serde_json::Value>>(&fixture).unwrap() {
+        fake.add_message("G1", message);
+    }
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+    let parent = cx.open_window(gpui::size(gpui::px(390.), gpui::px(594.)), |window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            Source::Conversation(ChannelId("G1".into())),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    until(&session, parent, cx, "the parent history", |view, _, cx| {
+        (view.transcript_text_for_test(cx).contains("the quote line")
+            && view.emoji_decoration_count_for_test() == 2
+            && matches!(
+                view.session().read(cx).status(),
+                rho_slack::session::Status::Connected
+            ))
+        .then_some(())
+    })
+    .await;
+    parent
+        .update(cx, |view, window, cx| {
+            view.display_text_for_test(cx);
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+    let thread = cx.open_window(gpui::size(gpui::px(390.), gpui::px(594.)), |window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            Source::Thread(ThreadKey {
+                workspace: rho_slack::WorkspaceName("acme".into()),
+                channel: ChannelId("G1".into()),
+                thread_ts: Ts(root.into()),
+            }),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    until(&session, thread, cx, "the thread root", |view, _, cx| {
+        view.transcript_text_for_test(cx)
+            .contains("kicking this off")
+            .then_some(())
+    })
+    .await;
+    let send = thread
+        .update(cx, |view, window, cx| {
+            view.select_compose(window, cx);
+            view.set_compose_for_test("touch regression reply 137".into(), cx);
+            view.submit(cx)
+        })
+        .unwrap();
+    assert_eq!(send.await, rho_slack::ui::conversation::Submitted::Sent);
+    until(&session, thread, cx, "the posted reply", |view, _, cx| {
+        view.transcript_text_for_test(cx)
+            .contains("touch regression reply 137")
+            .then_some(())
+    })
+    .await;
+    until(
+        &session,
+        parent,
+        cx,
+        "the parent's updated reply chrome",
+        |view, window, cx| {
+            let grown = view
+                .session()
+                .read(cx)
+                .loaded(&Source::Conversation(ChannelId("G1".into())))
+                .and_then(|loaded| loaded.messages.iter().find(|message| message.ts.0 == root))
+                .is_some_and(|message| message.reply_count > 0);
+            view.display_text_for_test(cx);
+            window.simulate_next_frame(cx);
+            grown.then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        fake.posted().last().unwrap().text,
+        "touch regression reply 137"
+    );
+}

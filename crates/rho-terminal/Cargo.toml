@@ -17,6 +17,7 @@ client = [
   "dep:futures",
   "dep:gpui",
   "dep:rho-agent-hosts",
+  "dep:rho-window",
   "dep:settings",
   "dep:theme",
   "dep:theme_settings",
@@ -31,6 +32,7 @@ anyhow = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
+rho-window = { workspace = true, optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = true }
@@ -38,3 +40,6 @@ theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = t
 [dev-dependencies]
 # The tests exercise the client too.
 rho-terminal = { path = ".", features = ["client"] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
+assets = { path = "../../vendor/zed/crates/assets" }
+tokio.workspace = true

@@ -1215,6 +1215,22 @@ impl BlockMap {
             // * Coalesce edits that intersect the same transform
             let mut old_end = edit.old.end;
             let mut new_end = edit.new.end;
+            // Below/Near blocks are anchored anywhere on a logical line but
+            // placed after its last soft-wrap row. A partial-line edit can
+            // enumerate that anchor while retaining the line's tail; rebuild
+            // the whole line so the block cannot consume that tail twice.
+            if new_end <= max_point.row()
+                && wrap_snapshot
+                    .to_point(WrapPoint::new(new_end, 0), Bias::Left)
+                    .column
+                    > 0
+            {
+                let line_end = wrap_snapshot
+                    .next_row_boundary(WrapPoint::new(new_end, 0))
+                    .unwrap_or(max_point.row() + WrapRow(1));
+                old_end += line_end - new_end;
+                new_end = line_end;
+            }
             // Rows of a split isomorphic transform that lie past the edit.
             // They are pushed back unchanged once the edited region is
             // rebuilt, and the cursor steps over the transform then.

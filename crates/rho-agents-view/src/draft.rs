@@ -19,11 +19,12 @@ use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Subscription, WeakEntity, Window};
+use gpui::{Context, Entity, Focusable, Subscription, WeakEntity, Window, div, px};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agent_types::ContentPart;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
+use theme::ActiveTheme as _;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
@@ -243,6 +244,64 @@ impl DraftModel {
         editor
     }
 
+    /// A direct-touch projection. Each editor contains exactly one of the
+    /// canonical buffers, so tapping a field cannot land in the message.
+    pub fn build_phone_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<PhoneDraft> {
+        let fields = Fields {
+            workdir: self.workdir_buffer.entity_id(),
+            role: self.role_buffer.entity_id(),
+            start: self.start_buffer.entity_id(),
+        };
+        let editors = [
+            self.workdir_buffer.clone(),
+            self.role_buffer.clone(),
+            self.start_buffer.clone(),
+            self.body_buffer.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, buffer)| {
+            let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let hooks = self.hooks.clone();
+            cx.new(|cx| {
+                let mode = if index == 3 {
+                    EditorMode::AutoHeight {
+                        min_lines: 4,
+                        max_lines: Some(6),
+                    }
+                } else {
+                    EditorMode::SingleLine
+                };
+                let mut editor = Editor::new(mode, multi_buffer, None, window, cx);
+                rho_window::editor_config::configure(&mut editor, window, cx);
+                editor.set_show_compact_gutter(false, cx);
+                editor.set_mouse_click_selection_enabled(true, cx);
+                if index == 3 {
+                    editor.set_placeholder_text("Write a message…", window, cx);
+                }
+                (hooks.0)(&mut editor, fields, window, cx);
+                editor
+            })
+        })
+        .collect::<Vec<_>>();
+        let model = cx.entity();
+        cx.new(|cx| PhoneDraft {
+            _subscription: cx.observe(&model, |_, _, cx| cx.notify()),
+            model,
+            workdir: editors[0].clone(),
+            role: editors[1].clone(),
+            start: editors[2].clone(),
+            body: editors[3].clone(),
+            scroll: gpui::ScrollHandle::new(),
+            last_viewport: gpui::Size::default(),
+            last_focus: None,
+        })
+    }
+
     /// The editors still alive, pruning dropped ones.
     fn live_editors(&mut self) -> Vec<Entity<Editor>> {
         self.editors.retain(|editor| editor.upgrade().is_some());
@@ -307,10 +366,18 @@ impl DraftModel {
     /// Shift-Tab while the cursor is in the start field: cycle how the
     /// target is interpreted (the field label shows the mode).
     pub fn cycle_start_mode(&mut self, cx: &mut Context<Self>) {
-        self.start_mode = match self.start_mode {
-            StartFieldMode::NewOn => StartFieldMode::Join,
-            StartFieldMode::Join => StartFieldMode::NewOn,
-        };
+        self.set_start_mode(
+            match self.start_mode {
+                StartFieldMode::NewOn => StartFieldMode::Join,
+                StartFieldMode::Join => StartFieldMode::NewOn,
+            },
+            cx,
+        );
+    }
+
+    /// Choose a base interpretation without depending on keyboard cycling.
+    pub fn set_start_mode(&mut self, mode: StartFieldMode, cx: &mut Context<Self>) {
+        self.start_mode = mode;
         for editor in self.live_editors() {
             self.insert_start_label_to(&editor, cx);
         }
@@ -790,9 +857,470 @@ impl DraftModel {
     }
 
     fn note_draft_edit(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
         if self.suppress_draft_activation {
             return;
         }
         cx.emit(Event::Edited);
+    }
+}
+
+/// Host-owned candidate lists for the three draft fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftField {
+    Workdir,
+    Role,
+    Start,
+}
+
+/// Touch controls request the same host operations as the desktop draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhoneDraftEvent {
+    PickField(DraftField),
+    Submit,
+    AttachImages,
+}
+
+/// The phone's draft surface, with independent cursors over canonical buffers.
+/// It owns no draft values and no submission logic.
+pub struct PhoneDraft {
+    model: Entity<DraftModel>,
+    workdir: Entity<Editor>,
+    role: Entity<Editor>,
+    start: Entity<Editor>,
+    body: Entity<Editor>,
+    scroll: gpui::ScrollHandle,
+    last_viewport: gpui::Size<gpui::Pixels>,
+    last_focus: Option<usize>,
+    _subscription: Subscription,
+}
+
+impl gpui::EventEmitter<PhoneDraftEvent> for PhoneDraft {}
+
+impl PhoneDraft {
+    pub fn body_editor(&self) -> Entity<Editor> {
+        self.body.clone()
+    }
+
+    pub fn field_editor(&self, field: DraftField) -> Entity<Editor> {
+        match field {
+            DraftField::Workdir => self.workdir.clone(),
+            DraftField::Role => self.role.clone(),
+            DraftField::Start => self.start.clone(),
+        }
+    }
+
+    pub fn focus_field(&self, field: DraftField, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.field_editor(field).read(cx).focus_handle(cx), cx);
+    }
+
+    /// Focus only the message editor; the desktop's multibuffer selection is
+    /// intentionally independent.
+    pub fn focus_body(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.body.read(cx).focus_handle(cx), cx);
+    }
+
+    fn field(
+        &self,
+        field: DraftField,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_color(colors.text_muted).child(label))
+                    .child(
+                        div()
+                            .id(("draft-pick", field as usize))
+                            .min_h(px(44.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_color(colors.text_accent)
+                            .child("Choose")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(PhoneDraftEvent::PickField(field));
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .min_h(px(44.))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(self.field_editor(field)),
+            )
+    }
+}
+
+impl Render for PhoneDraft {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let model = self.model.read(cx);
+        let mode = model.start_mode();
+        let refusal = model.refusal().map(str::to_owned);
+        let attachments = crate::attachment_labels(&model.attachments);
+        let target = model.start_text(cx);
+        let hint = model
+            .start_target_hints
+            .iter()
+            .find(|(label, _)| label == target.trim())
+            .map(|(_, hint)| hint.clone());
+        let focused = [
+            (1, &self.workdir),
+            (2, &self.role),
+            (4, &self.start),
+            (6 + usize::from(hint.is_some()), &self.body),
+        ]
+        .into_iter()
+        .find_map(|(index, editor)| {
+            editor
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+                .then_some(index)
+        });
+        if self.last_viewport != window.viewport_size() || self.last_focus != focused {
+            if let Some(index) = focused {
+                // ScrollHandle reads the previous frame's viewport bounds.
+                // Wait until this resize/focus frame has laid out the form.
+                let form = cx.entity().downgrade();
+                window.on_next_frame(move |_, cx| {
+                    if let Some(form) = form.upgrade() {
+                        form.update(cx, |form, cx| {
+                            form.scroll.scroll_to_item(index);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+            self.last_viewport = window.viewport_size();
+            self.last_focus = focused;
+        }
+        let colors = cx.theme().colors().clone();
+        let mut modes = div().flex().gap_2();
+        for (index, value, label) in [
+            (0, StartFieldMode::NewOn, "New on"),
+            (1, StartFieldMode::Join, "Join"),
+        ] {
+            modes = modes.child(
+                div()
+                    .id(("draft-start-mode", index as usize))
+                    .flex_1()
+                    .min_h(px(44.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if mode == value {
+                        colors.text_accent
+                    } else {
+                        colors.border
+                    })
+                    .text_color(if mode == value {
+                        colors.text_accent
+                    } else {
+                        colors.text_muted
+                    })
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model
+                            .update(cx, |model, cx| model.set_start_mode(value, cx));
+                    })),
+            );
+        }
+        div()
+            .id("phone-draft")
+            .track_scroll(&self.scroll)
+            .size_full()
+            .overflow_y_scroll()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_color(colors.text)
+            .child(div().text_lg().child("New agent"))
+            .child(self.field(DraftField::Workdir, "Workdir", cx))
+            .child(self.field(DraftField::Role, "Role", cx))
+            .child(modes)
+            .child(self.field(
+                DraftField::Start,
+                if mode == StartFieldMode::NewOn {
+                    "On top of"
+                } else {
+                    "Join"
+                },
+                cx,
+            ))
+            .children(hint.map(|hint| div().text_sm().text_color(colors.text_muted).child(hint)))
+            .child(div().text_color(colors.text_muted).child("First message"))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .debug_selector(|| "phone-draft-body".into())
+                    .child(self.body.clone()),
+            )
+            .children(attachments.iter().map(|label| {
+                div()
+                    .text_sm()
+                    .text_color(colors.text_muted)
+                    .child(label.clone())
+            }))
+            .when(!attachments.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("draft-clear-images")
+                        .min_h(px(44.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_color(colors.text_accent)
+                        .child("Remove images")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.model.update(cx, |model, cx| {
+                                model.clear_attachments(cx);
+                            });
+                        })),
+                )
+            })
+            .children(
+                refusal.map(|message| div().text_color(colors.terminal_ansi_red).child(message)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("draft-attach")
+                            .flex_1()
+                            .min_h(px(44.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .cursor_pointer()
+                            .child("Paste image")
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(PhoneDraftEvent::AttachImages)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("draft-submit")
+                            .flex_1()
+                            .min_h(px(44.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(colors.element_selected)
+                            .text_color(colors.text_accent)
+                            .cursor_pointer()
+                            .child("Create agent")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(PhoneDraftEvent::Submit))),
+                    ),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    fn init(cx: &mut gpui::App) {
+        assets::Assets.load_test_fonts(cx);
+        settings::init(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    }
+
+    #[gpui::test]
+    fn phone_editors_target_distinct_canonical_fields(cx: &mut TestAppContext) {
+        cx.update(init);
+        let model = cx.new(|cx| DraftModel::new(Hooks::new(|_, _, _, _| {}), cx));
+        model.update(cx, |model, cx| model.set_body_text("Keep this message", cx));
+        let window = cx.update(|cx| {
+            cx.open_window(gpui::WindowOptions::default(), |window, cx| {
+                model.update(cx, |model, cx| model.build_phone_form(window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |form, window, cx| {
+                for (field, text) in [
+                    (DraftField::Workdir, "/src/asymmetric-project"),
+                    (DraftField::Role, "reviewer-special"),
+                    (DraftField::Start, "feature/base-17"),
+                ] {
+                    form.focus_field(field, window, cx);
+                    let field_editor = form.field_editor(field);
+                    assert!(field_editor.read(cx).focus_handle(cx).is_focused(window));
+                    field_editor.update(cx, |editor, cx| {
+                        editor.set_text("", window, cx);
+                        editor.insert(text, window, cx);
+                    });
+                }
+                assert_eq!(model.read(cx).workdir_text(cx), "/src/asymmetric-project");
+                assert_eq!(model.read(cx).role_text(cx), "reviewer-special");
+                assert_eq!(model.read(cx).start_text(cx), "feature/base-17");
+                assert_eq!(model.read(cx).body_text(cx), "Keep this message");
+
+                form.body_editor().update(cx, |editor, cx| {
+                    editor.set_text("  Submit only this body\n", window, cx);
+                });
+                assert_eq!(
+                    model.read(cx).content(cx),
+                    Some(vec![ContentPart::Text {
+                        text: "Submit only this body".into()
+                    }]),
+                );
+                assert_eq!(model.read(cx).workdir_text(cx), "/src/asymmetric-project");
+                assert_eq!(model.read(cx).role_text(cx), "reviewer-special");
+                assert_eq!(model.read(cx).start_text(cx), "feature/base-17");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn phone_and_desktop_share_values_attachments_and_base_mode(cx: &mut TestAppContext) {
+        cx.update(init);
+        let model = cx.new(|cx| DraftModel::new(Hooks::new(|_, _, _, _| {}), cx));
+        let window = cx.update(|cx| {
+            cx.open_window(gpui::WindowOptions::default(), |window, cx| {
+                model.update(cx, |model, cx| model.build_phone_form(window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |form, window, cx| {
+                model.update(cx, |model, cx| {
+                    model.set_workdir_text("/shared/repository", cx);
+                    model.set_role_text("architect", cx);
+                    model.set_start_text("agent-29", cx);
+                    model.set_start_mode(StartFieldMode::Join, cx);
+                    model.set_body_text("Shared prompt", cx);
+                    model.add_image("image/png".into(), vec![2, 7, 3], cx);
+                    model.set_refusal(Some("Host is disconnected".into()), cx);
+                });
+                assert_eq!(
+                    form.field_editor(DraftField::Workdir).read(cx).text(cx),
+                    "/shared/repository"
+                );
+                assert_eq!(
+                    form.field_editor(DraftField::Role).read(cx).text(cx),
+                    "architect"
+                );
+                assert_eq!(
+                    form.field_editor(DraftField::Start).read(cx).text(cx),
+                    "agent-29"
+                );
+                assert_eq!(form.body_editor().read(cx).text(cx), "Shared prompt");
+                assert_eq!(model.read(cx).start_mode(), StartFieldMode::Join);
+                assert_eq!(model.read(cx).refusal(), Some("Host is disconnected"));
+                assert_eq!(
+                    model.read(cx).content(cx),
+                    Some(vec![
+                        ContentPart::Text {
+                            text: "Shared prompt".into()
+                        },
+                        ContentPart::Image {
+                            media_type: "image/png".into(),
+                            data: vec![2, 7, 3]
+                        },
+                    ])
+                );
+                model.update(cx, |model, cx| {
+                    model.cycle_start_mode(cx);
+                    assert_eq!(model.start_mode(), StartFieldMode::NewOn);
+                    assert_eq!(model.start_text(cx), "agent-29");
+                    let desktop = model.build_editor(window, cx);
+                    assert!(desktop.read(cx).text(cx).contains("Shared prompt"));
+                    model.set_start_mode(StartFieldMode::Join, cx);
+                    assert!(model.clear_attachments(cx));
+                    assert_eq!(
+                        model.content(cx),
+                        Some(vec![ContentPart::Text {
+                            text: "Shared prompt".into()
+                        }])
+                    );
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn phone_draft_keeps_the_focused_field_visible_when_keyboard_resizes(cx: &mut TestAppContext) {
+        use gpui::{AppContext as _, VisualTestContext};
+        cx.update(init);
+        let model = cx.new(|cx| DraftModel::new(Hooks::new(|_, _, _, _| {}), cx));
+        let window = cx.update(|cx| {
+            cx.open_window(gpui::WindowOptions::default(), |window, cx| {
+                model.update(cx, |model, cx| model.build_phone_form(window, cx))
+            })
+            .unwrap()
+        });
+        cx.simulate_window_resize(*window, gpui::size(px(360.), px(700.)));
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.draw_window(window.into());
+        window
+            .update(&mut visual, |form, window, cx| form.focus_body(window, cx))
+            .unwrap();
+        visual.draw_window(window.into());
+        visual.simulate_window_resize(*window, gpui::size(px(360.), px(350.)));
+        visual.draw_window(window.into());
+        visual
+            .update_window(window.into(), |_, window, cx| {
+                window.simulate_next_frame(cx)
+            })
+            .unwrap();
+        visual.draw_window(window.into());
+        let body = visual.debug_bounds("phone-draft-body").unwrap();
+        assert!(
+            body.top() >= px(0.) && body.bottom() <= px(350.),
+            "{body:?}"
+        );
+        window
+            .update(&mut visual, |form, window, cx| {
+                form.focus_field(DraftField::Workdir, window, cx)
+            })
+            .unwrap();
+        visual.draw_window(window.into());
+        visual
+            .update_window(window.into(), |_, window, cx| {
+                window.simulate_next_frame(cx)
+            })
+            .unwrap();
+        visual.draw_window(window.into());
+        let field = window
+            .update(&mut visual, |form, _, cx| {
+                *form.workdir.read(cx).last_bounds().unwrap()
+            })
+            .unwrap();
+        assert!(
+            field.top() >= px(0.) && field.bottom() <= px(350.),
+            "{field:?}"
+        );
     }
 }

@@ -19,3 +19,10 @@ pub mod style;
 pub mod transient;
 
 pub use style::{Region, StyleClass};
+
+/// The workspace's input/presentation mode. Feature buffers share operations,
+/// but may render direct-touch controls while the phone projection is active.
+#[derive(Default)]
+pub struct TouchMode(pub bool);
+
+impl gpui::Global for TouchMode {}

@@ -31,3 +31,8 @@ tracing.workspace = true
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { path = "../../vendor/zed/crates/ui" }
+
+[dev-dependencies]
+assets = { path = "../../vendor/zed/crates/assets" }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
+project = { path = "../../vendor/zed/crates/project" }

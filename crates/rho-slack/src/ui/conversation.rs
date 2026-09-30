@@ -21,7 +21,7 @@ use editor::{
     SelectionEffects, SizingBehavior,
 };
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, Image, ImageFormat, Task, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, Focusable, Image, ImageFormat, Task, Window, div};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
 use multi_buffer::{Anchor as MultiBufferAnchor, MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
@@ -73,6 +73,10 @@ pub struct ConversationView {
     input: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
+    /// Touch pins a second editor over the original input buffer below the
+    /// transcript. The desktop still uses its single canonical multibuffer.
+    composer_editor: Option<Entity<Editor>>,
+    phone_composer_visible: bool,
     /// How far the session's messages have been applied here.
     revision: u64,
     /// Whether the surface is writing the transcript. The edits move the
@@ -177,6 +181,10 @@ pub enum Event {
     RewriteLost,
     BroadcastWithFilesUnsupported,
     ActivateRequested,
+    MessageActionsRequested(Ts),
+    OpenThread(ThreadKey),
+    AttachRequested,
+    SubmitRequested,
 }
 
 /// What a press of enter turned out to be, once Slack had answered.
@@ -415,6 +423,9 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let touch = cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0);
         let saved = session.read(cx).draft(&source).unwrap_or_default();
         let saved_files = saved
             .files
@@ -444,13 +455,15 @@ impl ConversationView {
                 0,
                 cx,
             );
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(1),
-                input.clone(),
-                [Point::zero()..input.read(cx).max_point()],
-                0,
-                cx,
-            );
+            if !touch {
+                multi_buffer.set_excerpts_for_path(
+                    PathKey::sorted(1),
+                    input.clone(),
+                    [Point::zero()..input.read(cx).max_point()],
+                    0,
+                    cx,
+                );
+            }
             multi_buffer
         });
         let editor = cx.new(|cx| {
@@ -466,7 +479,7 @@ impl ConversationView {
                 cx,
             );
             (hooks.configure_editor)(&mut editor, window, cx);
-            editor.set_reserve_image_gutter(true, cx);
+            editor.set_reserve_image_gutter(!touch, cx);
             editor.set_gutter_highlight_text_inset(Some(0.5), cx);
             editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
@@ -478,6 +491,38 @@ impl ConversationView {
                 input: input.entity_id(),
             })));
             editor
+        });
+
+        let composer_editor = touch.then(|| {
+            cx.new(|cx| {
+                let buffer = cx.new(|cx| MultiBuffer::singleton(input.clone(), cx));
+                let mut editor = Editor::new(
+                    EditorMode::AutoHeight {
+                        min_lines: 2,
+                        max_lines: Some(6),
+                    },
+                    buffer,
+                    None,
+                    window,
+                    cx,
+                );
+                (hooks.configure_editor)(&mut editor, window, cx);
+                editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
+                editor.set_placeholder_text(
+                    &compose_placeholder(
+                        &session.read(cx).model().label(source.channel()),
+                        matches!(source, Source::Thread(_)),
+                    ),
+                    window,
+                    cx,
+                );
+                editor.set_completion_provider(Some(Rc::new(ComposeCompletions {
+                    session: session.downgrade(),
+                    channel: source.channel().clone(),
+                    input: input.entity_id(),
+                })));
+                editor
+            })
         });
 
         let mut subscriptions = vec![cx.observe_in(&session, window, |this, _, window, cx| {
@@ -554,6 +599,8 @@ impl ConversationView {
             input,
             multi_buffer,
             editor,
+            composer_editor,
+            phone_composer_visible: true,
             revision: 0,
             editing: false,
             centre_on_the_point: false,
@@ -622,6 +669,21 @@ impl ConversationView {
         &self.editor
     }
 
+    /// The pinned touch composer, when touch presentation was selected.
+    /// It edits the same input buffer used by submit, drafts and rewrites.
+    pub fn composer_editor(&self) -> Option<&Entity<Editor>> {
+        self.composer_editor.as_ref()
+    }
+
+    /// Dealer/read projections retain this conversation but reveal composing
+    /// only when the reader asks to reply. The draft and editor are retained.
+    pub fn set_phone_composer_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.phone_composer_visible != visible {
+            self.phone_composer_visible = visible;
+            cx.notify();
+        }
+    }
+
     /// The session behind this surface, for a host that has to ask it
     /// something the view does not wrap — the emoji table, say.
     pub fn session(&self) -> &Entity<Session> {
@@ -668,7 +730,11 @@ impl ConversationView {
                 .transcript
                 .line_meta(point.row, cx)
                 .is_some_and(|meta| {
-                    meta.interaction.is_some() || meta.preview_toggle.is_some() || meta.replies
+                    meta.interaction.is_some()
+                        || meta.preview_toggle.is_some()
+                        || meta.replies
+                        || (self.composer_editor.is_some()
+                            && (meta.file.is_some() || meta.link.is_some()))
                 })
         {
             return;
@@ -1439,6 +1505,10 @@ impl ConversationView {
     /// composer, and a message arriving appends itself after whatever is
     /// at the end.
     fn refresh_chip(&mut self, cx: &mut Context<Self>) {
+        if self.composer_editor.is_some() {
+            self.transcript.remove(&Row::Chip, cx);
+            return;
+        }
         if self.attached.is_empty()
             && self.send_state == SendState::Ready
             && !self.also_send_to_channel
@@ -1634,6 +1704,20 @@ impl ConversationView {
     /// The gutter is reserved for author avatars, not a composer stripe.
     fn apply_compose_chrome(&self, cx: &mut Context<Self>) {
         let placeholder = self.compose_placeholder(cx);
+        if let Some(composer) = &self.composer_editor {
+            composer.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let start = snapshot.anchor_before(Point::zero());
+                let end = snapshot.anchor_after(snapshot.max_point());
+                editor.highlight_text(
+                    editor::HighlightKey::SyntaxTreeView(COMPOSE_DRAFT_HIGHLIGHT_KEY),
+                    vec![start..end],
+                    (self.hooks.prompt_style)(cx),
+                    cx,
+                );
+            });
+            return;
+        }
         let (empty, start, end) = {
             let buffer = self.input.read(cx);
             (
@@ -1676,6 +1760,16 @@ impl ConversationView {
 
     /// Puts the cursor in the composer: what `i` asks for.
     pub fn select_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(composer) = &self.composer_editor {
+            composer.update(cx, |editor, cx| {
+                let end = editor.buffer().read(cx).snapshot(cx).max_point();
+                editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                    selections.select_ranges([end..end]);
+                });
+                window.focus(&editor.focus_handle(cx), cx);
+            });
+            return;
+        }
         let end = {
             let buffer = self.input.read(cx);
             buffer.anchor_after(buffer.len())
@@ -2224,6 +2318,11 @@ impl ConversationView {
                                     let name = name.clone();
                                     div()
                                         .id(("slack-reaction", chip_id))
+                                        .when(
+                                            cx.try_global::<rho_window::TouchMode>()
+                                                .is_some_and(|mode| mode.0),
+                                            |chip| chip.min_h(gpui::px(44.)).min_w(gpui::px(44.)),
+                                        )
                                         .cursor_pointer()
                                         .on_click(move |_, _, cx| {
                                             cx.stop_propagation();
@@ -3274,10 +3373,12 @@ impl ConversationView {
                     .rev()
                     .find(|other| in_thread || other.is_top_level())
             });
-            let header = !previous
-                .is_some_and(|previous| continues_author(previous, message, session.model()));
+            let header = self.composer_editor.is_some()
+                || !previous
+                    .is_some_and(|previous| continues_author(previous, message, session.model()));
             let row = Row::Message(message.ts.clone());
             if header
+                && self.composer_editor.is_none()
                 && system_line(message, session.model()).is_none()
                 && let Some(user) = &message.user
             {
@@ -3291,6 +3392,7 @@ impl ConversationView {
                 in_thread,
                 header,
                 &self.expanded_previews,
+                self.composer_editor.is_some(),
             )
         };
         let images = image_boxes(&item)
@@ -3339,6 +3441,17 @@ impl ConversationView {
                 order,
                 file,
                 self.session.downgrade(),
+                cx.entity().downgrade(),
+                self.composer_editor.is_some(),
+            ));
+        }
+        if self.composer_editor.is_some() {
+            item.blocks.push(message_action_block(
+                item.lines.len().saturating_sub(1) as u32,
+                message.ts.clone(),
+                message.thread_root(),
+                self.source.channel().clone(),
+                self.session.read(cx).model().workspace().clone(),
                 cx.entity().downgrade(),
             ));
         }
@@ -3748,8 +3861,13 @@ fn image_block(
     file: FileSummary,
     session: gpui::WeakEntity<Session>,
     view: gpui::WeakEntity<ConversationView>,
+    touch: bool,
 ) -> BlockSpec {
-    let rows = file.image_rows();
+    let rows = if touch {
+        file.image_rows().min(6)
+    } else {
+        file.image_rows()
+    };
     BlockSpec {
         line,
         height: rows,
@@ -3771,7 +3889,12 @@ fn image_block(
             // gutter. Match the text origin rather than adding body spaces.
             let style = cx.editor_style.text.clone();
             let box_height = cx.line_height * rows as f32;
-            let box_width = cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT);
+            let box_width = if touch {
+                // The preview fits the current text viewport, including landscape.
+                (cx.max_width - cx.margins.gutter.full_width()).min(gpui::px(280.))
+            } else {
+                cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT)
+            };
             // The picture's own size inside the box, spelled out rather than
             // left to the element: the editor measures a block and resizes
             // it to what it drew, so a thumbnail allowed to be its own tiny
@@ -3827,6 +3950,81 @@ fn image_block(
     }
 }
 
+/// Touch actions use the canonical message selection and the same host
+/// operations as keyboard actions, rather than interpreting message text.
+fn message_action_block(
+    line: u32,
+    ts: Ts,
+    root: Ts,
+    channel: crate::types::ChannelId,
+    workspace: crate::WorkspaceName,
+    view: gpui::WeakEntity<ConversationView>,
+) -> BlockSpec {
+    BlockSpec {
+        line,
+        height: 3,
+        priority: usize::MAX,
+        render: Arc::new(move |cx| {
+            let actions_view = view.clone();
+            let actions_ts = ts.clone();
+            let thread_view = view.clone();
+            let thread = ThreadKey {
+                workspace: workspace.clone(),
+                channel: channel.clone(),
+                thread_ts: root.clone(),
+            };
+            div()
+                .text_color(cx.theme().colors().text)
+                .flex()
+                .gap(gpui::px(8.))
+                .pl(cx.margins.gutter.full_width())
+                .h(cx.line_height * 3.)
+                .items_center()
+                .child(
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "slack-message-actions-{}",
+                            ts.0
+                        )))
+                        .min_h(gpui::px(44.))
+                        .px(gpui::px(12.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .child("Actions")
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let _ = actions_view.update(cx, |this, cx| {
+                                if this.place_cursor_on(&actions_ts, window, cx) {
+                                    cx.emit(Event::MessageActionsRequested(actions_ts.clone()));
+                                }
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "slack-message-thread-{}",
+                            ts.0
+                        )))
+                        .min_h(gpui::px(44.))
+                        .px(gpui::px(12.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .child("Reply / thread")
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            let thread = thread.clone();
+                            let _ =
+                                thread_view.update(cx, |_, cx| cx.emit(Event::OpenThread(thread)));
+                        }),
+                )
+                .into_any_element()
+        }),
+    }
+}
+
 /// Bound the initial quote by both lines and characters, cutting at a word
 /// boundary. Source and formatting beyond this point remain in the buffer.
 fn preview_cutoff(text: &str) -> Option<usize> {
@@ -3866,7 +4064,7 @@ fn continues_author(previous: &Message, message: &Message, model: &Model) -> boo
 /// Keeping metadata off the body preserves Markdown block syntax consistently.
 #[cfg(test)]
 fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
-    message_item_with_header(message, model, in_thread, true, &HashSet::new())
+    message_item_with_header(message, model, in_thread, true, &HashSet::new(), false)
 }
 
 fn message_item_with_header(
@@ -3875,6 +4073,7 @@ fn message_item_with_header(
     in_thread: bool,
     header: bool,
     expanded: &HashSet<(Ts, usize)>,
+    touch: bool,
 ) -> Rendered {
     let thread = Some(message.thread_root());
     let indent = " ".repeat(BODY_INDENT);
@@ -3949,6 +4148,15 @@ fn message_item_with_header(
         // A text-cell gap separates the profile inlay from the author name.
         spans.push(Span::plain(" "));
         spans.push(name);
+        if touch {
+            use chrono::{Local, TimeZone as _};
+            let time = Local
+                .timestamp_opt(message.ts.epoch_seconds() as i64, 0)
+                .single()
+                .map(|time| time.format("%H:%M").to_string())
+                .unwrap_or_default();
+            spans.push(Span::styled(format!("  {time}"), Class::Time));
+        }
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
@@ -4564,6 +4772,9 @@ impl gpui::Render for ConversationView {
             .flex()
             .flex_col()
             .bg(cx.theme().colors().editor_background)
+            .when(self.composer_editor.is_some(), |view| {
+                view.text_color(cx.theme().colors().text)
+            })
             // A file dropped on the conversation is an attachment for the
             // next message, the same as pasting one.
             .on_drop(
@@ -4591,6 +4802,9 @@ impl gpui::Render for ConversationView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .when(self.composer_editor.is_some(), |viewport| {
+                        viewport.overflow_hidden()
+                    })
                     .px(gpui::px(4.))
                     .on_mouse_up(
                         gpui::MouseButton::Left,
@@ -4601,6 +4815,120 @@ impl gpui::Render for ConversationView {
                         }),
                     )
                     .child(self.editor.clone()),
+            )
+            .when_some(
+                self.composer_editor
+                    .clone()
+                    .filter(|_| self.phone_composer_visible),
+                |view, composer| {
+                    view.child(
+                        div()
+                            .id("slack-touch-composer")
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border)
+                            .px(gpui::px(8.))
+                            .py(gpui::px(4.))
+                            .when(!self.attached.is_empty(), |composer| {
+                                composer.child(
+                                    div()
+                                        .id("slack-touch-attachments")
+                                        .max_h(gpui::px(96.))
+                                        .overflow_y_scroll()
+                                        .children(self.attached.iter().enumerate().map(
+                                            |(index, file)| {
+                                                div()
+                                                    .id(("slack-touch-attachment", index))
+                                                    .min_h(gpui::px(44.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .cursor_pointer()
+                                                    .child(format!("{}  ×", file.line()))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.remove_attachment(index, cx);
+                                                    }))
+                                            },
+                                        )),
+                                )
+                            })
+                            .when(self.send_state != SendState::Ready, |composer| {
+                                composer.child(if self.send_state == SendState::Sending {
+                                    "Sending…"
+                                } else {
+                                    "Send failed · tap Send to retry"
+                                })
+                            })
+                            .when(self.editing_message.is_some(), |composer| {
+                                composer.child(
+                                    div()
+                                        .id("slack-cancel-rewrite")
+                                        .min_h(gpui::px(44.))
+                                        .child("Cancel edit")
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_edit(cx);
+                                        })),
+                                )
+                            })
+                            .child(div().w_full().min_h(gpui::px(48.)).child(composer))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(gpui::px(8.))
+                                    .child(
+                                        div()
+                                            .id("slack-touch-attach")
+                                            .min_h(gpui::px(48.))
+                                            .px(gpui::px(12.))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .child("Attach")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(Event::AttachRequested)
+                                            })),
+                                    )
+                                    .when(matches!(self.source, Source::Thread(_)), |bar| {
+                                        bar.child(
+                                            div()
+                                                .id("slack-touch-broadcast")
+                                                .min_h(gpui::px(48.))
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .cursor_pointer()
+                                                .child(if self.also_send_to_channel {
+                                                    "☑ Also to channel"
+                                                } else {
+                                                    "☐ Also to channel"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_also_send_to_channel(
+                                                        !this.also_send_to_channel,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("slack-touch-send")
+                                            .min_h(gpui::px(48.))
+                                            .px(gpui::px(12.))
+                                            .flex()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .child("Send")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(Event::SubmitRequested)
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
             )
     }
 }
@@ -4771,6 +5099,53 @@ mod tests {
                 ])
             ),
             "a message above means the run landed in the middle"
+        );
+    }
+
+    #[test]
+    fn touch_headers_keep_sender_and_clock_out_of_markdown_body() {
+        let model = model();
+        let first = message("1700000000.0", None, "```rust\nlet n = 17;\n```");
+        let mut later = first.clone();
+        later.ts = Ts("1700003600.0".into());
+        let render = |message: &Message, touch| {
+            message_item_with_header(message, &model, false, true, &HashSet::new(), touch)
+        };
+        let desktop = render(&first, false);
+        let touch = render(&first, true);
+        let next = render(&later, true);
+        assert!(touch.text.starts_with(" ada  "), "{}", touch.text);
+        assert_eq!(
+            touch.text.split_once('\n').unwrap().1,
+            desktop.text.split_once('\n').unwrap().1,
+            "metadata must not damage code fences or replace the markdown pipeline"
+        );
+        let clock = |item: &super::Rendered| {
+            let range = item
+                .styles
+                .iter()
+                .find(|(class, _)| *class == Class::Time)
+                .unwrap()
+                .1
+                .clone();
+            item.text[range].trim().to_owned()
+        };
+        assert!(
+            !desktop
+                .styles
+                .iter()
+                .any(|(class, _)| *class == Class::Time)
+        );
+        let first_clock = clock(&touch);
+        let next_clock = clock(&next);
+        assert_eq!(first_clock.len(), 5);
+        assert_eq!(&first_clock[2..3], ":");
+        assert_eq!(&first_clock[3..], &next_clock[3..]);
+        let hour = |clock: &str| clock[..2].parse::<u32>().unwrap();
+        assert_eq!(
+            hour(&next_clock),
+            (hour(&first_clock) + 1) % 24,
+            "the visible clock must belong to each message, not the author group"
         );
     }
 
@@ -5067,7 +5442,8 @@ mod tests {
             continues_author(&first, &next, &model),
             "edits do not start a new author group"
         );
-        let rendered = message_item_with_header(&next, &model, false, false, &HashSet::new());
+        let rendered =
+            message_item_with_header(&next, &model, false, false, &HashSet::new(), false);
         assert_eq!(rendered.text, "two\n");
         assert!(rendered.lines[0].edited);
     }

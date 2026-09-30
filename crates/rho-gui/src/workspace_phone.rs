@@ -193,7 +193,13 @@ impl PhoneUi {
 
     pub(super) fn update_mode(&mut self, window: &Window) -> PhoneModeChange {
         let was_enabled = self.enabled;
-        self.enabled = self.forced || window.viewport_size().width <= PHONE_MAX_WIDTH;
+        let size = window.viewport_size();
+        // A phone rotated to landscape is still touch-operated. A desktop
+        // returns to its layout once both dimensions have room for it.
+        self.enabled = self.forced
+            || size.width <= PHONE_MAX_WIDTH
+            || (size.width <= px(1000.) && size.height <= PHONE_MAX_WIDTH)
+            || (was_enabled && size.height <= PHONE_MAX_WIDTH);
         PhoneModeChange {
             enabled: self.enabled,
             entered: self.enabled && !was_enabled,
@@ -203,6 +209,7 @@ impl PhoneUi {
 
     pub(super) fn show_feed(&mut self, context: ContextId, key: SurfaceKey) {
         self.feed_surface = Some((context, key));
+        self.stack.clear();
     }
 
     pub(super) fn show(&mut self, context: ContextId, key: SurfaceKey) {
@@ -258,7 +265,7 @@ pub(super) struct PhoneModeChange {
     exited: bool,
 }
 
-const PHONE_FONT_SCALE: f32 = 1.4;
+const PHONE_FONT_SCALE: f32 = 1.15;
 
 /// Touch is a plain-editor world: no Vim, no Helix, every editor accepts
 /// text directly. Applied on phone-mode entry and reverted on exit so a
@@ -293,6 +300,9 @@ impl Workspace {
                 set_touch_modal_editing(false, cx);
             });
         }
+        if change.entered || change.exited {
+            cx.set_global(rho_window::TouchMode(change.enabled));
+        }
         // The queue can be empty when the phone first draws: a Slack thread
         // becomes a node only once the mirror has synced. Without this the
         // feed would stay on "nothing needs attention" for the rest of the
@@ -324,24 +334,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Let the editor place its cursor first, then only enable text input
-        // when that cursor landed in the editable prompt tail.
+        // Let the tapped editor choose its point. The history reader must not
+        // summon the keyboard, while the separate prompt keeps its own focus.
         cx.defer_in(window, |this, window, cx| {
             let Some(surface) = this.phone_surface() else {
                 return;
             };
-            if !matches!(surface.key, super::SurfaceKey::Transcript(_)) {
+            let super::SurfaceView::Transcript { model, .. } = &surface.view else {
+                return;
+            };
+            if let Some((_, prompt)) = this.phone_agent_editors.get(&model.entity_id())
+                && prompt.focus_handle(cx).is_focused(window)
+            {
                 return;
             }
-            let super::SurfaceView::Transcript { model, editor } = &surface.view else {
-                return;
-            };
-            let focus = if model.read(cx).selection_in_prompt(editor, cx) {
-                editor.focus_handle(cx)
-            } else {
-                this.phone.feed_focus.clone()
-            };
-            window.focus(&focus, cx);
+            window.focus(&this.phone.feed_focus, cx);
         });
     }
 
@@ -460,9 +467,25 @@ impl Workspace {
 
     fn phone_deal_scroll_edge(&mut self, cx: &mut Context<Self>) -> PhoneScrollEdge {
         let editor = match &self.active_surface().view {
-            super::SurfaceView::Note(editor) | super::SurfaceView::Transcript { editor, .. } => {
-                Some(editor.clone())
+            super::SurfaceView::Note(editor) => {
+                let SurfaceKey::Note(node) = &self.active_surface().key else {
+                    unreachable!()
+                };
+                Some(
+                    self.note_views
+                        .get(node)
+                        .and_then(|view| view.phone_editor_if_built())
+                        .unwrap_or(editor)
+                        .clone(),
+                )
             }
+            super::SurfaceView::Transcript { model, editor } => Some(
+                self.phone_agent_editors
+                    .get(&model.entity_id())
+                    .map(|(reader, _)| reader)
+                    .unwrap_or(editor)
+                    .clone(),
+            ),
             _ => None,
         };
         let Some(editor) = editor else {
@@ -489,6 +512,9 @@ impl Workspace {
     pub(super) fn phone_debug_touch(&mut self, event: &TouchEvent, cx: &mut Context<Self>) {
         match event.phase {
             TouchPhase::Started => {
+                if self.phone.enabled {
+                    self.phone.forced = true;
+                }
                 self.shell_touches.insert(
                     event.id,
                     super::ShellTouchContact {
@@ -723,6 +749,577 @@ impl Workspace {
         })
     }
 
+    fn phone_draft_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<rho_agents_view::draft::PhoneDraft> {
+        if let Some(form) = &self.phone_draft {
+            return form.clone();
+        }
+        let model = self.draft_model.clone();
+        let form = model.update(cx, |model, cx| model.build_phone_form(window, cx));
+        self._phone_draft_subscription = Some(cx.subscribe_in(
+            &form,
+            window,
+            |this, _, event: &rho_agents_view::draft::PhoneDraftEvent, window, cx| {
+                use rho_agents_view::draft::PhoneDraftEvent;
+                match event {
+                    PhoneDraftEvent::PickField(field) => {
+                        this.phone_pick_draft_field(*field, window, cx)
+                    }
+                    PhoneDraftEvent::Submit => this.submit_prompt(&crate::SubmitPrompt, window, cx),
+                    PhoneDraftEvent::AttachImages => this.cmd_paste_prompt(window, cx),
+                }
+            },
+        ));
+        self.phone_draft = Some(form.clone());
+        form
+    }
+
+    fn phone_pick_draft_field(
+        &mut self,
+        field: rho_agents_view::draft::DraftField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use rho_agents_view::draft::DraftField;
+        let prompt = match field {
+            DraftField::Workdir => "Project or workdir",
+            DraftField::Role => "Agent role",
+            DraftField::Start => "Base revision or agent",
+        };
+        self.open_prompt(
+            prompt,
+            std::rc::Rc::new(move |this, input, _| match field {
+                DraftField::Workdir => {
+                    crate::commands::workdir_field_candidates(input, &this.hosts.workdir_table())
+                }
+                DraftField::Role => crate::commands::role_field_candidates(input),
+                DraftField::Start => {
+                    crate::commands::start_field_candidates(input, &this.live_agent_targets())
+                }
+            }),
+            std::rc::Rc::new(move |this, input, _window, cx| {
+                this.draft_model.update(cx, |model, cx| match field {
+                    DraftField::Workdir => model.set_workdir_text(&input, cx),
+                    DraftField::Role => model.set_role_text(&input, cx),
+                    DraftField::Start => model.set_start_text(&input, cx),
+                });
+            }),
+            window,
+            cx,
+        );
+        if let Some(prompt) = &mut self.minibuffer {
+            prompt.set_complete_whole_input();
+        }
+    }
+
+    pub(super) fn phone_buffer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut options = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for (context, surfaces) in &self.surfaces {
+            for surface in surfaces {
+                if !keys.insert(surface.key.clone()) {
+                    continue;
+                }
+                let label = self.phone_surface_title(surface, cx);
+                options.push((label, *context, surface.key.clone()));
+            }
+        }
+        // Agents need not have materialised a viewport to be switchable.
+        for agent in self.registry.known_agents().copied() {
+            let key = super::SurfaceKey::Transcript(agent);
+            if keys.insert(key.clone()) {
+                let label = self.surface_name(&key);
+                options.push((label, self.context_for_agent(agent), key));
+            }
+        }
+        options.sort_by(|a, b| a.0.cmp(&b.0));
+        // Distinguish equal user titles without exposing transport IDs.
+        for i in 0..options.len() {
+            let label = options[i].0.clone();
+            if options[..i].iter().any(|option| option.0 == label) {
+                options[i].0 = format!("{label} ({})", i + 1);
+            }
+        }
+        let complete = options.clone();
+        self.open_prompt(
+            "Switch buffer or agent",
+            std::rc::Rc::new(move |_, input, _| {
+                complete
+                    .iter()
+                    .filter(|(label, _, _)| {
+                        input
+                            .to_lowercase()
+                            .split_whitespace()
+                            .all(|word| label.to_lowercase().contains(word))
+                    })
+                    .map(|(label, _, key)| crate::minibuffer::Candidate {
+                        value: label.clone(),
+                        description: Self::surface_kind(key).into(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |this, input, window, cx| {
+                if let Some((_, context, key)) =
+                    options.iter().find(|(label, _, _)| *label == input)
+                {
+                    match key {
+                        super::SurfaceKey::Transcript(agent) => {
+                            this.select_agent(Some(*agent), window, cx)
+                        }
+                        _ => {
+                            this.active_context = *context;
+                            let surface = this.make_surface(key.clone(), window, cx);
+                            this.display_surface(surface, cx);
+                            this.focus_active_surface(window, cx);
+                        }
+                    }
+                }
+            }),
+            window,
+            cx,
+        );
+        if let Some(prompt) = &mut self.minibuffer {
+            prompt.set_complete_whole_input();
+        }
+    }
+
+    fn phone_surface_title(&self, surface: &super::Surface, cx: &gpui::App) -> String {
+        match &surface.key {
+            super::SurfaceKey::Note(node) => self.node_title(node, cx),
+            super::SurfaceKey::Draft => "New agent".into(),
+            super::SurfaceKey::Browser(page) => {
+                rho_browser::live_page_name(*page).unwrap_or_else(|| "Browser".into())
+            }
+            _ => self.surface_name(&surface.key),
+        }
+    }
+
+    fn render_phone_surface(
+        &mut self,
+        surface: &super::Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use super::SurfaceView;
+        match &surface.view {
+            SurfaceView::Shell { model, editor } => {
+                rho_shell_view::render_touch_editor(model, editor, cx)
+            }
+            SurfaceView::Draft { .. } => div()
+                .id("rho-phone-draft")
+                .size_full()
+                .child(self.phone_draft_form(window, cx))
+                .into_any_element(),
+            SurfaceView::SlackConversation(view) => {
+                let show_composer = !self.phone.stack.is_empty();
+                view.update(cx, |view, cx| {
+                    view.set_phone_composer_visible(show_composer, cx)
+                });
+                self.render_surface(surface)
+            }
+            SurfaceView::Browser(view) => div()
+                .id("phone-browser")
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("phone-browser-type")
+                        .flex_none()
+                        .min_h(px(48.))
+                        .px_2()
+                        .text_color(cx.theme().colors().text)
+                        .flex()
+                        .items_center()
+                        .child("Type in focused field…")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.phone_browser_type(window, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(view.clone()),
+                )
+                .into_any_element(),
+            SurfaceView::Note(_) => {
+                let super::SurfaceKey::Note(node) = &surface.key else {
+                    unreachable!()
+                };
+                let (editor, children) = {
+                    let view = self
+                        .note_views
+                        .get_mut(node)
+                        .expect("note surface has model");
+                    (view.phone_editor(window, cx), view.children())
+                };
+                let colors = cx.theme().colors();
+                div()
+                    .id("phone-note")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(editor))
+                    .when(!children.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .id("phone-note-children")
+                                .flex_none()
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .children(children.into_iter().enumerate().map(|(index, node)| {
+                                    let title = self.node_title(&node, cx);
+                                    div()
+                                        .id(("phone-note-child", index))
+                                        .min_h(px(52.))
+                                        .px_2()
+                                        .border_t_1()
+                                        .border_color(colors.border_variant)
+                                        .flex()
+                                        .items_center()
+                                        .child(title)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_node(&node, window, cx);
+                                        }))
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
+            SurfaceView::Transcript { model, .. } => {
+                let (reader, prompt) = self.phone_transcript_editors(model, window, cx);
+                let colors = cx.theme().colors();
+                let composing = !self.phone.stack.is_empty()
+                    && matches!(surface.key, super::SurfaceKey::Transcript(_));
+                div()
+                    .id("phone-agent-conversation")
+                    .size_full()
+                    .text_color(colors.text)
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(reader))
+                    .when(composing, |column| {
+                        column.child(
+                            div()
+                                .flex_none()
+                                .w_full()
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                                .px_2()
+                                .py_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(model.read(cx).attachment_labels().into_iter().map(
+                                    |label| {
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(colors.text_muted)
+                                            .child(label)
+                                    },
+                                ))
+                                .child(prompt)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("phone-agent-attach")
+                                                .min_h(px(48.))
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .bg(colors.element_background)
+                                                .child("Paste image")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cmd_paste_prompt(window, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("phone-agent-send")
+                                                .min_h(px(48.))
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .bg(colors.element_background)
+                                                .child("Send")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.submit_prompt(
+                                                        &crate::SubmitPrompt,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            }
+            _ => self.render_surface(surface),
+        }
+    }
+
+    pub(crate) fn phone_transcript_editors(
+        &mut self,
+        model: &gpui::Entity<rho_agents_view::AgentModel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (gpui::Entity<editor::Editor>, gpui::Entity<editor::Editor>) {
+        self.phone_agent_editors
+            .entry(model.entity_id())
+            .or_insert_with(|| {
+                model.update(cx, |model, cx| {
+                    (
+                        model.build_reading_editor(window, cx),
+                        model.build_prompt_editor(window, cx),
+                    )
+                })
+            })
+            .clone()
+    }
+
+    fn render_phone_header(&self, surface: &super::Surface, cx: &Context<Self>) -> AnyElement {
+        let title = self.phone_surface_title(surface, cx);
+        let subtitle = match surface.key {
+            super::SurfaceKey::Transcript(agent) | super::SurfaceKey::Activity(agent) => self
+                .registry
+                .agent_role(agent)
+                .map(super::agent_role_label)
+                .unwrap_or_default(),
+            super::SurfaceKey::File { .. } => {
+                let dirty = match &surface.view {
+                    super::SurfaceView::File(view) => view
+                        .read(cx)
+                        .editor()
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .is_dirty(cx),
+                    _ => false,
+                };
+                if dirty {
+                    "file · unsaved".into()
+                } else {
+                    "file · saved".into()
+                }
+            }
+            _ => Self::surface_kind(&surface.key).to_owned(),
+        };
+        div()
+            .id("phone-surface-header")
+            .text_color(cx.theme().colors().text)
+            .flex_none()
+            .min_h(px(48.))
+            .w_full()
+            .px_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(div().text_size(px(16.)).child(title))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().colors().text_muted)
+                            .child(subtitle),
+                    ),
+            )
+            .child(
+                div()
+                    .id("phone-header-menu")
+                    .min_w(px(48.))
+                    .h(px(48.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child("☰")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_phone_menu(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn phone_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.attention.open_pile = None;
+        let surface = self.make_surface(SurfaceKey::Home, window, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Command, cx);
+        self.refresh_home(cx);
+        self.focus_active_surface(window, cx);
+    }
+
+    pub(super) fn phone_command_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::transient::{self, Command, MenuAction};
+        let subject = self.subject(window, cx);
+        let mut options = Vec::new();
+        // The existing command menus remain the source of truth. Search
+        // includes infrequent tools, not merely the phone's prominent rows.
+        for menu in [
+            transient::phone_root_menu(&subject),
+            transient::phone_tools_menu(),
+            transient::phone_filing_menu(),
+            transient::editing_menu(),
+            transient::new_menu(),
+            transient::agent_menu(),
+            transient::slack_menu(),
+            transient::hosts_menu(),
+            transient::projects_menu(),
+            transient::status_menu(),
+            transient::input_menu(),
+            transient::usage_root_menu(),
+            transient::verdict_menu(),
+            transient::verdict_snooze_menu(),
+            transient::root_menu(&subject),
+        ] {
+            for item in menu.items() {
+                if matches!(
+                    item.action(),
+                    MenuAction::Open(_) | MenuAction::Command(Command::AllCommands)
+                ) {
+                    continue;
+                }
+                if options.iter().any(|(_, action)| action == item.action()) {
+                    continue;
+                }
+                options.push((
+                    format!("{} · {}", menu.title(), item.description()),
+                    item.action().clone(),
+                ));
+            }
+        }
+        let complete_options = options.clone();
+        self.open_prompt(
+            "Command",
+            std::rc::Rc::new(move |_, input, _| {
+                let query = input.to_lowercase();
+                complete_options
+                    .iter()
+                    .filter(|(label, _)| {
+                        query
+                            .split_whitespace()
+                            .all(|word| label.to_lowercase().contains(word))
+                    })
+                    .map(|(label, _)| crate::minibuffer::Candidate {
+                        value: label.clone(),
+                        description: String::new(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |this, input, window, cx| {
+                if let Some((_, action)) = options.iter().find(|(label, _)| *label == input) {
+                    this.run_menu_action(action.clone(), None, true, window, cx);
+                }
+            }),
+            window,
+            cx,
+        );
+        if let Some(prompt) = &mut self.minibuffer {
+            prompt.set_complete_whole_input();
+        }
+    }
+
+    pub(super) fn phone_edit(
+        &mut self,
+        action: crate::transient::EditCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::transient::EditCommand::*;
+        let action: Box<dyn gpui::Action> = match action {
+            Undo => Box::new(editor::Undo),
+            Redo => Box::new(editor::Redo),
+            Copy => Box::new(editor::Copy),
+            Cut => Box::new(editor::Cut),
+            Paste => Box::new(editor::Paste),
+            SelectAll => Box::new(editor::SelectAll),
+            SelectWord => Box::new(editor::SelectToNextWordEnd),
+            Top => Box::new(editor::MoveToBeginning),
+            Bottom => Box::new(editor::MoveToEnd),
+            PageUp => Box::new(editor::MovePageUp::default()),
+            PageDown => Box::new(editor::MovePageDown::default()),
+        };
+        window.dispatch_action(action, cx);
+    }
+
+    pub(super) fn phone_browser_type(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let super::SurfaceView::Browser(view) = &self.active_surface().view else {
+            self.echo(
+                "Open a browser and tap its text field first",
+                rho_window::style::StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let view = view.clone();
+        self.open_prompt(
+            "Type in the focused browser field:",
+            std::rc::Rc::new(|_, _, _| vec![]),
+            std::rc::Rc::new(move |_, text, window, cx| {
+                let task = view.update(cx, |view, cx| view.type_text(&text, window, cx));
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = this.update(cx, |this, cx| {
+                            this.echo(
+                                &format!("Browser typing: {error}"),
+                                rho_window::style::StyleClass::StatusError,
+                                cx,
+                            )
+                        });
+                    }
+                })
+                .detach();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn phone_find_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use super::SurfaceView;
+        match self.active_surface().view {
+            SurfaceView::SlackConversation(_) => self.prompt_slack_search(window, cx),
+            SurfaceView::Transcript { .. } => {
+                self.prompt_transcript_search(crate::search::Direction::Forward, window, cx)
+            }
+            _ => {
+                let editor = self.active_editor(cx);
+                self.prompt_for_query(
+                    crate::search::Direction::Forward,
+                    window,
+                    cx,
+                    move |this, query, window, cx| {
+                        if !this.search_editor(&editor, query, window, cx) {
+                            this.echo(
+                                "No matching text",
+                                rho_window::style::StyleClass::SystemInfo,
+                                cx,
+                            );
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    pub(super) fn open_phone_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let subject = self.subject(window, cx);
+        self.open_menu(crate::transient::phone_root_menu(&subject), window, cx);
+    }
+
     pub(super) fn render_phone_body(
         &mut self,
         text_style: &gpui::TextStyle,
@@ -733,13 +1330,13 @@ impl Workspace {
             && let Some(card) = self.open_card_in_view(cx)
         {
             let colors = cx.theme().colors();
-            let (breadcrumb, label) = {
+            let (breadcrumb, _) = {
                 let font_size = text_style.font_size.to_pixels(window.rem_size());
                 let font = text_style.font();
                 phone_deal_header_text(
                     &Self::card_path(&card),
-                    &card.label,
-                    window.viewport_size().width,
+                    "",
+                    window.viewport_size().width - px(48.),
                     |text| {
                         window
                             .text_system()
@@ -761,7 +1358,7 @@ impl Workspace {
             let header = div()
                 .id("phone-deal-header")
                 .flex_none()
-                .h(px(32.))
+                .h(px(48.))
                 .w_full()
                 .px_2()
                 .flex()
@@ -772,18 +1369,35 @@ impl Workspace {
                 .text_color(colors.text_muted)
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
+                    this.open_phone_menu(window, cx);
                 }))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(breadcrumb),
+                        .child(
+                            div()
+                                .text_size(px(16.))
+                                .text_color(colors.text)
+                                .child(breadcrumb),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .whitespace_nowrap()
+                                .child(card.label.clone()),
+                        ),
                 )
-                .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
-            let body = self.render_surface(&self.active_surface().clone());
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(48.))
+                        .flex()
+                        .justify_center()
+                        .child("☰"),
+                );
+            let body = self.render_phone_surface(&self.active_surface().clone(), window, cx);
             let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.feed_focus)
@@ -802,7 +1416,11 @@ impl Workspace {
                         .overflow_hidden()
                         .child(body),
                 )
-                .child(self.render_phone_verdict_bar(cx));
+                .children(
+                    self.minibuffer
+                        .is_none()
+                        .then(|| self.render_phone_verdict_bar(cx)),
+                );
             return if let Some(snap) = self.phone.snap {
                 card.with_animation(
                     ("phone-card-snap", snap.generation),
@@ -837,7 +1455,7 @@ impl Workspace {
                         .text_color(colors.text_muted)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_menu(crate::transient::phone_root_menu(), window, cx);
+                            this.open_phone_menu(window, cx);
                         }))
                         // The header names what the reader is looking at,
                         // and with the queue empty that is Home, not the
@@ -864,7 +1482,7 @@ impl Workspace {
                             .into_any_element(),
                     }
                 })
-                .child(self.render_phone_bar(cx))
+                .children(self.minibuffer.is_none().then(|| self.render_phone_bar(cx)))
                 .into_any_element();
         }
         if let Some(surface) = self.phone_surface() {
@@ -873,6 +1491,7 @@ impl Workspace {
                 .size_full()
                 .flex()
                 .flex_col()
+                .child(self.render_phone_header(&surface, cx))
                 .child(
                     div()
                         .flex_1()
@@ -880,9 +1499,9 @@ impl Workspace {
                         .w_full()
                         .overflow_hidden()
                         .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
-                        .child(self.render_surface(&surface)),
+                        .child(self.render_phone_surface(&surface, window, cx)),
                 )
-                .child(self.render_phone_bar(cx))
+                .children(self.minibuffer.is_none().then(|| self.render_phone_bar(cx)))
                 .into_any_element()
         } else {
             div()
@@ -898,7 +1517,7 @@ impl Workspace {
                         .overflow_hidden()
                         .track_focus(&self.phone.feed_focus),
                 )
-                .child(self.render_phone_bar(cx))
+                .children(self.minibuffer.is_none().then(|| self.render_phone_bar(cx)))
                 .into_any_element()
         }
     }
@@ -1077,21 +1696,6 @@ impl Workspace {
                 .child(div().text_size(px(18.)).child(icon))
                 .child(div().text_size(px(11.)).child(label))
         };
-        let primary = if self.phone_surface().is_some_and(|surface| {
-            matches!(
-                surface.key,
-                super::SurfaceKey::Draft
-                    | super::SurfaceKey::Transcript(_)
-                    | super::SurfaceKey::SlackConversation(_)
-            )
-        }) {
-            Some(
-                item("phone-send", "↑", "send")
-                    .on_click(cx.listener(|this, _, window, cx| this.phone_send(window, cx))),
-            )
-        } else {
-            None
-        };
         div()
             .id("phone-bottom-bar")
             .flex_none()
@@ -1107,44 +1711,12 @@ impl Workspace {
             )
             .child(
                 item("phone-menu", "☰", "menu").on_click(cx.listener(|this, _, window, cx| {
-                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
+                    this.open_phone_menu(window, cx);
                 })),
             )
-            .children(primary)
             .into_any_element()
     }
 
-    fn phone_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.minibuffer.is_some() {
-            self.minibuffer_confirm(window, cx);
-            return;
-        }
-        if self.phone.stack.is_empty() {
-            return;
-        }
-        let Some(surface) = self.phone_surface() else {
-            return;
-        };
-        match surface.key {
-            super::SurfaceKey::Draft | super::SurfaceKey::Transcript(_) => {
-                self.submit_prompt(&crate::SubmitPrompt, window, cx)
-            }
-            super::SurfaceKey::SlackConversation(_) => {
-                let super::SurfaceView::SlackConversation(view) = surface.view else {
-                    return;
-                };
-                // The answer says what Slack made of it, which the journal
-                // wants and the phone has nowhere to put. Dropping it drops
-                // the answer, not the message: the write is detached inside
-                // `submit`.
-                drop(view.update(cx, |view, cx| view.submit(cx)));
-            }
-            _ => {}
-        }
-    }
-
-    /// The open menu, drawn as a sheet: the same menu the desk draws as a
-    /// block under the point, with its rows as targets a thumb can hit.
     pub(super) fn render_phone_menu_sheet(
         &self,
         text_style: &gpui::TextStyle,
@@ -1154,6 +1726,8 @@ impl Workspace {
             title,
             rows,
             has_back: has_parent,
+            counted,
+            count,
         } = self.menu_sheet()?;
         let colors = cx.theme().colors();
 
@@ -1162,7 +1736,7 @@ impl Workspace {
             .items_center()
             .min_h(TARGET_HEIGHT)
             .px_3()
-            .gap_3()
+            .gap_1()
             .border_b_1()
             .border_color(colors.border_variant);
         if has_parent {
@@ -1174,7 +1748,7 @@ impl Workspace {
                     .min_w(TARGET_HEIGHT)
                     .flex()
                     .items_center()
-                    .child("back")
+                    .child("‹")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.menu_dismiss(window, cx);
                         cx.stop_propagation();
@@ -1182,9 +1756,25 @@ impl Workspace {
             );
         }
         header = header
+            .when(counted, |header| {
+                header.child(
+                    div()
+                        .id("phone-count")
+                        .min_h(TARGET_HEIGHT)
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .child(format!("×{}", count.unwrap_or(1)))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.phone_menu_count(window, cx)),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(title),
             )
@@ -1197,7 +1787,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_end()
-                    .child("close")
+                    .child("×")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.close_menu(window, cx);
                         cx.stop_propagation();
@@ -1217,7 +1807,7 @@ impl Workspace {
                     .gap_3()
                     .border_b_1()
                     .border_color(colors.border_variant)
-                    .child(div().flex_1().child(description));
+                    .child(div().flex_1().min_w_0().child(description));
                 if let Some(value) = value {
                     row = row.child(div().text_color(colors.text_muted).child(value));
                 }
@@ -1256,7 +1846,9 @@ impl Workspace {
                         .id("phone-sheet")
                         .max_h(gpui::relative(0.82))
                         .w_full()
-                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
                         .bg(background)
                         .text_color(text_style.color)
                         .font_family(text_style.font_family.clone())
@@ -1265,8 +1857,15 @@ impl Workspace {
                         .line_height(text_style.line_height)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(header)
-                        .children(rows),
+                        .child(header.flex_none())
+                        .child(
+                            div()
+                                .id("phone-sheet-rows")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 )
                 .into_any_element(),
         )

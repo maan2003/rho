@@ -339,6 +339,15 @@ impl Workspace {
         let session = self.slack_session(window, cx)?;
         let hooks = Self::slack_hooks();
         let list = cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx));
+        self._slack_view_subscriptions.push(cx.subscribe_in(
+            &list,
+            window,
+            |this, _, event: &rho_slack::ui::list::Event, window, cx| match event {
+                rho_slack::ui::list::Event::Open(source) => {
+                    this.open_slack_source(source.clone(), window, cx)
+                }
+            },
+        ));
         self.slack.list = Some(list.clone());
         Some(list)
     }
@@ -774,7 +783,12 @@ impl Workspace {
         let land = session
             .read(cx)
             .oldest_from_other_after(&unit_of, cursor.as_ref());
-        self.open_slack_source(unit_source(unit), window, cx);
+        self.open_slack_source_with_method(
+            unit_source(unit),
+            rho_journal::SurfaceShowMethod::Deal,
+            window,
+            cx,
+        );
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
@@ -791,6 +805,21 @@ impl Workspace {
     pub(crate) fn open_slack_source(
         &mut self,
         source: Source,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_slack_source_with_method(
+            source,
+            rho_journal::SurfaceShowMethod::Command,
+            window,
+            cx,
+        );
+    }
+
+    fn open_slack_source_with_method(
+        &mut self,
+        source: Source,
+        method: rho_journal::SurfaceShowMethod,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -852,12 +881,24 @@ impl Workspace {
                         rho_slack::ui::conversation::Event::ActivateRequested => {
                             workspace.slack_open_row(window, cx);
                         }
+                        rho_slack::ui::conversation::Event::MessageActionsRequested(_) => {
+                            workspace.prompt_slack_message_actions(window, cx);
+                        }
+                        rho_slack::ui::conversation::Event::OpenThread(thread) => {
+                            workspace.open_slack_source(Source::Thread(thread.clone()), window, cx);
+                        }
+                        rho_slack::ui::conversation::Event::AttachRequested => {
+                            workspace.prompt_slack_attach(window, cx);
+                        }
+                        rho_slack::ui::conversation::Event::SubmitRequested => {
+                            drop(view.update(cx, |view, cx| view.submit(cx)));
+                        }
                     },
                 ));
                 Self::wrap_surface(key, SurfaceView::SlackConversation(view))
             }
         };
-        self.show_slack_surface(surface, cx);
+        self.display_surface_with_method(surface, method, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }

@@ -6,10 +6,12 @@ use std::rc::Rc;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollDelta,
-    ScrollWheelEvent, Styled as _, StyledText, Subscription, TextStyle, Window, canvas, div, px,
+    AnyElement, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, StyledText, Subscription, TextStyle, UTF16Selection, Window,
+    canvas, div, px,
 };
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -38,6 +40,7 @@ gpui::actions!(
 
 /// Client-side scrollback retention; the agent host replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;
+const TOUCH_KEY_HEIGHT: f32 = 48.;
 
 /// The shared terminal state: wire screen, input stream, and read task.
 /// Panes hold views over it; the model outlives any of them.
@@ -105,6 +108,11 @@ impl TerminalModel {
     }
 }
 
+struct Preedit {
+    text: String,
+    selection: Range<usize>,
+}
+
 /// A terminal's viewport: focus, scroll offset, and mode.
 pub struct TerminalView {
     model: Entity<TerminalModel>,
@@ -121,6 +129,8 @@ pub struct TerminalView {
     /// Paint-time cell geometry for mouse-report coordinates.
     cell_width_px: Rc<Cell<f32>>,
     grid_origin_px: Rc<Cell<(f32, f32)>>,
+    /// IME preedit stays local: only committed text reaches the PTY.
+    marked_text: Option<Preedit>,
     _model_changed: Subscription,
 }
 
@@ -149,6 +159,7 @@ impl TerminalView {
             line_height_px: Rc::new(Cell::new(16.0)),
             cell_width_px: Rc::new(Cell::new(8.0)),
             grid_origin_px: Rc::new(Cell::new((0.0, 0.0))),
+            marked_text: None,
             _model_changed: model_changed,
         }
     }
@@ -159,6 +170,15 @@ impl TerminalView {
         }
         let ks = &event.keystroke;
         if ks.modifiers.platform {
+            return;
+        }
+        // GPUI delivers printable text through the registered input handler
+        // after key dispatch. Sending it here too would type it twice.
+        if !ks.modifiers.control
+            && !ks.modifiers.alt
+            && ((ks.key_char.is_some() && !matches!(ks.key.as_str(), "enter" | "tab"))
+                || self.marked_text.is_some())
+        {
             return;
         }
         let keystroke = TermKeystroke {
@@ -172,17 +192,25 @@ impl TerminalView {
         if self.scroll_offset != 0 {
             self.scroll_offset = 0;
         }
-        self.model
-            .read(cx)
-            .send(TermClientFrame::Keystroke(keystroke));
-        cx.notify();
+        self.send_keystroke(keystroke, cx);
         if handled {
             cx.stop_propagation();
         }
     }
 
+    /// Hardware and touch key controls use the same terminal input stream.
+    pub fn send_keystroke(&mut self, keystroke: TermKeystroke, cx: &mut Context<Self>) {
+        self.raw = true;
+        self.scroll_offset = 0;
+        self.model
+            .read(cx)
+            .send(TermClientFrame::Keystroke(keystroke));
+        cx.notify();
+    }
+
     fn paste(&mut self, _: &crate::TerminalPaste, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.marked_text = None;
             self.scroll_offset = 0;
             self.model.read(cx).send(TermClientFrame::Paste(text));
             cx.notify();
@@ -196,6 +224,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.raw = false;
+        self.marked_text = None;
         cx.notify();
     }
 
@@ -296,6 +325,114 @@ impl TerminalView {
     }
 }
 
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        // The terminal application's screen is not an editable text document.
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        (self.raw || ignore_disabled_input).then(|| UTF16Selection {
+            range: self
+                .marked_text
+                .as_ref()
+                .map_or(0..0, |marked| marked.selection.clone()),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_text
+            .as_ref()
+            .map(|marked| 0..marked.text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked_text = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = None;
+        if self.raw && !text.is_empty() {
+            self.scroll_offset = 0;
+            self.model
+                .read(cx)
+                .send(TermClientFrame::Input(text.as_bytes().to_vec()));
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        selected_range: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.raw {
+            self.marked_text = (!text.is_empty()).then(|| {
+                let end = text.encode_utf16().count();
+                Preedit {
+                    text: text.to_owned(),
+                    selection: selected_range.unwrap_or(end..end),
+                }
+            });
+            self.scroll_offset = 0;
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let cursor = &self.model.read(cx).screen.cursor;
+        let (x, y) = self.grid_origin_px.get();
+        Some(Bounds {
+            origin: Point::new(
+                px(x + f32::from(cursor.col) * self.cell_width_px.get()),
+                px(y + f32::from(cursor.row) * self.line_height_px.get()),
+            ),
+            size: gpui::size(px(self.cell_width_px.get()), px(self.line_height_px.get())),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.raw
+    }
+}
+
 enum VisibleLine<'a> {
     Row {
         row: &'a TermRow,
@@ -350,6 +487,9 @@ impl Render for TerminalView {
         let sent_size = model.sent_size.clone();
         let input = model.input.clone();
         let grid_origin_px = self.grid_origin_px.clone();
+        let raw = self.raw;
+        let focus_handle = self.focus_handle.clone();
+        let view = cx.entity();
         let measure = canvas(
             move |bounds, _window, _cx| {
                 grid_origin_px.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -367,7 +507,15 @@ impl Render for TerminalView {
                     });
                 }
             },
-            |_, _, _, _| {},
+            move |bounds, _, window, cx| {
+                if raw {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, view.clone()),
+                        cx,
+                    );
+                }
+            },
         )
         .size_full();
 
@@ -412,6 +560,127 @@ impl Render for TerminalView {
                 .child("NORMAL")
         });
 
+        let touch = cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0);
+        let mut strip = div()
+            .id("terminal-touch-keys")
+            .w_full()
+            .h(px(TOUCH_KEY_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .overflow_x_scroll()
+            .bg(colors.element_background)
+            .text_color(colors.text);
+        for (index, (label, key, ctrl)) in [
+            ("Esc", "escape", false),
+            ("Tab", "tab", false),
+            ("Ctrl-C", "c", true),
+            ("←", "left", false),
+            ("↓", "down", false),
+            ("↑", "up", false),
+            ("→", "right", false),
+            ("Enter", "enter", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            strip = strip.child(
+                div()
+                    .id(("terminal-touch-key", index))
+                    .min_w(px(TOUCH_KEY_HEIGHT))
+                    .h_full()
+                    .px_2()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.send_keystroke(
+                            TermKeystroke {
+                                key: key.into(),
+                                ctrl,
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                        window.focus(&this.focus_handle, cx);
+                    })),
+            );
+        }
+        strip = strip.child(
+            div()
+                .id("terminal-touch-paste")
+                .min_w(px(TOUCH_KEY_HEIGHT))
+                .h_full()
+                .px_2()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child("Paste")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.raw = true;
+                    this.paste(&crate::TerminalPaste, window, cx);
+                    window.focus(&this.focus_handle, cx);
+                })),
+        );
+        let preedit = self.marked_text.as_ref().map(|marked| {
+            let text = &marked.text;
+            div()
+                .absolute()
+                .left(cell_width * f32::from(model.screen.cursor.col))
+                .top(line_height * f32::from(model.screen.cursor.row))
+                .bg(background)
+                .child(StyledText::new(text.clone()).with_default_highlights(
+                    &text_style,
+                    [(
+                        0..text.len(),
+                        HighlightStyle {
+                            underline: Some(gpui::UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(foreground),
+                                wavy: false,
+                            }),
+                            ..Default::default()
+                        },
+                    )],
+                ))
+        });
+        let grid = div()
+            .relative()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .child(div().absolute().size_full().child(measure))
+            // PTY content is sized by the viewport, never the other way round.
+            .child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
+            .children(preedit)
+            .children(normal_badge)
+            .children(status.map(|status| {
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    .px_2()
+                    .bg(colors.element_background)
+                    .text_color(foreground.opacity(0.8))
+                    .child(status)
+            }));
+
         div()
             .id("rho-terminal")
             .track_focus(&self.focus_handle)
@@ -447,6 +716,12 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &crate::TerminalScrollBottom, _, cx| {
                 this.scroll_lines(isize::MIN / 2, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                }),
+            )
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .size_full()
@@ -456,31 +731,10 @@ impl Render for TerminalView {
             .font_family(font.family.clone())
             .text_size(font_size)
             .line_height(line_height)
-            .child(div().absolute().size_full().child(measure))
-            // The grid paints in an absolute layer: pty content is sized by
-            // the viewport, never the other way around, so a wide row can only
-            // be clipped.
-            .child(
-                div()
-                    .absolute()
-                    .size_full()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .children(rows),
-            )
-            .children(normal_badge)
-            .children(status.map(|status| {
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .w_full()
-                    .px_2()
-                    .bg(colors.element_background)
-                    .text_color(foreground.opacity(0.8))
-                    .child(status)
-            }))
+            .flex()
+            .flex_col()
+            .child(grid)
+            .when(touch, |el| el.child(strip))
     }
 }
 
@@ -755,6 +1009,196 @@ fn probably_produces_bytes(ks: &TermKeystroke) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<TerminalModel>,
+        futures_mpsc::Receiver<TermClientFrame>,
+        futures_mpsc::Sender<anyhow::Result<TermServerFrame>>,
+    ) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (input, received) = futures_mpsc::channel(64);
+        let (server, frames) = futures_mpsc::channel(8);
+        // The tests observe the exact view-to-host frames, without a live PTY.
+        // A real channel task supplies the ownership contract of TerminalChannel.
+        let (_, _, transport) = rho_rpc::Stream::new(tokio::io::empty(), tokio::io::sink())
+            .into_channel::<TermClientFrame, TermServerFrame>(rho_rpc::ChannelConfig {
+                tx_limit: 1024,
+                rx_limit: 1024,
+                tx_capacity: 1,
+                rx_capacity: 1,
+            })
+            .into_parts();
+        let model = cx.new(|cx| {
+            TerminalModel::new(
+                TerminalChannel {
+                    terminal_id: 1,
+                    frames,
+                    input,
+                    transport,
+                },
+                cx,
+            )
+        });
+        (model, received, server)
+    }
+
+    #[gpui::test]
+    fn ime_preedit_never_executes_and_commit_uses_utf8_once(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (model, mut received, _server) = test_model(cx);
+        let window = cx.add_window(|_, cx| TerminalView::new(model, cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.replace_and_mark_text_in_range(None, "A😀é", Some(1..3), window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(0..4));
+                assert_eq!(
+                    view.selected_text_range(false, window, cx).unwrap().range,
+                    1..3
+                );
+                assert!(received.try_recv().is_err());
+                view.replace_and_mark_text_in_range(Some(0..4), "中文", None, window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(0..2));
+                assert!(received.try_recv().is_err());
+                // Enter while composition is active must not run the half-written command.
+                view.key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(received.try_recv().is_err());
+                view.replace_text_in_range(Some(0..2), "中文😀", window, cx);
+                match received.try_recv().unwrap() {
+                    TermClientFrame::Input(bytes) => assert_eq!(bytes, "中文😀".as_bytes()),
+                    other => panic!("expected committed UTF-8 input, got {other:?}"),
+                }
+                assert!(received.try_recv().is_err());
+                assert!(view.marked_text_range(window, cx).is_none());
+                view.replace_and_mark_text_in_range(None, "not committed", None, window, cx);
+                view.unmark_text(window, cx);
+                assert!(received.try_recv().is_err());
+                view.enter_normal_mode(&crate::TerminalNormalMode, window, cx);
+                assert!(!view.accepts_text_input(window, cx));
+                assert!(view.selected_text_range(false, window, cx).is_none());
+                view.replace_text_in_range(None, "must not execute", window, cx);
+                assert!(received.try_recv().is_err());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn hardware_text_commits_once_while_control_keys_keep_protocol(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (model, mut received, _server) = test_model(cx);
+        let window = cx.add_window(|window, cx| {
+            let view = TerminalView::new(model, cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        cx.refresh().unwrap();
+        while received.try_recv().is_ok() {}
+        // This uses GPUI's real key -> input-handler dispatch, not separate calls
+        // that could miss accidental double forwarding in key_down.
+        for key in ["a", "é"] {
+            cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse(key).unwrap());
+        }
+        let mut bytes = Vec::new();
+        while let Ok(frame) = received.try_recv() {
+            match frame {
+                TermClientFrame::Input(input) => bytes.extend(input),
+                TermClientFrame::Resize { .. } => {}
+                other => panic!("printable text was forwarded as a duplicate key: {other:?}"),
+            }
+        }
+        assert_eq!(bytes, "aé".as_bytes());
+        for key in ["ctrl-c", "left", "enter", "tab"] {
+            cx.simulate_keystrokes(window.into(), key);
+            let mut sent = Vec::new();
+            while let Ok(frame) = received.try_recv() {
+                if let TermClientFrame::Keystroke(key) = frame {
+                    sent.push(key);
+                } else if !matches!(frame, TermClientFrame::Resize { .. }) {
+                    panic!("control key used text path: {frame:?}");
+                }
+            }
+            assert_eq!(sent.len(), 1, "{key}");
+            assert_eq!(sent[0].key, key.strip_prefix("ctrl-").unwrap_or(key));
+            assert_eq!(sent[0].ctrl, key.starts_with("ctrl-"));
+        }
+    }
+
+    #[gpui::test]
+    fn touch_keys_reserve_grid_height_and_send_direct_keys(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        let (model, mut received, _server) = test_model(cx);
+        let window = cx.open_window(gpui::size(px(390.), px(500.)), |window, cx| {
+            let view = TerminalView::new(model, cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        cx.draw_window(window.into());
+        let desktop_rows = std::iter::from_fn(|| received.try_recv().ok())
+            .find_map(|frame| match frame {
+                TermClientFrame::Resize { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        cx.set_global(rho_window::TouchMode(true));
+        cx.draw_window(window.into());
+        let phone_rows = std::iter::from_fn(|| received.try_recv().ok())
+            .find_map(|frame| match frame {
+                TermClientFrame::Resize { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        let row_height = cx.update(|cx| {
+            let settings = ThemeSettings::get_global(cx);
+            f32::from(settings.buffer_font_size(cx)) * settings.buffer_line_height.value()
+        });
+        assert_eq!(desktop_rows, (500. / row_height).floor() as u16);
+        assert_eq!(phone_rows, ((500. - 48.) / row_height).floor() as u16);
+        assert!(phone_rows < desktop_rows);
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_click(Point::new(px(24.), px(476.)), gpui::Modifiers::default());
+        let frame = received.try_recv().unwrap();
+        assert!(
+            matches!(frame, TermClientFrame::Keystroke(TermKeystroke { ref key, ctrl: false, .. }) if key == "escape")
+        );
+        assert!(received.try_recv().is_err());
+
+        // Touch controls return normal mode to raw input and refocus the grid.
+        window
+            .update(&mut visual, |view, window, cx| {
+                view.enter_normal_mode(&crate::TerminalNormalMode, window, cx);
+            })
+            .unwrap();
+        visual.draw_window(window.into());
+        visual.simulate_click(Point::new(px(72.), px(476.)), gpui::Modifiers::default());
+        let frame = received.try_recv().unwrap();
+        assert!(
+            matches!(frame, TermClientFrame::Keystroke(TermKeystroke { ref key, .. }) if key == "tab")
+        );
+        window
+            .update(&mut visual, |view, window, cx| {
+                assert!(view.raw);
+                assert!(view.focus_handle.is_focused(window));
+                assert!(view.accepts_text_input(window, cx));
+            })
+            .unwrap();
+    }
 
     fn rgba(red: f32, green: f32, blue: f32) -> gpui::Rgba {
         gpui::Rgba {

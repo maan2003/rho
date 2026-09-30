@@ -42,6 +42,7 @@ pub(crate) enum MenuId {
     Hosts,
     Projects,
     /// The snooze units under the verdicts (`s` then `m`, `h`, `d`, `w`).
+    Verdict,
     VerdictSnooze,
     Input,
     Agent,
@@ -49,6 +50,9 @@ pub(crate) enum MenuId {
     Status,
     /// `space s u`: which usage chart to look at.
     UsageRoot,
+    PhoneTools,
+    PhoneFiling,
+    Editing,
 }
 
 /// A command a menu item runs, which is the whole of what the item means.
@@ -57,10 +61,15 @@ pub(crate) enum MenuId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     // The root menu.
+    AllCommands,
+    Edit(EditCommand),
+    FindText,
     Voice,
     SwitchBuffer,
     MessageLog,
     SurfaceBack,
+    SurfaceForward,
+    FileSave,
     PullCard,
     CloseAndDeal,
     OpenFile,
@@ -125,6 +134,7 @@ pub(crate) enum Command {
     // New: creation, one verb.
     NewAgent,
     NewPage,
+    BrowserType,
     NewNote,
     // Status.
     /// One of the usage screen's charts, over that many days.
@@ -154,6 +164,22 @@ pub(crate) enum Command {
         hour: u32,
         tomorrow: bool,
     },
+}
+
+/// Direct editing without modal key sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditCommand {
+    Undo,
+    Redo,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+    SelectWord,
+    Top,
+    Bottom,
+    PageUp,
+    PageDown,
 }
 
 /// What a verdict item does. Kept apart from [`Command`] because a verdict
@@ -612,15 +638,162 @@ pub(crate) fn agent_menu() -> Menu {
         )
 }
 
-pub(crate) fn phone_root_menu() -> Menu {
-    Menu::new("menu")
+pub(crate) fn phone_root_menu(subject: &Subject) -> Menu {
+    Menu::new("Rho")
         .item(
-            "s",
-            "Slack",
-            MenuAction::Command(Command::SlackConversations),
+            "/",
+            "Find a command…",
+            MenuAction::Command(Command::AllCommands),
         )
-        .item("a", "Agents", MenuAction::Open(MenuId::Agent))
-        .item("i", "Status", MenuAction::Open(MenuId::Status))
+        .item("n", "New…", MenuAction::Open(MenuId::New))
+        .item(
+            "b",
+            "Buffers & agents…",
+            MenuAction::Command(Command::SwitchBuffer),
+        )
+        .item(
+            "f",
+            "Find notes, agents & conversations…",
+            MenuAction::Command(Command::FindNode),
+        )
+        .item("h", "Home", MenuAction::Command(Command::Home))
+        .item("s", "Slack…", MenuAction::Open(MenuId::Slack))
+        .when(
+            subject.has_agent(),
+            "a",
+            "Agent actions…",
+            MenuAction::Open(MenuId::Agent),
+        )
+        .item(
+            "e",
+            "Edit & search this buffer…",
+            MenuAction::Open(MenuId::Editing),
+        )
+        .item(
+            "w",
+            "Files, browser, shell & desktop…",
+            MenuAction::Open(MenuId::PhoneTools),
+        )
+        .item(
+            "l",
+            "Notes & filing…",
+            MenuAction::Open(MenuId::PhoneFiling),
+        )
+        .item("p", "Projects…", MenuAction::Open(MenuId::Projects))
+        .item("o", "Hosts…", MenuAction::Open(MenuId::Hosts))
+        .item("i", "Voice & input…", MenuAction::Open(MenuId::Input))
+        .item(
+            "m",
+            "Message history",
+            MenuAction::Command(Command::MessageLog),
+        )
+        .item(
+            "u",
+            "Undo verdict",
+            MenuAction::Command(Command::UndoVerdict),
+        )
+        .item("j", "Next card", MenuAction::Command(Command::PullCard))
+        .item("v", "Status & usage…", MenuAction::Open(MenuId::Status))
+        .item(
+            "d",
+            "Card actions & counts…",
+            MenuAction::Open(MenuId::Verdict),
+        )
+}
+
+pub(crate) fn phone_tools_menu() -> Menu {
+    Menu::new("Work")
+        .item("f", "Open file…", MenuAction::Command(Command::OpenFile))
+        .item("s", "Save file", MenuAction::Command(Command::FileSave))
+        .item(
+            "p",
+            "New browser page…",
+            MenuAction::Command(Command::NewPage),
+        )
+        .item(
+            "i",
+            "Type in browser field…",
+            MenuAction::Command(Command::BrowserType),
+        )
+        .item(
+            "c",
+            "Start / attach shell",
+            MenuAction::Command(Command::Shell),
+        )
+        .item(
+            "shift-c",
+            "Close shell",
+            MenuAction::Command(Command::ShellClose),
+        )
+        .item("t", "Terminal", MenuAction::Command(Command::Terminal))
+        .item(
+            "shift-t",
+            "New terminal",
+            MenuAction::Command(Command::NewTerminal),
+        )
+        .item("w", "Agent desktop…", MenuAction::Command(Command::Wayland))
+        .item(
+            "k",
+            "Previous surface",
+            MenuAction::Command(Command::SurfaceBack),
+        )
+        .item(
+            "shift-k",
+            "Forward surface",
+            MenuAction::Command(Command::SurfaceForward),
+        )
+        .item(
+            "j",
+            "Close buffer & deal",
+            MenuAction::Command(Command::CloseAndDeal),
+        )
+        .item("q", "Quit Rho", MenuAction::Command(Command::Quit))
+}
+
+pub(crate) fn phone_filing_menu() -> Menu {
+    Menu::new("Notes & filing")
+        .item("n", "New note…", MenuAction::Command(Command::NewNote))
+        .item(
+            "f",
+            "Find note or label…",
+            MenuAction::Command(Command::FindNode),
+        )
+        .item(
+            "shift-n",
+            "Notes for this",
+            MenuAction::Command(Command::NotesForThis),
+        )
+        .item(
+            "r",
+            "Rename / move label…",
+            MenuAction::Command(Command::MoveLabel),
+        )
+        .item(
+            "d",
+            "Delete this…",
+            MenuAction::Command(Command::DeleteMade),
+        )
+}
+
+pub(crate) fn editing_menu() -> Menu {
+    use EditCommand::*;
+    let mut menu = Menu::new("Edit");
+    for (key, label, action) in [
+        ("u", "Undo edit", Undo),
+        ("r", "Redo edit", Redo),
+        ("c", "Copy", Copy),
+        ("x", "Cut", Cut),
+        ("p", "Paste", Paste),
+        ("a", "Select all", SelectAll),
+        ("w", "Extend selection by word", SelectWord),
+        ("g", "Beginning", Top),
+        ("shift-g", "End", Bottom),
+        ("k", "Page up", PageUp),
+        ("j", "Page down", PageDown),
+    ] {
+        menu = menu.item(key, label, MenuAction::Command(Command::Edit(action)));
+    }
+    menu.item("/", "Find text…", MenuAction::Command(Command::FindText))
 }
 
 /// The phone's answer to "how long": the times a thumb picks, where a
@@ -664,6 +837,11 @@ pub(crate) fn snooze_sheet() -> Menu {
             "w",
             "next week",
             MenuAction::Command(Command::PhoneSnoozeAhead(SnoozeUnit::Weeks, 1)),
+        )
+        .item(
+            "c",
+            "Custom duration…",
+            MenuAction::Open(MenuId::VerdictSnooze),
         )
 }
 
@@ -739,7 +917,8 @@ mod tests {
                 "tonight (18:00)",
                 "tomorrow (09:00)",
                 "3d",
-                "next week"
+                "next week",
+                "Custom duration…"
             ]
         );
     }

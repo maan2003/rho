@@ -350,9 +350,29 @@ impl AgentModel {
     /// Builds an editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        self.build_transcript_editor(false, window, cx)
+    }
+
+    /// A full-size, read-only history surface with no prompt excerpt. It uses
+    /// the same transcript buffers and participates in history composition,
+    /// selection memory and transcript decorations like the desktop editor.
+    pub fn build_reading_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        self.build_transcript_editor(true, window, cx)
+    }
+
+    fn build_transcript_editor(
+        &mut self,
+        reading_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
         let completions = self.completions.clone();
-        let activity = self.view == TranscriptView::Activity;
-        let multi_buffer = if activity {
+        let read_only = reading_only || self.view == TranscriptView::Activity;
+        let multi_buffer = if read_only {
             self.document_multi_buffer.clone()
         } else {
             self.multi_buffer.clone()
@@ -373,7 +393,7 @@ impl AgentModel {
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(prompt_id, cx);
-            if activity {
+            if read_only {
                 editor.set_read_only(true);
                 editor.set_autoscroll_pin(
                     multi_buffer::Anchor::Max,
@@ -391,8 +411,9 @@ impl AgentModel {
             editor
         });
 
-        if let Some(draft_anchor) = self
-            .multi_buffer
+        if let Some(draft_anchor) = editor
+            .read(cx)
+            .buffer()
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(self.prompt_end)
@@ -433,6 +454,50 @@ impl AgentModel {
             self.go_to_store_point(&editor, point, window, cx);
         }
         editor
+    }
+
+    /// Builds a pinned conversation composer over the canonical prompt only.
+    /// Its cursor is independent of the transcript's reading position; it is
+    /// deliberately not a transcript attachment or a full-multibuffer editor.
+    /// Submit and attachment operations still act on this model.
+    ///
+    /// Focus this editor directly, not with the full-multibuffer
+    /// [`Self::focus_prompt`] or [`Self::selection_in_prompt`] helpers.
+    pub fn build_prompt_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(self.prompt_buffer.clone(), cx));
+        let completions = self.completions.clone();
+        cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(6),
+                },
+                multi_buffer,
+                None,
+                window,
+                cx,
+            );
+            rho_window::editor_config::configure(&mut editor, window, cx);
+            editor.set_show_compact_gutter(false, cx);
+            editor.set_mouse_click_selection_enabled(true, cx);
+            editor.disable_bracket_colorization(cx);
+            editor.set_completion_provider(Some(completions));
+            editor.set_placeholder_text("Write a message…", window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections
+                    .select_anchor_ranges([multi_buffer::Anchor::Max..multi_buffer::Anchor::Max]);
+            });
+            editor
+        })
+    }
+
+    /// Canonical image state for a composer rendered outside the transcript.
+    pub fn attachment_labels(&self) -> Vec<String> {
+        crate::attachment_labels(&self.attachments)
     }
 
     /// How much of the transcript is composed nowhere yet, in blocks.
@@ -623,8 +688,9 @@ impl AgentModel {
         let Some(anchor) = self.transcript.place_store_point(point, cx) else {
             return false;
         };
-        let Some(anchor) = self
-            .multi_buffer
+        let Some(anchor) = editor
+            .read(cx)
+            .buffer()
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(anchor)
@@ -733,7 +799,7 @@ impl AgentModel {
     /// Whether the newest selection head sits in the editable prompt tail of
     /// the transcript. The phone layout shows the keyboard only then.
     pub fn selection_in_prompt(&self, editor: &Entity<Editor>, cx: &App) -> bool {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let Some(prompt_start) = snapshot.anchor_in_excerpt(self.prompt_end) else {
             return false;
         };
@@ -750,8 +816,9 @@ impl AgentModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(prompt_end) = self
-            .multi_buffer
+        let Some(prompt_end) = editor
+            .read(cx)
+            .buffer()
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(self.prompt_end)
@@ -852,8 +919,9 @@ impl AgentModel {
     }
 
     fn apply_status_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let Some(anchor) = self
-            .multi_buffer
+        let Some(anchor) = editor
+            .read(cx)
+            .buffer()
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(self.prompt_end)
@@ -891,17 +959,18 @@ impl AgentModel {
         if self.attachments.is_empty() {
             return;
         }
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(self.prompt_end)
-        else {
-            return;
-        };
-        let block = style::attachment_block(anchor, crate::attachment_labels(&self.attachments));
+        let labels = crate::attachment_labels(&self.attachments);
         for editor in self.live_editors() {
-            let block = block.clone();
+            let Some(anchor) = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_in_excerpt(self.prompt_end)
+            else {
+                continue;
+            };
+            let block = style::attachment_block(anchor, labels.clone());
             let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));
             if let Some(block_id) = ids.into_iter().next() {
                 self.attachment_blocks.push((editor.downgrade(), block_id));
@@ -912,7 +981,7 @@ impl AgentModel {
     fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let buffer = self.prompt_buffer.read(cx);
         let draft_empty = buffer.is_empty();
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let Some(prompt_start) =
             snapshot.anchor_in_excerpt(self.prompt_buffer.read(cx).anchor_before(0))
         else {
@@ -975,7 +1044,223 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_token_count;
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    struct NoCompletions;
+
+    impl editor::CompletionProvider for NoCompletions {
+        fn completions(
+            &self,
+            _: &Entity<Buffer>,
+            _: text::Anchor,
+            _: editor::CompletionContext,
+            _: &mut Window,
+            _: &mut Context<Editor>,
+        ) -> Task<anyhow::Result<Vec<project::CompletionResponse>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn is_completion_trigger(
+            &self,
+            _: &Entity<Buffer>,
+            _: language::Anchor,
+            _: &str,
+            _: bool,
+            _: &mut Context<Editor>,
+        ) -> bool {
+            false
+        }
+    }
+
+    #[gpui::test]
+    fn pinned_composer_edits_only_shared_prompt_and_submits_shared_images(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let model = cx.new(|cx| {
+            AgentModel::new(
+                Rc::new(NoCompletions),
+                rho_agents_client::remote::AgentsLink::detached(),
+                cx,
+            )
+        });
+        let window = cx.add_window(|_, _| gpui::Empty);
+        window
+            .update(cx, |_, window, cx| {
+                let (transcript, prompt, reader) = model.update(cx, |model, cx| {
+                    let state = UiAgentState {
+                        blocks: vec![std::sync::Arc::new(
+                            rho_agents_client::state::UiBlock::AssistantMessage {
+                                text: "Transcript must stay unchanged".into(),
+                                phase: None,
+                            },
+                        )],
+                        status: rho_agents_client::state::UiAgentStatus::Streaming,
+                        runtime: None,
+                        awaiting_human: None,
+                        context_used: None,
+                        usage: Default::default(),
+                        exec_timings: Default::default(),
+                    };
+                    model.sync(
+                        &state,
+                        FrameSummary::everything(),
+                        0,
+                        &|_| "agent".into(),
+                        cx,
+                    );
+                    model.set_prompt_text("Existing prompt", cx);
+                    model.add_image("image/jpeg".into(), vec![4, 9], cx);
+                    (
+                        model.build_editor(window, cx),
+                        model.build_prompt_editor(window, cx),
+                        model.build_reading_editor(window, cx),
+                    )
+                });
+                // Reading a transcript must not retarget the independent composer.
+                transcript.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_anchor_ranges([
+                                multi_buffer::Anchor::Min..multi_buffer::Anchor::Min
+                            ]);
+                        },
+                    );
+                });
+                let transcript_selection = transcript.read(cx).selections.newest_anchor().clone();
+                let document_before = model
+                    .read(cx)
+                    .document_multi_buffer
+                    .read(cx)
+                    .snapshot(cx)
+                    .text();
+                assert!(document_before.contains("Transcript must stay unchanged"));
+                assert_eq!(reader.read(cx).text(cx), document_before);
+                assert!(!reader.read(cx).text(cx).contains("Existing prompt"));
+                assert!(!model.read(cx).selection_in_prompt(&reader, cx));
+                model.update(cx, |model, cx| {
+                    model.focus_prompt(&reader, window, cx);
+                    model.set_status("repository", None, None, None, None, cx);
+                    assert_eq!(model.attachment_blocks.len(), 1);
+                });
+                reader.update(cx, |editor, cx| {
+                    assert!(editor.read_only(cx));
+                    editor.insert("Must not enter read-only history", window, cx);
+                });
+                assert_eq!(reader.read(cx).text(cx), document_before);
+                prompt.update(cx, |editor, cx| {
+                    editor.insert(" + phone edit", window, cx);
+                });
+                assert_eq!(
+                    model.read(cx).prompt_text(cx),
+                    "Existing prompt + phone edit"
+                );
+                assert_eq!(
+                    model
+                        .read(cx)
+                        .document_multi_buffer
+                        .read(cx)
+                        .snapshot(cx)
+                        .text(),
+                    document_before
+                );
+                assert_eq!(
+                    transcript.read(cx).selections.newest_anchor(),
+                    &transcript_selection
+                );
+                assert_eq!(model.read(cx).editors.len(), 2);
+                assert_eq!(model.read(cx).attachment_labels(), vec!["JPEG · 1 KB"]);
+                model.update(cx, |model, cx| {
+                    assert_eq!(
+                        model.take_prompt(cx),
+                        Some(vec![
+                            ContentPart::Text {
+                                text: "Existing prompt + phone edit".into()
+                            },
+                            ContentPart::Image {
+                                media_type: "image/jpeg".into(),
+                                data: vec![4, 9]
+                            },
+                        ])
+                    );
+                    assert!(model.attachment_labels().is_empty());
+                    model.set_prompt_text("Restored from canonical operations", cx);
+                });
+                assert_eq!(
+                    prompt.read(cx).text(cx),
+                    "Restored from canonical operations"
+                );
+                assert_eq!(
+                    model
+                        .read(cx)
+                        .document_multi_buffer
+                        .read(cx)
+                        .snapshot(cx)
+                        .text(),
+                    document_before
+                );
+                // History placement must resolve against the reader's own
+                // excerpt IDs, not the prompt-containing desktop multibuffer.
+                let point = StorePoint {
+                    block: 0,
+                    offset: 7,
+                };
+                model.update(cx, |model, cx| {
+                    model.go_to_store_point(&reader, point, window, cx);
+                });
+                assert_eq!(model.read(cx).store_point(&reader, cx), Some(point));
+
+                // The reader remains attached to the live transcript.
+                model.update(cx, |model, cx| {
+                    let state = UiAgentState {
+                        blocks: vec![std::sync::Arc::new(
+                            rho_agents_client::state::UiBlock::AssistantMessage {
+                                text: "Updated transcript received from host".into(),
+                                phase: None,
+                            },
+                        )],
+                        status: rho_agents_client::state::UiAgentStatus::Streaming,
+                        runtime: None,
+                        awaiting_human: None,
+                        context_used: None,
+                        usage: Default::default(),
+                        exec_timings: Default::default(),
+                    };
+                    model.sync(
+                        &state,
+                        FrameSummary::everything(),
+                        1,
+                        &|_| "agent".into(),
+                        cx,
+                    );
+                });
+                assert!(
+                    reader
+                        .read(cx)
+                        .text(cx)
+                        .contains("Updated transcript received from host")
+                );
+                assert!(
+                    !reader
+                        .read(cx)
+                        .text(cx)
+                        .contains("Restored from canonical operations")
+                );
+                assert_eq!(
+                    prompt.read(cx).text(cx),
+                    "Restored from canonical operations"
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn token_counts_render_compactly() {

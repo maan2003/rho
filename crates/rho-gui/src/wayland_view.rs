@@ -43,10 +43,15 @@ pub struct WaylandView {
     frozen: Option<Rc<Shown>>,
     strokes: Vec<Vec<(u32, u32)>>,
     drawing: bool,
+    drawing_touch: Option<TouchId>,
+    secondary_click: bool,
+    active_left_button: u32,
     target: Option<Entity<rho_agents_view::AgentModel>>,
     status: Option<String>,
     size: (usize, usize),
     bounds: Rc<Cell<Bounds<Pixels>>>,
+    zoom: f32,
+    center: Point<f32>,
     focus: FocusHandle,
     error: Option<String>,
     first_paint: Rc<Cell<bool>>,
@@ -131,10 +136,15 @@ impl WaylandView {
             frozen: None,
             strokes: Vec::new(),
             drawing: false,
+            drawing_touch: None,
+            secondary_click: false,
+            active_left_button: 0x110,
             target: None,
             status: None,
             size: (1, 1),
             bounds: Rc::new(Cell::new(Bounds::default())),
+            zoom: 1.,
+            center: point(0.5, 0.5),
             focus,
             error: None,
             _updates: updates,
@@ -146,8 +156,28 @@ impl WaylandView {
     }
     pub(crate) fn toggle_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        self.drawing_touch = None;
         self.annotate(cx);
     }
+    pub(crate) fn input(&mut self, input: Input, cx: &mut Context<Self>) {
+        if self.frozen.is_none() {
+            self.send(input, cx);
+        }
+    }
+
+    pub(crate) fn right_click_next(&mut self, cx: &mut Context<Self>) {
+        self.secondary_click = true;
+        self.status = Some("Tap the target to right-click".into());
+        cx.notify();
+    }
+
+    pub(crate) fn undo_annotation(&mut self, cx: &mut Context<Self>) {
+        if self.frozen.is_some() {
+            self.strokes.pop();
+            cx.notify();
+        }
+    }
+
     fn annotate(&mut self, cx: &mut Context<Self>) {
         if self.frozen.is_some() {
             self.frozen = None;
@@ -241,19 +271,11 @@ impl Render for WaylandView {
         let strokes = self.strokes.clone();
         let size = self.size;
         let bounds = self.bounds.clone();
+        let zoom = self.zoom;
+        let center = self.center;
         let canvas = canvas(
             move |available, _, _| {
-                let ratio = (f32::from(available.size.width) / size.0 as f32)
-                    .min(f32::from(available.size.height) / size.1 as f32);
-                let size = gpui::size(px(size.0 as f32 * ratio), px(size.1 as f32 * ratio));
-                let fitted = Bounds::new(
-                    available.origin
-                        + point(
-                            (available.size.width - size.width) / 2.,
-                            (available.size.height - size.height) / 2.,
-                        ),
-                    size,
-                );
+                let fitted = camera_bounds(available, size, zoom, center);
                 bounds.set(fitted);
                 fitted
             },
@@ -320,7 +342,42 @@ impl Render for WaylandView {
             .flex_1()
             .min_h_0()
             .relative()
+            .overflow_hidden()
             .bg(rgb(0x161616))
+            .on_touch(cx.listener(|this, event: &TouchEvent, window, cx| {
+                if this.frozen.is_none() {
+                    return;
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                match event.phase {
+                    TouchPhase::Started if this.drawing_touch.is_none() => {
+                        if let Some(position) = this.position(event.position) {
+                            this.drawing_touch = Some(event.id);
+                            this.strokes.push(vec![position]);
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Moved if this.drawing_touch == Some(event.id) => {
+                        if let Some(position) = this.position(event.position)
+                            && let Some(stroke) = this.strokes.last_mut()
+                            && stroke.last() != Some(&position)
+                        {
+                            stroke.push(position);
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Ended if this.drawing_touch == Some(event.id) => {
+                        this.drawing_touch = None;
+                    }
+                    TouchPhase::Cancelled if this.drawing_touch == Some(event.id) => {
+                        this.drawing_touch = None;
+                        this.strokes.pop();
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if let Some(position) = this.position(event.position) {
                     if this.frozen.is_some() {
@@ -436,6 +493,18 @@ impl Render for WaylandView {
                                 }
                                 return;
                             }
+                            let code = if button == MouseButton::Left {
+                                this.active_left_button =
+                                    if std::mem::take(&mut this.secondary_click) {
+                                        0x111
+                                    } else {
+                                        0x110
+                                    };
+                                this.status = None;
+                                this.active_left_button
+                            } else {
+                                code
+                            };
                             this.viewer.motion.send_replace(None);
                             this.send(Input::Move { x, y }, cx);
                             this.send(
@@ -456,7 +525,11 @@ impl Render for WaylandView {
                         if this.frozen.is_none() {
                             this.send(
                                 Input::Button {
-                                    button: code,
+                                    button: if button == MouseButton::Left {
+                                        this.active_left_button
+                                    } else {
+                                        code
+                                    },
                                     pressed: false,
                                 },
                                 cx,
@@ -472,7 +545,11 @@ impl Render for WaylandView {
                         if this.frozen.is_none() {
                             this.send(
                                 Input::Button {
-                                    button: code,
+                                    button: if button == MouseButton::Left {
+                                        this.active_left_button
+                                    } else {
+                                        code
+                                    },
                                     pressed: false,
                                 },
                                 cx,
@@ -487,11 +564,81 @@ impl Render for WaylandView {
             .flex_col()
             .relative()
             .child(surface);
+        if cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0)
+        {
+            root = root.child(
+                div()
+                    .id("desktop-camera")
+                    .flex_none()
+                    .w_full()
+                    .min_h(px(48.))
+                    .overflow_x_scroll()
+                    .flex()
+                    .items_center()
+                    .text_color(cx.theme().colors().text)
+                    .children(
+                        ["Fit", "−", "+", "←", "↑", "↓", "→"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, label)| {
+                                div()
+                                    .id(("desktop-camera-action", index))
+                                    .flex_none()
+                                    .min_w(px(48.))
+                                    .min_h(px(48.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        match index {
+                                            0 => {
+                                                this.zoom = 1.;
+                                                this.center = point(0.5, 0.5);
+                                            }
+                                            1 => this.zoom = (this.zoom / 1.5).max(1.),
+                                            2 => this.zoom = (this.zoom * 1.5).min(8.),
+                                            3 => {
+                                                this.center.x =
+                                                    (this.center.x - 0.25 / this.zoom).max(0.)
+                                            }
+                                            4 => {
+                                                this.center.y =
+                                                    (this.center.y - 0.25 / this.zoom).max(0.)
+                                            }
+                                            5 => {
+                                                this.center.y =
+                                                    (this.center.y + 0.25 / this.zoom).min(1.)
+                                            }
+                                            6 => {
+                                                this.center.x =
+                                                    (this.center.x + 0.25 / this.zoom).min(1.)
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                        cx.notify();
+                                    }))
+                            }),
+                    ),
+            );
+        }
         if self.frozen.is_some() {
-            let action =
-                |id: &'static str, label: &'static str| div().id(id).cursor_pointer().child(label);
+            let action = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .when(
+                        cx.try_global::<rho_window::TouchMode>()
+                            .is_some_and(|mode| mode.0),
+                        |button| button.min_h(px(48.)).px_2().flex().items_center(),
+                    )
+                    .child(label)
+            };
             let mut mode_line = div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_3()
                 .px_2()
@@ -529,6 +676,16 @@ impl Render for WaylandView {
             }
             root = root.child(mode_line);
         }
+        if self.secondary_click {
+            root = root.child(
+                div()
+                    .flex_none()
+                    .min_h(px(48.))
+                    .px_2()
+                    .text_color(cx.theme().colors().text)
+                    .child("Tap the target to right-click"),
+            );
+        }
         if let Some(error) = &self.error {
             root = root.child(
                 div()
@@ -543,6 +700,36 @@ impl Render for WaylandView {
         }
         root
     }
+}
+
+// Keep small images centered; larger images cover the viewport at every pan
+// edge. Input and annotation use these same image bounds, not the clipped
+// viewport.
+fn camera_bounds(
+    available: Bounds<Pixels>,
+    size: (usize, usize),
+    zoom: f32,
+    center: Point<f32>,
+) -> Bounds<Pixels> {
+    let ratio = (f32::from(available.size.width) / size.0 as f32)
+        .min(f32::from(available.size.height) / size.1 as f32)
+        * zoom;
+    let image = gpui::size(px(size.0 as f32 * ratio), px(size.1 as f32 * ratio));
+    let offset = |viewport: Pixels, image: Pixels, center: f32| {
+        if image <= viewport {
+            (viewport - image) / 2.
+        } else {
+            (viewport / 2. - image * center).clamp(viewport - image, px(0.))
+        }
+    };
+    Bounds::new(
+        available.origin
+            + point(
+                offset(available.size.width, image.width, center.x),
+                offset(available.size.height, image.height, center.y),
+            ),
+        image,
+    )
 }
 
 /// A repeated paint (including annotation on a frozen frame) must not refresh
@@ -603,7 +790,7 @@ mod tests {
 
     use gpui::{EmptyView, TestAppContext};
 
-    use super::{draw_line, on_presented};
+    use super::{camera_bounds, draw_line, on_presented};
 
     #[gpui::test]
     fn presentation_feedback_waits_for_frame_and_ignores_repaints(cx: &mut TestAppContext) {
@@ -650,5 +837,24 @@ mod tests {
             &[0x50, 0x40, 0xff, 255]
         );
         assert_eq!(&pixels[(8 * 13) * 4..(8 * 13 + 1) * 4], &[7; 4]);
+    }
+    #[test]
+    fn desktop_camera_fits_and_reaches_both_image_edges() {
+        let available = gpui::Bounds::new(
+            gpui::point(gpui::px(13.), gpui::px(27.)),
+            gpui::size(gpui::px(360.), gpui::px(600.)),
+        );
+        let fit = camera_bounds(available, (1200, 800), 1., gpui::point(0.9, 0.1));
+        assert!((f32::from(fit.origin.x) - 13.).abs() < 0.001);
+        assert!((f32::from(fit.origin.y) - 207.).abs() < 0.001);
+        assert!((f32::from(fit.size.width) - 360.).abs() < 0.001);
+        assert!((f32::from(fit.size.height) - 240.).abs() < 0.001);
+        let left = camera_bounds(available, (1200, 800), 3., gpui::point(0., 0.));
+        assert_eq!(left.origin, available.origin);
+        let right = camera_bounds(available, (1200, 800), 3., gpui::point(1., 1.));
+        assert!((f32::from(right.origin.x) + 707.).abs() < 0.001);
+        assert!((f32::from(right.origin.y) + 93.).abs() < 0.001);
+        assert!((f32::from(right.size.width) - 1080.).abs() < 0.001);
+        assert!((f32::from(right.size.height) - 720.).abs() < 0.001);
     }
 }

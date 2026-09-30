@@ -7,7 +7,10 @@ use editor::{
 };
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
+use gpui::{
+    AnyElement, App, Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle, WeakEntity,
+    Window, div, px,
+};
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
@@ -741,6 +744,88 @@ fn replacement_styles_valid(
     true
 }
 
+/// The canonical shell editor with explicit phone controls. Desktop callers
+/// keep the same editor and no strip; no second draft or shell session exists.
+pub fn render_touch_editor(
+    model: &Entity<ShellModel>,
+    editor: &Entity<Editor>,
+    cx: &App,
+) -> AnyElement {
+    let touch = cx
+        .try_global::<rho_window::TouchMode>()
+        .is_some_and(|mode| mode.0);
+    let colors = cx.theme().colors();
+    let mut root = div()
+        .id("shell-touch-surface")
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .debug_selector(|| "shell-editor".into())
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(editor.clone()),
+        );
+    if touch {
+        let mut strip = div()
+            .id("shell-touch-keys")
+            .w_full()
+            .h(px(48.))
+            .flex_shrink_0()
+            .flex()
+            .overflow_x_scroll()
+            .bg(colors.element_background)
+            .text_color(colors.text);
+        for (index, (label, action)) in
+            shell_touch_actions(!model.read(cx).shell_state.pagers.is_empty())
+                .into_iter()
+                .enumerate()
+        {
+            let editor = editor.clone();
+            strip = strip.child(
+                div()
+                    .id(("shell-touch-key", index))
+                    .min_w(px(48.))
+                    .h_full()
+                    .px_2()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .debug_selector(|| label.into())
+                    .child(label)
+                    .on_click(move |_, window, cx| {
+                        window.focus(&editor.focus_handle(cx), cx);
+                        if let Ok(action) = cx.build_action(action, None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            );
+        }
+        root = root.child(strip);
+    }
+    root.into_any_element()
+}
+
+fn shell_touch_actions(pager: bool) -> Vec<(&'static str, &'static str)> {
+    let mut actions = vec![
+        ("Send", "rho_gui::SubmitPrompt"),
+        ("Ctrl-C", "rho_shell_view::ShellInterrupt"),
+        ("EOF", "rho_shell_view::ShellEof"),
+    ];
+    if pager {
+        actions.extend([
+            ("More", "rho_shell_view::ShellPagerMore"),
+            ("All", "rho_shell_view::ShellPagerAll"),
+            ("Stop", "rho_shell_view::ShellPagerQuit"),
+        ]);
+    }
+    actions
+}
+
 fn shell_state_styles_valid(state: &crate::protocol::ShellState) -> bool {
     state.pagers.len() <= crate::protocol::MAX_ACTIVE_PAGERS
         && state.pagers.iter().enumerate().all(|(index, pager)| {
@@ -848,6 +933,189 @@ fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    gpui::actions!(rho_gui, [SubmitPrompt]);
+
+    struct TestShell {
+        model: Entity<ShellModel>,
+        editor: Entity<Editor>,
+        menu_focus: gpui::FocusHandle,
+    }
+
+    impl gpui::Render for TestShell {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let assert_focus = |this: &Self, window: &Window, cx: &App| {
+                assert!(this.editor.focus_handle(cx).is_focused(window));
+            };
+            div()
+                .size_full()
+                .track_focus(&self.menu_focus)
+                .on_action(cx.listener(move |this, _: &SubmitPrompt, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, cx| model.submit(cx));
+                }))
+                .on_action(cx.listener(move |this, _: &ShellInterrupt, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, _| model.interrupt());
+                }))
+                .on_action(cx.listener(move |this, _: &ShellEof, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, cx| model.eof(cx));
+                }))
+                .on_action(cx.listener(move |this, _: &ShellPagerMore, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, _| {
+                        model.pager_action(crate::protocol::PagerAction::Continue)
+                    });
+                }))
+                .on_action(cx.listener(move |this, _: &ShellPagerAll, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, _| {
+                        model.pager_action(crate::protocol::PagerAction::Drain)
+                    });
+                }))
+                .on_action(cx.listener(move |this, _: &ShellPagerQuit, window, cx| {
+                    assert_focus(this, window, cx);
+                    this.model.update(cx, |model, _| {
+                        model.pager_action(crate::protocol::PagerAction::Quit)
+                    });
+                }))
+                .child(render_touch_editor(&self.model, &self.editor, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn touch_controls_use_canonical_submission_and_latest_pager(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let (_server, frames) = futures::channel::mpsc::channel(8);
+        let (submit, mut submitted) = tokio::sync::mpsc::channel(8);
+        let (control, mut controls) = tokio::sync::mpsc::channel(8);
+        let model = cx.new(|cx| {
+            ShellModel::new(
+                ShellChannel {
+                    frames,
+                    submit,
+                    control,
+                },
+                cx,
+            )
+        });
+        let window = cx.open_window(gpui::size(px(600.), px(500.)), |window, cx| {
+            let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+            TestShell {
+                model: model.clone(),
+                editor,
+                menu_focus: cx.focus_handle(),
+            }
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.draw_window(window.into());
+        assert_eq!(
+            visual.debug_bounds("shell-editor").unwrap().size.height,
+            px(500.)
+        );
+        assert!(visual.debug_bounds("Send").is_none());
+        visual.set_global(rho_window::TouchMode(true));
+        visual.draw_window(window.into());
+        assert_eq!(
+            visual.debug_bounds("shell-editor").unwrap().size.height,
+            px(452.)
+        );
+        assert!(visual.debug_bounds("More").is_none());
+        let click = |visual: &mut gpui::VisualTestContext, label| {
+            window
+                .update(visual, |this, window, cx| {
+                    window.focus(&this.menu_focus, cx)
+                })
+                .unwrap();
+            let bounds = visual.debug_bounds(label).unwrap();
+            assert!(bounds.size.width >= px(48.));
+            assert_eq!(bounds.size.height, px(48.));
+            visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        // EOF must not clear or execute a nonempty canonical draft.
+        model.update(cx, |model, cx| {
+            model.input_buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, "printf asymmetric")], None, cx)
+            });
+        });
+        click(&mut visual, "EOF");
+        assert!(controls.try_recv().is_err());
+        click(&mut visual, "Ctrl-C");
+        assert_eq!(controls.try_recv().unwrap(), ShellClientFrame::Interrupt);
+        click(&mut visual, "Send");
+        let submission = submitted.try_recv().unwrap();
+        assert_eq!(submission.command, "printf asymmetric");
+        assert!(!submission.command.ends_with('\n'));
+        assert!(submitted.try_recv().is_err());
+        submission.accepted.send(37).unwrap();
+        visual.run_until_parked();
+        click(&mut visual, "EOF");
+        assert_eq!(controls.try_recv().unwrap(), ShellClientFrame::Eof);
+        model.update(cx, |model, cx| {
+            model.apply(
+                ShellServerFrame::Snapshot {
+                    state: crate::protocol::ShellState {
+                        pagers: vec![
+                            crate::protocol::ShellPager {
+                                execution: 11,
+                                pager: 2,
+                                page: 4,
+                                lines: 10,
+                                bytes: 99,
+                            },
+                            crate::protocol::ShellPager {
+                                execution: 29,
+                                pager: 7,
+                                page: 3,
+                                lines: 18,
+                                bytes: 155,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                },
+                cx,
+            );
+        });
+        visual.draw_window(window.into());
+        for (label, action) in [
+            ("More", crate::protocol::PagerAction::Continue),
+            ("All", crate::protocol::PagerAction::Drain),
+            ("Stop", crate::protocol::PagerAction::Quit),
+        ] {
+            let bounds = visual.debug_bounds(label).unwrap();
+            visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+            assert_eq!(
+                controls.try_recv().unwrap(),
+                ShellClientFrame::PagerAction {
+                    execution: 29,
+                    pager: 7,
+                    page: 3,
+                    action,
+                }
+            );
+        }
+        assert!(controls.try_recv().is_err());
+        model.update(cx, |model, cx| {
+            model.apply(
+                ShellServerFrame::Snapshot {
+                    state: Default::default(),
+                },
+                cx,
+            );
+        });
+        visual.draw_window(window.into());
+        assert!(visual.debug_bounds("More").is_none());
+        assert!(visual.debug_bounds("All").is_none());
+        assert!(visual.debug_bounds("Stop").is_none());
+        assert!(visual.debug_bounds("Send").is_some());
+    }
 
     fn indexed(index: u8) -> ShellTextStyle {
         ShellTextStyle {

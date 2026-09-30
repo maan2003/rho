@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Window, div};
+use gpui::{Context, Entity, EventEmitter, Focusable, Window, div, px, uniform_list};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
 use text::Anchor;
@@ -23,6 +23,14 @@ use crate::model::{ConversationRow, Empty};
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
 use crate::ui::{Class, Hooks, Span, lay_out};
+
+/// Direct activation of a touch row; keyboard callers can still use
+/// cursor_source.
+pub enum Event {
+    Open(Source),
+}
+
+impl EventEmitter<Event> for ListView {}
 
 pub struct ListView {
     session: Entity<Session>,
@@ -888,11 +896,63 @@ fn render_row(row: &ConversationRow, favorite: bool) -> Vec<Span> {
 
 impl gpui::Render for ListView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0)
+        {
+            let focus = self.editor.read(cx).focus_handle(cx);
+            return div()
+                .key_context("RhoSlackList")
+                .track_focus(&focus)
+                .size_full()
+                .bg(cx.theme().colors().editor_background)
+                .text_color(cx.theme().colors().text)
+                .child(
+                    uniform_list(
+                        "slack-touch-list",
+                        self.drawn.len(),
+                        cx.processor(|this, range: Range<usize>, _, cx| {
+                            range
+                                .map(|row| {
+                                    let line = &this.drawn[row];
+                                    let source = line.id.clone().map(Source::Conversation);
+                                    div()
+                                        .id(("slack-touch-row", row))
+                                        .h(px(64.))
+                                        .overflow_hidden()
+                                        .w_full()
+                                        .px(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .border_b_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .when(source.is_some(), |row| row.cursor_pointer())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if let Some(source) = source.clone() {
+                                                this.place_cursor(row, window, cx);
+                                                cx.emit(Event::Open(source));
+                                            }
+                                        }))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .overflow_hidden()
+                                                .child(line.text.clone()),
+                                        )
+                                })
+                                .collect()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element();
+        }
         div()
             .key_context("RhoSlackList")
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())
+            .into_any_element()
     }
 }
 

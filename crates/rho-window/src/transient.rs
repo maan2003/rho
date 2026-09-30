@@ -199,6 +199,15 @@ impl<A> Transient<A> {
         self.count
     }
 
+    /// Touch and keyboard presentations share the same pending count.
+    pub fn is_counted(&self) -> bool {
+        self.counted
+    }
+
+    pub fn set_count(&mut self, count: Option<u32>) {
+        self.count = count;
+    }
+
     /// What this key means here.
     ///
     /// Cost: one pass over the rows of the menu, which is what is on the

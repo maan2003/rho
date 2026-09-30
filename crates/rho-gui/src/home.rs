@@ -123,6 +123,11 @@ pub(crate) enum HomeTarget {
     None,
 }
 
+pub(crate) enum Event {
+    Open(HomeTarget),
+}
+impl gpui::EventEmitter<Event> for HomeView {}
+
 /// One item of the transcript. A card keeps its key when it crosses the
 /// line, so crossing moves the row rather than rewriting two sections.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -442,11 +447,47 @@ fn columns(cells: &[(&str, HomeClass, usize)]) -> (String, Vec<(HomeClass, Range
 
 impl gpui::Render for HomeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0)
+        {
+            let mut rows = Vec::new();
+            for item in self.items() {
+                let target = item.lines.first().cloned().unwrap_or(HomeTarget::None);
+                let text = item.text.trim().to_owned();
+                let row = div()
+                    .id(gpui::SharedString::from(format!("home-{}", rows.len())))
+                    .min_h(gpui::px(52.))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(text);
+                rows.push(if target == HomeTarget::None {
+                    row.text_color(cx.theme().colors().text_muted)
+                        .into_any_element()
+                } else {
+                    row.on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(Event::Open(target.clone()))),
+                    )
+                    .into_any_element()
+                });
+            }
+            return div()
+                .id("phone-home")
+                .size_full()
+                .overflow_y_scroll()
+                .text_color(cx.theme().colors().text)
+                .children(rows)
+                .into_any_element();
+        }
         div()
             .key_context("RhoHome")
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())
+            .into_any_element()
     }
 }
 

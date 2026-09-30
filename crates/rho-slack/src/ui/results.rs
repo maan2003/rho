@@ -9,7 +9,10 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, EventEmitter, MouseButton, MouseUpEvent, Window, div};
+use gpui::{
+    Context, Entity, EventEmitter, Focusable, MouseButton, MouseUpEvent, Window, div, px,
+    uniform_list,
+};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
 use text::{Anchor, Bias};
@@ -499,6 +502,24 @@ impl ResultsView {
     }
 }
 
+/// A hit's header and body activate one target. Only adjacent equal targets
+/// coalesce: headings and two different messages in the same channel do not.
+fn touch_rows(lines: &[DrawnLine]) -> Vec<Range<usize>> {
+    let mut rows: Vec<Range<usize>> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.target.is_some()
+            && rows
+                .last()
+                .is_some_and(|row| lines[row.start].target == line.target)
+        {
+            rows.last_mut().unwrap().end = index + 1;
+        } else {
+            rows.push(index..index + 1);
+        }
+    }
+    rows
+}
+
 fn target_for_click(lines: &[DrawnLine], offset: Option<usize>) -> Option<Target> {
     target_at_offset(lines, offset?)
 }
@@ -580,6 +601,94 @@ fn now_seconds() -> i64 {
 impl gpui::Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
+        if cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0)
+        {
+            let rows = touch_rows(&self.drawn);
+            let focus = self.editor.read(cx).focus_handle(cx);
+            return div()
+                .key_context("RhoSlackResults")
+                .track_focus(&focus)
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(colors.editor_background)
+                .text_color(colors.text)
+                .child(
+                    uniform_list(
+                        "slack-touch-results",
+                        rows.len(),
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            range
+                                .map(|index| {
+                                    let row = rows[index].clone();
+                                    let target = this.drawn[row.start].target.clone();
+                                    let text = this.drawn[row.clone()]
+                                        .iter()
+                                        .map(|line| line.text.trim().to_owned())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    div()
+                                        .id(("slack-touch-result", index))
+                                        .h(px(88.))
+                                        .overflow_hidden()
+                                        .w_full()
+                                        .p(px(12.))
+                                        .border_b_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .when(target.is_some(), |row| row.cursor_pointer())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.place_cursor(row.start, window, cx);
+                                            match target.clone() {
+                                                Some(Target::Message(place)) => {
+                                                    cx.emit(Event::Open(place))
+                                                }
+                                                Some(Target::File(file)) => {
+                                                    cx.emit(Event::OpenFile(file))
+                                                }
+                                                None => {}
+                                            }
+                                        }))
+                                        .child(div().overflow_hidden().child(text))
+                                })
+                                .collect()
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0(),
+                )
+                .when(self.pages > 1, |view| {
+                    view.child(div().flex().gap(px(12.)).children([-1, 1].into_iter().map(
+                        |offset| {
+                            let enabled = !self.loading
+                                && if offset < 0 {
+                                    self.page > 1
+                                } else {
+                                    self.page < self.pages
+                                };
+                            div()
+                                .id(("slack-touch-page", (offset + 1) as usize))
+                                .h(px(48.))
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(enabled, |button| button.cursor_pointer())
+                                .text_color(if enabled {
+                                    colors.text
+                                } else {
+                                    colors.text_muted
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.request_adjacent(offset, window, cx);
+                                }))
+                                .child(if offset < 0 { "Previous" } else { "Next" })
+                        },
+                    )))
+                })
+                .into_any_element();
+        }
         div()
             .key_context("RhoSlackResults")
             .size_full()
@@ -598,6 +707,7 @@ impl gpui::Render for ResultsView {
                     )
                     .child(self.editor.clone()),
             )
+            .into_any_element()
     }
 }
 
@@ -616,6 +726,36 @@ mod tests {
             original_h: 0,
             thumb_url: String::new(),
         }
+    }
+
+    #[test]
+    fn touch_groups_hit_body_but_not_other_messages_or_headings() {
+        let first = Target::Message(Place {
+            source: Source::Conversation(crate::types::ChannelId("C1".into())),
+            ts: Ts("100.0".into()),
+        });
+        let second = Target::Message(Place {
+            source: Source::Conversation(crate::types::ChannelId("C1".into())),
+            ts: Ts("101.0".into()),
+        });
+        let lines = [
+            None,
+            Some(first.clone()),
+            Some(first.clone()),
+            Some(second),
+            None,
+            None,
+            Some(first),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| DrawnLine {
+            target,
+            text: format!("line {index}"),
+            styles: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(touch_rows(&lines), vec![0..1, 1..3, 3..4, 4..5, 5..6, 6..7]);
     }
 
     #[test]

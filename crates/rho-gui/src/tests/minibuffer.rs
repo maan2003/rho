@@ -150,3 +150,51 @@ fn a_cancellable_prompt_runs_its_cancel_handler_on_escape(cx: &mut TestAppContex
         "Escape closes the external interaction exactly once"
     );
 }
+
+#[gpui::test]
+fn phone_prompt_keeps_confirm_and_candidates_above_the_landscape_keyboard(cx: &mut TestAppContext) {
+    use gpui::{AppContext as _, VisualTestContext, px, size};
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    super::next_frame(cx, workspace);
+    cx.simulate_window_resize(*workspace, size(px(720.), px(240.)));
+    let submitted = Rc::new(RefCell::new(None));
+    let record = submitted.clone();
+    workspace
+        .update(cx, |this, window, cx| {
+            this.open_prompt(
+                "Choose the destination for this item, or enter another destination:",
+                Rc::new(|_, input, _| {
+                    (0..11)
+                        .map(|index| crate::minibuffer::Candidate {
+                            value: format!("destination {index}"),
+                            description: String::new(),
+                        })
+                        .filter(|candidate| candidate.value.contains(input))
+                        .collect()
+                }),
+                Rc::new(move |_, input, _, _| *record.borrow_mut() = Some(input)),
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    let mut visual = VisualTestContext::from_window(workspace.into(), cx);
+    visual.draw_window(workspace.into());
+    let confirm = visual
+        .debug_bounds("phone-confirm")
+        .expect("rendered confirm");
+    let cancel = visual
+        .debug_bounds("phone-cancel")
+        .expect("rendered cancel");
+    let candidates = visual
+        .debug_bounds("phone-candidates")
+        .expect("rendered candidates");
+    assert_eq!(confirm.size.height, px(48.));
+    assert_eq!(cancel.size.height, px(48.));
+    assert!(confirm.origin.y >= px(0.) && confirm.bottom() <= px(240.));
+    assert!(candidates.size.height >= px(48.) && candidates.bottom() <= confirm.origin.y);
+    visual.simulate_input("custom-target7");
+    visual.simulate_click(confirm.center(), gpui::Modifiers::default());
+    assert_eq!(submitted.borrow().as_deref(), Some("custom-target7"));
+}

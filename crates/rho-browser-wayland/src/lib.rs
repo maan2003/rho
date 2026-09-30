@@ -6,6 +6,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod text_input;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -574,6 +576,10 @@ enum PageCommand {
         keycode: u32,
         pressed: bool,
     },
+    Text {
+        text: String,
+        acknowledge: async_channel::Sender<Result<()>>,
+    },
     InputBarrier(u64, async_channel::Sender<()>),
     UnfreezeInput(u64),
     Close,
@@ -582,10 +588,20 @@ enum PageCommand {
 #[derive(Debug)]
 enum OrderedInput {
     PointerMotion(ResolvedPointerMotion),
-    PointerButton { button: u32, pressed: bool },
+    PointerButton {
+        button: u32,
+        pressed: bool,
+    },
     PointerAxis(PointerAxisFrame),
     Pinch(PinchGesture),
-    Key { keycode: u32, pressed: bool },
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
+    Text {
+        text: String,
+        acknowledge: async_channel::Sender<Result<()>>,
+    },
     InputBarrier(async_channel::Sender<()>),
 }
 
@@ -709,6 +725,25 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     }
     pub fn key(&self, keycode: u32, pressed: bool) {
         self.send(PageCommand::Key { keycode, pressed })
+    }
+
+    /// Commits whole UTF-8 text through Chromium's enabled text-input-v3 field.
+    /// Unlike physical key forwarding, this needs no keymap or DOM assumptions.
+    /// Success acknowledges compositor delivery, not Chromium applying the
+    /// edit. This shares the ordered input queue and handoff cutoff with
+    /// other input.
+    pub fn type_text(
+        &self,
+        text: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+        let (acknowledge, committed) = async_channel::bounded(1);
+        self.send(PageCommand::Text { text, acknowledge });
+        async move {
+            committed
+                .recv()
+                .await
+                .context("browser typing was cancelled")?
+        }
     }
     pub fn input_barrier(
         &self,
@@ -883,6 +918,7 @@ struct State<K: BrowserPageKey> {
     seat_state: SeatState<Self>,
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
+    text_input: text_input::BrowserTextInput,
     pointer: PointerHandle<Self>,
     serial: u32,
     windows: HashMap<K, WindowState>,
@@ -2187,7 +2223,9 @@ impl<K: BrowserPageKey> SeatHandler for State<K> {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        self.text_input.focus_changed(focused);
+    }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         let cursor = browser_cursor(image);
         for window in self.windows.values() {
@@ -2470,6 +2508,7 @@ fn run<K: BrowserPageKey>(
         }
         BrowserRenderConfig::SoftwareShmQa => (None, None, Arc::from([]), true),
     };
+    text_input::create_global::<K>(&dh);
     let mut state = State {
         loop_handle,
         display_handle: dh.clone(),
@@ -2491,6 +2530,7 @@ fn run<K: BrowserPageKey>(
         seat_state,
         _seat: seat,
         keyboard,
+        text_input: text_input::BrowserTextInput::default(),
         pointer,
         serial: 1,
         windows: HashMap::new(),
@@ -2838,6 +2878,9 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         PageCommand::Key { keycode, pressed } => {
             queue_input(state, id, OrderedInput::Key { keycode, pressed })
         }
+        PageCommand::Text { text, acknowledge } => {
+            queue_input(state, id, OrderedInput::Text { text, acknowledge })
+        }
         PageCommand::InputBarrier(generation, acknowledge) => {
             let Some(window) = state.windows.get_mut(&id) else {
                 return;
@@ -3172,6 +3215,10 @@ fn deliver_input<K: BrowserPageKey>(state: &mut State<K>, id: K, input: OrderedI
         OrderedInput::PointerAxis(frame) => deliver_pointer_axis(state, id, frame),
         OrderedInput::Pinch(gesture) => pointer_pinch(state, id, gesture),
         OrderedInput::Key { keycode, pressed } => keyboard_key(state, id, keycode, pressed),
+        OrderedInput::Text { text, acknowledge } => {
+            let result = state.text_input.type_text(text);
+            let _ = acknowledge.try_send(result);
+        }
         OrderedInput::InputBarrier(acknowledge) => {
             release_active_input(state, id);
             let _ = state.display_handle.flush_clients();
@@ -3646,6 +3693,75 @@ mod tests {
         assert!(dequeue_ready_input(&mut queued).is_none());
     }
 
+    #[test]
+    fn text_commits_before_handoff_barrier_and_cancellation_closes_acknowledgements() {
+        let mut queued = VecDeque::new();
+        let (text_ack, text_result) = async_channel::bounded(1);
+        assert!(admit_input(
+            false,
+            &mut queued,
+            OrderedInput::Text {
+                text: "only the original tab".into(),
+                acknowledge: text_ack,
+            }
+        ));
+        let (barrier_ack, _) = async_channel::bounded(1);
+        queued.push_back(OrderedInput::InputBarrier(barrier_ack));
+        let (late_ack, late_result) = async_channel::bounded(1);
+        assert!(!admit_input(
+            true,
+            &mut queued,
+            OrderedInput::Text {
+                text: "must not cross the tab handoff".into(),
+                acknowledge: late_ack,
+            }
+        ));
+        assert!(late_result.is_closed());
+        assert!(matches!(dequeue_ready_input(&mut queued),
+            Some(OrderedInput::Text { ref text, .. }) if text == "only the original tab"));
+        assert!(text_result.is_closed()); // Dropping cancelled input reports failure.
+        assert!(matches!(
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::InputBarrier(_))
+        ));
+        let (close_ack, close_result) = async_channel::bounded(1);
+        assert!(admit_input(
+            false,
+            &mut queued,
+            OrderedInput::Text {
+                text: "cancelled by close".into(),
+                acknowledge: close_ack,
+            }
+        ));
+        queued.clear(); // Same cancellation as PageCommand::Close.
+        assert!(close_result.is_closed());
+    }
+
+    #[test]
+    fn stopped_compositor_and_dropped_commands_resolve_typing_tasks_with_error() {
+        for disconnect_before_send in [true, false] {
+            let (commands, receiver) = channel::channel();
+            let (_, events) = browser_event_channel();
+            let session = BrowserSession {
+                id: 7u64,
+                session_generation: 1,
+                commands,
+                events,
+            };
+            let receiver = if disconnect_before_send {
+                drop(receiver);
+                None
+            } else {
+                Some(receiver)
+            };
+            let committed = session.type_text("user commit".into());
+            drop(receiver);
+            // One poll must already produce Result::Err, not an indefinitely
+            // pending receive held open by a hidden acknowledgement clone.
+            let result = futures_lite::future::block_on(futures_lite::future::poll_once(committed));
+            assert!(result.unwrap().is_err());
+        }
+    }
     #[test]
     fn frozen_input_cutoff_rejects_events_after_its_ordered_barrier() {
         let (acknowledge, acknowledged) = async_channel::bounded(1);

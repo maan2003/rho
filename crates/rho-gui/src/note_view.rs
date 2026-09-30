@@ -50,6 +50,7 @@ pub struct NoteView {
     node: NodeId,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
+    phone_editor: Option<Entity<Editor>>,
     composition: Composition,
     body: Entity<Buffer>,
     /// The text last read from the ledger or written to it. An edit is
@@ -109,6 +110,7 @@ impl NoteView {
             node,
             multi_buffer,
             editor,
+            phone_editor: None,
             composition: Composition::default(),
             body,
             synced: text,
@@ -125,6 +127,39 @@ impl NoteView {
 
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    pub(crate) fn phone_editor_if_built(&self) -> Option<&Entity<Editor>> {
+        self.phone_editor.as_ref()
+    }
+
+    /// The phone edits the same note buffer; generated child rows are touch
+    /// targets outside it rather than editable-looking transcript excerpts.
+    pub(crate) fn phone_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Editor> {
+        self.phone_editor
+            .get_or_insert_with(|| {
+                let buffer = cx.new(|cx| MultiBuffer::singleton(self.body.clone(), cx));
+                cx.new(|cx| {
+                    let mut editor = Editor::new(
+                        EditorMode::Full {
+                            scale_ui_elements_with_buffer_font_size: true,
+                            show_active_line_background: false,
+                            sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                        },
+                        buffer,
+                        None,
+                        window,
+                        cx,
+                    );
+                    rho_window::editor_config::configure(&mut editor, window, cx);
+                    editor
+                })
+            })
+            .clone()
     }
 
     pub fn body(&self) -> &Entity<Buffer> {

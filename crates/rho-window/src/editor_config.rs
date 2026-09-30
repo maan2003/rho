@@ -18,7 +18,16 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_vertical_scrollbar(false, cx);
     editor.set_show_horizontal_scrollbar(false, cx);
     editor.set_offset_content(false, cx);
-    editor.set_mouse_click_selection_enabled(false, cx);
+    editor.set_mouse_click_selection_enabled(
+        cx.try_global::<crate::TouchMode>()
+            .is_some_and(|mode| mode.0),
+        cx,
+    );
+    cx.observe_global::<crate::TouchMode>(|editor, cx| {
+        let touch = cx.global::<crate::TouchMode>().0;
+        editor.set_mouse_click_selection_enabled(touch, cx);
+    })
+    .detach();
     editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
     editor.set_show_wrap_guides(false, cx);
     editor.set_show_indent_guides(false, cx);

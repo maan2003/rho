@@ -29,9 +29,7 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
-#[cfg(test)]
-use rho_agent_types::AdvisorIntelligence;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
+use rho_agent_types::{AdvisorIntelligence, AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
 use rho_agents_client::protocol::{AgentCommand, NewAgent};
 use rho_agents_client::remote::AgentsLink;
@@ -202,6 +200,8 @@ pub(crate) struct MenuSheet {
     pub(crate) rows: Vec<MenuRow>,
     /// Whether anything is under this menu for `back` to return to.
     pub(crate) has_back: bool,
+    pub(crate) counted: bool,
+    pub(crate) count: Option<u32>,
 }
 
 pub(crate) struct MenuRow {
@@ -265,6 +265,9 @@ pub struct Workspace {
     pub(crate) agents_client: rho_agents_client::model::AgentsClient,
     desktop_streams: rho_desktop_client::stream::DesktopStreams,
     draft_model: Entity<DraftModel>,
+    phone_draft: Option<Entity<rho_agents_view::draft::PhoneDraft>>,
+    phone_agent_editors: HashMap<gpui::EntityId, (Entity<editor::Editor>, Entity<editor::Editor>)>,
+    _phone_draft_subscription: Option<gpui::Subscription>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
     /// the surface.
@@ -917,6 +920,9 @@ impl Workspace {
             agents_client,
             desktop_streams,
             draft_model,
+            phone_draft: None,
+            phone_agent_editors: HashMap::new(),
+            _phone_draft_subscription: None,
             messages,
             draft_area: None,
             chrome_editor,
@@ -1476,6 +1482,15 @@ impl Workspace {
             return;
         };
         let target = view.update(cx, |view, cx| view.cursor_target(cx));
+        self.home_open_target(target, window, cx);
+    }
+
+    fn home_open_target(
+        &mut self,
+        target: crate::home::HomeTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let wanted = match target {
             crate::home::HomeTarget::Card(card) => card,
             // A running agent is not a card: its row opens the agent.
@@ -3288,15 +3303,18 @@ impl Workspace {
         let create = rho_browser::create_page(url, cx);
         cx.spawn(async move |this, cx| {
             let record = create.await;
-            let _ = this.update_in(cx, |this, _, cx| match record {
-                Ok(record) => rho_journal::record(rho_journal::Event::Created {
-                    node_id: rho_journal::NodeIdentity::Page {
-                        uuid: *record.id.0.as_bytes(),
-                    },
-                    kind: rho_journal::CreatedKind::Page,
-                    method: rho_journal::CreateMethod::TabBirth,
-                    at_root: true,
-                }),
+            let _ = this.update_in(cx, |this, window, cx| match record {
+                Ok(record) => {
+                    rho_journal::record(rho_journal::Event::Created {
+                        node_id: rho_journal::NodeIdentity::Page {
+                            uuid: *record.id.0.as_bytes(),
+                        },
+                        kind: rho_journal::CreatedKind::Page,
+                        method: rho_journal::CreateMethod::TabBirth,
+                        at_root: true,
+                    });
+                    this.open_browser_page(record.id, window, cx);
+                }
                 Err(error) => {
                     tracing::error!(%error, "browser page creation failed");
                     let message = format!("browser: {error:#}");
@@ -4445,9 +4463,12 @@ impl Workspace {
             Some(existing) => *existing = surface.clone(),
             None => list.push(surface.clone()),
         }
-        // Home is not a card on the phone: it is what the feed shows when
-        // there is nothing to deal, so it never joins the stack.
-        if self.phone.enabled && surface.key != SurfaceKey::Home {
+        // Explicit Home navigation is a surface; an empty deal is still the
+        // permanent feed root rather than an entry on the navigation stack.
+        if self.phone.enabled
+            && (surface.key != SurfaceKey::Home
+                || method == rho_journal::SurfaceShowMethod::Command)
+        {
             if method == rho_journal::SurfaceShowMethod::Deal {
                 self.phone
                     .show_feed(self.active_context, surface.key.clone());
@@ -5072,15 +5093,44 @@ impl Workspace {
             SurfaceView::Home(view) => view.read(cx).editor().clone(),
             SurfaceView::Messages(editor) => editor.clone(),
             SurfaceView::Usage(view) => view.read(cx).editor().clone(),
-            SurfaceView::Note(editor) => editor.clone(),
-            SurfaceView::Transcript { editor, .. } => editor.clone(),
+            SurfaceView::Note(editor) => {
+                if self.phone.enabled
+                    && let SurfaceKey::Note(node) = &self.active_surface().key
+                {
+                    self.note_views
+                        .get(node)
+                        .and_then(|view| view.phone_editor_if_built())
+                        .unwrap_or(editor)
+                        .clone()
+                } else {
+                    editor.clone()
+                }
+            }
+            SurfaceView::Transcript { model, editor } => {
+                if self.phone.enabled
+                    && let Some((_, prompt)) = self.phone_agent_editors.get(&model.entity_id())
+                {
+                    prompt.clone()
+                } else {
+                    editor.clone()
+                }
+            }
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Terminal(_) => self.chrome_editor(),
             SurfaceView::Browser(_) => self.chrome_editor(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackResults(view) => view.read(cx).editor().clone(),
-            SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
+            SurfaceView::SlackConversation(view) => {
+                if self.phone.enabled {
+                    view.read(cx)
+                        .composer_editor()
+                        .unwrap_or(view.read(cx).editor())
+                        .clone()
+                } else {
+                    view.read(cx).editor().clone()
+                }
+            }
             SurfaceView::Image(_) => self.chrome_editor(),
         }
     }
@@ -5124,7 +5174,19 @@ impl Workspace {
             SurfaceView::Home(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
             SurfaceView::Usage(view) => view.read(cx).editor().focus_handle(cx),
-            SurfaceView::Note(editor) => editor.focus_handle(cx),
+            SurfaceView::Note(editor) => {
+                if self.phone.enabled
+                    && let SurfaceKey::Note(node) = &self.active_surface().key
+                {
+                    self.note_views
+                        .get(node)
+                        .and_then(|view| view.phone_editor_if_built())
+                        .unwrap_or(editor)
+                        .focus_handle(cx)
+                } else {
+                    editor.focus_handle(cx)
+                }
+            }
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
@@ -5195,7 +5257,17 @@ impl Workspace {
                 SurfaceView::Draft { editor }
             }
             SurfaceKey::Home => {
-                SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
+                let view = cx.new(|cx| crate::home::HomeView::new(window, cx));
+                self.agent_model_subscriptions.push(cx.subscribe_in(
+                    &view,
+                    window,
+                    |this, _, event: &crate::home::Event, window, cx| match event {
+                        crate::home::Event::Open(target) => {
+                            this.home_open_target(target.clone(), window, cx)
+                        }
+                    },
+                ));
+                SurfaceView::Home(view)
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
@@ -5325,7 +5397,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
@@ -5367,7 +5439,7 @@ impl Workspace {
         self.minibuffer_confirm(window, cx);
     }
 
-    fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
             rho_journal::record(rho_journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
@@ -5636,6 +5708,8 @@ impl Workspace {
                 })
                 .collect(),
             has_back: !open.under.is_empty(),
+            counted: open.menu.is_counted(),
+            count: open.menu.count().or(open.carried_count),
         })
     }
 
@@ -5655,9 +5729,45 @@ impl Workspace {
         };
         let action = item.action().clone();
         let closes = item.kind() == rho_window::transient::Kind::Suffix;
-        let count = open.carried_count;
+        let count = open.menu.count().or(open.carried_count);
         self.run_menu_action(action, count, closes, window, cx);
         cx.notify();
+    }
+
+    pub(super) fn phone_menu_count(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.menu_buffer.take() else {
+            return;
+        };
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Some(open)));
+        let submit_saved = saved.clone();
+        let submit = std::rc::Rc::new(
+            move |this: &mut Self, input: String, window: &mut Window, cx: &mut Context<Self>| {
+                if let Some(mut open) = submit_saved.borrow_mut().take() {
+                    if let Ok(count) = input.trim().parse::<u32>() {
+                        open.menu.set_count(Some(count));
+                        open.carried_count = None;
+                    }
+                    this.menu_buffer = Some(open);
+                    window.focus(&this.transient_focus, cx);
+                    cx.notify();
+                }
+            },
+        );
+        let cancel = std::rc::Rc::new(
+            move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                this.menu_buffer = saved.borrow_mut().take();
+                window.focus(&this.transient_focus, cx);
+                cx.notify();
+            },
+        );
+        self.open_prompt_cancellable(
+            "count:",
+            std::rc::Rc::new(|_, _, _| vec![]),
+            submit,
+            cancel,
+            window,
+            cx,
+        );
     }
 
     /// Close the menu and give the keyboard back to the surface it opened
@@ -5770,14 +5880,23 @@ impl Workspace {
             MenuId::Slack => crate::transient::slack_menu(),
             MenuId::Hosts => crate::transient::hosts_menu(),
             MenuId::Projects => crate::transient::projects_menu(),
+            MenuId::Verdict => crate::transient::verdict_menu(),
             MenuId::VerdictSnooze => crate::transient::verdict_snooze_menu(),
             MenuId::Input => crate::transient::input_menu(),
             MenuId::Agent => crate::transient::agent_menu(),
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
+            MenuId::PhoneTools => crate::transient::phone_tools_menu(),
+            MenuId::PhoneFiling => crate::transient::phone_filing_menu(),
+            MenuId::Editing => crate::transient::editing_menu(),
         };
-        self.show_menu(menu, count, Back::Over, false);
+        self.show_menu(
+            menu,
+            count,
+            Back::Over,
+            matches!(id, MenuId::Verdict | MenuId::VerdictSnooze),
+        );
         cx.notify();
     }
 
@@ -5817,10 +5936,19 @@ impl Workspace {
     ) {
         use crate::transient::Command;
         match command {
+            Command::AllCommands => self.phone_command_picker(window, cx),
+            Command::Edit(action) => self.phone_edit(action, window, cx),
+            Command::FindText => self.phone_find_text(window, cx),
             Command::Voice => self.cmd_voice(window, cx),
+            Command::SwitchBuffer if self.phone.enabled => self.phone_buffer_picker(window, cx),
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
+            Command::SurfaceForward => self.cmd_surface_forward_or_deal(window, cx),
+            Command::FileSave => {
+                self.focus_active_surface(window, cx);
+                window.dispatch_action(Box::new(rho_files::FileSave), cx);
+            }
             Command::AgentActivity => self.open_agent_view(TranscriptView::Activity, window, cx),
             Command::AgentConversation => {
                 self.open_agent_view(TranscriptView::Conversation, window, cx)
@@ -5839,6 +5967,7 @@ impl Workspace {
             Command::DeleteMade => self.delete_made(window, cx),
             Command::MoveLabel => self.prompt_move_label(window, cx),
             Command::Quit => cx.quit(),
+            Command::Home if self.phone.enabled => self.phone_home(window, cx),
             Command::Home => self.toggle_overview(window, cx),
             Command::SlackReact(name) => self.slack_react(&name, window, cx),
             Command::SlackReactByName => self.prompt_slack_react(window, cx),
@@ -5880,6 +6009,7 @@ impl Workspace {
             Command::ClearPromptImages => self.cmd_clear_prompt_attachments(cx),
             Command::NewAgent => self.begin_new(crate::create::NewKind::Agent, window, cx),
             Command::NewPage => self.begin_new(crate::create::NewKind::Page, window, cx),
+            Command::BrowserType => self.phone_browser_type(window, cx),
             Command::NewNote => self.begin_new(crate::create::NewKind::Note, window, cx),
             Command::Usage(chart, days) => self.open_usage_chart(chart, days, window, cx),
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
@@ -6957,7 +7087,16 @@ impl Workspace {
     /// The transcript model and editor of the surface the reader is on.
     fn active_transcript(&self) -> Option<(Entity<AgentModel>, Entity<editor::Editor>)> {
         match &self.active_surface().view {
-            SurfaceView::Transcript { model, editor } => Some((model.clone(), editor.clone())),
+            SurfaceView::Transcript { model, editor } => {
+                let reader = self
+                    .phone
+                    .enabled
+                    .then(|| self.phone_agent_editors.get(&model.entity_id()))
+                    .flatten()
+                    .map(|(reader, _)| reader)
+                    .unwrap_or(editor);
+                Some((model.clone(), reader.clone()))
+            }
             _ => None,
         }
     }
@@ -7806,9 +7945,7 @@ impl Workspace {
     }
 }
 
-/// How a role reads in the chips a transcript shows. Only the tests ask
-/// for it as a string; the chips themselves are styled from the family.
-#[cfg(test)]
+/// How an agent role reads in touch headers and compact status text.
 fn agent_role_label(config: AgentRole) -> String {
     match config {
         AgentRole::Advisor { intelligence } => match intelligence {
@@ -7829,11 +7966,19 @@ fn agent_role_label(config: AgentRole) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let phone = self.phone_mode(window, cx);
         if let Some(desktop) = self.desktop.clone() {
             let editor = self.active_editor(cx);
             let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
             return div()
-                .font_family(text_style.font_family)
+                .key_context("RhoGui")
+                .on_action(cx.listener(|this, _: &MinibufferConfirm, window, cx| {
+                    this.minibuffer_confirm(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MinibufferCancel, window, cx| {
+                    this.minibuffer_cancel(window, cx)
+                }))
+                .font_family(text_style.font_family.clone())
                 .size_full()
                 .flex()
                 .flex_col()
@@ -7846,6 +7991,7 @@ impl Render for Workspace {
                         .items_center()
                         .px(px(8.))
                         .py(px(3.))
+                        .when(phone, |header| header.min_h(px(48.)).flex_wrap())
                         .text_size(px(12.))
                         .text_color(cx.theme().colors().text_muted)
                         .child(format!("desktop / {}", self.desktop_name))
@@ -7858,6 +8004,14 @@ impl Render for Workspace {
                                     div()
                                         .id("annotate-desktop")
                                         .p(px(4.))
+                                        .when(phone, |button| {
+                                            button
+                                                .min_w(px(48.))
+                                                .min_h(px(48.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                        })
                                         .tooltip(ui::Tooltip::text("Toggle drawing mode"))
                                         .cursor_pointer()
                                         .child(
@@ -7879,6 +8033,14 @@ impl Render for Workspace {
                                     div()
                                         .id("close-desktop")
                                         .px(px(4.))
+                                        .when(phone, |button| {
+                                            button
+                                                .min_w(px(48.))
+                                                .min_h(px(48.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                        })
                                         .tooltip(ui::Tooltip::text("Return to agent"))
                                         .cursor_pointer()
                                         .child("×")
@@ -7890,12 +8052,98 @@ impl Render for Workspace {
                                 ),
                         ),
                 )
+                .when(phone, |root| {
+                    root.child(
+                        div()
+                            .id("phone-desktop-keys")
+                            .flex_none()
+                            .min_h(px(48.))
+                            .flex()
+                            .w_full()
+                            .overflow_x_scroll()
+                            .gap_1()
+                            .children(
+                                [
+                                    ("Type…", ""),
+                                    ("Key…", ""),
+                                    ("Esc", "escape"),
+                                    ("Tab", "tab"),
+                                    ("Enter", "enter"),
+                                    ("Undo drawing", ""),
+                                    ("Right click…", ""),
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (label, key))| {
+                                    let desktop = desktop.clone();
+                                    div()
+                                        .id(("phone-desktop-key", index))
+                                        .flex_none()
+                                        .min_h(px(48.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if index == 6 {
+                                                desktop.update(cx, |view, cx| {
+                                                    view.right_click_next(cx)
+                                                });
+                                            } else if index == 5 {
+                                                desktop.update(cx, |view, cx| {
+                                                    view.undo_annotation(cx);
+                                                });
+                                            } else if key.is_empty() {
+                                                let desktop = desktop.clone();
+                                                this.open_prompt(
+                                                    if index == 0 {
+                                                        "type on desktop:"
+                                                    } else {
+                                                        "key (e.g. ctrl+c, super+enter):"
+                                                    },
+                                                    std::rc::Rc::new(|_, _, _| vec![]),
+                                                    std::rc::Rc::new(move |_, text, _, cx| {
+                                                        desktop.update(cx, |view, cx| {
+                                                            view.input(
+                                                                if index == 0 {
+                                                                    rho_desktop_proto::Input::Text(
+                                                                        text,
+                                                                    )
+                                                                } else {
+                                                                    rho_desktop_proto::Input::Key(
+                                                                        text,
+                                                                    )
+                                                                },
+                                                                cx,
+                                                            )
+                                                        })
+                                                    }),
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                desktop.update(cx, |view, cx| {
+                                                    view.input(
+                                                        rho_desktop_proto::Input::Key(key.into()),
+                                                        cx,
+                                                    )
+                                                });
+                                            }
+                                        }))
+                                }),
+                            ),
+                    )
+                })
                 .child(div().flex_1().min_h_0().child(desktop))
+                .children(
+                    self.minibuffer
+                        .as_ref()
+                        .map(|minibuffer| minibuffer.render_phone(&text_style, window, cx)),
+                )
                 .into_any_element();
         }
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
-        let phone = self.phone_mode(window, cx);
         div()
             .id("rho-gui")
             .relative()
@@ -8165,17 +8413,20 @@ impl Render for Workspace {
                         if let SurfaceView::SlackConversation(view) = &this.active_surface().view {
                             let view = view.clone();
                             view.update(cx, |view, cx| view.select_compose(window, cx));
-                            window.focus(&view.read(cx).editor().focus_handle(cx), cx);
+                            if !this.phone.enabled {
+                                window.focus(&view.read(cx).editor().focus_handle(cx), cx);
+                            }
                         }
                     }
                     rho_dealer::NodeId::Agent(agent_id) => {
                         this.open_agent(*agent_id, window, cx);
                         if this.phone.enabled
-                            && let SurfaceView::Transcript { model, editor } =
+                            && let SurfaceView::Transcript { model, .. } =
                                 &this.active_surface().view
                         {
-                            let (model, editor) = (model.clone(), editor.clone());
-                            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
+                            let model = model.clone();
+                            let (_, prompt) = this.phone_transcript_editors(&model, window, cx);
+                            window.focus(&prompt.focus_handle(cx), cx);
                         }
                     }
                     node => {
@@ -8252,6 +8503,20 @@ impl Render for Workspace {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
             .children((!phone).then(|| self.render_status_line(&text_style, window, cx)))
+            .children(if phone {
+                self.echo.as_ref().map(|echo| {
+                    div()
+                        .id("phone-notice")
+                        .flex_none()
+                        .max_h(px(100.))
+                        .overflow_y_scroll()
+                        .child(echo.render(&text_style, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.cmd_messages(window, cx)))
+                        .into_any_element()
+                })
+            } else {
+                None
+            })
             .child(
                 div()
                     .flex_1()
@@ -8309,7 +8574,7 @@ impl Render for Workspace {
                 ) {
                     (Some(approval), _) => Some(approval),
                     (None, Some(minibuffer)) => Some(if phone {
-                        minibuffer.render_phone(&text_style, cx)
+                        minibuffer.render_phone(&text_style, window, cx)
                     } else {
                         minibuffer.render(&text_style, cx)
                     }),

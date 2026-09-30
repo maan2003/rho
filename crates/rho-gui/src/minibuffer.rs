@@ -409,18 +409,14 @@ impl Minibuffer {
     pub(crate) fn render_phone(
         &self,
         text_style: &gpui::TextStyle,
+        window: &Window,
         cx: &Context<Workspace>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let window_start = self
-            .selected
-            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let rows = self
             .candidates
             .iter()
             .enumerate()
-            .skip(window_start)
-            .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
                 let mut row = div()
                     .id(("phone-minibuffer-candidate", index))
@@ -431,7 +427,7 @@ impl Minibuffer {
                     .w_full()
                     .min_h(px(48.))
                     .px_3()
-                    .child(div().child(candidate.value.clone()));
+                    .child(div().flex_1().min_w_0().child(candidate.value.clone()));
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
@@ -447,21 +443,73 @@ impl Minibuffer {
                 }))
             });
         bottom_strip(text_style, cx)
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom(px(48.))
+            .max_h((window.viewport_size().height - px(4.)).max(px(0.)))
+            .min_h_0()
+            .overflow_hidden()
             .key_context("RhoMinibuffer")
             .child(
                 div()
                     .flex()
-                    .items_center()
+                    .flex_col()
+                    .flex_none()
                     .min_h(px(48.))
                     .px_3()
-                    .child(div().child(self.prompt.clone()))
-                    .child(div().flex_grow(1.0).child(self.editor.clone())),
+                    .child(
+                        div()
+                            .id("phone-prompt-question")
+                            .w_full()
+                            .max_h(window.viewport_size().height / 4.)
+                            .overflow_y_scroll()
+                            .child(self.prompt.clone()),
+                    )
+                    .child(div().w_full().min_h(px(44.)).child(self.editor.clone())),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("phone-prompt-candidates")
+                    .debug_selector(|| "phone-candidates".into())
+                    .max_h(px(180.))
+                    .min_h_0()
+                    .flex_shrink(1.)
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        div()
+                            .id("phone-prompt-cancel")
+                            .debug_selector(|| "phone-cancel".into())
+                            .flex_1()
+                            .min_h(px(48.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.minibuffer_cancel(window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("phone-prompt-confirm")
+                            .debug_selector(|| "phone-confirm".into())
+                            .flex_1()
+                            .min_h(px(48.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .child("Confirm")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.minibuffer_confirm(window, cx)
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 }

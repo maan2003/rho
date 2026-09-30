@@ -11,7 +11,7 @@
 //! it is up.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, FocusHandle, TextStyle, Window, div};
+use gpui::{AnyElement, App, FocusHandle, TextStyle, Window, div, px};
 use rho_agent_hosts::connection::GitApprovalDecision;
 use theme::ActiveTheme as _;
 
@@ -97,7 +97,14 @@ impl GitApproval {
     ) -> Option<AnyElement> {
         let pending = self.pending.as_ref()?;
         let colors = cx.theme().colors();
-        let mut deny = div().flex().flex_row().px_1().child("n deny");
+        let mut deny = div()
+            .id("git-deny")
+            .flex()
+            .items_center()
+            .min_h(px(48.))
+            .px_2()
+            .child("Deny")
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::GitApprovalDeny), cx));
         if self.focus.is_focused(window) {
             deny = deny.bg(colors.element_selected);
         } else {
@@ -122,7 +129,7 @@ impl GitApproval {
                                         .child("Git approval"),
                                 )
                                 .child("·")
-                                .child(pending.prompt.clone()),
+                                .child(div().flex_1().min_w_0().child(pending.prompt.clone())),
                         )
                         .child(
                             div()
@@ -131,7 +138,22 @@ impl GitApproval {
                                 .items_center()
                                 .gap_4()
                                 .px_2()
-                                .child(div().text_color(colors.text_muted).child("Y allow"))
+                                .child(
+                                    div()
+                                        .id("git-allow")
+                                        .min_h(px(48.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .text_color(colors.text)
+                                        .child("Allow")
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(crate::GitApprovalAllow),
+                                                cx,
+                                            )
+                                        }),
+                                )
                                 .child(deny),
                         ),
                 )

@@ -12676,6 +12676,7 @@ name = "rho-agents-view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "chrono",
  "collections",
  "editor",
@@ -12683,6 +12684,7 @@ dependencies = [
  "json-stream",
  "language",
  "multi_buffer",
+ "project",
  "rho-agent-types",
  "rho-agents-client",
  "rho-window",
@@ -12703,6 +12705,7 @@ name = "rho-browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "async-channel 2.5.0",
  "dirs",
  "futures-lite 2.6.1",
@@ -12710,11 +12713,14 @@ dependencies = [
  "image",
  "libc",
  "rho-browser-wayland",
+ "rho-window",
  "serde",
  "serde_json",
+ "settings",
  "smallvec",
  "tempfile",
  "theme",
+ "theme_settings",
  "tracing",
  "url",
  "uuid",
@@ -13382,6 +13388,7 @@ name = "rho-shell-view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "bytes",
  "editor",
  "futures",
@@ -13394,8 +13401,10 @@ dependencies = [
  "rho-terminal",
  "rho-window",
  "senax-encoder",
+ "settings",
  "text",
  "theme",
+ "theme_settings",
  "tokio",
 ]
 
@@ -13421,6 +13430,7 @@ dependencies = [
  "rho-db",
  "rho-slack",
  "rho-transcript",
+ "rho-window",
  "rustls",
  "senax-encoder",
  "serde",
@@ -13440,16 +13450,19 @@ name = "rho-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "bytes",
  "futures",
  "gpui",
  "rho-agent-hosts",
  "rho-rpc",
  "rho-terminal",
+ "rho-window",
  "senax-encoder",
  "settings",
  "theme",
  "theme_settings",
+ "tokio",
 ]
 
 [[package]]

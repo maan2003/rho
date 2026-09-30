@@ -71,6 +71,8 @@ impl BrowserRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .arg("--ozone-platform=wayland")
+            .arg("--enable-wayland-ime")
+            .arg("--wayland-text-input-version=3")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--restore-last-session")
@@ -166,6 +168,19 @@ fn begin_shutdown(started: &AtomicBool) -> bool {
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
         self.shutdown_background();
+    }
+}
+
+#[cfg(test)]
+impl BrowserRuntime {
+    pub(crate) fn inert() -> Self {
+        Self {
+            compositor: Mutex::new(None),
+            bridge: Mutex::new(None),
+            runtime_lock: Mutex::new(None),
+            chrome: Mutex::new(None),
+            shutdown_started: AtomicBool::new(false),
+        }
     }
 }
 

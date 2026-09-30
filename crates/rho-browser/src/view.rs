@@ -13,9 +13,9 @@ use gpui::{
     LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent,
     LinuxWaylandDmaBufPlane, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer,
     LinuxWaylandPassthroughEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, RenderImage,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, Window,
-    canvas, div, img, px, surface,
+    ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent, PinchEvent, Render, RenderImage,
+    ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, TouchPhase, Window, canvas, div, img, px, surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
@@ -1152,7 +1152,11 @@ pub struct BrowserView {
     claiming_pointer_focus: bool,
     finger_axes: (bool, bool),
     last_axis_time: u32,
+    touch_clock: std::time::Instant,
     pinch_active: bool,
+    touch_scroll_active: bool,
+    native_pinch_active: bool,
+    touch_pinch_scale: Option<f64>,
     scheduled_scene: Option<u64>,
     passthrough: Option<Arc<dyn LinuxWaylandPassthrough>>,
     passthrough_attempted: bool,
@@ -1207,7 +1211,11 @@ impl BrowserView {
             claiming_pointer_focus: false,
             finger_axes: (false, false),
             last_axis_time: 0,
+            touch_clock: std::time::Instant::now(),
             pinch_active: false,
+            touch_scroll_active: false,
+            native_pinch_active: false,
+            touch_pinch_scale: None,
             scheduled_scene: None,
             passthrough: None,
             passthrough_attempted: false,
@@ -1412,6 +1420,19 @@ impl BrowserView {
     }
 
     fn pinch(&mut self, event: &LinuxPinchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.native_pinch_active = !matches!(event, LinuxPinchEvent::End { .. });
+        if matches!(event, LinuxPinchEvent::Begin { .. }) {
+            self.touch_pinch_scale = None;
+        }
+        self.forward_pinch(event, window, cx);
+    }
+
+    fn forward_pinch(
+        &mut self,
+        event: &LinuxPinchEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pinch_was_active = self.pinch_active;
         let position = match event {
             LinuxPinchEvent::Begin { position, .. } | LinuxPinchEvent::Update { position, .. } => {
@@ -1454,6 +1475,90 @@ impl BrowserView {
         }
         model.pinch(gesture);
         cx.stop_propagation();
+    }
+
+    fn touch_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(axis) = touch_axis_event(
+            &mut self.touch_scroll_active,
+            event,
+            self.touch_clock.elapsed().as_millis() as u32,
+        ) else {
+            return;
+        };
+        self.pointer_axis(&axis, window, cx);
+    }
+
+    fn touch_pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pinch) =
+            touch_pinch_event(&mut self.touch_pinch_scale, event, self.native_pinch_active)
+        {
+            self.forward_pinch(&pinch, window, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    /// Explicit phone typing into Chromium's actually enabled text input.
+    /// The caller's native minibuffer owns the OSK; this never assumes that
+    /// a pointer click or text-shaped cursor means a website field is focused.
+    pub fn type_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let model = self.model.read(cx);
+        if !model.presents(self.owner_id, self.page_id) {
+            return Task::ready(Err(anyhow::anyhow!("browser is still switching pages")));
+        }
+        let Some(session) = model.runtime.session.as_ref() else {
+            return Task::ready(Err(anyhow::anyhow!("browser is disconnected")));
+        };
+        let committed = session.type_text(text.to_owned());
+        self.claiming_pointer_focus = true;
+        self.focus_handle.focus(window, cx);
+        cx.background_spawn(committed)
+    }
+
+    fn touch_key(&mut self, keycode: u32, ctrl: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Use the same press/release path and handoff queue as physical keys,
+        // without translating a control into committed text.
+        self.claiming_pointer_focus = true;
+        self.focus_handle.focus(window, cx);
+        if ctrl {
+            self.physical_key(
+                &PhysicalKeyEvent {
+                    key: PhysicalKey::LinuxEvdev(29),
+                    pressed: true,
+                },
+                window,
+                cx,
+            );
+        }
+        for pressed in [true, false] {
+            self.physical_key(
+                &PhysicalKeyEvent {
+                    key: PhysicalKey::LinuxEvdev(keycode),
+                    pressed,
+                },
+                window,
+                cx,
+            );
+        }
+        if ctrl {
+            self.physical_key(
+                &PhysicalKeyEvent {
+                    key: PhysicalKey::LinuxEvdev(29),
+                    pressed: false,
+                },
+                window,
+                cx,
+            );
+        }
     }
 
     fn physical_key(
@@ -1546,6 +1651,9 @@ impl BrowserView {
         if *hovered {
             return;
         }
+        self.touch_scroll_active = false;
+        self.native_pinch_active = false;
+        self.touch_pinch_scale = None;
         let finger_axes = std::mem::take(&mut self.finger_axes);
         let pinch_active = std::mem::take(&mut self.pinch_active);
         let axis_stop = (finger_axes != (false, false)).then(|| LinuxPointerAxisEvent {
@@ -1596,6 +1704,9 @@ impl BrowserView {
         self.queued_input = None;
         self.pending_key = None;
         self.claiming_pointer_focus = false;
+        self.touch_scroll_active = false;
+        self.native_pinch_active = false;
+        self.touch_pinch_scale = None;
         let model = self.model.read(cx);
         let presents = model.presents(self.owner_id, self.page_id);
         for keycode in self.pressed_keys.drain() {
@@ -2145,7 +2256,8 @@ impl Render for BrowserView {
         )
         .size_full();
 
-        div()
+        let viewport = div()
+            .debug_selector(|| "browser-viewport".into())
             .id("rho-browser")
             .track_focus(&self.focus_handle)
             .on_hover(cx.listener(Self::hover_changed))
@@ -2163,12 +2275,14 @@ impl Render for BrowserView {
             // Bubble the coarse wheel event so the GUI action journal can
             // record one surface-level scroll burst. Native pointer-axis
             // forwarding above remains the page's actual scroll path.
-            .on_scroll_wheel(|_, _, _| {})
-            .on_pinch(|_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(cx.listener(Self::touch_scroll))
+            .on_pinch(cx.listener(Self::touch_pinch))
             .on_physical_key(cx.listener(Self::physical_key))
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(|_, _, cx| cx.stop_propagation())
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .relative()
             .overflow_hidden()
             .bg(colors.editor_background)
@@ -2212,13 +2326,321 @@ impl Render for BrowserView {
                     .text_size(theme::theme_settings(cx).ui_font_size(cx))
                     .text_color(colors.text_muted)
                     .child(status)
-            }))
+            }));
+        let touch = cx
+            .try_global::<rho_window::TouchMode>()
+            .is_some_and(|mode| mode.0);
+        let mut root = div()
+            .id("browser-touch-surface")
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(viewport);
+        if touch {
+            let mut strip = div()
+                .id("browser-touch-keys")
+                .w_full()
+                .h(px(48.))
+                .flex_shrink_0()
+                .flex()
+                .overflow_x_scroll()
+                .bg(colors.element_background)
+                .text_color(colors.text);
+            for (index, (label, keycode, ctrl)) in BROWSER_TOUCH_KEYS.into_iter().enumerate() {
+                strip = strip.child(
+                    div()
+                        .id(("browser-touch-key", index))
+                        .min_w(px(48.))
+                        .h_full()
+                        .px_2()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .debug_selector(|| label.into())
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.touch_key(keycode, ctrl, window, cx)
+                        })),
+                );
+            }
+            root = root.child(strip);
+        }
+        root
     }
+}
+
+const BROWSER_TOUCH_KEYS: [(&str, u32, bool); 4] = [
+    ("Enter", 28, false),
+    ("Tab", 15, false),
+    ("Esc", 1, false),
+    ("Ctrl-A", 30, true),
+];
+
+// Linux physical devices also send coarse wheel/pinch events after their raw
+// events. Only a Started touch-pan sequence is accepted here: physical coarse
+// wheels have Moved phase only and are already forwarded as LinuxPointerAxis.
+fn touch_axis_event(
+    active: &mut bool,
+    event: &ScrollWheelEvent,
+    time: u32,
+) -> Option<LinuxPointerAxisEvent> {
+    if event.touch_phase == TouchPhase::Started {
+        *active = true;
+    }
+    if !*active {
+        return None;
+    }
+    let ended = matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled);
+    if ended {
+        *active = false;
+    }
+    let delta = match event.delta {
+        ScrollDelta::Pixels(delta) => {
+            (f64::from(f32::from(delta.x)), f64::from(f32::from(delta.y)))
+        }
+        ScrollDelta::Lines(_) => return None,
+    };
+    Some(LinuxPointerAxisEvent {
+        position: event.position,
+        time,
+        source: LinuxAxisSource::Finger,
+        // GPUI pan deltas follow the finger/content, Wayland axes follow the
+        // scroll direction, so the signs are opposite.
+        value: if ended {
+            (0., 0.)
+        } else {
+            (-delta.0, -delta.1)
+        },
+        v120: (None, None),
+        stop: (ended, ended),
+        relative_direction: (
+            LinuxAxisRelativeDirection::Identical,
+            LinuxAxisRelativeDirection::Identical,
+        ),
+    })
+}
+
+fn touch_pinch_event(
+    scale: &mut Option<f64>,
+    event: &PinchEvent,
+    native_active: bool,
+) -> Option<LinuxPinchEvent> {
+    if native_active {
+        return None;
+    }
+    Some(match event.phase {
+        TouchPhase::Started => {
+            *scale = Some(1.);
+            LinuxPinchEvent::Begin {
+                position: event.position,
+                fingers: event.fingers,
+            }
+        }
+        TouchPhase::Moved => {
+            let current = scale.as_mut()?;
+            // Native touchscreen deltas are successive distance ratios, not
+            // differences between absolute scales as the trackpad reports.
+            *current *= 1. + f64::from(event.delta);
+            LinuxPinchEvent::Update {
+                position: event.position,
+                delta: (0., 0.),
+                scale: *current,
+                rotation: 0.,
+            }
+        }
+        TouchPhase::Ended | TouchPhase::Cancelled => {
+            scale.take()?;
+            LinuxPinchEvent::End {
+                cancelled: event.phase == TouchPhase::Cancelled,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn touch_keys_reserve_viewport_and_queue_balanced_physical_controls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        // No external Chromium/compositor is started. Keep the model at an
+        // unfinished handoff to inspect the exact canonical replay queue.
+        let model = cx.new(|_| BrowserModel {
+            browser: Arc::new(BrowserRuntime::inert()),
+            handoff: None,
+            active_focus: None,
+            next_handoff_generation: 1,
+            next_frame_barrier: 1,
+            next_input_freeze: 1,
+            input_freeze: None,
+            presentation_owner: None,
+            passthrough_owner: Rc::new(Cell::new(None)),
+            runtime: RuntimePageState {
+                session: None,
+                terminal: false,
+                buffers: HashMap::new(),
+                scene: Vec::new(),
+                scene_id: None,
+                logical_size: (390, 500),
+                painted_scene_id: None,
+                invalidated_through: 0,
+                presented_barrier: 0,
+                status: None,
+                sent_size: Rc::new(Cell::new((0, 0, 0))),
+                cursor: BrowserCursor::Arrow,
+            },
+            _events_task: Task::ready(()),
+            _metadata_task: Task::ready(()),
+        });
+        let page = PageId(uuid::Uuid::new_v4());
+        let window = cx.open_window(gpui::size(px(390.), px(500.)), |_, cx| {
+            BrowserView::new(model.clone(), page, cx)
+        });
+        window
+            .update(cx, |view, _, cx| {
+                model.update(cx, |model, _| {
+                    model.presentation_owner = Some(view.owner_id);
+                    model.handoff = Some(PageHandoff {
+                        generation: 9,
+                        target: page,
+                        phase: HandoffPhase::Focusing,
+                        input_generation: Some(3),
+                    });
+                });
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.draw_window(window.into());
+        assert!(visual.debug_bounds("Enter").is_none());
+        assert_eq!(
+            visual.debug_bounds("browser-viewport").unwrap().size.height,
+            px(500.)
+        );
+        visual.set_global(rho_window::TouchMode(true));
+        visual.draw_window(window.into());
+        assert_eq!(
+            visual.debug_bounds("browser-viewport").unwrap().size.height,
+            px(452.)
+        );
+        visual.update(|_, cx| {
+            assert_eq!(model.read(cx).runtime.sent_size.get().0, 390);
+            assert_eq!(model.read(cx).runtime.sent_size.get().1, 452);
+        });
+        for (label, expected) in [
+            ("Enter", vec![(28, true), (28, false)]),
+            ("Tab", vec![(15, true), (15, false)]),
+            ("Esc", vec![(1, true), (1, false)]),
+            (
+                "Ctrl-A",
+                vec![(29, true), (30, true), (30, false), (29, false)],
+            ),
+        ] {
+            let bounds = visual.debug_bounds(label).unwrap();
+            assert!(bounds.size.width >= px(48.));
+            assert_eq!(bounds.size.height, px(48.));
+            visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+            window
+                .update(&mut visual, |view, window, _| {
+                    assert!(view.focus_handle.is_focused(window));
+                    let queued = view.queued_input.take().unwrap();
+                    assert_eq!(queued.generation, 9);
+                    let keys = queued
+                        .events
+                        .into_iter()
+                        .map(|event| match event {
+                            QueuedInputEvent::Key { keycode, pressed } => (keycode, pressed),
+                            _ => panic!("strip click leaked pointer input to Chromium"),
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(keys, expected);
+                    assert!(view.pending_key.is_none());
+                    assert!(view.pressed_keys.is_empty());
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn touch_pan_uses_signed_pixel_axes_and_does_not_duplicate_native_wheels() {
+        let mut active = false;
+        let mut event = ScrollWheelEvent {
+            position: gpui::point(px(151.), px(283.)),
+            delta: ScrollDelta::Pixels(gpui::point(px(-31.), px(17.))),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        };
+        // The Linux backend sends native axes and a Moved coarse wheel.
+        assert!(touch_axis_event(&mut active, &event, 70).is_none());
+        event.touch_phase = TouchPhase::Started;
+        let axis = touch_axis_event(&mut active, &event, 71).unwrap();
+        assert_eq!(axis.position, event.position);
+        assert_eq!(axis.value, (31., -17.));
+        assert_eq!(axis.time, 71);
+        assert_eq!(axis.source, LinuxAxisSource::Finger);
+        assert_eq!(axis.stop, (false, false));
+        event.touch_phase = TouchPhase::Moved;
+        event.delta = ScrollDelta::Pixels(gpui::point(px(4.), px(-53.)));
+        assert_eq!(
+            touch_axis_event(&mut active, &event, 80).unwrap().value,
+            (-4., 53.)
+        );
+        event.touch_phase = TouchPhase::Cancelled;
+        let stop = touch_axis_event(&mut active, &event, 81).unwrap();
+        assert_eq!(stop.value, (0., 0.));
+        assert_eq!(stop.stop, (true, true));
+        assert!(!active);
+        event.touch_phase = TouchPhase::Moved;
+        assert!(touch_axis_event(&mut active, &event, 82).is_none());
+    }
+
+    #[test]
+    fn touch_pinch_accumulates_ratios_and_ignores_native_pinch_duplicate() {
+        let mut scale = None;
+        let mut event = PinchEvent {
+            position: gpui::point(px(88.), px(173.)),
+            fingers: 2,
+            phase: TouchPhase::Started,
+            ..Default::default()
+        };
+        assert!(touch_pinch_event(&mut scale, &event, true).is_none());
+        assert!(scale.is_none());
+        assert!(matches!(touch_pinch_event(&mut scale, &event, false),
+            Some(LinuxPinchEvent::Begin { position, fingers: 2 }) if position == event.position));
+        event.phase = TouchPhase::Moved;
+        event.delta = 0.5;
+        assert!(matches!(
+            touch_pinch_event(&mut scale, &event, false),
+            Some(LinuxPinchEvent::Update { scale: 1.5, .. })
+        ));
+        event.delta = -0.25;
+        // Multiplication is required: 1.5 * .75 = 1.125, not 1 + .5 - .25.
+        assert!(matches!(
+            touch_pinch_event(&mut scale, &event, false),
+            Some(LinuxPinchEvent::Update {
+                scale: 1.125,
+                delta: (0., 0.),
+                rotation: 0.,
+                ..
+            })
+        ));
+        event.phase = TouchPhase::Cancelled;
+        assert!(matches!(
+            touch_pinch_event(&mut scale, &event, false),
+            Some(LinuxPinchEvent::End { cancelled: true })
+        ));
+        assert!(scale.is_none());
+        // The native End already cleared its stream; coarse End must not send another.
+        assert!(touch_pinch_event(&mut scale, &event, false).is_none());
+    }
 
     #[test]
     fn queued_input_waits_for_its_painted_handoff_and_cancels_when_superseded() {

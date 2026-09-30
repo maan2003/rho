@@ -608,7 +608,10 @@ fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppCo
         agent_id,
         state(vec![user("read this first")], Vec::new()),
     );
-    let editor = active_editor(&workspace, cx);
+    next_frame(cx, workspace);
+    let editor = workspace
+        .update(cx, |this, _, cx| this.active_editor(cx))
+        .unwrap();
     workspace
         .update(cx, |_, window, cx| {
             assert!(
@@ -619,8 +622,10 @@ fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppCo
         .expect("inspect initial transcript focus");
 
     let reply_position = editor.read_with(cx, |editor, _| {
-        let bounds = *editor.last_bounds().expect("painted reply editor bounds");
-        gpui::point(bounds.center().x, bounds.bottom() - px(48.))
+        editor
+            .last_bounds()
+            .expect("painted reply editor bounds")
+            .center()
     });
     cx.update_window(*workspace, |_, window, cx| {
         window.dispatch_event(
@@ -6675,6 +6680,160 @@ fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext
                 "draft",
                 "forward walked back into the discarded draft"
             );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_rotation_and_keyboard_resize_keep_direct_editing(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    next_frame(cx, workspace);
+    cx.update_window(*workspace, |_, window, cx| {
+        for phase in [TouchPhase::Started, TouchPhase::Ended] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(19),
+                    phase,
+                    position: point(px(200.), px(300.)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    for dimensions in [
+        size(px(844.), px(390.)),
+        size(px(844.), px(180.)),
+        size(px(390.), px(844.)),
+    ] {
+        cx.simulate_window_resize(*workspace, dimensions);
+        next_frame(cx, workspace);
+        cx.update(|cx| {
+            assert!(cx.global::<rho_window::TouchMode>().0);
+            assert!(!vim_mode_setting::VimModeSetting::get_global(cx).0);
+            assert!(!vim_mode_setting::HelixModeSetting::get_global(cx).0);
+        });
+    }
+}
+
+#[gpui::test]
+fn explicit_phone_home_does_not_replace_the_pending_deal(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |this, _, cx| {
+            let note = this.create_note(None, cx);
+            this.write_marks(
+                vec![body(&note, "Still waiting"), said(&note, todo_now())],
+                cx,
+            );
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |this, window, cx| {
+            assert!(this.phone_feed_for_test(cx));
+            this.phone_home(window, cx);
+            assert!(this.phone_has_surface_for_test(&crate::pane::SurfaceKey::Home));
+            assert!(!this.phone_feed_is_active_for_test());
+            assert_eq!(this.current_surface_name_for_test(), "home");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_counted_menu_taps_use_the_pending_digits(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |this, window, cx| {
+            this.open_menu(crate::transient::verdict_snooze_menu(), window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "4 7");
+    workspace
+        .update(cx, |this, _, _| {
+            let sheet = this.menu_sheet().expect("counted menu");
+            assert!(sheet.counted);
+            assert_eq!(sheet.count, Some(47));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_reply_reuses_the_rendered_prompt(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(vec![user("reply to this")], Vec::new()),
+    );
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |this, window, cx| {
+            let model = match &this.active_surface().view {
+                crate::workspace::SurfaceView::Transcript { model, .. } => model.clone(),
+                _ => panic!("expected transcript"),
+            };
+            let (_, first) = this.phone_transcript_editors(&model, window, cx);
+            let (_, reply) = this.phone_transcript_editors(&model, window, cx);
+            assert_eq!(first.entity_id(), reply.entity_id());
+            window.focus(&reply.focus_handle(cx), cx);
+            assert!(
+                this.active_editor(cx)
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn choosing_a_card_from_phone_home_returns_to_the_feed(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(vec![user("pending card")], Vec::new()),
+    );
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |this, window, cx| {
+            this.phone_home(window, cx);
+            assert!(this.phone_has_surface_for_test(&crate::pane::SurfaceKey::Home));
+            let card = this.card_for(&rho_dealer::NodeId::Agent(agent(1)), cx);
+            this.open_card(card, window, cx);
+            assert!(
+                this.phone_feed_for_test(cx),
+                "the old Home must not cover the selected card"
+            );
+            assert!(!this.phone_has_surface_for_test(&crate::pane::SurfaceKey::Home));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_phone_starting_in_landscape_uses_direct_editing(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(844.), px(390.)));
+    next_frame(cx, workspace);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |_, _, cx| {
+            assert!(cx.global::<rho_window::TouchMode>().0);
+            assert!(!vim_mode_setting::HelixModeSetting::get_global(cx).0);
+            assert!(!vim_mode_setting::VimModeSetting::get_global(cx).0);
         })
         .unwrap();
 }
