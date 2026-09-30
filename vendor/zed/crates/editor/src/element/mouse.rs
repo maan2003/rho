@@ -626,7 +626,9 @@ impl EditorElement {
         }
 
         let text_hitbox = &position_map.text_hitbox;
-        if !editor.mouse_click_selection_enabled {
+        // A touchscreen has no other way to place the cursor, so a tap
+        // places it even where a mouse click does not.
+        if !editor.mouse_click_selection_enabled && !window.last_input_was_touch() {
             if text_hitbox.is_hovered(window) {
                 cx.stop_propagation();
             }

@@ -347,8 +347,66 @@ impl Workspace {
             super::SurfaceView::SlackResults(_) => {
                 self.slack_open_found(window, cx);
             }
+            super::SurfaceView::Draft { editor, .. } => {
+                self.phone_pick_draft_field(&editor, window, cx);
+            }
             _ => {}
         }
+    }
+
+    /// A tap on one of the draft's header rows offers its values as a list,
+    /// the completions a keyboard would have typed its way to.
+    fn phone_pick_draft_field(
+        &mut self,
+        editor: &gpui::Entity<editor::Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[derive(Clone, Copy)]
+        enum Field {
+            Workdir,
+            Role,
+            Start,
+        }
+        let draft = self.draft_model.read(cx);
+        let field = if draft.cursor_in_role_field(editor, cx) {
+            Field::Role
+        } else if draft.cursor_in_start_field(editor, cx) {
+            Field::Start
+        } else if draft.cursor_in_a_field(editor, cx) {
+            Field::Workdir
+        } else {
+            return;
+        };
+        let prompt = match field {
+            Field::Workdir => "workdir:",
+            Field::Role => "role:",
+            Field::Start => "on top of:",
+        };
+        let complete = std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
+            match field {
+                Field::Workdir => {
+                    crate::commands::workdir_field_candidates(input, &workspace.hosts.workdir_table())
+                }
+                Field::Role => crate::commands::role_field_candidates(input),
+                Field::Start => {
+                    crate::commands::start_field_candidates(input, &workspace.live_agent_targets())
+                }
+            }
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.draft_model.update(cx, |draft, cx| match field {
+                    Field::Workdir => draft.set_workdir_text(&input, cx),
+                    Field::Role => draft.set_role_text(&input, cx),
+                    Field::Start => draft.set_start_text(&input, cx),
+                });
+            },
+        );
+        self.open_prompt(prompt, complete, on_submit, window, cx);
     }
 
     /// The phone's right click: what can be done with the thing under the
@@ -548,6 +606,7 @@ impl Workspace {
             super::SurfaceView::Note(editor) | super::SurfaceView::Transcript { editor, .. } => {
                 Some(editor.clone())
             }
+            super::SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
             _ => None,
         };
         let Some(editor) = editor else {
@@ -834,7 +893,13 @@ impl Workspace {
                         .overflow_hidden()
                         .child(body),
                 )
-                .child(self.render_phone_verdict_bar(cx));
+                // A question in the minibuffer is answered with ok and dropped
+                // with back, whatever it was asked over.
+                .child(if self.minibuffer.is_some() {
+                    self.render_phone_bar(cx)
+                } else {
+                    self.render_phone_verdict_bar(cx)
+                });
             return if let Some(snap) = self.phone.snap {
                 card.with_animation(
                     ("phone-card-snap", snap.generation),

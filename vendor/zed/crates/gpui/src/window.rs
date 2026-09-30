@@ -2954,6 +2954,12 @@ impl Window {
         self.last_input_modality == InputModality::Keyboard
     }
 
+    /// Returns true if the last input event was a touch, including the mouse
+    /// events a tap or long press is delivered as.
+    pub fn last_input_was_touch(&self) -> bool {
+        self.last_input_modality == InputModality::Touch
+    }
+
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
         self.capslock

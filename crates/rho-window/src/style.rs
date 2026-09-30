@@ -208,7 +208,9 @@ pub fn refusal_block(anchor: Anchor, message: String) -> BlockProperties<Anchor>
         // so `None` leaves the refusal painted over the rows below it
         // instead of moving them down.
         height: Some(1),
-        style: BlockStyle::Fixed,
+        // Flex: the editor's width, so the cause wraps; a fixed block is
+        // laid out at its content's width and runs off the frame.
+        style: BlockStyle::Flex,
         render: Arc::new(move |cx| render_refusal_block(&message, cx).into_any_element()),
         priority: 1,
     }

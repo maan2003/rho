@@ -431,10 +431,21 @@ impl Minibuffer {
                     .w_full()
                     .min_h(px(48.))
                     .px_3()
-                    .child(div().child(candidate.value.clone()));
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(gpui::relative(0.6))
+                            .truncate()
+                            .child(candidate.value.clone()),
+                    );
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl_3()
+                            .truncate()
+                            .text_right()
                             .text_color(colors.text_muted)
                             .child(candidate.description.clone()),
                     );
