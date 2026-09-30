@@ -253,6 +253,11 @@ impl ShellModel {
         }
     }
 
+    /// Whether a pager is paused waiting for the reader.
+    pub fn pager_paused(&self) -> bool {
+        !self.shell_state.pagers.is_empty()
+    }
+
     pub fn pager_action(&self, action: crate::protocol::PagerAction) {
         let Some(pager) = self.shell_state.pagers.last() else {
             return;

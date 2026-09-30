@@ -402,17 +402,18 @@ impl Workspace {
             Field::Role => "role:",
             Field::Start => "on top of:",
         };
-        let complete = std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
-            match field {
-                Field::Workdir => {
-                    crate::commands::workdir_field_candidates(input, &workspace.hosts.workdir_table())
-                }
+        let complete = std::rc::Rc::new(
+            move |workspace: &Workspace, input: &str, _: &gpui::App| match field {
+                Field::Workdir => crate::commands::workdir_field_candidates(
+                    input,
+                    &workspace.hosts.workdir_table(),
+                ),
                 Field::Role => crate::commands::role_field_candidates(input),
                 Field::Start => {
                     crate::commands::start_field_candidates(input, &workspace.live_agent_targets())
                 }
-            }
-        });
+            },
+        );
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
                   input: String,
@@ -783,7 +784,11 @@ impl Workspace {
                 },
             ),
             PhonePeek::Pile => ("pile".to_owned(), None, note("the next card on the pile")),
-            PhonePeek::Undo => ("undo".to_owned(), None, note("let go to take the last verdict back")),
+            PhonePeek::Undo => (
+                "undo".to_owned(),
+                None,
+                note("let go to take the last verdict back"),
+            ),
         };
         div()
             .size_full()
@@ -839,8 +844,7 @@ impl Workspace {
                     && self.minibuffer.is_none()
                 {
                     let edge = if let Some(card) = self.open_card_in_view(cx) {
-                        (self.phone.peek_next, self.phone.peek_back) =
-                            self.phone_peeks(&card, cx);
+                        (self.phone.peek_next, self.phone.peek_back) = self.phone_peeks(&card, cx);
                         self.build_phone_peek_surface(window, cx);
                         self.phone_deal_scroll_edge(cx)
                     } else {
@@ -901,7 +905,8 @@ impl Workspace {
                 self.phone.drag_offset = Pixels::ZERO;
                 let card_in_view = self.open_card_in_view(cx).is_some();
                 // A card with nothing beyond it in that direction stays.
-                let direction = direction.filter(|_| !card_in_view || self.phone_peek_toward(from).is_some());
+                let direction =
+                    direction.filter(|_| !card_in_view || self.phone_peek_toward(from).is_some());
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
@@ -1203,6 +1208,7 @@ impl Workspace {
                         .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
                         .child(self.render_surface(&surface)),
                 )
+                .children(self.render_phone_keys(&surface, cx))
                 .child(self.render_phone_bar(cx))
                 .into_any_element()
         } else {
@@ -1267,7 +1273,8 @@ impl Workspace {
         run(self, window, cx);
         cx.defer_in(window, move |this, window, cx| {
             let after = this.open_card_in_view(cx).map(|card| card.node);
-            if before.is_some() && after.is_some() && before != after && this.phone.stack.is_empty() {
+            if before.is_some() && after.is_some() && before != after && this.phone.stack.is_empty()
+            {
                 // The next card rises into place, as it does under a flick;
                 // what was answered is gone, so nothing follows it down.
                 this.phone.peek_next = None;
@@ -1446,6 +1453,115 @@ impl Workspace {
             )
             .child(primary)
             .into_any_element()
+    }
+
+    /// The keys an on-screen keyboard lacks, above the bar of a terminal or
+    /// a shell. Ctrl and alt latch for the next key, typed or tapped.
+    fn render_phone_keys(&self, surface: &Surface, cx: &Context<Self>) -> Option<AnyElement> {
+        use rho_shell_view::protocol::PagerAction;
+        let colors = cx.theme().colors();
+        let key = |id: &'static str, label: &'static str, lit: bool| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .h_full()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.))
+                .when(lit, |key| {
+                    key.bg(colors.element_selected).text_color(colors.text)
+                })
+                .when(!lit, |key| key.text_color(colors.text_muted))
+                .child(label)
+        };
+        let keys: Vec<gpui::Stateful<gpui::Div>> = match &surface.view {
+            super::SurfaceView::Terminal(view) => {
+                let latched = view.read(cx).latched();
+                let press = |id, label, name: &'static str| {
+                    let view = view.clone();
+                    key(id, label, false).on_click(move |_, _, cx| {
+                        view.update(cx, |view, cx| view.press(name, cx));
+                    })
+                };
+                let latch = |id, label, lit, next: rho_terminal::Latched| {
+                    let view = view.clone();
+                    key(id, label, lit).on_click(move |_, _, cx| {
+                        view.update(cx, |view, cx| view.set_latched(next, cx));
+                    })
+                };
+                vec![
+                    press("phone-key-esc", "esc", "escape"),
+                    press("phone-key-tab", "tab", "tab"),
+                    latch(
+                        "phone-key-ctrl",
+                        "ctrl",
+                        latched.ctrl,
+                        rho_terminal::Latched {
+                            ctrl: !latched.ctrl,
+                            ..latched
+                        },
+                    ),
+                    latch(
+                        "phone-key-alt",
+                        "alt",
+                        latched.alt,
+                        rho_terminal::Latched {
+                            alt: !latched.alt,
+                            ..latched
+                        },
+                    ),
+                    press("phone-key-left", "←", "left"),
+                    press("phone-key-down", "↓", "down"),
+                    press("phone-key-up", "↑", "up"),
+                    press("phone-key-right", "→", "right"),
+                ]
+            }
+            super::SurfaceView::Shell { model, .. } => {
+                let control = |id,
+                               label,
+                               act: fn(
+                    &mut rho_shell_view::ShellModel,
+                    &mut Context<rho_shell_view::ShellModel>,
+                )| {
+                    let model = model.clone();
+                    key(id, label, false).on_click(move |_, _, cx| model.update(cx, act))
+                };
+                let mut keys = vec![
+                    control("phone-key-interrupt", "^C", |model, _| model.interrupt()),
+                    control("phone-key-eof", "^D", |model, cx| model.eof(cx)),
+                ];
+                if model.read(cx).pager_paused() {
+                    keys.extend([
+                        control("phone-key-more", "more", |model, _| {
+                            model.pager_action(PagerAction::Continue)
+                        }),
+                        control("phone-key-all", "all", |model, _| {
+                            model.pager_action(PagerAction::Drain)
+                        }),
+                        control("phone-key-stop", "stop", |model, _| {
+                            model.pager_action(PagerAction::Quit)
+                        }),
+                    ]);
+                }
+                keys
+            }
+            _ => return None,
+        };
+        Some(
+            div()
+                .id("phone-keys")
+                .flex_none()
+                .h(px(40.))
+                .w_full()
+                .flex()
+                .items_stretch()
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .children(keys)
+                .into_any_element(),
+        )
     }
 
     /// The phone's whole menu: every leader item, and the card's verdicts

@@ -6369,9 +6369,7 @@ fn a_phone_flick_moves_from_one_dated_card_to_the_next(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn the_card_peeking_in_under_a_phone_drag_is_the_one_the_flick_lands_on(
-    cx: &mut TestAppContext,
-) {
+fn the_card_peeking_in_under_a_phone_drag_is_the_one_the_flick_lands_on(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, _, cx| {

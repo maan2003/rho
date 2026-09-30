@@ -121,7 +121,17 @@ pub struct TerminalView {
     /// Paint-time cell geometry for mouse-report coordinates.
     cell_width_px: Rc<Cell<f32>>,
     grid_origin_px: Rc<Cell<(f32, f32)>>,
+    /// Modifiers latched from a touch key row, applied to the next key.
+    latched: Latched,
     _model_changed: Subscription,
+}
+
+/// A modifier a touchscreen holds for the next key, since an on-screen
+/// keyboard has no ctrl or alt of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Latched {
+    pub ctrl: bool,
+    pub alt: bool,
 }
 
 impl TerminalView {
@@ -149,6 +159,7 @@ impl TerminalView {
             line_height_px: Rc::new(Cell::new(16.0)),
             cell_width_px: Rc::new(Cell::new(8.0)),
             grid_origin_px: Rc::new(Cell::new((0.0, 0.0))),
+            latched: Latched::default(),
             _model_changed: model_changed,
         }
     }
@@ -163,22 +174,46 @@ impl TerminalView {
         }
         let keystroke = TermKeystroke {
             key: ks.key.clone(),
-            ctrl: ks.modifiers.control,
-            alt: ks.modifiers.alt,
+            ctrl: ks.modifiers.control || self.latched.ctrl,
+            alt: ks.modifiers.alt || self.latched.alt,
             shift: ks.modifiers.shift,
             key_char: ks.key_char.clone(),
         };
         let handled = probably_produces_bytes(&keystroke);
-        if self.scroll_offset != 0 {
-            self.scroll_offset = 0;
+        self.send_keystroke(keystroke, cx);
+        if handled {
+            cx.stop_propagation();
         }
+    }
+
+    fn send_keystroke(&mut self, keystroke: TermKeystroke, cx: &mut Context<Self>) {
+        self.scroll_offset = 0;
+        self.latched = Latched::default();
         self.model
             .read(cx)
             .send(TermClientFrame::Keystroke(keystroke));
         cx.notify();
-        if handled {
-            cx.stop_propagation();
-        }
+    }
+
+    /// Presses a named key (`escape`, `tab`, `up`, …) with whatever is
+    /// latched, for a touch key row.
+    pub fn press(&mut self, key: &str, cx: &mut Context<Self>) {
+        let keystroke = TermKeystroke {
+            key: key.to_owned(),
+            ctrl: self.latched.ctrl,
+            alt: self.latched.alt,
+            ..TermKeystroke::default()
+        };
+        self.send_keystroke(keystroke, cx);
+    }
+
+    pub fn latched(&self) -> Latched {
+        self.latched
+    }
+
+    pub fn set_latched(&mut self, latched: Latched, cx: &mut Context<Self>) {
+        self.latched = latched;
+        cx.notify();
     }
 
     fn paste(&mut self, _: &crate::TerminalPaste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -367,7 +402,19 @@ impl Render for TerminalView {
                     });
                 }
             },
-            |_, _, _, _| {},
+            // Committed text from an input method, which is how an
+            // on-screen keyboard types; a handler also keeps it open.
+            {
+                let view = cx.entity();
+                let focus_handle = self.focus_handle.clone();
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        gpui::ElementInputHandler::new(bounds, view),
+                        cx,
+                    );
+                }
+            },
         )
         .size_full();
 
@@ -481,6 +528,85 @@ impl Render for TerminalView {
                     .text_color(foreground.opacity(0.8))
                     .child(status)
             }))
+    }
+}
+
+impl gpui::EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        Some(gpui::UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.raw || text.is_empty() {
+            return;
+        }
+        match committed_frame(text, self.latched) {
+            TermClientFrame::Keystroke(keystroke) => self.send_keystroke(keystroke, cx),
+            frame => {
+                self.scroll_offset = 0;
+                self.model.read(cx).send(frame);
+                cx.notify();
+            }
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        _: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -752,9 +878,59 @@ fn probably_produces_bytes(ks: &TermKeystroke) -> bool {
         || ((ks.ctrl || ks.alt) && ks.key.is_ascii() && ks.key.len() == 1)
 }
 
+/// What text an input method commits sends: one character under a latched
+/// modifier is that key chorded, anything else is typed as is, with the
+/// keyboard's newline as the terminal's return.
+fn committed_frame(text: &str, latched: Latched) -> TermClientFrame {
+    let mut chars = text.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next())
+        && latched != Latched::default()
+    {
+        return TermClientFrame::Keystroke(TermKeystroke {
+            key: ch.to_lowercase().to_string(),
+            ctrl: latched.ctrl,
+            alt: latched.alt,
+            shift: ch.is_uppercase(),
+            key_char: Some(ch.to_string()),
+        });
+    }
+    TermClientFrame::Input(text.replace('\n', "\r").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_text_chords_one_latched_key_and_types_the_rest() {
+        let ctrl = Latched {
+            ctrl: true,
+            alt: false,
+        };
+        assert_eq!(
+            committed_frame("C", ctrl),
+            TermClientFrame::Keystroke(TermKeystroke {
+                key: "c".into(),
+                ctrl: true,
+                alt: false,
+                shift: true,
+                key_char: Some("C".into()),
+            })
+        );
+        // A word under a latch is typed, not chorded letter by letter.
+        assert_eq!(
+            committed_frame("ls", ctrl),
+            TermClientFrame::Input(b"ls".to_vec())
+        );
+        assert_eq!(
+            committed_frame("ls -la\n", Latched::default()),
+            TermClientFrame::Input(b"ls -la\r".to_vec())
+        );
+        assert_eq!(
+            committed_frame("c", Latched::default()),
+            TermClientFrame::Input(b"c".to_vec())
+        );
+    }
 
     fn rgba(red: f32, green: f32, blue: f32) -> gpui::Rgba {
         gpui::Rgba {
