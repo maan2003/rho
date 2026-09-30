@@ -122,13 +122,27 @@ impl StyleClass {
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
         };
+        let code = matches!(
+            self,
+            Self::ToolShell | Self::ToolDetail | Self::ShellPrompt | Self::ShellCommand
+        );
         HighlightStyle {
             color: Some(color),
             font_weight: bold.then_some(FontWeight::BOLD),
+            font_family: code.then_some(CODE_FONT_FAMILY),
             ..HighlightStyle::default()
         }
     }
 }
+
+/// The face code keeps when the prose around it is set in another: the
+/// bundled buffer font, which every character of a command or a source
+/// line has to line up in.
+pub const CODE_FONT_FAMILY: &str = "Rho Font";
+
+/// The face prose is read in on a phone: the bundled proportional sibling
+/// of the buffer font, which fits more of a sentence on a narrow line.
+pub const PROSE_FONT_FAMILY: &str = "Rho Prose";
 
 pub fn hint_color(cx: &App) -> Hsla {
     cx.theme()

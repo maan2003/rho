@@ -150,6 +150,12 @@ pub(crate) enum Command {
     AgentCacheKey,
     AgentRestartWorkset,
     // The phone.
+    /// The selection a long press made, to the clipboard.
+    CopySelection,
+    /// The whole surface selected, the ordinary next thing after a word.
+    SelectAll,
+    /// Everything `⋯` offers, from the selection sheet.
+    PhoneMore,
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
     /// A named hour of the day: `tonight` is this evening while it is still
@@ -387,6 +393,15 @@ pub(crate) fn slack_react_menu(choices: &rho_slack::ui::ReactionChoices) -> Menu
         "by name…",
         MenuAction::Command(Command::SlackReactByName),
     )
+}
+
+/// What a long press on prose asks once the finger lifts: the selection
+/// it made is the subject, and the message under it comes after.
+pub(crate) fn selection_menu() -> Menu {
+    Menu::new("selection")
+        .item("y", "copy", MenuAction::Command(Command::CopySelection))
+        .item("a", "select all", MenuAction::Command(Command::SelectAll))
+        .item("m", "more…", MenuAction::Command(Command::PhoneMore))
 }
 
 pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageActions) -> Menu {

@@ -1257,6 +1257,52 @@ impl Editor {
         }
     }
 
+    /// A long press on a touch screen: the word under the finger becomes
+    /// the selection, pending, so the finger can drag it wider before it
+    /// lifts. Returns whether the position was over the text at all.
+    pub fn begin_touch_selection(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(point) = self.touch_display_point(position) else {
+            return false;
+        };
+        self.begin_selection(point, false, 2, window, cx);
+        true
+    }
+
+    /// The finger moving after a long press: the pending word selection
+    /// grows or shrinks to the word under it, as a mouse drag would.
+    pub fn extend_touch_selection(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(point) = self.touch_display_point(position) else {
+            return;
+        };
+        if self.has_pending_selection() {
+            self.update_selection(point, 0, gpui::Point::default(), window, cx);
+        }
+    }
+
+    /// The finger lifting after a long press: the pending selection is
+    /// settled.
+    pub fn end_touch_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_selection(window, cx);
+    }
+
+    fn touch_display_point(&self, position: gpui::Point<Pixels>) -> Option<DisplayPoint> {
+        let position_map = self.last_position_map.as_ref()?;
+        if !position_map.text_hitbox.bounds.contains(&position) {
+            return None;
+        }
+        Some(position_map.point_for_position(position).nearest_valid)
+    }
+
     pub(super) fn extend_selection(
         &mut self,
         position: DisplayPoint,

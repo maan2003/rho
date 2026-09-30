@@ -44,17 +44,20 @@ pub(crate) enum Phase {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Button {
-    Primary,
-    Secondary,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GestureAction {
+    /// A tap: down and up within the tap duration and slop.
     Click {
         position: Position,
-        button: Button,
+    },
+    /// A finger held still past the long-press duration. `Started` fires at
+    /// the deadline while the finger is still down; the finger then owns
+    /// what it pressed until it lifts, so `Moved` follows it (a drag that
+    /// began with a hold, which is how touch selects text) and `Ended` is
+    /// the release.
+    LongPress {
+        position: Position,
+        phase: Phase,
     },
     Scroll {
         position: Position,
@@ -239,6 +242,12 @@ impl TouchGestureRecognizer {
                 phase: Phase::Moved,
             }];
         }
+        if self.state == GestureState::LongPressed {
+            return vec![GestureAction::LongPress {
+                position,
+                phase: Phase::Moved,
+            }];
+        }
         Vec::new()
     }
 
@@ -251,16 +260,27 @@ impl TouchGestureRecognizer {
             GestureState::PossibleTap if Some(id) == self.primary => {
                 let elapsed = at.saturating_sub(contact.down_at);
                 if elapsed >= self.tuning.long_press_duration {
-                    actions.push(GestureAction::Click {
+                    // The deadline timer has not run yet: the hold begins
+                    // and ends in one go.
+                    actions.push(GestureAction::LongPress {
                         position: contact.position,
-                        button: Button::Secondary,
+                        phase: Phase::Started,
+                    });
+                    actions.push(GestureAction::LongPress {
+                        position: contact.position,
+                        phase: Phase::Ended,
                     });
                 } else if elapsed <= self.tuning.tap_duration {
                     actions.push(GestureAction::Click {
                         position: contact.position,
-                        button: Button::Primary,
                     });
                 }
+            }
+            GestureState::LongPressed if Some(id) == self.primary => {
+                actions.push(GestureAction::LongPress {
+                    position: contact.position,
+                    phase: Phase::Ended,
+                });
             }
             GestureState::Panning if Some(id) == self.primary => {
                 self.record_sample(contact.position, at);
@@ -341,9 +361,9 @@ impl TouchGestureRecognizer {
             && at.saturating_sub(contact.down_at) >= self.tuning.long_press_duration
         {
             self.state = GestureState::LongPressed;
-            return vec![GestureAction::Click {
+            return vec![GestureAction::LongPress {
                 position: contact.position,
-                button: Button::Secondary,
+                phase: Phase::Started,
             }];
         }
         Vec::new()
@@ -365,6 +385,13 @@ impl TouchGestureRecognizer {
                 delta: 0.0,
                 phase: Phase::Cancelled,
             }),
+            GestureState::LongPressed => self
+                .primary
+                .and_then(|id| self.contacts.get(&id))
+                .map(|c| GestureAction::LongPress {
+                    position: c.position,
+                    phase: Phase::Cancelled,
+                }),
             _ => self.momentum.map(|m| GestureAction::Scroll {
                 position: m.position,
                 delta: Position::default(),
@@ -453,10 +480,7 @@ mod tests {
         assert!(gesture.motion(1, pos(8.0, 0.0), at(50)).is_empty());
         assert!(matches!(
             gesture.up(1, at(100)).as_slice(),
-            [GestureAction::Click {
-                button: Button::Primary,
-                ..
-            }]
+            [GestureAction::Click { .. }]
         ));
 
         gesture.down(2, pos(0.0, 0.0), at(200));
@@ -470,18 +494,62 @@ mod tests {
     }
 
     #[test]
-    fn long_press_wins_over_tap_at_deadline() {
+    fn long_press_starts_at_the_deadline_follows_the_finger_and_ends_on_release() {
         let mut gesture = TouchGestureRecognizer::default();
         gesture.down(1, pos(4.0, 5.0), at(0));
         assert!(gesture.advance(at(499)).is_empty());
-        assert!(matches!(
-            gesture.advance(at(500)).as_slice(),
-            [GestureAction::Click {
-                button: Button::Secondary,
-                ..
+        assert_eq!(
+            gesture.advance(at(500)),
+            vec![GestureAction::LongPress {
+                position: pos(4.0, 5.0),
+                phase: Phase::Started,
             }]
+        );
+        // Moving after the hold is not a scroll: the finger drags what it
+        // pressed, however far it goes.
+        assert_eq!(
+            gesture.motion(1, pos(40.0, 5.0), at(600)),
+            vec![GestureAction::LongPress {
+                position: pos(40.0, 5.0),
+                phase: Phase::Moved,
+            }]
+        );
+        assert_eq!(
+            gesture.up(1, at(700)),
+            vec![GestureAction::LongPress {
+                position: pos(40.0, 5.0),
+                phase: Phase::Ended,
+            }]
+        );
+        assert!(gesture.is_idle());
+    }
+
+    #[test]
+    fn a_release_past_the_deadline_before_the_timer_is_a_whole_long_press() {
+        let mut gesture = TouchGestureRecognizer::default();
+        gesture.down(1, pos(4.0, 5.0), at(0));
+        assert_eq!(
+            gesture.up(1, at(510)),
+            vec![
+                GestureAction::LongPress {
+                    position: pos(4.0, 5.0),
+                    phase: Phase::Started,
+                },
+                GestureAction::LongPress {
+                    position: pos(4.0, 5.0),
+                    phase: Phase::Ended,
+                },
+            ]
+        );
+        // A release inside the tap window is still a tap, and a release
+        // between the two is neither.
+        gesture.down(2, pos(0.0, 0.0), at(1000));
+        assert!(matches!(
+            gesture.up(2, at(1100)).as_slice(),
+            [GestureAction::Click { .. }]
         ));
-        assert!(gesture.up(1, at(510)).is_empty());
+        gesture.down(3, pos(0.0, 0.0), at(2000));
+        assert!(gesture.up(3, at(2400)).is_empty());
     }
 
     #[test]

@@ -6872,3 +6872,288 @@ fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+/// A long press on prose selects the word under the finger, the finger
+/// extends the selection while it stays down, and lifting asks what to do
+/// with it: `copy` puts the words on the clipboard.
+#[gpui::test]
+fn a_long_press_on_a_phone_note_selects_and_the_sheet_copies(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(vec![body(&note, "alpha bravo charlie delta")], cx);
+            workspace.open_node(&note, window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let text = display_text(&workspace, cx);
+    let row = text
+        .lines()
+        .position(|line| line.contains("alpha bravo charlie delta"))
+        .unwrap_or_else(|| panic!("the note shows its body: {text:?}")) as u32;
+    let line = text.lines().nth(row as usize).unwrap();
+    let column_of = |word: &str| (line.find(word).unwrap() + 1) as u32;
+    let position_of = |cx: &mut TestAppContext, column: u32| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                let editor = workspace.active_editor(cx);
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    editor
+                        .window_position_for_display_point(
+                            DisplayPoint::new(DisplayRow(row), column),
+                            &snapshot,
+                            window,
+                            cx,
+                        )
+                        .expect("the word is on screen")
+                })
+            })
+            .unwrap()
+    };
+    let bravo = position_of(cx, column_of("bravo"));
+    let charlie = position_of(cx, column_of("charlie"));
+    let touch = |phase, position, millis| TouchEvent {
+        id: TouchId(1),
+        phase,
+        position,
+        timestamp: std::time::Duration::from_millis(millis),
+        ..Default::default()
+    };
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Started, bravo, 0).to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let selected = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let editor = workspace.active_editor(cx);
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let range = editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&editor.display_snapshot(cx))
+                        .range();
+                    snapshot.text_for_range(range).collect::<String>()
+                })
+            })
+            .unwrap()
+    };
+    assert_eq!(selected(cx), "bravo", "the press selects the word under it");
+    assert!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .menu_title_for_test()
+                .is_none())
+            .unwrap(),
+        "no sheet while the finger is down"
+    );
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            touch(TouchPhase::Moved, charlie, 900).to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        selected(cx),
+        "bravo charlie",
+        "the finger extends by whole words"
+    );
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            touch(TouchPhase::Ended, charlie, 1000).to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.menu_title_for_test().as_deref(),
+                Some("selection"),
+                "lifting the finger asks what to do with the selection"
+            );
+            assert_eq!(workspace.current_surface_name_for_test(), "note");
+            workspace.run_menu_at(0, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("copy put the selection on the clipboard");
+    assert_eq!(copied, "bravo charlie");
+}
+
+/// The keyboard shortens the window under the composer: the line being
+/// typed is scrolled back into view instead of staying under the keys.
+#[gpui::test]
+fn a_shorter_phone_window_keeps_the_composer_cursor_in_view(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.enter_draft(None, window, cx);
+            let editor = workspace.active_editor(cx);
+            editor.update(cx, |editor, cx| {
+                window.focus(&editor.focus_handle(cx), cx);
+                editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+                let lines = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>();
+                editor.insert(&lines.join("\n"), window, cx);
+                // Halfway up: the end of the buffer would stay in view by
+                // the scroll clamping alone.
+                let snapshot = editor.display_snapshot(cx);
+                let middle = editor.selections.newest_display(&snapshot).head().row().0 - 20;
+                let middle = DisplayPoint::new(DisplayRow(middle), 0);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_display_ranges([middle..middle]);
+                });
+            });
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let cursor_in_view = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    workspace.phone_composer_focused_for_test(window, cx),
+                    "typing into the draft is composing"
+                );
+                let editor = workspace.active_editor(cx);
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    let cursor = editor.selections.newest_display(&snapshot).head().row().0 as f64;
+                    let top = snapshot.scroll_position().y as f64;
+                    let visible = editor.visible_line_count().unwrap_or(0.);
+                    (cursor, top, visible)
+                })
+            })
+            .unwrap()
+    };
+    let (cursor, top, visible) = cursor_in_view(cx);
+    assert!(
+        cursor >= top && cursor < top + visible,
+        "before: cursor {cursor} in {top}..{visible}"
+    );
+    cx.simulate_window_resize(*workspace, size(px(400.), px(300.)));
+    next_frame(cx, workspace);
+    next_frame(cx, workspace);
+    let (cursor, top, visible) = cursor_in_view(cx);
+    assert!(
+        cursor >= top && cursor < top + visible,
+        "after the keyboard: cursor row {cursor} within {top}..{}",
+        top + visible
+    );
+}
+
+/// Prose is read in the proportional face on the phone and in the buffer
+/// face on the desk; a surface opened before the phone mode began follows
+/// the change.
+#[gpui::test]
+fn phone_prose_is_set_in_the_prose_face(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(vec![body(&note, "A note to read")], cx);
+            workspace.open_node(&note, window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let family = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let editor = workspace.active_editor(cx);
+                editor.update(cx, |editor, cx| {
+                    editor.style(cx).text.font_family.to_string()
+                })
+            })
+            .unwrap()
+    };
+    assert_eq!(family(cx), "Rho Font", "the desk reads in the buffer face");
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    next_frame(cx, workspace);
+    assert_eq!(
+        family(cx),
+        "Rho Prose",
+        "the phone reads prose in the prose face"
+    );
+    cx.simulate_window_resize(*workspace, size(px(1200.), px(800.)));
+    next_frame(cx, workspace);
+    next_frame(cx, workspace);
+    assert_eq!(family(cx), "Rho Font", "back on the desk, the buffer face");
+}
+
+/// A sheet is open over the deal: a finger moving on it scrolls the
+/// sheet, and the card under it stays where it is.
+#[gpui::test]
+fn a_swipe_on_an_open_phone_sheet_does_not_flick_the_card(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for title in ["First phone card", "Second phone card"] {
+                let note = workspace.create_note(None, cx);
+                workspace.write_marks(vec![body(&note, title), said(&note, todo_now())], cx);
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    let first = workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            let card = workspace.current_deal_card_for_test(cx).unwrap().0;
+            workspace.open_menu(crate::transient::verdict_menu(), window, cx);
+            card
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 600., 0),
+            (TouchPhase::Moved, 300., 80),
+            (TouchPhase::Ended, 300., 100),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(1),
+                    phase,
+                    position: point(px(200.), px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                Some("verdict"),
+                "the sheet stays open"
+            );
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                first,
+                "the card under the sheet was not flicked away"
+            );
+        })
+        .unwrap();
+}

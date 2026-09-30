@@ -5671,16 +5671,12 @@ impl Window {
         actions: Vec<crate::touch_gestures::GestureAction>,
         cx: &mut App,
     ) {
-        use crate::touch_gestures::{Button, GestureAction, Phase};
+        use crate::touch_gestures::{GestureAction, Phase};
 
         for action in actions {
             match action {
-                GestureAction::Click { position, button } => {
+                GestureAction::Click { position } => {
                     let position = point(px(position.x), px(position.y));
-                    let button = match button {
-                        Button::Primary => MouseButton::Left,
-                        Button::Secondary => MouseButton::Right,
-                    };
                     self.platform_window
                         .begin_touch_serial(self.touch_gesture_serial);
                     self.dispatch_touch_default_mouse_event(
@@ -5694,7 +5690,7 @@ impl Window {
                     );
                     self.dispatch_touch_default_mouse_event(
                         &crate::MouseDownEvent {
-                            button,
+                            button: MouseButton::Left,
                             position,
                             modifiers: self.modifiers,
                             click_count: 1,
@@ -5705,7 +5701,7 @@ impl Window {
                     );
                     self.dispatch_touch_default_mouse_event(
                         &MouseUpEvent {
-                            button,
+                            button: MouseButton::Left,
                             position,
                             modifiers: self.modifiers,
                             click_count: 1,
@@ -5713,6 +5709,64 @@ impl Window {
                         position,
                         cx,
                     );
+                    self.platform_window.end_touch_serial();
+                }
+                // A long press is touch's secondary button: it goes down
+                // when the hold is recognized, drags while the finger moves,
+                // and comes up when the finger lifts, so a listener sees the
+                // same down, moves with the button held, and up a right
+                // mouse button would send.
+                GestureAction::LongPress { position, phase } => {
+                    let position = point(px(position.x), px(position.y));
+                    self.platform_window
+                        .begin_touch_serial(self.touch_gesture_serial);
+                    match phase {
+                        Phase::Started => {
+                            self.dispatch_touch_default_mouse_event(
+                                &MouseMoveEvent {
+                                    position,
+                                    pressed_button: None,
+                                    modifiers: self.modifiers,
+                                },
+                                position,
+                                cx,
+                            );
+                            self.dispatch_touch_default_mouse_event(
+                                &crate::MouseDownEvent {
+                                    button: MouseButton::Right,
+                                    position,
+                                    modifiers: self.modifiers,
+                                    click_count: 1,
+                                    first_mouse: false,
+                                },
+                                position,
+                                cx,
+                            );
+                        }
+                        Phase::Moved => {
+                            self.dispatch_touch_default_mouse_event(
+                                &MouseMoveEvent {
+                                    position,
+                                    pressed_button: Some(MouseButton::Right),
+                                    modifiers: self.modifiers,
+                                },
+                                position,
+                                cx,
+                            );
+                        }
+                        Phase::Ended | Phase::Cancelled => {
+                            self.dispatch_touch_default_mouse_event(
+                                &MouseUpEvent {
+                                    button: MouseButton::Right,
+                                    position,
+                                    modifiers: self.modifiers,
+                                    click_count: 1,
+                                },
+                                position,
+                                cx,
+                            );
+                        }
+                    }
                     self.platform_window.end_touch_serial();
                 }
                 GestureAction::Scroll {
