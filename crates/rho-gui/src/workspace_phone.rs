@@ -352,12 +352,29 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn phone_feed_is_active_for_test(&self) -> bool {
+        self.phone_feed_is_active()
+    }
+
+    /// Whether what is on screen is the feed card itself. A verdict closes
+    /// it, so the surface that shows through afterwards is not the feed
+    /// and the next pull does not pass it over.
+    pub(super) fn phone_feed_is_active(&self) -> bool {
         self.phone
             .feed_surface
             .as_ref()
             .is_some_and(|(context, key)| {
                 *context == self.active_context && self.active_surface().key == *key
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_flick_for_test(
+        &mut self,
+        direction: rho_journal::PhoneFlickDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_phone_flick(direction, window, cx);
     }
 
     #[cfg(test)]
@@ -409,7 +426,7 @@ impl Workspace {
         window.focus(&self.phone.feed_focus, cx);
     }
 
-    pub(super) fn phone_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn phone_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
             return;
@@ -463,6 +480,7 @@ impl Workspace {
             super::SurfaceView::Note(editor) | super::SurfaceView::Transcript { editor, .. } => {
                 Some(editor.clone())
             }
+            super::SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
             _ => None,
         };
         let Some(editor) = editor else {

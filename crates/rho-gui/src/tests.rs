@@ -51,13 +51,13 @@ use crate::attention::Write;
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
 /// What the tests say about a node.
-enum Said {
+pub(super) enum Said {
     Snooze { until: Until },
     Todo,
 }
 
 /// The write that says `said` about `node`.
-fn said(node: &rho_dealer::NodeId, said: Said) -> Write {
+pub(super) fn said(node: &rho_dealer::NodeId, said: Said) -> Write {
     let node = node.clone();
     match said {
         Said::Snooze { until } => Fact::Snooze { node, until },
@@ -71,12 +71,12 @@ fn said(node: &rho_dealer::NodeId, said: Said) -> Write {
 }
 
 /// A todo on the plate from now.
-fn todo_now() -> Said {
+pub(super) fn todo_now() -> Said {
     Said::Todo
 }
 
 /// A note's text, written.
-fn body(note: &rho_dealer::NodeId, text: &str) -> Write {
+pub(super) fn body(note: &rho_dealer::NodeId, text: &str) -> Write {
     let rho_dealer::NodeId::Note(note) = note else {
         panic!("not a note")
     };

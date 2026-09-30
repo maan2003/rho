@@ -774,7 +774,12 @@ impl Workspace {
         let land = session
             .read(cx)
             .oldest_from_other_after(&unit_of, cursor.as_ref());
-        self.open_slack_source(unit_source(unit), window, cx);
+        self.open_slack_source_with(
+            unit_source(unit),
+            rho_journal::SurfaceShowMethod::Deal,
+            window,
+            cx,
+        );
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
@@ -791,6 +796,23 @@ impl Workspace {
     pub(crate) fn open_slack_source(
         &mut self,
         source: Source,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_slack_source_with(
+            source,
+            rho_journal::SurfaceShowMethod::Command,
+            window,
+            cx,
+        );
+    }
+
+    /// `open_slack_source` with how the surface is shown: a dealt card
+    /// lands in the phone feed, an opened one on the stack above it.
+    fn open_slack_source_with(
+        &mut self,
+        source: Source,
+        method: rho_journal::SurfaceShowMethod,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -857,7 +879,7 @@ impl Workspace {
                 Self::wrap_surface(key, SurfaceView::SlackConversation(view))
             }
         };
-        self.show_slack_surface(surface, cx);
+        self.display_surface_with_method(surface, method, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
