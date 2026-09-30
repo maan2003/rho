@@ -7,7 +7,12 @@ struct Args {
     agent_host: rho_agent_host::HostArgs,
 }
 
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
+    // Return freed memory to the system while the host is idle.
+    tikv_jemalloc_ctl::background_thread::write(true).expect("start jemalloc background thread");
     let args = Args::parse();
     init_tracing();
     rho_agent_host::configure_embedded_environment();

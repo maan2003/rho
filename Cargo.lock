@@ -12538,6 +12538,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tikv-jemalloc-ctl",
  "tokio",
  "tree-sitter",
  "tree-sitter-python",
@@ -12599,6 +12600,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -13166,6 +13169,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -15844,6 +15848,17 @@ dependencies = [
  "quick-error 2.0.1",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

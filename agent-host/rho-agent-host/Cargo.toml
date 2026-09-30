@@ -7,6 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# unprefixed_malloc routes CPython and other C allocations through jemalloc
+# too; glibc keeps freed memory in per-thread arenas instead of returning it.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = "0.6"
 rho-rtc.workspace = true
 rho-desktop-client.workspace = true
 rho-agent-hosts.workspace = true

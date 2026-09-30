@@ -40,6 +40,10 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         config_home,
     )?;
     unsafe { startup.layout.enter()? };
+    // Returns freed memory to the system while the workset is idle. Started
+    // only now: unsharing the user namespace needs a single thread.
+    tikv_jemalloc_ctl::background_thread::write(true)
+        .map_err(|error| anyhow::anyhow!("start jemalloc background thread: {error}"))?;
     // This process owns provider transports, but does not start the agent host's
     // RPC listener (which installs its own TLS provider).
     rustls::crypto::aws_lc_rs::default_provider()
