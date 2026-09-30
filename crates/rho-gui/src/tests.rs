@@ -6314,6 +6314,200 @@ fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut 
     assert!(home_text(&workspace, cx).contains("Review the patch"));
 }
 
+/// Home on the phone is rows under a thumb: a tap on one opens its card,
+/// and a long press opens the menu for that row rather than the editor's
+/// desktop context menu, which would otherwise take the press and show
+/// nothing.
+#[gpui::test]
+fn a_tap_on_a_phone_home_row_opens_it_and_a_long_press_opens_its_menu(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for title in ["First home row", "Second home row"] {
+                let note = workspace.create_note(None, cx);
+                workspace.write_marks(vec![body(&note, title), said(&note, todo_now())], cx);
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| workspace.open_home(window, cx))
+        .unwrap();
+    next_frame(cx, workspace);
+    let text = buffer_text(&workspace, cx);
+    let row = text
+        .lines()
+        .position(|line| line.contains("Second home row"))
+        .unwrap_or_else(|| panic!("home lists both cards: {text:?}")) as u32;
+    // A phone-width row is two lines: the title, then its label under it.
+    let under = text.lines().nth(row as usize + 1).unwrap_or_default();
+    assert!(
+        under.starts_with("    ") && !under.trim().is_empty(),
+        "the label sits under the title on the phone: {text:?}"
+    );
+    let (target, position) = workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            let view = workspace.home_view().expect("home is open");
+            let target = view.read(cx).target_at_row_for_test(row, cx);
+            let editor = view.read(cx).editor().clone();
+            let position = editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                editor
+                    .window_position_for_display_point(
+                        DisplayPoint::new(DisplayRow(row), 6),
+                        &snapshot,
+                        window,
+                        cx,
+                    )
+                    .expect("the row is on screen")
+            });
+            (target, position)
+        })
+        .unwrap();
+    let crate::home::HomeTarget::Card(card) = target.clone() else {
+        panic!("the row stands for a card: {target:?}");
+    };
+    let touch = |phase, millis| TouchEvent {
+        id: TouchId(1),
+        phase,
+        position,
+        timestamp: std::time::Duration::from_millis(millis),
+        ..Default::default()
+    };
+
+    // Holding on the row: its menu, with the cursor moved onto it first.
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Started, 0).to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Ended, 700).to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(
+                workspace.menu_title_for_test().is_some(),
+                "a long press on a row opens a menu"
+            );
+            let view = workspace.home_view().unwrap();
+            assert_eq!(
+                view.update(cx, |view, cx| view.cursor_target(cx)),
+                target,
+                "the menu is the pressed row's"
+            );
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "home",
+                "a long press does not open the row"
+            );
+            workspace.close_menu(window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+
+    // A tap opens the card the row stands for.
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Started, 2000).to_platform_input(), cx);
+        window.dispatch_event(touch(TouchPhase::Ended, 2080).to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(card),
+                "the tapped row's card is what opened"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_tap_on_a_phone_draft_field_asks_for_its_value(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.enter_draft(None, window, cx)
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let text = display_text(&workspace, cx);
+    let row = text
+        .lines()
+        .position(|line| line.contains("Workdir:"))
+        .unwrap_or_else(|| panic!("the draft shows its workdir field: {text:?}"))
+        as u32;
+    let position = workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.active_editor(cx);
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                editor
+                    .window_position_for_display_point(
+                        DisplayPoint::new(DisplayRow(row), 12),
+                        &snapshot,
+                        window,
+                        cx,
+                    )
+                    .expect("the field is on screen")
+            })
+        })
+        .unwrap();
+    let touch = |phase, millis| TouchEvent {
+        id: TouchId(1),
+        phase,
+        position,
+        timestamp: std::time::Duration::from_millis(millis),
+        ..Default::default()
+    };
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(TouchPhase::Started, 0).to_platform_input(), cx);
+        window.dispatch_event(touch(TouchPhase::Ended, 80).to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(400));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let minibuffer = workspace
+                .minibuffer
+                .as_mut()
+                .expect("a tap on the workdir field asks for a workdir");
+            assert_eq!(minibuffer.prompt(), "workdir:");
+            minibuffer.set_input("/srv/work".to_owned(), window, cx);
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                workspace.minibuffer.is_none(),
+                "the answer closes the prompt"
+            );
+            assert_eq!(
+                workspace.draft_model.read(cx).workdir_text(cx),
+                "/srv/work",
+                "the answer lands in the field"
+            );
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn a_phone_flick_moves_from_one_dated_card_to_the_next(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

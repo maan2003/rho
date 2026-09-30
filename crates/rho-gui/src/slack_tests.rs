@@ -3146,7 +3146,10 @@ async fn a_dealt_slack_card_is_the_phone_feed(cx: &mut TestAppContext) {
                 "back from the feed stays on the feed"
             );
             let note = workspace.create_note(None, cx);
-            workspace.write_marks(vec![body(&note, "After the DM"), said(&note, todo_now())], cx);
+            workspace.write_marks(
+                vec![body(&note, "After the DM"), said(&note, todo_now())],
+                cx,
+            );
             note
         })
         .unwrap();
@@ -3210,6 +3213,20 @@ async fn a_dealt_slack_card_is_the_phone_feed(cx: &mut TestAppContext) {
             );
             assert!(workspace.phone_feed_for_test(cx));
             assert!(workspace.phone_feed_is_active_for_test());
+
+            // Undo brings the conversation back as the feed, on the message
+            // it was dealt for: the verdict bar, not the composer's.
+            workspace.undo_verdict(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(node.clone()),
+                "undo deals the conversation again"
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+            assert!(
+                !workspace.phone_composer_focused_for_test(window, cx),
+                "the restored card sits on its message, not in the composer"
+            );
         })
         .unwrap();
 }

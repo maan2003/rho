@@ -264,7 +264,7 @@ pub struct Workspace {
     /// and whose rows it wants. The journal cursor is the model's.
     pub(crate) agents_client: rho_agents_client::model::AgentsClient,
     desktop_streams: rho_desktop_client::stream::DesktopStreams,
-    draft_model: Entity<DraftModel>,
+    pub(crate) draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
     /// the surface.
@@ -3921,8 +3921,14 @@ impl Workspace {
 
     /// Replacing a message cancels its predecessor's dismiss timer.
     fn show_echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
+        // A toast is read after the thumb has left the bar, and its undo is
+        // reached for; the echo line is read where the eye already is.
+        let duration = match self.phone.enabled {
+            true => phone::PHONE_TOAST_DURATION,
+            false => ECHO_DURATION,
+        };
         let dismiss = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(ECHO_DURATION).await;
+            cx.background_executor().timer(duration).await;
             let _ = this.update(cx, |this, cx| {
                 this.echo = None;
                 cx.notify();
@@ -5195,7 +5201,12 @@ impl Workspace {
                 SurfaceView::Draft { editor }
             }
             SurfaceKey::Home => {
-                SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
+                let narrow = self.phone.enabled;
+                SurfaceView::Home(cx.new(|cx| {
+                    let mut view = crate::home::HomeView::new(window, cx);
+                    view.set_narrow(narrow, cx);
+                    view
+                }))
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
@@ -5765,8 +5776,14 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let menu = Self::menu_for_id(id);
+        self.show_menu(menu, count, Back::Over, false);
+        cx.notify();
+    }
+
+    fn menu_for_id(id: crate::transient::MenuId) -> crate::transient::Menu {
         use crate::transient::MenuId;
-        let menu = match id {
+        match id {
             MenuId::Slack => crate::transient::slack_menu(),
             MenuId::Hosts => crate::transient::hosts_menu(),
             MenuId::Projects => crate::transient::projects_menu(),
@@ -5776,9 +5793,78 @@ impl Workspace {
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
+        }
+    }
+
+    /// `command…`: every item of every menu, by name, for a reader who
+    /// remembers what a thing is called and not where it lives. The
+    /// verdicts are included while there is a card to take one on.
+    pub(crate) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::transient::MenuAction;
+        let subject = self.subject(window, cx);
+        let mut commands: Vec<(String, MenuAction)> = Vec::new();
+        let mut walk = |menu: crate::transient::Menu, prefix: &str| {
+            let mut pending = vec![(menu, prefix.to_owned())];
+            let mut seen = Vec::new();
+            while let Some((menu, prefix)) = pending.pop() {
+                for item in menu.items() {
+                    let name = match prefix.is_empty() {
+                        true => item.description().to_owned(),
+                        false => format!("{prefix} › {}", item.description()),
+                    };
+                    match item.action() {
+                        MenuAction::Open(id) if !seen.contains(id) => {
+                            seen.push(*id);
+                            pending.push((
+                                Self::menu_for_id(*id),
+                                name.trim_end_matches('…').to_owned(),
+                            ));
+                        }
+                        MenuAction::Open(_) => {}
+                        action => commands.push((name, action.clone())),
+                    }
+                }
+            }
         };
-        self.show_menu(menu, count, Back::Over, false);
-        cx.notify();
+        if self.label_target(cx).is_some() {
+            walk(crate::transient::verdict_menu(), "verdict");
+        }
+        walk(crate::transient::root_menu(&subject), "");
+        // A palette lists each command once, whichever menus it is in.
+        let mut names = std::collections::HashSet::new();
+        commands.retain(|(_, action)| names.insert(format!("{action:?}")));
+        let commands = std::rc::Rc::new(commands);
+        let held = commands.clone();
+        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
+            let query = input.trim();
+            let mut rows = held
+                .iter()
+                .filter_map(|(name, _)| {
+                    crate::find::score(name, query).map(|score| (score, name.clone()))
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            rows.into_iter()
+                .map(|(_, name)| crate::minibuffer::Candidate {
+                    value: name,
+                    description: String::new(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                let Some((_, action)) = commands.iter().find(|(name, _)| name == input) else {
+                    return;
+                };
+                workspace.run_menu_action(action.clone(), None, true, window, cx);
+            },
+        );
+        self.open_prompt("command:", complete, on_submit, window, cx);
+        self.set_prompt_complete_whole_input();
     }
 
     /// The only place that knows what a verdict item means.
@@ -5820,6 +5906,8 @@ impl Workspace {
             Command::Voice => self.cmd_voice(window, cx),
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
+            Command::Agents => self.open_agents_list(window, cx),
+            Command::Palette => self.open_command_palette(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
             Command::AgentActivity => self.open_agent_view(TranscriptView::Activity, window, cx),
             Command::AgentConversation => {
@@ -6208,7 +6296,7 @@ impl Workspace {
             self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Deal, cx);
         }
         if self.phone.enabled {
-            window.focus(&self.phone.feed_focus, cx);
+            self.focus_phone_feed(window, cx);
         } else {
             self.focus_active_surface(window, cx);
         }
@@ -7463,6 +7551,37 @@ impl Workspace {
         .into_any_element()
     }
 
+    /// What the surface in view is called, as the status line and the
+    /// phone's title bar name it: an agent by its filing and name, a
+    /// conversation by its label, anything else by its surface name.
+    pub(crate) fn surface_title(&self, cx: &App) -> String {
+        match &self.active_surface().key {
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
+                let leaf = self.registry.agent_display_label(*agent_id);
+                let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
+                    context if context.is_empty() => leaf,
+                    context => format!("{context} / {leaf}"),
+                };
+                // The conversation is what a transcript is; only the
+                // activity view needs saying.
+                if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+                    format!("{path} · activity")
+                } else {
+                    path
+                }
+            }
+            SurfaceKey::Browser(page) => {
+                rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
+            }
+            SurfaceKey::SlackConversation(source) => self
+                .slack
+                .session()
+                .map(|session| session.read(cx).label(source))
+                .unwrap_or_else(|| self.surface_name(&self.active_surface().key)),
+            key => self.surface_name(key),
+        }
+    }
+
     fn render_status_line(
         &mut self,
         text_style: &gpui::TextStyle,
@@ -7490,33 +7609,7 @@ impl Workspace {
         {
             return self.render_deal_why(&card, text_style, window, cx);
         }
-        let path = {
-            match &self.active_surface().key {
-                SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
-                    let leaf = self.registry.agent_display_label(*agent_id);
-                    let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
-                        context if context.is_empty() => leaf,
-                        context => format!("{context} / {leaf}"),
-                    };
-                    // The conversation is what a transcript is; only the
-                    // activity view needs saying.
-                    if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
-                        format!("{path} · activity")
-                    } else {
-                        path
-                    }
-                }
-                SurfaceKey::Browser(page) => {
-                    rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
-                }
-                SurfaceKey::SlackConversation(source) => self
-                    .slack
-                    .session()
-                    .map(|session| session.read(cx).label(source))
-                    .unwrap_or_else(|| self.surface_name(&self.active_surface().key)),
-                key => self.surface_name(key),
-            }
-        };
+        let path = self.surface_title(cx);
         let state = agent_in_view
             .filter(|_| echo.is_none())
             .and_then(|agent_id| {
@@ -8273,6 +8366,11 @@ impl Render for Workspace {
                         self.render_workspace(window, cx)
                     }),
             )
+            .children(if phone {
+                self.render_phone_toast(&text_style, cx)
+            } else {
+                None
+            })
             .children(if phone {
                 self.render_phone_touch_debug(self.shell_touches.len())
             } else {

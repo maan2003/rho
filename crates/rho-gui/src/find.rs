@@ -525,12 +525,31 @@ impl Workspace {
 
     /// The finder itself: type a path, `enter` opens it.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let candidates = self.find_candidates(cx);
+        self.open_find_among("find:", candidates, window, cx);
+    }
+
+    /// The agents the reader manages, as a list to pick from: the finder
+    /// narrowed to one kind, with the most recently used first.
+    pub(crate) fn open_agents_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut candidates = self.find_candidates(cx);
+        candidates.retain(|candidate| candidate.kind == "agent");
+        self.open_find_among("agent:", candidates, window, cx);
+    }
+
+    fn open_find_among(
+        &mut self,
+        prompt: &'static str,
+        candidates: Vec<FindCandidate>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Everything there is to find, taken here and held by the prompt's
         // own closures, so it lives exactly as long as the prompt does and
         // no keystroke rebuilds it. The reader cannot file a note or start
         // an agent while the finder is up, so a snapshot is not stale: what
         // it holds is what there was when they asked.
-        let snapshot = std::rc::Rc::new(FindSnapshot::of(self.find_candidates(cx)));
+        let snapshot = std::rc::Rc::new(FindSnapshot::of(candidates));
         let held = snapshot.clone();
         self.find_snapshot = Some(snapshot);
         let complete =
@@ -543,7 +562,7 @@ impl Workspace {
                 workspace.find_open(&input, window, cx);
             },
         );
-        self.open_prompt("find:", complete, on_submit, window, cx);
+        self.open_prompt(prompt, complete, on_submit, window, cx);
         if let Some(minibuffer) = &mut self.minibuffer {
             // A path has spaces in it, so completion replaces the whole
             // input rather than the last word.
