@@ -6172,20 +6172,23 @@ impl Workspace {
                 self.selection.select_agent(agent_id);
                 self.active_context = self.context_for_agent(agent_id);
                 self.activate_agent(agent_id, cx);
-                self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
+                Some(self.make_surface(SurfaceKey::Transcript(agent_id), window, cx))
             }
             // A Slack card is a conversation: the deal view is the
             // conversation surface itself, opened the way `enter` opens
             // it, with the message that raised the card on screen.
             rho_dealer::NodeId::Slack(unit) => {
                 if self.open_slack_deal(unit, window, cx) {
-                    return true;
+                    None
+                } else {
+                    Some(self.make_surface(SurfaceKey::Note(card.node.clone()), window, cx))
                 }
-                self.make_surface(SurfaceKey::Note(card.node.clone()), window, cx)
             }
-            node => self.make_surface(SurfaceKey::Note(node.clone()), window, cx),
+            node => Some(self.make_surface(SurfaceKey::Note(node.clone()), window, cx)),
         };
-        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Deal, cx);
+        if let Some(surface) = surface {
+            self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Deal, cx);
+        }
         if self.phone.enabled {
             window.focus(&self.phone.feed_focus, cx);
         } else {
@@ -6203,7 +6206,12 @@ impl Workspace {
             return;
         }
         let now = jiff::Timestamp::now();
-        let in_view = self.open_card_in_view(cx);
+        // On the phone only the feed card is passed over: after a verdict
+        // the surface underneath shows through, and it was never dealt.
+        let in_view = match self.phone.enabled && !self.phone_feed_is_active() {
+            true => None,
+            false => self.open_card_in_view(cx),
+        };
         // Reading a card and pulling again is what a skip is: the card is
         // still owed, it is just not what to look at next.
         if let Some(card) = &in_view

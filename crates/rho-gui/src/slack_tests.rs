@@ -5,9 +5,9 @@
 //! line. A test belongs to the surface it is about, and this is where
 //! rho-slack's are.
 
-use gpui::{AppContext as _, Focusable as _, TestAppContext};
+use gpui::{AppContext as _, Focusable as _, InputEvent as _, TestAppContext};
 
-use super::tests::{bind_test_keymaps, init_test_app, test_workspace};
+use super::tests::{bind_test_keymaps, body, init_test_app, said, test_workspace, todo_now};
 
 /// The workspace both tests read, seeded on the server.
 ///
@@ -3095,6 +3095,123 @@ fn reason_of(
                 .map(|(_, attention)| *attention)
         })
         .unwrap()
+}
+
+/// A dealt Slack card is the feed on the phone, the same as a dealt note
+/// or transcript: it opens with the verdict bar under it and nothing on
+/// the stack, and the next pull replaces it rather than stacking on it.
+#[gpui::test]
+async fn a_dealt_slack_card_is_the_phone_feed(cx: &mut TestAppContext) {
+    use rho_dealer::NodeId;
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let state = tempfile::tempdir().unwrap();
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    fake.push_frame(serde_json::json!({
+        "type": "message", "channel": "D1", "ts": "1800000100.000000",
+        "user": "UA", "text": "are you around?"
+    }));
+    let unit = slack_unit("D1", None);
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+    let node = NodeId::Slack(unit);
+    // The feed sat empty, so the arrival is dealt on its own: no pull.
+    cx.run_until_parked();
+    let note = workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(node.clone()),
+                "the Slack card is what was dealt"
+            );
+            assert!(
+                workspace.phone_feed_for_test(cx),
+                "the dealt conversation is the feed, not a surface stacked on it"
+            );
+            assert!(workspace.phone_feed_is_active_for_test());
+            workspace.phone_back(window, cx);
+            assert!(
+                workspace.phone_feed_for_test(cx),
+                "back from the feed stays on the feed"
+            );
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(vec![body(&note, "After the DM"), said(&note, todo_now())], cx);
+            note
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    // A flick up on the conversation is a skip, the same as on a note: the
+    // conversation is short, so its editor sits at both edges.
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (gpui::TouchPhase::Started, 600., 0),
+            (gpui::TouchPhase::Moved, 300., 80),
+            (gpui::TouchPhase::Ended, 300., 100),
+        ] {
+            window.dispatch_event(
+                gpui::TouchEvent {
+                    id: gpui::TouchId(1),
+                    phase,
+                    position: gpui::point(gpui::px(200.), gpui::px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.phone_last_gesture_for_test(),
+                Some("flick up · moved")
+            );
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(note.clone()),
+                "the flick skipped the conversation for the note"
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+
+            // Flicking back returns the conversation as the feed.
+            workspace.phone_flick_for_test(rho_journal::PhoneFlickDirection::Down, window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(node.clone())
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+
+            // A verdict moves the feed on to the next card, which is the
+            // feed again rather than a surface over the one just closed.
+            workspace.verdict_done(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(note),
+                "the next card is dealt after the verdict"
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+            assert!(workspace.phone_feed_is_active_for_test());
+        })
+        .unwrap();
 }
 
 /// `d` on a Slack card: rho's own cursor moves here and now, and the
