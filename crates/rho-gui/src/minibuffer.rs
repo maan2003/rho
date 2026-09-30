@@ -450,7 +450,8 @@ impl Minibuffer {
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(48.))
+            .bottom(px(56.))
+            .occlude()
             .key_context("RhoMinibuffer")
             .child(
                 div()

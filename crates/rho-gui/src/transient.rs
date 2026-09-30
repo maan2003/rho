@@ -49,6 +49,8 @@ pub(crate) enum MenuId {
     Status,
     /// `space s u`: which usage chart to look at.
     UsageRoot,
+    /// The verdicts, as the phone's `card…` row reaches them.
+    Verdict,
 }
 
 /// A command a menu item runs, which is the whole of what the item means.
@@ -612,15 +614,42 @@ pub(crate) fn agent_menu() -> Menu {
         )
 }
 
-pub(crate) fn phone_root_menu() -> Menu {
-    Menu::new("menu")
-        .item(
-            "s",
-            "Slack",
-            MenuAction::Command(Command::SlackConversations),
-        )
-        .item("a", "Agents", MenuAction::Open(MenuId::Agent))
-        .item("i", "Status", MenuAction::Open(MenuId::Status))
+/// The phone's menu: the leader menu, every item of it, in the order a
+/// thumb wants them, with the card's verdicts first while a card is dealt.
+/// The keys stay what they are on the desk, so a phone with a keyboard
+/// reads the same menu the same way.
+pub(crate) fn phone_root_menu(subject: &Subject, card: bool) -> Menu {
+    let root = root_menu(subject);
+    let mut items = root.items().iter().collect::<Vec<_>>();
+    items.sort_by_key(|item| phone_rank(item.action()));
+    items.into_iter().fold(
+        Menu::new("menu").when(card, "tab", "card…", MenuAction::Open(MenuId::Verdict)),
+        |menu, item| menu.item(item.key(), item.description(), item.action().clone()),
+    )
+}
+
+/// Where a leader item sits on the phone: going places and making things
+/// first, the machinery last. Unranked items keep the leader's own order.
+fn phone_rank(action: &MenuAction) -> u8 {
+    match action {
+        MenuAction::Open(MenuId::New) => 0,
+        MenuAction::Command(Command::SwitchBuffer) => 1,
+        MenuAction::Open(MenuId::Slack) => 2,
+        MenuAction::Open(MenuId::Agent) => 3,
+        MenuAction::Command(Command::FindNode) => 4,
+        MenuAction::Command(Command::NotesForThis) => 5,
+        MenuAction::Command(Command::UndoVerdict) => 6,
+        MenuAction::Command(Command::MessageLog) => 7,
+        MenuAction::Open(MenuId::Input) => 8,
+        MenuAction::Command(Command::Voice) => 9,
+        MenuAction::Command(Command::Terminal | Command::NewTerminal) => 10,
+        MenuAction::Command(Command::Shell | Command::ShellClose) => 11,
+        MenuAction::Command(Command::Wayland) => 12,
+        MenuAction::Command(Command::OpenFile) => 13,
+        MenuAction::Open(MenuId::Projects | MenuId::Hosts | MenuId::Status) => 14,
+        MenuAction::Command(Command::Quit) => u8::MAX,
+        _ => 15,
+    }
 }
 
 /// The phone's answer to "how long": the times a thumb picks, where a
@@ -742,6 +771,31 @@ mod tests {
                 "next week"
             ]
         );
+    }
+
+    #[test]
+    fn the_phone_menu_holds_every_leader_item() {
+        let subject = Subject {
+            agent: Some(
+                rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                    .unwrap(),
+            ),
+            ..Subject::default()
+        };
+        let actions = |menu: &Menu| {
+            menu.items()
+                .iter()
+                .map(|item| format!("{:?}", item.action()))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let root = actions(&root_menu(&subject));
+        assert!(root.contains("Open(Agent)"));
+        assert_eq!(actions(&phone_root_menu(&subject, false)), root);
+
+        let with_card = phone_root_menu(&subject, true);
+        assert_eq!(with_card.items()[0].description(), "card…");
+        assert_eq!(with_card.items().len(), root.len() + 1);
+        assert_eq!(with_card.items().last().unwrap().description(), "quit");
     }
 
     #[test]

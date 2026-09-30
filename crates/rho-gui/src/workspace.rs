@@ -5776,6 +5776,7 @@ impl Workspace {
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
+            MenuId::Verdict => crate::transient::verdict_menu(),
         };
         self.show_menu(menu, count, Back::Over, false);
         cx.notify();
@@ -7455,6 +7456,75 @@ impl Workspace {
         .into_any_element()
     }
 
+    /// Opens the card in view to answer it: the conversation with its
+    /// composer, the agent at its prompt, or the note.
+    pub(crate) fn deal_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.card_in_view(cx) else {
+            return;
+        };
+        if matches!(card.node, rho_dealer::NodeId::Slack(_)) && !self.phone.enabled {
+            return;
+        }
+        Self::record_dealer_verdict(
+            &card,
+            rho_journal::DealerVerdict::Open,
+            jiff::Timestamp::now(),
+            None,
+        );
+        match &card.node {
+            rho_dealer::NodeId::Slack(unit) => {
+                self.open_slack_source(crate::slack::unit_source(unit), window, cx);
+                if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
+                    let view = view.clone();
+                    view.update(cx, |view, cx| view.select_compose(window, cx));
+                    window.focus(&view.read(cx).editor().focus_handle(cx), cx);
+                }
+            }
+            rho_dealer::NodeId::Agent(agent_id) => {
+                self.open_agent(*agent_id, window, cx);
+                if self.phone.enabled
+                    && let SurfaceView::Transcript { model, editor } = &self.active_surface().view
+                {
+                    let (model, editor) = (model.clone(), editor.clone());
+                    model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
+                }
+            }
+            node => {
+                self.open_note(node, window, cx);
+            }
+        }
+    }
+
+    /// The name of what is in view, as the status line and the phone's
+    /// title bar both say it.
+    pub(crate) fn surface_path(&self, cx: &App) -> String {
+        match &self.active_surface().key {
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
+                let leaf = self.registry.agent_display_label(*agent_id);
+                let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
+                    context if context.is_empty() => leaf,
+                    context => format!("{context} / {leaf}"),
+                };
+                // The conversation is what a transcript is; only the
+                // activity view needs saying.
+                if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
+                    format!("{path} · activity")
+                } else {
+                    path
+                }
+            }
+            SurfaceKey::Browser(page) => {
+                rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
+            }
+            SurfaceKey::SlackConversation(source) => self
+                .slack
+                .session()
+                .map(|session| session.read(cx).label(source))
+                .unwrap_or_else(|| self.surface_name(&self.active_surface().key)),
+            key => self.surface_name(key),
+        }
+    }
+
     fn render_status_line(
         &mut self,
         text_style: &gpui::TextStyle,
@@ -7482,33 +7552,7 @@ impl Workspace {
         {
             return self.render_deal_why(&card, text_style, window, cx);
         }
-        let path = {
-            match &self.active_surface().key {
-                SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
-                    let leaf = self.registry.agent_display_label(*agent_id);
-                    let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
-                        context if context.is_empty() => leaf,
-                        context => format!("{context} / {leaf}"),
-                    };
-                    // The conversation is what a transcript is; only the
-                    // activity view needs saying.
-                    if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
-                        format!("{path} · activity")
-                    } else {
-                        path
-                    }
-                }
-                SurfaceKey::Browser(page) => {
-                    rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned())
-                }
-                SurfaceKey::SlackConversation(source) => self
-                    .slack
-                    .session()
-                    .map(|session| session.read(cx).label(source))
-                    .unwrap_or_else(|| self.surface_name(&self.active_surface().key)),
-                key => self.surface_name(key),
-            }
-        };
+        let path = self.surface_path(cx);
         let state = agent_in_view
             .filter(|_| echo.is_none())
             .and_then(|agent_id| {
@@ -8147,41 +8191,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DealReply, window, cx| {
                 vim::take_count(cx);
-                let Some(card) = this.card_in_view(cx) else {
-                    return;
-                };
-                if matches!(card.node, rho_dealer::NodeId::Slack(_)) && !this.phone.enabled {
-                    return;
-                }
-                Self::record_dealer_verdict(
-                    &card,
-                    rho_journal::DealerVerdict::Open,
-                    jiff::Timestamp::now(),
-                    None,
-                );
-                match &card.node {
-                    rho_dealer::NodeId::Slack(unit) => {
-                        this.open_slack_source(crate::slack::unit_source(unit), window, cx);
-                        if let SurfaceView::SlackConversation(view) = &this.active_surface().view {
-                            let view = view.clone();
-                            view.update(cx, |view, cx| view.select_compose(window, cx));
-                            window.focus(&view.read(cx).editor().focus_handle(cx), cx);
-                        }
-                    }
-                    rho_dealer::NodeId::Agent(agent_id) => {
-                        this.open_agent(*agent_id, window, cx);
-                        if this.phone.enabled
-                            && let SurfaceView::Transcript { model, editor } =
-                                &this.active_surface().view
-                        {
-                            let (model, editor) = (model.clone(), editor.clone());
-                            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
-                        }
-                    }
-                    node => {
-                        this.open_note(node, window, cx);
-                    }
-                }
+                this.deal_reply(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(
@@ -8260,13 +8270,18 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     .child(if phone {
-                        self.render_phone_body(&text_style, window, cx)
+                        self.render_phone_body(cx)
                     } else {
                         self.render_workspace(window, cx)
                     }),
             )
             .children(if phone {
                 self.render_phone_touch_debug(self.shell_touches.len())
+            } else {
+                None
+            })
+            .children(if phone {
+                self.render_phone_toast(cx)
             } else {
                 None
             })

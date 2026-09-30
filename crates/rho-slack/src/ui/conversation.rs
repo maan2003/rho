@@ -1674,6 +1674,18 @@ impl ConversationView {
         compose_placeholder(&label, matches!(self.source, Source::Thread(_)))
     }
 
+    /// Whether the cursor is in the composer rather than on a message: a
+    /// tap there on the phone is a reply, not a look at a message.
+    pub fn cursor_in_compose(&self, cx: &App) -> bool {
+        let start = self.input.read(cx).anchor_before(0);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(start) = snapshot.anchor_in_excerpt(start) else {
+            return false;
+        };
+        let head = self.editor.read(cx).selections.newest_anchor().head();
+        head.cmp(&start, &snapshot).is_ge()
+    }
+
     /// Puts the cursor in the composer: what `i` asks for.
     pub fn select_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let end = {

@@ -168,6 +168,18 @@ pub fn deploy_context_menu(
 
     let display_map = editor.display_snapshot(cx);
     let source_anchor = display_map.display_point_to_anchor(point, text::Bias::Right);
+    // Move the cursor to the clicked location so that dispatched actions make
+    // sense, whether or not a menu follows: an editor with no menu of its own
+    // (rho's, on a touch long press) still acts on what was pressed.
+    if !display_ranges(&display_map, &editor.selections).any(|r| r.contains(&point)) {
+        let anchor = display_map
+            .buffer_snapshot()
+            .anchor_before(point.to_point(&display_map));
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.clear_disjoint();
+            s.set_pending_anchor_range(anchor..anchor, SelectMode::Character);
+        });
+    }
     let context_menu = if let Some(custom) = editor.custom_context_menu.take() {
         let menu = custom(editor, point, window, cx);
         editor.custom_context_menu = Some(custom);
@@ -190,13 +202,6 @@ pub fn deploy_context_menu(
         let display_map = editor.display_snapshot(cx);
         let buffer = snapshot.buffer_snapshot();
         let anchor = buffer.anchor_before(point.to_point(&display_map));
-        if !display_ranges(&display_map, &editor.selections).any(|r| r.contains(&point)) {
-            // Move the cursor to the clicked location so that dispatched actions make sense
-            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                s.clear_disjoint();
-                s.set_pending_anchor_range(anchor..anchor, SelectMode::Character);
-            });
-        }
 
         let focus = window.focused(cx);
         let has_reveal_target = editor.target_file(cx).is_some();
