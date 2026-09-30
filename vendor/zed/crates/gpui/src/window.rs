@@ -2896,6 +2896,12 @@ impl Window {
         self.default_prevented = true;
     }
 
+    /// The cursor style the element under the pointer asks for, which is how
+    /// an element says that a press on it is its own.
+    pub fn hovered_cursor_style(&self) -> Option<CursorStyle> {
+        self.rendered_frame.cursor_style(self)
+    }
+
     /// Obtain whether default has been prevented for the event currently being dispatched.
     pub fn default_prevented(&self) -> bool {
         self.default_prevented

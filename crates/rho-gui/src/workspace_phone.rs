@@ -327,8 +327,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A sheet or the minibuffer over the surface owns the press.
-        if self.menu_buffer.is_some() || self.minibuffer.is_some() {
+        // A sheet or the minibuffer over the surface owns the press, and so
+        // does anything in it that can be clicked, like a reaction chip.
+        if self.menu_buffer.is_some()
+            || self.minibuffer.is_some()
+            || window.hovered_cursor_style() == Some(gpui::CursorStyle::PointingHand)
+        {
             return;
         }
         let button = event.button;
