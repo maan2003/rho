@@ -422,30 +422,26 @@ impl Minibuffer {
             .skip(window_start)
             .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
+                // A list row the way phones draw them: the value, and what
+                // it is in smaller type beneath, each with the full width.
                 let mut row = div()
                     .id(("phone-minibuffer-candidate", index))
                     .cursor_pointer()
                     .flex()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
+                    .justify_center()
                     .w_full()
                     .min_h(px(48.))
                     .px_3()
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(gpui::relative(0.6))
-                            .truncate()
-                            .child(candidate.value.clone()),
-                    );
+                    .py_1()
+                    .child(div().w_full().truncate().child(candidate.value.clone()));
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .pl_3()
+                            .w_full()
                             .truncate()
-                            .text_right()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
                             .text_color(colors.text_muted)
                             .child(candidate.description.clone()),
                     );

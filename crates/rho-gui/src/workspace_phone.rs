@@ -522,6 +522,7 @@ impl Workspace {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn phone_last_gesture_for_test(&self) -> Option<&str> {
         self.phone.last_gesture.as_deref()
     }
@@ -1189,7 +1190,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(self.render_phone_title(
-                    self.surface_path(cx),
+                    self.phone_surface_title(cx),
                     self.phone_surface_state(cx),
                     cx,
                 ))
@@ -1500,6 +1501,15 @@ impl Workspace {
 
     /// What the status line says beside a surface's name: an agent's state,
     /// or what arrived in a Slack conversation below the fold.
+    /// A note is called by its first line on the phone, as its card is; the
+    /// bare kind says nothing on a screen with no other chrome.
+    fn phone_surface_title(&self, cx: &Context<Self>) -> String {
+        match &self.active_surface().key {
+            SurfaceKey::Note(node) => Self::card_path(&self.card_for(node, cx)),
+            _ => self.surface_path(cx),
+        }
+    }
+
     fn phone_surface_state(&self, cx: &Context<Self>) -> Option<String> {
         match &self.active_surface().key {
             SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
