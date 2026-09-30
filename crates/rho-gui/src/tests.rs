@@ -6802,3 +6802,75 @@ fn a_phone_on_its_side_stays_a_phone_but_a_short_desk_window_does_not_become_one
     assert!(phone_after(800., 400., cx), "the same phone on its side");
     assert!(!phone_after(1200., 800., cx), "a desk window again");
 }
+
+#[gpui::test]
+fn a_phone_pinch_zooms_a_picture_and_then_a_drag_moves_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    let view = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_image(
+                "/nonexistent/picture.png".into(),
+                "picture".into(),
+                window,
+                cx,
+            );
+            match &workspace.active_surface().view {
+                crate::workspace::SurfaceView::Image(view) => view.clone(),
+                _ => panic!("the picture is the surface in view"),
+            }
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let touch = |id, phase, x: f32, y: f32, millis| {
+        TouchEvent {
+            id: TouchId(id),
+            phase,
+            position: point(px(x), px(y)),
+            timestamp: std::time::Duration::from_millis(millis),
+            ..Default::default()
+        }
+        .to_platform_input()
+    };
+    let drag = |cx: &mut TestAppContext, start: u64| {
+        cx.update_window(*workspace, |_, window, cx| {
+            window.dispatch_event(touch(3, TouchPhase::Started, 200., 400., start), cx);
+            window.dispatch_event(touch(3, TouchPhase::Moved, 260., 440., start + 300), cx);
+            window.dispatch_event(touch(3, TouchPhase::Ended, 260., 440., start + 900), cx);
+        })
+        .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+    };
+    // Unzoomed there is nothing to move.
+    drag(cx, 0);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.zoom_and_pan_for_test()),
+        (1., gpui::Point::default())
+    );
+
+    // Two fingers from 100px apart to 200px apart double the picture.
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(touch(1, TouchPhase::Started, 150., 400., 2000), cx);
+        window.dispatch_event(touch(2, TouchPhase::Started, 250., 400., 2010), cx);
+        window.dispatch_event(touch(1, TouchPhase::Moved, 100., 400., 2100), cx);
+        window.dispatch_event(touch(2, TouchPhase::Moved, 300., 400., 2110), cx);
+        window.dispatch_event(touch(1, TouchPhase::Ended, 100., 400., 2200), cx);
+        window.dispatch_event(touch(2, TouchPhase::Ended, 300., 400., 2210), cx);
+    })
+    .unwrap();
+    next_frame(cx, workspace);
+    let (zoom, pan) = view.read_with(cx, |view, _| view.zoom_and_pan_for_test());
+    assert!((zoom - 2.).abs() < 0.05, "zoomed to {zoom}");
+    assert_eq!(pan, gpui::Point::default());
+
+    // Zoomed, a drag moves the picture with the finger.
+    drag(cx, 5000);
+    let (_, pan) = view.read_with(cx, |view, _| view.zoom_and_pan_for_test());
+    assert!(
+        (pan.x - px(60.)).abs() < px(1.) && (pan.y - px(40.)).abs() < px(1.),
+        "moved by {pan:?}"
+    );
+}
