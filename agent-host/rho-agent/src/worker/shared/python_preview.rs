@@ -73,6 +73,8 @@ fn preview_from_start(
     };
     let is_fstring = delimiter.to_ascii_lowercase().contains('f');
     let is_raw = delimiter.to_ascii_lowercase().contains('r');
+    // Recovery may invent a missing terminator at a ')' inside the body.
+    // Only a delimiter present in the source closes the literal.
     let string_end = start
         .parent()
         .filter(|parent| parent.kind() == "string")
@@ -80,22 +82,13 @@ fn preview_from_start(
             let mut cursor = parent.walk();
             parent
                 .children(&mut cursor)
-                .find(|child| child.kind() == "string_end")
+                .find(|child| child.kind() == "string_end" && !child.is_missing())
         });
     // An unfinished triple-quoted string may already contain one or two
     // closing quotes. Treat them as a pending delimiter, not body text, and
     // complete only the missing quotes in the repaired parse.
     let pending_quotes = if string_end.is_none() && closing.len() == 3 {
-        let count = source[start.end_byte()..]
-            .bytes()
-            .rev()
-            .take_while(|b| *b == quote)
-            .count()
-            .min(2);
-        let preceding = &source[..source.len() - count];
-        (preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0)
-            .then_some(count)
-            .unwrap_or(0)
+        pending_closing_quotes(source, start.end_byte(), quote)
     } else {
         0
     };
@@ -122,7 +115,14 @@ fn preview_from_start(
     {
         format!("\\{closing})")
     } else {
-        format!("{})", &closing[pending_quotes..])
+        // A prefix cut before interpolation does not include the pending
+        // closing quotes at the end of the original source.
+        let missing = if interpolation.is_some() {
+            closing.as_str()
+        } else {
+            &closing[pending_quotes..]
+        };
+        format!("{missing})")
     };
     let repaired = format!("{prefix}{suffix}");
     let tree = parser.parse(&repaired, None)?;
@@ -144,6 +144,19 @@ fn preview_from_start(
         )
         .filter(|text| !text.is_empty()),
     )
+}
+
+fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usize {
+    let count = source[content_start..]
+        .bytes()
+        .rev()
+        .take_while(|b| *b == quote)
+        .count()
+        .min(2);
+    let preceding = &source[..source.len() - count];
+    (preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0)
+        .then_some(count)
+        .unwrap_or(0)
 }
 
 fn last_send(node: Node<'_>, source: &str) -> Option<usize> {
@@ -227,9 +240,14 @@ fn known_sum(tree: Node<'_>, source: &str, mut i: usize, mut text: String) -> Op
             .and_then(|node| {
                 let mut cursor = node.walk();
                 node.children(&mut cursor)
-                    .find(|child| child.kind() == "string_end")
+                    .find(|child| child.kind() == "string_end" && !child.is_missing())
             });
-        let content_end = end.map_or(source.len(), |end| end.start_byte());
+        let pending = if end.is_none() && delimiter.as_bytes().ends_with(&[quote, quote, quote]) {
+            pending_closing_quotes(source, start.end_byte(), quote)
+        } else {
+            0
+        };
+        let content_end = end.map_or(source.len() - pending, |end| end.start_byte());
         let content = &source[start.end_byte()..content_end];
         let interpolates = fstring && first_interpolation(content).is_some();
         let decoded = decode(content, fstring, raw).unwrap_or_default();
@@ -558,6 +576,71 @@ mod tests {
         }
     }
     #[test]
+    fn multiline_triple_quoted_prefixes_keep_their_known_text() {
+        let cases = [
+            (
+                "human.send(\"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\")",
+                "First line\n\nSecond line with \"quotes\" and α.",
+            ),
+            (
+                "human.send(\n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n)",
+                "\nFirst line\nSecond line\n",
+            ),
+            (
+                "human.send('''First line\nSecond line with 'quotes'.''')",
+                "First line\nSecond line with 'quotes'.",
+            ),
+            (
+                "human.send(f\"\"\"First line\nSecond line {name}!\"\"\")",
+                "First line\nSecond line ",
+            ),
+            (
+                "human.send(r\"\"\"First line\nSecond line\\n\"\"\")",
+                "First line\nSecond line\\n",
+            ),
+            (
+                "human.send(\"\"\"First line\"\"\" + \"\"\"Second line\"\"\")",
+                "First lineSecond line",
+            ),
+            (
+                "human.send(\"\"\"Before (\"A Python\"). After.\"\"\")",
+                "Before (\"A Python\"). After.",
+            ),
+        ];
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        for (source, expected) in cases {
+            let mut seen = false;
+            for (i, _) in source
+                .char_indices()
+                .chain(std::iter::once((source.len(), '\0')))
+            {
+                let prefix = &source[..i];
+                let draft = preview(&mut parser, prefix);
+                if draft.is_some() {
+                    seen = true;
+                }
+                if seen {
+                    assert!(draft.is_some(), "lost draft at {prefix:?}");
+                }
+                if let Some(draft) = draft {
+                    assert!(
+                        expected.starts_with(&draft),
+                        "incorrect draft {draft:?} at {prefix:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                preview(&mut parser, source).as_deref(),
+                Some(expected),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn partially_closed_triple_quote_keeps_body_without_delimiter() {
         let mut parser = Parser::new();
         parser
@@ -581,7 +664,8 @@ mod tests {
 
     #[test]
     fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
-        let source = "human.send(\"\"\"First line\nSecond line with \"quotes\".\"\"\")";
+        let source =
+            "human.send(\"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
         let arguments = serde_json::json!({"source": source}).to_string();
         let mut visible = false;
         for (i, _) in arguments
