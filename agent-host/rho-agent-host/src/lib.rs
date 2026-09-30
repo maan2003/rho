@@ -719,7 +719,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
         .context("register SIGUSR2 handler")?;
     phases.mark("services");
-    eprintln!("rho-agent-host: ready in {phases}");
+    // Read from this process's own /proc entry, which others may not read.
+    let exe = std::env::current_exe().map_or_else(
+        |error| format!("an unknown executable ({error})"),
+        |exe| exe.display().to_string(),
+    );
+    eprintln!("rho-agent-host: ready in {phases}, running {exe}");
 
     loop {
         tokio::select! {
