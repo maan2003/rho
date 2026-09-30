@@ -590,10 +590,14 @@ impl EditorElement {
                                 * ScrollPixelOffset::from(glyph_width)
                                 - ScrollPixelOffset::from(delta.x * scroll_sensitivity))
                                 / ScrollPixelOffset::from(glyph_width);
-                            let y = (current_scroll_position.y
-                                * ScrollPixelOffset::from(line_height)
-                                - ScrollPixelOffset::from(delta.y * scroll_sensitivity))
-                                / ScrollPixelOffset::from(line_height);
+                            // Rows can be taller than a line, so the pixels move
+                            // through row geometry rather than a fixed line height.
+                            let snapshot = &position_map.snapshot;
+                            let y = snapshot.row_at_y(
+                                snapshot.row_y(current_scroll_position.y)
+                                    - ScrollPixelOffset::from(delta.y * scroll_sensitivity)
+                                        / ScrollPixelOffset::from(line_height),
+                            );
                             let mut scroll_position =
                                 point(x, y).clamp(&point(0., 0.), &position_map.scroll_max);
                             let forbid_vertical_scroll =

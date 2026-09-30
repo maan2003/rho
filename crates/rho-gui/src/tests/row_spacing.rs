@@ -405,3 +405,60 @@ fn anchored_hanging_indents_wrap_resize_and_hit_test_without_changing_source(
             .unwrap();
     }
 }
+
+#[gpui::test]
+fn precise_scrolling_moves_rows_by_the_pixels_dragged(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        let text = (0..60)
+            .map(|row| format!("row {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.set_text(text, window, cx);
+        let source = editor.buffer().read(cx).snapshot(cx);
+        let spacing = (0..60)
+            .map(|row| {
+                let end = source.anchor_after(language::Point::new(row, 0));
+                editor::display_map::RowSpacing {
+                    range: end..end,
+                    minimum_height: 0.,
+                    gap_after: 1.,
+                }
+            })
+            .collect();
+        editor.set_row_spacing(spacing, cx);
+        editor
+    });
+    cx.simulate_window_resize(*editor, size(px(400.), px(300.)));
+    cx.run_until_parked();
+    cx.draw_window(*editor);
+    let line_height = editor
+        .update(cx, |editor, window, cx| {
+            editor.set_scroll_position(point(0., 20.), window, cx);
+            editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+        })
+        .unwrap();
+    cx.draw_window(*editor);
+    // Each row is two lines tall, so a four-line drag moves two rows.
+    cx.update_window(*editor, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: point(px(200.), px(150.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), line_height * 4.)),
+                touch_phase: TouchPhase::Moved,
+                ..Default::default()
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    editor
+        .update(cx, |editor, _, cx| {
+            assert_eq!(editor.scroll_position(cx).y, 18.);
+        })
+        .unwrap();
+}
