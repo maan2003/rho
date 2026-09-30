@@ -105,6 +105,10 @@ between frames, and execs its binary with the connections left open. The
 successor, same pid, writes the frames the old writers still held, adopts the
 workers and their agents without bootstrapping them, and reads on. Workers
 need no part in this. A worker whose protocol version differs is not adopted.
+An adopted worker started from another build is stale, which its agents'
+status says. The agent host replaces it once no agent has work and no
+terminal or shell is open, or at once when the user restarts its workset;
+its agents load again in the new process.
 Workers carry no parent-death signal, which a re-exec would fire; a worker
 ends when its connections close.
 

@@ -622,7 +622,10 @@ impl Agent {
                     .iter()
                     .all(|source| source.finished.is_some())
             })
-            && (self.archived || self.stopped.is_some() || self.progress.last_response.is_none())
+            && (self.archived
+                || self.stopped.is_some()
+                || self.progress.ended
+                || self.progress.last_response.is_none())
     }
 
     fn cell_running(&self) -> bool {
@@ -1389,6 +1392,7 @@ impl Agent {
                     self.facts().checkin
                 },
                 archived: self.archived,
+                stale: false,
             },
             response: self.response(),
             draft: self.draft(),

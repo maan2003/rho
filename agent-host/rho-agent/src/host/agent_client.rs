@@ -73,13 +73,15 @@ impl AgentClient {
         process: Arc<crate::host::Process>,
         cwd: Option<camino::Utf8PathBuf>,
     ) -> anyhow::Result<Self> {
-        let services = Arc::new(Services::new(
+        let mut services = Services::new(
             pool.db().clone(),
             pool.inference().clone(),
             agent,
             Arc::downgrade(pool),
             process.next.clone(),
-        ));
+        );
+        services.stale = process.stale();
+        let services = Arc::new(services);
         let (incoming, receiver) = tokio::sync::mpsc::unbounded_channel();
         anyhow::ensure!(
             process

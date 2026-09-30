@@ -326,6 +326,129 @@ impl AgentPool {
         }
     }
 
+    /// Replaces a workset's process with one of this agent host's build and
+    /// loads its agents again there. Unforced, only a stale process with
+    /// nothing running is replaced: every agent retires, and no terminal
+    /// or shell is open. Forced, whatever runs there ends. Says
+    /// whether it replaced one.
+    pub async fn restart_workset(
+        self: &Arc<Self>,
+        workset: &str,
+        force: bool,
+    ) -> anyhow::Result<bool> {
+        let slot = self.execution_slot(workset).await;
+        let admission = slot.admission.clone().write_owned().await;
+        let mut current = slot.process.lock().await;
+        let Some(process) = current.clone().filter(|process| !*process.closed.borrow()) else {
+            return Ok(false);
+        };
+        if !force && !(process.stale() && process.quiet().await?) {
+            return Ok(false);
+        }
+        let ids = process
+            .agents
+            .lock()
+            .expect("poison")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut agents = Vec::new();
+        for agent_id in &ids {
+            let lock = self
+                .load_locks
+                .lock()
+                .await
+                .entry(*agent_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            let loading = lock.lock_owned().await;
+            if let Some(agent) = self.agents.lock().await.get(agent_id).cloned() {
+                agents.push((*agent_id, agent, loading));
+            }
+        }
+        let mut replace = true;
+        if !force {
+            // Asking first leaves no agent retired, and so frozen, when
+            // another still has work; retirement then only confirms.
+            if !agents.iter().all(|(_, agent, _)| agent.settled()) {
+                return Ok(false);
+            }
+            // One that took on work meanwhile keeps the process; those
+            // retired already are frozen and load again in it.
+            if let Some(busy) =
+                futures::future::join_all(agents.iter().map(|(_, agent, _)| agent.retire()))
+                    .await
+                    .iter()
+                    .position(Result::is_err)
+            {
+                agents.remove(busy);
+                replace = false;
+            }
+        }
+        futures::future::join_all(agents.iter().map(|(_, agent, _)| agent.shutdown())).await;
+        {
+            let mut loaded = self.agents.lock().await;
+            let mut recent = self.recent.lock().expect("poison");
+            for (agent_id, _, _) in &agents {
+                loaded.remove(agent_id);
+                recent.retain(|id| id != agent_id);
+            }
+        }
+        if replace {
+            process.shutdown().await;
+            *current = None;
+        }
+        let ids = agents
+            .iter()
+            .map(|(agent_id, _, _)| *agent_id)
+            .collect::<Vec<_>>();
+        drop((current, admission, agents));
+        for agent_id in ids {
+            if let Err(error) = self.load(agent_id).await {
+                eprintln!("rho-agent: reloading {}: {error:#}", agent_id.encoded());
+            }
+        }
+        Ok(replace)
+    }
+
+    /// Replaces stale workset processes as they fall quiet, checking every
+    /// minute.
+    pub fn replace_stale_worksets(self: &Arc<Self>) {
+        let pool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let Some(pool) = pool.upgrade() else { return };
+                let slots = pool
+                    .processes
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(workset, slot)| (workset.clone(), slot.clone()))
+                    .collect::<Vec<_>>();
+                for (workset, slot) in slots {
+                    let stale = slot
+                        .process
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|process| process.stale() && !*process.closed.borrow());
+                    if !stale {
+                        continue;
+                    }
+                    match pool.restart_workset(&workset, false).await {
+                        Ok(true) => eprintln!("rho-agent: replaced stale workset {workset}"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("rho-agent: replacing stale workset {workset}: {error:#}")
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Takes over the workset processes, and their agents, that the agent
     /// host this one re-executed handed over.
     pub async fn adopt(self: &Arc<Self>, handed: Vec<crate::host::Handed>) {
@@ -1694,5 +1817,57 @@ mod tests {
             .unwrap();
         process.shutdown().await;
         drop((one, two, second, active));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_stale_quiet_workset_is_replaced_unless_forced() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let (agent_id, _) = pool
+            .create(AgentRole::default(), None, StartPlace::new(place.clone()))
+            .await
+            .unwrap();
+        let first = pool.execution(agent_id).await.unwrap();
+        assert!(
+            !pool.restart_workset(&place.workset, false).await.unwrap(),
+            "current build"
+        );
+        assert!(!*first.closed.borrow());
+
+        first.make_stale();
+        assert!(pool.restart_workset(&place.workset, false).await.unwrap());
+        assert!(*first.closed.borrow());
+        let second = pool.execution(agent_id).await.unwrap();
+        assert_ne!(second.pid, first.pid);
+        assert!(!second.stale());
+        assert!(
+            pool.agents.lock().await.contains_key(&agent_id),
+            "loaded again"
+        );
+
+        let _terminal = second
+            .attach(crate::WorksetAttach::Terminal {
+                agent: agent_id,
+                terminal: 1,
+                create: true,
+                cols: 80,
+                rows: 24,
+                cwd: "/src".into(),
+                shell: "bash".into(),
+            })
+            .await
+            .unwrap();
+        second.make_stale();
+        assert!(
+            !pool.restart_workset(&place.workset, false).await.unwrap(),
+            "a terminal is open"
+        );
+        assert!(!*second.closed.borrow());
+
+        assert!(pool.restart_workset(&place.workset, true).await.unwrap());
+        assert!(*second.closed.borrow());
+        let third = pool.execution(agent_id).await.unwrap();
+        assert_ne!(third.pid, second.pid);
+        third.shutdown().await;
     }
 }

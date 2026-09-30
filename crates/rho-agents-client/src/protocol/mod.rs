@@ -243,6 +243,11 @@ pub enum AgentCommand {
     ChangePromptCacheKey {
         agent_id: AgentId,
     },
+    /// Replaces the agent's workset process with one of the agent host's
+    /// build. Everything running in it ends; its agents load again.
+    RestartWorkset {
+        agent_id: AgentId,
+    },
 }
 
 impl AgentCommand {
@@ -255,7 +260,8 @@ impl AgentCommand {
             | Self::Cancel { agent_id }
             | Self::Rewind { agent_id, .. }
             | Self::Continue { agent_id }
-            | Self::ChangePromptCacheKey { agent_id } => *agent_id,
+            | Self::ChangePromptCacheKey { agent_id }
+            | Self::RestartWorkset { agent_id } => *agent_id,
         }
     }
 }
@@ -385,6 +391,7 @@ mod tests {
                     awaiting_human: true,
                     checkin_at: Some(rho_agent_types::UnixMs(7)),
                     archived: false,
+                    stale: false,
                 },
                 response: Some(transcript::StreamingResponse {
                     id: "response-1".into(),

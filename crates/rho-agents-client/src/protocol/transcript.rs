@@ -288,6 +288,10 @@ pub struct RuntimeState {
     pub awaiting_human: bool,
     pub checkin_at: Option<UnixMs>,
     pub archived: bool,
+    /// The agent runs in a workset process older than its agent host's
+    /// build, so fixes since reach it only when the workset restarts.
+    #[senax(default)]
+    pub stale: bool,
 }
 
 impl RuntimeState {

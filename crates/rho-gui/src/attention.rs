@@ -1041,6 +1041,21 @@ pub(crate) fn agent_state_label(
     facts: &rho_agents_client::AgentFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
+    let label = runtime_state_label(facts, now)?;
+    // Fixes since reach it only when its workset restarts.
+    Some(
+        if facts.runtime.as_ref().is_some_and(|runtime| runtime.stale) {
+            format!("{label} · old build")
+        } else {
+            label
+        },
+    )
+}
+
+fn runtime_state_label(
+    facts: &rho_agents_client::AgentFacts,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Option<String> {
     if facts
         .runtime
         .as_ref()

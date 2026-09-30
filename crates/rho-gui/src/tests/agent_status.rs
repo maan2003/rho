@@ -16,6 +16,7 @@ fn notebook_status_does_not_treat_a_message_as_a_finished_turn() {
             running_tasks: 2,
             checkin_at: Some(UnixMs((now_ms + 60_000) as u64)),
             archived: false,
+            stale: false,
         }),
         turn_running: true,
         last_message_sent: Some(UnixMs((now_ms - 120_000) as u64)),
@@ -82,5 +83,35 @@ fn retry_and_failure_status_override_archived_or_running_tasks() {
     assert_eq!(
         crate::attention::agent_state_label(&facts, now).as_deref(),
         Some("errored")
+    );
+}
+
+#[test]
+fn a_stale_workset_is_told_whatever_the_state() {
+    use rho_agents_client::protocol::transcript::RuntimeState;
+    let now = chrono::DateTime::from_timestamp_millis(1_757_000_000_000)
+        .unwrap()
+        .fixed_offset();
+    let mut facts = AgentFacts {
+        runtime: Some(RuntimeState {
+            awaiting_human: true,
+            stale: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("waiting on you · old build")
+    );
+    facts.runtime.as_mut().unwrap().awaiting_human = false;
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("idle · old build")
+    );
+    facts.runtime.as_mut().unwrap().stale = false;
+    assert_eq!(
+        crate::attention::agent_state_label(&facts, now).as_deref(),
+        Some("idle")
     );
 }

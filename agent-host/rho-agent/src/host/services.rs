@@ -27,6 +27,8 @@ pub(crate) struct Services {
     pub db: RhoDb,
     pub agent: AgentId,
     pub status: tokio::sync::watch::Sender<crate::AgentStatus>,
+    /// Whether the agent's workset process is stale, told in its status.
+    pub stale: bool,
     pool: std::sync::Weak<crate::host::pool::AgentPool>,
     title: tokio::sync::Mutex<crate::title::Task>,
 }
@@ -58,6 +60,7 @@ impl Services {
             title,
             pool,
             status,
+            stale: false,
         }
     }
 
@@ -174,7 +177,8 @@ impl Services {
                                 }
                                 continue;
                             }
-                            Message::Status { status, queue } => {
+                            Message::Status { mut status, queue } => {
+                                status.runtime.stale = self.stale;
                                 // Only focused clients receive the response body. Avoid
                                 // cloning its growing text for an unfocused publication.
                                 let snapshot = if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {

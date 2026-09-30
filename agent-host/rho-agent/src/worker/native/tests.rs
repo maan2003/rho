@@ -1263,3 +1263,25 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
     }
     agent.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("import asyncio\nasyncio.create_task(asyncio.sleep(1))\nend_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    say(&handle, "hi").await;
+    harness
+        .until("the wait", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
+        })
+        .await;
+    assert!(handle.retire().await.is_err(), "its task is still running");
+    harness
+        .until("the task to finish", |_| handle.status().settled())
+        .await;
+    handle.retire().await.unwrap();
+}

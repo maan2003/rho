@@ -448,6 +448,7 @@ fn claude_runtime(
         awaiting_human,
         checkin_at: python.and_then(python_host::PythonHost::checkin_at),
         archived,
+        stale: false,
     }
 }
 

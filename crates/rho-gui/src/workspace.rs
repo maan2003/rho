@@ -2766,6 +2766,23 @@ impl Workspace {
         }
     }
 
+    /// Restarts the agent's workset process on its host's current build,
+    /// ending whatever runs there.
+    pub(crate) fn cmd_restart_workset(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("restart-workset", window, cx) {
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(agent_id, AgentCommand::RestartWorkset { agent_id }, cx);
+            self.notice_on(
+                Some(&agent_id),
+                "restarting workset",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+    }
+
     pub(crate) fn cmd_change_agent_role(
         &mut self,
         intelligence: EngineerIntelligence,
@@ -5875,6 +5892,7 @@ impl Workspace {
             Command::AgentRewindMany => self.prompt_rewind(window, cx),
             Command::AgentContinue => self.cmd_continue_turn(window, cx),
             Command::AgentCacheKey => self.cmd_change_prompt_cache_key(window, cx),
+            Command::AgentRestartWorkset => self.cmd_restart_workset(window, cx),
             Command::PhoneSnoozeAhead(unit, count) => {
                 self.phone_verdict_with(
                     rho_journal::PhoneVerdict::Defer,

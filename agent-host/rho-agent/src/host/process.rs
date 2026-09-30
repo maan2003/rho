@@ -50,6 +50,8 @@ enum Handoff {
 pub struct Process {
     pub(crate) pid: u32,
     version: u32,
+    /// The worker runs an older build than this agent host would start.
+    stale: std::sync::atomic::AtomicBool,
     /// The connections, kept for a handoff.
     socket: std::os::fd::OwnedFd,
     requests_socket: std::os::fd::OwnedFd,
@@ -134,11 +136,44 @@ impl Process {
             .unwrap();
     }
 
+    pub(crate) fn stale(&self) -> bool {
+        self.stale.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_stale(&self) {
+        self.stale.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn action(&self, action: workset::Action) -> anyhow::Result<workset::Reply> {
         let admission = self.admission.clone().read_owned().await;
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.request(id, workset::Message::Action { id, action }, Some(admission))
             .await
+    }
+
+    /// Whether nothing but its agents runs in the workset: no terminal or
+    /// shell, open or retained. Desktops run outside it. The caller holds the
+    /// workset's admission exclusively, so nothing can open one meanwhile.
+    pub(crate) async fn quiet(&self) -> anyhow::Result<bool> {
+        if !self.clients.lock().expect("poison").is_empty() {
+            return Ok(false);
+        }
+        for action in [workset::Action::TerminalList, workset::Action::ShellList] {
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let empty = match self
+                .request(id, workset::Message::Action { id, action }, None)
+                .await?
+            {
+                workset::Reply::Terminals(terminals) => terminals.is_empty(),
+                workset::Reply::Shells(shells) => shells.is_empty(),
+                _ => anyhow::bail!("unexpected workset reply"),
+            };
+            if !empty {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn request(
@@ -289,13 +324,7 @@ impl Process {
             claude,
             responses_base_url: pool.inference().responses_base_url().to_owned(),
         };
-        let sibling = std::env::current_exe()?.with_file_name("rho-agent-worker");
-        let executable = if sibling.is_file() {
-            sibling
-        } else {
-            "rho-agent-worker".into()
-        };
-        let mut command = tokio::process::Command::new(executable);
+        let mut command = tokio::process::Command::new(worker_program()?);
         pool.worksets().environment().apply(&mut command);
         command.envs(pool.worksets().store_environment());
         command.envs(pool.worksets().identity_environment().iter().cloned());
@@ -341,6 +370,7 @@ impl Process {
             Some(startup),
             1,
             admission,
+            false,
         )
         .await
     }
@@ -375,6 +405,7 @@ impl Process {
                 protocol::VERSION
             );
         }
+        let stale = !runs_program(handed.pid, &worker_program()?)?;
         let process = Self::connect(
             pool.inference(),
             socket,
@@ -383,6 +414,7 @@ impl Process {
             None,
             handed.next,
             admission,
+            stale,
         )
         .await?;
         for (sender, unwritten) in [
@@ -407,6 +439,7 @@ impl Process {
         startup: Option<Startup>,
         next: u64,
         admission: Arc<tokio::sync::RwLock<()>>,
+        stale: bool,
     ) -> anyhow::Result<Arc<Self>> {
         let pid = worker.pid;
         let version = startup
@@ -605,6 +638,7 @@ impl Process {
         Ok(Arc::new(Self {
             pid,
             version,
+            stale: stale.into(),
             socket: handoff_socket,
             requests_socket,
             handoff,
@@ -621,6 +655,25 @@ impl Process {
             stop: Mutex::new(Some(stop)),
         }))
     }
+}
+
+/// The worker this agent host starts: the one beside its own executable, as
+/// installed, or else the one on `PATH`.
+fn worker_program() -> std::io::Result<std::path::PathBuf> {
+    let sibling = std::env::current_exe()?.with_file_name("rho-agent-worker");
+    Ok(if sibling.is_file() {
+        sibling
+    } else {
+        "rho-agent-worker".into()
+    })
+}
+
+/// Whether `pid` was started as `program`. A worker is started by its path,
+/// which names its build: a store path.
+fn runs_program(pid: u32, program: &std::path::Path) -> std::io::Result<bool> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let started = cmdline.split(|&byte| byte == 0).next().unwrap_or_default();
+    Ok(started == program.as_os_str().as_encoded_bytes())
 }
 
 /// A worker process, watched through a pidfd: tokio cannot take over a child
@@ -717,6 +770,7 @@ mod tests {
             None,
             1,
             Default::default(),
+            false,
         )
         .await
         .unwrap();
@@ -750,6 +804,7 @@ mod tests {
             None,
             handed.next,
             Default::default(),
+            false,
         )
         .await
         .unwrap();
@@ -769,5 +824,30 @@ mod tests {
         assert_eq!((requests, answers), (vec![2, 3], vec![9]));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn a_process_runs_the_program_it_was_started_as() {
+        let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("sleep"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let mut child = std::process::Command::new(&sleep)
+            .arg("60")
+            .spawn()
+            .unwrap();
+        // Its arguments show once exec has set them up.
+        while std::fs::read(format!("/proc/{}/cmdline", child.id()))
+            .unwrap()
+            .is_empty()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(runs_program(child.id(), &sleep).unwrap());
+        // A prefix of the path, or the path with its argument, is another program.
+        assert!(!runs_program(child.id(), sleep.parent().unwrap()).unwrap());
+        assert!(!runs_program(child.id(), &sleep.with_file_name("sleep60")).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

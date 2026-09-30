@@ -612,6 +612,17 @@ pub(crate) async fn handle_agent_command(
             let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
         }
+        AgentCommand::RestartWorkset { agent_id } => {
+            let workset = services
+                .pool
+                .db()
+                .read()
+                .get_agent(agent_id)
+                .place()
+                .workset
+                .clone();
+            services.pool.restart_workset(&workset, true).await?;
+        }
     }
     Ok(())
 }

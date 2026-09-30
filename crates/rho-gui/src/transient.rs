@@ -144,6 +144,7 @@ pub(crate) enum Command {
     AgentRewindMany,
     AgentContinue,
     AgentCacheKey,
+    AgentRestartWorkset,
     // The phone.
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
@@ -603,6 +604,11 @@ pub(crate) fn agent_menu() -> Menu {
             "shift-k",
             "new prompt cache key",
             MenuAction::Command(Command::AgentCacheKey),
+        )
+        .item(
+            "shift-r",
+            "restart workset",
+            MenuAction::Command(Command::AgentRestartWorkset),
         )
 }
 
