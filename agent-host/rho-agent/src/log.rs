@@ -399,7 +399,7 @@ impl SessionBinding {
 
     pub fn deep_model(self) -> Option<InferenceModel> {
         match self {
-            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt6Sol),
+            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt61Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt6Luna),
             Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,

@@ -126,6 +126,7 @@ impl PythonHost {
         self.progress.told_returned = false;
         self.progress.last_response = Some(now);
         self.progress.prose = 0;
+        self.progress.ended = false;
         self.pending = Some(PendingExec {
             request_id,
             rpc_id,
@@ -178,6 +179,16 @@ impl PythonHost {
         }
     }
 
+    /// The open exec ends the turn: its answer tells the CLI to stop, and
+    /// the idle model is woken only by news.
+    pub(crate) fn end_turn(&mut self) {
+        self.progress.ended = true;
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.progress.ended
+    }
+
     pub(crate) fn prose_correction(&self) -> bool {
         self.progress.prose > 0 && self.progress.prose < Progress::MAX_PROSE
     }
@@ -196,7 +207,7 @@ impl PythonHost {
     }
 
     pub(crate) fn checkin_at(&self) -> Option<UnixMs> {
-        if self.stopped || self.progress.prose >= Progress::MAX_PROSE {
+        if self.stopped || self.progress.prose >= Progress::MAX_PROSE || self.progress.ended {
             None
         } else {
             self.progress
@@ -250,6 +261,14 @@ impl PythonHost {
         facts.agent = agent_oldest_at;
         facts.archived = archived;
         facts.prose_silenced = self.stopped || self.progress.prose >= Progress::MAX_PROSE;
+        // Answer an open call before the CLI's own timeout fails it.
+        if self.pending.is_some()
+            && let Some(opened) = self.progress.last_response
+        {
+            let limit =
+                opened + (rho_claude::mcp::EXEC_TIMEOUT - std::time::Duration::from_secs(60));
+            facts.checkin = Some(facts.checkin.map_or(limit, |at| at.min(limit)));
+        }
         let checkin_at = facts.checkin;
         let why = match wake::decide(&facts, now) {
             Decision::Now(why) => Some(why),
@@ -528,6 +547,85 @@ mod tests {
         assert!(matches!(
             host.decide(true, None, Some(UnixMs(0)), false, false, UnixMs(100_000)),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
+        ));
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ended_turn_still_answers_its_call_then_wakes_only_for_news() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path());
+        let t0 = UnixMs::now().0;
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(1),
+                "call".try_into().unwrap(),
+                "print('done')".into(),
+                UnixMs(t0),
+            )
+            .is_none()
+        );
+        host.end_turn();
+        let wake = settle(&mut host).await;
+        assert_eq!(wake.trigger, WakeTrigger::Finished);
+        assert!(host.answer_pending().is_some());
+        assert!(host.ended(), "the answer carries the end of the turn");
+        host.acknowledge();
+        host.turn_ended(UnixMs(t0 + 1_000), true);
+        assert_eq!(host.checkin_at(), None);
+        assert!(matches!(
+            host.decide(true, None, None, false, false, UnixMs(t0 + 1_000_000)),
+            Boundary::No { recheck: None }
+        ));
+        assert!(matches!(
+            host.decide(true, None, Some(UnixMs(t0 + 2_000)), false, false, UnixMs(t0 + 1_000_000)),
+            Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
+        ));
+        // The next exec is a new turn.
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(2),
+                "next".try_into().unwrap(),
+                "pass".into(),
+                UnixMs(t0 + 20_000),
+            )
+            .is_none()
+        );
+        assert!(!host.ended());
+        assert_eq!(host.checkin_at(), Some(UnixMs(t0 + 140_000)));
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_open_call_is_answered_before_the_cli_times_it_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path());
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(1),
+                "call".try_into().unwrap(),
+                "import asyncio\nset_max_wait(10**9)\nawait asyncio.sleep(600)".into(),
+                UnixMs(10_000),
+            )
+            .is_none()
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while host.notebook.checkin() != std::time::Duration::from_secs(1_000_000_000) {
+            assert!(tokio::time::Instant::now() < deadline, "set_max_wait ran");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let limit =
+            UnixMs(10_000) + (rho_claude::mcp::EXEC_TIMEOUT - std::time::Duration::from_secs(60));
+        assert!(matches!(
+            host.decide(true, None, None, false, false, UnixMs(limit.0 - 1)),
+            Boundary::No { recheck: Some(at) } if at == limit
+        ));
+        assert!(matches!(
+            host.decide(true, None, None, false, false, limit),
+            Boundary::Now { wake } if wake.trigger == WakeTrigger::Checkin
         ));
         host.shutdown().await.unwrap();
     }

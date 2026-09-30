@@ -220,7 +220,7 @@ async fn call(inference: &Accounts, body: Request, sender: &PolicySender) -> any
 pub(crate) async fn serve(
     inference: Accounts,
     sender: PolicySender,
-    mut incoming: mpsc::Receiver<Vec<u8>>,
+    mut incoming: mpsc::Receiver<(Vec<u8>, Arc<()>)>,
 ) -> anyhow::Result<()> {
     let mut routes = inference.route_updates();
     let mut credentials = inference.credential_updates();
@@ -232,7 +232,7 @@ pub(crate) async fn serve(
                     biased;
                     Some(result) = calls.join_next(), if !calls.is_empty() => { result??; }
                     message = incoming.recv() => {
-                        let bytes = message.ok_or_else(|| anyhow::anyhow!("workset policy connection closed"))?;
+                        let (bytes, inflight) = message.ok_or_else(|| anyhow::anyhow!("workset policy connection closed"))?;
                         let mut remaining = bytes.as_slice();
                         let message = senax_encoder::decode(&mut remaining)
                             .map_err(|_| anyhow::anyhow!("invalid inference policy request"))?;
@@ -249,7 +249,9 @@ pub(crate) async fn serve(
                         calls.spawn(async move {
                             let result = call(&inference, body, &sender).await;
                             let body = result.unwrap_or_else(|error| Reply::Error(error.to_string()));
-                            send(&sender, Message::Reply { id, body }).await
+                            send(&sender, Message::Reply { id, body }).await?;
+                            drop(inflight);
+                            Ok::<(), anyhow::Error>(())
                         });
                     }
                 }

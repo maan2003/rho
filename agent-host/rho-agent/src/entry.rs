@@ -153,7 +153,7 @@ impl RequestNotice {
                 "Your response was cut off while you were writing its cell; only the code shown ran. Carry on from the notebook's state without replaying it."
             }
             Self::PreviousResponseHadNoExec => {
-                "Your last response had no exec call. Text outside a call reaches nobody: speak with human.send()."
+                "Your last response had no exec call. Text outside a call reaches nobody."
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
@@ -194,15 +194,13 @@ pub enum Entry {
         at: UnixMs,
         text: String,
     },
-    /// Some task began awaiting `human.reply()`: from here the agent is
-    /// parked on the human until they write, it is archived, or it stops
-    /// waiting unanswered. A restart does not end it; a restarted agent
-    /// still waits for fresh input.
+    /// The model ended its turn with `end_turn()`: from here the agent is
+    /// parked on the human until they write or it is archived. A restart
+    /// does not end it; a restarted agent still waits for fresh input.
     AwaitingHuman {
         at: UnixMs,
     },
-    /// The last waiting task stopped without the human writing: cancelled,
-    /// failed, or given up.
+    /// The wait ended without the human writing: the agent was archived.
     StoppedAwaitingHuman {
         at: UnixMs,
     },

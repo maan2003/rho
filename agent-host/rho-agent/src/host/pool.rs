@@ -86,9 +86,6 @@ pub struct AgentPool {
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
-    /// Set by [`AgentPool::drain`]: the agent host is stopping, and a worker
-    /// that goes away now was let go rather than lost.
-    draining: std::sync::atomic::AtomicBool,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
     /// Which agents each connection is looking at; the union is the live
@@ -148,7 +145,6 @@ impl AgentPool {
             worksets,
             claude,
             agents: Mutex::new(HashMap::new()),
-            draining: std::sync::atomic::AtomicBool::new(false),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
@@ -262,6 +258,103 @@ impl AgentPool {
         .await?;
         *process = Some(started.clone());
         Ok(started)
+    }
+
+    /// Readies every workset process for a re-executed agent host to take
+    /// over and describes them for it. The host stops reading worker
+    /// requests and keeps reading everything else until every request it
+    /// started, anywhere, is answered: one may wait on a frame from another
+    /// workset. Then it stops reading altogether. If that takes too long,
+    /// all carry on and this errs.
+    pub async fn hand_over(&self) -> anyhow::Result<Vec<crate::host::Handed>> {
+        let slots = self
+            .processes
+            .lock()
+            .await
+            .iter()
+            .map(|(workset, slot)| (workset.clone(), slot.clone()))
+            .collect::<Vec<_>>();
+        let mut processes = Vec::new();
+        for (workset, slot) in slots {
+            if let Some(process) = slot
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .filter(|process| !*process.closed.borrow())
+            {
+                processes.push((workset, process.clone()));
+            }
+        }
+        let idle = || async {
+            while !processes.iter().all(|(_, process)| process.idle()) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let handed = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            futures::future::try_join_all(
+                processes.iter().map(|(_, process)| process.stop_requests()),
+            )
+            .await?;
+            idle().await;
+            futures::future::try_join_all(
+                processes.iter().map(|(_, process)| process.stop_reading()),
+            )
+            .await?;
+            futures::future::try_join_all(
+                processes
+                    .iter()
+                    .map(|(workset, process)| process.hand(workset.clone())),
+            )
+            .await
+        })
+        .await
+        .context("workset processes did not settle")
+        .flatten();
+        if handed.is_err() {
+            for (_, process) in &processes {
+                process.resume();
+            }
+        }
+        handed
+    }
+
+    /// Undoes a [`AgentPool::hand_over`] whose exec failed.
+    pub async fn resume(&self) {
+        for process in self.executions().await {
+            process.resume();
+        }
+    }
+
+    /// Takes over the workset processes, and their agents, that the agent
+    /// host this one re-executed handed over.
+    pub async fn adopt(self: &Arc<Self>, handed: Vec<crate::host::Handed>) {
+        for handed in handed {
+            if let Err(error) = self.adopt_process(&handed).await {
+                eprintln!("rho-agent: not taking over {}: {error:#}", handed.workset);
+            }
+        }
+    }
+
+    async fn adopt_process(self: &Arc<Self>, handed: &crate::host::Handed) -> anyhow::Result<()> {
+        let slot = self.execution_slot(&handed.workset).await;
+        let process = crate::host::Process::adopt(self, handed, slot.admission.clone()).await?;
+        *slot.process.lock().await = Some(process.clone());
+        for &agent_id in &handed.agents {
+            match AgentClient::adopt(self, agent_id, process.clone()).await {
+                Ok(agent) => {
+                    agent.tell_tail();
+                    self.agents.lock().await.insert(agent_id, agent);
+                    self.touch(agent_id);
+                }
+                Err(error) => eprintln!(
+                    "rho-agent: not taking over {}: {error:#}",
+                    agent_id.encoded()
+                ),
+            }
+        }
+        process.resume();
+        Ok(())
     }
 
     pub fn worksets(&self) -> &Arc<Worksets> {
@@ -384,40 +477,6 @@ impl AgentPool {
             self.touch(agent_id);
         }
         agent
-    }
-
-    /// Loaded agents mid-turn or with input waiting.
-    pub async fn unsettled(&self) -> Vec<AgentId> {
-        self.agents
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, agent)| !agent.settled())
-            .map(|(agent_id, _)| *agent_id)
-            .collect()
-    }
-
-    /// Drains every loaded agent at once; see [`AgentClient::drain`].
-    pub async fn drain(&self) {
-        self.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let agents = self
-            .agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent_id, agent)| (*agent_id, agent.clone()))
-            .collect::<Vec<_>>();
-        let drains = agents.into_iter().map(|(agent_id, agent)| async move {
-            if let Err(error) = agent.drain().await {
-                eprintln!("rho-agent: drain {}: {error:#}", agent_id.encoded());
-            }
-        });
-        futures::future::join_all(drains).await;
-    }
-
-    pub(crate) fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether any client is looking at this agent right now. Read by the

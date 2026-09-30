@@ -88,6 +88,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         anthropic_base_url: None,
         extra_before_path: None,
         extra_after_path: None,
+        handoff: None,
     }));
     loop {
         match rho_rpc::connect_unix(&socket_path).await {

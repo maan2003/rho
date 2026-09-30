@@ -130,6 +130,15 @@ fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
     Ok(environment)
 }
 
+fn strip_github_environment(environment: &mut Vec<(OsString, OsString)>) {
+    environment.retain(|(name, _)| {
+        !matches!(
+            name.to_str(),
+            Some("GH_TOKEN" | "GITHUB_TOKEN" | "GH_HOST" | "GH_CONFIG_DIR")
+        )
+    });
+}
+
 fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> anyhow::Result<()> {
     let count = environment
         .iter()
@@ -225,6 +234,19 @@ impl PlatformSecrets {
             Err(error) => tracing::error!(%error, "reclaiming platform secrets fd"),
         }
         secrets
+    }
+
+    /// The store a predecessor left open at `fd`.
+    fn handed(fd: i32) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the predecessor left this fd open for us and nothing else
+        // claims it.
+        let store =
+            secret_store::SecretStore::from_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        store.keep()?;
+        let secrets = Self::default();
+        *secrets.store.lock().expect("platform secrets lock") = Some(Arc::new(store));
+        Ok(secrets)
     }
 
     fn current_store(&self) -> Option<Arc<secret_store::SecretStore>> {
@@ -361,8 +383,51 @@ pub fn configure_embedded_environment() {
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
+/// What a re-executed agent host inherits from its predecessor, in
+/// [`HANDOFF_ENV`] as hex.
+#[derive(senax_encoder::Encode, senax_encoder::Decode)]
+struct Handoff {
+    workers: Vec<rho_agent::host::Handed>,
+    /// The platform secrets memfd, left open across exec.
+    secrets: Option<i32>,
+}
+
+const HANDOFF_ENV: &str = "RHO_HANDOFF";
+
+/// Takes a predecessor's handoff out of the environment, so no child
+/// inherits it. Must run before the Tokio runtime starts, for the same
+/// reason as [`configure_embedded_environment`].
+pub fn take_handoff() -> Option<String> {
+    let handoff = std::env::var(HANDOFF_ENV).ok();
+    // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
+    unsafe { std::env::remove_var(HANDOFF_ENV) };
+    handoff
+}
+
+impl Handoff {
+    fn decode(hex: &str) -> anyhow::Result<Self> {
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|at| {
+                u8::from_str_radix(hex.get(at..at + 2).context("odd hex")?, 16).map_err(Into::into)
+            })
+            .collect::<anyhow::Result<Vec<u8>>>()?;
+        senax_encoder::decode(&mut bytes::Bytes::from(bytes))
+            .map_err(|error| anyhow::anyhow!("decode handoff: {error}"))
+    }
+
+    fn encode(&self) -> anyhow::Result<String> {
+        let bytes = senax_encoder::encode(self)
+            .map_err(|error| anyhow::anyhow!("encode handoff: {error}"))?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct HostArgs {
+    /// A predecessor's handoff; see [`take_handoff`].
+    #[arg(skip)]
+    pub handoff: Option<String>,
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
@@ -420,8 +485,52 @@ impl HostProfiler {
     }
 }
 
+/// How long each phase of starting up or handing over took, for the log.
+struct Phases {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    done: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl Phases {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            start: now,
+            last: now,
+            done: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.done.push((phase, now - self.last));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Phases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ms (",
+            self.last.duration_since(self.start).as_millis()
+        )?;
+        for (index, (phase, took)) in self.done.iter().enumerate() {
+            let separator = if index == 0 { "" } else { ", " };
+            write!(f, "{separator}{phase} {} ms", took.as_millis())?;
+        }
+        write!(f, ")")
+    }
+}
+
 pub async fn run(args: HostArgs) -> anyhow::Result<()> {
-    let platform_secrets = PlatformSecrets::from_fd_store();
+    let mut phases = Phases::new();
+    let handoff = args.handoff.as_deref().map(Handoff::decode).transpose()?;
+    let platform_secrets = match handoff.as_ref().and_then(|handoff| handoff.secrets) {
+        Some(fd) => PlatformSecrets::handed(fd)?,
+        None => PlatformSecrets::from_fd_store(),
+    };
     let runtime = start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
 
     // The agent host's own cwd must never matter: agents each carry their own
@@ -457,6 +566,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         rho_rpc::protocol::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
+    // A login shell may carry GitHub credentials and gh configuration.
+    // Agents use only Octo's host-held token.
+    strip_github_environment(&mut user_environment);
     configure_octo_git_transport(&mut user_environment)?;
     if let Some(endpoint) = &args.anthropic_base_url {
         let parsed = url::Url::parse(endpoint).context("parse Anthropic base URL")?;
@@ -472,6 +584,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     }
     apply_host_directories(&mut user_environment, &state_dir, &claude);
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
+    phases.mark("environment");
 
     let db = RhoDb::open(db_path);
     let inference = match args.openai_base_url {
@@ -484,6 +597,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         }
         None => Accounts::new(db.clone()).await?,
     };
+    phases.mark("database");
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path
@@ -520,12 +634,14 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             .await?
         }
     };
+    phases.mark("worksets");
     run_devshell_daemon(&worksets);
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
                 .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
+        phases.mark("iroh");
         Some((listener, auth))
     } else {
         None
@@ -539,6 +655,10 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         claude.clone(),
     )
     .await;
+    if let Some(handoff) = handoff {
+        pool.adopt(handoff.workers).await;
+        phases.mark("adopt");
+    }
     let services = Arc::new(
         Services::new(
             db,
@@ -547,7 +667,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             claude.clone(),
             user_environment,
             platform_secrets,
-            runtime.paths.octo_socket(),
         )
         .await?,
     );
@@ -579,27 +698,53 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mut iroh_listener = iroh.map(|(listener, _)| {
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(run_iroh_listener(
-            services.clone(),
-            listener,
-            iroh_auth.clone(),
-            stopped,
-        ));
-        (shutdown, task)
-    });
-    let resume_path = state_dir.join(RESUME_AFTER_RESTART);
-    tokio::spawn(resume_after_restart(services.clone(), resume_path.clone()));
+    let start_iroh = {
+        let services = services.clone();
+        let iroh_auth = iroh_auth.clone();
+        move |listener| {
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_iroh_listener(
+                services.clone(),
+                listener,
+                iroh_auth.clone(),
+                stopped,
+            ));
+            (shutdown, task)
+        }
+    };
+    let iroh_enabled = iroh.is_some();
+    let mut iroh_listener = iroh.map(|(listener, _)| start_iroh(listener));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        .context("register SIGUSR2 handler")?;
+    phases.mark("services");
+    // Read from this process's own /proc entry, which others may not read.
+    let exe = std::env::current_exe().map_or_else(
+        |error| format!("an unknown executable ({error})"),
+        |exe| exe.display().to_string(),
+    );
+    eprintln!("rho-agent-host: ready in {phases}, running {exe}");
 
     loop {
         tokio::select! {
+            _ = upgrade.recv() => {
+                let error = reexec(&services, &mut iroh_listener).await;
+                eprintln!("rho-agent-host: re-exec failed, carrying on: {error:#}");
+                if iroh_enabled && iroh_listener.is_none() {
+                    match rho_rpc::AuthenticatedIrohListener::bind(
+                        services.db.clone(),
+                        rho_rpc::protocol::IROH_ALPN,
+                    )
+                    .await
+                    {
+                        Ok((listener, _)) => iroh_listener = Some(start_iroh(listener)),
+                        Err(error) => eprintln!("rho-agent-host: iroh stays down: {error:#}"),
+                    }
+                }
+            }
             result = &mut shutdown => {
                 result?;
-                services.stopping.store(true, Ordering::Relaxed);
-                stop_executions(&services, &resume_path).await;
                 if let Some((shutdown, listener)) = iroh_listener.take() {
                     let _ = shutdown.send(());
                     listener.await.context("close iroh listener")?;
@@ -621,82 +766,71 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Agents that were working when this agent host was told to stop, one id
-/// per line, for the next one to wake.
-const RESUME_AFTER_RESTART: &str = "resume-after-restart";
-
-/// A stop someone asked for (a deploy, say) is a chosen restart: the agents
-/// it interrupted carry on after it. A crash writes nothing, so a crash is
-/// still never a reason to send
-/// (`DECISION-a-restart-does-not-resume-by-itself`).
-async fn record_resume_after_restart(services: &Services, path: &Utf8Path) {
-    let agents = services.pool.unsettled().await;
-    let text: String = agents.iter().map(|id| id.encoded() + "\n").collect();
-    if let Err(error) = std::fs::write(path, text) {
-        eprintln!("rho-agent-host: could not record agents to resume in {path}: {error}");
-    }
-}
-
-/// How long stopping may take: draining the agents (each workset gives
-/// up on a request at 50s) and then the workset processes. systemd's default
-/// stop timeout is 90s.
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Drains every agent, so requests in flight end and each log is flushed,
-/// then stops every workset process, as idle eviction does, rather than
-/// leaving them to die with this one. Under `KillMode=mixed` only this
-/// process is signalled, so the workers are still there to drain.
-async fn stop_executions(services: &Services, resume_path: &Utf8Path) {
-    let stop = async {
-        services.pool.drain().await;
-        // After the drain: an agent whose request ended in a final answer
-        // is done, and only those still at work are woken.
-        record_resume_after_restart(services, resume_path).await;
-        let stops = services
-            .pool
-            .executions()
-            .await
-            .into_iter()
-            .map(|process| async move { process.shutdown().await });
-        futures::future::join_all(stops).await;
+/// Replaces this agent host with whatever binary its path now names, keeping
+/// the pid: the workset processes, still its children, are handed over with
+/// their agents, Python and commands running. Returns only on failure, with
+/// everything carrying on here.
+async fn reexec(
+    services: &Services,
+    iroh: &mut Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )>,
+) -> anyhow::Error {
+    use std::os::unix::process::CommandExt as _;
+    let mut phases = Phases::new();
+    let workers = match services.pool.hand_over().await {
+        Ok(workers) => workers,
+        Err(error) => return error,
     };
-    if tokio::time::timeout(STOP_TIMEOUT, stop).await.is_err() {
-        eprintln!("rho-agent-host: still stopping after {STOP_TIMEOUT:?}; exiting anyway");
-    }
-}
-
-/// Wakes the agents the last agent host recorded on its way down. The record
-/// is removed first, so an agent host that dies waking them does not wake
-/// them again.
-async fn resume_after_restart(services: Arc<Services>, path: Utf8PathBuf) {
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if let Err(error) = std::fs::remove_file(&path) {
-        eprintln!("rho-agent-host: not resuming agents, {path} stays: {error}");
-        return;
-    }
-    for id in text.lines().filter(|line| !line.is_empty()) {
-        let Ok(agent_id) = AgentId::from_encoded(id) else {
-            eprintln!("rho-agent-host: not resuming unknown agent id {id}");
-            continue;
-        };
-        let command = rho_agents_client::protocol::AgentCommand::Send {
-            agent_id,
-            messages: vec![rho_agents_client::protocol::UserMessage {
-                id: rho_agent::entry::MessageId::new().0,
-                content: vec![ContentPart::Text {
-                    text: "The agent host was stopped on purpose (for example to deploy a new \
-                           rho) while you were working, and has started again. Continue your \
-                           task."
-                        .to_owned(),
-                }],
-            }],
-        };
-        if let Err(error) = agents::handle_agent_command(&services, command).await {
-            eprintln!("rho-agent-host: could not resume {id}: {error:#}");
+    phases.mark("hand over");
+    let error = async {
+        services.pool.flush_agent_usage(None).await;
+        phases.mark("usage");
+        let secrets = services
+            .platform_secrets
+            .current_store()
+            .map(|store| store.hand())
+            .transpose()?;
+        let handoff = Handoff { workers, secrets }.encode()?;
+        let _settled = services.db.settle().await?;
+        phases.mark("database");
+        // Peers hear their connections close rather than wait out the idle
+        // timeout.
+        if let Some((shutdown, listener)) = iroh.take() {
+            let _ = shutdown.send(());
+            if tokio::time::timeout(std::time::Duration::from_secs(5), listener)
+                .await
+                .is_err()
+            {
+                eprintln!("rho-agent-host: iroh still closing after 5s; re-executing anyway");
+            }
+            phases.mark("iroh");
         }
+        let mut args = std::env::args_os();
+        let program = args.next().context("no argv[0]")?;
+        eprintln!(
+            "rho-agent-host: re-executing {} after {phases}",
+            program.to_string_lossy()
+        );
+        // The systemd fd store's fds were claimed, so its numbers are stale.
+        Err::<(), _>(anyhow::Error::from(
+            std::process::Command::new(program)
+                .args(args)
+                .env(HANDOFF_ENV, handoff)
+                .env_remove("LISTEN_PID")
+                .env_remove("LISTEN_FDS")
+                .env_remove("LISTEN_FDNAMES")
+                .exec(),
+        ))
     }
+    .await
+    .unwrap_err();
+    if let Some(store) = services.platform_secrets.current_store() {
+        let _ = store.keep();
+    }
+    services.pool.resume().await;
+    error
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {
@@ -974,8 +1108,6 @@ struct Services {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    /// Stateless PR, CI, review, and comment operations.
-    pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
     /// Marked whenever a quota observation lands; every agents session
@@ -989,9 +1121,6 @@ struct Services {
     git_transport: GitTransportBroker,
     /// At most one GUI owns the voice session's microphone and playback.
     voice_lease: Arc<TokioMutex<()>>,
-    /// Set once this agent host starts stopping: agents are draining, and
-    /// none is created or loaded or told anything new.
-    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Services {
@@ -1003,11 +1132,8 @@ impl Services {
         claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_fs_view::UserEnvironment,
         platform_secrets: PlatformSecrets,
-        octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
-        let pr_monitor =
-            rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let ledger = rho_ledger_server::LedgerServer::open(db.clone()).await;
         let registry = Self {
@@ -1018,23 +1144,13 @@ impl Services {
             visualizations,
             inference,
             machine_seed,
-            pr_monitor,
             platform_secrets,
             quota: tokio::sync::watch::channel(()).0,
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
-            stopping: std::sync::atomic::AtomicBool::new(false),
         };
         Ok(registry)
-    }
-
-    fn refuse_while_stopping(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.stopping.load(Ordering::Relaxed),
-            "the agent host is stopping; try again once it is back"
-        );
-        Ok(())
     }
 
     fn auth_state(&self) -> AuthState {
@@ -1055,7 +1171,6 @@ impl Services {
         role: AgentRole,
         start: StartMode,
     ) -> anyhow::Result<(AgentId, AgentClient)> {
-        self.refuse_while_stopping()?;
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 // The agent record is committed before its workset is cloned
@@ -1132,7 +1247,6 @@ impl Services {
     }
 
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, AgentClient, bool)> {
-        self.refuse_while_stopping()?;
         self.pool.load(agent_id).await
     }
 }
@@ -1365,8 +1479,27 @@ mod tests {
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
         PlatformSecrets, configure_octo_git_transport, prepare_image_content,
-        start_runtime_sockets, validate_image_content,
+        start_runtime_sockets, strip_github_environment, validate_image_content,
     };
+
+    #[test]
+    fn github_credentials_and_gh_config_do_not_enter_agent_environment() {
+        let mut environment = [
+            ("GH_TOKEN", "ambient-gh-token"),
+            ("GITHUB_TOKEN", "ambient-github-token"),
+            ("GH_HOST", "enterprise.example"),
+            ("GH_CONFIG_DIR", "/tmp/gh"),
+            ("PATH", "/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        strip_github_environment(&mut environment);
+        assert_eq!(
+            environment,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin"))]
+        );
+    }
 
     #[tokio::test]
     async fn explicit_socket_keeps_runtime_files_beside_it() {
@@ -1382,7 +1515,6 @@ mod tests {
         assert!(paths.octo_socket().exists());
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
-        assert!(!paths.pr_logs().exists());
         assert_eq!(
             std::fs::read_dir(runtime.path())
                 .unwrap()

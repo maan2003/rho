@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
-    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
+    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -181,17 +181,6 @@ where
             })
             .await
         }
-        Request::Pr(call) => {
-            respond(
-                writer,
-                call,
-                |Pr {
-                     agent_id: _,
-                     command,
-                 }| async move { Ok(pr(services, command).await) },
-            )
-            .await
-        }
         Request::Snapshot(call) => {
             respond(writer, call, |Snapshot| debug::host_snapshot(&services.db)).await
         }
@@ -262,101 +251,6 @@ fn install_platform_secrets(
         Err(error) => (false, format!("{error:#}")),
     };
     Ok(PlatformStatus { running, detail })
-}
-
-/// A PR command's outcome. A failure is the command's own output, not a
-/// refused call.
-async fn pr(services: &Services, command: rho_agent_hosts::protocol::PrCommand) -> PrOutput {
-    let result = async {
-        match command {
-            rho_agent_hosts::protocol::PrCommand::Create {
-                owner,
-                repo,
-                head,
-                base,
-                title,
-                body,
-                review_bots: _,
-            } => services
-                .pr_monitor
-                .create(rho_pr_monitor::CreatePullRequest {
-                    owner,
-                    repo,
-                    head,
-                    base,
-                    title,
-                    body,
-                })
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Subscribe { .. } => Ok((
-                "persistent PR subscriptions were removed; poll `rho pr status` instead".to_owned(),
-                Vec::new(),
-            )),
-            rho_agent_hosts::protocol::PrCommand::Status { url } => services
-                .pr_monitor
-                .status(&url)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Stop { .. } => Ok((
-                "persistent PR subscriptions were removed".to_owned(),
-                Vec::new(),
-            )),
-            rho_agent_hosts::protocol::PrCommand::Comment {
-                url,
-                reply_comment,
-                body,
-            } => services
-                .pr_monitor
-                .comment(&url, reply_comment, &body)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Comments { url } => services
-                .pr_monitor
-                .comments(&url)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Checks { url } => services
-                .pr_monitor
-                .checks(&url)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Edit {
-                url,
-                base,
-                title,
-                body,
-            } => services
-                .pr_monitor
-                .edit(&url, base, title, body)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Rerun { url, run_id } => services
-                .pr_monitor
-                .rerun(&url, run_id)
-                .await
-                .map(|output| (output, Vec::new())),
-            rho_agent_hosts::protocol::PrCommand::Logs { url, run_id } => services
-                .pr_monitor
-                .logs(&url, run_id)
-                .await
-                .map(|data| (format!("downloaded logs for run {run_id}"), data.to_vec())),
-        }
-    }
-    .await;
-    match result {
-        Ok((output, data)) => PrOutput {
-            output,
-            data,
-            is_error: false,
-        },
-        Err(error) => PrOutput {
-            output: format!("{error:#}"),
-            data: Vec::new(),
-            is_error: true,
-        },
-    }
 }
 
 async fn store_gui_telemetry(snapshot: Vec<u8>) -> anyhow::Result<String> {

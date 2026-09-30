@@ -48,7 +48,7 @@ impl InferenceHost for FakeHost {
     fn serve_policy(
         &self,
         _: PolicySender,
-        mut incoming: mpsc::Receiver<Vec<u8>>,
+        mut incoming: mpsc::Receiver<(Vec<u8>, Arc<()>)>,
     ) -> BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             while incoming.recv().await.is_some() {}

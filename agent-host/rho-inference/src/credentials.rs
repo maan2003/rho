@@ -95,7 +95,7 @@ fn subscribe_with(
 ) -> watch::Receiver<CredentialSnapshot> {
     let resolve = std::sync::Arc::new(resolve);
     let initial = CredentialSnapshot {
-        revision: 0,
+        revision: crate::revision_floor(),
         state: CredentialState::Pending,
     };
     let (published, updates) = watch::channel(initial);

@@ -941,7 +941,6 @@ impl ClaudeLoop {
                             .collect(),
                     })
                     .await?;
-                    self.mailroom.agent_received();
                     self.pending_agent.push_back(at);
                     self.deferred.push_back((content, uuid, sender, id));
                     if let Some(accepted) = accepted {
@@ -950,11 +949,11 @@ impl ClaudeLoop {
                     return Ok(());
                 }
                 if matches!(source, InputSource::Human(_)) {
-                    self.mailroom.received();
+                    // The human's message ends a wait it answers.
+                    self.awaiting = false;
                     self.pending_human.push_back(at);
                 }
                 if matches!(source, InputSource::Agent(_)) {
-                    self.mailroom.agent_received();
                     self.pending_agent.push_back(at);
                 }
                 let original_content = content.clone();
@@ -1176,18 +1175,16 @@ impl ClaudeLoop {
                 self.host.message_sent(text).await?;
             }
             Outbound::Status(text) => self.entry(Entry::Status { at, text }).await?,
-            Outbound::Awaiting if !self.archived => {
-                self.awaiting = true;
-                self.entry(Entry::AwaitingHuman { at }).await?;
-            }
-            // The human's message already ends a wait it answers.
-            Outbound::StoppedAwaiting { answered } if !self.archived && self.awaiting => {
-                self.awaiting = false;
-                if !answered {
-                    self.entry(Entry::StoppedAwaitingHuman { at }).await?;
+            Outbound::EndTurn if !self.archived => {
+                if let Some(python) = self.python.as_mut() {
+                    python.end_turn();
+                }
+                if !self.awaiting {
+                    self.awaiting = true;
+                    self.entry(Entry::AwaitingHuman { at }).await?;
                 }
             }
-            Outbound::Awaiting | Outbound::StoppedAwaiting { .. } => {}
+            Outbound::EndTurn => {}
             Outbound::Archive => {
                 self.archived = true;
                 self.entry(Entry::Notice {
@@ -2030,12 +2027,19 @@ impl ClaudeLoop {
             python_host::Boundary::Now { wake } => {
                 self.python_recheck = None;
                 if let Some((pending, mut drained)) = host.answer_pending() {
+                    let ends_turn = host.ended();
                     let batch = self.record_output(&mut drained, wake, now).await?;
                     let delivered = self.pending_output.clone().expect("recorded output");
+                    let mut result = drained.into_mcp_result();
+                    if ends_turn {
+                        // Claude Code ends the turn on this result without
+                        // sampling the model again (unless it is an error).
+                        result["_meta"] = serde_json::json!({ "claude/endTurn": true });
+                    }
                     let reply = serde_json::json!({
                         "mcp_response": {
                             "jsonrpc": "2.0", "id": pending.rpc_id,
-                            "result": drained.into_mcp_result(),
+                            "result": result,
                         },
                     });
                     self.observe_exec(
@@ -2082,7 +2086,7 @@ impl ClaudeLoop {
                         return Ok(());
                     }
                     let content = if correction {
-                        vec![ContentPart::Text { text: "Your last response had no exec call. Text outside a call reaches nobody: speak with human.send().".into() }]
+                        vec![ContentPart::Text { text: "Your last response had no exec call. Text outside a call reaches nobody.".into() }]
                     } else if drained.is_empty() && self.pending_output.is_none() {
                         vec![ContentPart::Text {
                             text: "Check-in: nothing new.".into(),
@@ -2397,7 +2401,6 @@ impl ClaudeLoop {
             match turn.source {
                 InputSource::Human(_) => {
                     self.pending_human.pop_front();
-                    self.mailroom.read(1);
                 }
                 InputSource::Agent(_) | InputSource::DeferredAgent(..) => {
                     self.pending_agent.pop_front();

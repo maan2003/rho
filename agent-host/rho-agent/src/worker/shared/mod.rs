@@ -16,6 +16,8 @@ pub(crate) struct Progress {
     pub last_response: Option<UnixMs>,
     pub told_returned: bool,
     pub prose: u32,
+    /// The model called `end_turn()`: until it is woken, no check-in.
+    pub ended: bool,
 }
 
 impl Progress {
@@ -40,7 +42,10 @@ impl Progress {
                 .filter(|facts| !facts.delivered && facts.finished.is_some_and(|end| end.failed))
                 .filter_map(|facts| facts.finished.map(|end| end.at))
                 .min(),
-            checkin: self.last_response.map(|at| at + wait),
+            checkin: self
+                .last_response
+                .filter(|_| !self.ended)
+                .map(|at| at + wait),
             response_finished: self.last_response,
             prose: self.prose > 0,
             ..Default::default()

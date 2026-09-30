@@ -52,7 +52,7 @@ fn sol_binding_is_the_medium_engineer() {
         effort: ReasoningEffort::High,
         fast_mode: false,
     });
-    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt6Sol));
+    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt61Sol));
     assert_eq!(
         binding.agent_role(),
         AgentRole::Engineer {
@@ -579,6 +579,55 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
+async fn migration_removes_retired_pr_monitor_tables() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    // The retired tables' contents are deliberately not decoded by this build.
+    let watches = TableDefinition::<String, String>::new("pr_watches");
+    let feedback = TableDefinition::<String, String>::new("pr_feedback");
+    let unrelated = TableDefinition::<String, String>::new("unrelated");
+
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"e3a95c07".to_owned());
+    write
+        .open_table(watches)
+        .insert(&"watch".to_owned(), &"old".to_owned());
+    write
+        .open_table(feedback)
+        .insert(&"comment".to_owned(), &"old".to_owned());
+    write
+        .open_table(unrelated)
+        .insert(&"keep".to_owned(), &"value".to_owned());
+    write.commit();
+
+    assert_eq!(
+        db.read().open_table(FORMAT).get(&()).unwrap().value(),
+        "e3a95c07"
+    );
+    prepare(&db).await;
+    let read = db.read();
+    assert!(!read.has_table("pr_watches"));
+    assert!(!read.has_table("pr_feedback"));
+    assert_eq!(
+        read.open_table(unrelated)
+            .get(&"keep".to_owned())
+            .unwrap()
+            .value(),
+        "value"
+    );
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    drop(read);
+    assert_eq!(savepoints(&db).await.len(), 1);
+
+    // A second open does not run the migration or create another savepoint.
+    prepare(&db).await;
+    assert_eq!(savepoints(&db).await.len(), 1);
+}
+
+#[tokio::test]
 async fn current_agent_db_format_is_accepted_on_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -591,7 +640,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format 7f24a9d3, this build expects e3a95c07")]
+#[should_panic(expected = "database format 7f24a9d3, this build expects 1f34dc6c")]
 async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -602,7 +651,7 @@ async fn init_agent_tables_rejects_older_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format deadbeef, this build expects e3a95c07")]
+#[should_panic(expected = "database format deadbeef, this build expects 1f34dc6c")]
 async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -1317,10 +1366,14 @@ async fn migration_splits_old_waits_into_starts_and_stops() {
             }),
         );
     }
+    write
+        .open_table(TableDefinition::<String, String>::new("pr_watches"))
+        .insert(&"watch".to_owned(), &"old".to_owned());
     write.open_table(FORMAT).insert(&(), &"a3f26d91".to_owned());
     write.commit();
     prepare(&db).await;
     let read = db.read();
+    assert!(!read.has_table("pr_watches"));
     assert_eq!(
         read.open_table(FORMAT).get(&()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT

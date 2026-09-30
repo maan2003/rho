@@ -35,7 +35,6 @@ members = [
   "crates/rho-desktop-client",
   "agent-host/rho-ledger-server",
   "agent-host/rho-openai-realtime",
-  "agent-host/rho-pr-monitor",
   "agent-host/rho-devshell-builder",
   "crates/rho-profiling",
   "crates/rho-qa",
@@ -150,7 +149,6 @@ rho-dealer = { path = "crates/rho-dealer" }
 rho-desktop-client = { path = "crates/rho-desktop-client" }
 rho-ledger-server = { path = "agent-host/rho-ledger-server" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
-rho-pr-monitor = { path = "agent-host/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-agent-hosts = { path = "crates/rho-agent-hosts" }
 rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }

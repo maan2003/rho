@@ -18,7 +18,7 @@ impl InferenceHost for Accounts {
     fn serve_policy(
         &self,
         sender: PolicySender,
-        incoming: mpsc::Receiver<Vec<u8>>,
+        incoming: mpsc::Receiver<(Vec<u8>, std::sync::Arc<()>)>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(crate::policy::serve(self.clone(), sender, incoming))
     }

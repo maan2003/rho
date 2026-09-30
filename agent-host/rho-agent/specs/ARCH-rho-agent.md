@@ -95,6 +95,18 @@ healthy commit acknowledgments: request batches include pending timing, and
 response batches include usage accounting in the same transaction. Explicit
 barriers synchronize rewind, profile changes, terminal publication and shutdown.
 A crash may lose the unflushed tail, but cannot expose a partial database batch.
+Workset processes outlive a re-exec of the agent host. Each worker has two
+connections: one carries the requests it makes of the host and their answers,
+the other everything else. On `SIGUSR2` the host stops reading requests,
+leaving new ones in the socket, while answers keep arriving, so a request
+waiting on another workset can finish. Once no started request is in flight
+anywhere, it stops reading the other connection too, holds both writers
+between frames, and execs its binary with the connections left open. The
+successor, same pid, writes the frames the old writers still held, adopts the
+workers and their agents without bootstrapping them, and reads on. Workers
+need no part in this. A worker whose protocol version differs is not adopted.
+Workers carry no parent-death signal, which a re-exec would fire; a worker
+ends when its connections close.
 
 The host uses persisted `Place` and `Workset` directly; no per-agent view
 descriptor is retained. New checkouts have a one-shot preparation future,

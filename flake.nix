@@ -347,10 +347,87 @@
           paths = buildPaths;
         };
 
-        pythonPackages = pkgs.python3.withPackages (ps: [
-          ps.pyyaml
-          ps.httpx
-        ]);
+        # The selected ghapi sources use upstream's OpenAPI operation machinery.
+        # Package its Python dependencies without vendoring their repositories.
+        pythonPackages = pkgs.python3.withPackages (
+          ps:
+          let
+            fastcore = ps.buildPythonPackage {
+              pname = "fastcore";
+              version = "2.2.23";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fastcore";
+                version = "2.2.23";
+                hash = "sha256-2IFuQOZXla2iHIBGip5Ni8Pr8SMD+3FRT85zDP9mdO4=";
+              };
+              build-system = [ ps.setuptools ];
+              doCheck = false;
+            };
+            fasttransport = ps.buildPythonPackage {
+              pname = "fasttransport";
+              version = "0.0.2";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fasttransport";
+                version = "0.0.2";
+                hash = "sha256-aG7l2KVLMUVwTO1prt28YykHbNyEHfD//xFh+T021Xk=";
+              };
+              build-system = [ ps.setuptools ];
+              dependencies = [ fastcore ps.httpx2 ];
+              doCheck = false;
+            };
+            fastspec = ps.buildPythonPackage {
+              pname = "fastspec";
+              version = "0.2.5";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "fastspec";
+                version = "0.2.5";
+                hash = "sha256-pdMq/4osnf19szO5SxEm8/99D+DGGuVNo/IZc5KvP/o=";
+              };
+              build-system = [ ps.setuptools ];
+              dependencies = [ fastcore fasttransport ];
+              doCheck = false;
+            };
+            # xdir/ls for exploring notebook objects; packaged from a pinned
+            # upstream revision instead of copying the Python sources here.
+            pythonLs = ps.buildPythonPackage {
+              pname = "python-ls";
+              version = "unstable-2026-03-07";
+              src = pkgs.fetchFromGitHub {
+                owner = "gabrielcnr";
+                repo = "python-ls";
+                rev = "e84e0c27514708f997ad4fb27b1b0cf56fdac4fe";
+                hash = "sha256-DwTTaXJF9IJ/F1LyWLWo29rzOe4xdaM8GU9ysKrSlXA=";
+              };
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/python_ls"
+                cp python_ls/*.py "$out/${pkgs.python3.sitePackages}/python_ls/"
+                runHook postInstall
+              '';
+            };
+            ghapi = ps.buildPythonPackage {
+              pname = "ghapi";
+              version = "2.1.5-rho";
+              src = ./agent-host/rho-notebook/src/ghapi;
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/ghapi"
+                cp *.py "$out/${pkgs.python3.sitePackages}/ghapi/"
+                runHook postInstall
+              '';
+              dependencies = [ fastcore fastspec fasttransport ];
+              doCheck = false;
+            };
+          in
+          [ ps.pyyaml ps.httpx ghapi pythonLs ]
+        );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
         # Evaluation in rho-devshell-builder records what the evaluator

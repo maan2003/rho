@@ -24,6 +24,16 @@ pub use responses::{
     ResolvedOAuth, RouteSelection,
 };
 
+/// Where a publisher's policy revisions start. Workers outlive a re-exec of
+/// the agent host and ignore revisions they have passed, so each publisher
+/// starts at the clock: above its predecessor, which bumps far less often
+/// than once a millisecond.
+fn revision_floor() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// Installs the TLS crypto provider if nothing has yet. Any HTTP client built
 /// here needs one; a host that has not installed its own can call this first.
 pub fn ensure_crypto_provider() {

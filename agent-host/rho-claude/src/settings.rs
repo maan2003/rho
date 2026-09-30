@@ -54,14 +54,21 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "Write",
 ];
 
-/// `base` with every built-in tool added to `permissions.deny`, leaving the
-/// account's other settings alone.
-/// A non-object base is replaced rather than merged.
+/// `base` with every built-in tool added to `permissions.deny`, every
+/// configured MCP server shut out, and the output style dropped, leaving the
+/// account's other settings alone. An empty `allowedMcpServers` admits no
+/// server by configuration, but Claude Code always admits `sdk` servers, so
+/// the notebook stays while the account's claude.ai connectors and any
+/// `.mcp.json` server go. An output style would restyle prose the model is
+/// told never reaches anyone, and the CLI repeats its reminder on every
+/// tool result. A non-object base is replaced rather than merged.
 pub fn deny_all_but_own_tools(base: &Value) -> Value {
     let mut settings = match base {
         Value::Object(map) => map.clone(),
         _ => serde_json::Map::new(),
     };
+    settings.remove("outputStyle");
+    settings.insert("allowedMcpServers".into(), json!([]));
     let permissions = settings.entry("permissions").or_insert_with(|| json!({}));
     if !permissions.is_object() {
         *permissions = json!({});
@@ -91,10 +98,14 @@ mod tests {
     fn extends_existing_deny_list_without_duplicates() {
         let base = json!({
             "model": "opus",
+            "outputStyle": "Explanatory",
+            "allowedMcpServers": [{ "serverName": "claude_ai_Gmail" }],
             "permissions": { "allow": ["Bash(git:*)"], "deny": ["Bash", "Read"] },
         });
         let settings = deny_all_but_own_tools(&base);
         assert_eq!(settings["model"], "opus");
+        assert!(settings.get("outputStyle").is_none());
+        assert_eq!(settings["allowedMcpServers"], json!([]));
         assert_eq!(settings["permissions"]["allow"], json!(["Bash(git:*)"]));
         let deny = settings["permissions"]["deny"].as_array().unwrap();
         assert_eq!(deny[0], "Bash");

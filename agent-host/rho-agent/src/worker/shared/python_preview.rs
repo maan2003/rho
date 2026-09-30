@@ -427,7 +427,7 @@ mod tests {
             ),
             ("human.send('old')\nhuman.send('new", Some("new")),
             (
-                "await human.reply()\nfor item in items:\n    print(item)\nhuman.send(\"After work",
+                "end_turn()\nfor item in items:\n    print(item)\nhuman.send(\"After work",
                 Some("After work"),
             ),
         ] {

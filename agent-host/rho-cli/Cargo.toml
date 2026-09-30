@@ -37,7 +37,6 @@ serde_json.workspace = true
 text.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zip.workspace = true
 
 # The driver's pointer: a headless seat has no pointer device, so `click`
 # creates one over `zwlr_virtual_pointer_v1` the way `wtype` creates a virtual
