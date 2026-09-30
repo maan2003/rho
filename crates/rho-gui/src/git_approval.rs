@@ -97,7 +97,27 @@ impl GitApproval {
     ) -> Option<AnyElement> {
         let pending = self.pending.as_ref()?;
         let colors = cx.theme().colors();
-        let mut deny = div().flex().flex_row().px_1().child("n deny");
+        // Tappable too: the phone has no `Y` and `n` to press, and an
+        // approval nobody can answer leaves the agent host blocked.
+        let answer = |id: &'static str, label: &'static str, action: Box<dyn gpui::Action>| {
+            div()
+                .id(id)
+                .debug_selector(|| id.to_owned())
+                .flex()
+                .flex_row()
+                .px_1()
+                .cursor_pointer()
+                .child(label)
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(action.boxed_clone(), cx);
+                    cx.stop_propagation();
+                })
+        };
+        let mut deny = answer(
+            "git-approval-deny",
+            "n deny",
+            Box::new(crate::GitApprovalDeny),
+        );
         if self.focus.is_focused(window) {
             deny = deny.bg(colors.element_selected);
         } else {
@@ -131,7 +151,14 @@ impl GitApproval {
                                 .items_center()
                                 .gap_4()
                                 .px_2()
-                                .child(div().text_color(colors.text_muted).child("Y allow"))
+                                .child(
+                                    answer(
+                                        "git-approval-allow",
+                                        "Y allow",
+                                        Box::new(crate::GitApprovalAllow),
+                                    )
+                                    .text_color(colors.text_muted),
+                                )
                                 .child(deny),
                         ),
                 )

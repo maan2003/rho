@@ -758,7 +758,7 @@ impl FileView {
         &self.editor
     }
 
-    fn save(&mut self, _: &crate::FileSave, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn save(&mut self, _: &crate::FileSave, window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
         save_buffers(self.remote.clone(), buffers, window, cx);
     }

@@ -6874,3 +6874,57 @@ fn a_phone_pinch_zooms_a_picture_and_then_a_drag_moves_it(cx: &mut TestAppContex
         "moved by {pan:?}"
     );
 }
+
+#[gpui::test]
+fn a_phone_answers_a_git_approval_by_tapping_allow(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    let (response, mut answered) = tokio::sync::oneshot::channel();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::GitTransportApproval {
+                    request_id: 7,
+                    prompt: "git fetch git@example.com:demo".to_owned(),
+                    response,
+                },
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    let mut vcx = gpui::VisualTestContext::from_window(*workspace, cx);
+    let allow = vcx
+        .debug_bounds("git-approval-allow")
+        .expect("the approval shows an allow to tap");
+    assert!(
+        answered.try_recv().is_err(),
+        "nothing is answered before the tap"
+    );
+    let tap = |phase, millis| {
+        TouchEvent {
+            id: TouchId(1),
+            phase,
+            position: allow.center(),
+            timestamp: std::time::Duration::from_millis(millis),
+            ..Default::default()
+        }
+        .to_platform_input()
+    };
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(tap(TouchPhase::Started, 0), cx);
+        window.dispatch_event(tap(TouchPhase::Ended, 60), cx);
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(
+        answered.try_recv().ok(),
+        Some(rho_agent_hosts::connection::GitApprovalDecision::Allow)
+    );
+}

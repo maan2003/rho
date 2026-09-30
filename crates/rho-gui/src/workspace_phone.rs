@@ -1451,6 +1451,14 @@ impl Workspace {
             };
             item("phone-send", "↑", label)
                 .on_click(cx.listener(|this, _, window, cx| this.phone_send(window, cx)))
+        } else if let Some(super::SurfaceView::File(view)) =
+            self.phone_surface().map(|surface| surface.view)
+        {
+            // The desk saves with `ctrl-s`, which an on-screen keyboard has
+            // no way to type.
+            item("phone-save", "↓", "save").on_click(cx.listener(move |_, _, window, cx| {
+                view.update(cx, |view, cx| view.save(&crate::FileSave, window, cx));
+            }))
         } else {
             div().id("phone-primary-empty").flex_1()
         };
