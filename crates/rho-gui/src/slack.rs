@@ -2250,6 +2250,9 @@ impl Workspace {
                     session.update(cx, |session, cx| session.open_file(&file, cx));
                 }
             }
+            rho_slack::ui::Target::Page(offset) => {
+                return self.slack_search_page(offset, window, cx);
+            }
         }
         true
     }

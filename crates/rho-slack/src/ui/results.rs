@@ -31,6 +31,9 @@ pub struct Place {
 pub enum Target {
     Message(Place),
     File(FileSummary),
+    /// The page this many pages away: the line that says `] next` goes
+    /// there on a tap or `enter`, for a reader with no `]` to press.
+    Page(i32),
 }
 
 #[derive(Clone, Debug)]
@@ -393,7 +396,12 @@ impl ResultsView {
         self.drawn.get(row).and_then(|line| line.target.clone())
     }
 
-    fn open_clicked(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+    fn open_clicked(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let hit = self.editor.update(cx, |editor, cx| {
             let selection = editor
                 .selections
@@ -410,6 +418,9 @@ impl ResultsView {
         match target {
             Target::Message(place) => cx.emit(Event::Open(place)),
             Target::File(file) => cx.emit(Event::OpenFile(file)),
+            Target::Page(offset) => {
+                self.request_adjacent(offset, window, cx);
+            }
         }
     }
 
@@ -520,27 +531,26 @@ fn append_navigation(lines: &mut Vec<(Option<Target>, Vec<Span>)>, page: u32, pa
     if pages <= 1 {
         return;
     }
-    let mut navigation = Vec::new();
-    if page > 1 {
-        navigation.push("[ previous");
-    }
-    if page < pages {
-        navigation.push("] next");
-    }
     lines.push((
         None,
         vec![Span::styled(
-            format!(
-                "page {page} of {pages}{}",
-                if navigation.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", navigation.join(" · "))
-                }
-            ),
+            format!("page {page} of {pages}"),
             Class::Muted,
         )],
     ));
+    // A line each, so each is a target of its own.
+    if page > 1 {
+        lines.push((
+            Some(Target::Page(-1)),
+            vec![Span::styled("[ previous page".to_owned(), Class::Muted)],
+        ));
+    }
+    if page < pages {
+        lines.push((
+            Some(Target::Page(1)),
+            vec![Span::styled("] next page".to_owned(), Class::Muted)],
+        ));
+    }
 }
 
 fn row_for_place(lines: &[DrawnLine], selected: &Place) -> Option<usize> {
@@ -592,8 +602,8 @@ impl gpui::Render for ResultsView {
                     .min_h_0()
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                            this.open_clicked(event.position, cx)
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.open_clicked(event.position, window, cx)
                         }),
                     )
                     .child(self.editor.clone()),

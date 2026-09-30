@@ -2151,7 +2151,8 @@ async fn search_results_move_to_the_next_numbered_page(cx: &mut TestAppContext) 
     cx.simulate_keystrokes(*workspace, "p a g i n a t i o n enter");
     let first = wait_for_results(cx, &workspace).await;
     assert!(
-        first.iter().any(|line| line == "page 1 of 2 · ] next"),
+        first.iter().any(|line| line == "page 1 of 2")
+            && first.last().map(String::as_str) == Some("] next page"),
         "the next page is discoverable in the buffer: {first:?}"
     );
     assert!(
@@ -2161,10 +2162,13 @@ async fn search_results_move_to_the_next_numbered_page(cx: &mut TestAppContext) 
         "the first page holds the newest hit: {first:?}"
     );
 
-    cx.simulate_keystrokes(*workspace, "]");
+    // `enter` on the line that names the next page goes there, which is
+    // what a tap on it does on a phone with no `]` to press.
+    // The buffer ends in a newline, so the last line is the one above.
+    cx.simulate_keystrokes(*workspace, "shift-g k enter");
     let second = wait_for_results(cx, &workspace).await;
     assert!(
-        second.iter().any(|line| line == "page 2 of 2 · [ previous"),
+        second.iter().any(|line| line == "[ previous page"),
         "the reader can return as well as advance: {second:?}"
     );
     assert!(
