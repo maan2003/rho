@@ -5095,6 +5095,58 @@ impl Workspace {
         }
     }
 
+    /// Copies the lines around the cursor up to the blank lines on either
+    /// side, and says what it took.
+    pub(crate) fn copy_paragraph(&mut self, cx: &mut Context<Self>) {
+        let editor = self.active_editor(cx);
+        let text = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let row = editor
+                .selections
+                .newest::<multi_buffer::MultiBufferPoint>(&editor.display_snapshot(cx))
+                .head()
+                .row;
+            let blank = |row: u32| {
+                snapshot.line_len(multi_buffer::MultiBufferRow(row)) == 0
+                    || snapshot
+                        .text_for_range(
+                            multi_buffer::MultiBufferPoint::new(row, 0)
+                                ..multi_buffer::MultiBufferPoint::new(
+                                    row,
+                                    snapshot.line_len(multi_buffer::MultiBufferRow(row)),
+                                ),
+                        )
+                        .all(|chunk| chunk.trim().is_empty())
+            };
+            let mut start = row;
+            while start > 0 && !blank(start - 1) {
+                start -= 1;
+            }
+            let mut end = row;
+            while end < snapshot.max_point().row && !blank(end + 1) {
+                end += 1;
+            }
+            let end_column = snapshot.line_len(multi_buffer::MultiBufferRow(end));
+            snapshot
+                .text_for_range(
+                    multi_buffer::MultiBufferPoint::new(start, 0)
+                        ..multi_buffer::MultiBufferPoint::new(end, end_column),
+                )
+                .collect::<String>()
+        });
+        if text.trim().is_empty() {
+            self.echo("nothing to copy here", StyleClass::SystemInfo, cx);
+            return;
+        }
+        let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = match preview.char_indices().nth(40) {
+            Some((cut, _)) => format!("{}…", &preview[..cut]),
+            None => preview,
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.echo(&format!("copied “{preview}”"), StyleClass::SystemInfo, cx);
+    }
+
     /// The draft editor, when the active viewport shows the draft.
     fn focused_draft_editor(&self) -> Option<Entity<editor::Editor>> {
         match &self.active_surface().view {
@@ -5878,6 +5930,7 @@ impl Workspace {
             Command::SlackMessageReact(ts) => self.slack_react_at(ts, window, cx),
             Command::SlackMessageCopyLink(ts) => self.slack_copy_message_link(ts, cx),
             Command::SlackMessageCopyText(ts) => self.slack_copy_message_text(ts, cx),
+            Command::CopyParagraph => self.copy_paragraph(cx),
             Command::SlackMessageForward(ts) => self.prompt_slack_forward_message(ts, window, cx),
             Command::SlackMarkReadBefore => self.prompt_slack_mark_read_before(window, cx),
             Command::SlackMarkUnread => self.slack_mark_unread(window, cx),

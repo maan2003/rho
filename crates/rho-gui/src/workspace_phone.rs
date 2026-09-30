@@ -447,13 +447,26 @@ impl Workspace {
     /// The phone's right click: what can be done with the thing under the
     /// finger. A message has its actions and an agent its menu; anywhere
     /// else it is the whole menu.
+    /// Text under a long press can be copied: the sheet leads with it.
     fn phone_long_press(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.active_surface().view {
             super::SurfaceView::SlackConversation(view) if !view.read(cx).cursor_in_compose(cx) => {
                 self.run_command(crate::transient::Command::SlackMessageActions, window, cx);
             }
             super::SurfaceView::Transcript { .. } => {
-                self.open_menu(crate::transient::agent_menu(), window, cx);
+                self.open_menu(with_copy(crate::transient::agent_menu()), window, cx);
+            }
+            super::SurfaceView::Note(_)
+            | super::SurfaceView::File(_)
+            | super::SurfaceView::Messages(_)
+            | super::SurfaceView::Draft { .. } => {
+                let subject = self.subject(window, cx);
+                let card = self.phone.stack.is_empty() && self.open_card_in_view(cx).is_some();
+                self.open_menu(
+                    with_copy(crate::transient::phone_root_menu(&subject, card)),
+                    window,
+                    cx,
+                );
             }
             _ => self.open_phone_menu(window, cx),
         }
@@ -1966,4 +1979,18 @@ mod tests {
             Some(rho_journal::PhoneFlickDirection::Up)
         );
     }
+}
+
+/// `menu` with a copy of the paragraph under the finger at its head: a long
+/// press is how a phone asks for the text it is on.
+fn with_copy(menu: crate::transient::Menu) -> crate::transient::Menu {
+    use crate::transient::{Command, Menu, MenuAction};
+    menu.items().iter().fold(
+        Menu::new(menu.title()).item(
+            "y",
+            "copy paragraph",
+            MenuAction::Command(Command::CopyParagraph),
+        ),
+        |copy, item| copy.item(item.key(), item.description(), item.action().clone()),
+    )
 }

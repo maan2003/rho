@@ -113,6 +113,9 @@ pub(crate) enum Command {
     SlackMessageCopyLink(rho_slack::types::Ts),
     SlackMessageCopyText(rho_slack::types::Ts),
     SlackMessageForward(rho_slack::types::Ts),
+    /// The paragraph under the cursor, to the clipboard: the phone's copy,
+    /// where there is no selecting and yanking.
+    CopyParagraph,
     // Hosts.
     HostsList,
     HostAttach,

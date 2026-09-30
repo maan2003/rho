@@ -6928,3 +6928,44 @@ fn a_phone_answers_a_git_approval_by_tapping_allow(cx: &mut TestAppContext) {
         Some(rho_agent_hosts::connection::GitApprovalDecision::Allow)
     );
 }
+
+#[gpui::test]
+fn copy_paragraph_takes_the_lines_between_blank_lines(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(
+                vec![body(
+                    &note,
+                    "before\n\nfirst of it\nsecond of it\n  \nafter",
+                )],
+                cx,
+            );
+            workspace.open_note(&note, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.active_editor(cx);
+            assert!(editor.read(cx).text(cx).contains("second of it"));
+            editor.update(cx, |editor, cx| {
+                let row = editor
+                    .text(cx)
+                    .lines()
+                    .position(|line| line == "second of it")
+                    .unwrap() as u32;
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections
+                        .select_ranges([language::Point::new(row, 2)..language::Point::new(row, 2)])
+                });
+            });
+            workspace.copy_paragraph(cx);
+        })
+        .unwrap();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("first of it\nsecond of it".to_owned())
+    );
+}
