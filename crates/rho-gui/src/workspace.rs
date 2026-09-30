@@ -1476,6 +1476,15 @@ impl Workspace {
             return;
         };
         let target = view.update(cx, |view, cx| view.cursor_target(cx));
+        self.home_open_target(target, window, cx);
+    }
+
+    fn home_open_target(
+        &mut self,
+        target: crate::home::HomeTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let wanted = match target {
             crate::home::HomeTarget::Card(card) => card,
             // A running agent is not a card: its row opens the agent.
@@ -2134,7 +2143,7 @@ impl Workspace {
     /// motion and is passed straight on.
     fn submit_from_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let in_field = self
-            .focused_draft_editor()
+            .focused_draft_editor(cx)
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx));
         if in_field {
             self.submit_prompt(&SubmitPrompt, window, cx);
@@ -2147,7 +2156,7 @@ impl Workspace {
     /// it, ready to type. In the body the key is vim's own scroll.
     fn clear_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let in_field = self
-            .focused_draft_editor()
+            .focused_draft_editor(cx)
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx));
         if !in_field {
             if let Ok(action) = cx.build_action("vim::ScrollUp", None) {
@@ -2155,7 +2164,7 @@ impl Workspace {
             }
             return;
         }
-        let Some(editor) = self.focused_draft_editor() else {
+        let Some(editor) = self.focused_draft_editor(cx) else {
             return;
         };
         self.draft_model
@@ -2440,7 +2449,7 @@ impl Workspace {
         let Some(content) = self.draft_model.read(cx).content(cx) else {
             // Enter in the workdir field with nothing to send: jump to the
             // body instead of submitting.
-            if let Some(editor) = self.focused_draft_editor() {
+            if let Some(editor) = self.focused_draft_editor(cx) {
                 self.draft_model
                     .update(cx, |view, cx| view.focus_body(&editor, window, cx));
             }
@@ -3621,7 +3630,7 @@ impl Workspace {
                     }
                 };
                 let label = self.hosts.workdir_label(&workdir);
-                let editor = self.focused_draft_editor();
+                let editor = self.focused_draft_editor(cx);
                 self.draft_model.update(cx, |view, cx| {
                     view.seed(&label, true, editor.as_ref(), window, cx)
                 });
@@ -3793,7 +3802,7 @@ impl Workspace {
     /// key can be the verdicts there.
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.selection.selected_agent().is_none()
-            && let Some(editor) = self.focused_draft_editor()
+            && let Some(editor) = self.focused_draft_editor(cx)
         {
             self.draft_model
                 .update(cx, |view, cx| view.toggle_field(&editor, window, cx));
@@ -3809,7 +3818,7 @@ impl Workspace {
     /// nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.selection.selected_agent().is_none()
-            && let Some(editor) = self.focused_draft_editor()
+            && let Some(editor) = self.focused_draft_editor(cx)
         {
             self.draft_model
                 .update(cx, |view, cx| view.toggle_field_back(&editor, window, cx));
@@ -3821,7 +3830,7 @@ impl Workspace {
     /// there being no value to cycle.
     fn cycle_draft_value(&mut self, cx: &mut Context<Self>) {
         if self.selection.selected_agent().is_none()
-            && let Some(editor) = self.focused_draft_editor()
+            && let Some(editor) = self.focused_draft_editor(cx)
         {
             self.draft_model.update(cx, |view, cx| {
                 if view.cursor_in_role_field(&editor, cx) {
@@ -3841,7 +3850,7 @@ impl Workspace {
             .draft_default_workdir()
             .map(|path| self.hosts.workdir_label(&path))
             .unwrap_or_default();
-        let editor = self.focused_draft_editor();
+        let editor = self.focused_draft_editor(cx);
         self.draft_model.update(cx, |view, cx| {
             view.seed(&label, force_header, editor.as_ref(), window, cx)
         });
@@ -3921,8 +3930,13 @@ impl Workspace {
 
     /// Replacing a message cancels its predecessor's dismiss timer.
     fn show_echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
+        let duration = if self.phone.enabled {
+            std::time::Duration::from_secs(6)
+        } else {
+            ECHO_DURATION
+        };
         let dismiss = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(ECHO_DURATION).await;
+            cx.background_executor().timer(duration).await;
             let _ = this.update(cx, |this, cx| {
                 this.echo = None;
                 cx.notify();
@@ -5086,7 +5100,12 @@ impl Workspace {
     }
 
     /// The draft editor, when the active viewport shows the draft.
-    fn focused_draft_editor(&self) -> Option<Entity<editor::Editor>> {
+    fn focused_draft_editor(&self, cx: &App) -> Option<Entity<editor::Editor>> {
+        if self.phone.enabled && self.active_surface().key == SurfaceKey::Draft {
+            if let Some(editor) = self.draft_model.read(cx).phone_body_editor() {
+                return Some(editor);
+            }
+        }
         match &self.active_surface().view {
             SurfaceView::Draft { editor, .. } => Some(editor.clone()),
             _ => None,
@@ -5115,7 +5134,10 @@ impl Workspace {
 
     fn active_surface_focus(&self, cx: &App) -> gpui::FocusHandle {
         if self.phone.enabled
-            && matches!(self.active_surface().view, SurfaceView::Transcript { .. })
+            && matches!(
+                self.active_surface().view,
+                SurfaceView::Transcript { .. } | SurfaceView::Draft { .. }
+            )
         {
             return self.phone.feed_focus.clone();
         }
@@ -5195,7 +5217,17 @@ impl Workspace {
                 SurfaceView::Draft { editor }
             }
             SurfaceKey::Home => {
-                SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
+                let view = cx.new(|cx| {
+                    let mut view = crate::home::HomeView::new(window, cx);
+                    view.set_touch_presentation(self.phone.enabled, cx);
+                    view
+                });
+                cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+                    let crate::home::Event::OpenTarget(target) = event;
+                    this.home_open_target(target.clone(), window, cx);
+                })
+                .detach();
+                SurfaceView::Home(view)
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
@@ -5325,7 +5357,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
@@ -5367,7 +5399,7 @@ impl Workspace {
         self.minibuffer_confirm(window, cx);
     }
 
-    fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
             rho_journal::record(rho_journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
@@ -5625,7 +5657,10 @@ impl Workspace {
     pub(crate) fn menu_sheet(&self) -> Option<MenuSheet> {
         let open = self.menu_buffer.as_ref()?;
         Some(MenuSheet {
-            title: open.menu.title().to_owned(),
+            title: match open.carried_count {
+                Some(count) => format!("{} · count {count}", open.menu.title()),
+                None => open.menu.title().to_owned(),
+            },
             rows: open
                 .menu
                 .items()
@@ -5750,7 +5785,7 @@ impl Workspace {
                 if closes {
                     self.close_menu(window, cx);
                 }
-                self.run_command(command, window, cx);
+                self.run_command(command, count, window, cx);
             }
         }
     }
@@ -5776,6 +5811,9 @@ impl Workspace {
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
+            MenuId::PhoneSurface => self.phone_surface_menu(),
+            MenuId::PhoneEdit => crate::transient::phone_edit_menu(),
+            MenuId::PhoneVerdicts => crate::transient::phone_verdict_menu(),
         };
         self.show_menu(menu, count, Back::Over, false);
         cx.notify();
@@ -5812,11 +5850,135 @@ impl Workspace {
     fn run_command(
         &mut self,
         command: crate::transient::Command,
+        count: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::transient::Command;
         match command {
+            Command::PhoneBrowserCommand(keys, needs_character) => {
+                let SurfaceView::Browser(view) = &self.active_surface().view else {
+                    return;
+                };
+                let view = view.clone();
+                if needs_character {
+                    self.open_prompt(
+                        "Mark name (one character):",
+                        std::rc::Rc::new(|_, _, _| Vec::new()),
+                        std::rc::Rc::new(move |this, input, _, cx| {
+                            if input.chars().count() != 1 {
+                                this.echo(
+                                    "Enter one character for the mark",
+                                    StyleClass::SystemImportant,
+                                    cx,
+                                );
+                                return;
+                            }
+                            this.run_phone_browser_command(
+                                view.clone(),
+                                keys,
+                                count,
+                                Some(input),
+                                cx,
+                            );
+                        }),
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.run_phone_browser_command(view, keys, count, None, cx);
+                }
+            }
+            Command::PhoneTerminalChord => {
+                self.open_prompt(
+                    "Key chord (e.g. ctrl-o, alt-enter, f5):",
+                    std::rc::Rc::new(|_, _, _| Vec::new()),
+                    std::rc::Rc::new(|this, input, _, cx| {
+                        match gpui::Keystroke::parse(input.trim()) {
+                            Ok(key) if key.modifiers.platform || key.modifiers.function => {
+                                this.echo(
+                                    "Terminal chords support Ctrl, Alt and Shift modifiers",
+                                    StyleClass::SystemImportant,
+                                    cx,
+                                );
+                            }
+                            Ok(key) => {
+                                if let SurfaceView::Terminal(view) = &this.active_surface().view {
+                                    view.update(cx, |view, cx| {
+                                        view.send_key(
+                                            rho_terminal::protocol::TermKeystroke {
+                                                key: key.key,
+                                                ctrl: key.modifiers.control,
+                                                alt: key.modifiers.alt,
+                                                shift: key.modifiers.shift,
+                                                key_char: key.key_char,
+                                            },
+                                            cx,
+                                        )
+                                    });
+                                }
+                            }
+                            Err(error) => this.echo(
+                                &format!("Invalid key chord: {error}"),
+                                StyleClass::SystemImportant,
+                                cx,
+                            ),
+                        }
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            Command::PhoneTerminalKey(key, control) => {
+                if let SurfaceView::Terminal(view) = &self.active_surface().view {
+                    view.update(cx, |view, cx| {
+                        view.send_key(
+                            rho_terminal::protocol::TermKeystroke {
+                                key: key.to_owned(),
+                                ctrl: control,
+                                alt: false,
+                                shift: false,
+                                key_char: None,
+                            },
+                            cx,
+                        )
+                    });
+                }
+            }
+            Command::PhoneAction(name) => {
+                if let Ok(action) = cx.build_action(name, None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
+            Command::PhoneSearch => {
+                self.prompt_transcript_search(search::Direction::Forward, window, cx)
+            }
+            Command::PhoneCopy => window.dispatch_action(Box::new(editor::Copy), cx),
+            Command::PhoneCut => window.dispatch_action(Box::new(editor::Cut), cx),
+            Command::PhonePaste => window.dispatch_action(Box::new(editor::Paste), cx),
+            Command::PhoneSelectAll => window.dispatch_action(Box::new(editor::SelectAll), cx),
+            Command::PhoneUndo => window.dispatch_action(Box::new(editor::Undo), cx),
+            Command::PhoneRedo => window.dispatch_action(Box::new(editor::Redo), cx),
+            Command::PhoneCount(menu) => {
+                self.open_prompt(
+                    "Count (positive whole number):",
+                    std::rc::Rc::new(|_, _, _| Vec::new()),
+                    std::rc::Rc::new(move |this, input, window, cx| {
+                        match input.trim().parse::<u32>() {
+                            Ok(count) if count > 0 => {
+                                this.open_menu_by_id(menu, Some(count), window, cx);
+                            }
+                            _ => this.echo(
+                                "Count must be a positive whole number",
+                                StyleClass::SystemImportant,
+                                cx,
+                            ),
+                        }
+                    }),
+                    window,
+                    cx,
+                );
+            }
             Command::Voice => self.cmd_voice(window, cx),
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
@@ -5839,7 +6001,15 @@ impl Workspace {
             Command::DeleteMade => self.delete_made(window, cx),
             Command::MoveLabel => self.prompt_move_label(window, cx),
             Command::Quit => cx.quit(),
-            Command::Home => self.toggle_overview(window, cx),
+            Command::Home => {
+                if self.phone.enabled {
+                    self.attention.open_pile = None;
+                    self.open_home(window, cx);
+                    self.phone.show(self.active_context, SurfaceKey::Home);
+                } else {
+                    self.toggle_overview(window, cx);
+                }
+            }
             Command::SlackReact(name) => self.slack_react(&name, window, cx),
             Command::SlackReactByName => self.prompt_slack_react(window, cx),
             Command::SlackConversations => self.open_slack(window, cx),
@@ -5851,6 +6021,8 @@ impl Workspace {
             Command::SlackActivity => self.open_slack_activity(window, cx),
             Command::SlackSaved => self.open_slack_saved(window, cx),
             Command::SlackDrafts => self.open_slack_drafts(window, cx),
+            Command::SlackCopyMessage => self.slack_copy_message(cx),
+            Command::SlackReplyThread => self.slack_reply_thread(window, cx),
             Command::SlackMessageActions => {
                 self.prompt_slack_message_actions(window, cx);
             }
@@ -6197,6 +6369,11 @@ impl Workspace {
             // it, with the message that raised the card on screen.
             rho_dealer::NodeId::Slack(unit) => {
                 if self.open_slack_deal(unit, window, cx) {
+                    if self.phone.enabled {
+                        self.phone
+                            .show_feed(self.active_context, self.active_surface().key.clone());
+                        window.focus(&self.phone.feed_focus, cx);
+                    }
                     return true;
                 }
                 self.make_surface(SurfaceKey::Note(card.node.clone()), window, cx)
@@ -6756,7 +6933,7 @@ impl Workspace {
             .unwrap_or_default();
         self.select_agent_inner(None, true, window, cx);
         self.draft_area = area;
-        let editor = self.focused_draft_editor();
+        let editor = self.focused_draft_editor(cx);
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
@@ -6929,19 +7106,19 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn cursor_in_draft_field_for_test(&self, cx: &mut Context<Self>) -> bool {
-        self.focused_draft_editor()
+        self.focused_draft_editor(cx)
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx))
     }
 
     #[cfg(test)]
     pub(crate) fn cursor_in_draft_start_field_for_test(&self, cx: &mut Context<Self>) -> bool {
-        self.focused_draft_editor()
+        self.focused_draft_editor(cx)
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_start_field(&editor, cx))
     }
 
     #[cfg(test)]
     pub(crate) fn cursor_in_draft_role_field_for_test(&self, cx: &mut Context<Self>) -> bool {
-        self.focused_draft_editor()
+        self.focused_draft_editor(cx)
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_role_field(&editor, cx))
     }
 
@@ -7857,6 +8034,11 @@ impl Render for Workspace {
                                 .child(
                                     div()
                                         .id("annotate-desktop")
+                                        .min_w(px(48.))
+                                        .min_h(px(48.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .p(px(4.))
                                         .tooltip(ui::Tooltip::text("Toggle drawing mode"))
                                         .cursor_pointer()
@@ -7878,6 +8060,11 @@ impl Render for Workspace {
                                 .child(
                                     div()
                                         .id("close-desktop")
+                                        .min_w(px(48.))
+                                        .min_h(px(48.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .px(px(4.))
                                         .tooltip(ui::Tooltip::text("Return to agent"))
                                         .cursor_pointer()
@@ -8252,6 +8439,15 @@ impl Render for Workspace {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
             .children((!phone).then(|| self.render_status_line(&text_style, window, cx)))
+            .children(phone.then(|| self.echo.as_ref()).flatten().map(|echo| {
+                div()
+                    .id("phone-notice")
+                    .flex_none()
+                    .max_h(px(96.))
+                    .overflow_hidden()
+                    .child(echo.render(&text_style, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.cmd_messages(window, cx)))
+            }))
             .child(
                 div()
                     .flex_1()
@@ -8309,7 +8505,7 @@ impl Render for Workspace {
                 ) {
                     (Some(approval), _) => Some(approval),
                     (None, Some(minibuffer)) => Some(if phone {
-                        minibuffer.render_phone(&text_style, cx)
+                        minibuffer.render_phone(&text_style, window, cx)
                     } else {
                         minibuffer.render(&text_style, cx)
                     }),
@@ -8319,7 +8515,7 @@ impl Render for Workspace {
                     // overlay to draw. Without this arm the phone opens a menu
                     // nobody can see — the buffer has no block on purpose.
                     (None, None) if phone && self.menu_buffer.is_some() => {
-                        self.render_phone_menu_sheet(&text_style, cx)
+                        self.render_phone_menu_sheet(&text_style, window, cx)
                     }
                     (None, None) => None,
                 },
@@ -8365,6 +8561,36 @@ pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn phone_count_returns_to_requested_menu(cx: &mut gpui::TestAppContext) {
+        use crate::transient::{Command, MenuId};
+        let workspace = crate::tests::test_workspace(cx);
+        for menu in [MenuId::PhoneSurface, MenuId::PhoneVerdicts] {
+            workspace
+                .update(cx, |workspace, window, cx| {
+                    workspace.run_command(Command::PhoneCount(menu), None, window, cx);
+                    workspace
+                        .minibuffer
+                        .as_mut()
+                        .unwrap()
+                        .set_input("3".into(), window, cx);
+                    workspace.minibuffer_confirm(window, cx);
+                    let open = workspace.menu_buffer.as_ref().unwrap();
+                    assert_eq!(open.carried_count, Some(3));
+                    assert_eq!(
+                        open.menu.title(),
+                        match menu {
+                            MenuId::PhoneSurface => "On this screen",
+                            MenuId::PhoneVerdicts => "verdict",
+                            _ => unreachable!(),
+                        }
+                    );
+                    workspace.close_menu(window, cx);
+                })
+                .unwrap();
+        }
+    }
 
     #[test]
     fn labels_current_agent_roles() {

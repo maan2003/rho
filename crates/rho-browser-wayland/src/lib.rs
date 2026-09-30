@@ -89,6 +89,20 @@ use smithay::{
     delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
+mod text_input;
+pub use text_input::{TextInputState, TextInputUpdate};
+use smithay::input::touch::{TouchHandle, DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
+use smithay::backend::input::TouchSlot;
+use text_input::TextInputs;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TouchInput {
+    Down { id: u64, time: u32, scene: u64, x: f64, y: f64 },
+    Motion { id: u64, time: u32, x: f64, y: f64 },
+    Up { id: u64, time: u32 },
+    Cancel,
+}
+
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCENE_SHM_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BROWSER_TIMINGS: usize = 4_096;
@@ -322,6 +336,7 @@ impl Drop for DmaBufFrame {
 pub enum BrowserEvent {
     Scene(SceneUpdate),
     Cursor(BrowserCursor),
+    TextInput(TextInputState),
     FrameRetired(u64),
     ToplevelReady,
     Closed,
@@ -569,6 +584,8 @@ enum PageCommand {
         pressed: bool,
     },
     PointerAxis(PointerAxisFrame),
+    Touch(TouchInput),
+    TextInput(TextInputUpdate),
     Pinch(PinchGesture),
     Key {
         keycode: u32,
@@ -584,6 +601,8 @@ enum OrderedInput {
     PointerMotion(ResolvedPointerMotion),
     PointerButton { button: u32, pressed: bool },
     PointerAxis(PointerAxisFrame),
+    Touch(TouchInput, Option<ResolvedPointerMotion>),
+    TextInput(TextInputUpdate),
     Pinch(PinchGesture),
     Key { keycode: u32, pressed: bool },
     InputBarrier(async_channel::Sender<()>),
@@ -707,6 +726,12 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn pinch(&self, gesture: PinchGesture) {
         self.send(PageCommand::Pinch(gesture))
     }
+    pub fn touch(&self, event: TouchInput) {
+        self.send(PageCommand::Touch(event));
+    }
+    pub fn text_input(&self, update: TextInputUpdate) {
+        self.send(PageCommand::TextInput(update));
+    }
     pub fn key(&self, keycode: u32, pressed: bool) {
         self.send(PageCommand::Key { keycode, pressed })
     }
@@ -807,6 +832,7 @@ struct WindowState {
     last_finger_axis_time: u32,
     active_buttons: HashSet<u32>,
     active_keys: HashSet<u32>,
+    active_touches: HashMap<u64, (TouchSlot, (f64, f64))>,
     pinch_active: bool,
     surface_slots: HashMap<ObjectId, SurfaceSlot>,
     pending_imports: HashMap<u64, BufferImport>,
@@ -884,6 +910,8 @@ struct State<K: BrowserPageKey> {
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
+    touch: TouchHandle<Self>,
+    text_inputs: TextInputs,
     serial: u32,
     windows: HashMap<K, WindowState>,
     unbound_toplevels: HashMap<ObjectId, (ToplevelSurface, Instant)>,
@@ -2187,7 +2215,18 @@ impl<K: BrowserPageKey> SeatHandler for State<K> {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        if self.text_inputs.focused_surface() == focused { return; }
+        let previous = self.text_inputs.focused_surface()
+            .and_then(|surface| self.window_id_for_surface(surface));
+        self.text_inputs.focus(focused.cloned());
+        if let Some(id) = previous {
+            self.windows[&id].events.send(BrowserEvent::TextInput(TextInputState {
+                generation: self.text_inputs.generation(), ..Default::default()
+            }));
+        }
+        self.publish_text_input();
+    }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         let cursor = browser_cursor(image);
         for window in self.windows.values() {
@@ -2425,6 +2464,8 @@ fn run<K: BrowserPageKey>(
         .add_keyboard(Default::default(), 600, 25)
         .context("create embedded Chrome keyboard")?;
     let pointer = seat.add_pointer();
+    let touch = seat.add_touch();
+    dh.create_global::<State<K>, smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3, _>(1, ());
     let mut dmabuf = DmabufState::new();
     let (global, syncobj, formats, allow_root_shm) = match render {
         BrowserRenderConfig::DmaBuf(config) => {
@@ -2491,6 +2532,8 @@ fn run<K: BrowserPageKey>(
         seat_state,
         _seat: seat,
         keyboard,
+        touch,
+        text_inputs: TextInputs::default(),
         pointer,
         serial: 1,
         windows: HashMap::new(),
@@ -2623,6 +2666,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     last_finger_axis_time: 0,
                     active_buttons: HashSet::new(),
                     active_keys: HashSet::new(),
+                    active_touches: HashMap::new(),
                     pinch_active: false,
                     surface_slots: HashMap::new(),
                     pending_imports: HashMap::new(),
@@ -2833,6 +2877,15 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         PageCommand::PointerButton { button, pressed } => {
             queue_input(state, id, OrderedInput::PointerButton { button, pressed })
         }
+        PageCommand::Touch(event) => {
+            let resolved = if let TouchInput::Down { scene, x, y, .. } = event {
+                let Some(window) = state.windows.get(&id) else { return; };
+                let Some(motion) = resolve_pointer_motion(&window.pointer_frames, &window.hit_scenes, scene, x, y) else { return; };
+                Some(motion)
+            } else { None };
+            queue_input(state, id, OrderedInput::Touch(event, resolved));
+        }
+        PageCommand::TextInput(update) => queue_input(state, id, OrderedInput::TextInput(update)),
         PageCommand::PointerAxis(frame) => queue_input(state, id, OrderedInput::PointerAxis(frame)),
         PageCommand::Pinch(gesture) => queue_input(state, id, OrderedInput::Pinch(gesture)),
         PageCommand::Key { keycode, pressed } => {
@@ -2854,6 +2907,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             }
         }
         PageCommand::Close => {
+            release_active_input(state, id);
             if let Some(window) = state.windows.get_mut(&id) {
                 window.pending_input.clear();
             }
@@ -3170,6 +3224,8 @@ fn deliver_input<K: BrowserPageKey>(state: &mut State<K>, id: K, input: OrderedI
             pointer_button(state, id, button, pressed)
         }
         OrderedInput::PointerAxis(frame) => deliver_pointer_axis(state, id, frame),
+        OrderedInput::Touch(event, resolved) => deliver_touch(state, id, event, resolved),
+        OrderedInput::TextInput(update) => state.text_inputs.update(update),
         OrderedInput::Pinch(gesture) => pointer_pinch(state, id, gesture),
         OrderedInput::Key { keycode, pressed } => keyboard_key(state, id, keycode, pressed),
         OrderedInput::InputBarrier(acknowledge) => {
@@ -3181,9 +3237,10 @@ fn deliver_input<K: BrowserPageKey>(state: &mut State<K>, id: K, input: OrderedI
 }
 
 fn release_active_input<K: BrowserPageKey>(state: &mut State<K>, id: K) {
-    let Some(window) = state.windows.get_mut(&id) else {
-        return;
-    };
+    if !state.windows.contains_key(&id) { return; }
+    cancel_touch(state, id);
+    state.text_inputs.clear_preedit();
+    let Some(window) = state.windows.get_mut(&id) else { return; };
     let buttons = active_release_codes(&window.active_buttons);
     let keys = active_release_codes(&window.active_keys);
     let finger_axes = window.active_finger_axes;
@@ -3215,6 +3272,55 @@ fn release_active_input<K: BrowserPageKey>(state: &mut State<K>, id: K) {
     }
     if pinch_active {
         pointer_pinch(state, id, PinchGesture::End { cancelled: true });
+    }
+}
+
+fn cancel_touch<K: BrowserPageKey>(state: &mut State<K>, id: K) {
+    let Some(window) = state.windows.get_mut(&id) else { return; };
+    let active = std::mem::take(&mut window.active_touches);
+    if active.is_empty() { return; }
+    let touch = state.touch.clone();
+    // Pinned Smithay skips cancel for already-framed slots. Refresh their
+    // unchanged position without a frame first, so cancel clears every grab.
+    for (_, (slot, position)) in active {
+        touch.motion(state, None, &TouchMotionEvent {
+            slot, time: monotonic_time_ms(), location: position.into(),
+        });
+    }
+    touch.cancel(state);
+}
+
+fn deliver_touch<K: BrowserPageKey>(
+    state: &mut State<K>, id: K, event: TouchInput, resolved: Option<ResolvedPointerMotion>,
+) {
+    let Some(window) = state.windows.get_mut(&id) else { return; };
+    let touch = state.touch.clone();
+    match event {
+        TouchInput::Down { id: contact, time, .. } => {
+            let Some(motion) = resolved else { return; };
+            if motion.target.is_none() || window.active_touches.contains_key(&contact) { return; }
+            let slot = (0u32..).find(|slot| !window.active_touches.values().any(|(active, _)| *active == TouchSlot::from(Some(*slot)))).unwrap();
+            let slot = TouchSlot::from(Some(slot));
+            window.active_touches.insert(contact, (slot, motion.location));
+            let serial = state.next_serial();
+            touch.down(state, motion.target.map(|(surface, origin)| (surface, origin.into())),
+                &TouchDownEvent { slot, time, serial, location: motion.location.into() });
+            touch.frame(state);
+        }
+        TouchInput::Motion { id: contact, time, x, y } => {
+            let Some((slot, position)) = window.active_touches.get_mut(&contact) else { return; };
+            *position = (x, y);
+            let slot = *slot;
+            touch.motion(state, None, &TouchMotionEvent { slot, time, location: (x,y).into() });
+            touch.frame(state);
+        }
+        TouchInput::Up { id: contact, time } => {
+            let Some((slot, _)) = window.active_touches.remove(&contact) else { return; };
+            let serial = state.next_serial();
+            touch.up(state, &TouchUpEvent { slot, time, serial });
+            touch.frame(state);
+        }
+        TouchInput::Cancel => cancel_touch(state, id),
     }
 }
 
@@ -3827,6 +3933,7 @@ mod tests {
             last_finger_axis_time: 0,
             active_buttons: HashSet::new(),
             active_keys: HashSet::new(),
+            active_touches: HashMap::new(),
             pinch_active: false,
             surface_slots: HashMap::new(),
             pending_imports: HashMap::new(),

@@ -97,7 +97,19 @@ impl GitApproval {
     ) -> Option<AnyElement> {
         let pending = self.pending.as_ref()?;
         let colors = cx.theme().colors();
-        let mut deny = div().flex().flex_row().px_1().child("n deny");
+        let size = window.viewport_size();
+        let phone = size.width <= gpui::px(600.)
+            || (size.height <= gpui::px(600.) && size.width <= gpui::px(1000.));
+        let mut deny = div()
+            .id("git-deny")
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_h(gpui::px(if phone { 48. } else { 0. }))
+            .px_3()
+            .cursor_pointer()
+            .child(if phone { "Deny" } else { "n deny" })
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::GitApprovalDeny), cx));
         if self.focus.is_focused(window) {
             deny = deny.bg(colors.element_selected);
         } else {
@@ -131,7 +143,23 @@ impl GitApproval {
                                 .items_center()
                                 .gap_4()
                                 .px_2()
-                                .child(div().text_color(colors.text_muted).child("Y allow"))
+                                .child(
+                                    div()
+                                        .id("git-allow")
+                                        .min_h(gpui::px(if phone { 48. } else { 0. }))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .text_color(colors.text_muted)
+                                        .child(if phone { "Allow" } else { "Y allow" })
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(crate::GitApprovalAllow),
+                                                cx,
+                                            )
+                                        }),
+                                )
                                 .child(deny),
                         ),
                 )

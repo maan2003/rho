@@ -595,3 +595,7 @@ pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
 }
 
 pub mod wayland_view;
+
+#[cfg(test)]
+#[path = "../../../vendor/zed/crates/editor/tests/touch_input.rs"]
+mod touch_input;

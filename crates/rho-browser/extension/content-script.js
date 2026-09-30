@@ -943,12 +943,28 @@
     requestAnimationFrame(refreshHintMarkers);
   }
 
+  let touchCommand = false;
+
   function addHintMarkers(items) {
     assignHints(items);
     items.forEach((item, index) => {
       const marker = document.createElement("span");
       marker.textContent = item.hint;
       marker.style.zIndex = String(index + 1);
+      if (hints.touch) {
+        marker.style.pointerEvents = "auto";
+        marker.style.minWidth = "44px";
+        marker.style.minHeight = "44px";
+        marker.style.display = "flex";
+        marker.style.padding = "12px";
+        marker.setAttribute("role", "button");
+        marker.setAttribute("aria-label", `${hints.action}: ${item.text || item.hint}`);
+        marker.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          activateHint(item);
+        });
+      }
       item.marker = marker;
       hints.shadow.append(marker);
     });
@@ -1030,6 +1046,7 @@
       enteredHint: "",
       enteredText: "",
       action,
+      touch: touchCommand,
       count: hintCount,
     };
     addHintMarkers(items);
@@ -1362,6 +1379,41 @@
   addEventListener("keydown", onKeyDown, true);
   globalThis.chrome?.runtime?.onMessage?.addListener((message) => {
     if (message?.type === "rho-vim-stop") window.stop();
+    if (message?.type !== "rho-touch-command" || window !== window.top) return;
+    try {
+      let entry = COMMANDS;
+      const keys = message.keys === "Space" || message.keys === "S-Space"
+        || message.keys === "Escape" ? [message.keys] : [...(message.keys || "")];
+      for (const key of keys) entry = entry && Object.hasOwn(entry, key) ? entry[key] : undefined;
+      if (!entry?.run) throw new Error("unknown browser command");
+      if (message.keys === "Escape") {
+        clearHints();
+        document.getElementById("__rho_vim_help")?.remove();
+        clearTimeout(captureTimer);
+        captureKey = undefined;
+        captureTimer = undefined;
+        ignoreRemaining = undefined;
+        ignoreReason = undefined;
+        returnToIgnore = false;
+        setMode("normal");
+        resetInput();
+        entry.run(1, { repeat: false }, false);
+      } else if (message.keys === "m" || message.keys === "'") {
+        if (typeof message.character !== "string" || [...message.character].length !== 1) {
+          throw new Error("scroll mark needs one character");
+        }
+        (message.keys === "m" ? markScrollPosition : jumpToScrollMark)(message.character);
+      } else {
+        touchCommand = true;
+        entry.run(Math.max(1, Number(message.count) || 1), { repeat: false },
+          Number(message.count) > 0);
+      }
+      touchCommand = false;
+      return Promise.resolve({ ok: true });
+    } catch (error) {
+      touchCommand = false;
+      return Promise.resolve({ ok: false, error: String(error?.message || error) });
+    }
   });
   addEventListener("keyup", (event) => {
     if (!event.isTrusted) return;
@@ -1401,7 +1453,7 @@
   }, true);
   addEventListener("mousedown", (event) => {
     if (!event.isTrusted) return;
-    if (hints) clearHints();
+    if (hints && !event.composedPath().includes(hints.host)) clearHints();
     if (!focusInputs?.includes(event.target)) focusInputs = undefined;
   }, true);
   addEventListener("pagehide", clearHints, true);

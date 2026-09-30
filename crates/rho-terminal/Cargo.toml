@@ -38,3 +38,7 @@ theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = t
 [dev-dependencies]
 # The tests exercise the client too.
 rho-terminal = { path = ".", features = ["client"] }
+
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
+assets = { path = "../../vendor/zed/crates/assets" }
+tokio.workspace = true

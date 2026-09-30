@@ -1519,6 +1519,32 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    pub fn begin_input_method_batch(&mut self) {
+        self.cx
+            .update(|window, cx| self.handler.begin_input_method_batch(window, cx))
+            .ok();
+    }
+    pub fn end_input_method_batch(&mut self) {
+        self.cx
+            .update(|window, cx| self.handler.end_input_method_batch(window, cx))
+            .ok();
+    }
+
+    pub fn delete_surrounding_text(&mut self, before_length: usize, after_length: usize) {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .delete_surrounding_text(before_length, after_length, window, cx)
+            })
+            .ok();
+    }
+
+    pub fn set_ime_cursor_visible(&mut self, visible: bool) {
+        self.cx
+            .update(|window, cx| self.handler.set_ime_cursor_visible(visible, window, cx))
+            .ok();
+    }
+
     pub fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -1731,6 +1757,25 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Begin one atomic platform input-method update.
+    fn begin_input_method_batch(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Finish one atomic platform input-method update.
+    fn end_input_method_batch(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// Delete surrounding UTF-16 code units without changing selected text.
+    fn delete_surrounding_text(
+        &mut self,
+        _before_length: usize,
+        _after_length: usize,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// Show or hide the local caret during IME composition.
+    fn set_ime_cursor_visible(&mut self, _visible: bool, _window: &mut Window, _cx: &mut App) {}
 
     /// Replace the text in the given document range with the given text,
     /// and mark the given text as part of an IME 'composing' state

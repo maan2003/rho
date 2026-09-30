@@ -1,8 +1,8 @@
 //! Native web-page resources for rho.
 //!
 //! The bundled extension owns client-local page identity and persistence; this
-//! crate owns browser runtime integration and GPUI page views. The agent host and
-//! Desk remain unaware of client-local browser processes.
+//! crate owns browser runtime integration and GPUI page views. The agent host
+//! and Desk remain unaware of client-local browser processes.
 
 #![cfg(target_os = "linux")]
 
@@ -31,6 +31,216 @@ pub use view::{
     BrowserModel as PageModel, BrowserView as PageView, HandoffEvent, PageMetadataChanged,
     snapshot_handoff_events,
 };
+
+/// Existing extension commands available from a touch transient.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchCommand {
+    pub label: &'static str,
+    pub keys: &'static str,
+    /// The mark name is collected by the editor minibuffer, not a hidden
+    /// extension-owned keyboard capture.
+    pub needs_character: bool,
+}
+
+pub fn touch_commands() -> &'static [TouchCommand] {
+    &[
+        TouchCommand {
+            label: "Back",
+            keys: "H",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Forward",
+            keys: "L",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Reload",
+            keys: "r",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Force reload",
+            keys: "R",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Stop loading",
+            keys: "s",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Cancel / normal mode",
+            keys: "Escape",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Scroll left",
+            keys: "h",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Scroll down",
+            keys: "j",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Scroll up",
+            keys: "k",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Scroll right",
+            keys: "l",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Half page down",
+            keys: "d",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Half page up",
+            keys: "u",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Page down",
+            keys: "Space",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Page up",
+            keys: "S-Space",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Left edge",
+            keys: "0",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Right edge",
+            keys: "$",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Top",
+            keys: "gg",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Bottom",
+            keys: "G",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Follow link",
+            keys: "f",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Copy link / input",
+            keys: "yf",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Focus element",
+            keys: "ef",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Element context menu",
+            keys: "ec",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Focus text input",
+            keys: "gi",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Ignore browser keys",
+            keys: "i",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Quote keys",
+            keys: "I",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Set scroll mark",
+            keys: "m",
+            needs_character: true,
+        },
+        TouchCommand {
+            label: "Jump to scroll mark",
+            keys: "'",
+            needs_character: true,
+        },
+        TouchCommand {
+            label: "Previous link",
+            keys: "[",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Next link",
+            keys: "]",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Previous scroll jump",
+            keys: "g[",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Next scroll jump",
+            keys: "g]",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Parent URL",
+            keys: "gu",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Root URL",
+            keys: "gU",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Copy URL",
+            keys: "yy",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Toggle site key blacklist",
+            keys: "gB",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Reload all pages",
+            keys: "ar",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Force reload all pages",
+            keys: "aR",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Stop all pages",
+            keys: "as",
+            needs_character: false,
+        },
+        TouchCommand {
+            label: "Help",
+            keys: "?",
+            needs_character: false,
+        },
+    ]
+}
 
 pub struct WebState {
     state_dir: std::path::PathBuf,
@@ -232,6 +442,27 @@ mod page_name_tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn both_touch_mark_commands_collect_a_character() {
+        for keys in ["m", "'"] {
+            assert!(
+                touch_commands()
+                    .iter()
+                    .find(|command| command.keys == keys)
+                    .unwrap()
+                    .needs_character,
+                "{keys} must collect its mark rather than enter hidden keyboard capture"
+            );
+        }
+        assert!(
+            !touch_commands()
+                .iter()
+                .find(|command| command.keys == "gi")
+                .unwrap()
+                .needs_character
+        );
+    }
 
     #[test]
     fn live_name_prefers_title_then_url_host() {

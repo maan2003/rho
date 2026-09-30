@@ -10655,6 +10655,7 @@ impl Element for EditorElement {
                     self.paint_sticky_headers(layout, window, cx);
                     self.paint_minimap(layout, window, cx);
                     self.paint_scrollbars(layout, window, cx);
+                    self.paint_touch_selection(layout, window, cx);
                     #[cfg(feature = "native")]
                     self.paint_edit_prediction_popover(layout, window, cx);
                     #[cfg(feature = "native")]

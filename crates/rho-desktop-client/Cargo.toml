@@ -21,6 +21,8 @@ client = [
   "dep:tracing",
 ]
 
+test-support = ["client"]
+
 [dependencies]
 bytes.workspace = true
 rho-rpc.workspace = true

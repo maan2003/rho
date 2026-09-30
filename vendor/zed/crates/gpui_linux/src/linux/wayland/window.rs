@@ -30,6 +30,7 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
+use super::text_input::{ImeBatch, SurroundingText};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -1020,14 +1021,15 @@ impl WaylandWindowStatePtr {
             .map(|input_handler| input_handler.query_accepts_text_input())
             .unwrap_or(false);
         drop(state);
-        if Some(ime_enabled) == client.ime_enabled() {
-            return;
+        if Some(ime_enabled) != client.ime_enabled() {
+            if ime_enabled {
+                client.enable_ime();
+            } else {
+                client.disable_ime();
+            }
         }
-
         if ime_enabled {
-            client.enable_ime();
-        } else {
-            client.disable_ime();
+            client.update_ime_surrounding(self.get_ime_surrounding());
         }
     }
 
@@ -1394,13 +1396,34 @@ impl WaylandWindowStatePtr {
                     input_handler.unmark_text();
                 }
                 ImeInput::DeleteText => {
-                    if let Some(marked) = input_handler.marked_text_range() {
-                        input_handler.replace_text_in_range(Some(marked), "");
+                    if input_handler.marked_text_range().is_some() {
+                        input_handler.replace_and_mark_text_in_range(None, "", None);
                     }
                 }
             }
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
+    }
+
+    pub(super) fn handle_ime_batch(&self, batch: ImeBatch) {
+        if self.is_blocked() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(mut handler) = state.input_handler.take() {
+            drop(state);
+            batch.apply(&mut handler);
+            self.state.borrow_mut().input_handler = Some(handler);
+        }
+    }
+
+    pub(super) fn get_ime_surrounding(&self) -> Option<SurroundingText> {
+        let mut state = self.state.borrow_mut();
+        let mut handler = state.input_handler.take()?;
+        drop(state);
+        let text = SurroundingText::read(&mut handler);
+        self.state.borrow_mut().input_handler = Some(handler);
+        text
     }
 
     pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {

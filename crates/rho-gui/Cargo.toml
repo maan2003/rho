@@ -125,6 +125,7 @@ tikv-jemallocator = { version = "0.6", features = [
 
 
 [dev-dependencies]
+rho-desktop-client = { workspace = true, features = ["test-support"] }
 backtrace = "0.3"
 # The fake Slack server, so a Slack surface can be stood up in a test the
 # way it stands up in production: against a server, never a stubbed client.

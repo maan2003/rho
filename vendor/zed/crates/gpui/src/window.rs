@@ -1179,6 +1179,7 @@ pub struct Window {
     touch_gesture_serial: Option<u32>,
     touch_momentum: Option<Task<()>>,
     touch_long_press: Option<Task<()>>,
+    dispatching_touch_mouse_event: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1967,6 +1968,7 @@ impl Window {
             touch_gesture_serial: None,
             touch_momentum: None,
             touch_long_press: None,
+            dispatching_touch_mouse_event: false,
             modifiers,
             capslock,
             scale_factor,
@@ -5624,13 +5626,15 @@ impl Window {
                 self.touch_long_press = None;
                 let actions = self.touch_gesture.up(id, event.timestamp);
                 if self.touch_gesture.has_momentum() {
-                    let mut at = event.timestamp;
+                    let released_at = event.timestamp;
+                    let started = cx.background_executor().now();
                     let task = self.spawn(cx, async move |cx| {
                         loop {
                             cx.background_executor()
                                 .timer(crate::touch_gestures::momentum_interval())
                                 .await;
-                            at += crate::touch_gestures::momentum_interval();
+                            let at = released_at
+                                + cx.background_executor().now().duration_since(started);
                             let keep_going = cx
                                 .update(|window, cx| {
                                     let actions = window.touch_gesture.advance(at);
@@ -5756,6 +5760,11 @@ impl Window {
         }
     }
 
+    /// Whether the current mouse event was synthesized from a touch gesture.
+    pub fn is_touch_interaction(&self) -> bool {
+        self.dispatching_touch_mouse_event
+    }
+
     fn dispatch_touch_default_mouse_event(
         &mut self,
         event: &dyn Any,
@@ -5765,6 +5774,7 @@ impl Window {
         let Some(target) = self.touch_gesture_target.clone() else {
             return;
         };
+        let was_touch = mem::replace(&mut self.dispatching_touch_mouse_event, true);
         let old_position = mem::replace(&mut self.mouse_position, position);
         let old_hit_test = mem::replace(&mut self.mouse_hit_test, target.hit_test);
         let current_mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
@@ -5790,6 +5800,7 @@ impl Window {
                 }
             }
         }
+        self.dispatching_touch_mouse_event = was_touch;
         self.mouse_position = old_position;
         self.mouse_hit_test = old_hit_test;
         if self.rendered_frame.mouse_listeners.is_empty() {

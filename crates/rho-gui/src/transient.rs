@@ -49,6 +49,9 @@ pub(crate) enum MenuId {
     Status,
     /// `space s u`: which usage chart to look at.
     UsageRoot,
+    PhoneEdit,
+    PhoneVerdicts,
+    PhoneSurface,
 }
 
 /// A command a menu item runs, which is the whole of what the item means.
@@ -98,6 +101,8 @@ pub(crate) enum Command {
     SlackDrafts,
     SlackDetach,
     SlackMessageActions,
+    SlackCopyMessage,
+    SlackReplyThread,
     SlackBroadcast,
     SlackFavorite,
     SlackFollow,
@@ -146,6 +151,18 @@ pub(crate) enum Command {
     AgentCacheKey,
     AgentRestartWorkset,
     // The phone.
+    PhoneCopy,
+    PhoneCut,
+    PhonePaste,
+    PhoneSelectAll,
+    PhoneUndo,
+    PhoneRedo,
+    PhoneCount(MenuId),
+    PhoneAction(&'static str),
+    PhoneSearch,
+    PhoneTerminalKey(&'static str, bool),
+    PhoneTerminalChord,
+    PhoneBrowserCommand(&'static str, bool),
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
     /// A named hour of the day: `tonight` is this evening while it is still
@@ -387,7 +404,17 @@ pub(crate) fn slack_react_menu(choices: &rho_slack::ui::ReactionChoices) -> Menu
 
 pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageActions) -> Menu {
     let ts = actions.ts.clone();
-    let mut menu = Menu::new("message");
+    let mut menu = Menu::new("message")
+        .item(
+            "t",
+            "reply in thread",
+            MenuAction::Command(Command::SlackReplyThread),
+        )
+        .item(
+            "y",
+            "copy message text",
+            MenuAction::Command(Command::SlackCopyMessage),
+        );
     if actions.can_edit {
         menu = menu.item(
             "e",
@@ -612,15 +639,75 @@ pub(crate) fn agent_menu() -> Menu {
         )
 }
 
-pub(crate) fn phone_root_menu() -> Menu {
-    Menu::new("menu")
+pub(crate) fn phone_root_menu(subject: &Subject) -> Menu {
+    // The phone promotes navigation and creation, but loses none of the
+    // desktop vocabulary. Keep the remaining commands sourced from root.
+    let mut menu = Menu::new("rho")
         .item(
-            "s",
-            "Slack",
-            MenuAction::Command(Command::SlackConversations),
+            "tab",
+            "Home · cards and piles",
+            MenuAction::Command(Command::Home),
         )
-        .item("a", "Agents", MenuAction::Open(MenuId::Agent))
-        .item("i", "Status", MenuAction::Open(MenuId::Status))
+        .item(
+            "shift-f",
+            "Find anything…",
+            MenuAction::Command(Command::FindNode),
+        )
+        .item(
+            "b",
+            "Switch buffer…",
+            MenuAction::Command(Command::SwitchBuffer),
+        )
+        .item(
+            "n",
+            "New agent, note or page…",
+            MenuAction::Open(MenuId::New),
+        )
+        .item("shift-s", "Slack…", MenuAction::Open(MenuId::Slack))
+        .item(
+            "o",
+            "On this screen…",
+            MenuAction::Open(MenuId::PhoneSurface),
+        )
+        .item(
+            "e",
+            "Edit · copy, paste, selection…",
+            MenuAction::Open(MenuId::PhoneEdit),
+        )
+        .item(
+            "v",
+            "Card actions · snooze, pile, undo…",
+            MenuAction::Open(MenuId::PhoneVerdicts),
+        );
+    for item in root_menu(subject).items() {
+        if !menu
+            .items()
+            .iter()
+            .any(|held| held.action() == item.action())
+        {
+            menu = menu.item(item.key(), item.description(), item.action().clone());
+        }
+    }
+    menu
+}
+
+pub(crate) fn phone_edit_menu() -> Menu {
+    use Command::*;
+    Menu::new("Edit selection")
+        .item("c", "Copy", MenuAction::Command(PhoneCopy))
+        .item("x", "Cut", MenuAction::Command(PhoneCut))
+        .item("v", "Paste", MenuAction::Command(PhonePaste))
+        .item("a", "Select all", MenuAction::Command(PhoneSelectAll))
+        .item("u", "Undo text edit", MenuAction::Command(PhoneUndo))
+        .item("r", "Redo text edit", MenuAction::Command(PhoneRedo))
+}
+
+pub(crate) fn phone_verdict_menu() -> Menu {
+    verdict_menu().item(
+        "c",
+        "Set count · days, hours, priority…",
+        MenuAction::Command(Command::PhoneCount(MenuId::PhoneVerdicts)),
+    )
 }
 
 /// The phone's answer to "how long": the times a thumb picks, where a
@@ -724,6 +811,39 @@ pub(crate) fn usage_root_menu() -> Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phone_keeps_every_desktop_root_action() {
+        for subject in [
+            Subject::default(),
+            Subject {
+                agent: Some(
+                    rho_agent_types::AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0))
+                        .unwrap(),
+                ),
+                agents: Vec::new(),
+                made: Some(rho_dealer::NodeId::Label(uuid::Uuid::nil())),
+            },
+            Subject {
+                agent: None,
+                agents: Vec::new(),
+                made: Some(rho_dealer::NodeId::Note(uuid::Uuid::nil())),
+            },
+        ] {
+            let desktop = root_menu(&subject);
+            let phone = phone_root_menu(&subject);
+            for item in desktop.items() {
+                assert!(
+                    phone
+                        .items()
+                        .iter()
+                        .any(|row| row.action() == item.action()),
+                    "phone dropped {}",
+                    item.description()
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_phone_snooze_sheet_offers_the_decided_chips() {

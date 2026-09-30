@@ -12732,7 +12732,10 @@ dependencies = [
  "futures-lite 2.6.1",
  "libc",
  "smithay",
+ "tempfile",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
@@ -13440,6 +13443,7 @@ name = "rho-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "bytes",
  "futures",
  "gpui",
@@ -13450,6 +13454,7 @@ dependencies = [
  "settings",
  "theme",
  "theme_settings",
+ "tokio",
 ]
 
 [[package]]

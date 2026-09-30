@@ -5,6 +5,7 @@ mod display;
 mod passthrough;
 mod popup;
 mod serial;
+mod text_input;
 mod window;
 
 /// Contains Types for configuring layer_shell surfaces.

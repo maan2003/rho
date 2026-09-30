@@ -299,6 +299,14 @@ async function dispatch(message) {
     case "focus": return activatePage(message.params.id);
     case "close": return closePage(message.params.id);
     case "list": return listPages(message.params?.limit);
+    case "touch-command": {
+      const tab = await findPage(message.params.id);
+      if (!tab.active) throw new Error("browser command belongs to an inactive page");
+      const result = await chrome.tabs.sendMessage(tab.id,
+        { ...message.params, type: "rho-touch-command" }, { frameId: 0 });
+      if (!result?.ok) throw new Error(result?.error || "browser command failed");
+      return null;
+    }
     default: throw new Error(`unknown browser method: ${message.method}`);
   }
 }

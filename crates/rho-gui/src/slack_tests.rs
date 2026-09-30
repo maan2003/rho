@@ -4669,3 +4669,640 @@ async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAp
         })
         .unwrap();
 }
+
+/// Slack deals must leave overlay navigation and participate in the same feed
+/// gestures as notes. Three cards distinguish one advance from a double pull.
+#[gpui::test]
+async fn phone_slack_deals_flick_once_and_return_without_overlay_stack(cx: &mut TestAppContext) {
+    use gpui::{InputEvent as _, TouchEvent, TouchId, TouchPhase, point, px, size};
+    use rho_dealer::NodeId;
+    use rho_slack::fake::Fake;
+
+    use crate::pane::SurfaceKey;
+
+    let workspace = test_workspace(cx);
+    cx.executor().allow_parking();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.draw_window(*workspace);
+    cx.run_until_parked();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let state = tempfile::tempdir().unwrap();
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    let me = fake.self_id();
+    for (channel, ts) in [
+        ("C1", "1800000100.0"),
+        ("C2", "1800000200.0"),
+        ("C3", "1800000300.0"),
+    ] {
+        fake.push_frame(serde_json::json!({
+            "type": "message", "channel": channel, "ts": ts, "user": "UA",
+            "text": format!("<@{me}> short phone card {channel}")
+        }));
+    }
+    wait_for_reasons(
+        cx,
+        &workspace,
+        &[
+            slack_unit("C1", None),
+            slack_unit("C2", None),
+            slack_unit("C3", None),
+        ],
+    )
+    .await;
+    let first = workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(
+                workspace.phone_has_surface_for_test(&SurfaceKey::SlackList),
+                "start in a genuine overlay, not directly in a deal"
+            );
+            workspace.pull_card(window, cx);
+            assert!(
+                workspace.phone_feed_for_test(cx),
+                "a normal Slack dealer pull must clear overlay navigation"
+            );
+            assert!(workspace.phone_feed_is_active_for_test());
+            assert!(!workspace.phone_has_surface_for_test(&SurfaceKey::SlackList));
+            let first = workspace.current_deal_card_for_test(cx).unwrap().0;
+            assert!(matches!(first, NodeId::Slack(_)));
+            first
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack_transcript_for_test(cx)
+                    .iter()
+                    .any(|line| line.contains("short phone card"))
+            })
+            .unwrap()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    cx.draw_window(*workspace);
+    let next = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.hand(cx).top(Some(&first)).unwrap().node.clone()
+        })
+        .unwrap();
+    let flick = |cx: &mut TestAppContext, id, from, to, expected: &NodeId| {
+        cx.update_window(*workspace, |_, window, cx| {
+            for (phase, y, millis) in [
+                (TouchPhase::Started, from, 0),
+                (TouchPhase::Moved, to, 80),
+                (TouchPhase::Ended, to, 100),
+            ] {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: TouchId(id),
+                        phase,
+                        position: point(px(200.), px(y)),
+                        timestamp: std::time::Duration::from_millis(millis),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            workspace
+                .update(cx, |workspace, _, cx| workspace
+                    .current_deal_card_for_test(cx)
+                    .unwrap()
+                    .0)
+                .unwrap(),
+            *expected,
+            "release commits exactly one card before the settling animation",
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        cx.draw_window(*workspace);
+    };
+    flick(cx, 11, 600., 300., &next);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                next,
+                "one flick advances to exactly the next card"
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+            assert_eq!(
+                workspace.phone_last_gesture_for_test(),
+                Some("flick up · moved")
+            );
+        })
+        .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.current_deal_card_for_test(cx).unwrap().0
+            })
+            .unwrap(),
+        next,
+        "the ended contact must not advance again"
+    );
+    // The second conversation must be laid out before its edge can be tested.
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack_transcript_for_test(cx)
+                    .iter()
+                    .any(|line| line.contains("short phone card"))
+            })
+            .unwrap()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    cx.draw_window(*workspace);
+    flick(cx, 12, 300., 600., &first);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
+            assert!(workspace.phone_feed_for_test(cx));
+            assert!(workspace.phone_feed_is_active_for_test());
+            assert_eq!(
+                workspace.phone_last_gesture_for_test(),
+                Some("flick down · moved")
+            );
+        })
+        .unwrap();
+}
+
+/// Long-press must target the touched message rather than whichever message
+/// was selected before the finger arrived.
+#[gpui::test]
+async fn phone_slack_longpress_requests_actions_for_the_touched_message(cx: &mut TestAppContext) {
+    use gpui::{InputEvent as _, TouchEvent, TouchId, TouchPhase, px, size};
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, Ts};
+
+    use crate::workspace::SurfaceView;
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts":"1000.0","user":"UA","text":"first untouched message"}),
+    );
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts":"1001.0","user":"UD","text":"second touched message"}),
+    );
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.draw_window(*workspace);
+    cx.run_until_parked();
+    let view = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(Source::Conversation(ChannelId("C1".into())), window, cx);
+            let SurfaceView::SlackConversation(view) = &workspace.active_surface().view else {
+                panic!("opening the source must show its conversation");
+            };
+            view.clone()
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if view
+            .read_with(cx, |view, cx| view.drawn_lines_for_test(cx))
+            .iter()
+            .any(|line| line.contains("second touched message"))
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    cx.draw_window(*workspace);
+    let requests = cx.new(|_| Vec::<Ts>::new());
+    cx.update(|cx| {
+        cx.subscribe(&view, {
+            let requests = requests.clone();
+            move |_, event, cx| {
+                if let rho_slack::ui::conversation::Event::MessageActionsRequested(ts) = event {
+                    requests.update(cx, |requests, _| requests.push(ts.clone()));
+                }
+            }
+        })
+        .detach();
+    });
+    let position = workspace
+        .update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.place_cursor_on_for_test(&Ts("1001.0".into()), window, cx));
+                let position = view.editor().update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    let point = editor.selections.newest_display(&snapshot).head();
+                    let mut position = editor
+                        .window_position_for_display_point(point, &snapshot, window, cx)
+                        .unwrap();
+                    position.y += px(5.);
+                    position
+                });
+                assert!(view.place_cursor_on_for_test(&Ts("1000.0".into()), window, cx));
+                position
+            })
+        })
+        .unwrap();
+    // Repaint with the cursor on the other message; retained hit geometry is
+    // deliberately different from the editor's current selection.
+    cx.draw_window(*workspace);
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            TouchEvent {
+                id: TouchId(21),
+                phase: TouchPhase::Started,
+                position,
+                timestamp: std::time::Duration::ZERO,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(650));
+    cx.run_until_parked();
+    assert_eq!(
+        requests.read_with(cx, |requests, _| requests.clone()),
+        vec![Ts("1001.0".into())]
+    );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.menu_title_for_test(), Some("message"));
+            view.update(cx, |view, cx| {
+                assert_eq!(view.cursor_message(cx).unwrap().ts, Ts("1001.0".into()));
+            });
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            TouchEvent {
+                id: TouchId(21),
+                phase: TouchPhase::Ended,
+                position,
+                timestamp: std::time::Duration::from_millis(700),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests.read_with(cx, |requests, _| requests.len()),
+        1,
+        "release cannot also activate or request again"
+    );
+}
+
+/// A vertical gesture inside a long Slack page scrolls that page, rather than
+/// treating every swipe as a dealer pull. Reaching an edge is required to page.
+#[gpui::test]
+async fn phone_slack_long_card_scrolls_inside_without_a_verdict(cx: &mut TestAppContext) {
+    use gpui::{InputEvent as _, TouchEvent, TouchId, TouchPhase, point, px, size};
+    use rho_dealer::NodeId;
+
+    use crate::workspace::SurfaceView;
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    let long_body = (0..90)
+        .map(|line| format!("long card line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let me = fake.self_id();
+    fake.push_frame(serde_json::json!({
+        "type":"message", "channel":"C1", "ts":"1800000100.0", "user":"UA",
+        "text":format!("<@{me}> read the whole report\n{long_body}")
+    }));
+    fake.push_frame(serde_json::json!({
+        "type":"message", "channel":"C2", "ts":"1800000200.0", "user":"UD",
+        "text":format!("<@{me}> next short card")
+    }));
+    let long_unit = slack_unit("C1", None);
+    wait_for_reasons(cx, &workspace, &[long_unit.clone(), slack_unit("C2", None)]).await;
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.draw_window(*workspace);
+    cx.run_until_parked();
+    let editor = workspace
+        .update(cx, |workspace, window, cx| {
+            let card = workspace
+                .hand(cx)
+                .cards
+                .into_iter()
+                .find(|card| card.node == NodeId::Slack(long_unit.clone()))
+                .unwrap();
+            workspace.open_card(card, window, cx);
+            let SurfaceView::SlackConversation(view) = &workspace.active_surface().view else {
+                panic!("Slack deal");
+            };
+            view.read(cx).editor().clone()
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack_transcript_for_test(cx)
+                    .iter()
+                    .any(|line| line.contains("long card line 89"))
+            })
+            .unwrap()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    cx.draw_window(*workspace);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(point(0., 20.), window, cx)
+            });
+        })
+        .unwrap();
+    cx.draw_window(*workspace);
+    let before = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 550., 0),
+            (TouchPhase::Moved, 250., 80),
+            (TouchPhase::Ended, 250., 100),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(31),
+                    phase,
+                    position: point(px(200.), px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                NodeId::Slack(long_unit.clone())
+            );
+            assert!(workspace.phone_feed_for_test(cx));
+            assert!(
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == NodeId::Slack(long_unit.clone())),
+                "scrolling cannot resolve the card"
+            );
+            assert!(
+                editor.update(cx, |editor, cx| editor.scroll_position(cx).y) > before,
+                "the gesture must actually scroll message content"
+            );
+        })
+        .unwrap();
+    assert_eq!(
+        fake.calls("conversations.mark"),
+        0,
+        "scrolling is not a Slack read verdict"
+    );
+
+    // A sheet above that same card owns its gestures. Without occlusion,
+    // its scroll events also reached the editor (and could page at an edge).
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(point(0., 20.), window, cx);
+            });
+            workspace.open_menu(
+                crate::transient::phone_root_menu(&crate::workspace::Subject::default()),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.draw_window(*workspace);
+    let covered_position = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 650., 4000),
+            (TouchPhase::Moved, 350., 4080),
+            (TouchPhase::Ended, 350., 4100),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(32),
+                    phase,
+                    position: point(px(200.), px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(
+        editor.update(cx, |editor, cx| editor.scroll_position(cx).y),
+        covered_position,
+        "scrolling a phone sheet must not scroll the covered editor",
+    );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                NodeId::Slack(long_unit),
+                "scrolling a phone sheet cannot change the card",
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn slack_list_taps_open_rows_but_not_rules_or_drag_selections(cx: &mut TestAppContext) {
+    use gpui::{
+        InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        TouchEvent, TouchId, TouchPhase, px, size,
+    };
+    use rho_slack::session::{Session, SessionEvent};
+    use rho_slack::types::ChannelId;
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { rho_slack::fake::Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "muted");
+    fake.mute("C2");
+    let state = tempfile::tempdir().unwrap();
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let session = cx
+        .new(|cx| Session::with_client(client, rho_slack::config::Paths::under(state.path()), cx));
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ListView::new(
+            session.clone(),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    wait_for_rows(cx, &window).await;
+    let mut rule = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        rule = window
+            .update(cx, |view, _, cx| {
+                view.text_for_test(cx)
+                    .lines()
+                    .position(|line| line == "─────")
+            })
+            .unwrap();
+        if rule.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let rule = rule.expect("muted section rule");
+    let opened = cx.new(|_| Vec::<ChannelId>::new());
+    cx.update(|cx| {
+        cx.subscribe(&session, {
+            let opened = opened.clone();
+            move |_, event, cx| {
+                if let SessionEvent::OpenConversation(channel) = event {
+                    opened.update(cx, |opened, _| opened.push(channel.clone()));
+                }
+            }
+        })
+        .detach();
+    });
+    cx.simulate_window_resize(*window, size(px(400.), px(800.)));
+    cx.draw_window(*window);
+    let positions = window
+        .update(cx, |view, window, cx| {
+            let row = view.row_of_for_test(&ChannelId("C1".into())).unwrap();
+            [rule, row].map(|row| {
+                view.place_cursor_for_test(row, window, cx);
+                view.editor().update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    let point = editor.selections.newest_display(&snapshot).head();
+                    let mut position = editor
+                        .window_position_for_display_point(point, &snapshot, window, cx)
+                        .unwrap();
+                    position.y += px(5.);
+                    position
+                })
+            })
+        })
+        .unwrap();
+    cx.draw_window(*window);
+    cx.update_window(*window, |_, window, cx| {
+        let start = positions[1];
+        let end = start + gpui::point(px(40.), px(0.));
+        window.dispatch_event(
+            MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                position: end,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    assert!(
+        opened.read_with(cx, |opened, _| opened.is_empty()),
+        "drag selection cannot open a conversation"
+    );
+    let mut visual = gpui::VisualTestContext::from_window(*window, cx);
+    visual.simulate_click(positions[0], Modifiers::none());
+    assert!(
+        opened.read_with(cx, |opened, _| opened.is_empty()),
+        "section rules cannot open a conversation"
+    );
+    cx.update_window(*window, |_, window, cx| {
+        for (phase, millis) in [(TouchPhase::Started, 0), (TouchPhase::Ended, 60)] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(41),
+                    phase,
+                    position: positions[1],
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        opened.read_with(cx, |opened, _| opened.clone()),
+        vec![ChannelId("C1".into())]
+    );
+}

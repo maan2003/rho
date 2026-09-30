@@ -42,6 +42,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ime_cursor_visible = true;
         if !self.input_enabled {
             cx.emit(EditorEvent::InputIgnored { text: text.into() });
             return;
@@ -2871,6 +2872,7 @@ impl EntityInputHandler for Editor {
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.ime_cursor_visible = true;
         self.clear_highlights(HighlightKey::InputComposition, cx);
         self.ime_transaction.take();
     }
@@ -2963,6 +2965,54 @@ impl EntityInputHandler for Editor {
         }
 
         self.unmark_text(window, cx);
+    }
+
+    fn delete_surrounding_text(
+        &mut self,
+        before_length: usize,
+        after_length: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.accepts_text_input(window, cx) {
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        let buffer = snapshot.buffer_snapshot();
+        let mut edits = Vec::new();
+        for selection in self.selections.all::<MultiBufferOffsetUtf16>(&snapshot) {
+            let before = buffer.clip_offset_utf16(
+                MultiBufferOffsetUtf16(OffsetUtf16(
+                    selection.start.0.0.saturating_sub(before_length),
+                )),
+                Bias::Left,
+            )..selection.start;
+            let after = selection.end
+                ..buffer.clip_offset_utf16(
+                    MultiBufferOffsetUtf16(OffsetUtf16(
+                        selection.end.0.0.saturating_add(after_length),
+                    )),
+                    Bias::Right,
+                );
+            for range in [before, after] {
+                if range.start != range.end {
+                    let points = range.start.to_offset(buffer).to_point(buffer)
+                        ..range.end.to_offset(buffer).to_point(buffer);
+                    if !Self::range_is_editable(buffer, points) {
+                        return;
+                    }
+                    edits.push((range, ""));
+                }
+            }
+        }
+        // Anchored selections track both context deletions without losing direction
+        // or collapsing the selected text, unlike replacement-range input.
+        self.transact(window, cx, |this, _, cx| this.edit(edits, cx));
+    }
+
+    fn set_ime_cursor_visible(&mut self, visible: bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.ime_cursor_visible = visible;
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -3157,7 +3207,14 @@ impl EntityInputHandler for Editor {
         Some(utf16_offset.0.0)
     }
 
-    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.expects_character_input
+    fn accepts_text_input(&self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.expects_character_input || self.read_only(cx) {
+            return false;
+        }
+        let snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        self.selections
+            .all::<Point>(&snapshot)
+            .iter()
+            .all(|selection| Self::range_is_editable(snapshot.buffer_snapshot(), selection.range()))
     }
 }

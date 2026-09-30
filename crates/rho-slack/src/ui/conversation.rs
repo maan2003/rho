@@ -67,6 +67,8 @@ pub struct ConversationView {
     session: Entity<Session>,
     hooks: Hooks,
     source: Source,
+    /// Host-selected presentation, shared by portrait and landscape phones.
+    touch_presentation: bool,
     /// The messages on screen, each keyed and each owning its own range: a
     /// new message rewrites one item, not the conversation.
     transcript: Transcript<Row, Class, LineMeta, ChromeGutter>,
@@ -177,6 +179,9 @@ pub enum Event {
     RewriteLost,
     BroadcastWithFilesUnsupported,
     ActivateRequested,
+    /// A secondary click (including the platform's long-press gesture) on
+    /// this message. The cursor is placed on it before the request is emitted.
+    MessageActionsRequested(Ts),
 }
 
 /// What a press of enter turned out to be, once Slack had answered.
@@ -550,6 +555,7 @@ impl ConversationView {
             session: session.clone(),
             hooks,
             source: source.clone(),
+            touch_presentation: false,
             transcript: Transcript::new(transcript),
             input,
             multi_buffer,
@@ -630,6 +636,61 @@ impl ConversationView {
 
     pub fn source(&self) -> &Source {
         &self.source
+    }
+
+    /// Keep sender/time visible and bound inline media on touch surfaces.
+    /// The host owns phone detection; width alone cannot distinguish a narrow
+    /// desktop pane from a phone in either orientation.
+    pub fn set_touch_presentation(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.touch_presentation == enabled {
+            return;
+        }
+        let was_on = self.cursor_message_ts(cx);
+        self.touch_presentation = enabled;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_reserve_image_gutter(!enabled, cx);
+        });
+        self.rebuild(cx);
+        self.refresh(window, cx);
+        if let Some(ts) = was_on {
+            self.place_cursor_on(&ts, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn request_clicked_message_actions(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Hit-test independently of the cursor: a context click need not move
+        // the editor's selection, and the composer is a different buffer.
+        let Some((_, buffer_id, offset)) = self
+            .editor
+            .read(cx)
+            .buffer_location_for_window_position(position, language::Bias::Left)
+        else {
+            return;
+        };
+        let buffer = self.transcript.buffer().read(cx);
+        if buffer.remote_id() != buffer_id {
+            return;
+        }
+        let row = buffer.snapshot().offset_to_point(offset).row;
+        let Some(Row::Message(ts)) = self.transcript.key_at_row(row, cx) else {
+            return;
+        };
+        let ts = ts.clone();
+        if self.place_cursor_on(&ts, window, cx) {
+            cx.emit(Event::MessageActionsRequested(ts));
+            cx.stop_propagation();
+        }
     }
 
     /// The app control on the cursor's line, if that line is interactive.
@@ -3274,10 +3335,12 @@ impl ConversationView {
                     .rev()
                     .find(|other| in_thread || other.is_top_level())
             });
-            let header = !previous
-                .is_some_and(|previous| continues_author(previous, message, session.model()));
+            let header = self.touch_presentation
+                || !previous
+                    .is_some_and(|previous| continues_author(previous, message, session.model()));
             let row = Row::Message(message.ts.clone());
             if header
+                && !self.touch_presentation
                 && system_line(message, session.model()).is_none()
                 && let Some(user) = &message.user
             {
@@ -3290,6 +3353,7 @@ impl ConversationView {
                 session.model(),
                 in_thread,
                 header,
+                self.touch_presentation,
                 &self.expanded_previews,
             )
         };
@@ -3340,6 +3404,7 @@ impl ConversationView {
                 file,
                 self.session.downgrade(),
                 cx.entity().downgrade(),
+                self.touch_presentation,
             ));
         }
         item
@@ -3733,6 +3798,14 @@ fn drawn_size(
     (gpui::px(width * scale), gpui::px(height * scale))
 }
 
+fn inline_image_rows(file: &FileSummary, touch_presentation: bool) -> u32 {
+    if touch_presentation {
+        file.image_rows().div_ceil(2)
+    } else {
+        file.image_rows()
+    }
+}
+
 /// A picture under the line that names it, indented to the body column.
 /// Clicking it asks for the full-size view, the same thing `enter` on the
 /// file line asks for.
@@ -3748,8 +3821,9 @@ fn image_block(
     file: FileSummary,
     session: gpui::WeakEntity<Session>,
     view: gpui::WeakEntity<ConversationView>,
+    touch_presentation: bool,
 ) -> BlockSpec {
-    let rows = file.image_rows();
+    let rows = inline_image_rows(&file, touch_presentation);
     BlockSpec {
         line,
         height: rows,
@@ -3771,7 +3845,17 @@ fn image_block(
             // gutter. Match the text origin rather than adding body spaces.
             let style = cx.editor_style.text.clone();
             let box_height = cx.line_height * rows as f32;
-            let box_width = cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT);
+            let columns = if touch_presentation {
+                24
+            } else {
+                IMAGE_COLUMNS
+            };
+            let box_width = cx.line_height * (columns as f32 * CELL_ASPECT);
+            let box_width = if touch_presentation {
+                box_width.min((cx.max_width - cx.margins.gutter.full_width()).max(gpui::px(0.)))
+            } else {
+                box_width
+            };
             // The picture's own size inside the box, spelled out rather than
             // left to the element: the editor measures a block and resizes
             // it to what it drew, so a thumbnail allowed to be its own tiny
@@ -3866,7 +3950,7 @@ fn continues_author(previous: &Message, message: &Message, model: &Model) -> boo
 /// Keeping metadata off the body preserves Markdown block syntax consistently.
 #[cfg(test)]
 fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
-    message_item_with_header(message, model, in_thread, true, &HashSet::new())
+    message_item_with_header(message, model, in_thread, true, false, &HashSet::new())
 }
 
 fn message_item_with_header(
@@ -3874,6 +3958,7 @@ fn message_item_with_header(
     model: &Model,
     in_thread: bool,
     header: bool,
+    touch_presentation: bool,
     expanded: &HashSet<(Ts, usize)>,
 ) -> Rendered {
     let thread = Some(message.thread_root());
@@ -3949,6 +4034,15 @@ fn message_item_with_header(
         // A text-cell gap separates the profile inlay from the author name.
         spans.push(Span::plain(" "));
         spans.push(name);
+        if touch_presentation {
+            spans.push(Span::styled(
+                format!(
+                    " · {}",
+                    crate::ui::clock_time(message.ts.epoch_seconds() as i64)
+                ),
+                Class::Muted,
+            ));
+        }
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
@@ -4592,6 +4686,13 @@ impl gpui::Render for ConversationView {
                     .flex_1()
                     .min_h_0()
                     .px(gpui::px(4.))
+                    .capture_any_mouse_down(cx.listener(
+                        |this, event: &gpui::MouseDownEvent, window, cx| {
+                            if event.button == gpui::MouseButton::Right {
+                                this.request_clicked_message_actions(event.position, window, cx);
+                            }
+                        },
+                    ))
                     .on_mouse_up(
                         gpui::MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
@@ -5067,7 +5168,8 @@ mod tests {
             continues_author(&first, &next, &model),
             "edits do not start a new author group"
         );
-        let rendered = message_item_with_header(&next, &model, false, false, &HashSet::new());
+        let rendered =
+            message_item_with_header(&next, &model, false, false, false, &HashSet::new());
         assert_eq!(rendered.text, "two\n");
         assert!(rendered.lines[0].edited);
     }
@@ -5404,6 +5506,67 @@ mod tests {
         );
         let item = message_item(&preview, &model(), false);
         assert!(item.gutter.is_none(), "the gutter is reserved for avatars");
+    }
+
+    #[test]
+    fn touch_headers_show_identity_and_time_without_changing_file_targets() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0", "user": "U1", "text": "here is the deck",
+            "files": [{
+                "id": "F1", "name": "deck.pdf", "title": "deck.pdf",
+                "filetype": "pdf", "size": 225_280,
+                "url_private": "https://files.example.com/deck.pdf"
+            }]
+        }));
+        let phone =
+            message_item_with_header(&with_file, &model(), false, true, true, &HashSet::new());
+        let desktop = message_item(&with_file, &model(), false);
+        assert_eq!(
+            phone.text.lines().next().unwrap(),
+            format!(" ada · {}", crate::ui::clock_time(1_700_000_000))
+        );
+        assert_eq!(desktop.text.lines().next(), Some(" ada"));
+        assert_eq!(
+            phone.text.lines().skip(1).collect::<Vec<_>>(),
+            desktop.text.lines().skip(1).collect::<Vec<_>>(),
+            "presentation must not change the Markdown body or attachment line",
+        );
+        let file_line = phone
+            .text
+            .lines()
+            .position(|line| line.trim() == "deck.pdf · 220 KB")
+            .unwrap();
+        assert_eq!(phone.lines[file_line].file.as_ref().unwrap().id, "F1");
+    }
+
+    #[test]
+    fn touch_media_is_bounded_for_tall_unknown_and_wide_images() {
+        let picture = |width, height| {
+            parsed(json!({
+                "ts": "1700000000.0", "user": "U1", "text": "",
+                "files": [{
+                    "id": "F1", "name": "image.png", "title": "image.png", "filetype": "png",
+                    "original_w": width, "original_h": height,
+                    "url_private": "https://files.example.com/image.png"
+                }]
+            }))
+            .files
+            .remove(0)
+        };
+        for file in [picture(200, 1600), picture(0, 0)] {
+            assert_eq!(inline_image_rows(&file, false), 12);
+            assert_eq!(inline_image_rows(&file, true), 6);
+        }
+        // A wide image should shrink proportionally, not occupy the cap.
+        let wide = picture(1600, 200);
+        assert_eq!(inline_image_rows(&wide, false), 3);
+        assert_eq!(inline_image_rows(&wide, true), 2);
+        let (width, height) = drawn_size(&wide, gpui::px(240.), gpui::px(40.));
+        assert!((f32::from(width) - 240.).abs() < 0.001);
+        assert!((f32::from(height) - 30.).abs() < 0.001);
+        // Both sides of rounding: never lose the row that contains pixels.
+        assert_eq!(inline_image_rows(&picture(1600, 160), true), 2);
+        assert_eq!(inline_image_rows(&picture(1600, 100), true), 1);
     }
 
     #[test]

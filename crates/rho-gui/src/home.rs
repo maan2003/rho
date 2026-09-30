@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, HighlightStyle, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, HighlightStyle, Window, div, px};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_agent_types::AgentId;
@@ -123,6 +123,11 @@ pub(crate) enum HomeTarget {
     None,
 }
 
+/// Home requests navigation; the workspace owns what opening a target does.
+pub(crate) enum Event {
+    OpenTarget(HomeTarget),
+}
+
 /// One item of the transcript. A card keeps its key when it crosses the
 /// line, so crossing moves the row rather than rewriting two sections.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -183,7 +188,10 @@ pub struct HomeView {
     transcript: Transcript<HomeKey, HomeClass, HomeTarget>,
     editor: Entity<Editor>,
     rows: HomeRows,
+    touch_presentation: bool,
 }
+
+impl EventEmitter<Event> for HomeView {}
 
 impl HomeView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -223,6 +231,7 @@ impl HomeView {
             transcript: Transcript::new(buffer),
             editor,
             rows: HomeRows::default(),
+            touch_presentation: false,
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // A Home nobody has told anything yet still answers the question.
@@ -234,6 +243,132 @@ impl HomeView {
 
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    pub fn set_touch_presentation(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.touch_presentation != enabled {
+            self.touch_presentation = enabled;
+            cx.notify();
+        }
+    }
+
+    fn touch_row(
+        &self,
+        index: usize,
+        target: HomeTarget,
+        title: String,
+        detail: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(format!("home-touch-{target:?}"))
+            .debug_selector(move || format!("home-touch-row-{index}"))
+            .w_full()
+            .min_w_0()
+            .min_h(px(48.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(4.))
+            .px(px(12.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(Event::OpenTarget(target.clone()));
+            }))
+            .child(div().w_full().text_size(px(16.)).child(title))
+            .when(!detail.is_empty(), |row| {
+                row.child(
+                    div()
+                        .w_full()
+                        .text_size(px(14.))
+                        .text_color(cx.theme().status().warning)
+                        .child(detail),
+                )
+            })
+    }
+
+    fn render_touch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().colors().text_muted;
+        let heading = |name: &'static str| {
+            div()
+                .debug_selector(move || format!("home-touch-section-{name}"))
+                .flex_none()
+                .px(px(12.))
+                .pt(px(16.))
+                .pb(px(6.))
+                .text_size(px(14.))
+                .text_color(muted)
+                .child(name)
+        };
+        let mut content = div()
+            .id("rho-home-touch")
+            .key_context("RhoHome")
+            .size_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().colors().editor_background)
+            .text_color(cx.theme().colors().text);
+        if self.rows.is_empty() {
+            return content.child(
+                div()
+                    .p(px(12.))
+                    .text_color(cx.theme().colors().text_muted)
+                    .child("nothing needs attention"),
+            );
+        }
+        let mut index = 0;
+        if !self.rows.next.is_empty() {
+            content = content.child(heading("next"));
+            for row in &self.rows.next {
+                content = content.child(self.touch_row(
+                    index,
+                    HomeTarget::Card(row.card.clone()),
+                    row.title.clone(),
+                    card_label(row),
+                    cx,
+                ));
+                index += 1;
+            }
+        }
+        if !self.rows.running.is_empty() {
+            content = content.child(heading("running"));
+            for row in &self.rows.running {
+                content = content.child(self.touch_row(
+                    index,
+                    HomeTarget::Agent(row.agent_id),
+                    row.name.clone(),
+                    String::new(),
+                    cx,
+                ));
+                index += 1;
+            }
+        }
+        if !self.rows.piles.is_empty() {
+            content = content.child(heading("piles"));
+            for row in &self.rows.piles {
+                let detail = if row.back.is_empty() {
+                    row.count.to_string()
+                } else {
+                    format!("{} · {}", row.count, row.back)
+                };
+                content = content.child(self.touch_row(
+                    index,
+                    HomeTarget::Pile(row.name.clone()),
+                    row.name.clone().unwrap_or_else(|| "later".to_owned()),
+                    detail,
+                    cx,
+                ));
+                index += 1;
+            }
+        }
+        content
     }
 
     /// What the cursor is on. The row under the cursor is the one a deal
@@ -393,16 +528,20 @@ fn line(key: HomeKey, text: &str, class: HomeClass) -> Item<HomeKey, HomeClass, 
     Item::new(key, text.to_owned()).with_styles(vec![(class, 0..text.len())])
 }
 
+fn card_label(row: &HomeRow) -> String {
+    match (row.skipped, row.label.is_empty()) {
+        (false, _) => row.label.clone(),
+        (true, true) => "skipped".to_owned(),
+        (true, false) => format!("{} · skipped", row.label),
+    }
+}
+
 fn card_line(
     row: &HomeRow,
     column: usize,
     title_class: HomeClass,
 ) -> Item<HomeKey, HomeClass, HomeTarget> {
-    let label = match (row.skipped, row.label.is_empty()) {
-        (false, _) => row.label.clone(),
-        (true, true) => "skipped".to_owned(),
-        (true, false) => format!("{} · skipped", row.label),
-    };
+    let label = card_label(row);
     let (text, styles) = columns(&[
         (row.title.as_str(), title_class, column),
         (label.as_str(), HomeClass::Label, 0),
@@ -442,17 +581,133 @@ fn columns(cells: &[(&str, HomeClass, usize)]) -> (String, Vec<(HomeClass, Range
 
 impl gpui::Render for HomeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.touch_presentation {
+            return self.render_touch(cx).into_any_element();
+        }
         div()
             .key_context("RhoHome")
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())
+            .into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn touch_home_wraps_rows_and_opens_each_kind_without_caret_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, Modifiers, VisualTestContext, size};
+        cx.update(crate::tests::init_test_app);
+        let agent = AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let card_id = NodeId::Note(uuid::Uuid::from_u128(42));
+        let rows = HomeRows {
+            next: vec![HomeRow {
+                title: "A long conversation title with important context that must remain readable without moving sideways or truncating the question the reader needs to answer".into(),
+                label: "needs reply · 2h".into(),
+                card: card_id.clone(),
+                skipped: true,
+            }],
+            running: vec![RunningRow { agent_id: agent, name: "active engineer".into() }],
+            // More than HOME_CAP: piles must never disappear behind that cap.
+            piles: (0..7).map(|index| PileRow {
+                name: (index != 0).then(|| format!("pile {index}")),
+                count: index + 1,
+                back: if index == 0 { "back in 2h".into() } else { String::new() },
+            }).collect(),
+        };
+        let home = cx.add_window(HomeView::new);
+        let events = cx.new(|_| Vec::<HomeTarget>::new());
+        let entity = home
+            .update(cx, |home, _, cx| {
+                home.set_rows(rows, cx);
+                home.set_touch_presentation(true, cx);
+                cx.entity()
+            })
+            .unwrap();
+        cx.update(|cx| {
+            cx.subscribe(&entity, {
+                let events = events.clone();
+                move |_, Event::OpenTarget(target), cx| {
+                    events.update(cx, |events, _| events.push(target.clone()));
+                }
+            })
+            .detach();
+        });
+        cx.simulate_window_resize(*home, size(px(340.), px(1000.)));
+        cx.draw_window(*home);
+        let narrow_height;
+        {
+            let mut visual = VisualTestContext::from_window(*home, cx);
+            narrow_height = visual.debug_bounds("home-touch-row-0").unwrap().size.height;
+            for selector in [
+                "home-touch-row-0",
+                "home-touch-row-1",
+                "home-touch-row-2",
+                "home-touch-row-8",
+            ] {
+                let bounds = visual
+                    .debug_bounds(selector)
+                    .expect("every target is drawn, including every pile");
+                assert!(bounds.size.height >= px(48.), "{selector}: {bounds:?}");
+                assert!(bounds.right() <= px(340.), "a row cannot extend sideways");
+                visual.simulate_click(bounds.center(), Modifiers::none());
+            }
+            // Headings label sections; unlike rows, they cannot open anything.
+            let heading = visual.debug_bounds("home-touch-section-next").unwrap();
+            visual.simulate_click(heading.center(), Modifiers::none());
+        }
+        assert_eq!(
+            events.read_with(cx, |events, _| events.clone()),
+            vec![
+                HomeTarget::Card(card_id),
+                HomeTarget::Agent(agent),
+                HomeTarget::Pile(None),
+                HomeTarget::Pile(Some("pile 6".into())),
+            ]
+        );
+        cx.simulate_window_resize(*home, size(px(900.), px(1000.)));
+        cx.draw_window(*home);
+        let mut visual = VisualTestContext::from_window(*home, cx);
+        let wide_height = visual.debug_bounds("home-touch-row-0").unwrap().size.height;
+        assert!(
+            narrow_height > wide_height,
+            "long titles must wrap at the available width"
+        );
+        home.update(cx, |home, _, cx| home.set_touch_presentation(false, cx))
+            .unwrap();
+        cx.draw_window(*home);
+        let mut visual = VisualTestContext::from_window(*home, cx);
+        assert!(
+            visual.debug_bounds("home-touch-row-0").is_none(),
+            "desktop keeps the editor"
+        );
+    }
+
+    #[test]
+    fn skipped_labels_are_shared_by_touch_and_editor_rows() {
+        let mut row = HomeRow {
+            title: "a question".into(),
+            label: "needs reply".into(),
+            card: NodeId::Note(uuid::Uuid::nil()),
+            skipped: true,
+        };
+        assert_eq!(card_label(&row), "needs reply · skipped");
+        assert!(
+            card_line(&row, 10, HomeClass::Title)
+                .text
+                .trim_end()
+                .ends_with("needs reply · skipped")
+        );
+        row.label.clear();
+        assert_eq!(card_label(&row), "skipped");
+        row.skipped = false;
+        assert!(card_label(&row).is_empty());
+    }
 
     fn card(title: &str, priority: f64) -> Card {
         Card {

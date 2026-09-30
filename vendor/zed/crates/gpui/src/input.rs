@@ -44,6 +44,31 @@ pub trait EntityInputHandler: 'static + Sized {
         cx: &mut Context<Self>,
     );
 
+    /// Begin one atomic platform input-method update.
+    fn begin_input_method_batch(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Finish one atomic platform input-method update.
+    fn end_input_method_batch(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Delete surrounding UTF-16 code units without changing selected text.
+    fn delete_surrounding_text(
+        &mut self,
+        _before_length: usize,
+        _after_length: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    /// Show or hide the local caret during IME composition.
+    fn set_ime_cursor_visible(
+        &mut self,
+        _visible: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     /// See [`InputHandler::replace_and_mark_text_in_range`] for details
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -152,6 +177,33 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     ) {
         self.view.update(cx, |view, cx| {
             view.replace_text_in_range(replacement_range, text, window, cx)
+        });
+    }
+
+    fn begin_input_method_batch(&mut self, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, cx| view.begin_input_method_batch(window, cx));
+    }
+    fn end_input_method_batch(&mut self, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, cx| view.end_input_method_batch(window, cx));
+    }
+
+    fn delete_surrounding_text(
+        &mut self,
+        before_length: usize,
+        after_length: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, cx| {
+            view.delete_surrounding_text(before_length, after_length, window, cx)
+        });
+    }
+
+    fn set_ime_cursor_visible(&mut self, visible: bool, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            view.set_ime_cursor_visible(visible, window, cx)
         });
     }
 

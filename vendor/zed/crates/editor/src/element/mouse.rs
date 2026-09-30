@@ -6,10 +6,10 @@ use collections::HashMap;
 #[cfg(feature = "native")]
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
-    AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
-    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    ParentElement, Pixels, PressureStage, ScrollDelta, ScrollWheelEvent, TextStyleRefinement,
-    Window, anchored, deferred, point, px,
+    AnyElement, App, AvailableSpace, Bounds, ClickEvent, Context, DefiniteLength, DispatchPhase,
+    Element, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, ParentElement, Pixels, PressureStage, ScrollDelta, ScrollWheelEvent,
+    TextStyleRefinement, TouchEvent, TouchPhase, Window, anchored, deferred, fill, point, px, size,
 };
 use multi_buffer::MultiBufferRow;
 #[cfg(feature = "native")]
@@ -17,6 +17,7 @@ use project::DisableAiSettings;
 use settings::Settings;
 use sum_tree::Bias;
 use text::SelectionGoal;
+use theme::ActiveTheme;
 use theme_settings::BufferLineHeight;
 use util::{RangeExt, debug_panic, post_inc};
 
@@ -24,8 +25,8 @@ use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSid
 use crate::{
     CURSORS_VISIBLE_FOR, ColumnarMode, DisplayPoint, DisplayRow, Editor, EditorSettings,
     EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData, SelectPhase, Selection,
-    SelectionDragState, display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    scroll::ScrollPixelOffset,
+    SelectionDragState, SelectionEffects, display_map::ToDisplayPoint,
+    editor_settings::DoubleClickInMultibuffer, scroll::ScrollPixelOffset,
 };
 #[cfg(feature = "native")]
 use crate::{
@@ -420,7 +421,27 @@ impl EditorElement {
                             );
                         }),
                         MouseButton::Right => editor.update(cx, |editor, cx| {
-                            Self::mouse_right_down(editor, event, &position_map, window, cx);
+                            if window.is_touch_interaction()
+                                && position_map.text_hitbox.is_hovered(window)
+                            {
+                                let position = position_map
+                                    .point_for_position(event.position)
+                                    .nearest_valid;
+                                editor.touch_selection_active = true;
+                                editor.begin_selection(position, false, 2, window, cx);
+                                editor.end_selection(window, cx);
+                                if let Some(id) = editor.touch_contact {
+                                    let selection = editor.selections.newest_anchor();
+                                    editor.touch_selection_drag = Some((
+                                        id,
+                                        selection.start..selection.end,
+                                        point(px(0.), px(0.)),
+                                    ));
+                                }
+                                // Keep bubbling: transcript owners may also offer message actions.
+                            } else {
+                                Self::mouse_right_down(editor, event, &position_map, window, cx);
+                            }
                         }),
                         MouseButton::Middle => editor.update(cx, |editor, cx| {
                             Self::mouse_middle_down(editor, event, &position_map, window, cx);
@@ -514,6 +535,149 @@ impl EditorElement {
                 }
             }
         });
+    }
+
+    pub(super) fn paint_touch_selection(
+        &self,
+        layout: &EditorLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let position_map = layout.position_map.clone();
+        let handles = self.editor.read_with(cx, |editor, _| {
+            if !editor.touch_selection_active {
+                return Vec::new();
+            }
+            let selection = editor.selections.newest_anchor();
+            if selection.start == selection.end {
+                return Vec::new();
+            }
+            [
+                (selection.start, selection.end),
+                (selection.end, selection.start),
+            ]
+            .into_iter()
+            .filter_map(|(endpoint, fixed)| {
+                let display = endpoint.to_display_point(&position_map.snapshot);
+                let line_index = display
+                    .row()
+                    .0
+                    .checked_sub(position_map.visible_row_range.start.0)?;
+                let line = position_map.line_layouts.get(line_index as usize)?;
+                let x = line.x_for_index(display.column() as usize)
+                    + line.alignment_offset(position_map.text_align, position_map.content_width)
+                    - px(position_map.scroll_pixel_position.x as f32);
+                let y = (position_map.snapshot.row_y(display.row().0 as f64 + 1.)
+                    - position_map.snapshot.row_y(position_map.scroll_position.y))
+                    as f32
+                    * position_map.line_height;
+                let stem = position_map.text_hitbox.bounds.origin + point(x, y);
+                if !position_map
+                    .text_hitbox
+                    .bounds
+                    .contains(&point(stem.x, stem.y - px(1.)))
+                {
+                    return None;
+                }
+                let center = stem + point(px(0.), px(8.));
+                Some((center, fixed))
+            })
+            .collect::<Vec<_>>()
+        });
+        let color = cx.theme().colors().text_accent;
+        for (center, _) in &handles {
+            window.paint_quad(
+                fill(
+                    Bounds::new(*center - point(px(7.), px(7.)), size(px(14.), px(14.))),
+                    color,
+                )
+                .corner_radii(px(7.)),
+            );
+        }
+        let editor = self.editor.clone();
+        window.on_touch_event(
+            layout.hitbox.id,
+            move |event: &TouchEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    match event.phase {
+                        TouchPhase::Started => {
+                            if editor.touch_contact.is_some() {
+                                editor.touch_selection_drag = None;
+                                return;
+                            }
+                            editor.touch_contact = Some(event.id);
+                            editor.touch_selection_active = true;
+                            let nearest = handles
+                                .iter()
+                                .filter_map(|(center, fixed)| {
+                                    let delta = event.position - *center;
+                                    let distance =
+                                        delta.x.as_f32().powi(2) + delta.y.as_f32().powi(2);
+                                    (distance <= 22f32.powi(2))
+                                        .then_some((distance, *center, *fixed))
+                                })
+                                .min_by(|a, b| a.0.total_cmp(&b.0));
+                            if let Some((_, center, fixed)) = nearest {
+                                // The finger grips below the line; retain that offset to avoid jumping.
+                                let offset = event.position
+                                    - (center
+                                        - point(px(0.), px(8.) + position_map.line_height / 2.));
+                                editor.touch_selection_drag =
+                                    Some((event.id, fixed..fixed, offset));
+                                cx.stop_propagation();
+                            }
+                            cx.notify();
+                        }
+                        TouchPhase::Moved => {
+                            if let Some((id, initial, offset)) = editor.touch_selection_drag.clone()
+                                && id == event.id
+                            {
+                                let display = position_map
+                                    .point_for_position(event.position - offset)
+                                    .nearest_valid;
+                                let head = position_map
+                                    .snapshot
+                                    .display_point_to_anchor(display, Bias::Left);
+                                let start = initial.start.to_display_point(&position_map.snapshot);
+                                let end = initial.end.to_display_point(&position_map.snapshot);
+                                let range = if start <= display && display <= end {
+                                    initial
+                                } else if display < start {
+                                    initial.end..head
+                                } else {
+                                    initial.start..head
+                                };
+                                editor.change_selections(
+                                    SelectionEffects::no_scroll(),
+                                    window,
+                                    cx,
+                                    |selections| {
+                                        selections.select_anchor_ranges([range]);
+                                    },
+                                );
+                                cx.stop_propagation();
+                            }
+                        }
+                        TouchPhase::Ended | TouchPhase::Cancelled => {
+                            if editor.touch_contact == Some(event.id) {
+                                editor.touch_contact = None;
+                            }
+                            if editor
+                                .touch_selection_drag
+                                .as_ref()
+                                .is_some_and(|(id, _, _)| *id == event.id)
+                            {
+                                editor.touch_selection_drag = None;
+                                cx.stop_propagation();
+                            }
+                        }
+                    }
+                });
+            },
+        );
     }
 
     fn paint_scroll_wheel_listener(
@@ -625,8 +789,12 @@ impl EditorElement {
             return;
         }
 
+        if !window.is_touch_interaction() {
+            editor.touch_selection_active = false;
+            editor.touch_selection_drag = None;
+        }
         let text_hitbox = &position_map.text_hitbox;
-        if !editor.mouse_click_selection_enabled {
+        if !editor.mouse_click_selection_enabled && !window.is_touch_interaction() {
             if text_hitbox.is_hovered(window) {
                 cx.stop_propagation();
             }

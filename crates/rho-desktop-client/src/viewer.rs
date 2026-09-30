@@ -619,6 +619,57 @@ pub struct Viewer {
     task: tokio::task::JoinHandle<()>,
 }
 impl Viewer {
+    /// An in-memory decoded desktop for native view tests. Requires a Tokio
+    /// runtime, like the live viewer; inputs remain observable by the caller.
+    #[cfg(feature = "test-support")]
+    pub fn test() -> Result<(
+        Self,
+        mpsc::Receiver<Input>,
+        watch::Sender<Option<Arc<Image>>>,
+    )> {
+        // A gray 32×24 I444 VP9 keyframe, encoded independently with vpxenc.
+        // Native input tests need decoded planes, not a live encoder.
+        const FRAME: &[u8] = &[
+            162, 73, 131, 66, 0, 0, 62, 0, 46, 192, 7, 4, 131, 131, 0, 0, 0, 4, 0, 0, 56, 0,
+        ];
+        let planes = Decoder::new()?
+            .decode_planes(FRAME)?
+            .ok_or_else(|| anyhow::anyhow!("test frame was not decoded"))?;
+        let image = Arc::new(Image {
+            width: 32,
+            height: 24,
+            planes: Arc::new(planes),
+            id: FrameId {
+                epoch: 1,
+                timestamp_us: 1,
+            },
+            received_at: Instant::now(),
+            lag_us: 0,
+            progress: Arc::new(Progress::default()),
+        });
+        let (images, image_rx) = watch::channel(Some(image));
+        let (errors, error_rx) = watch::channel(None);
+        let (input, input_rx) = mpsc::channel(128);
+        let (motion, motion_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            let _channels = (errors, motion_rx);
+            std::future::pending::<()>().await;
+        });
+        Ok((
+            Self {
+                started_at: Instant::now(),
+                desktop_id: 0,
+                images: image_rx,
+                errors: error_rx,
+                input,
+                motion,
+                task,
+            },
+            input_rx,
+            images,
+        ))
+    }
+
     pub fn disconnect(&self) {
         self.task.abort();
     }

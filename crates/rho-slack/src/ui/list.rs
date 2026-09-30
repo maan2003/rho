@@ -20,7 +20,7 @@ use text::Anchor;
 use theme::ActiveTheme as _;
 
 use crate::model::{ConversationRow, Empty};
-use crate::session::{Session, Source, Status};
+use crate::session::{Session, SessionEvent, Source, Status};
 use crate::types::ChannelId;
 use crate::ui::{Class, Hooks, Span, lay_out};
 
@@ -238,6 +238,30 @@ impl ListView {
     pub fn cursor_source(&self, cx: &mut Context<Self>) -> Option<Source> {
         let row = self.cursor_row(cx);
         self.id_at(row).map(Source::Conversation)
+    }
+
+    fn activate_clicked(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let hit = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<Point>(&snapshot)
+                .is_empty()
+                .then(|| editor.buffer_location_for_window_position(position, language::Bias::Left))
+                .flatten()
+        });
+        let Some((_, buffer_id, offset)) = hit else {
+            return;
+        };
+        let buffer = self.buffer.read(cx);
+        if buffer.remote_id() != buffer_id {
+            return;
+        }
+        let row = buffer.snapshot().offset_to_point(offset).row as usize;
+        if let Some(channel) = self.id_at(row) {
+            self.session
+                .update(cx, |_, cx| cx.emit(SessionEvent::OpenConversation(channel)));
+        }
     }
 
     /// The conversation a buffer line opens. `drawn` is the buffer as it
@@ -889,9 +913,18 @@ fn render_row(row: &ConversationRow, favorite: bool) -> Vec<Span> {
 impl gpui::Render for ListView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("rho-slack-list")
             .key_context("RhoSlackList")
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    if event.click_count == 1 && !event.modifiers.modified() {
+                        this.activate_clicked(event.position, cx);
+                    }
+                }),
+            )
             .child(self.editor.clone())
     }
 }

@@ -450,7 +450,7 @@ impl Editor {
         ClipboardItem::new_string_with_json_metadata(text, clipboard_selections)
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if self.read_only(cx) {
             return;
         }
@@ -573,7 +573,7 @@ impl Editor {
         self.do_copy(true, cx);
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         self.do_copy(false, cx);
     }
 

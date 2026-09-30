@@ -818,6 +818,9 @@ impl Workspace {
                 let view = cx.new(|cx| {
                     rho_slack::ui::ConversationView::new(session, source, hooks, window, cx)
                 });
+                view.update(cx, |view, cx| {
+                    view.set_touch_presentation(self.touch_mode(), window, cx)
+                });
                 self._slack_view_subscriptions.push(cx.subscribe_in(
                     &view,
                     window,
@@ -848,6 +851,9 @@ impl Workspace {
                                 StyleClass::SystemImportant,
                                 cx,
                             );
+                        }
+                        rho_slack::ui::conversation::Event::MessageActionsRequested(_) => {
+                            workspace.prompt_slack_message_actions(window, cx);
                         }
                         rho_slack::ui::conversation::Event::ActivateRequested => {
                             workspace.slack_open_row(window, cx);
@@ -1554,6 +1560,35 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    pub(crate) fn slack_copy_message(&mut self, cx: &mut gpui::Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let text = view.clone().update(cx, |view, cx| {
+            let message = view.cursor_message(cx)?;
+            Some(view.session().read(cx).model().render(&message))
+        });
+        if let Some(text) = text {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            self.echo("Message copied", StyleClass::SystemInfo, cx);
+        }
+    }
+
+    pub(crate) fn slack_reply_thread(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let thread = view.clone().update(cx, |view, cx| view.cursor_thread(cx));
+        if let Some(thread) = thread {
+            self.open_slack_source(Source::Thread(thread), window, cx);
+            self.enter_composer(window, cx);
+        }
     }
 
     pub(crate) fn prompt_slack_message_actions(

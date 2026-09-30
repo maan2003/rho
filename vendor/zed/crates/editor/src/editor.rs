@@ -1163,7 +1163,11 @@ pub struct Editor {
     workspace: Option<(WeakEntity<Workspace>, Option<WorkspaceId>)>,
     input_enabled: bool,
     expects_character_input: bool,
+    ime_cursor_visible: bool,
     use_modal_editing: bool,
+    touch_selection_active: bool,
+    touch_contact: Option<gpui::TouchId>,
+    touch_selection_drag: Option<(gpui::TouchId, Range<Anchor>, gpui::Point<Pixels>)>,
     read_only: bool,
     #[cfg(feature = "native")]
     leader_id: Option<CollaboratorId>,
@@ -2634,7 +2638,11 @@ impl Editor {
             workspace: None,
             input_enabled: !is_minimap,
             expects_character_input: !is_minimap,
+            ime_cursor_visible: true,
             use_modal_editing: full_mode,
+            touch_selection_active: false,
+            touch_contact: None,
+            touch_selection_drag: None,
             read_only: is_minimap,
             use_autoclose: true,
             use_auto_surround: true,
@@ -10391,6 +10399,7 @@ impl Editor {
             || self.cursor_shape == CursorShape::Block
             || self.blink_manager.read(cx).visible())
             && self.focus_handle.is_focused(window)
+            && self.ime_cursor_visible
     }
 
     pub fn set_show_cursor_when_unfocused(&mut self, is_enabled: bool, cx: &mut Context<Self>) {

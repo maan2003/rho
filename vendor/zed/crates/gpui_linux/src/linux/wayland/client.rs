@@ -1,3 +1,4 @@
+use super::text_input::{ImeBatch, SurroundingText};
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -104,8 +105,8 @@ use crate::linux::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
-    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     Size, TouchEvent, TouchId, TouchPhase, UserIdleEvent, WindowButtonLayout, WindowKind,
@@ -209,6 +210,7 @@ fn update_ime_cursor_rectangle(
     text_input.commit_ime_state();
 }
 
+#[cfg(test)]
 fn set_ime_cursor_rectangle_after_done(
     text_input: &impl ImeCursorRectangleSink,
     last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
@@ -384,7 +386,10 @@ pub(crate) struct WaylandClientState {
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
-    ime_pre_edit: Option<String>,
+    ime_batch: ImeBatch,
+    ime_commit_serial: u32,
+    ime_can_update: bool,
+    ime_surrounding: Option<SurroundingText>,
     composing: bool,
     last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
     // Surface to Window mapping
@@ -625,6 +630,8 @@ impl WaylandClientStatePtr {
             return;
         }
         state.last_ime_cursor_rectangle = None;
+        state.ime_surrounding = None;
+        state.ime_can_update = true;
         let Some(text_input) = state.text_input.take() else {
             return;
         };
@@ -639,9 +646,15 @@ impl WaylandClientStatePtr {
                 set_ime_cursor_rectangle(&text_input, area);
                 cursor_rectangle = Some(area);
             }
+            let surrounding = window.get_ime_surrounding();
+            if let Some(s) = &surrounding {
+                text_input.set_surrounding_text(s.text.clone(), s.cursor, s.anchor);
+            }
             state = client.borrow_mut();
+            state.ime_surrounding = surrounding;
         }
         text_input.commit();
+        state.ime_commit_serial = state.ime_commit_serial.wrapping_add(1);
         state.last_ime_cursor_rectangle = cursor_rectangle;
         state.text_input = Some(text_input);
     }
@@ -656,7 +669,40 @@ impl WaylandClientStatePtr {
         if let Some(text_input) = &state.text_input {
             text_input.disable();
             text_input.commit();
+            state.ime_commit_serial = state.ime_commit_serial.wrapping_add(1);
         }
+        state.ime_surrounding = None;
+    }
+
+    pub(super) fn update_ime_surrounding(&self, surrounding: Option<SurroundingText>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if !state.ime_state.requests_allowed()
+            || !state.ime_can_update
+            || state.ime_state.desired_enabled != Some(true)
+        {
+            return;
+        }
+        if state.ime_surrounding == surrounding {
+            return;
+        }
+        if let Some(text_input) = &state.text_input {
+            if let Some(s) = &surrounding {
+                text_input.set_surrounding_text(s.text.clone(), s.cursor, s.anchor);
+            } else if state.ime_surrounding.is_some() {
+                // Enabling resets v3 state. A handler with no context (PTYs)
+                // must not inherit the previous field's surrounding text.
+                text_input.disable();
+                text_input.enable();
+                text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
+                if let Some(rectangle) = state.last_ime_cursor_rectangle {
+                    set_ime_cursor_rectangle(text_input, rectangle);
+                }
+            }
+            text_input.commit();
+            state.ime_commit_serial = state.ime_commit_serial.wrapping_add(1);
+        }
+        state.ime_surrounding = surrounding;
     }
 
     pub fn ime_enabled(&self) -> Option<bool> {
@@ -667,13 +713,19 @@ impl WaylandClientStatePtr {
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        if !state.ime_state.requests_allowed() || state.pre_edit_text.is_some() {
+        if !state.ime_state.requests_allowed()
+            || !state.ime_can_update
+            || state.pre_edit_text.is_some()
+        {
             return;
         }
         let Some(text_input) = state.text_input.clone() else {
             return;
         };
-        update_ime_cursor_rectangle(&text_input, &mut state.last_ime_cursor_rectangle, bounds);
+        if state.last_ime_cursor_rectangle != Some(ImeCursorRectangle::from(bounds)) {
+            update_ime_cursor_rectangle(&text_input, &mut state.last_ime_cursor_rectangle, bounds);
+            state.ime_commit_serial = state.ime_commit_serial.wrapping_add(1);
+        }
     }
 
     pub fn handle_keyboard_layout_change(&self) {
@@ -1014,7 +1066,10 @@ impl WaylandClient {
             primary_selection,
             text_input: None,
             pre_edit_text: None,
-            ime_pre_edit: None,
+            ime_batch: ImeBatch::default(),
+            ime_commit_serial: 0,
+            ime_can_update: true,
+            ime_surrounding: None,
             composing: false,
             last_ime_cursor_rectangle: None,
             outputs: HashMap::default(),
@@ -2050,11 +2105,14 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 if let Some(text_input) = state.text_input.take() {
                     text_input.destroy();
-                    state.ime_pre_edit = None;
+                    state.ime_batch = ImeBatch::default();
+                    state.ime_surrounding = None;
                     state.composing = false;
                     state.ime_state.leave_surface();
                 }
 
+                state.ime_commit_serial = 0;
+                state.ime_can_update = true;
                 state.text_input = state
                     .globals
                     .text_input_manager
@@ -2373,7 +2431,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
 impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        text_input: &zwp_text_input_v3::ZwpTextInputV3,
+        _text_input: &zwp_text_input_v3::ZwpTextInputV3,
         event: <zwp_text_input_v3::ZwpTextInputV3 as Proxy>::Event,
         _: &(),
         _: &Connection,
@@ -2393,63 +2451,46 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 state.ime_state.leave_surface();
                 state.last_ime_cursor_rectangle = None;
                 state.composing = false;
-                state.ime_pre_edit = None;
+                state.ime_batch = ImeBatch::default();
+                state.ime_surrounding = None;
                 // `leave` has already cleared the current surface; v3 says
                 // the compositor must ignore requests until the next enter.
                 // Retain the desired state and re-apply it from `Enter`.
             }
             zwp_text_input_v3::Event::CommitString { text } => {
-                state.composing = false;
-                let Some(window) = state.keyboard_focused_window.clone() else {
-                    return;
-                };
-
-                if let Some(commit_text) = text {
-                    drop(state);
-                    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
-                    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
-                    if commit_text.len() == 1 {
-                        window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
-                            keystroke: Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: commit_text.clone(),
-                                key_char: Some(commit_text),
-                            },
-                            is_held: false,
-                            prefer_character_input: false,
-                        }));
-                    } else {
-                        window.handle_ime(ImeInput::InsertText(commit_text));
-                    }
-                }
+                state.ime_batch.commit = text;
             }
-            zwp_text_input_v3::Event::PreeditString { text, .. } => {
-                state.composing = true;
-                state.ime_pre_edit = text;
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
+                state.ime_batch.preedit = text.map(|text| (text, cursor_begin, cursor_end));
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state.ime_batch.delete = Some((before_length, after_length));
             }
             zwp_text_input_v3::Event::Done { serial } => {
-                let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
+                // Stale done still changes the document, but cannot publish a
+                // new client state until the compositor acknowledges our commit.
+                state.ime_can_update = serial == state.ime_commit_serial;
+                let batch = std::mem::take(&mut state.ime_batch);
+                state.composing = batch
+                    .preedit
+                    .as_ref()
+                    .is_some_and(|(text, _, _)| !text.is_empty());
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
                 };
-
-                if let Some(text) = state.ime_pre_edit.take() {
-                    drop(state);
-                    window.handle_ime(ImeInput::SetMarkedText(text));
-                    if let Some(area) = window.get_ime_area() {
-                        let mut state = client.borrow_mut();
-                        set_ime_cursor_rectangle_after_done(
-                            text_input,
-                            &mut state.last_ime_cursor_rectangle,
-                            area,
-                            last_serial.as_raw() == serial,
-                        );
-                    }
-                } else {
-                    state.composing = false;
-                    drop(state);
-                    window.handle_ime(ImeInput::DeleteText);
+                drop(state);
+                window.handle_ime_batch(batch);
+                this.update_ime_surrounding(window.get_ime_surrounding());
+                if let Some(area) = window.get_ime_area() {
+                    this.update_ime_position(area);
                 }
             }
             _ => {}

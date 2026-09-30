@@ -2,25 +2,28 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    AppContext as _, Context, CursorStyle, Entity, EntityId, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, LinuxAxisRelativeDirection,
-    LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent,
-    LinuxWaylandDmaBufPlane, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer,
-    LinuxWaylandPassthroughEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, RenderImage,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, Window,
-    canvas, div, img, px, surface,
+    AppContext as _, Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityId,
+    EntityInputHandler, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent,
+    LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
+    LinuxPointerAxisEvent, LinuxWaylandDmaBufPlane, LinuxWaylandPassthrough,
+    LinuxWaylandPassthroughBuffer, LinuxWaylandPassthroughEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent,
+    Render, RenderImage, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, TouchEvent, TouchPhase, UTF16Selection, Window, canvas, div, img, px,
+    surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
     BrowserCursor, BrowserEvent, BrowserSession, BufferImport, HostPresentation, PinchGesture,
-    PointerAxisDirection, PointerAxisFrame, PointerAxisSource, SceneNode,
+    PointerAxisDirection, PointerAxisFrame, PointerAxisSource, SceneNode, TextInputState,
+    TextInputUpdate, TouchInput,
 };
 use theme::ActiveTheme as _;
 
@@ -40,6 +43,7 @@ struct RuntimePageState {
     status: Option<String>,
     sent_size: Rc<Cell<(u32, u32, u32)>>,
     cursor: BrowserCursor,
+    text_input: TextInputState,
 }
 
 #[derive(Clone)]
@@ -399,6 +403,7 @@ impl BrowserModel {
                                         Some("Chrome surface import was retired".into());
                                 }
                             }
+                            BrowserEvent::TextInput(state) => { model.runtime.text_input = state; }
                             BrowserEvent::Cursor(cursor) => {
                                 model.runtime.cursor = cursor;
                             }
@@ -469,6 +474,7 @@ impl BrowserModel {
                 status: Some("waiting for Chrome".into()),
                 sent_size: Rc::new(Cell::new((1280, 720, 1.0_f32.to_bits()))),
                 cursor: BrowserCursor::Arrow,
+                text_input: TextInputState::default(),
             },
             _events_task: events_task,
             _metadata_task: metadata_task,
@@ -489,6 +495,7 @@ impl BrowserModel {
     }
 
     fn request_handoff(&mut self, target: PageId) {
+        self.runtime.text_input = TextInputState::default();
         let generation = self.next_handoff_generation;
         self.next_handoff_generation = self.next_handoff_generation.wrapping_add(1).max(1);
         self.handoff = Some(PageHandoff {
@@ -862,6 +869,24 @@ impl BrowserModel {
         }
     }
 
+    fn touch(&self, mut event: TouchInput) {
+        if let TouchInput::Down { scene, .. } = &mut event {
+            let Some(painted) = self.runtime.painted_scene_id else {
+                return;
+            };
+            *scene = painted;
+        }
+        if let Some(session) = &self.runtime.session {
+            session.touch(event);
+        }
+    }
+
+    fn text_input(&self, update: TextInputUpdate) {
+        if let Some(session) = &self.runtime.session {
+            session.text_input(update);
+        }
+    }
+
     fn key(&self, keycode: u32, pressed: bool) -> bool {
         if pressed && self.runtime.painted_scene_id.is_none() {
             return false;
@@ -1036,8 +1061,9 @@ struct QueuedInput {
 
 const MAX_QUEUED_INPUT_EVENTS: usize = 256;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum QueuedInputEvent {
+    Touch(TouchInput),
     Motion {
         position: (f64, f64),
     },
@@ -1148,6 +1174,11 @@ pub struct BrowserView {
     pressed_keys: HashSet<u32>,
     pending_key: Option<(u32, Option<u64>)>,
     pressed_buttons: HashSet<u32>,
+    touches: HashSet<u64>,
+    preedit: String,
+    preedit_generation: u64,
+    preedit_selection: Range<usize>,
+    input_method_batch: Option<TextInputUpdate>,
     queued_input: Option<QueuedInput>,
     claiming_pointer_focus: bool,
     finger_axes: (bool, bool),
@@ -1203,6 +1234,11 @@ impl BrowserView {
             pressed_keys: HashSet::new(),
             pending_key: None,
             pressed_buttons: HashSet::new(),
+            touches: HashSet::new(),
+            preedit: String::new(),
+            preedit_generation: 0,
+            preedit_selection: 0..0,
+            input_method_batch: None,
             queued_input: None,
             claiming_pointer_focus: false,
             finger_axes: (false, false),
@@ -1300,6 +1336,56 @@ impl BrowserView {
             self.focus_handle.focus(window, cx);
         }
         generation
+    }
+
+    fn touch(&mut self, event: &TouchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (origin_x, origin_y) = self.origin.get();
+        let x = f64::from(f32::from(event.position.x) - origin_x);
+        let y = f64::from(f32::from(event.position.y) - origin_y);
+        let time = event.timestamp.as_millis() as u32;
+        let input = match event.phase {
+            TouchPhase::Started => {
+                self.touches.insert(event.id.0);
+                TouchInput::Down {
+                    id: event.id.0,
+                    time,
+                    scene: 0,
+                    x,
+                    y,
+                }
+            }
+            TouchPhase::Moved if self.touches.contains(&event.id.0) => TouchInput::Motion {
+                id: event.id.0,
+                time,
+                x,
+                y,
+            },
+            TouchPhase::Ended if self.touches.remove(&event.id.0) => TouchInput::Up {
+                id: event.id.0,
+                time,
+            },
+            TouchPhase::Cancelled => {
+                self.touches.clear();
+                TouchInput::Cancel
+            }
+            _ => return,
+        };
+        if self.queued_input.is_some()
+            || !self.model.read(cx).presents(self.owner_id, self.page_id)
+            || (event.phase == TouchPhase::Started && !self.focus_handle.is_focused(window))
+        {
+            if let Some(generation) =
+                self.claim_for_input(event.phase == TouchPhase::Started, window, cx)
+            {
+                self.queue_input_event(generation, QueuedInputEvent::Touch(input));
+            }
+        } else {
+            self.model.read(cx).touch(input);
+        }
+        // Chromium owns touch gestures, including DOM touch-action, scroll and
+        // pinch. Suppress GPUI's compatibility mouse and scroll stream.
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1521,6 +1607,11 @@ impl BrowserView {
             return;
         }
         let Some((keycode, generation)) = self.pending_key.take() else {
+            // Outer Wayland turns a one-byte IME commit into a KeyDown with no
+            // evdev event. It is text, not a second physical key press.
+            if let Some(text) = &event.keystroke.key_char {
+                self.commit_text(None, text, cx);
+            }
             cx.stop_propagation();
             return;
         };
@@ -1592,12 +1683,137 @@ impl BrowserView {
         }
     }
 
+    /// Execute an existing extension command on this view's page, without
+    /// injecting normal-mode keystrokes into a possibly focused text field.
+    pub fn run_touch_command(
+        &mut self,
+        keys: String,
+        count: usize,
+        character: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let browser = self.model.read(cx).browser.clone();
+        let page = self.page_id;
+        cx.background_spawn(async move { browser.run_touch_command(page, &keys, count, character) })
+    }
+
+    fn editable(&self, cx: &Context<Self>) -> bool {
+        let model = self.model.read(cx);
+        model.presents(self.owner_id, self.page_id) && model.runtime.text_input.enabled
+    }
+
+    fn input_text(&self, cx: &Context<Self>) -> (String, Range<usize>) {
+        let state = &self.model.read(cx).runtime.text_input;
+        let (mut text, cursor, anchor) = state.surrounding.clone().unwrap_or_default();
+        let start = cursor.min(anchor) as usize;
+        let end = cursor.max(anchor) as usize;
+        let selection = text[..start].encode_utf16().count()..text[..end].encode_utf16().count();
+        if self.preedit_generation == state.generation && !self.preedit.is_empty() {
+            text.replace_range(start..end, &self.preedit);
+            let range = selection.start + self.preedit_selection.start
+                ..selection.start + self.preedit_selection.end;
+            (text, range)
+        } else {
+            (text, selection)
+        }
+    }
+
+    fn commit_text(&mut self, range: Option<Range<usize>>, text: &str, cx: &mut Context<Self>) {
+        if !self.editable(cx) {
+            return;
+        }
+        let model = self.model.read(cx);
+        let state = &model.runtime.text_input;
+        let marked = self.marked_range(cx);
+        let delete = if let Some(range) = range.filter(|range| Some(range) != marked.as_ref()) {
+            let Some((surrounding, cursor, anchor)) = &state.surrounding else {
+                return;
+            };
+            let selection = (*cursor).min(*anchor) as usize..(*cursor).max(*anchor) as usize;
+            let (Some(start), Some(end)) = (
+                utf16_byte(surrounding, range.start),
+                utf16_byte(surrounding, range.end),
+            ) else {
+                return;
+            };
+            if start > selection.start || end < selection.end {
+                return;
+            }
+            Some((
+                (selection.start - start) as u32,
+                (end - selection.end) as u32,
+            ))
+        } else {
+            None
+        };
+        let generation = state.generation;
+        self.send_text_input(
+            TextInputUpdate {
+                generation,
+                commit: Some(text.to_owned()),
+                preedit: Some((String::new(), 0, 0)),
+                delete,
+            },
+            cx,
+        );
+        self.preedit.clear();
+        cx.notify();
+    }
+
+    fn send_text_input(&mut self, update: TextInputUpdate, cx: &Context<Self>) {
+        if let Some(batch) = &mut self.input_method_batch {
+            if batch.generation == update.generation {
+                if update.delete.is_some() {
+                    batch.delete = update.delete;
+                }
+                if update.commit.is_some() {
+                    batch.commit = update.commit;
+                }
+                if update.preedit.is_some() {
+                    batch.preedit = update.preedit;
+                }
+            }
+        } else {
+            self.model.read(cx).text_input(update);
+        }
+    }
+
+    fn marked_range(&self, cx: &Context<Self>) -> Option<Range<usize>> {
+        let state = &self.model.read(cx).runtime.text_input;
+        if self.preedit_generation != state.generation || self.preedit.is_empty() {
+            return None;
+        }
+        let start = state
+            .surrounding
+            .as_ref()
+            .map(|(text, cursor, anchor)| {
+                text[..(*cursor).min(*anchor) as usize]
+                    .encode_utf16()
+                    .count()
+            })
+            .unwrap_or(0);
+        Some(start..start + self.preedit.encode_utf16().count())
+    }
+
     fn release_input(&mut self, cx: &mut Context<Self>) {
+        self.preedit.clear();
+        self.input_method_batch = None;
+        let had_touches = !std::mem::take(&mut self.touches).is_empty();
         self.queued_input = None;
         self.pending_key = None;
         self.claiming_pointer_focus = false;
         let model = self.model.read(cx);
         let presents = model.presents(self.owner_id, self.page_id);
+        if presents {
+            if had_touches {
+                model.touch(TouchInput::Cancel);
+            }
+            model.text_input(TextInputUpdate {
+                generation: model.runtime.text_input.generation,
+                preedit: Some((String::new(), 0, 0)),
+                ..Default::default()
+            });
+        }
         for keycode in self.pressed_keys.drain() {
             if presents {
                 model.key(keycode, false);
@@ -1625,6 +1841,212 @@ impl BrowserView {
         if std::mem::take(&mut self.pinch_active) && presents {
             model.pinch(PinchGesture::End { cancelled: true });
         }
+    }
+}
+
+/// Translate only complete Unicode scalar boundaries; never split a surrogate.
+fn utf16_byte(text: &str, offset: usize) -> Option<usize> {
+    let mut utf16 = 0;
+    for (byte, character) in text.char_indices() {
+        if utf16 == offset {
+            return Some(byte);
+        }
+        utf16 += character.len_utf16();
+    }
+    (utf16 == offset).then_some(text.len())
+}
+
+/// V3 deletion excludes selected text, even for a reversed selection.
+fn surrounding_delete_bytes(
+    text: &str,
+    selection: Range<usize>,
+    before: usize,
+    after: usize,
+) -> Option<(u32, u32)> {
+    let start = utf16_byte(text, selection.start)?;
+    let end = utf16_byte(text, selection.end)?;
+    let before = utf16_byte(text, selection.start.checked_sub(before)?)?;
+    let after = utf16_byte(text, selection.end.checked_add(after)?)?;
+    Some(((start - before) as u32, (after - end) as u32))
+}
+
+impl EntityInputHandler for BrowserView {
+    fn accepts_text_input(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.focus_handle.is_focused(window) && self.editable(cx)
+    }
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, _) = self.input_text(cx);
+        let start = utf16_byte(&text, range.start)?;
+        let end = utf16_byte(&text, range.end)?;
+        *adjusted = Some(range);
+        text.get(start..end).map(str::to_owned)
+    }
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if !ignore_disabled && !self.editable(cx) {
+            return None;
+        }
+        let (_, range) = self.input_text(cx);
+        let state = &self.model.read(cx).runtime.text_input;
+        let reversed = self.marked_range(cx).is_none()
+            && state
+                .surrounding
+                .as_ref()
+                .is_some_and(|(_, cursor, anchor)| cursor < anchor);
+        Some(UTF16Selection { range, reversed })
+    }
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range(cx)
+    }
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range(cx).is_some() {
+            let text = self.preedit.clone();
+            self.commit_text(None, &text, cx);
+        }
+    }
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_text(range, text, cx);
+    }
+    fn begin_input_method_batch(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.input_method_batch = Some(TextInputUpdate {
+            generation: self.model.read(cx).runtime.text_input.generation,
+            ..Default::default()
+        });
+    }
+
+    fn end_input_method_batch(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(batch) = self.input_method_batch.take()
+            && self.editable(cx)
+            && batch.generation == self.model.read(cx).runtime.text_input.generation
+            && (batch.delete.is_some() || batch.commit.is_some() || batch.preedit.is_some())
+        {
+            self.model.read(cx).text_input(batch);
+        }
+    }
+
+    fn set_ime_cursor_visible(&mut self, visible: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.editable(cx) || self.marked_range(cx).is_none() {
+            return;
+        }
+        let (begin, end) = if visible {
+            let (Some(begin), Some(end)) = (
+                utf16_byte(&self.preedit, self.preedit_selection.start),
+                utf16_byte(&self.preedit, self.preedit_selection.end),
+            ) else {
+                return;
+            };
+            (begin as i32, end as i32)
+        } else {
+            (-1, -1)
+        };
+        self.send_text_input(
+            TextInputUpdate {
+                generation: self.preedit_generation,
+                preedit: Some((self.preedit.clone(), begin, end)),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    fn delete_surrounding_text(
+        &mut self,
+        before: usize,
+        after: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.editable(cx) {
+            return;
+        }
+        let (text, selection) = self.input_text(cx);
+        let Some(delete) = surrounding_delete_bytes(&text, selection, before, after) else {
+            return;
+        };
+        self.send_text_input(
+            TextInputUpdate {
+                generation: self.model.read(cx).runtime.text_input.generation,
+                delete: Some(delete),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.editable(cx) {
+            return;
+        }
+        let selected = selected.unwrap_or_else(|| {
+            let end = text.encode_utf16().count();
+            end..end
+        });
+        let (Some(begin), Some(end)) = (
+            utf16_byte(text, selected.start),
+            utf16_byte(text, selected.end),
+        ) else {
+            return;
+        };
+        self.preedit_generation = self.model.read(cx).runtime.text_input.generation;
+        self.preedit = text.to_owned();
+        self.preedit_selection = selected;
+        self.send_text_input(
+            TextInputUpdate {
+                generation: self.preedit_generation,
+                preedit: Some((text.to_owned(), begin as i32, end as i32)),
+                ..Default::default()
+            },
+            cx,
+        );
+        cx.notify();
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<gpui::Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        let (x, y, width, height) = self.model.read(cx).runtime.text_input.cursor_rectangle?;
+        let (origin_x, origin_y) = self.origin.get();
+        Some(Bounds::new(
+            gpui::point(px(origin_x + x as f32), px(origin_y + y as f32)),
+            gpui::size(px(width as f32), px(height as f32)),
+        ))
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+    fn text_length_utf16(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        Some(self.input_text(cx).0.encode_utf16().count())
     }
 }
 
@@ -1857,6 +2279,7 @@ impl Render for BrowserView {
             match replay_state {
                 InputReplayState::Waiting => {}
                 InputReplayState::Cancel => {
+                    self.touches.clear();
                     self.queued_input = None;
                     self.pinch_active = false;
                 }
@@ -1865,6 +2288,7 @@ impl Render for BrowserView {
                     let model = self.model.read(cx);
                     for event in queued.events {
                         match event {
+                            QueuedInputEvent::Touch(event) => model.touch(event),
                             QueuedInputEvent::Motion { position } => {
                                 model.pointer_motion(position.0, position.1);
                             }
@@ -2028,6 +2452,8 @@ impl Render for BrowserView {
         let passthrough_timing_enabled = self.passthrough_timing_enabled.clone();
         let timing_model = self.model.clone();
         let passthrough_owner = model.passthrough_owner.clone();
+        let input_view = cx.entity();
+        let input_focus = self.focus_handle.clone();
         let measure = canvas(
             move |bounds, _, cx| {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -2039,6 +2465,11 @@ impl Render for BrowserView {
                 }
             },
             move |bounds, _, window, cx| {
+                window.handle_input(
+                    &input_focus,
+                    ElementInputHandler::new(bounds, input_view.clone()),
+                    cx,
+                );
                 let mut state = passthrough_state.get();
                 let compositor_eligible = passthrough.is_some()
                     && passthrough_scene.is_some()
@@ -2151,6 +2582,7 @@ impl Render for BrowserView {
             .on_hover(cx.listener(Self::hover_changed))
             .cursor(cursor)
             .key_context("RhoBrowser")
+            .on_touch(cx.listener(Self::touch))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
@@ -2219,6 +2651,21 @@ impl Render for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surrounding_deletion_uses_utf8_bytes_outside_the_selected_text() {
+        // Select é, preserving both it and the cursor direction. Delete the
+        // preceding emoji (2 UTF16,4 UTF8) and following Han (1 UTF16,3 UTF8).
+        assert_eq!(
+            surrounding_delete_bytes("a😀é漢Z", 3..4, 2, 1),
+            Some((4, 3))
+        );
+        assert_eq!(surrounding_delete_bytes("a😀é漢Z", 3..4, 1, 1), None);
+        assert_eq!(surrounding_delete_bytes("a😀é漢Z", 3..4, 4, 1), None);
+        assert_eq!(utf16_byte("a😀é", 2), None);
+        assert_eq!(utf16_byte("a😀é", 3), Some(5));
+        assert_eq!(utf16_byte("a😀é", 4), Some(7));
+    }
 
     #[test]
     fn queued_input_waits_for_its_painted_handoff_and_cancels_when_superseded() {
@@ -2474,6 +2921,7 @@ mod tests {
             status: Some("switching browser page".into()),
             sent_size: Rc::new(Cell::new((1, 1, 1.0_f32.to_bits()))),
             cursor: BrowserCursor::Arrow,
+            text_input: TextInputState::default(),
         };
         let mut handoff = Some(PageHandoff {
             generation: 1,

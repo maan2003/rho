@@ -409,59 +409,136 @@ impl Minibuffer {
     pub(crate) fn render_phone(
         &self,
         text_style: &gpui::TextStyle,
+        window: &Window,
         cx: &Context<Workspace>,
     ) -> AnyElement {
+        let compact = window.viewport_size().height < px(300.);
         let colors = cx.theme().colors();
-        let window_start = self
-            .selected
-            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let rows = self
             .candidates
             .iter()
             .enumerate()
-            .skip(window_start)
-            .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
-                let mut row = div()
+                div()
                     .id(("phone-minibuffer-candidate", index))
                     .cursor_pointer()
                     .flex()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
+                    .justify_center()
+                    .min_h(px(56.))
                     .w_full()
-                    .min_h(px(48.))
                     .px_3()
-                    .child(div().child(candidate.value.clone()));
-                if !candidate.description.is_empty() {
-                    row = row.child(
-                        div()
-                            .text_color(colors.text_muted)
-                            .child(candidate.description.clone()),
-                    );
-                }
-                if index == self.selected {
-                    row = row.bg(colors.element_selected);
-                }
-                row.on_click(cx.listener(move |workspace, _, window, cx| {
-                    workspace.phone_choose_minibuffer(index, window, cx);
-                }))
+                    .py_2()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .when(index == self.selected, |row| {
+                        row.bg(colors.element_selected)
+                    })
+                    .child(div().w_full().child(candidate.value.clone()))
+                    .when(!candidate.description.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .w_full()
+                                .text_size(px(13.))
+                                .text_color(colors.text_muted)
+                                .child(candidate.description.clone()),
+                        )
+                    })
+                    .on_click(cx.listener(move |workspace, _, window, cx| {
+                        workspace.phone_choose_minibuffer(index, window, cx);
+                    }))
             });
+        let input = div()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .w_full()
+                    .when(compact, |label| label.py_0().text_size(px(13.)))
+                    .child(self.prompt.clone()),
+            )
+            .child(
+                div()
+                    .min_h(px(48.))
+                    .mx_3()
+                    .mb_2()
+                    .when(compact, |input| input.mb_0())
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(self.editor.clone()),
+            );
+        let contents = if compact {
+            // With a landscape keyboard, input and candidates share one
+            // scrollport: neither may squeeze the other to a sliver.
+            div()
+                .id("phone-minibuffer-contents")
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(input)
+                .children(rows)
+        } else {
+            div()
+                .id("phone-minibuffer-contents")
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .child(input.flex_none())
+                .child(
+                    div()
+                        .id("phone-minibuffer-results")
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
+        };
         bottom_strip(text_style, cx)
+            .occlude()
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(48.))
+            .bottom_0()
+            .max_h(gpui::relative(if compact { 1. } else { 0.95 }))
+            .overflow_hidden()
             .key_context("RhoMinibuffer")
+            .child(contents)
             .child(
                 div()
+                    .flex_none()
                     .flex()
-                    .items_center()
-                    .min_h(px(48.))
-                    .px_3()
-                    .child(div().child(self.prompt.clone()))
-                    .child(div().flex_grow(1.0).child(self.editor.clone())),
+                    .h(px(if compact { 48. } else { 56. }))
+                    .w_full()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        div()
+                            .id("phone-prompt-cancel")
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|workspace, _, window, cx| {
+                                workspace.minibuffer_cancel(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("phone-prompt-confirm")
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Confirm")
+                            .on_click(cx.listener(|workspace, _, window, cx| {
+                                workspace.minibuffer_confirm(window, cx);
+                            })),
+                    ),
             )
-            .children(rows)
             .into_any_element()
     }
 }

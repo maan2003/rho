@@ -71,6 +71,8 @@ impl BrowserRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .arg("--ozone-platform=wayland")
+            .arg("--enable-wayland-ime")
+            .arg("--wayland-text-input-version=3")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--restore-last-session")
@@ -99,6 +101,22 @@ impl BrowserRuntime {
         let bridge = self.bridge()?;
         let value = bridge.request("create", json!({ "url": target }))?;
         serde_json::from_value(value).context("decode created browser page")
+    }
+
+    pub(crate) fn run_touch_command(
+        &self,
+        id: PageId,
+        keys: &str,
+        count: usize,
+        character: Option<String>,
+    ) -> Result<()> {
+        self.bridge()?.request(
+            "touch-command",
+            json!({
+                "id": id.0, "keys": keys, "count": count, "character": character
+            }),
+        )?;
+        Ok(())
     }
 
     pub(crate) fn focus_page(&self, id: PageId) -> Result<()> {

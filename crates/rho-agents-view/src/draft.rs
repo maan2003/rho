@@ -19,11 +19,14 @@ use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Subscription, WeakEntity, Window};
+use gpui::{
+    AnyElement, Context, Entity, Focusable as _, Subscription, WeakEntity, Window, div, px,
+};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agent_types::ContentPart;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
+use theme::ActiveTheme as _;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
@@ -111,6 +114,8 @@ pub struct DraftModel {
     /// Editors currently displaying the draft, weakly held: surfaces own
     /// their editors; the model reconciles whoever is still alive.
     editors: Vec<WeakEntity<Editor>>,
+    /// Phone controls share the desktop buffers, not its excerpts or chrome.
+    phone_editors: Option<[Entity<Editor>; 4]>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -155,6 +160,7 @@ impl DraftModel {
             cx.subscribe(&role_buffer, |this, _, event, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.note_draft_edit(cx);
+                    cx.notify();
                 }
             }),
             cx.subscribe(&start_buffer, |this, _, event, cx| {
@@ -181,6 +187,7 @@ impl DraftModel {
             refusal_blocks: Vec::new(),
             suppress_draft_activation: false,
             editors: Vec::new(),
+            phone_editors: None,
             _subscriptions: subscriptions,
         }
     }
@@ -241,6 +248,271 @@ impl DraftModel {
         self.refresh_refusal_blocks(cx);
         self.focus_body(&editor, window, cx);
         editor
+    }
+
+    fn ensure_phone_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phone_editors.is_none() {
+            let buffers = [
+                self.workdir_buffer.clone(),
+                self.role_buffer.clone(),
+                self.start_buffer.clone(),
+                self.body_buffer.clone(),
+            ];
+            let fields = Fields {
+                workdir: self.workdir_buffer.entity_id(),
+                role: self.role_buffer.entity_id(),
+                start: self.start_buffer.entity_id(),
+            };
+            let hooks = self.hooks.clone();
+            self.phone_editors = Some(std::array::from_fn(|index| {
+                let buffer = cx.new(|cx| MultiBuffer::singleton(buffers[index].clone(), cx));
+                cx.new(|cx| {
+                    let mode = if index == 3 {
+                        EditorMode::AutoHeight {
+                            min_lines: 6,
+                            max_lines: None,
+                        }
+                    } else {
+                        EditorMode::SingleLine
+                    };
+                    let mut editor = Editor::new(mode, buffer, None, window, cx);
+                    rho_window::editor_config::configure(&mut editor, window, cx);
+                    editor.set_mouse_click_selection_enabled(true, cx);
+                    editor.set_placeholder_text(
+                        [
+                            "Working directory",
+                            "Role",
+                            "Agent or revision",
+                            "Write a message…",
+                        ][index],
+                        window,
+                        cx,
+                    );
+                    (hooks.0)(&mut editor, fields, window, cx);
+                    editor
+                })
+            }));
+        }
+    }
+
+    /// A touch form over the same buffers as the desktop multibuffer. Building
+    /// it never focuses an input: the keyboard opens only after a tap.
+    pub fn render_phone(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_phone_editors(window, cx);
+        let compact = window.viewport_size().height <= px(300.);
+        let editors = self.phone_editors.as_ref().unwrap();
+        let colors = cx.theme().colors();
+        let control = |id: &'static str, label: &'static str, editor: &Entity<Editor>| {
+            let focus = editor.focus_handle(cx);
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .when(compact, |control| control.gap_0())
+                .child(
+                    div()
+                        .text_color(colors.text_muted)
+                        .when(compact, |label| label.text_size(px(13.)))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .id(id)
+                        .w_full()
+                        .min_h(px(48.))
+                        .px_2()
+                        .py_3()
+                        .when(compact, |control| control.py_1())
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .cursor_text()
+                        .on_click(move |_, window, cx| {
+                            window.focus(&focus, cx);
+                        })
+                        .child(editor.clone()),
+                )
+        };
+        let mut form = div()
+            .w_full()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .when(compact, |form| form.px_2().py_0().gap_2())
+            .child(control("phone-draft-prompt", "Message", &editors[3]));
+        for (index, label) in crate::attachment_labels(&self.attachments)
+            .into_iter()
+            .enumerate()
+        {
+            form = form.child(
+                div()
+                    .id(("phone-draft-attachment", index))
+                    .min_h(px(48.))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_md()
+                    .child(label),
+            );
+        }
+        if let Some(message) = &self.refusal {
+            form = form.child(
+                div()
+                    .id("phone-draft-refusal")
+                    .text_color(colors.text_accent)
+                    .child(message.clone()),
+            );
+        }
+        form = form
+            .child(control(
+                "phone-draft-workdir",
+                "Working directory",
+                &editors[0],
+            ))
+            .child(control("phone-draft-role", "Role", &editors[1]));
+        // Use the desktop role cycle as the source of available choices.
+        let selected_role = self.role_text(cx).trim().to_ascii_lowercase();
+        let mut roles = div().flex().flex_wrap().gap_2().w_full();
+        let mut role = DEFAULT_ROLE;
+        loop {
+            let selected =
+                selected_role == role || (selected_role.is_empty() && role == DEFAULT_ROLE);
+            roles = roles.child(
+                div()
+                    .id(gpui::SharedString::from(format!("phone-draft-role-{role}")))
+                    .flex_1()
+                    .min_w(px(100.))
+                    .min_h(px(48.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(if selected {
+                        colors.text_accent
+                    } else {
+                        colors.border
+                    })
+                    .text_color(if selected {
+                        colors.text_accent
+                    } else {
+                        colors.text
+                    })
+                    .rounded_md()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_role_text(role, cx);
+                        this.note_draft_edit(cx);
+                        cx.notify();
+                    }))
+                    .child(role),
+            );
+            role = rho_agents_client::create::cycle_agent_role_text(role);
+            if role == DEFAULT_ROLE {
+                break;
+            }
+        }
+        form = form
+            .child(
+                div()
+                    .text_color(colors.text_muted)
+                    .child("Choose an agent role"),
+            )
+            .child(roles);
+        let mut modes = div().flex().gap_2().w_full();
+        for (mode, label) in [
+            (StartFieldMode::NewOn, "New on"),
+            (StartFieldMode::Join, "Join"),
+        ] {
+            let selected = self.start_mode == mode;
+            modes = modes.child(
+                div()
+                    .id(if mode == StartFieldMode::NewOn {
+                        "phone-draft-new-on"
+                    } else {
+                        "phone-draft-join"
+                    })
+                    .flex_1()
+                    .min_h(px(48.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(if selected {
+                        colors.text_accent
+                    } else {
+                        colors.border
+                    })
+                    .text_color(if selected {
+                        colors.text_accent
+                    } else {
+                        colors.text
+                    })
+                    .rounded_md()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.start_mode != mode {
+                            this.cycle_start_mode(cx);
+                        }
+                    }))
+                    .child(label),
+            );
+        }
+        form = form
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(colors.text_muted).child("Start mode"))
+                    .child(modes),
+            )
+            .child(control(
+                "phone-draft-start",
+                if self.start_mode == StartFieldMode::NewOn {
+                    "On top of (agent or revision)"
+                } else {
+                    "Join agent"
+                },
+                &editors[2],
+            ));
+        let target = self.start_text(cx);
+        if let Some((_, hint)) = self
+            .start_target_hints
+            .iter()
+            .find(|(label, _)| label == target.trim())
+        {
+            form = form.child(div().text_color(colors.text_muted).child(hint.clone()));
+        }
+        div()
+            .id("phone-draft-form")
+            .size_full()
+            .overflow_y_scroll()
+            .child(form)
+            .into_any_element()
+    }
+
+    /// The phone prompt, for explicit focus or submission routing. None until
+    /// the phone form is first rendered.
+    pub fn phone_body_editor(&self) -> Option<Entity<Editor>> {
+        self.phone_editors
+            .as_ref()
+            .map(|editors| editors[3].clone())
+    }
+
+    /// The phone control receiving keys, falling back to the prompt when
+    /// none is focused (e.g. a touch toolbar or menu has taken focus).
+    pub fn phone_active_editor(&self, window: &Window, cx: &gpui::App) -> Option<Entity<Editor>> {
+        let editors = self.phone_editors.as_ref()?;
+        Some(
+            editors
+                .iter()
+                .find(|editor| editor.focus_handle(cx).contains_focused(window, cx))
+                .unwrap_or(&editors[3])
+                .clone(),
+        )
     }
 
     /// The editors still alive, pruning dropped ones.
@@ -337,7 +609,7 @@ impl DraftModel {
     fn cursor_in(&self, buffer: &Entity<Buffer>, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         let field = buffer.read(cx);
         let range = field.anchor_before(0)..field.anchor_after(field.len());
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let (Some(start), Some(end)) = (
             snapshot.anchor_in_excerpt(range.start),
             snapshot.anchor_in_excerpt(range.end),
@@ -526,7 +798,7 @@ impl DraftModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
         let (Some(start), Some(end)) = (
             snapshot.anchor_in_excerpt(range.start),
             snapshot.anchor_in_excerpt(range.end),
@@ -597,6 +869,7 @@ impl DraftModel {
     }
 
     fn update_start_target_hint(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
         for editor in self.live_editors() {
             self.apply_start_target_hint_to(&editor, cx);
         }
@@ -794,5 +1067,169 @@ impl DraftModel {
             return;
         }
         cx.emit(Event::Edited);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    struct PhoneForm(Entity<DraftModel>);
+
+    impl gpui::Render for PhoneForm {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let form = self
+                .0
+                .update(cx, |draft, cx| draft.render_phone(window, cx));
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(form))
+                // The persistent phone toolbar still owns its full touch height.
+                .child(div().h(px(56.)).flex_shrink_0())
+        }
+    }
+
+    #[gpui::test]
+    fn compact_phone_form_keeps_first_prompt_line_above_toolbar(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            cx.text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(
+                    include_bytes!("../../../vendor/zed/assets/fonts/lilex/Lilex-Regular.ttf")
+                        .as_slice(),
+                )])
+                .unwrap();
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let draft = cx.new(|cx| {
+                let mut draft = DraftModel::new(Hooks::new(|_, _, _, _| {}), cx);
+                draft.set_body_text("Visible prompt", cx);
+                draft
+            });
+            PhoneForm(draft)
+        });
+        cx.simulate_window_resize(*window, gpui::size(px(720.), px(120.)));
+        window
+            .update(cx, |_, window, cx| {
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+        window
+            .update(cx, |form, window, cx| {
+                let draft = form.0.read(cx);
+                let prompt = draft.phone_body_editor().unwrap();
+                prompt.update(cx, |editor, cx| {
+                let bounds = *editor
+                    .last_bounds()
+                    .expect("prompt must have been rendered");
+                let line_height = editor
+                    .style(cx)
+                    .text
+                    .line_height_in_pixels(window.rem_size());
+                assert!(
+                    bounds.top() + line_height <= px(64.),
+                    "first editable line must fit in 120px viewport minus 56px toolbar: {bounds:?}"
+                );
+                assert!(editor.text(cx).contains("Visible prompt"));
+                });
+                assert!(
+                    !prompt.focus_handle(cx).is_focused(window),
+                    "rendering must not open keyboard"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn phone_edits_share_desktop_buffers_without_mixing_fields_and_prompt(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+        let hook_count = Rc::new(Cell::new(0));
+        let configured = hook_count.clone();
+        let draft = cx.new(|cx| {
+            DraftModel::new(
+                Hooks::new(move |_, _, _, _| {
+                    configured.set(configured.get() + 1);
+                }),
+                cx,
+            )
+        });
+        let window = cx.add_window(|_, _| gpui::Empty);
+        window.update(cx, |_, window, cx| {
+            draft.update(cx, |draft, cx| {
+                draft.set_workdir_text("/src/desktop-seed", cx);
+                draft.set_role_text("high1-eng", cx);
+                draft.set_start_text("base-agent", cx);
+                draft.set_body_text("Original prompt\nsecond line", cx);
+                draft.ensure_phone_editors(window, cx);
+                let phone = draft.phone_editors.as_ref().unwrap().clone();
+                assert!(phone.iter().all(|editor| !editor.focus_handle(cx).is_focused(window)));
+                assert_eq!(hook_count.get(), 4);
+                assert_eq!(draft.phone_active_editor(window, cx).unwrap(), phone[3]);
+                window.focus(&phone[1].focus_handle(cx), cx);
+                assert_eq!(draft.phone_active_editor(window, cx).unwrap(), phone[1]);
+                window.blur();
+
+                // Editing a field must not appear in submission content.
+                phone[0].update(cx, |editor, cx| editor.set_text("/src/phone", window, cx));
+                phone[1].update(cx, |editor, cx| editor.set_text("mini-eng", window, cx));
+                phone[2].update(cx, |editor, cx| editor.set_text("topic-branch", window, cx));
+                phone[3].update(cx, |editor, cx| editor.set_text("Phone prompt\nwith details", window, cx));
+                draft.cycle_start_mode(cx);
+                draft.add_image("image/png".into(), vec![1, 2, 3], cx);
+                draft.set_refusal(Some("Choose another target".into()), cx);
+
+                assert_eq!(draft.workdir_text(cx), "/src/phone");
+                assert_eq!(draft.role_text(cx), "mini-eng");
+                assert_eq!(draft.start_text(cx), "topic-branch");
+                assert_eq!(draft.start_mode(), StartFieldMode::Join);
+                assert_eq!(draft.body_text(cx), "Phone prompt\nwith details");
+                let content = draft.content(cx).unwrap();
+                assert!(matches!(&content[0], ContentPart::Text { text } if text == "Phone prompt\nwith details"));
+                assert!(matches!(&content[1], ContentPart::Image { media_type, data } if media_type == "image/png" && data == &[1, 2, 3]));
+                assert_eq!(content.len(), 2);
+                assert_eq!(draft.refusal(), Some("Choose another target"));
+
+                assert!(draft.cursor_in_a_field(&phone[0], cx));
+                assert!(draft.cursor_in_role_field(&phone[1], cx));
+                assert!(draft.cursor_in_start_field(&phone[2], cx));
+                assert!(!draft.cursor_in_a_field(&phone[3], cx));
+                draft.focus_body(&phone[3], window, cx);
+                assert_eq!(phone[3].read(cx).selections.newest_anchor().head()
+                    .to_offset(&phone[3].read(cx).buffer().read(cx).snapshot(cx)),
+                    editor::MultiBufferOffset("Phone prompt\nwith details".len()));
+
+                // Switching presentation preserves all values and both surfaces
+                // keep observing the same buffers, including subsequent edits.
+                let desktop = draft.build_editor(window, cx);
+                assert!(desktop.read(cx).text(cx).contains("/src/phone"));
+                assert!(desktop.read(cx).text(cx).contains("mini-eng"));
+                assert!(desktop.read(cx).text(cx).contains("topic-branch"));
+                draft.focus_body(&desktop, window, cx);
+                assert!(!draft.cursor_in_a_field(&desktop, cx));
+                draft.set_body_text("Desktop replacement", cx);
+                draft.set_role_text("med1-eng", cx);
+                draft.ensure_phone_editors(window, cx);
+                assert_eq!(hook_count.get(), 5, "building again must reuse phone controls");
+                assert_eq!(draft.phone_body_editor().unwrap(), phone[3]);
+                assert_eq!(phone[3].read(cx).text(cx), "Desktop replacement");
+                assert_eq!(phone[1].read(cx).text(cx), "med1-eng");
+                assert_eq!(draft.start_mode(), StartFieldMode::Join);
+                assert_eq!(draft.refusal(), Some("Choose another target"));
+                assert_eq!(draft.content(cx).unwrap().len(), 2);
+            });
+        }).unwrap();
     }
 }

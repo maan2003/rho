@@ -6,9 +6,8 @@ use std::sync::Arc;
 use editor::display_map::{Block, CustomBlockId, DisplayPoint, DisplayRow};
 use editor::{Copy, Editor, MoveRight, SelectionEffects};
 use gpui::{
-    App, AppContext as _, Entity, Focusable as _, InputEvent as _, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, TestAppContext, TouchEvent, TouchId, TouchPhase, WindowHandle,
-    point, px, size,
+    App, AppContext as _, Entity, Focusable as _, InputEvent as _, TestAppContext, TouchEvent,
+    TouchId, TouchPhase, WindowHandle, point, px, size,
 };
 use language::InlayId;
 use rho_agent_hosts::connection::ConnEvent;
@@ -623,27 +622,22 @@ fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppCo
         gpui::point(bounds.center().x, bounds.bottom() - px(48.))
     });
     cx.update_window(*workspace, |_, window, cx| {
-        window.dispatch_event(
-            MouseDownEvent {
-                position: reply_position,
-                modifiers: Modifiers::none(),
-                button: MouseButton::Left,
-                click_count: 1,
-                first_mouse: false,
-            }
-            .to_platform_input(),
-            cx,
-        );
-        window.dispatch_event(
-            MouseUpEvent {
-                position: reply_position,
-                modifiers: Modifiers::none(),
-                button: MouseButton::Left,
-                click_count: 1,
-            }
-            .to_platform_input(),
-            cx,
-        );
+        for (phase, milliseconds) in [
+            (gpui::TouchPhase::Started, 0),
+            (gpui::TouchPhase::Ended, 70),
+        ] {
+            window.dispatch_event(
+                gpui::TouchEvent {
+                    id: gpui::TouchId(1),
+                    phase,
+                    position: reply_position,
+                    timestamp: std::time::Duration::from_millis(milliseconds),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
     })
     .expect("tap reply editor");
     cx.run_until_parked();
@@ -6677,4 +6671,132 @@ fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext
             );
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn phone_rotation_and_keyboard_preserve_touch_mode_until_desktop_size(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    for (width, height, touch) in [
+        (390., 844., true),
+        (844., 390., true),
+        (844., 150., true),
+        (390., 604., true),
+        (1200., 800., false),
+    ] {
+        cx.simulate_window_resize(*workspace, size(px(width), px(height)));
+        cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, cx| {
+                assert_eq!(workspace.touch_mode(), touch, "{width}×{height}");
+                assert_eq!(vim_mode_setting::HelixModeSetting::get_global(cx).0, !touch);
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn phone_git_approval_buttons_answer_without_a_keyboard(cx: &mut TestAppContext) {
+    use rho_agent_hosts::connection::GitApprovalDecision;
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(390.), px(844.)));
+    for (x, expected) in [
+        (45., GitApprovalDecision::Allow),
+        (150., GitApprovalDecision::Deny),
+    ] {
+        let (response, mut receiver) = tokio::sync::oneshot::channel();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_event(
+                    HostId::default(),
+                    ConnEvent::GitTransportApproval {
+                        request_id: 7,
+                        prompt: "Fetch repository over SSH?".into(),
+                        response,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.draw_window(*workspace);
+        cx.update_window(*workspace, |_, window, cx| {
+            for phase in [TouchPhase::Started, TouchPhase::Ended] {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: TouchId(71),
+                        phase,
+                        position: point(px(x), px(820.)),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(receiver.try_recv().unwrap(), expected);
+    }
+}
+
+#[gpui::test]
+fn delayed_touch_momentum_tick_finishes_in_elapsed_time(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use gpui::prelude::*;
+    struct ScrollView(Rc<RefCell<Vec<TouchPhase>>>);
+    impl gpui::Render for ScrollView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let phases = self.0.clone();
+            gpui::div()
+                .id("momentum-target")
+                .size_full()
+                .on_scroll_wheel(move |event, _, _| phases.borrow_mut().push(event.touch_phase))
+        }
+    }
+    let phases = Rc::new(RefCell::new(Vec::new()));
+    let window = cx.add_window(|_, _| ScrollView(phases.clone()));
+    cx.draw_window(*window);
+    cx.update_window(*window, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 160., 0),
+            (TouchPhase::Moved, 100., 50),
+            (TouchPhase::Ended, 100., 60),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(1),
+                    phase,
+                    position: point(px(20.), px(y)),
+                    timestamp: Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_ne!(phases.borrow().last(), Some(&TouchPhase::Ended));
+    // Do not run intermediate ticks: model a stalled frame.
+    cx.executor()
+        .dispatcher()
+        .as_test()
+        .unwrap()
+        .scheduler()
+        .clock()
+        .advance(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(phases.borrow().last(), Some(&TouchPhase::Ended));
 }
