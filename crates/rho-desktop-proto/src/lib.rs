@@ -156,6 +156,32 @@ pub enum Input {
     ReleaseAll,
     Quality { bitrate: u32, keyframe: bool },
     Feedback(Feedback),
+    /// One touch contact, in output pixels like `Move`. `slot` tells contacts
+    /// apart; a down/motion/up sequence on one slot is one finger.
+    Touch {
+        slot: u32,
+        phase: TouchPhase,
+        x: u32,
+        y: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "senax",
+    derive(
+        senax_encoder::Encode,
+        senax_encoder::Decode,
+        senax_encoder::Pack,
+        senax_encoder::Unpack
+    )
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchPhase {
+    Down,
+    Motion,
+    Up,
+    Cancel,
 }
 
 /// Identity survives capture, transport, decode, and presentation. Timestamps
