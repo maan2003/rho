@@ -1,16 +1,17 @@
-# iA Writer Typeface
+# Source Sans 3
 
-Copyright © 2018 Information Architects Inc. with Reserved Font Name "iA Writer"
+Copyright 2010-2024 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'. All Rights Reserved. Source is a trademark of Adobe in the United States and/or other countries.
 
-# Based on IBM Plex Typeface
+# Source Code Pro
 
-Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
+Copyright 2010-2020 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'. All Rights Reserved. Source is a trademark of Adobe in the United States and/or other countries.
 
 # License
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
-This license is copied below, and is also available with a FAQ at:
-http://scripts.sil.org/OFL
+
+This license is copied below, and is also available with a FAQ at: http://scripts.sil.org/OFL
+
 
 -----------------------------------------------------------
 SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
