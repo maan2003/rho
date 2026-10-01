@@ -2,19 +2,22 @@
 //! store, and shell tool commands inside the view namespace.
 //! Run with `cargo run -p rho-tool-shell --example workspace_smoke`.
 
-use std::time::Duration;
-
-use rho_agent_types::transcript::{ExecId, ToolCall, ToolName, ToolType};
 use rho_fs_view::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
-use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
+use rho_tool_shell::{ProcessEvent, ShellTools};
 
-fn shell_call(command: &str) -> ToolCall {
-    ToolCall {
-        id: ExecId::try_from("call-1").unwrap(),
-        name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).unwrap(),
-        tool_type: ToolType::Function,
-        arguments: serde_json::json!({ "command": command }).to_string(),
+/// Runs `cmd` to the end and returns its output, failing unless it succeeds.
+async fn shell(tools: &ShellTools, cmd: &str) -> anyhow::Result<String> {
+    let mut process = tools.spawn(cmd, None, false).await?;
+    let mut output = Vec::new();
+    loop {
+        match process.next().await {
+            ProcessEvent::Output(bytes) => output.extend(bytes),
+            ProcessEvent::Exited(status) => anyhow::ensure!(status.success(), "{cmd}: {status}"),
+            ProcessEvent::Closed => break,
+            ProcessEvent::Failed(error) => anyhow::bail!("{cmd}: {error}"),
+        }
     }
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) {
@@ -93,41 +96,30 @@ async fn run() -> anyhow::Result<()> {
 }
 
 async fn run_tools() -> anyhow::Result<()> {
-    let tools = ShellTools::in_directory(
-        Duration::from_secs(30),
-        "/src/project".into(),
-        PathOverrides::default(),
-    );
+    let tools = ShellTools::in_directory("/src/project".into(), PathOverrides::default());
 
     let started = std::time::Instant::now();
-    let result = tools.call(shell_call("pwd; cat file.txt")).await;
-    println!("first call ({:?}):\n{}", started.elapsed(), result.output);
+    let output = shell(&tools, "pwd; cat file.txt").await?;
+    println!("first call ({:?}):\n{output}", started.elapsed());
     assert!(
-        result.output.contains("/src/project"),
+        output.contains("/src/project"),
         "commands start in the working directory"
     );
-    assert!(
-        result.output.contains("origin"),
-        "the clone's files are visible"
-    );
+    assert!(output.contains("origin"), "the clone's files are visible");
 
-    let result = tools
-        .call(shell_call(
-            "echo agent > file.txt && git status --short && git log --oneline -1",
-        ))
-        .await;
-    println!("write + git inside the view:\n{}", result.output);
-    assert!(
-        result.output.contains("Process exited with code 0"),
-        "git should work inside the view"
-    );
-    let result = tools
-        .call(shell_call(
-            "touch /tmp/scratch && ls / && test ! -e $HOME/.bashrc && echo home-is-empty",
-        ))
-        .await;
-    println!("outside the workset:\n{}", result.output);
-    assert!(result.output.contains("home-is-empty"));
+    let output = shell(
+        &tools,
+        "echo agent > file.txt && git status --short && git log --oneline -1",
+    )
+    .await?;
+    println!("write + git inside the view:\n{output}");
+    let output = shell(
+        &tools,
+        "touch /tmp/scratch && ls / && test ! -e $HOME/.bashrc && echo home-is-empty",
+    )
+    .await?;
+    println!("outside the workset:\n{output}");
+    assert!(output.contains("home-is-empty"));
 
     println!("smoke test passed");
     Ok(())

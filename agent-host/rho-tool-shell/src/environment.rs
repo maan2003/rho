@@ -668,7 +668,6 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             std::fs::write(root.path().join("flake.nix"), "").unwrap();
             let mut tools = ShellTools::in_directory(
-                Duration::from_secs(5),
                 camino::Utf8PathBuf::from_path_buf(root.path().to_owned()).unwrap(),
                 PathOverrides::default(),
             )
@@ -1052,7 +1051,6 @@ mod latency {
     async fn warm_admission() {
         let cwd = std::env::current_dir().unwrap();
         let tools = ShellTools::in_directory(
-            Duration::from_secs(30),
             camino::Utf8PathBuf::try_from(cwd.clone()).unwrap(),
             PathOverrides::default(),
         );
@@ -1089,7 +1087,6 @@ mod latency {
     async fn real_flake_admission() {
         let flake = std::env::var("RHO_TEST_FLAKE").unwrap();
         let tools = ShellTools::in_directory(
-            Duration::from_secs(600),
             camino::Utf8PathBuf::from(flake.clone()),
             PathOverrides::default(),
         );

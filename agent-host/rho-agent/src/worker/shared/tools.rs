@@ -13,7 +13,7 @@ use pyo3::types::PyDict;
 use rho_agent_types::transcript::{ImageDetail, ToolExecutionContext};
 use rho_agent_types::{AgentId, AgentRole};
 use rho_notebook::{Export, operation};
-use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
+use rho_tool_shell::ShellTools;
 use rho_web_search::{WebRequest, WebSearchTools};
 
 use super::mailroom::Mailroom;
@@ -38,12 +38,8 @@ pub(crate) fn host_tools(
     mailroom: Option<&Arc<Mailroom>>,
     original_images: bool,
 ) -> (ShellTools, Vec<Export>) {
-    let shell = ShellTools::in_directory(
-        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        cwd.to_owned(),
-        Default::default(),
-    )
-    .with_env("RHO_AGENT_ID", agent_id.encoded());
+    let shell = ShellTools::in_directory(cwd.to_owned(), Default::default())
+        .with_env("RHO_AGENT_ID", agent_id.encoded());
     let agent_host = host.map(|host| {
         let host = Arc::clone(host);
         Arc::new(move |call| -> Pin<Box<dyn Future<Output = _> + Send>> {

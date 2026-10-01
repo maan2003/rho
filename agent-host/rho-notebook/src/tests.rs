@@ -8,11 +8,7 @@ use tokio::sync::Notify;
 use crate::{CellHandle, Notebook};
 
 fn notebook() -> (Notebook, Arc<Notify>) {
-    let shell = ShellTools::in_directory(
-        Duration::from_secs(5),
-        "/tmp".into(),
-        PathOverrides::default(),
-    );
+    let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
     let wake = Arc::new(Notify::new());
     (
         Notebook::new(shell, Vec::new(), Arc::clone(&wake)).unwrap(),

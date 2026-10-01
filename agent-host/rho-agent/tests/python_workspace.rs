@@ -31,11 +31,7 @@ fn main() {
         std::fs::write(work.join("project/value"), "host").unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
         let notebook = Notebook::new(
-            ShellTools::in_directory(
-                Duration::from_secs(5),
-                "/src/project".into(),
-                Default::default(),
-            ),
+            ShellTools::in_directory("/src/project".into(), Default::default()),
             vec![],
             wake.clone(),
         )

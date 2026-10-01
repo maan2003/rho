@@ -2951,7 +2951,6 @@ mod tests {
         let notify = Arc::new(tokio::sync::Notify::new());
         let notebook = rho_notebook::Notebook::new(
             rho_tool_shell::ShellTools::in_directory(
-                Duration::from_secs(5),
                 temp.path().to_str().unwrap().into(),
                 Default::default(),
             ),
