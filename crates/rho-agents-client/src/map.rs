@@ -186,10 +186,6 @@ impl AgentMap {
             .map(|(id, host)| (*id, host.name.as_str()))
     }
 
-    pub fn host_count(&self) -> usize {
-        self.hosts.len()
-    }
-
     pub fn host_machine_seed(&self, host: HostId) -> u64 {
         self.hosts
             .get(&host)
@@ -625,10 +621,6 @@ impl AgentMap {
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<rho_agent_types::WorkspaceInfo> {
         self.agent_place(agent_id).map(|place| place.clone().into())
     }
-    pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
-        self.agent_place(agent_id)
-            .map(|place| format!("ws-{}", place.workset))
-    }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_agent_types::AgentRole> {
         self.agent_identity(agent_id).map(|identity| identity.role)
     }
@@ -652,11 +644,6 @@ impl AgentMap {
         self.filing
             .get(&agent_id)
             .is_some_and(|filing| filing.muted)
-    }
-    pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
-        self.agent_labels(agent_id)
-            .iter()
-            .any(|label| label == "pin")
     }
     fn agent_labels(&self, agent_id: AgentId) -> &[String] {
         self.filing
