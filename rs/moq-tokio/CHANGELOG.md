@@ -7,6 +7,193 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.20](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.19...moq-tokio-v0.19.20) - 2026-09-30
+
+### Added
+
+- *(net)* drain queued stream data before a graceful close ([#4430](https://github.com/moq-dev/moq/pull/4430))
+
+### Fixed
+
+- *(net)* send the AUTHORITY setup option from moqt:// clients ([#4578](https://github.com/moq-dev/moq/pull/4578))
+- *(moq-net)* a group awaiting its FIN ack still expires and follows priority ([#4534](https://github.com/moq-dev/moq/pull/4534))
+- *(tokio)* drive raw stream handshakes per connection ([#4474](https://github.com/moq-dev/moq/pull/4474))
+- *(moq-tokio)* iroh honors the configured versions ([#4448](https://github.com/moq-dev/moq/pull/4448))
+- *(tokio)* keep a WebTransport session's H3 streams open while it closes ([#4429](https://github.com/moq-dev/moq/pull/4429))
+- *(tokio)* drain a GOAWAY predecessor on Connection::close ([#4436](https://github.com/moq-dev/moq/pull/4436))
+- *(sock)* resolve an ephemeral reuseport group's port with a plain bind ([#4409](https://github.com/moq-dev/moq/pull/4409))
+- *(tokio)* handle IPv6 literals in TLS server names ([#4322](https://github.com/moq-dev/moq/pull/4322))
+- *(tokio)* accept a bare IPv6 TLS host name override on WebSocket ([#4405](https://github.com/moq-dev/moq/pull/4405))
+
+### Other
+
+- *(tokio)* isolate TLS root reload tests from shared /tmp ([#4537](https://github.com/moq-dev/moq/pull/4537))
+- *(tokio)* match a worker group's full address when counting its sockets ([#4404](https://github.com/moq-dev/moq/pull/4404))
+- prove stopped relays and worker groups closed their sockets instead of racing a rebind ([#4408](https://github.com/moq-dev/moq/pull/4408))
+
+## [0.19.19](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.18...moq-tokio-v0.19.19) - 2026-09-27
+
+### Added
+
+- *(net)* the SETUP AUTHORIZATION TOKEN option reaches the verifier ([#4278](https://github.com/moq-dev/moq/pull/4278))
+
+### Fixed
+
+- *(cli)* close the relay connection on SIGINT and SIGTERM ([#4287](https://github.com/moq-dev/moq/pull/4287))
+
+### Other
+
+- fix three load-only test failures at the cause ([#4286](https://github.com/moq-dev/moq/pull/4286))
+
+## [0.19.18](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.17...moq-tokio-v0.19.18) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+### Fixed
+
+- *(net)* end a track with its session's error when the session dies ([#4120](https://github.com/moq-dev/moq/pull/4120))
+
+## [0.19.17](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.16...moq-tokio-v0.19.17) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.16](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.15...moq-tokio-v0.19.16) - 2026-09-25
+
+### Fixed
+
+- *(net)* skip a stale warm cache on an IETF rejoin ([#4150](https://github.com/moq-dev/moq/pull/4150))
+
+## [0.19.15](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.14...moq-tokio-v0.19.15) - 2026-09-25
+
+### Fixed
+
+- *(moq-tokio)* release the QUIC socket before Listener::close returns ([#4087](https://github.com/moq-dev/moq/pull/4087))
+
+### Other
+
+- *(moq-tokio)* dial the WebSocket fallback on its own ephemeral port ([#4084](https://github.com/moq-dev/moq/pull/4084))
+
+## [0.19.14](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.13...moq-tokio-v0.19.14) - 2026-09-25
+
+### Added
+
+- *(net)* hide dot-named broadcasts from discovery (moq-lite-07) ([#4060](https://github.com/moq-dev/moq/pull/4060))
+
+### Other
+
+- *(moq-tokio)* fix websocket_forbidden port-collision flake ([#4055](https://github.com/moq-dev/moq/pull/4055))
+
+## [0.19.13](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.12...moq-tokio-v0.19.13) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.19.12](https://github.com/moq-dev/moq/compare/moq-tokio-v0.19.11...moq-tokio-v0.19.12) - 2026-09-23
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.19.11](https://github.com/moq-dev/moq/releases/tag/moq-tokio-v0.19.11) - 2026-09-23
+
+### Added
+
+- *(relay)* expose reusable embedding lifecycle and test fixture ([#3927](https://github.com/moq-dev/moq/pull/3927))
+- *(quic)* [**breaking**] build on moq-noq, the MoQ fork of noq ([#3866](https://github.com/moq-dev/moq/pull/3866))
+- *(moq-net)* add moq-transport draft-22 (moqt-22) ([#3858](https://github.com/moq-dev/moq/pull/3858))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(net)* [**breaking**] scope origins with any pattern union and report announce matches ([#3746](https://github.com/moq-dev/moq/pull/3746))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(tokio)* [**breaking**] settle moq-tokio names under their modules ([#3745](https://github.com/moq-dev/moq/pull/3745))
+- *(net)* [**breaking**] scope origins with pattern unions ([#3672](https://github.com/moq-dev/moq/pull/3672))
+- *(net)* [**breaking**] one name per announce, request, and origin config concept ([#3725](https://github.com/moq-dev/moq/pull/3725))
+- [**breaking**] refuse released spellings and drop unused deprecated APIs ([#3719](https://github.com/moq-dev/moq/pull/3719))
+- *(tokio)* [**breaking**] own the worker split group ([#3673](https://github.com/moq-dev/moq/pull/3673))
+- *(net)* [**breaking**] name stats counter edges started and ended ([#3712](https://github.com/moq-dev/moq/pull/3712))
+- *(tokio)* [**breaking**] rename ConnectionStatsReader to connection::Monitor ([#3705](https://github.com/moq-dev/moq/pull/3705))
+- *(relay)* admit every session through a moq-auth lease ([#3688](https://github.com/moq-dev/moq/pull/3688))
+- *(net)* [**breaking**] advertise wildcard routes with Pattern events ([#3649](https://github.com/moq-dev/moq/pull/3649))
+- *(ffi)* [**breaking**] preserve session and stream protocol error details ([#3615](https://github.com/moq-dev/moq/pull/3615))
+- *(tokio)* [**breaking**] partition LAN discovery by application ([#3621](https://github.com/moq-dev/moq/pull/3621))
+- *(moq-ffi)* expose the reconnect epoch and QUIC stream cap ([#3627](https://github.com/moq-dev/moq/pull/3627))
+- *(relay)* merge config with recorded provenance ([#3587](https://github.com/moq-dev/moq/pull/3587))
+- *(tokio)* support pinned connection targets ([#3595](https://github.com/moq-dev/moq/pull/3595))
+- *(moq-tokio)* expose the QUIC flow-control windows ([#3446](https://github.com/moq-dev/moq/pull/3446))
+- *(relay)* [**breaking**] add --auth-api-mode proxy, where the endpoint decides ([#3044](https://github.com/moq-dev/moq/pull/3044))
+- *(moq-tokio)* give the quiche backend the shared certificate semantics ([#3418](https://github.com/moq-dev/moq/pull/3418))
+- *(net)* [**breaking**] fold serving into origin::Producer::dynamic and let broadcasts announce themselves ([#3400](https://github.com/moq-dev/moq/pull/3400))
+- default QUIC backends to noq ([#3342](https://github.com/moq-dev/moq/pull/3342))
+- *(tokio)* [**breaking**] run local futures on pinned workers ([#3303](https://github.com/moq-dev/moq/pull/3303))
+- *(net)* [**breaking**] resume subscriptions across routes sharing a first hop ([#3312](https://github.com/moq-dev/moq/pull/3312))
+- *(net)* [**breaking**] announcements are prefix routes ([#3225](https://github.com/moq-dev/moq/pull/3225))
+- *(cli)* complete broadcast, track, and capture-source names at the prompt ([#3156](https://github.com/moq-dev/moq/pull/3156))
+- *(net)* [**breaking**] resolve the subscribe start from max age, with Group Start as an absolute floor ([#3158](https://github.com/moq-dev/moq/pull/3158))
+- *(sock)* extract the shared listener plumbing and steer the uring endpoint ([#3078](https://github.com/moq-dev/moq/pull/3078))
+- *(cli)* [**breaking**] migrate command-line parsing to usage-rs ([#3030](https://github.com/moq-dev/moq/pull/3030))
+- *(net)* [**breaking**] run moq-lite machines unboxed over any transport ([#3031](https://github.com/moq-dev/moq/pull/3031))
+- *(net)* [**breaking**] inject an explicit Runtime for session timers and machines ([#3007](https://github.com/moq-dev/moq/pull/3007))
+- *(moq-tokio)* identify peers by certificate fingerprint ([#2944](https://github.com/moq-dev/moq/pull/2944))
+- *(relay)* serve QUIC from pinned per-core workers, steered by connection ID (M1) ([#2921](https://github.com/moq-dev/moq/pull/2921))
+- *(rs)* [**breaking**] rename moq-native to moq-tokio ([#2896](https://github.com/moq-dev/moq/pull/2896))
+
+### Fixed
+
+- tighten release APIs and preserve Lite compatibility ([#3933](https://github.com/moq-dev/moq/pull/3933))
+- *(tokio)* start jemalloc sampling on demand instead of at startup ([#3919](https://github.com/moq-dev/moq/pull/3919))
+- *(tokio)* fail a connect on auth only once every transport has ([#3741](https://github.com/moq-dev/moq/pull/3741))
+- adapt main's NVENC VBV test and tokio Url imports to the dev API
+- *(moq-tokio)* hold feature-extreme builds to -D warnings ([#3584](https://github.com/moq-dev/moq/pull/3584))
+- *(tokio)* compile every subset of the transport features ([#3439](https://github.com/moq-dev/moq/pull/3439))
+- *(moq-tokio)* default the GOAWAY redirect policy to same-host ([#3448](https://github.com/moq-dev/moq/pull/3448))
+- repair draft-20 merge regressions ([#3301](https://github.com/moq-dev/moq/pull/3301))
+- *(tokio)* require explicit QUIC crypto providers ([#3210](https://github.com/moq-dev/moq/pull/3210))
+- *(moq-tokio)* check isolated feature builds ([#3150](https://github.com/moq-dev/moq/pull/3150))
+- *(relay)* give the io_uring listener its certificate and mTLS ([#3116](https://github.com/moq-dev/moq/pull/3116))
+- *(moq-tokio)* enforce peer identity configuration ([#3040](https://github.com/moq-dev/moq/pull/3040))
+- *(tokio)* [**breaking**] leave process signals to the owner of the accept loop ([#2952](https://github.com/moq-dev/moq/pull/2952))
+- *(cli)* [**breaking**] refuse the renamed flags with a migration instead of ignoring them ([#2915](https://github.com/moq-dev/moq/pull/2915))
+
+### Other
+
+- *(moq-sock)* [**breaking**] complete groups before serving ([#3832](https://github.com/moq-dev/moq/pull/3832))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- *(tokio)* make API shapes type-safe ([#3816](https://github.com/moq-dev/moq/pull/3816))
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+- *(tokio)* skip cert reload when the host cannot start an inotify watcher
+- *(tokio)* skip the bare-filename watch probe when inotify is exhausted
+- *(tokio)* watch certs from a unique tempdir, skip if inotify is exhausted
+- merge main into dev
+- merge main into dev
+- merge main into dev
+- *(tokio)* one abort-on-drop guard per crate instead of five ([#3472](https://github.com/moq-dev/moq/pull/3472))
+- *(moq-sock)* [**breaking**] centralize reuseport group formation ([#3414](https://github.com/moq-dev/moq/pull/3414))
+- Merge remote-tracking branch 'origin/dev' into dev
+- Merge remote-tracking branch 'origin/main' into dev
+- Merge main into dev
+- Merge main into dev
+- Merge main into dev
+- *(net)* [**breaking**] name the hop identifier Hop, and fix three API shapes the review found ([#3252](https://github.com/moq-dev/moq/pull/3252))
+- *(rs)* [**breaking**] keep dependency errors out of public APIs ([#3243](https://github.com/moq-dev/moq/pull/3243))
+- merge main into dev
+- Merge updated dev
+- Merge remote-tracking branch 'origin/dev' into claude/merge-main-into-dev-3057
+- Merge remote-tracking branch 'origin/main' into dev
+- Merge remote-tracking branch 'origin/dev' into dev
+- Merge branch 'main' into dev
+- *(net)* [**breaking**] replace the Latency type with a plain `max_age` duration ([#2955](https://github.com/moq-dev/moq/pull/2955))
+- Merge remote-tracking branch 'origin/main' into claude/merge-main-into-dev-b9f056
+- merge main into dev
+- *(net)* [**breaking**] make the origin lifecycle caller-driven ([#2897](https://github.com/moq-dev/moq/pull/2897))
+
 ### Changed
 
 - [**breaking**] `connection::Monitor::presence` reports `sessions_started` / `sessions_ended`.

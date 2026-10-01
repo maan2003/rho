@@ -11,8 +11,13 @@ cargo build --release
 This will:
 
 - Build the static library (`libmoq.a` on Unix-like systems, `moq.lib` on Windows)
-- Generate the C header file at `target/include/moq.h`
-- Generate the pkg-config file at `target/release/lib/pkgconfig/moq.pc`
+- Generate the C header file at `$OUT_DIR/include/moq.h`
+
+`OUT_DIR` is the build script's hashed output directory, which
+`cargo build --message-format=json` reports as `out_dir` on the
+`build-script-executed` message for libmoq.
+The pkg-config file (`moq.pc.in`) is rendered only when packaging (`nix build .#libmoq`
+and the release tarballs), since its paths assume `lib/libmoq.a` beside `lib/pkgconfig/`.
 
 There's also a [CMakeLists.txt](CMakeLists.txt) file that can be used to import/build the library.
 
@@ -35,6 +40,17 @@ int32_t moq_reservation_grant(uint32_t reservation, uint64_t *bps, bool *present
 int32_t moq_reservation_update(uint32_t reservation, uint64_t max_bps);
 int32_t moq_reservation_close(uint32_t reservation);
 
+// Server
+int32_t moq_server_listen(const moq_server_config *config, moq_status_callback on_request, void *user_data);
+int32_t moq_server_addr(uint32_t server, moq_string *dst);
+int32_t moq_server_fingerprints(uint32_t server, moq_string *dst, uintptr_t count);
+int32_t moq_server_close(uint32_t server);
+int32_t moq_session_request_path(uint32_t request, moq_string *dst);
+int32_t moq_session_request_query(uint32_t request, moq_string *dst);
+int32_t moq_session_request_accept(uint32_t request, uint32_t origin_publish, uint32_t origin_consume, moq_status_callback on_status, void *user_data);
+int32_t moq_session_request_reject(uint32_t request, uint16_t code);
+int32_t moq_session_request_free(uint32_t request);
+
 // Origin
 int32_t moq_origin_create(void);
 int32_t moq_origin_close(uint32_t origin);
@@ -52,7 +68,7 @@ int32_t moq_origin_announced_cancel(uint32_t announced);
 // Publishing
 int32_t moq_publish_announce(uint32_t broadcast, const moq_route *route);
 int32_t moq_publish_unannounce(uint32_t broadcast);
-int32_t moq_publish_finish(uint32_t broadcast);
+int32_t moq_publish_close(uint32_t broadcast);
 int32_t moq_publish_audio(uint32_t broadcast, const moq_audio_init *config);
 int32_t moq_publish_video(uint32_t broadcast, const moq_video_init *config);
 int32_t moq_publish_container(uint32_t broadcast, const moq_container_init *config);
@@ -60,6 +76,7 @@ int32_t moq_publish_container_write(uint32_t container, const uint8_t *payload, 
 int32_t moq_publish_container_finish(uint32_t container);
 int32_t moq_publish_media_finish(uint32_t media);
 int32_t moq_publish_media_frame(uint32_t media, const uint8_t *payload, uintptr_t payload_size, uint64_t timestamp_us);
+int32_t moq_publish_media_flush(uint32_t media, uint64_t timestamp_us);
 int32_t moq_publish_track(uint32_t broadcast, const char *name, uintptr_t name_len, const moq_track_info *info);
 int32_t moq_publish_track_group(uint32_t track);
 int32_t moq_publish_track_frame(uint32_t track, const uint8_t *payload, uintptr_t payload_size, uint64_t timestamp_us);

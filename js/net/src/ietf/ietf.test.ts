@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import * as Path from "../path.ts";
-import { Reader, Writer } from "../stream.ts";
+import { type Cursor, Reader, Writer } from "../stream.ts";
 import { Timescale, Timestamp } from "../time.ts";
 import * as Varint from "../varint.ts";
+import { Fetch } from "./fetch.ts";
 import * as GoAway from "./goaway.ts";
 import * as Namespace from "./namespace.ts";
 import { FetchFrame, type FetchPosition, Frame, Group, type GroupFlags } from "./object.ts";
@@ -89,6 +90,77 @@ async function encodeFetchFrameVersioned(
 	await writer.closed;
 	return concatChunks(written);
 }
+
+test("DEFAULT_PUBLISHER_PRIORITY has exact SUBSCRIBE_OK bytes per draft", async () => {
+	for (const version of [
+		Version.DRAFT_14,
+		Version.DRAFT_15,
+		Version.DRAFT_16,
+		Version.DRAFT_17,
+		Version.DRAFT_18,
+		Version.DRAFT_19,
+		Version.DRAFT_20,
+		Version.DRAFT_21,
+		Version.DRAFT_22,
+	] as const) {
+		const requestId = version <= Version.DRAFT_16 ? 7n : undefined;
+		const baseline = await encodeVersioned(new Subscribe.SubscribeOk({ requestId, trackAlias: 42n }), version);
+		const encoded = await encodeVersioned(
+			new Subscribe.SubscribeOk({ requestId, trackAlias: 42n, properties: { priority: 37 } }),
+			version,
+		);
+		if (version <= Version.DRAFT_16) {
+			expect(Array.from(encoded)).toEqual(Array.from(baseline));
+		} else {
+			expect(Array.from(encoded)).toEqual([baseline[0], baseline[1] + 2, ...baseline.slice(2), 0x0e, 37]);
+			const decoded = await decodeVersioned(encoded, Subscribe.SubscribeOk.decode, version);
+			expect(decoded.properties.priority).toBe(37);
+		}
+	}
+});
+
+test("DEFAULT_PUBLISHER_PRIORITY has exact PUBLISH bytes per draft", async () => {
+	for (const version of [
+		Version.DRAFT_14,
+		Version.DRAFT_15,
+		Version.DRAFT_16,
+		Version.DRAFT_17,
+		Version.DRAFT_18,
+		Version.DRAFT_19,
+		Version.DRAFT_20,
+		Version.DRAFT_21,
+		Version.DRAFT_22,
+	] as const) {
+		const fields = {
+			requestId: 1n,
+			trackNamespace: Path.from("ns"),
+			trackName: "video",
+			trackAlias: 42n,
+			groupOrder: 2,
+			contentExists: false,
+			largest: undefined,
+			forward: true,
+		};
+		const baseline = await encodeVersioned(new Publish(fields), version);
+		const encoded = await encodeVersioned(new Publish({ ...fields, priority: 37 }), version);
+		if (version <= Version.DRAFT_16) {
+			expect(Array.from(encoded)).toEqual(Array.from(baseline));
+		} else {
+			// The new property precedes GROUP_ORDER, so its delta changes 0x22 to 0x14.
+			expect(Array.from(encoded)).toEqual([
+				baseline[0],
+				baseline[1] + 2,
+				...baseline.slice(2, -2),
+				0x0e,
+				37,
+				0x14,
+				2,
+			]);
+			const decoded = await decodeVersioned(encoded, Publish.decode, version);
+			expect(decoded.priority).toBe(37);
+		}
+	}
+});
 
 test("Message Parameters: uint8 wire encoding changes in draft 17", async () => {
 	const params = new Parameters();
@@ -480,20 +552,19 @@ test("Subscribe v14: rejects invalid filter type", async () => {
 	).rejects.toThrow();
 });
 
-test("SubscribeOk v14: rejects non-zero expires", async () => {
-	const invalidBytes = new Uint8Array([
-		0x01, // subscribe_id
-		0x05, // INVALID: expires = 5
+test("SubscribeOk v14: ignores non-zero expires", async () => {
+	const body = [
+		0x01, // request_id
+		0x00, // track_alias
+		0x05, // expires = 5
 		0x02, // group_order
 		0x00, // content_exists
 		0x00, // num_params
-	]);
+	];
+	const bytes = new Uint8Array([0x00, body.length, ...body]);
 
-	await expect(
-		(async () => {
-			await decodeVersioned(invalidBytes, Subscribe.SubscribeOk.decode, Version.DRAFT_14);
-		})(),
-	).rejects.toThrow();
+	const decoded = await decodeVersioned(bytes, Subscribe.SubscribeOk.decode, Version.DRAFT_14);
+	expect(decoded.requestId).toBe(1n);
 });
 
 // Unicode tests
@@ -998,7 +1069,7 @@ test("TrackStatusRequest v17: round trip with requiredRequestIdDelta", async () 
 // Helper to encode a namespace to raw bytes
 async function encodeNamespace(namespace: Path.Valid): Promise<Uint8Array> {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, Version.DRAFT_14);
 	await Namespace.encode(writer, namespace);
 	writer.close();
 	await writer.closed;
@@ -1007,14 +1078,14 @@ async function encodeNamespace(namespace: Path.Valid): Promise<Uint8Array> {
 
 // Helper to decode a namespace from raw bytes
 async function decodeNamespace(bytes: Uint8Array): Promise<Path.Valid> {
-	const reader = new Reader(undefined, bytes);
+	const reader = new Reader(undefined, bytes, Version.DRAFT_14);
 	return await Namespace.decode(reader);
 }
 
 // Helper to encode raw IETF namespace tuple fields
 async function encodeNamespaceTuple(parts: string[]): Promise<Uint8Array> {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, Version.DRAFT_14);
 	await writer.u53(parts.length);
 	for (const part of parts) await writer.string(part);
 	writer.close();
@@ -1520,11 +1591,8 @@ test("Frame object time: draft-15 uses absolute property types", async () => {
 	expect(await props.u62()).toBe(96_000n);
 	expect(await props.done()).toBe(true);
 
-	const decoded = await Frame.decode(
-		new Reader(undefined, encoded, Version.DRAFT_15),
-		flags,
-		Timescale.MILLI,
-		Version.DRAFT_15,
+	const decoded = await new Reader(undefined, encoded, Version.DRAFT_15).decode((c) =>
+		Frame.decode(c, flags, Timescale.MILLI),
 	);
 	expect(decoded.timestamp?.value).toBe(96_000);
 	expect(decoded.timestamp?.scale).toBe(Timescale.MILLI);
@@ -1588,14 +1656,64 @@ test("Frame object time: draft-16 starts delta property types", async () => {
 	expect(await props.u62()).toBe(96_000n);
 	expect(await props.done()).toBe(true);
 
-	const decoded = await Frame.decode(
-		new Reader(undefined, encoded, Version.DRAFT_16),
-		flags,
-		Timescale.MILLI,
-		Version.DRAFT_16,
+	const decoded = await new Reader(undefined, encoded, Version.DRAFT_16).decode((c) =>
+		Frame.decode(c, flags, Timescale.MILLI),
 	);
 	expect(decoded.timestamp?.value).toBe(96_000);
 	expect(decoded.timestamp?.scale).toBe(Timescale.MILLI);
+});
+
+test("Frame decodes objects split at every byte", async () => {
+	const flags: GroupFlags = {
+		hasExtensions: true,
+		hasSubgroup: false,
+		hasSubgroupObject: false,
+		hasEnd: true,
+		hasPriority: true,
+		firstObject: true,
+	};
+	const frames = [
+		new Frame({ payload: new Uint8Array([1]), timestamp: new Timestamp(96_000, Timescale.MILLI) }),
+		new Frame({ payload: new Uint8Array(300).fill(2), timestamp: new Timestamp(96_033, Timescale.MILLI) }),
+	];
+	const bytes = concatChunks(await Promise.all(frames.map((f) => encodeFrameVersioned(f, flags, Version.DRAFT_20))));
+	const reader = new Reader(
+		new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+				controller.close();
+			},
+		}),
+		undefined,
+		Version.DRAFT_20,
+	);
+
+	const decode = (c: Cursor) => Frame.decode(c, flags, Timescale.MILLI);
+	for (const frame of frames) {
+		const decoded = await reader.decodeMaybe(decode);
+		expect(decoded?.payload).toEqual(frame.payload);
+		expect(decoded?.timestamp?.value).toBe(frame.timestamp?.value);
+	}
+	expect(await reader.decodeMaybe(decode)).toBeUndefined();
+});
+
+// The properties block is sized on the wire, so a property running past it is malformed, not
+// a reason to wait for more of the stream.
+test("Frame rejects a property that runs past its block", async () => {
+	const flags: GroupFlags = {
+		hasExtensions: true,
+		hasSubgroup: false,
+		hasSubgroupObject: false,
+		hasEnd: true,
+		hasPriority: true,
+		firstObject: true,
+	};
+	// Delta 0, a 2-byte block holding a Timestamp id and the first byte of a 2-byte value, a
+	// 1-byte payload, then bytes the block must not borrow.
+	const reader = new Reader(undefined, new Uint8Array([0, 2, 0x10, 0x80, 1, 0xaa, 0x01]), Version.DRAFT_20);
+	await expect(reader.decode((c) => Frame.decode(c, flags, Timescale.MILLI))).rejects.toThrow(
+		"message is shorter than its fields",
+	);
 });
 
 // A fetch stream's first object is the only one carrying absolute ids, so a wrong flag byte
@@ -1679,4 +1797,124 @@ test("FetchFrame: an unstamped first object keeps its ids", async () => {
 		0x01,
 		0x01,
 	]);
+});
+
+/** Frame a control message body with its 16-bit Length, as every draft does. */
+function framed(body: number[]): Uint8Array {
+	return new Uint8Array([body.length >> 8, body.length & 0xff, ...body]);
+}
+
+/** Request ID 1, Track Namespace ("live"), Track Name ("video"): the head of a SUBSCRIBE or draft-20 FETCH. */
+const TRACK_HEAD = [0x01, 0x01, 0x04, ...new TextEncoder().encode("live"), 0x05, ...new TextEncoder().encode("video")];
+
+// Every parameter draft-20 lets a SUBSCRIBE carry that we don't act on still decodes, with
+// what we have to refuse recorded rather than failing the stream.
+test("Subscribe v20: decodes every legal parameter", async () => {
+	const body = framed([
+		...TRACK_HEAD,
+		0x06, // Number of Parameters
+		...[0x03, 0x03, 0x03, 0x00, 0xaa], // AUTHORIZATION TOKEN
+		...[0x00, 0x03, 0x03, 0x00, 0xbb], // a second one, which the draft allows
+		...[0x0d, 0x00], // FORWARD (0x10) = 0
+		...[0x15, 0x03, 0x00, 0x00, 0x01], // SUBGROUP_FILTER (0x25)
+		...[0x0d, 0x07], // NEW_GROUP_REQUEST (0x32)
+		...[0x03, 0x00], // INCLUDE_PROPERTIES (0x35) = 0, a uint8
+	]);
+
+	const msg = await decodeVersioned(body, Subscribe.Subscribe.decode, Version.DRAFT_20);
+	expect(msg.forward).toBe(false);
+	expect(msg.rangeFilters).toBe(true);
+	expect(msg.propertiesWanted).toBe(false);
+});
+
+// INCLUDE_PROPERTIES is a uint8: one raw byte with no Length.
+test("Subscribe v20: INCLUDE_PROPERTIES is a uint8", async () => {
+	const msg = new Subscribe.Subscribe({
+		requestId: 1n,
+		trackNamespace: Path.from("live"),
+		trackName: "video",
+		subscriberPriority: 128,
+		propertiesWanted: false,
+	});
+	const encoded = await encodeVersioned(msg, Version.DRAFT_20);
+	expect(Array.from(encoded.slice(-2))).toEqual([0x13, 0x00]);
+	expect(Array.from(encoded.slice(-3, -2))).not.toEqual([0x01]);
+});
+
+// FORWARD=0 decodes on every draft, so the request can be refused rather than failing.
+test("Subscribe: FORWARD=0 decodes", async () => {
+	for (const version of [Version.DRAFT_14, Version.DRAFT_15, Version.DRAFT_17, Version.DRAFT_20] as const) {
+		const msg = new Subscribe.Subscribe({
+			requestId: 1n,
+			trackNamespace: Path.from("live"),
+			trackName: "video",
+			subscriberPriority: 128,
+			forward: false,
+		});
+		const decoded = await decodeVersioned(await encodeVersioned(msg, version), Subscribe.Subscribe.decode, version);
+		expect(decoded.forward).toBe(false);
+	}
+});
+
+// A draft-20 FETCH names the track up front and carries its range in LOCATION_FILTER.
+test("Fetch v20: decodes every legal parameter", async () => {
+	const body = framed([
+		...TRACK_HEAD,
+		0x07, // Number of Parameters
+		...[0x03, 0x03, 0x03, 0x00, 0xaa], // AUTHORIZATION TOKEN
+		...[0x07, 0x64], // FILL_TIMEOUT (0x0A)
+		...[0x16, 0x40], // SUBSCRIBER_PRIORITY (0x20)
+		...[0x01, 0x03, 0x04, 0x00, 0x02], // LOCATION_FILTER (0x21)
+		...[0x01, 0x01], // GROUP_ORDER (0x22)
+		...[0x04, 0x02, 0x00, 0x05], // OBJECTID_FILTER (0x26)
+		...[0x0f, 0x00], // INCLUDE_PROPERTIES (0x35)
+	]);
+
+	const msg = await decodeVersioned(body, Fetch.decode, Version.DRAFT_20);
+	expect(msg.requestId).toBe(1n);
+});
+
+// The tagged forms through draft-19, with a token.
+test("Fetch v15: decodes a joining FETCH", async () => {
+	const body = framed([
+		0x01, // Request ID
+		...[0x02, 0x03, 0x00], // Relative Joining: subscription 3, offset 0
+		0x01, // Number of Parameters
+		...[0x03, 0x03, 0x03, 0x00, 0xaa], // AUTHORIZATION TOKEN
+	]);
+
+	const msg = await decodeVersioned(body, Fetch.decode, Version.DRAFT_15);
+	expect(msg.requestId).toBe(1n);
+});
+
+// TRACK_STATUS is identical to SUBSCRIBE on every draft, fields and parameters included.
+test("TrackStatusRequest: carries SUBSCRIBE fields", async () => {
+	const cases: [IetfVersion, number[]][] = [
+		// Priority, group order, forward, AbsoluteStart {5, 1}, no parameters.
+		[Version.DRAFT_14, [0x80, 0x02, 0x00, 0x03, 0x05, 0x01, 0x00]],
+		// AUTHORIZATION TOKEN and INCLUDE_PROPERTIES.
+		[Version.DRAFT_20, [0x02, 0x03, 0x03, 0x03, 0x00, 0xaa, 0x32, 0x00]],
+	];
+	for (const [version, rest] of cases) {
+		const msg = await decodeVersioned(framed([...TRACK_HEAD, ...rest]), Track.TrackStatusRequest.decode, version);
+		expect(msg.trackName).toBe("video");
+	}
+});
+
+// TRACK_PROPERTY_FILTER is legal only on SUBSCRIBE_TRACKS and its updates, so on a
+// SUBSCRIBE or FETCH it stays a protocol violation rather than a per-request refusal.
+test("TRACK_PROPERTY_FILTER is rejected on SUBSCRIBE and FETCH", async () => {
+	// One parameter: TRACK_PROPERTY_FILTER (0x29), SetID 0, property type 2, from 0.
+	const params = [0x01, 0x29, 0x03, 0x00, 0x02, 0x00];
+	const body = framed([...TRACK_HEAD, ...params]);
+	await expect(decodeVersioned(body, Subscribe.Subscribe.decode, Version.DRAFT_20)).rejects.toThrow();
+	await expect(decodeVersioned(body, Fetch.decode, Version.DRAFT_20)).rejects.toThrow();
+});
+
+// INCLUDE_PROPERTIES postdates draft-16, where it arrives as a Key-Value-Pair; it must
+// still read as present so the draft gate refuses it.
+test("Subscribe v16: rejects INCLUDE_PROPERTIES", async () => {
+	// One parameter: INCLUDE_PROPERTIES (0x35), length 1, value 0.
+	const body = framed([...TRACK_HEAD, 0x01, 0x35, 0x01, 0x00]);
+	await expect(decodeVersioned(body, Subscribe.Subscribe.decode, Version.DRAFT_16)).rejects.toThrow();
 });

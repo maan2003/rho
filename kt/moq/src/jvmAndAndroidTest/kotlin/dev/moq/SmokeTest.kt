@@ -1,16 +1,21 @@
 package dev.moq
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import kotlinx.serialization.Serializable
 import uniffi.moq.MoqException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.microseconds
+import kotlin.time.Duration.Companion.milliseconds
 
 @Serializable
 private data class Status(val state: String)
@@ -29,6 +34,9 @@ private fun opusHead(): ByteArray =
         0,
         0,
     )
+
+/** Wall-clock bound on polling for a configuration race, so a regression fails instead of hanging. */
+private const val CONFIG_RACE_TIMEOUT_NS = 10_000_000_000L
 
 class SmokeTest {
     @Test
@@ -61,6 +69,27 @@ class SmokeTest {
             ex.isShutdown || ex is MoqException.Connect || ex is MoqException.Url,
             "expected shutdown/connect/url error, got: $ex",
         )
+    }
+
+    /**
+     * The WebSocket fallback knobs reach the native client: a QUIC-only dial with
+     * no head start still fails fast, and a negative delay is refused up front
+     * rather than wrapping into an enormous one.
+     */
+    @Test
+    fun `connect accepts the websocket fallback knobs`() = runTest {
+        assertFailsWith<MoqException> {
+            Moq.connect(
+                "https://localhost:0/test",
+                tlsVerify = false,
+                reconnect = false,
+                websocketEnabled = false,
+                websocketDelay = 0.milliseconds,
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            Moq.connect("https://localhost:0/test", websocketDelay = (-1).milliseconds)
+        }
     }
 
     /**
@@ -101,6 +130,29 @@ class SmokeTest {
         assertNull(properties.flip)
         assertEquals(500_000uL, backoff.initialUs)
         assertEquals(ConnectionStatus.CONNECTED, status)
+    }
+
+    @Test
+    fun `closing a broadcast ends it, and closing again is a no-op`() = runTest {
+        val broadcast = BroadcastProducer()
+        val consumer = broadcast.consume()
+        // AutoCloseable.close() releases the last producer handle, which ends the broadcast.
+        broadcast.close()
+        broadcast.close()
+        assertFailsWith<MoqException> { consumer.subscribeTrack("events", null) }
+    }
+
+    @Test
+    fun `end ends a broadcast while a dynamic handle is still held`() = runTest {
+        BroadcastProducer().use { broadcast ->
+            broadcast.dynamic().use {
+                val consumer = broadcast.consume()
+                broadcast.end()
+                broadcast.end()
+                assertFailsWith<MoqException> { consumer.subscribeTrack("events", null) }
+                assertFailsWith<MoqException> { broadcast.publishTrack("events", null) }
+            }
+        }
     }
 
     @Test
@@ -179,6 +231,44 @@ class SmokeTest {
     }
 
     /** The typed JSON helpers round-trip a `@Serializable` value. */
+    /**
+     * Video has the same Flow audio does. Decoding real frames needs an encoder
+     * backend, so this pins the extension's shape; the decode itself is covered
+     * by the interop test (`just test interop`).
+     */
+    @Test
+    fun `video consumer exposes a frames flow like audio does`() {
+        val video: (VideoConsumer) -> Flow<VideoDecodedFrame> = VideoConsumer::frames
+        val audio: (AudioConsumer) -> Flow<AudioFrame> = AudioConsumer::frames
+        assertNotNull(video)
+        assertNotNull(audio)
+    }
+
+    /** Microsecond fields read back as a Duration. */
+    @Test
+    fun `microsecond fields read back as durations`() {
+        val backoff = Backoff(initialUs = 1_000uL, multiplier = 2u, maxUs = 2_000uL, timeoutUs = 3_000uL)
+        assertEquals(1.milliseconds, backoff.initial)
+        assertEquals(2.milliseconds, backoff.max)
+        assertEquals(3.milliseconds, backoff.timeout)
+
+        fun stats(rttUs: ULong?) = ConnectionStats(
+            rttUs = rttUs,
+            estimatedSendRateBps = null,
+            estimatedRecvRateBps = null,
+            bytesSent = null,
+            bytesReceived = null,
+            bytesLost = null,
+            packetsSent = null,
+            packetsReceived = null,
+            packetsLost = null,
+        )
+        assertNull(stats(null).rtt)
+        assertEquals(1_500.microseconds, stats(1_500uL).rtt)
+        assertEquals(20.milliseconds, Frame(payload = ByteArray(0), timestampUs = 20_000uL).timestamp)
+        assertEquals(20.milliseconds, AudioEncoderOutput(codec = AudioCodec.opus()).frameDuration)
+    }
+
     @Test
     fun `typed json snapshot round-trips a serializable value`() = runTest {
         BroadcastProducer().use { broadcast ->
@@ -188,6 +278,21 @@ class SmokeTest {
 
             val consumer = broadcast.consume().subscribeJsonSnapshot("status", config)
             assertEquals(Status(state = "live"), consumer.valuesAs<Status>().first())
+        }
+    }
+
+    @Test
+    fun `json producer demand follows subscribers`() = runTest {
+        BroadcastProducer().use { broadcast ->
+            val config = JsonSnapshotConfig(deltaRatio = 0u, compression = false)
+            val demand: TrackDemand = broadcast.publishJsonSnapshot("status", config).demand()
+            assertEquals("status", demand.name())
+            assertEquals(false, demand.isUsed())
+
+            val consumer = broadcast.consume().subscribeJsonSnapshot("status", config)
+            demand.used()
+            consumer.cancel()
+            demand.unused()
         }
     }
 
@@ -220,25 +325,45 @@ class SmokeTest {
             server.createBroadcast("live").use { broadcast ->
                 broadcast.announce(Route())
                 broadcast.unannounce()
-                broadcast.finish()
             }
         }
     }
 
     @Test
-    fun `announce then unannounce is visible`() = runTest {
+    fun `closing a server releases its port`() = runTest {
+        val first = Server.listen("127.0.0.1:0", tlsGenerate = listOf("localhost"))
+        val addr = first.localAddr
+        first.close()
+
+        // No retry: close() released the listening socket before returning.
+        Server.listen(addr, tlsGenerate = listOf("localhost")).use { rebound ->
+            assertEquals(addr, rebound.localAddr)
+        }
+    }
+
+    @Test
+    fun `a broadcast is reachable only while announced`() = runTest {
         OriginProducer(OriginConfig()).use { origin ->
             origin.createBroadcast("live").use { broadcast ->
                 broadcast.publishTrack("events", null)
+                val consumer = origin.consume()
+                assertFailsWith<MoqException> { consumer.requestBroadcast("live") }
+
                 broadcast.announce(Route())
-                val announced = origin.consume().announced(AnnounceConfig())
+                val announced = consumer.announced(AnnounceConfig())
                 val first = announced.next()!!
                 assertEquals("live", first.prefix())
                 assertTrue(first.active())
+
                 broadcast.unannounce()
                 val retracted = announced.next()!!
                 assertEquals("live", retracted.prefix())
                 assertTrue(!retracted.active())
+                assertFailsWith<MoqException> { consumer.requestBroadcast("live") }
+
+                broadcast.announce(Route())
+                assertTrue(announced.next()!!.active())
+                consumer.requestBroadcast("live")
             }
         }
     }
@@ -282,6 +407,127 @@ class SmokeTest {
             track.createGroup(4uL).finish()
             assertFailsWith<MoqException> { track.createGroup(5uL) }
             track.finish()
+        }
+    }
+
+    /**
+     * `frameDurationUs` is microseconds so Opus' 2.5 ms frame is expressible at
+     * all, and a duration outside the Opus set is refused rather than silently
+     * rounded.
+     */
+    @Test
+    fun `encode audio honors the opus frame duration set`() {
+        val input = AudioEncoderInput(format = AudioSampleFormat.F32, sampleRate = 48_000u, channels = 1u)
+
+        BroadcastProducer().use { broadcast ->
+            val fine = broadcast.encodeAudio(
+                "fine",
+                input,
+                AudioEncoderOutput(codec = AudioCodec.opus(), frameDurationUs = 2_500u),
+            )
+            // 2.5 ms of silence at 48 kHz mono f32: exactly one encoded frame.
+            fine.write(AudioFrame(timestampUs = 0uL, data = ByteArray(120 * 4)))
+            fine.finish()
+
+            assertFailsWith<MoqException.Audio> {
+                broadcast.encodeAudio(
+                    "coarse",
+                    input,
+                    AudioEncoderOutput(codec = AudioCodec.opus(), frameDurationUs = 2_000u),
+                )
+            }
+        }
+    }
+
+    /**
+     * Configuration must apply or fail: a setter racing an in-flight connect
+     * throws [MoqException.Busy], and one after [Client.cancel] throws
+     * [MoqException.Cancelled]. Mirrors `test_client_setters_fail_after_cancel`
+     * in `py/moq-rs/tests/test_server.py`.
+     */
+    @Test
+    fun `client setters are busy during connect and cancelled after`() = runTest {
+        Server.listen("127.0.0.1:0", tlsGenerate = listOf("localhost")).use { server ->
+            val client = Client()
+            client.setTlsVerify(false)
+            client.setBind("127.0.0.1:0")
+            // A reconnecting client would redial instead of failing the connect.
+            client.setReconnect(false)
+
+            // Nothing accepts the request, so connect parks holding the client lock.
+            // runCatching, because a failed `async` would cancel the test scope
+            // before `await` ever reported it.
+            val connect = async { runCatching { client.connect("https://${server.localAddr}") } }
+
+            // The lock is taken on the ffi runtime thread, so poll until it is.
+            val deadline = System.nanoTime() + CONFIG_RACE_TIMEOUT_NS
+            var busy: Throwable? = null
+            while (busy == null && System.nanoTime() < deadline) {
+                busy = runCatching { client.setTlsVerify(false) }.exceptionOrNull()
+                yield()
+            }
+            assertTrue(busy is MoqException.Busy, "expected Busy while connecting, got: $busy")
+            assertFailsWith<MoqException.Busy> { client.setBind("127.0.0.1:0") }
+
+            client.cancel()
+            assertFailsWith<MoqException.Cancelled> { client.setTlsVerify(true) }
+            assertFailsWith<MoqException.Cancelled> { client.setBind("127.0.0.1:0") }
+
+            val connected = connect.await().exceptionOrNull()
+            assertTrue(connected is MoqException.Cancelled, "expected a cancelled connect, got: $connected")
+        }
+    }
+
+    @Test
+    fun `decode video picks its pixel format`() = runTest {
+        OriginProducer(OriginConfig()).use { origin ->
+            origin.createBroadcast("video-decode-format").use { broadcast ->
+                val video = broadcast.encodeVideo(
+                    VideoEncoderInput(format = VideoPixelFormat.RGBA, width = 320u, height = 240u, framerate = 30u),
+                    // Software both ways so the test is deterministic everywhere.
+                    VideoEncoderOutput(codec = VideoCodec.H264, track = "camera", kind = softwareEncoder),
+                    null,
+                )
+                broadcast.announce(Route())
+
+                // Seed the track so a subscriber joining below lands on encoded media.
+                val rgba = ByteArray(320 * 240 * 4) { 0x80.toByte() }
+                video.cut()
+                for (i in 0 until 10) {
+                    video.write(VideoFrame(timestampUs = i.toULong() * 33_333uL, data = rgba))
+                }
+
+                val consumer = origin.consume().requestBroadcast("video-decode-format")
+                val catalog = consumer.subscribeCatalog().next()!!
+                val rendition = catalog.video["camera"]!!
+
+                // Two subscribers over one publication, so the same encoded frames
+                // are read twice and only the requested layout differs.
+                val i420 = consumer.decodeVideo("camera", rendition, VideoDecoderOutput())
+                val packed = consumer.decodeVideo(
+                    "camera",
+                    rendition,
+                    VideoDecoderOutput(format = VideoPixelFormat.RGBA),
+                )
+
+                // Keep the encoder fed so both decoders see frames after they joined.
+                for (i in 10 until 40) {
+                    video.write(VideoFrame(timestampUs = i.toULong() * 33_333uL, data = rgba))
+                }
+
+                val planar = i420.next()!!
+                assertEquals(VideoPixelFormat.I420, planar.format)
+                assertEquals(planar.width.toInt() * planar.height.toInt() * 3 / 2, planar.data.size)
+
+                val frame = packed.next()!!
+                assertEquals(VideoPixelFormat.RGBA, frame.format)
+                assertEquals(frame.width.toInt() * frame.height.toInt() * 4, frame.data.size)
+                assertTrue(frame.data.indices.filter { it % 4 == 3 }.all { frame.data[it] == 0xFF.toByte() })
+
+                i420.cancel()
+                packed.cancel()
+                video.finish()
+            }
         }
     }
 

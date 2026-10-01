@@ -1,18 +1,51 @@
 //! The track-free half of snapshot publishing: values in, frame payloads out.
 
+use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{Compression, Diff, Result, diff};
+use crate::{Compression, Result};
 
 /// Maximum frames (snapshot + deltas) in a single group before a new snapshot is forced.
 ///
 /// Kept well below moq-net's per-group frame cap so a late joiner can always read the snapshot
 /// at frame 0 before the group is evicted.
 pub(super) const MAX_DELTA_FRAMES: usize = 256;
+
+/// What an [`Encoder`] keeps of the value it last emitted.
+///
+/// A delta is a diff against the previous value, so one has to be parsed to diff against
+/// whenever deltas are possible. With `delta_ratio = 0` none ever are, and the only question
+/// an update asks of the baseline is whether the value changed at all, which the encoded
+/// bytes answer directly. The parse is deferred in that case, and a value that is only ever
+/// published never pays for one.
+enum Baseline {
+	/// Deltas are possible, so the baseline is kept parsed and ready to diff against.
+	Parsed(Value),
+
+	/// Deltas are disabled. The emitted bytes (shared with the frame payload when not
+	/// compressing) stand in for the value, parsed only if a caller reads it back.
+	Encoded {
+		bytes: Bytes,
+		parsed: OnceLock<Option<Value>>,
+	},
+}
+
+impl Baseline {
+	/// The baseline as a parsed value, parsing the encoded bytes on first use.
+	fn value(&self) -> Option<&Value> {
+		match self {
+			Self::Parsed(value) => Some(value),
+			// Serialized by us, so this parses unless the caller's `Serialize` emitted
+			// something `serde_json` will not read back.
+			Self::Encoded { bytes, parsed } => parsed.get_or_init(|| serde_json::from_slice(bytes).ok()).as_ref(),
+		}
+	}
+}
 
 /// Codec options for an [`Encoder`], and so for the [`Producer`](super::Producer) wrapping one.
 ///
@@ -162,7 +195,11 @@ pub struct Encoder<T> {
 
 	/// The last encoded value, the baseline every delta is diffed against. `None` until the first
 	/// snapshot, which is what makes that first [`update`](Self::update) a keyframe.
-	last: Option<Value>,
+	last: Option<Baseline>,
+
+	/// Reused key buffers for comparing unchanged fields without per-update allocations, and the
+	/// memoized root entries that let an unchanged entry skip the baseline walk.
+	scratch: RefCell<crate::diff::Scratch>,
 
 	/// The current group's DEFLATE encoder (one window per group), `Some` while compressing.
 	flate: Option<moq_flate::Encoder>,
@@ -177,6 +214,10 @@ pub struct Encoder<T> {
 
 	/// Frames emitted into the current group, snapshot included.
 	group_frames: usize,
+
+	/// The most bytes a group may hold, the cap a delta is admitted under. A field rather than the
+	/// constant so a test can shrink it to a size it can reach.
+	max_group_bytes: u64,
 
 	/// Whether the next frame has to be a full snapshot, because a frame was lost or the caller cut
 	/// the group. Kept separate from [`last`](Self::last) so a resync doesn't erase the value: that
@@ -193,10 +234,12 @@ impl<T> Encoder<T> {
 		Self {
 			config,
 			last: None,
+			scratch: RefCell::new(crate::diff::Scratch::memoized()),
 			flate: None,
 			delta_bytes: 0,
 			snapshot_len: 0,
 			group_frames: 0,
+			max_group_bytes: moq_net::group::MAX_CACHE_BYTES,
 			resync: false,
 			_marker: PhantomData,
 		}
@@ -206,8 +249,11 @@ impl<T> Encoder<T> {
 	///
 	/// This is the baseline the next delta is diffed against, which is what a caller editing the
 	/// value in place needs to start from.
+	///
+	/// With deltas disabled the baseline is held as the encoded bytes, so the first call parses
+	/// them; the result is cached, and callers that never read the value never pay for it.
 	pub fn value(&self) -> Option<&Value> {
-		self.last.as_ref()
+		self.last.as_ref()?.value()
 	}
 
 	/// Force the next [`update`](Self::update) to emit a full snapshot, even for an unchanged value.
@@ -253,16 +299,31 @@ impl<T: Serialize> Encoder<T> {
 			return self.snapshot(value).map(Some);
 		}
 
+		// With deltas disabled there is nothing to diff, so the only question is whether the value
+		// changed: compare the encodings rather than parsing a baseline to diff against. The bytes
+		// are handed straight to the snapshot when it did change, so an update still serializes
+		// `T` exactly once.
+		if let Some(Baseline::Encoded { bytes, .. }) = self.last.as_ref() {
+			let bytes = bytes.clone();
+			let next = serde_json::to_vec(value)?;
+			if next.as_slice() == bytes.as_ref() {
+				return Ok(None);
+			}
+			return self.snapshot_encoded(next).map(Some);
+		}
+
 		// The first update has no baseline to diff against, so it seeds the stream with a snapshot.
-		let Some(last) = self.last.as_ref() else {
+		let Some(Baseline::Parsed(last)) = self.last.as_ref() else {
 			return self.snapshot(value).map(Some);
 		};
 
 		// Diff straight off `T`, without building a full `Value` for the new value first.
-		let Diff { patch, forced_snapshot } = diff(last, value);
+		let crate::diff::PatchBytes { patch, forced_snapshot } =
+			crate::diff::bytes(last, value, &self.scratch).map_err(crate::Error::Json)?;
 
 		// An empty object patch with no forced null means the value is unchanged: encode nothing.
-		if !forced_snapshot && patch.as_object().is_some_and(serde_json::Map::is_empty) {
+		if !forced_snapshot && patch.is_empty() {
+			self.scratch.get_mut().commit_memo();
 			return Ok(None);
 		}
 
@@ -273,7 +334,7 @@ impl<T: Serialize> Encoder<T> {
 		}
 
 		// Compress into the per-group window only now, for a frame we are committed to emitting.
-		let bytes = serde_json::to_vec(&patch)?;
+		let bytes = Bytes::from(patch);
 
 		// Same cap as a snapshot, on the patch's plaintext: a delta that decompresses past the
 		// consumer's limit makes the whole group unreadable, since there is no keyframe after it to
@@ -283,7 +344,7 @@ impl<T: Serialize> Encoder<T> {
 		}
 		let payload = match self.flate.as_mut() {
 			Some(flate) => flate.frame(&bytes),
-			None => Bytes::from(bytes),
+			None => bytes.clone(),
 		};
 
 		// A delta is only readable while the group still holds the snapshot it applies to.
@@ -295,7 +356,7 @@ impl<T: Serialize> Encoder<T> {
 		// come out slightly larger than its input, so the plaintext is not an upper bound. Compressing
 		// first advances the window, but [`Self::snapshot`] opens a fresh one, so an over-budget delta
 		// costs only the wasted compression.
-		if self.snapshot_len + self.delta_bytes + payload.len() as u64 > moq_net::group::MAX_CACHE_BYTES {
+		if self.snapshot_len + self.delta_bytes + payload.len() as u64 > self.max_group_bytes {
 			return self.snapshot(value).map(Some);
 		}
 
@@ -303,7 +364,13 @@ impl<T: Serialize> Encoder<T> {
 		self.group_frames += 1;
 
 		// Fold the delta into the baseline so the next diff is against the value we just encoded.
-		json_patch::merge(self.last.as_mut().expect("a snapshot precedes any delta"), &patch);
+		// Reaching a delta means `delta_allowed`, which means a non-zero ratio, which is what keeps
+		// the baseline parsed.
+		let Some(Baseline::Parsed(last)) = self.last.as_mut() else {
+			unreachable!("a parsed snapshot precedes any delta")
+		};
+		crate::merge::apply_generated_bytes(last, &bytes)?;
+		self.scratch.get_mut().commit_memo();
 
 		Ok(Some(Encoded {
 			payload,
@@ -331,7 +398,12 @@ impl<T: Serialize> Encoder<T> {
 		// Serialize directly from `value` so the snapshot frame preserves the type's own field order,
 		// keeping the wire bytes identical to serializing `T` straight to a frame.
 		let snapshot = serde_json::to_vec(value)?;
+		self.snapshot_encoded(snapshot)
+	}
 
+	/// [`snapshot`](Self::snapshot) for a value that is already serialized, so an update that
+	/// encoded `T` to compare it against a byte baseline does not encode it a second time.
+	fn snapshot_encoded(&mut self, snapshot: Vec<u8>) -> Result<Encoded> {
 		// Every consumer decodes with moq-flate's default output cap, so a value past it would be
 		// unreadable however small it compresses to. Reject it before anything is published, so the
 		// previously published value stands rather than being superseded by one nothing can read.
@@ -339,18 +411,30 @@ impl<T: Serialize> Encoder<T> {
 			return Err(moq_flate::Error::TooLarge(moq_flate::DEFAULT_MAX_FRAME_SIZE).into());
 		}
 
-		// Read the baseline back out of those same bytes rather than serializing `value` a second
-		// time, so the baseline IS the emitted snapshot by construction. A `Serialize` impl reading a
-		// clock or interior mutable state would otherwise seed the baseline with a value no consumer
-		// ever received, and every later delta would rebase them onto it. `T` is also only visited
-		// once, which is what a caller with an expensive or effectful `Serialize` pays for.
+		// With deltas possible, read the baseline back out of those same bytes rather than
+		// serializing `value` a second time, so the baseline IS the emitted snapshot by
+		// construction. A `Serialize` impl reading a clock or interior mutable state would otherwise
+		// seed the baseline with a value no consumer ever received, and every later delta would
+		// rebase them onto it. `T` is also only visited once, which is what a caller with an
+		// expensive or effectful `Serialize` pays for.
 		//
-		// This trades a second walk of `T` for a parse of the bytes, so it is not automatically
-		// cheaper than `to_value` (see the `baseline` benchmark); consistency is the reason.
+		// That trades a second walk of `T` for a parse of the bytes, so it is not automatically
+		// cheaper than `to_value` (see the `baseline` benchmark); consistency is the reason. With
+		// deltas off there is no diff to rebase and no reason to pay it at all.
 		//
-		// Both fallible steps run before any state changes, so a failure leaves the encoder exactly
+		// Every fallible step runs before any state changes, so a failure leaves the encoder exactly
 		// as it was rather than half-advanced with no frame to show for it.
-		let last = serde_json::from_slice(&snapshot)?;
+		let snapshot = Bytes::from(snapshot);
+		let last = if self.config.delta_ratio == 0 {
+			// No delta will ever diff against this, so hold the bytes instead. Uncompressed, they are
+			// the same allocation the payload carries, so the baseline costs a refcount.
+			Baseline::Encoded {
+				bytes: snapshot.clone(),
+				parsed: OnceLock::new(),
+			}
+		} else {
+			Baseline::Parsed(serde_json::from_slice(&snapshot)?)
+		};
 
 		// Open a fresh per-group encoder (cold window) and compress the snapshot as frame 0, recording
 		// its wire size as the delta anchor.
@@ -360,7 +444,7 @@ impl<T: Serialize> Encoder<T> {
 				let payload = flate.frame(&snapshot);
 				(payload, Some(flate))
 			}
-			Compression::None => (Bytes::from(snapshot), None),
+			Compression::None => (snapshot, None),
 		};
 
 		self.snapshot_len = payload.len() as u64;
@@ -369,6 +453,8 @@ impl<T: Serialize> Encoder<T> {
 		self.flate = flate;
 		self.last = Some(last);
 		self.resync = false;
+		// Seeded from the snapshot rather than a diff, so no root entry is memoized against it yet.
+		self.scratch.get_mut().clear_memo();
 
 		Ok(Encoded {
 			payload,
@@ -381,6 +467,33 @@ impl<T: Serialize> Encoder<T> {
 mod test {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn duplicate_serialized_keys_are_refused() {
+		use serde::ser::SerializeMap;
+		struct Duplicate {
+			duplicate: bool,
+		}
+		impl Serialize for Duplicate {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+				let mut map = serializer.serialize_map(Some(2 + usize::from(self.duplicate)))?;
+				map.serialize_entry("a", &1)?;
+				map.serialize_entry("b", &2)?;
+				if self.duplicate {
+					map.serialize_entry("a", &3)?;
+				}
+				map.end()
+			}
+		}
+		let mut encoder = Encoder::<Duplicate>::new(Config::default());
+		encoder
+			.update(&Duplicate { duplicate: false })
+			.unwrap()
+			.unwrap()
+			.commit();
+		let err = encoder.encode(&Duplicate { duplicate: true }).unwrap_err();
+		assert!(err.to_string().contains("duplicate JSON object key"));
+	}
 
 	/// Encode a sequence of values, committing each frame, and return `(keyframe, payload_len)` per
 	/// emitted frame.
@@ -440,6 +553,57 @@ mod test {
 			&[json!({ "a": 1 }), json!({ "a": 2 })],
 		);
 		assert_eq!(frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![true, true]);
+	}
+
+	/// Deltas off keeps the baseline as bytes rather than a parsed value, so the unchanged check
+	/// runs on the encoding. It still has to suppress a republish, or every stats tick would
+	/// re-emit an identical frame.
+	#[test]
+	fn deltas_off_still_skips_an_unchanged_value() {
+		let frames = encode(
+			Config::default().with_delta_ratio(0),
+			&[json!({ "a": 1 }), json!({ "a": 1 }), json!({ "a": 1 })],
+		);
+		assert_eq!(frames.len(), 1);
+	}
+
+	/// Field order is part of the encoding, so a byte baseline only answers "unchanged" correctly
+	/// because `T` serializes deterministically. Same keys, different values, must still emit.
+	#[test]
+	fn deltas_off_detects_a_change_under_the_same_keys() {
+		let frames = encode(
+			Config::default().with_delta_ratio(0),
+			&[json!({ "a": 1, "b": 2 }), json!({ "a": 1, "b": 3 })],
+		);
+		assert_eq!(frames.len(), 2);
+	}
+
+	/// The byte baseline is parsed on demand, so `value` (and so `Producer::modify`, which seeds an
+	/// edit from it) keeps working with deltas off. Dropping the baseline instead would make
+	/// `modify` start from `T::default()` and publish a document with every other field missing.
+	#[test]
+	fn deltas_off_still_exposes_the_value() {
+		let mut encoder = Encoder::<Value>::new(Config::default().with_delta_ratio(0));
+		assert_eq!(encoder.value(), None);
+
+		commit(&mut encoder, &json!({ "a": 1, "b": 2 })).unwrap();
+		assert_eq!(encoder.value(), Some(&json!({ "a": 1, "b": 2 })));
+
+		commit(&mut encoder, &json!({ "a": 1, "b": 3 })).unwrap();
+		assert_eq!(encoder.value(), Some(&json!({ "a": 1, "b": 3 })));
+	}
+
+	/// Compressing shares no allocation between the baseline and the payload, so the byte baseline
+	/// has to hold the plaintext rather than the compressed frame.
+	#[test]
+	fn deltas_off_while_compressing_keeps_the_plaintext_baseline() {
+		let mut config = Config::default().with_delta_ratio(0);
+		config.compression = Compression::Deflate;
+
+		let mut encoder = Encoder::<Value>::new(config);
+		commit(&mut encoder, &json!({ "a": 1 })).unwrap();
+		assert_eq!(encoder.value(), Some(&json!({ "a": 1 })));
+		assert!(commit(&mut encoder, &json!({ "a": 1 })).is_none());
 	}
 
 	/// A value the caller might reasonably expect to be a delta, but that merge patch can't express:
@@ -538,6 +702,47 @@ mod test {
 		);
 	}
 
+	/// A sync-flushed DEFLATE frame can come out larger than its input, so the plaintext is not an
+	/// upper bound on what lands in the group. A patch that fits the budget by its plaintext but not
+	/// by its encoded size would otherwise slip through the gate, overflow the group, and evict the
+	/// snapshot a late joiner needs. Matches the JS `a compressed delta is gated on its encoded size`.
+	#[test]
+	fn a_compressed_delta_is_gated_on_its_encoded_size() {
+		let value = json!({ "v": "x".repeat(1000) });
+		let patched = json!({ "v": "x".repeat(1000), "q": "a" });
+		let plaintext = serde_json::to_vec(&json!({ "q": "a" })).unwrap().len();
+		let config = Config {
+			delta_ratio: 100,
+			compression: Compression::Deflate,
+		};
+
+		// Measure the frames under the default budget, which admits the delta.
+		let mut probe = Encoder::<Value>::new(config.clone());
+		let snapshot = commit(&mut probe, &value).expect("a snapshot");
+		let delta = commit(&mut probe, &patched).expect("a delta");
+		assert!(!delta.keyframe);
+		assert!(
+			delta.payload.len() > plaintext,
+			"the encoded delta ({}) must outgrow its plaintext ({plaintext}) for this to test anything",
+			delta.payload.len()
+		);
+
+		// A budget with room for the plaintext patch but not the encoded one.
+		let mut encoder = Encoder::<Value>::new(config);
+		encoder.max_group_bytes = (snapshot.payload.len() + plaintext) as u64;
+		assert!(commit(&mut encoder, &value).unwrap().keyframe);
+
+		// The patch rolls a fresh snapshot instead of joining the first group.
+		let rolled = commit(&mut encoder, &patched).expect("a rolled snapshot");
+		assert!(rolled.keyframe);
+		let mut decoder = moq_flate::Decoder::new();
+		assert_eq!(
+			serde_json::from_slice::<Value>(&decoder.frame(&rolled.payload).unwrap()).unwrap(),
+			patched,
+			"the snapshot carries the whole value, not a patch"
+		);
+	}
+
 	#[test]
 	fn compressed_deltas_reuse_the_group_window() {
 		let phrase = "Media over QUIC delivers real-time latency at massive scale";
@@ -595,6 +800,216 @@ mod test {
 		let emitted: Value = serde_json::from_slice(&payload).unwrap();
 		assert_eq!(emitted, json!({ "n": 0 }));
 		assert_eq!(encoder.value(), Some(&emitted), "the baseline must be what was emitted");
+	}
+
+	/// A root entry the memo has not seen yet is diffed from the bytes the memo recorded, not
+	/// serialized again: a second pass could disagree with the first, leaving the memo describing a
+	/// value the baseline never held.
+	#[test]
+	fn a_delta_serializes_each_entry_once() {
+		let value = std::collections::BTreeMap::from([("row", Ticking(std::cell::Cell::new(0)))]);
+		let mut encoder = Encoder::new(Config::default().with_delta_ratio(100));
+		encoder.update(&value).unwrap().expect("a snapshot").commit();
+
+		let frame = encoder.update(&value).unwrap().expect("a delta");
+		assert!(!frame.keyframe);
+		let emitted: Value = serde_json::from_slice(&frame.payload).unwrap();
+		frame.commit();
+
+		assert_eq!(
+			value["row"].0.get(),
+			2,
+			"each update should serialize the entry exactly once"
+		);
+		assert_eq!(emitted, json!({ "row": { "n": 1 } }));
+		assert_eq!(encoder.value(), Some(&emitted), "the baseline must be what was emitted");
+	}
+
+	/// A key repeated below the root is refused whether the memo meets it in a new entry or in a
+	/// value replaced wholesale, as the value diff refuses it. Letting one into the memo would pair
+	/// the repeats by position, where the consumer keeps the last.
+	#[test]
+	fn a_repeated_nested_key_is_refused_through_the_memo() {
+		use serde::ser::SerializeMap;
+
+		/// `{"row": {"o": ..}}`, where `o` is `1` or an object that repeats a key.
+		struct Doc {
+			repeat: bool,
+		}
+		struct Row<'a>(&'a Doc);
+		struct Repeat;
+
+		impl Serialize for Repeat {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+				let mut map = serializer.serialize_map(Some(2))?;
+				map.serialize_entry("x", &1)?;
+				map.serialize_entry("x", &2)?;
+				map.end()
+			}
+		}
+		impl Serialize for Row<'_> {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+				let mut map = serializer.serialize_map(Some(1))?;
+				match self.0.repeat {
+					true => map.serialize_entry("o", &Repeat)?,
+					false => map.serialize_entry("o", &1)?,
+				}
+				map.end()
+			}
+		}
+		impl Serialize for Doc {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+				let mut map = serializer.serialize_map(Some(1))?;
+				map.serialize_entry("row", &Row(self))?;
+				map.end()
+			}
+		}
+
+		let config = Config::default().with_delta_ratio(100);
+		let (plain, repeat) = (Doc { repeat: false }, Doc { repeat: true });
+
+		// A new entry: the first diff after a snapshot has nothing memoized yet.
+		let mut encoder = Encoder::<Doc>::new(config.clone());
+		encoder.update(&plain).unwrap().expect("a snapshot").commit();
+		let err = encoder.encode(&repeat).unwrap_err();
+		assert!(err.to_string().contains("duplicate JSON object key"), "{err}");
+
+		// A memoized entry whose scalar becomes an object.
+		let mut encoder = Encoder::<Doc>::new(config);
+		encoder.update(&plain).unwrap().expect("a snapshot").commit();
+		assert!(encoder.update(&plain).unwrap().is_none(), "unchanged, now memoized");
+		let err = encoder.encode(&repeat).unwrap_err();
+		assert!(err.to_string().contains("duplicate JSON object key"), "{err}");
+	}
+
+	/// A root object whose entries serialize in the order given, sorted or not.
+	struct Rows(Vec<(String, Value)>);
+
+	impl Serialize for Rows {
+		fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+			serializer.collect_map(self.0.iter().map(|(key, value)| (key, value)))
+		}
+	}
+
+	/// A deterministic xorshift, so a failure replays.
+	struct Rng(u64);
+
+	impl Rng {
+		fn below(&mut self, n: u64) -> u64 {
+			self.0 ^= self.0 << 13;
+			self.0 ^= self.0 >> 7;
+			self.0 ^= self.0 << 17;
+			self.0 % n
+		}
+
+		/// A row value covering what the memo has to get right: nested objects that gain and lose
+		/// keys, values that change type, nulls in and out of arrays, and strings that look like JSON.
+		fn row(&mut self) -> Value {
+			let strings = ["plain", "q\"uote", "back\\slash", "},{\"x\":1", "null", "a:b,c"];
+			let mut row = serde_json::Map::new();
+			row.insert(
+				"n".into(),
+				match self.below(30) {
+					0 => Value::Null,
+					n => json!(n % 4),
+				},
+			);
+			if self.below(4) > 0 {
+				row.insert("s".into(), json!(strings[self.below(strings.len() as u64) as usize]));
+			}
+			let mut nested = serde_json::Map::new();
+			nested.insert("a".into(), json!(self.below(3)));
+			if self.below(3) == 0 {
+				nested.insert("b".into(), json!([self.below(2), null]));
+			}
+			if self.below(40) == 0 {
+				nested.insert("c".into(), Value::Null);
+			}
+			row.insert("o".into(), Value::Object(nested));
+			row.insert(
+				"t".into(),
+				match self.below(5) {
+					0 => json!({ "k": self.below(2) }),
+					1 => json!({}),
+					2 => json!([{ "k": null }]),
+					3 => json!(1.5 + self.below(2) as f64),
+					_ => json!("t"),
+				},
+			);
+			if self.below(60) == 0 {
+				row.insert("z".into(), Value::Null);
+			}
+			Value::Object(row)
+		}
+	}
+
+	/// The memo is a shortcut past the value diff, so it must never change a frame: every payload and
+	/// keyframe has to match an encoder diffing without it, through inserts, deletions, reorders,
+	/// shape changes, forced snapshots, and group rolls.
+	#[test]
+	fn memo_matches_the_value_diff() {
+		for (seed, compression) in [
+			(1, Compression::None),
+			(2, Compression::Deflate),
+			(3, Compression::None),
+		] {
+			let mut config = Config::default().with_delta_ratio(2);
+			config.compression = compression;
+			let mut memoized = Encoder::<Rows>::new(config.clone());
+			let mut plain = Encoder::<Rows>::new(config);
+			plain.scratch = RefCell::new(crate::diff::Scratch::default());
+
+			let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+			let mut rows: Vec<(String, Value)> = (0..40).map(|i| (format!("row-{i:03}"), rng.row())).collect();
+			let mut emitted = 0;
+			for tick in 0..400 {
+				for row in rows.iter_mut() {
+					if rng.below(4) == 0 {
+						row.1 = rng.row();
+					}
+				}
+				if rng.below(3) == 0 {
+					let index = rng.below(rows.len() as u64) as usize;
+					rows.remove(index);
+				}
+				if rng.below(3) == 0 {
+					rows.push((format!("row-{:03}", 40 + rng.below(40)), rng.row()));
+				}
+				rows.sort_by(|a, b| a.0.cmp(&b.0));
+				rows.dedup_by(|a, b| a.0 == b.0);
+				// Now and then, a root that stops ascending.
+				if seed == 3 && rng.below(10) == 0 {
+					let (a, b) = (
+						rng.below(rows.len() as u64) as usize,
+						rng.below(rows.len() as u64) as usize,
+					);
+					rows.swap(a, b);
+				}
+
+				let value = Rows(rows.clone());
+				let want = plain.update(&value).unwrap().map(|frame| {
+					let encoded = (*frame).clone();
+					frame.commit();
+					encoded
+				});
+				let got = memoized.update(&value).unwrap().map(|frame| {
+					let encoded = (*frame).clone();
+					frame.commit();
+					encoded
+				});
+				match (want, got) {
+					(None, None) => {}
+					(Some(want), Some(got)) => {
+						assert_eq!(got.keyframe, want.keyframe, "seed {seed} tick {tick}: keyframe");
+						assert_eq!(got.payload, want.payload, "seed {seed} tick {tick}: payload");
+						emitted += usize::from(!got.keyframe);
+					}
+					(want, got) => panic!("seed {seed} tick {tick}: {want:?} vs {got:?}"),
+				}
+				assert_eq!(memoized.value(), plain.value(), "seed {seed} tick {tick}: baseline");
+			}
+			assert!(emitted > 100, "seed {seed}: only {emitted} deltas exercised the memo");
+		}
 	}
 
 	#[test]

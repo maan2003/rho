@@ -1,6 +1,10 @@
+import { Once } from "@moq/signals";
 import { Mutex } from "async-mutex";
+import type { Drain } from "../connection/goaway.ts";
+import { error, ProtocolViolation } from "../error.ts";
 import { Reader, Stream, type Writer } from "../stream.ts";
 import * as Varint from "../varint.ts";
+import { GoAway } from "./goaway.ts";
 import * as Namespace from "./namespace.ts";
 import { type IetfVersion, Version } from "./version.ts";
 
@@ -58,7 +62,7 @@ export class NativeSession implements Session {
 const Route = {
 	NewRequest: 0, // Create virtual bidi stream, push initial message
 	Response: 1, // Push message to existing stream (keep open)
-	ErrorResponse: 2, // Push message to existing stream, then close
+	ErrorResponse: 2, // Push a final message to existing stream, then close
 	CloseStream: 3, // Close stream recv (no bytes pushed)
 	FollowUp: 4, // Push follow-up message to existing stream
 	MaxRequestId: 5, // Update flow control
@@ -89,6 +93,9 @@ export class ControlStreamAdapter implements Session {
 	#writer: Writer;
 	#writeMutex = new Mutex();
 	readonly version: IetfVersion;
+
+	/** The peer's GOAWAY, which draft-14 to -16 carry on the shared control stream. */
+	readonly goaway = new Once<Drain>();
 
 	// Virtual streams keyed by requestId
 	#streams = new Map<bigint, StreamEntry>();
@@ -123,6 +130,9 @@ export class ControlStreamAdapter implements Session {
 
 	#closed = false;
 
+	// Whether this side opened the session. Only a server may name a redirect.
+	#client: boolean;
+
 	constructor(
 		quic: WebTransport,
 		controlStream: Stream,
@@ -138,6 +148,7 @@ export class ControlStreamAdapter implements Session {
 		this.version = version;
 		this.#maxRequestId = maxRequestId;
 		this.#requestId = client ? 0n : 1n;
+		this.#client = client;
 	}
 
 	/**
@@ -211,9 +222,7 @@ export class ControlStreamAdapter implements Session {
 			},
 		});
 
-		const stream = new Stream({ readable, writable: sendWritable });
-		stream.reader.version = this.version;
-		stream.writer.version = this.version;
+		const stream = new Stream({ readable, writable: sendWritable, version: this.version });
 		return stream;
 	}
 
@@ -246,6 +255,8 @@ export class ControlStreamAdapter implements Session {
 	 * Must be called after construction. Runs until the control stream closes.
 	 */
 	async run(): Promise<void> {
+		// Why the virtual streams end: undefined only for a GOAWAY, which is not a failure.
+		let cause: Error | undefined;
 		try {
 			// v16: also accept real bidi streams (for SubscribeNamespace)
 			if (this.version === Version.DRAFT_16) {
@@ -254,7 +265,10 @@ export class ControlStreamAdapter implements Session {
 
 			for (;;) {
 				const done = await this.#reader.done();
-				if (done) break;
+				if (done) {
+					cause = new ProtocolViolation("control stream closed");
+					break;
+				}
 
 				const typeId = await this.#reader.u53();
 				const size = await this.#reader.u16();
@@ -263,8 +277,15 @@ export class ControlStreamAdapter implements Session {
 				const classified = await this.#classify(typeId, body);
 
 				if (classified.route === Route.GoAway) {
-					console.warn("received GOAWAY on control stream");
-					return;
+					// The session keeps serving: a GOAWAY asks us to migrate, not to stop reading.
+					const msg = await GoAway.decodeBody(body, this.version);
+					if (this.goaway.peek() !== undefined) throw new ProtocolViolation("duplicate GOAWAY");
+					// A client may leave, but only the server may name where to go.
+					if (!this.#client && msg.newSessionUri !== "") {
+						throw new ProtocolViolation("client GOAWAY must not name a redirect");
+					}
+					this.goaway.set(msg.drain());
+					continue;
 				}
 
 				const { route, requestId } = classified;
@@ -293,8 +314,11 @@ export class ControlStreamAdapter implements Session {
 						break;
 				}
 			}
+		} catch (err: unknown) {
+			cause = error(err);
+			throw err;
 		} finally {
-			this.close();
+			this.close(cause);
 		}
 	}
 
@@ -330,9 +354,7 @@ export class ControlStreamAdapter implements Session {
 
 		const sendWritable = this.#createSendWritable();
 
-		const stream = new Stream({ readable, writable: sendWritable });
-		stream.reader.version = this.version;
-		stream.writer.version = this.version;
+		const stream = new Stream({ readable, writable: sendWritable, version: this.version });
 
 		this.#streams.set(requestId, { controller });
 
@@ -636,7 +658,10 @@ export class ControlStreamAdapter implements Session {
 				return { route: Route.FollowUp, requestId: subNs08 };
 			}
 			case 0x0e: {
-				// v15: NamespaceDone entry (no requestId) — route to SubscribeNamespace stream
+				if (this.version === Version.DRAFT_14 || this.version === Version.DRAFT_15) {
+					throw new Error("unexpected message 0x0e");
+				}
+				// v16+: NamespaceDone entry (no requestId) — route to SubscribeNamespace stream
 				const subNs0e = this.#subscribeNamespaces.values().next().value;
 				if (subNs0e === undefined) throw new Error("unexpected message 0x0e: no SubscribeNamespace stream");
 				return { route: Route.FollowUp, requestId: subNs0e };
@@ -655,9 +680,9 @@ export class ControlStreamAdapter implements Session {
 				return { route: Route.CloseStream, requestId };
 			}
 			case 0x0b: {
-				// PublishDone
+				// PublishDone: the subscriber reads its status and stream count before the end.
 				const requestId = await readRequestId();
-				return { route: Route.CloseStream, requestId };
+				return { route: Route.ErrorResponse, requestId };
 			}
 			case 0x17: {
 				// FetchCancel
@@ -716,15 +741,19 @@ export class ControlStreamAdapter implements Session {
 		}
 	}
 
-	close() {
+	/**
+	 * Ends every virtual stream: cleanly for a deliberate close, or with `err` when the
+	 * control stream died under them, since every request riding it was cut off.
+	 */
+	close(err?: Error) {
 		if (this.#closed) return;
 		this.#closed = true;
 		console.debug("adapter: close() called");
 
-		// Close all virtual streams
 		for (const entry of this.#streams.values()) {
 			try {
-				entry.controller.close();
+				if (err) entry.controller.error(err);
+				else entry.controller.close();
 			} catch {
 				// Already closed
 			}

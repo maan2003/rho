@@ -124,6 +124,8 @@ use super::Version;
 pub(crate) enum PublishDoneStatus {
 	/// An implementation-specific failure ended the subscription.
 	InternalError,
+	/// The subscriber is no longer authorized for the track.
+	Unauthorized,
 	/// The track is no longer being published.
 	TrackEnded,
 }
@@ -144,6 +146,7 @@ impl PublishDoneStatus {
 			| Version::Draft21
 			| Version::Draft22 => match self {
 				Self::InternalError => 0x0,
+				Self::Unauthorized => 0x1,
 				Self::TrackEnded => 0x2,
 			},
 		}
@@ -157,6 +160,31 @@ pub struct PublishDone<'a> {
 	pub status_code: u64,
 	pub stream_count: u64,
 	pub reason_phrase: Cow<'a, str>,
+}
+
+impl PublishDone<'_> {
+	/// How the publisher ended the subscription: cleanly, or with the error its status names.
+	pub(crate) fn end(&self, version: Version) -> Result<(), crate::Error> {
+		match self.status_code {
+			code if code == PublishDoneStatus::TrackEnded.code(version) => Ok(()),
+			code if code == PublishDoneStatus::Unauthorized.code(version) => Err(crate::Error::Unauthorized),
+			// SUBSCRIPTION_ENDED: the subscription reached the end its filter asked for.
+			// Draft-20 removed it and left 0x3 unassigned.
+			0x3 if matches!(
+				version,
+				Version::Draft14
+					| Version::Draft15
+					| Version::Draft16
+					| Version::Draft17
+					| Version::Draft18
+					| Version::Draft19
+			) =>
+			{
+				Ok(())
+			}
+			code => Err(crate::Error::Remote(u32::try_from(code).unwrap_or(u32::MAX))),
+		}
+	}
 }
 
 impl Message for PublishDone<'_> {
@@ -281,7 +309,7 @@ impl Message for Publish<'_> {
 				};
 				let forward = bool::decode(r, version)?;
 				// parameters
-				let _params = Parameters::decode(r, version)?;
+				Parameters::skip(r, version)?;
 
 				Ok(Self {
 					request_id,
@@ -306,6 +334,7 @@ impl Message for Publish<'_> {
 				// letting the request reach its NOT_SUPPORTED response.
 				decode_params!(r, version,
 					0x02 => object_delivery_timeout: Option<u64>,
+					0x03 => _authorization_token: Vec<super::Opaque>,
 					0x06 => subgroup_delivery_timeout: Option<u64>,
 					0x08 => _expires: Option<u64>,
 					0x09 => largest_location: Option<Location>,
@@ -409,7 +438,7 @@ impl Message for PublishOk {
 				let filter = Filter::decode(r, version)?;
 
 				// no parameters
-				let _params = Parameters::decode(r, version)?;
+				Parameters::skip(r, version)?;
 
 				Ok(Self {
 					request_id,
@@ -420,7 +449,9 @@ impl Message for PublishOk {
 				})
 			}
 			_ => {
+				// EXPIRES is ignored, as in SUBSCRIBE_OK.
 				decode_params!(r, version,
+					0x08 => _expires: Option<u64>,
 					0x10 => forward: Option<bool>,
 					0x20 => subscriber_priority: Option<u8>,
 					0x21 => filter: Option<Filter>,
@@ -692,6 +723,37 @@ mod tests {
 		}
 	}
 
+	/// A subscriber ends the track the way the publisher said it ended: cleanly for a
+	/// finished track or a reached filter end, with the publisher's code otherwise.
+	#[test]
+	fn publish_done_end_follows_the_status() {
+		let done = |status_code| PublishDone {
+			request_id: None,
+			status_code,
+			stream_count: 0,
+			reason_phrase: "".into(),
+		};
+
+		for version in [Version::Draft14, Version::Draft19, Version::Draft20, Version::Draft22] {
+			assert!(done(0x2).end(version).is_ok(), "{version:?}");
+			assert!(
+				matches!(done(0x1).end(version), Err(crate::Error::Unauthorized)),
+				"{version:?}"
+			);
+			assert!(
+				matches!(done(0x0).end(version), Err(crate::Error::Remote(0x0))),
+				"{version:?}"
+			);
+		}
+
+		// SUBSCRIPTION_ENDED is clean until draft-20 unassigned it.
+		assert!(done(0x3).end(Version::Draft19).is_ok());
+		assert!(matches!(
+			done(0x3).end(Version::Draft20),
+			Err(crate::Error::Remote(0x3))
+		));
+	}
+
 	#[test]
 	fn test_publish_v18_round_trip() {
 		let msg = Publish {
@@ -718,6 +780,46 @@ mod tests {
 		assert!(decoded.forward);
 	}
 
+	#[test]
+	fn publish_priority_property_bytes_on_every_draft() {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+			Version::Draft19,
+			Version::Draft20,
+			Version::Draft21,
+			Version::Draft22,
+		] {
+			let mut msg = Publish {
+				request_id: RequestId(1),
+				track_namespace: Path::new("ns"),
+				track_name: "video".into(),
+				track_alias: 42,
+				largest_location: None,
+				forward: true,
+				properties: Properties::default(),
+			};
+			let baseline = encode_message(&msg, version);
+			msg.properties.priority = Some(37);
+			let encoded = encode_message(&msg, version);
+			if matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16) {
+				assert_eq!(encoded, baseline, "{version}");
+			} else {
+				assert_eq!(encoded, [baseline, vec![0x0e, 37]].concat(), "{version}");
+				assert_eq!(
+					decode_message::<Publish>(&encoded, version)
+						.unwrap()
+						.properties
+						.priority,
+					Some(37)
+				);
+			}
+		}
+	}
+
 	/// GROUP_ORDER (0x22) is only a legal PUBLISH *message parameter* through draft-15; a
 	/// draft-16+ peer closes the session with PROTOCOL_VIOLATION when it sees one. The
 	/// publisher's preference belongs in the DEFAULT_PUBLISHER_GROUP_ORDER track property,
@@ -733,6 +835,7 @@ mod tests {
 			forward: true,
 			properties: Properties {
 				timescale: None,
+				priority: None,
 				group_order: Some(GroupOrder::Descending),
 			},
 		};
@@ -767,6 +870,7 @@ mod tests {
 			forward: true,
 			properties: Properties {
 				timescale: None,
+				priority: None,
 				group_order: Some(GroupOrder::Descending),
 			},
 		};
@@ -826,6 +930,16 @@ mod tests {
 		assert_eq!(decoded.request_id, None);
 		assert!(decoded.forward);
 		assert_eq!(decoded.subscriber_priority, 128);
+	}
+
+	/// Draft-18 lets PUBLISH_OK carry EXPIRES; it is ignored rather than rejected.
+	#[test]
+	fn test_publish_ok_ignores_expires() {
+		let bytes = [0x04, 0x01, 0x08, 0x05];
+
+		let decoded: PublishOk = decode_message(&bytes, Version::Draft16).unwrap();
+		assert_eq!(decoded.request_id, Some(RequestId(4)));
+		assert!(decoded.forward);
 	}
 
 	#[test]

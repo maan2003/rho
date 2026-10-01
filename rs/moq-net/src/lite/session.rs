@@ -24,7 +24,7 @@ pub(crate) struct SessionStart<S: crate::transport::poll::Session> {
 /// the session, so the caller can inspect the advertised path (and gate on it) before
 /// serving. lite-05+ only.
 ///
-/// Blocks on the peer's Setup Stream, which every lite-05 endpoint opens at startup.
+/// Blocks on the peer's Setup Stream, which every lite-05+ endpoint opens at startup.
 /// Almost always the first unidirectional stream; any other uni stream that races
 /// ahead of it is `STOP_SENDING`-ed and skipped (we don't support proactive uni
 /// PUBLISH, so nothing legitimate precedes the SETUP today). The eventual home for
@@ -230,6 +230,10 @@ where
 {
 	pub(crate) fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let res = std::task::ready!(self.poll_protocol(waiter));
+		if let Err(err) = &res {
+			// Every track this session was receiving ends with its error.
+			self.subscriber.abort(err);
+		}
 		match &res {
 			Err(Error::Transport(_)) => {
 				tracing::info!("session terminated");
@@ -246,6 +250,11 @@ where
 			}
 		}
 		Poll::Ready(res)
+	}
+
+	/// Whether no stream still owes the peer data, for a draining close.
+	pub(crate) fn drained(&self) -> bool {
+		self.publisher.drained()
 	}
 
 	fn poll_protocol(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {

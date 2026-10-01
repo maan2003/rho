@@ -32,17 +32,17 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
-        with:
-          tool-cache: false
-
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Full history so `just check` can diff against origin/$GITHUB_BASE_REF.
+          # Full history so `just ci check` can diff against origin/$GITHUB_BASE_REF.
           fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # main
+        with:
+          tool-cache: false
 
       - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
         with:
@@ -67,22 +67,19 @@ jobs:
 
       # The same recipe a developer runs locally. It diffs against
       # origin/$GITHUB_BASE_REF and touches only the packages this PR changed
-      # plus their dependents, so a one-crate PR compiles one crate.
+      # plus their dependents, so a one-crate PR compiles one crate and a
+      # quest-only PR runs only the lints. sh/dispatch.sh's impact map is the one
+      # place that decides; the setup above always runs rather than keep a second
+      # path map here.
       #
       # MOQ_STRICT turns every "tool missing, skipping" guard into an error.
       # Locally an absent formatter means less gets checked; here it would mean
       # a green run that checked nothing, which is the failure mode worth
       # spending a preflight on.
-      - name: Test direnv hook
-        run: bash .claude/hooks/direnv.test.sh
-
       - name: Check
-        run: nix develop --command just check
+        run: nix develop --command just ci check
         env:
           MOQ_STRICT: 1
-
-      - name: Media feature contracts
-        run: nix develop --command just rs media-features
 
   test:
     name: Test
@@ -91,17 +88,17 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
-        with:
-          tool-cache: false
-
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Full history so `just test` can diff against origin/$GITHUB_BASE_REF.
+          # Full history so `just ci test` can diff against origin/$GITHUB_BASE_REF.
           fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # main
+        with:
+          tool-cache: false
 
       - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
         with:
@@ -123,7 +120,7 @@ jobs:
       # NEXTEST_PROFILE picks up the longer hang timeout in .config/nextest.toml;
       # without it a runner under load could trip the local one.
       - name: Test
-        run: nix develop --command just test
+        run: nix develop --command just ci test
         env:
           MOQ_STRICT: 1
           NEXTEST_PROFILE: ci

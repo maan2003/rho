@@ -384,6 +384,26 @@ impl Track {
 		Ok(())
 	}
 
+	/// Record a locally encoded frame's transport handoff. Call this only for an original
+	/// encoder; file, pipe, and network imports must leave the clock out of the estimate.
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> Result<()> {
+		match self.kind {
+			TrackKind::Avc3 { ref mut import, .. } | TrackKind::Avc1 { ref mut import, .. } => {
+				import.flush(timestamp, now)
+			}
+			TrackKind::Hev1 { ref mut import, .. } | TrackKind::Hvc1 { ref mut import, .. } => {
+				import.flush(timestamp, now)
+			}
+			TrackKind::Av01 { ref mut import, .. } => import.flush(timestamp, now),
+			TrackKind::Vp8(ref mut import) => import.flush(timestamp, now),
+			TrackKind::Vp9(ref mut import) => import.flush(timestamp, now),
+			TrackKind::Aac(ref mut import) => import.flush(timestamp, now),
+			TrackKind::Opus(ref mut import) => import.flush(timestamp, now),
+			TrackKind::Mp3(ref mut import) => import.flush(timestamp, now),
+			TrackKind::Flac(ref mut import) => import.flush(timestamp, now),
+		}
+	}
+
 	/// Finish the importer, flushing any buffered data.
 	pub fn finish(&mut self) -> Result<()> {
 		match self.kind {
@@ -437,6 +457,44 @@ impl Track {
 			TrackKind::Opus(ref mut import) => import.cut(end),
 			TrackKind::Mp3(ref mut import) => import.cut(end),
 			TrackKind::Flac(ref mut import) => import.cut(end),
+		}
+	}
+
+	/// Mark a timeline break, clearing partial frames and restarting handoff measurement.
+	///
+	/// Publishes a marker without lowering advertised values; resumed timestamps must continue forward.
+	pub fn discontinuity(&mut self) -> Result<()> {
+		self.group_start = None;
+		match self.kind {
+			TrackKind::Avc3 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Avc1 { ref mut import, .. } => import.discontinuity(),
+			TrackKind::Hev1 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Hvc1 { ref mut import, .. } => import.discontinuity(),
+			TrackKind::Av01 {
+				ref mut split,
+				ref mut import,
+			} => {
+				split.reset();
+				import.discontinuity()
+			}
+			TrackKind::Vp8(ref mut import) => import.discontinuity(),
+			TrackKind::Vp9(ref mut import) => import.discontinuity(),
+			TrackKind::Aac(ref mut import) => import.discontinuity(),
+			TrackKind::Opus(ref mut import) => import.discontinuity(),
+			TrackKind::Mp3(ref mut import) => import.discontinuity(),
+			TrackKind::Flac(ref mut import) => import.discontinuity(),
 		}
 	}
 
@@ -968,6 +1026,35 @@ mod tests {
 		import.finish().unwrap();
 
 		assert_eq!(collect_groups(subscriber).await, vec![3, 2]);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn discontinuity_resets_audio_measurement_and_separates_groups() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let (import, subscriber) = opus_import(&mut broadcast, &catalog);
+		let mut import: Track = import.into();
+		let anchor = std::time::Instant::now();
+		for (pts, arrival) in [(0, 0), (20, 120)] {
+			let timestamp = Timestamp::from_micros(pts * 1_000).unwrap();
+			import.decode(b"a", Some(timestamp)).unwrap();
+			import
+				.flush(timestamp, anchor + Duration::from_millis(arrival))
+				.unwrap();
+		}
+		let before = catalog.snapshot().audio.renditions["audio"].jitter;
+		assert_eq!(before, Some(Duration::from_millis(100)));
+		import.discontinuity().unwrap();
+		for (pts, arrival) in [(100, 6_000), (120, 6_020)] {
+			let timestamp = Timestamp::from_micros(pts * 1_000).unwrap();
+			import.decode(b"b", Some(timestamp)).unwrap();
+			import
+				.flush(timestamp, anchor + Duration::from_millis(arrival))
+				.unwrap();
+		}
+		assert_eq!(catalog.snapshot().audio.renditions["audio"].jitter, before);
+		import.finish().unwrap();
+		// The middle group is the established empty-payload discontinuity marker.
+		assert_eq!(collect_groups(subscriber).await, vec![2, 1, 2]);
 	}
 
 	/// Cutting after every frame is still available, and is what a caller wanting the lowest

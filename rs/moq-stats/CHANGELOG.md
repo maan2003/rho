@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.8...moq-stats-v0.2.9) - 2026-09-30
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.7...moq-stats-v0.2.8) - 2026-09-27
+
+### Fixed
+
+- *(stats)* keep an idle path in the frame while its counters live ([#4299](https://github.com/moq-dev/moq/pull/4299))
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.6...moq-stats-v0.2.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+## [0.2.6](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.5...moq-stats-v0.2.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.2.5](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.4...moq-stats-v0.2.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.2.4](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.3...moq-stats-v0.2.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.2.3](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.2...moq-stats-v0.2.3) - 2026-09-25
+
+### Added
+
+- *(net)* hide dot-named broadcasts from discovery (moq-lite-07) ([#4060](https://github.com/moq-dev/moq/pull/4060))
+
+### Other
+
+- *(json)* track the error path only when a snapshot decode fails ([#4019](https://github.com/moq-dev/moq/pull/4019))
+
+## [0.2.2](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.1...moq-stats-v0.2.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.2.1](https://github.com/moq-dev/moq/compare/moq-stats-v0.2.0...moq-stats-v0.2.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-json
+
+## [0.2.0](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.11...moq-stats-v0.2.0) - 2026-09-23
+
+### Added
+
+- *(gateway)* [**breaking**] align embedding APIs ([#3818](https://github.com/moq-dev/moq/pull/3818))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(net)* [**breaking**] scope origins with any pattern union and report announce matches ([#3746](https://github.com/moq-dev/moq/pull/3746))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(net)* [**breaking**] one name per announce, request, and origin config concept ([#3725](https://github.com/moq-dev/moq/pull/3725))
+- *(json)* [**breaking**] Config means the same thing in json and binary ([#3718](https://github.com/moq-dev/moq/pull/3718))
+- *(net)* [**breaking**] name stats counter edges started and ended ([#3712](https://github.com/moq-dev/moq/pull/3712))
+
+### Other
+
+- allocation-free binary stats ([#3918](https://github.com/moq-dev/moq/pull/3918))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
 ### Changed
 
 - [**breaking**] Traffic and presence frames use `*_started` / `*_ended` (re-exported from moq-net) and still emit the previous `announced` / `*_closed` names for one release.

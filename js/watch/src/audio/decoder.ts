@@ -20,17 +20,12 @@ import type { Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
-import { reanchorFloor, ringSamples } from "./latency";
+import { ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
 import { type DecodedSpan, Terminal } from "./terminal";
-import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
-
-// How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
-// slider drag (many small steps) into a single re-anchor once the user settles on a value.
-const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
 
 const LEGACY_WARMUP_CALLBACKS = 3;
 
@@ -109,10 +104,6 @@ export class Decoder {
 	// Ordered discontinuity and endpoint state from the container consumer.
 	#terminal = new Terminal();
 
-	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
-	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
-	#prevFloor?: Time.Milli;
-
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
 
@@ -145,7 +136,6 @@ export class Decoder {
 		this.#signals.run(this.#runWorklet.bind(this));
 		this.#signals.run(this.#runEnabled.bind(this));
 		this.#signals.run(this.#runLatency.bind(this));
-		this.#signals.run(this.#runLatencyReanchor.bind(this));
 		this.#signals.run(this.#runDecoder.bind(this));
 	}
 
@@ -182,10 +172,7 @@ export class Decoder {
 			// abandoned, so building against its name would throw. Gate on the race result, not
 			// `context.state`, because `AudioContext.close()` only flips `.state` to "closed" synchronously
 			// on Chrome (Firefox/Safari report "suspended").
-			const loaded = await Promise.race([
-				context.audioWorklet.addModule(RenderWorklet).then(() => true),
-				effect.cancel,
-			]);
+			const loaded = await effect.race(context.audioWorklet.addModule(RenderWorklet).then(() => true));
 			if (!loaded) return;
 
 			// Create the worklet node. outputChannelCount must be set explicitly
@@ -237,8 +224,8 @@ export class Decoder {
 		if (!context) return;
 
 		// The context is built at page load (see #runWorklet), before any user gesture, so it
-		// must be started from a real interaction. See unlockOnGesture.
-		unlockOnGesture(effect, context);
+		// must be started from a real interaction.
+		Util.Gesture.unlock(effect, context);
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
 	}
@@ -251,37 +238,10 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
+		// A rise parks playback until the ring refills to the new floor, which is what keeps audio in
+		// step with video. A catalog's jitter estimate can rise a millisecond at a time.
 		const delay = effect.get(this.sync.out.delay);
 		ring.setLatency(ringSamples(ring.rate, delay));
-	}
-
-	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
-	// rebuilds it implicitly (its per-frame sync.wait() reads the live buffer, so it just holds
-	// longer), but the audio ring keeps draining at its old depth -- resize() (via setLatency) only
-	// re-stalls an *empty* ring, so a mid-playback ring never refills to the new floor and audio runs
-	// ahead of video (the "raise latency, only video re-buffers" desync). reset() re-stalls the ring
-	// so it refills to the new floor. Watch the latency target and media delay, excluding adaptive
-	// RTT jitter, and debounce so a slider drag coalesces into one re-anchor. Decreases are left to
-	// natural catch-up.
-	#runLatencyReanchor(effect: Effect): void {
-		const delay = effect.get(this.sync.out.delay);
-		const jitter = effect.get(this.sync.out.jitter);
-		const floor = reanchorFloor({
-			delay: effect.get(this.sync.in.delay),
-			media: Time.Milli.sub(delay, jitter),
-		});
-		if (this.#prevFloor === undefined) {
-			// Startup: the initial fill already builds the cushion; just record the baseline.
-			this.#prevFloor = floor;
-			return;
-		}
-		// When the timer fires, the floor read above is still current: any change would have rerun
-		// this effect (tearing down the timer), so compare it against the pre-change baseline directly.
-		const baseline = this.#prevFloor;
-		effect.timer(() => {
-			if (floor > baseline) this.reset();
-			this.#prevFloor = floor;
-		}, LATENCY_REANCHOR_DEBOUNCE_MS);
 	}
 
 	#runDecoder(effect: Effect): void {
@@ -616,7 +576,12 @@ export class Decoder {
 
 	// Apply ordered container metadata before handling the result. An endpoint that also
 	// starts a new epoch must survive the reset so its following drain is trimmed.
-	#onNext(next: { discontinuity: number; end?: Time.Micro; frame?: { timestamp: Time.Micro } }): boolean {
+	#onNext(next: {
+		discontinuity: number;
+		group: number;
+		end?: Time.Micro;
+		frame?: { timestamp: Time.Micro };
+	}): boolean {
 		if (!this.#terminal.update(next)) return false;
 		this.#ring?.reset();
 		this.sync.reset();

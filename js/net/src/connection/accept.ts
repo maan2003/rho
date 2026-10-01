@@ -60,8 +60,9 @@ async function acceptInner(
 	url: URL,
 	props: Omit<AcceptProps, "transport" | "url">,
 ): Promise<Established> {
-	// @ts-expect-error - TODO: add protocol to WebTransport
-	const protocol: string | undefined = transport.protocol;
+	// The DOM lib has no `protocol` property yet. It is "" when none was negotiated, and
+	// undefined in a browser that predates subprotocols (Firefox before 155).
+	const protocol = (transport as { protocol?: string }).protocol;
 
 	const wiring: SessionProps = {
 		discovery: props.discovery ?? true,
@@ -87,7 +88,9 @@ async function acceptInner(
 		return acceptSetup(transport, url, Ietf.Version.DRAFT_16, wiring);
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		return acceptSetup(transport, url, Ietf.Version.DRAFT_15, wiring);
-	} else if (protocol === Lite.ALPN_06_WIP) {
+	} else if (protocol === Lite.ALPN_07_WIP) {
+		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_07, ...wiring });
+	} else if (protocol === Lite.ALPN_06) {
 		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_06, ...wiring });
 	} else if (protocol === Lite.ALPN_05) {
 		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_05, ...wiring });
@@ -112,7 +115,7 @@ async function acceptAlpn(
 	version: Ietf.IetfVersion,
 	wiring: SessionProps,
 ): Promise<Established> {
-	const { control, solicit, cluster } = await exchangeSetup(transport, version, "moq-lite-js");
+	const { control, solicit, hidden, cluster } = await exchangeSetup(transport, version, "moq-lite-js");
 
 	return new Ietf.Connection({
 		...wiring,
@@ -121,6 +124,7 @@ async function acceptAlpn(
 		quic: transport,
 		control,
 		solicit,
+		hidden,
 		cluster,
 		// v17+ uses NativeSession which manages its own request IDs; maxRequestId is unused.
 		maxRequestId: 0n,
@@ -139,7 +143,7 @@ async function acceptSetup(
 	wiring: SessionProps,
 ): Promise<Established> {
 	// Accept bidi, read ClientSetup, write ServerSetup
-	const stream = await Stream.accept(transport);
+	const stream = await Stream.accept(transport, version);
 	if (!stream) throw new Error("no incoming bidi stream for SETUP");
 
 	const clientCompat = await stream.reader.u53();
@@ -156,6 +160,7 @@ async function acceptSetup(
 	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
 	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
 	Ietf.solicitIntoSetup(params);
+	Ietf.hiddenIntoSetup(params);
 
 	const server = new Ietf.ServerSetup({ version, parameters: params });
 	await server.encode(stream.writer, version);
@@ -171,6 +176,7 @@ async function acceptSetup(
 		maxRequestId,
 		version,
 		solicit: Ietf.solicitFromSetup(client.parameters),
+		hidden: Ietf.hiddenFromSetup(client.parameters),
 	});
 }
 
@@ -182,7 +188,7 @@ async function acceptNegotiated(
 ): Promise<Established> {
 	const setupVersion = Ietf.Version.DRAFT_14;
 
-	const stream = await Stream.accept(transport);
+	const stream = await Stream.accept(transport, setupVersion);
 	if (!stream) throw new Error("no incoming bidi stream for SETUP");
 
 	const clientCompat = await stream.reader.u53();
@@ -214,6 +220,7 @@ async function acceptNegotiated(
 	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
 	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
 	Ietf.solicitIntoSetup(params);
+	Ietf.hiddenIntoSetup(params);
 
 	const server = new Ietf.ServerSetup({ version: selectedVersion, parameters: params });
 	await server.encode(stream.writer, setupVersion);
@@ -237,6 +244,7 @@ async function acceptNegotiated(
 			maxRequestId,
 			version: selectedVersion as Ietf.IetfVersion,
 			solicit: Ietf.solicitFromSetup(client.parameters),
+			hidden: Ietf.hiddenFromSetup(client.parameters),
 		});
 	} else {
 		throw new Error(`unsupported version: ${selectedVersion.toString(16)}`);

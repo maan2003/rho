@@ -10,14 +10,14 @@ protocol. A publisher in Python is consumable by a subscriber in Swift.
 
 | Language | Package | Best for |
 | --- | --- | --- |
-| [Rust](/lib/rs/) | `moq-net`, `hang`, and friends on crates.io | Servers, CLIs, native apps, anything that needs the full stack including hardware codecs. |
-| [TypeScript](/lib/js/) | `@moq/*` on npm | Browsers (WebTransport + WebCodecs) and Node/Bun/Deno. |
-| [Swift](/lib/swift/) | `Moq` via SwiftPM | iOS, iPadOS, macOS. |
-| [Kotlin](/lib/kt/) | `dev.moq:moq` on Maven Central | Android and the JVM. |
-| [Python](/lib/py/) | `moq-rs` on PyPI | Scripts, ML pipelines, voice agents. |
-| [Go](/lib/go/) | `moq.dev/moq` | Go services and tooling. |
-| [Dart](/lib/dart/) | `moq` on pub.dev | Flutter apps. |
-| [C](/lib/c/) | `libmoq` | C/C++ and any language with a C FFI. |
+| <img class="language-icon" src="/icons/languages/rust.svg" alt="" /> [Rust](/lib/rs/) | `moq-net`, `hang`, and friends on crates.io | Servers, CLIs, native apps, anything that needs the full stack including hardware codecs. |
+| <img class="language-icon" src="/icons/languages/typescript.svg" alt="" /> [TypeScript](/lib/js/) | `@moq/*` on npm | Browsers (WebTransport + WebCodecs) and Node/Bun/Deno. |
+| <img class="language-icon" src="/icons/languages/swift.svg" alt="" /> [Swift](/lib/swift/) | `Moq` via SwiftPM | iOS, iPadOS, macOS. |
+| <img class="language-icon" src="/icons/languages/kotlin.svg" alt="" /> [Kotlin](/lib/kt/) | `dev.moq:moq` on Maven Central | Android and the JVM. |
+| <img class="language-icon" src="/icons/languages/python.svg" alt="" /> [Python](/lib/py/) | `moq-rs` on PyPI | Scripts, ML pipelines, voice agents. |
+| <img class="language-icon" src="/icons/languages/go.svg" alt="" /> [Go](/lib/go/) | `moq.dev/moq` | Go services and tooling. |
+| <img class="language-icon" src="/icons/languages/dart.svg" alt="" /> [Dart](/lib/dart/) | `moq` on pub.dev | Flutter apps. |
+| <img class="language-icon" src="/icons/languages/c.svg" alt="" /> [C](/lib/c/) | `libmoq` | C/C++ and any language with a C FFI. |
 
 ## How they relate
 
@@ -35,7 +35,7 @@ how it looks in that language:
 
 - **Connect** to a relay with TLS options (system roots, custom CA, fingerprint pinning, mTLS) and a JWT in the URL, or **serve** sessions yourself and accept or reject each request by path.
 - **Reconnect** automatically with backoff when the transport drops, with `status`/`epoch` reporting each (re)connect and backoff tunable down to retrying forever. The peer's inbound QUIC stream limit is configurable for subscribe-heavy clients.
-- **Discover** broadcasts by prefix, wait for a specific one, or request an unannounced one. Advertise an exact path with `create_broadcast` then `announce` / `unannounce`, or claim a path prefix with `dynamic(prefix, route)`.
+- **Discover** broadcasts by prefix, wait for a specific one, or request one by path, including a path a prefix claim serves on demand. Advertise an exact path with `create_broadcast` then `announce` / `unannounce` (a broadcast is invisible to local consumers and peers alike until announced), or claim a path prefix with `dynamic(prefix, route)`.
 - **Publish and subscribe to media** with the hang catalog filled in from the bitstream, plus raw pixels or PCM in and out with the codec running inside the binding (VideoToolbox, Media Foundation, NVENC, openh264, Opus). A publisher follows the connection's send estimate through `session.bandwidth()`: reserve a share for an app-owned encoder, or pass the handle when encoding so the built-in video encoder follows the grant.
 - **Connection health.** `stats()` snapshots RTT, send/receive estimates, and byte/packet counters. `bandwidth()` divides that send estimate among tracks sharing the connection.
 - **Raw tracks** of arbitrary bytes with timestamps, sparse or replayed groups, per-subscriber priority and max age, and best-effort datagrams.

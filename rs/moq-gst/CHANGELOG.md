@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.8...moq-gst-v0.4.9) - 2026-09-30
+
+### Fixed
+
+- *(gst)* recover from leading deltas and timestamp rewinds ([#4480](https://github.com/moq-dev/moq/pull/4480))
+- *(moq-gst)* moqsrc waits for its session to end on stop ([#4416](https://github.com/moq-dev/moq/pull/4416))
+- *(gst)* keep waiting for a keyframe after a header-only buffer ([#4356](https://github.com/moq-dev/moq/pull/4356))
+
+### Other
+
+- one rpm repo command that works on DNF4 and DNF5 ([#4567](https://github.com/moq-dev/moq/pull/4567))
+
+## [0.4.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.7...moq-gst-v0.4.8) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.6...moq-gst-v0.4.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+- *(mux)* forward importer discontinuities through publishers ([#4239](https://github.com/moq-dev/moq/pull/4239))
+
+## [0.4.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.5...moq-gst-v0.4.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.4...moq-gst-v0.4.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-tokio, hang
+
+## [0.4.4](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.3...moq-gst-v0.4.4) - 2026-09-25
+
+### Fixed
+
+- *(moq-gst)* wait for the sink's reconnect loop to end on stop ([#4074](https://github.com/moq-dev/moq/pull/4074))
+
+## [0.4.3](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.2...moq-gst-v0.4.3) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-tokio, hang
+
+## [0.4.2](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.1...moq-gst-v0.4.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-tokio
+
+## [0.4.1](https://github.com/moq-dev/moq/compare/moq-gst-v0.4.0...moq-gst-v0.4.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-tokio, hang, moq-mux
+
+## [0.4.0](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.12...moq-gst-v0.4.0) - 2026-09-23
+
+### Added
+
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- [**breaking**] name every rate estimate estimated_*_rate
+- *(net)* [**breaking**] name stats counter edges started and ended ([#3712](https://github.com/moq-dev/moq/pull/3712))
+- *(tokio)* [**breaking**] rename ConnectionStatsReader to connection::Monitor ([#3705](https://github.com/moq-dev/moq/pull/3705))
+
+### Fixed
+
+- *(moq-gst)* Drain subscriptions whose track was removed from catalog ([#3864](https://github.com/moq-dev/moq/pull/3864))
+
+### Other
+
+- *(moq-gst)* decide the cancelled pump race instead of sleeping on it ([#3898](https://github.com/moq-dev/moq/pull/3898))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- *(tokio)* make API shapes type-safe ([#3816](https://github.com/moq-dev/moq/pull/3816))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
 ### Changed
 
 - Track suffixes derive from the typed import format, so the suffix and the codec cannot disagree.

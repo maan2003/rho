@@ -13,6 +13,10 @@ const MAX_DELTA_FRAMES = 256;
 // entrypoint: the Producer needs it to know whether to hold a group open, nothing else does.
 export const DEFAULT_DELTA_RATIO = 8;
 
+// Bytes a group may hold before it rolls when {@link Config.maxGroupBytes} is left unset: moq-net's
+// per-group cache limit. Not re-exported from the package entrypoint; a test pins it to that limit.
+export const DEFAULT_MAX_GROUP_BYTES = Group.MAX_GROUP_CACHE_BYTES;
+
 /** Options shared by an {@link Encoder} and the {@link Producer} that wraps one. */
 export interface Config<T> {
 	// Controls how aggressively the encoder emits deltas (merge patches) instead of full snapshots.
@@ -42,6 +46,14 @@ export interface Config<T> {
 	// `"none"`/unset (the default) writes plaintext JSON frames. A {@link Decoder} reading them
 	// must set the same {@link compression}.
 	compression?: Compression;
+
+	/**
+	 * Bytes a group may hold before it rolls, defaulting to moq-net's per-group cache limit. Lets a
+	 * test reach the limit without megabytes of JSON. Must fit the snapshot's own frame.
+	 *
+	 * @internal
+	 */
+	maxGroupBytes?: number;
 }
 
 /** One encoded frame, and the group boundary it implies. */
@@ -106,6 +118,7 @@ export interface Pending extends Encoded {
 export class Encoder<T> {
 	#config: Config<T>;
 	#compress: boolean;
+	#maxGroupBytes: number;
 
 	// The last encoded value, normalized through JSON so it matches what landed on the wire. The
 	// baseline every delta is diffed against, and `undefined` until the first snapshot.
@@ -140,6 +153,7 @@ export class Encoder<T> {
 	constructor(config: Config<T> = {}) {
 		this.#config = config;
 		this.#compress = isDeflate(config.compression);
+		this.#maxGroupBytes = config.maxGroupBytes ?? DEFAULT_MAX_GROUP_BYTES;
 	}
 
 	/**
@@ -218,7 +232,7 @@ export class Encoder<T> {
 			// can come out slightly larger than its input, so the plaintext is not an upper bound.
 			// Compressing first advances the window, but `#snapshot` opens a fresh one, so an
 			// over-budget delta costs only the wasted compression.
-			if (this.#snapshotLen + this.#deltaBytes + payload.length <= Group.MAX_GROUP_CACHE_BYTES) {
+			if (this.#snapshotLen + this.#deltaBytes + payload.length <= this.#maxGroupBytes) {
 				this.#last = json;
 				this.#deltaBytes += payload.length;
 				this.#groupFrames += 1;
