@@ -92,7 +92,8 @@ fn main() -> Result<()> {
             content:None,
         }).await.context("agent creation failed")?;
         let desktop_name = "preview".to_owned();
-        let desktop_directory = runtime.join("rho-desktop/agents").join(agent.encoded());
+        let handle = rho_agent_types::AgentRole::default().full_handle(agent);
+        let desktop_directory = runtime.join("rho-desktop/agents").join(&handle);
         let desktop_program=std::env::var_os("RHO_AGENT_DESKTOP_BIN").map(PathBuf::from)
             .unwrap_or_else(||PathBuf::from("rho-agent-desktop"));
         let config=temp.path().join("desktop.kdl");
@@ -104,7 +105,7 @@ layout { background-color "#315b97"; }
 
         let desktop_log=temp.path().join("desktop.log");
         let mut desktop=Child(Command::new(&desktop_program)
-            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1").env("RHO_AGENT_ID",agent.encoded())
+            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1").env("RHO_AGENT_ID",&handle)
             .args(["--headless","--name",&desktop_name,"--width","640","--height","480","--scale","1","--config"])
             .arg(&config).stdout(Stdio::null()).stderr(std::fs::File::create(&desktop_log)?).spawn()?);
         let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
@@ -212,7 +213,7 @@ layout { background-color "#315b97"; }
         // A second named desktop is advertised, then excluded after a crash
         // even though SIGKILL leaves its manifest behind.
         let mut second = Child(Command::new(&desktop_program)
-            .env("XDG_RUNTIME_DIR", &runtime).env("RHO_AGENT_ID", agent.encoded())
+            .env("XDG_RUNTIME_DIR", &runtime).env("RHO_AGENT_ID", &handle)
             .args(["--headless", "--name", "browser", "--width", "128", "--height", "96", "--scale", "1", "--config"])
             .arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         tokio::time::timeout(Duration::from_secs(5), async {

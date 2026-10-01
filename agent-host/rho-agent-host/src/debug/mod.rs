@@ -158,7 +158,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             socket_path,
             text,
         } => {
-            let agent_id = rho_agent_types::AgentId::from_encoded(&agent)
+            let agent_id = rho_agent_types::parse_full_handle(&agent)
                 .with_context(|| format!("agent id {agent}"))?;
             let call = rho_agents_client::protocol::AgentCommand::Send {
                 agent_id,

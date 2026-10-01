@@ -1569,7 +1569,7 @@ impl ClaudeLoop {
         let mut options =
             ClaudeCodeOptions::new(cwd.clone(), self.model, self.effort, self.session_id);
         options.session = session;
-        options.set_env("RHO_AGENT_ID", self.agent_id.encoded());
+        options.set_env("RHO_AGENT_ID", self.role.full_handle(self.agent_id));
         self.ensure_python().await?;
         // Tool search would defer the one tool behind a lookup; the deny
         // list in the generated settings removes ToolSearch too. The
