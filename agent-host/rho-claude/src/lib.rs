@@ -122,6 +122,9 @@ impl ClaudeCodeOptions {
         // conflict with Rho's own git guidance; the github-workflow skill
         // owns that territory instead.
         command.env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1");
+        // Its nudge after quiet turns asks for a status Rho's own prompt
+        // already governs, so agents sent one per step.
+        command.env("CLAUDE_CODE_SILENT_TURN_REMINDER", "0");
         for (name, value) in &self.env {
             command.env(name, value);
         }
