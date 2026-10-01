@@ -1230,7 +1230,6 @@ pub struct Window {
     touch_gesture_target: Option<TouchCapture>,
     touch_gesture_serial: Option<u32>,
     touch_momentum: Option<Task<()>>,
-    touch_long_press: Option<Task<()>>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2111,7 +2110,6 @@ impl Window {
             touch_gesture_target: None,
             touch_gesture_serial: None,
             touch_momentum: None,
-            touch_long_press: None,
             modifiers,
             capslock,
             scale_factor,
@@ -5872,12 +5870,26 @@ impl Window {
         } else if let PlatformInput::Touch(touch) = &event {
             let claimed = self.dispatch_raw_touch_event(touch, cx);
             if !claimed {
+                // Starting the default path first ends old momentum at its captured target
+                // before the opt-in gesture recognizer can capture this touch.
+                if touch.phase == TouchPhase::Started {
+                    self.handle_default_touch(touch, cx);
+                }
                 self.dispatch_touch_event(touch, cx);
+            } else {
+                self.dispatch_touch_event(
+                    &TouchEvent {
+                        phase: TouchPhase::Cancelled,
+                        ..touch.clone()
+                    },
+                    cx,
+                );
             }
             if !claimed && !self.claimed_touch_gestures.contains(&touch.id) {
-                self.handle_default_touch(touch, cx);
+                if touch.phase != TouchPhase::Started {
+                    self.handle_default_touch(touch, cx);
+                }
             } else if !self.touch_gesture.is_idle() || self.touch_gesture.has_momentum() {
-                self.touch_long_press = None;
                 self.touch_momentum = None;
                 let actions = self.touch_gesture.cancel();
                 self.dispatch_touch_gesture_actions(actions, cx);
@@ -5887,6 +5899,7 @@ impl Window {
                 self.touch_captures.remove(&touch.id);
                 self.claimed_touches.remove(&touch.id);
                 self.claimed_touch_gestures.remove(&touch.id);
+                self.clear_touch_gesture_target_if_idle();
             }
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
@@ -5997,7 +6010,7 @@ impl Window {
             self.dispatch_recognized_touch_gesture(gesture, cx);
         }
         if event.phase == crate::TouchPhase::Started {
-            self.schedule_long_press_timer(cx);
+            self.schedule_long_press_timer(&event, cx);
         } else if self.touch_gestures.pending_long_press().is_none() {
             self.long_press_timer.take();
         }
@@ -6062,22 +6075,27 @@ impl Window {
             self.claimed_touch_gestures.insert(id);
         }
         self.touch_momentum = None;
-        self.touch_long_press = None;
         let actions = self.touch_gesture.cancel();
         self.dispatch_touch_gesture_actions(actions, cx);
     }
 
-    fn schedule_long_press_timer(&mut self, cx: &mut App) {
+    fn schedule_long_press_timer(&mut self, event: &TouchEvent, cx: &mut App) {
         self.long_press_timer.take();
         let Some((touch_id, duration)) = self.touch_gestures.pending_long_press() else {
             return;
         };
+        let deadline = event.timestamp + duration;
         self.long_press_timer = Some(self.spawn(cx, async move |cx| {
             cx.background_executor.timer(duration).await;
             cx.update(move |window, cx| {
                 window.long_press_timer.take();
                 if let Some(gesture) = window.touch_gestures.offer_long_press(touch_id) {
                     window.dispatch_recognized_touch_gesture(gesture, cx);
+                    if !window.claimed_touch_gestures.contains(&touch_id) {
+                        let actions = window.touch_gesture.advance(deadline);
+                        window.dispatch_touch_gesture_actions(actions, cx);
+                        window.clear_touch_gesture_target_if_idle();
+                    }
                 }
             })
             .log_err();
@@ -6234,7 +6252,6 @@ impl Window {
         let actions = match event.phase {
             TouchPhase::Started => {
                 self.touch_momentum = None;
-                self.touch_long_press = None;
                 let starts_new_gesture = self.touch_gesture.is_idle();
                 let mut actions = self.touch_gesture.down(id, position, event.timestamp);
                 if starts_new_gesture {
@@ -6244,23 +6261,10 @@ impl Window {
                     self.touch_gesture_target = self.touch_captures.get(&event.id).cloned();
                     self.touch_gesture_serial = event.serial;
                 }
-                let long_press_duration = self.touch_gesture.long_press_duration();
-                let deadline = event.timestamp + long_press_duration;
-                let task = self.spawn(cx, async move |cx| {
-                    cx.background_executor().timer(long_press_duration).await;
-                    cx.update(move |window, cx| {
-                        let actions = window.touch_gesture.advance(deadline);
-                        window.dispatch_touch_gesture_actions(actions, cx);
-                        window.clear_touch_gesture_target_if_idle();
-                    })
-                    .ok();
-                });
-                self.touch_long_press = Some(task);
                 actions
             }
             TouchPhase::Moved => self.touch_gesture.motion(id, position, event.timestamp),
             TouchPhase::Ended => {
-                self.touch_long_press = None;
                 let actions = self.touch_gesture.up(id, event.timestamp);
                 if self.touch_gesture.has_momentum() {
                     let mut at = event.timestamp;
@@ -6288,7 +6292,6 @@ impl Window {
                 actions
             }
             TouchPhase::Cancelled => {
-                self.touch_long_press = None;
                 self.touch_momentum = None;
                 self.touch_gesture.cancel()
             }
@@ -6299,7 +6302,10 @@ impl Window {
     }
 
     fn clear_touch_gesture_target_if_idle(&mut self) {
-        if self.touch_gesture.is_idle() && !self.touch_gesture.has_momentum() {
+        if self.touch_gesture.is_idle()
+            && !self.touch_gesture.has_momentum()
+            && self.recognized_touch_id.is_none()
+        {
             self.touch_gesture_target = None;
             self.touch_gesture_serial = None;
         }
@@ -9698,6 +9704,43 @@ mod tests {
     }
 
     #[gpui::test]
+    fn claimed_long_press_suppresses_secondary_click_default(cx: &mut TestAppContext) {
+        struct View(Rc<Cell<usize>>);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.0.clone();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event(|_: &LongPressEvent, phase, window, _| {
+                            if phase == DispatchPhase::Bubble {
+                                window.prevent_default();
+                            }
+                        });
+                        let clicks = clicks.clone();
+                        window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
+                            if phase == DispatchPhase::Bubble {
+                                clicks.set(clicks.get() + 1);
+                            }
+                        });
+                    },
+                )
+            }
+        }
+
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |_, _| View(clicks)
+        });
+        dispatch_recognizer_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_recognizer_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
+        assert_eq!(clicks.get(), 0);
+    }
+
+    #[gpui::test]
     fn stale_default_prevention_does_not_claim_long_press(cx: &mut TestAppContext) {
         let phases = Rc::new(RefCell::new(Vec::new()));
         let window = cx.add_window({
@@ -10135,6 +10178,7 @@ mod tests {
                         position: point(px(x), px(0.)),
                         predicted_position: None,
                         force: None,
+                        ..Default::default()
                     }
                     .to_platform_input(),
                     cx,

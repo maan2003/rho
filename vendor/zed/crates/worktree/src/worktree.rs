@@ -81,7 +81,6 @@ use util::{
 };
 pub use worktree_settings::WorktreeSettings;
 
-use crate::ignore::IgnoreKind;
 
 const DEFAULT_FILE_SIZE_LIMIT: u64 = 6 * 1024 * 1024 * 1024;
 static FILE_SIZE_LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_FILE_SIZE_LIMIT);

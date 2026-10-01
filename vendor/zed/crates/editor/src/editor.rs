@@ -8707,8 +8707,11 @@ impl Editor {
             .buffer
             .update(cx, |buffer, _| buffer.push_external_transaction());
         let selections = self.selections.all_anchors(&self.display_snapshot(cx));
-        self.selection_history
-            .insert_transaction(transaction_id, selections);
+        self.selection_history.insert_transaction(
+            transaction_id,
+            selections,
+            self.add_selections_state.clone(),
+        );
         transaction_id
     }
 

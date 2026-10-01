@@ -1860,9 +1860,9 @@ impl<'a> HighlightedChunk<'a> {
                 let (invisible_text, suffix) = text.split_at(ch_end);
                 text = suffix;
                 let invisible_highlight = HighlightStyle {
-                    background_color: Some(editor_style.status.hint_background),
+                    background_color: Some(editor_style.status.hint_background.into()),
                     underline: Some(UnderlineStyle {
-                        color: Some(editor_style.status.hint),
+                        color: Some(editor_style.status.hint.into()),
                         thickness: px(1.),
                         wavy: false,
                     }),

@@ -2209,6 +2209,7 @@ mod tests {
             position: point(px(x), px(y)),
             predicted_position: None,
             force: None,
+            ..Default::default()
         }
     }
 }

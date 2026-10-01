@@ -310,7 +310,7 @@ fn render_inline_input_block(
             .child(EditorElement::new(
                 &input,
                 EditorStyle {
-                    background: cx.theme().system().transparent,
+                    background: cx.theme().system().transparent.into(),
                     local_player: cx.editor_style.local_player,
                     text: cx.editor_style.text.clone(),
                     scrollbar_width: cx.editor_style.scrollbar_width,
@@ -322,9 +322,9 @@ fn render_inline_input_block(
             .when_some(preview.as_ref(), |this, preview| {
                 let mut text_style = cx.editor_style.text.clone();
                 text_style.color = if preview.is_error {
-                    cx.theme().status().error
+                    cx.theme().status().error.into()
                 } else {
-                    cx.theme().colors().text_muted
+                    cx.theme().colors().text_muted.into()
                 };
                 let syntax = cx.theme().syntax();
                 let highlights = preview

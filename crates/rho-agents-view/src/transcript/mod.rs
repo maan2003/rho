@@ -307,7 +307,7 @@ impl TranscriptModel {
         let mut installed = Vec::with_capacity(prepared.chunks.len());
         for (chunk, (reservation, text_buffer)) in prepared.chunks.into_iter().zip(text_buffers) {
             let buffer = cx.insert_entity(reservation, |cx| {
-                let mut buffer = Buffer::build(text_buffer, None, language::Capability::Read);
+                let mut buffer = Buffer::build(text_buffer, None, language::Capability::Read, cx);
                 if chunk.markdown {
                     rho_window::markdown::configure_buffer(&mut buffer, cx);
                 }

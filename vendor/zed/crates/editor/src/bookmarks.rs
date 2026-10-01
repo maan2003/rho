@@ -482,7 +482,12 @@ impl Editor {
             };
             self.highlight_rows::<BookmarkRowHighlights>(
                 start..end,
-                |cx| cx.theme().colors().editor_highlighted_line_background,
+                |cx| {
+                    cx.theme()
+                        .colors()
+                        .editor_highlighted_line_background
+                        .into()
+                },
                 RowHighlightOptions::default(),
                 cx,
             );

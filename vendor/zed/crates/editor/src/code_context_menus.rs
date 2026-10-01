@@ -1071,7 +1071,7 @@ impl CompletionsMenu {
 
                         let suffix_label = if !suffix_text.is_empty() {
                             let suffix_text_style = gpui::TextStyle {
-                                color: cx.theme().colors().text_muted,
+                                color: cx.theme().colors().text_muted.into(),
                                 ..style.text.clone()
                             };
                             Some(
