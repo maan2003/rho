@@ -66,6 +66,21 @@ pub trait LineTypesetter: Send + Sync {
     /// Moves glyphs of `layout`, shaped from `text`, and may swap their glyph or font. Each glyph
     /// keeps its `index`, and the line keeps its width.
     fn typeset(&self, text_system: &dyn PlatformTextSystem, text: &str, layout: &mut LineLayout);
+
+    /// Breaks a line of `font_id` text into rows at most `wrap_width` wide, rows after the first
+    /// `indent` narrower, returning where each row after the first starts. `None` leaves the
+    /// line to the line wrapper.
+    fn wrap(
+        &self,
+        _text_system: &dyn PlatformTextSystem,
+        _font_id: FontId,
+        _font_size: Pixels,
+        _fragments: &[LineFragment],
+        _wrap_width: Pixels,
+        _indent: Pixels,
+    ) -> Option<Vec<usize>> {
+        None
+    }
 }
 
 pub(crate) type Typesetter = Arc<RwLock<Option<Arc<dyn LineTypesetter>>>>;

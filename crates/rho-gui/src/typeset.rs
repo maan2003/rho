@@ -1,36 +1,43 @@
-//! How Rho Font sets a word: each letter's MONO form and where it sits.
+//! How Rho Font sets text: letters by their ink, lines by their paragraph.
 //!
-//! The shaper sets Rho Font at its default, MONO 0.82, and that fixes every
-//! word's width, so wrapping, cursors and clicks stay as shaped. Inside each
-//! word, letters take equal cells (one and a half for `m` and `w`), the
-//! monospace rhythm. Each letter then picks a MONO form, and moves off its
-//! cell, so the white between neighbours is optically even: the mean gap across
+//! Inside a word, each letter sits so the white between it and its neighbour
+//! is one optical gap, the font's own between two `n`s: the mean gap across
 //! the x-height between their ink profiles, capped where a letter opens like
-//! `c` or `r`. Upright `i` is iA Writer Duo's, carried by the font at U+E000.
+//! `c` or `r`. A word takes whatever width that gives; nothing is on a grid.
+//!
+//! Every letter of a line takes the line's MONO value, its stretch, as in
+//! font expansion. The line wrapper asks this typesetter to break each
+//! paragraph, choosing the breaks and each line's MONO together to keep the
+//! right edge even (Knuth–Plass), and remembers each row's MONO so drawing the
+//! row sets it the same way. Upright `i` is iA Writer Duo's, carried by the
+//! font at U+E000, and `m` and `w` take their sans form.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use gpui::{FontId, GlyphId, LineLayout, LineTypesetter, PlatformTextSystem, ShapedRun, px};
+use gpui::{
+    FontId, FontRun, GlyphId, LineFragment, LineLayout, LineTypesetter, Pixels, PlatformTextSystem,
+    ShapedRun, px,
+};
 
 const MONO: [u8; 4] = *b"MONO";
-/// Forms a letter may take, as MONO values, preferring the widest. They are
-/// slimmer than the default, so the rest of each cell opens the gaps.
-const FORMS: [f32; 4] = [0.3, 0.4, 0.5, 0.6];
-/// Wide letters are cramped as slabs, so they take the sans form, MONO 0, in a
-/// wider cell.
-const WIDE_FORMS: [f32; 3] = [0.0, 0.2, 0.4];
+/// The MONO values a line may take; it prefers `PREFERRED`.
+const MONOS: [f32; 5] = [0.5, 0.55, 0.6, 0.65, 0.7];
+const PREFERRED: f32 = 0.6;
+/// Cost of a line's MONO a tenth from `PREFERRED`, against a line an em short
+/// of the right edge.
+const STRETCH: f32 = 1.;
 const WIDE: &str = "mwMW";
 const DUO_I: char = '\u{E000}';
 /// Scanlines across the x-height for ink profiles.
 const SCANLINES: usize = 12;
+/// Scanlines from descender to ascender, where ink must keep `CLEAR` apart.
+const WHOLE: usize = 24;
+const CLEAR: f32 = 0.04;
 /// How far into an opening the optical gap looks, in ems.
 const DEPTH: f32 = 0.1;
-/// Cost of a letter's form being a whole MONO unit from its preferred one, in
-/// gap errors of 0.05 em squared.
-const PULL: f32 = 3.0;
-/// Cost of a letter moving off its cell, against an equal error in a gap.
-const STAY: f32 = 1.0;
+/// Rows remembered per font size before they are all forgotten.
+const ROWS: usize = 100_000;
 
 #[derive(Default)]
 pub struct RhoTypesetter(Mutex<Cache>);
@@ -39,13 +46,20 @@ pub struct RhoTypesetter(Mutex<Cache>);
 struct Cache {
     faces: HashMap<FontId, Option<Face>>,
     glyphs: HashMap<(FontId, GlyphId), Glyph>,
+    /// Each wrapped row's MONO by font size and the row's trimmed text.
+    rows: HashMap<u32, HashMap<String, f32>>,
+    /// Each word's widths at `MONOS` by font, font size and the word.
+    words: HashMap<(FontId, u32, String), Vec<f32>>,
 }
 
-/// A Rho Font face (some weight, upright or italic) at each MONO value a form
-/// uses.
+/// A Rho Font face (some weight, upright or italic).
+#[derive(Clone)]
 struct Face {
+    /// The face at each MONO value a letter takes.
     at: Vec<(f32, FontId)>,
     duo_i: Option<GlyphId>,
+    /// The optical gap between letters, in ems.
+    gap: f32,
 }
 
 impl Face {
@@ -54,7 +68,7 @@ impl Face {
             .iter()
             .find(|(m, _)| *m == mono)
             .map(|(_, id)| *id)
-            .expect("a form's MONO value")
+            .expect("a line's MONO value")
     }
 }
 
@@ -65,31 +79,38 @@ struct Glyph {
     advance: f32,
     left: [Option<f32>; SCANLINES],
     right: [Option<f32>; SCANLINES],
+    /// Ink's left and right edges at scanlines from descender to ascender.
+    whole: [Option<(f32, f32)>; WHOLE],
 }
 
-/// One way to draw a letter.
-#[derive(Clone, Copy)]
-struct Form {
+/// A glyph of a line, flattened out of its run.
+struct Placed {
     font: FontId,
-    glyph: GlyphId,
-    mono: f32,
+    glyph: gpui::ShapedGlyph,
 }
 
 impl Cache {
-    fn face(&mut self, ts: &dyn PlatformTextSystem, font: FontId) -> Option<&Face> {
-        self.faces
-            .entry(font)
-            .or_insert_with(|| {
-                let mut at = Vec::new();
-                for mono in FORMS.iter().chain(&WIDE_FORMS).chain(&[1.]) {
-                    at.push((*mono, ts.font_with_axis(font, MONO, *mono)?));
-                }
-                Some(Face {
-                    at,
-                    duo_i: ts.glyph_for_char(font, DUO_I),
-                })
+    fn face(&mut self, ts: &dyn PlatformTextSystem, font: FontId) -> Option<Face> {
+        if let Some(face) = self.faces.get(&font) {
+            return face.clone();
+        }
+        let face = (|| {
+            let mut at = Vec::new();
+            for mono in MONOS.iter().chain(&[0.]) {
+                at.push((*mono, ts.font_with_axis(font, MONO, *mono)?));
+            }
+            let n = ts.glyph_for_char(font, 'n')?;
+            let preferred = at.iter().find(|(m, _)| *m == PREFERRED)?.1;
+            let n = self.glyph(ts, preferred, n).clone();
+            let gap = n.advance + optical(&n, &n)?;
+            Some(Face {
+                at,
+                duo_i: ts.glyph_for_char(font, DUO_I),
+                gap,
             })
-            .as_ref()
+        })();
+        self.faces.insert(font, face.clone());
+        face
     }
 
     fn glyph(&mut self, ts: &dyn PlatformTextSystem, font: FontId, glyph: GlyphId) -> &Glyph {
@@ -97,27 +118,141 @@ impl Cache {
             let metrics = ts.font_metrics(font);
             let upm = metrics.units_per_em as f32;
             let advance = ts.advance(font, glyph).map_or(0., |a| a.width / upm);
-            let (mut left, mut right) = ([None; SCANLINES], [None; SCANLINES]);
-            for curve in ts
+            let outline = ts
                 .glyph_outline(font, glyph)
                 .ok()
                 .flatten()
-                .unwrap_or_default()
-            {
-                for s in 0..SCANLINES {
-                    let y = metrics.x_height / upm * (s as f32 + 0.5) / SCANLINES as f32;
-                    for x in crossings(&curve, y) {
-                        left[s] = Some(left[s].map_or(x, |l: f32| l.min(x)));
-                        right[s] = Some(right[s].map_or(x, |r: f32| r.max(x)));
-                    }
-                }
+                .unwrap_or_default();
+            let edges = |y: f32| {
+                let xs = outline.iter().flat_map(|curve| crossings(curve, y));
+                xs.fold(None, |e: Option<(f32, f32)>, x| {
+                    Some(e.map_or((x, x), |(l, r)| (l.min(x), r.max(x))))
+                })
+            };
+            let (mut left, mut right) = ([None; SCANLINES], [None; SCANLINES]);
+            for s in 0..SCANLINES {
+                let y = metrics.x_height / upm * (s as f32 + 0.5) / SCANLINES as f32;
+                (left[s], right[s]) = edges(y).unzip();
             }
+            let (low, high) = (metrics.descent / upm, metrics.ascent / upm);
+            let whole = std::array::from_fn(|s| {
+                edges(low + (high - low) * (s as f32 + 0.5) / WHOLE as f32)
+            });
             Glyph {
                 advance,
                 left,
                 right,
+                whole,
             }
         })
+    }
+
+    /// Sets `line`, shaped from `text` and `width` wide, at `mono`, returning
+    /// its new width. Words of Rho Font letters are set by their ink;
+    /// everything else keeps its advance.
+    fn set(
+        &mut self,
+        ts: &dyn PlatformTextSystem,
+        text: &str,
+        line: &mut [Placed],
+        width: f32,
+        em: f32,
+        mono: f32,
+    ) -> f32 {
+        let advances: Vec<f32> = (0..line.len())
+            .map(|i| {
+                let end = line
+                    .get(i + 1)
+                    .map_or(width, |p| f32::from(p.glyph.position.x));
+                end - f32::from(line[i].glyph.position.x)
+            })
+            .collect();
+        let (mut pen, mut start) = (0., 0);
+        while start < line.len() {
+            let font = line[start].font;
+            let letter = |p: &Placed| {
+                p.font == font
+                    && !p.glyph.is_emoji
+                    && !text[p.glyph.index..].starts_with(char::is_whitespace)
+            };
+            let face = if letter(&line[start]) {
+                self.face(ts, font)
+            } else {
+                None
+            };
+            let Some(face) = face else {
+                line[start].glyph.position.x = px(pen);
+                pen += advances[start];
+                start += 1;
+                continue;
+            };
+            let end = (start..line.len())
+                .find(|&i| !letter(&line[i]))
+                .unwrap_or(line.len());
+            let mut prev: Option<Glyph> = None;
+            let mut x = 0.;
+            for placed in &mut line[start..end] {
+                let ch = text[placed.glyph.index..].chars().next().unwrap_or(' ');
+                let (form, id) = match (ch, face.duo_i) {
+                    ('i', Some(duo)) => (font, duo),
+                    _ if WIDE.contains(ch) => (face.at(0.), placed.glyph.id),
+                    _ => (face.at(mono), placed.glyph.id),
+                };
+                let glyph = self.glyph(ts, form, id).clone();
+                if let Some(prev) = &prev {
+                    let even = optical(prev, &glyph).map_or(prev.advance, |c| face.gap - c);
+                    x += even.max(clearance(prev, &glyph));
+                }
+                placed.font = form;
+                placed.glyph.id = id;
+                placed.glyph.position.x = px(pen + x * em);
+                prev = Some(glyph);
+            }
+            pen += (x + prev.map_or(0., |p| p.advance)) * em;
+            start = end;
+        }
+        pen
+    }
+
+    /// The width of `text` set at each of `MONOS`, shaped alone in `font`.
+    fn widths(
+        &mut self,
+        ts: &dyn PlatformTextSystem,
+        text: &str,
+        font: FontId,
+        em: Pixels,
+    ) -> Vec<f32> {
+        let key = (font, f32::from(em).to_bits(), text.to_owned());
+        if let Some(widths) = self.words.get(&key) {
+            return widths.clone();
+        }
+        let layout = ts.layout_line(
+            text,
+            em,
+            &[FontRun {
+                len: text.len(),
+                font_id: font,
+            }],
+        );
+        let widths: Vec<f32> = MONOS
+            .iter()
+            .map(|&mono| {
+                let mut line = flatten(layout.runs.clone());
+                self.set(
+                    ts,
+                    text,
+                    &mut line,
+                    f32::from(layout.width),
+                    f32::from(em),
+                    mono,
+                )
+            })
+            .collect();
+        if self.words.len() > ROWS {
+            self.words.clear();
+        }
+        self.words.insert(key, widths.clone());
+        widths
     }
 }
 
@@ -144,8 +279,14 @@ fn crossings(curve: &gpui::QuadraticCurve, y: f32) -> impl Iterator<Item = f32> 
 }
 
 /// The optical gap between `a` and `b` drawn with origins one em-unit apart,
-/// minus that distance.
+/// minus that distance, or `None` when either has ink on fewer than half the
+/// scanlines, like a hyphen or a period, whose missing scanlines would read as
+/// white.
 fn optical(a: &Glyph, b: &Glyph) -> Option<f32> {
+    let inked = |edges: &[Option<f32>]| edges.iter().flatten().count() * 2 >= SCANLINES;
+    if !inked(&a.right) || !inked(&b.left) {
+        return None;
+    }
     let gaps: Vec<Option<f32>> = (0..SCANLINES)
         .map(|s| Some(b.left[s]? - a.right[s]?))
         .collect();
@@ -159,56 +300,51 @@ fn optical(a: &Glyph, b: &Glyph) -> Option<f32> {
     )
 }
 
-/// A glyph of the line, flattened out of its run.
-struct Placed {
-    font: FontId,
-    glyph: gpui::ShapedGlyph,
+/// The least distance between the origins of `a` and `b` that keeps their ink
+/// `CLEAR` apart at every height.
+fn clearance(a: &Glyph, b: &Glyph) -> f32 {
+    a.whole
+        .iter()
+        .zip(&b.whole)
+        .filter_map(|(a, b)| Some(a.as_ref()?.1 - b.as_ref()?.0 + CLEAR))
+        .fold(f32::MIN, f32::max)
+}
+
+fn flatten(runs: Vec<ShapedRun>) -> Vec<Placed> {
+    runs.into_iter()
+        .flat_map(|run| {
+            run.glyphs.into_iter().map(move |glyph| Placed {
+                font: run.font_id,
+                glyph,
+            })
+        })
+        .collect()
+}
+
+/// A piece of a paragraph that can't be broken: a word, an inline element, or
+/// part of a word too long for a row.
+struct Piece {
+    start: usize,
+    /// Its width at each of `MONOS`, in pixels.
+    widths: Vec<f32>,
+    /// The width of the spaces after it.
+    spaces: f32,
+    /// Whether a row may start with it.
+    breakable: bool,
 }
 
 impl LineTypesetter for RhoTypesetter {
     fn typeset(&self, ts: &dyn PlatformTextSystem, text: &str, layout: &mut LineLayout) {
         let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut line: Vec<Placed> = layout
-            .runs
-            .drain(..)
-            .flat_map(|run| {
-                run.glyphs.into_iter().map(move |glyph| Placed {
-                    font: run.font_id,
-                    glyph,
-                })
-            })
-            .collect();
         let em = f32::from(layout.font_size);
-        let mut start = 0;
-        while start < line.len() {
-            let font = line[start].font;
-            let letter = |p: &Placed| {
-                p.font == font
-                    && !p.glyph.is_emoji
-                    && !text[p.glyph.index..].starts_with(char::is_whitespace)
-            };
-            if !letter(&line[start]) || cache.face(ts, font).is_none() {
-                start += 1;
-                continue;
-            }
-            let end = (start..line.len())
-                .find(|&i| !letter(&line[i]))
-                .unwrap_or(line.len());
-            let right = line
-                .get(end)
-                .map_or(f32::from(layout.width), |p| f32::from(p.glyph.position.x));
-            let left = f32::from(line[start].glyph.position.x);
-            set_word(
-                &mut cache,
-                ts,
-                text,
-                font,
-                &mut line[start..end],
-                (right - left) / em,
-                em,
-            );
-            start = end;
-        }
+        let mono = cache
+            .rows
+            .get(&em.to_bits())
+            .and_then(|rows| rows.get(text.trim()))
+            .copied()
+            .unwrap_or(PREFERRED);
+        let mut line = flatten(std::mem::take(&mut layout.runs));
+        layout.width = px(cache.set(ts, text, &mut line, f32::from(layout.width), em, mono));
         for placed in line {
             match layout.runs.last_mut() {
                 Some(run) if run.font_id == placed.font => run.glyphs.push(placed.glyph),
@@ -219,182 +355,190 @@ impl LineTypesetter for RhoTypesetter {
             }
         }
     }
-}
 
-/// Sets one word, `width` ems wide, in place.
-fn set_word(
-    cache: &mut Cache,
-    ts: &dyn PlatformTextSystem,
-    text: &str,
-    font: FontId,
-    word: &mut [Placed],
-    width: f32,
-    em: f32,
-) {
-    let face = cache.face(ts, font).expect("a Rho Font face");
-    let (one, duo_i) = (face.at(1.), face.duo_i);
-    let options: Vec<(Vec<Form>, f32)> = word
-        .iter()
-        .map(|p| {
-            let ch = text[p.glyph.index..].chars().next().unwrap_or(' ');
-            let glyph = p.glyph.id;
-            match (ch, duo_i) {
-                ('i', Some(duo)) => (
-                    vec![Form {
-                        font,
-                        glyph: duo,
-                        mono: 1.,
-                    }],
-                    1.,
-                ),
-                _ if WIDE.contains(ch) => (
-                    WIDE_FORMS
-                        .iter()
-                        .map(|&m| Form {
-                            font: face.at(m),
-                            glyph,
-                            mono: m,
-                        })
-                        .collect(),
-                    0.,
-                ),
-                _ => (
-                    FORMS
-                        .iter()
-                        .map(|&m| Form {
-                            font: face.at(m),
-                            glyph,
-                            mono: m,
-                        })
-                        .collect(),
-                    FORMS[FORMS.len() - 1],
-                ),
+    fn wrap(
+        &self,
+        ts: &dyn PlatformTextSystem,
+        font: FontId,
+        font_size: Pixels,
+        fragments: &[LineFragment],
+        wrap_width: Pixels,
+        indent: Pixels,
+    ) -> Option<Vec<usize>> {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        cache.face(ts, font)?;
+        let (em, wrap_width, indent) = (
+            f32::from(font_size),
+            f32::from(wrap_width),
+            f32::from(indent),
+        );
+        let space = cache.widths(ts, " ", font, font_size)[0];
+
+        // The paragraph's text, with each element's bytes as NULs, cut into pieces:
+        // words between spaces, and each element on its own.
+        let mut text = String::new();
+        let mut elements = Vec::new();
+        for fragment in fragments {
+            match fragment {
+                LineFragment::Text { text: t } => text.push_str(t),
+                LineFragment::Element { width, len_utf8 } => {
+                    elements.push((text.len(), *len_utf8, f32::from(*width)));
+                    text.extend(std::iter::repeat_n('\0', *len_utf8));
+                }
             }
-        })
-        .collect();
-    let cells: Vec<f32> = word
-        .iter()
-        .zip(&options)
-        .map(|(p, (_, preferred))| {
-            let cell = cache.glyph(ts, one, p.glyph.id).advance;
-            if *preferred == 0. { 1.5 * cell } else { cell }
-        })
-        .collect();
-    let scale = width / cells.iter().sum::<f32>().max(1e-3);
-    let mut at = 0.;
-    let slots: Vec<(f32, f32)> = cells
-        .iter()
-        .map(|c| {
-            let s = (at, c * scale);
-            at += c * scale;
-            s
-        })
-        .collect();
-    let mut glyph = |f: &Form| cache.glyph(ts, f.font, f.glyph).clone();
-    let forms: Vec<Vec<(Form, Glyph)>> = options
-        .iter()
-        .map(|(fs, _)| fs.iter().map(|f| (*f, glyph(f))).collect())
-        .collect();
-    // Each form centred in its slot.
-    let centred = |i: usize, g: &Glyph| slots[i].0 + (slots[i].1 - g.advance) / 2.;
-    let gap = |i: usize, a: &Glyph, b: &Glyph| {
-        optical(a, b).map(|c| centred(i + 1, b) - centred(i, a) + c)
-    };
-    // The word's mean gap with preferred forms, so evening the gaps never resizes
-    // the word.
-    let preferred = |i: usize| {
-        forms[i]
-            .iter()
-            .min_by(|a, b| {
-                (a.0.mono - options[i].1)
-                    .abs()
-                    .total_cmp(&(b.0.mono - options[i].1).abs())
-            })
-            .map(|f| &f.1)
-            .expect("a form")
-    };
-    let gaps: Vec<f32> = (1..word.len())
-        .filter_map(|i| gap(i - 1, preferred(i - 1), preferred(i)))
-        .collect();
-    let even = gaps.iter().sum::<f32>() / gaps.len().max(1) as f32;
-    let unit = 0.05;
-    let unary = |i: usize, f: &Form| PULL * (f.mono - options[i].1).powi(2);
-
-    // Viterbi over forms, letters centred in their slots.
-    let mut cost: Vec<f32> = forms[0].iter().map(|(f, _)| unary(0, f)).collect();
-    let mut back: Vec<Vec<usize>> = vec![Vec::new()];
-    for i in 1..word.len() {
-        let (mut next, mut from) = (Vec::new(), Vec::new());
-        for (f, g) in &forms[i] {
-            let (j, c) = forms[i - 1]
-                .iter()
-                .enumerate()
-                .map(|(j, (_, p))| {
-                    (
-                        j,
-                        cost[j] + gap(i - 1, p, g).map_or(0., |x| ((x - even) / unit).powi(2)),
-                    )
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .expect("a form");
-            next.push(c + unary(i, f));
-            from.push(j);
         }
-        cost = next;
-        back.push(from);
-    }
-    let mut pick = vec![0; word.len()];
-    pick[word.len() - 1] = (0..cost.len())
-        .min_by(|a, b| cost[*a].total_cmp(&cost[*b]))
-        .unwrap_or(0);
-    for i in (1..word.len()).rev() {
-        pick[i - 1] = back[i][pick[i]];
-    }
-    let chosen: Vec<&(Form, Glyph)> = pick
-        .iter()
-        .enumerate()
-        .map(|(i, k)| &forms[i][*k])
-        .collect();
+        let mut pieces: Vec<Piece> = Vec::new();
+        let (mut lead, mut at) = (0., 0);
+        while at < text.len() {
+            let spaces = text[at..].len() - text[at..].trim_start_matches(' ').len();
+            if spaces > 0 {
+                match pieces.last_mut() {
+                    Some(piece) => piece.spaces += space * spaces as f32,
+                    None => lead += space * spaces as f32,
+                }
+                at += spaces;
+                continue;
+            }
+            let breakable = pieces.last().is_some_and(|piece| piece.spaces > 0.);
+            if let Some(&(_, len, width)) = elements.iter().find(|e| e.0 == at) {
+                let widths = vec![width; MONOS.len()];
+                pieces.push(Piece {
+                    start: at,
+                    widths,
+                    spaces: 0.,
+                    breakable,
+                });
+                at += len;
+                continue;
+            }
+            let element = elements.iter().map(|e| e.0).find(|&e| e > at);
+            let end = text[at..]
+                .find(' ')
+                .map_or(text.len(), |i| at + i)
+                .min(element.unwrap_or(text.len()));
+            let widths = cache.widths(ts, &text[at..end], font, font_size);
+            pieces.push(Piece {
+                start: at,
+                widths,
+                spaces: 0.,
+                breakable,
+            });
+            at = end;
+        }
+        // Words too wide for a row break between letters, as greedily as they must.
+        let mut i = 0;
+        while i < pieces.len() {
+            let room = wrap_width - indent;
+            if pieces[i].widths[0] <= room || text.as_bytes()[pieces[i].start] == 0 {
+                i += 1;
+                continue;
+            }
+            let end = pieces.get(i + 1).map_or(text.len(), |p| p.start);
+            let word = text[pieces[i].start..end].trim_end_matches(' ');
+            let cut = word
+                .char_indices()
+                .skip(1)
+                .map(|(ix, _)| ix)
+                .take_while(|&ix| cache.widths(ts, &word[..ix], font, font_size)[0] <= room)
+                .last()
+                .unwrap_or_else(|| word.chars().next().map_or(word.len(), char::len_utf8));
+            if cut >= word.len() {
+                i += 1;
+                continue;
+            }
+            let start = pieces[i].start;
+            pieces[i].widths = cache.widths(ts, &word[..cut], font, font_size);
+            let spaces = std::mem::take(&mut pieces[i].spaces);
+            let widths = cache.widths(ts, &word[cut..], font, font_size);
+            pieces.insert(
+                i + 1,
+                Piece {
+                    start: start + cut,
+                    widths,
+                    spaces,
+                    breakable: true,
+                },
+            );
+            i += 1;
+        }
+        if pieces.is_empty() {
+            return Some(Vec::new());
+        }
 
-    // Offsets off the cells: minimise Σ STAY·o² + Σ (o[i+1] - o[i] + error[i])²
-    // over pairs with an optical gap, a tridiagonal system solved by the Thomas
-    // algorithm.
-    let n = word.len();
-    let (mut lower, mut diag, mut upper, mut rhs) =
-        (vec![0f32; n], vec![STAY; n], vec![0f32; n], vec![0f32; n]);
-    for i in 0..n.saturating_sub(1) {
-        let Some(g) = gap(i, &chosen[i].1, &chosen[i + 1].1) else {
-            continue;
-        };
-        let error = g - even;
-        diag[i] += 1.;
-        diag[i + 1] += 1.;
-        upper[i] -= 1.;
-        lower[i + 1] -= 1.;
-        rhs[i] += error;
-        rhs[i + 1] -= error;
-    }
-    for i in 1..n {
-        let f = lower[i] / diag[i - 1];
-        diag[i] -= f * upper[i - 1];
-        rhs[i] -= f * rhs[i - 1];
-    }
-    let mut offset = vec![0f32; n];
-    for i in (0..n).rev() {
-        let next = if i + 1 < n {
-            upper[i] * offset[i + 1]
-        } else {
-            0.
-        };
-        offset[i] = (rhs[i] - next) / diag[i];
-    }
+        // Knuth–Plass: the cheapest rows ending at each piece, each row at its best
+        // MONO.
+        let preferred = MONOS
+            .iter()
+            .position(|m| *m == PREFERRED)
+            .expect("MONOS has PREFERRED");
+        let n = pieces.len();
+        let mut best: Vec<(f32, usize, usize)> = vec![(f32::INFINITY, 0, preferred); n + 1];
+        best[0].0 = 0.;
+        for end in 1..=n {
+            let mut width = vec![0.; MONOS.len()];
+            for start in (0..end).rev() {
+                for (k, w) in width.iter_mut().enumerate() {
+                    *w += pieces[start].widths[k] + pieces[start].spaces;
+                }
+                if start > 0 && !pieces[start].breakable {
+                    continue;
+                }
+                let room = wrap_width - if start == 0 { 0. } else { indent };
+                let used: Vec<f32> = width
+                    .iter()
+                    .map(|w| w + if start == 0 { lead } else { 0. })
+                    .collect();
+                let fits = |k: usize| used[k] <= room;
+                let stretch = |k: usize| STRETCH * ((MONOS[k] - PREFERRED) / 0.1).powi(2);
+                let row = if end == n {
+                    // The last row needs only to fit.
+                    (0..MONOS.len())
+                        .filter(|&k| fits(k))
+                        .map(|k| (stretch(k), k))
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                } else {
+                    (0..MONOS.len())
+                        .filter(|&k| fits(k))
+                        .map(|k| (((room - used[k]) / em).powi(2) + stretch(k), k))
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                };
+                let (cost, k) = match row {
+                    Some(row) => row,
+                    // A row too wide at every MONO overflows only when nothing shorter can end
+                    // here.
+                    None if best[end].0.is_infinite() => (1e6, 0),
+                    None => break,
+                };
+                if best[start].0 + cost < best[end].0 {
+                    best[end] = (best[start].0 + cost, start, k);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        let mut end = n;
+        while end > 0 {
+            let (_, start, k) = best[end];
+            rows.push((start, end, MONOS[k]));
+            end = start;
+        }
+        rows.reverse();
 
-    let origin = f32::from(word[0].glyph.position.x);
-    for (i, placed) in word.iter_mut().enumerate() {
-        let (form, g) = chosen[i];
-        placed.font = form.font;
-        placed.glyph.id = form.glyph;
-        placed.glyph.position.x = px(origin + (centred(i, g) + offset[i]) * em);
+        let remembered = cache.rows.entry(em.to_bits()).or_default();
+        if remembered.len() > ROWS {
+            remembered.clear();
+        }
+        for &(start, end, mono) in &rows {
+            let row = &text[pieces[start].start..pieces.get(end).map_or(text.len(), |p| p.start)];
+            if !row.contains('\0') {
+                remembered.insert(row.trim().to_owned(), mono);
+            }
+        }
+        Some(
+            rows[1..]
+                .iter()
+                .map(|&(start, _, _)| pieces[start].start)
+                .collect(),
+        )
     }
 }
 
@@ -405,50 +549,10 @@ mod tests {
 
     use super::*;
 
-    /// How far optical gaps between neighbouring letters stray from their
-    /// word's mean, as a root mean square in ems.
-    fn unevenness(
-        cache: &mut Cache,
-        ts: &dyn PlatformTextSystem,
-        text: &str,
-        layout: &LineLayout,
-    ) -> f32 {
-        let em = f32::from(layout.font_size);
-        let glyphs: Vec<(FontId, &gpui::ShapedGlyph)> = layout
-            .runs
-            .iter()
-            .flat_map(|r| r.glyphs.iter().map(move |g| (r.font_id, g)))
-            .collect();
-        let (mut words, mut gaps) = (Vec::new(), Vec::new());
-        for pair in glyphs.windows(2) {
-            let [(fa, a), (fb, b)] = pair else { continue };
-            if text[b.index..].starts_with(' ') {
-                words.push(std::mem::take(&mut gaps));
-            }
-            if text[a.index..].starts_with(' ') || text[b.index..].starts_with(' ') {
-                continue;
-            }
-            let (ga, gb) = (
-                cache.glyph(ts, *fa, a.id).clone(),
-                cache.glyph(ts, *fb, b.id).clone(),
-            );
-            if let Some(c) = optical(&ga, &gb) {
-                gaps.push(f32::from(b.position.x - a.position.x) / em + c);
-            }
-        }
-        words.push(gaps);
-        let errors: Vec<f32> = words
-            .iter()
-            .flat_map(|gaps| {
-                let mean = gaps.iter().sum::<f32>() / gaps.len().max(1) as f32;
-                gaps.iter().map(move |g| (g - mean).powi(2))
-            })
-            .collect();
-        (errors.iter().sum::<f32>() / errors.len() as f32).sqrt()
-    }
+    const EM: f32 = 16.;
+    const PARAGRAPH: &str = "Transcripts mix prose with paths like crates/rho-gui/src/typeset.rs::RhoTypesetter::wrap_every_paragraph_whole and identifiers. Full monospace spends width on every narrow letter, and plain sans makes code look like prose; minimum illicit swimming, wow.";
 
-    #[test]
-    fn words_keep_their_width_and_even_out() -> anyhow::Result<()> {
+    fn rho() -> anyhow::Result<(CosmicTextSystem, FontId)> {
         let ts = CosmicTextSystem::new_without_system_fonts("sans-serif");
         ts.add_fonts(vec![
             std::fs::read(concat!(
@@ -458,72 +562,234 @@ mod tests {
             .into(),
         ])?;
         let font = ts.font_id(&gpui::font("Rho Font"))?;
-        let text = "fill the illicit minimum, wow: ruler rhythm";
-        let shaped = ts.layout_line(
-            text,
-            px(16.),
-            &[FontRun {
-                len: text.len(),
-                font_id: font,
-            }],
-        );
-        let mut set = ts.layout_line(
-            text,
-            px(16.),
-            &[FontRun {
-                len: text.len(),
-                font_id: font,
-            }],
-        );
-        RhoTypesetter::default().typeset(&ts, text, &mut set);
+        Ok((ts, font))
+    }
 
-        let flat = |l: &LineLayout| -> Vec<(FontId, gpui::ShapedGlyph)> {
-            l.runs
-                .iter()
-                .flat_map(|r| r.glyphs.iter().map(|g| (r.font_id, g.clone())))
-                .collect()
-        };
-        let (before, after) = (flat(&shaped), flat(&set));
-        assert_eq!(set.width, shaped.width, "the line keeps its width");
+    fn shape(ts: &CosmicTextSystem, text: &str, font: FontId) -> LineLayout {
+        ts.layout_line(
+            text,
+            px(EM),
+            &[FontRun {
+                len: text.len(),
+                font_id: font,
+            }],
+        )
+    }
+
+    fn glyphs(layout: &LineLayout) -> Vec<(FontId, gpui::ShapedGlyph)> {
+        layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter().map(|g| (r.font_id, g.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn letters_keep_one_optical_gap() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        let text = "minimum illicit, wow rhythm";
+        let shaped = shape(&ts, text, font);
+        let mut set = shape(&ts, text, font);
+        let typesetter = RhoTypesetter::default();
+        typesetter.typeset(&ts, text, &mut set);
+
+        let mut cache = typesetter.0.lock().unwrap();
+        let face = cache.face(&ts, font).expect("Rho Font");
+        let (before, after) = (glyphs(&shaped), glyphs(&set));
         assert_eq!(
             before.iter().map(|g| g.1.index).collect::<Vec<_>>(),
             after.iter().map(|g| g.1.index).collect::<Vec<_>>()
         );
-
         let duo = ts
             .glyph_for_char(font, DUO_I)
             .expect("Rho Font carries Duo's i");
-        let wide: Vec<FontId> = WIDE_FORMS
-            .iter()
-            .map(|m| ts.font_with_axis(font, MONO, *m).unwrap())
-            .collect();
-        for ((_, was), (now_font, now)) in before.iter().zip(&after) {
-            match &text[now.index..now.index + 1] {
-                " " => assert_eq!(
-                    now.position, was.position,
-                    "spaces stay where the shaper put them"
-                ),
-                "i" => assert_eq!(now.id, duo),
-                "m" | "w" => assert!(wide.contains(now_font), "m and w take a sans-side form"),
-                _ => assert_eq!(now.id, was.id),
+        let mut gaps = 0;
+        for (i, (form, glyph)) in after.iter().enumerate() {
+            let ch = &text[glyph.index..glyph.index + 1];
+            match ch {
+                "i" => assert_eq!(glyph.id, duo),
+                "m" | "w" => assert_eq!(*form, face.at(0.), "m and w take their sans form"),
+                " " => assert_eq!(*form, font),
+                _ => assert_eq!(*form, face.at(PREFERRED)),
+            }
+            let Some((next_form, next)) = after.get(i + 1) else {
+                continue;
+            };
+            let next_ch = &text[next.index..next.index + 1];
+            if ch == " " {
+                let was = f32::from(before[i + 1].1.position.x - before[i].1.position.x);
+                assert!(
+                    (f32::from(next.position.x - glyph.position.x) - was).abs() < 1e-3,
+                    "spaces keep their width"
+                );
+            } else if next_ch != " " && next_ch != "," {
+                let (a, b) = (
+                    cache.glyph(&ts, *form, glyph.id).clone(),
+                    cache.glyph(&ts, *next_form, next.id).clone(),
+                );
+                let distance = f32::from(next.position.x - glyph.position.x) / EM;
+                let gap = distance + optical(&a, &b).expect("letters share the x-height");
+                assert!(
+                    (gap - face.gap).abs() < 1e-4,
+                    "{ch}{next_ch}: gap {gap}, want {}",
+                    face.gap
+                );
+                gaps += 1;
             }
         }
+        assert_eq!(gaps, 19);
         assert!(
-            after
-                .windows(2)
-                .all(|p| p[0].1.position.x < p[1].1.position.x),
-            "letters stay in order"
-        );
-
-        let mut cache = Cache::default();
-        let (was, now) = (
-            unevenness(&mut cache, &ts, text, &shaped),
-            unevenness(&mut cache, &ts, text, &set),
-        );
-        assert!(
-            now < was * 0.6,
-            "optical gaps even out: {was} em spread before, {now} after"
+            face.gap > 0.05 && face.gap < 0.3,
+            "an ordinary letter gap: {}",
+            face.gap
         );
         Ok(())
     }
+
+    /// Each row of `text` broken at `breaks`, set as it would be drawn.
+    fn draw(
+        typesetter: &RhoTypesetter,
+        ts: &CosmicTextSystem,
+        font: FontId,
+        breaks: &[usize],
+    ) -> Vec<(String, f32)> {
+        let mut starts = vec![0];
+        starts.extend(breaks);
+        starts.push(PARAGRAPH.len());
+        starts
+            .windows(2)
+            .map(|w| {
+                let row = &PARAGRAPH[w[0]..w[1]];
+                let mut layout = shape(ts, row, font);
+                typesetter.typeset(ts, row, &mut layout);
+                (row.to_owned(), f32::from(layout.width))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_fit_and_beat_greedy_breaks() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        for width in [150., 260., 410.] {
+            let typesetter = RhoTypesetter::default();
+            let fragments = [LineFragment::text(PARAGRAPH)];
+            let breaks = typesetter
+                .wrap(&ts, font, px(EM), &fragments, px(width), px(0.))
+                .expect("Rho Font wraps");
+            let rows = draw(&typesetter, &ts, font, &breaks);
+            for (row, drawn) in &rows {
+                assert!(
+                    *drawn <= width + 0.01,
+                    "{row:?} is {drawn} wide, over {width}"
+                );
+                let monos = &typesetter.0.lock().unwrap().rows[&EM.to_bits()];
+                assert!(monos.contains_key(row.trim()), "{row:?} remembers its MONO");
+            }
+            assert!(
+                rows.iter()
+                    .any(|(row, _)| row.starts_with("wrap_") || row.contains("::wrap"))
+            );
+
+            // Greedy breaks at the preferred MONO, measured as drawn.
+            let plain = RhoTypesetter::default();
+            let mut greedy = Vec::new();
+            let (mut start, mut last_fit) = (0, None);
+            let words: Vec<usize> = PARAGRAPH.match_indices(' ').map(|(i, _)| i + 1).collect();
+            for &end in words.iter().chain([&PARAGRAPH.len()]) {
+                let row = &PARAGRAPH[start..end];
+                let mut layout = shape(&ts, row, font);
+                plain.typeset(&ts, row, &mut layout);
+                if f32::from(layout.width) > width
+                    && let Some(fit) = last_fit
+                {
+                    greedy.push(fit);
+                    start = fit;
+                }
+                last_fit = Some(end);
+            }
+            let ragged = |rows: &[(String, f32)], monos: &HashMap<String, f32>| -> f32 {
+                rows[..rows.len() - 1]
+                    .iter()
+                    .map(|(row, drawn)| {
+                        let mono = monos.get(row.trim()).copied().unwrap_or(PREFERRED);
+                        ((width - drawn) / EM).powi(2)
+                            + STRETCH * ((mono - PREFERRED) / 0.1).powi(2)
+                    })
+                    .sum()
+            };
+            let ours = ragged(&rows, &typesetter.0.lock().unwrap().rows[&EM.to_bits()]);
+            let greedy_rows = draw(&plain, &ts, font, &greedy);
+            if greedy_rows.iter().all(|(_, drawn)| *drawn <= width + 0.01) {
+                let theirs = ragged(&greedy_rows, &HashMap::new());
+                assert!(
+                    ours <= theirs + 1e-3,
+                    "at {width}: ours {ours}, greedy {theirs}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn highlight_chunks_do_not_break_words() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        let typesetter = RhoTypesetter::default();
+        let whole = typesetter.wrap(
+            &ts,
+            font,
+            px(EM),
+            &[LineFragment::text(PARAGRAPH)],
+            px(260.),
+            px(0.),
+        );
+        let chunks: Vec<LineFragment> = PARAGRAPH
+            .as_bytes()
+            .chunks(7)
+            .map(|c| LineFragment::text(std::str::from_utf8(c).unwrap()))
+            .collect();
+        let chunked = typesetter.wrap(&ts, font, px(EM), &chunks, px(260.), px(0.));
+        assert_eq!(whole, chunked);
+        Ok(())
+    }
+
+    #[test]
+    fn capitals_keep_clear_of_their_neighbours() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        let text = "The FIs (L4) Tyr";
+        let typesetter = RhoTypesetter::default();
+        let mut set = shape(&ts, text, font);
+        typesetter.typeset(&ts, text, &mut set);
+        let mut cache = typesetter.0.lock().unwrap();
+        let after = glyphs(&set);
+        let mut pairs = 0;
+        for pair in after.windows(2) {
+            let [(fa, a), (fb, b)] = pair else { continue };
+            if text[a.index..].starts_with(' ') || text[b.index..].starts_with(' ') {
+                continue;
+            }
+            let (ga, gb) = (
+                cache.glyph(&ts, *fa, a.id).clone(),
+                cache.glyph(&ts, *fb, b.id).clone(),
+            );
+            let tightest = ga
+                .whole
+                .iter()
+                .zip(&gb.whole)
+                .filter_map(|(l, r)| {
+                    Some(
+                        f32::from(b.position.x - a.position.x) / EM + r.as_ref()?.0 - l.as_ref()?.1,
+                    )
+                })
+                .fold(f32::MAX, f32::min);
+            assert!(
+                tightest >= CLEAR - 1e-4,
+                "{:?}: ink {tightest} em apart",
+                &text[a.index..=b.index]
+            );
+            pairs += 1;
+        }
+        assert_eq!(pairs, 9);
+        Ok(())
+    }
+
 }

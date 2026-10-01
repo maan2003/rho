@@ -1,6 +1,6 @@
 # Rho Font
 
-Source Sans 3 0.82 of the way to Source Code Pro, set word by word by
+Source Sans 3 interpolated toward Source Code Pro, set line by line by
 rho's typesetter (`src/typeset.rs`). Transcripts mix
 prose with paths and identifiers. Full monospace spends width on every
 narrow letter, and plain sans makes code look like prose. Part of the
@@ -26,11 +26,13 @@ matches Duo's, and existing font-size settings read as they did.
 
 The OFL reserves "Source", "Plex" and "iA Writer", so the result carries rho's own name.
 
-The typesetter keeps each word's shaped width and redraws its letters
-inside it: each letter picks a slimmer `MONO` instance, from 0.3 to 0.6 (`m`
-and `w` from 0 to 0.4), so the gaps open up and come out optically even.
-Monospaced words would line up but space unevenly; this keeps the
-rhythm of a grid while narrow letters stay narrow.
+The typesetter sets every line of Rho Font itself. Each letter sits so
+the optical gap to its neighbour matches the gap between two `n`s, so a
+word's width comes from its letters, not from a grid. When the editor
+wraps a paragraph, the typesetter chooses the breaks and each line's
+`MONO` value between 0.5 and 0.7 together, keeping the right edge even
+(Knuth–Plass, with `MONO` as font expansion). `m` and `w` take their
+sans form; in the mono master they get one and a half cells, as in Duo.
 
 Plex's slab `i`, as drawn for iA Writer Duo and scaled to 942 units per
 em, sits at U+E000 in the upright font. The typesetter draws every
