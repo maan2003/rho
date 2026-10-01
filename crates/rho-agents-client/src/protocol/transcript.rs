@@ -267,6 +267,8 @@ pub enum Live {
         draft: Option<String>,
     },
     /// Claude Code holds its queue in its process, outside the mirror.
+    // TODO: drop at the next GUI protocol bump. No agent host sends it any
+    // more: every loop keeps its queue in its rows.
     Queued { items: Vec<QueuedItem> },
 }
 

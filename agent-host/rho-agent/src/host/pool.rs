@@ -15,6 +15,7 @@ use rho_fs_view::{Workset, Worksets};
 use tokio::sync::{Mutex, broadcast};
 
 use super::AgentClient;
+use crate::AgentStatus;
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
 use crate::log::{
@@ -91,10 +92,10 @@ pub struct AgentPool {
     /// Which agents each connection is looking at; the union is the live
     /// set. A connection that goes away takes its wants with it.
     live_wants: std::sync::Mutex<HashMap<u64, HashSet<AgentId>>>,
-    /// The live set: agents whose loops tell the tail as it changes. A
-    /// loaded live agent is also told it is watched, which is what lets
-    /// its title and activity refresh.
+    /// The live set: agents whose statuses carry their response body.
     live: std::sync::Mutex<HashSet<AgentId>>,
+    /// Every GUI connection's statuses still to send.
+    statuses: std::sync::Mutex<Vec<std::sync::Weak<Statuses>>>,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -112,6 +113,33 @@ pub struct AgentCreated {
     pub agent_id: AgentId,
     /// The agent that spawned this one, when another agent did.
     pub parent: Option<AgentId>,
+}
+
+/// One GUI connection's statuses still to send: the latest of each loaded
+/// agent whose status changed since the connection last took them. A newer
+/// status replaces an unsent one, so a slow connection holds at most one
+/// per agent and never falls behind.
+#[derive(Default)]
+pub struct Statuses {
+    unsent: std::sync::Mutex<HashMap<AgentId, Arc<AgentStatus>>>,
+    changed: tokio::sync::Notify,
+}
+
+impl Statuses {
+    /// Every status not yet taken.
+    pub fn take(&self) -> HashMap<AgentId, Arc<AgentStatus>> {
+        std::mem::take(&mut *self.unsent.lock().expect("poison"))
+    }
+
+    /// Resolves once a status arrives after the last wait.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    fn put(&self, agent_id: AgentId, status: Arc<AgentStatus>) {
+        self.unsent.lock().expect("poison").insert(agent_id, status);
+        self.changed.notify_one();
+    }
 }
 
 /// An explicit message, mailed to whoever subscribed to this agent.
@@ -148,6 +176,7 @@ impl AgentPool {
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
+            statuses: std::sync::Mutex::new(Vec::new()),
             load_locks: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
@@ -603,8 +632,9 @@ impl AgentPool {
     }
 
     /// One connection's whole focus set, replacing what it wanted before.
-    /// The live set is the union over connections; an agent entering it
-    /// starts telling its tail (whole, once) and an agent leaving it stops.
+    /// The live set is the union over connections; a loaded agent entering
+    /// it is told again with its response body, and one leaving it is told
+    /// without from its next status on.
     pub async fn set_live_wants(&self, connection: u64, wants: HashSet<AgentId>) {
         let union = {
             let mut live_wants = self.live_wants.lock().expect("poison");
@@ -632,33 +662,65 @@ impl AgentPool {
         let agents = self.agents.lock().await;
         for agent_id in joined {
             if let Some(agent) = agents.get(&agent_id) {
-                self.attach_live(agent_id, agent);
+                self.tell_status(agent_id, agent);
             }
         }
     }
 
-    /// A live agent is loaded: it is watched (titles and activity get
-    /// made) and tells its tail whole. Leaving the live set unwatches it.
-    fn attach_live(&self, agent_id: AgentId, agent: &AgentClient) {
-        if !self.live.lock().expect("poison").contains(&agent_id) {
-            return;
-        }
-        agent.tell_tail();
+    /// Tells every connection a loaded agent's status: once it is loaded,
+    /// and again with its response body once it is live.
+    fn tell_status(&self, agent_id: AgentId, agent: &AgentClient) {
+        self.status_changed(agent_id, agent.status_cell());
     }
 
-    /// A reconnect gets current state for every loaded agent. Only focused
-    /// agents include a response body; runtime occupancy is useful everywhere.
-    pub async fn tell_tails(&self) {
+    /// Every loaded agent's status now, and each status that changes from
+    /// now on, for one GUI connection. Its statuses go when it drops them.
+    pub async fn watch_statuses(&self) -> Arc<Statuses> {
+        let statuses = Arc::new(Statuses::default());
         let agents = self.agents.lock().await;
+        let mut watchers = self.statuses.lock().expect("poison");
+        watchers.push(Arc::downgrade(&statuses));
         for (agent_id, agent) in agents.iter() {
-            let mut status = agent.status();
-            if !self.is_live(*agent_id) {
-                status.response = None;
-            }
-            crate::journal::tell_status(&self.db, *agent_id, Arc::new(status), None);
-            // Claude's queue is held by the worker, so ask it to republish too.
-            agent.tell_tail();
+            statuses.put(
+                *agent_id,
+                self.shown(*agent_id, &agent.status_cell().borrow()),
+            );
         }
+        statuses
+    }
+
+    /// An agent's status changed; every connection gets it as it shows.
+    /// It is read under the connections' lock, so of two calls racing, the
+    /// later never puts an older status.
+    pub(crate) fn status_changed(
+        &self,
+        agent_id: AgentId,
+        status: &tokio::sync::watch::Sender<AgentStatus>,
+    ) {
+        let mut watchers = self.statuses.lock().expect("poison");
+        let shown = self.shown(agent_id, &status.borrow());
+        watchers.retain(|statuses| match statuses.upgrade() {
+            Some(statuses) => {
+                statuses.put(agent_id, shown.clone());
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Only an agent someone is looking at shows its response body; its
+    /// runtime occupancy is useful everywhere.
+    fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Arc<AgentStatus> {
+        Arc::new(if self.is_live(agent_id) {
+            status.clone()
+        } else {
+            AgentStatus {
+                runtime: status.runtime.clone(),
+                response: None,
+                draft: None,
+                queued: status.queued,
+            }
+        })
     }
 
     fn touch(&self, agent_id: AgentId) {
@@ -800,7 +862,7 @@ impl AgentPool {
                 let mut agents = pool.agents.lock().await;
                 agents.insert(agent_id, agent.clone());
                 pool.touch(agent_id);
-                pool.attach_live(agent_id, &agent);
+                pool.tell_status(agent_id, &agent);
             }
             drop(loading);
             drop(admission);
@@ -1051,7 +1113,7 @@ impl AgentPool {
                     let mut agents = pool.agents.lock().await;
                     agents.insert(agent_id, agent.clone());
                     pool.touch(agent_id);
-                    pool.attach_live(agent_id, &agent);
+                    pool.tell_status(agent_id, &agent);
                 }
                 drop(loading);
                 drop(admission);
@@ -1183,6 +1245,65 @@ mod tests {
         )
         .await;
         (pool, place)
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_each_agents_latest_status_with_bodies_only_while_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, _) = test_pool(directory.path()).await;
+        let (watched, other) = {
+            let mut write = pool.db.write().await;
+            let ids = (write.alloc_agent_id(), write.alloc_agent_id());
+            write.commit();
+            ids
+        };
+        let status = |queued| AgentStatus {
+            response: Some(rho_agents_client::protocol::transcript::StreamingResponse {
+                id: "response".into(),
+                items: Vec::new(),
+            }),
+            draft: Some("draft".into()),
+            queued,
+            ..Default::default()
+        };
+        let tell = |agent_id, queued| {
+            pool.status_changed(agent_id, &tokio::sync::watch::Sender::new(status(queued)))
+        };
+        let slow = pool.watch_statuses().await;
+        assert!(slow.take().is_empty(), "no agent is loaded");
+
+        // A connection that reads nothing meanwhile holds the latest status
+        // of each agent, never a backlog.
+        for queued in 0..1000 {
+            tell(watched, queued);
+        }
+        tell(other, 7);
+        tokio::time::timeout(std::time::Duration::from_secs(1), slow.changed())
+            .await
+            .expect("a waiting connection is woken");
+        let taken = slow.take();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[&watched].queued, 999);
+        assert_eq!(taken[&other].queued, 7);
+        assert!(slow.take().is_empty());
+
+        // Nobody is looking: the body stays home. Once one connection looks,
+        // every connection gets it.
+        assert_eq!(
+            (&taken[&watched].response, &taken[&watched].draft),
+            (&None, &None)
+        );
+        pool.set_live_wants(1, HashSet::from([watched])).await;
+        tell(watched, 1);
+        tell(other, 1);
+        let taken = slow.take();
+        assert_eq!(*taken[&watched], status(1));
+        assert_eq!(taken[&other].response, None);
+
+        // A connection that went away is forgotten.
+        drop(slow);
+        tell(other, 2);
+        assert!(pool.statuses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

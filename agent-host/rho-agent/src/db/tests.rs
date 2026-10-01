@@ -948,7 +948,7 @@ async fn the_journal_names_every_row_in_write_order() {
 
     // Every row was announced after commit, in the same order.
     let mut announced = Vec::new();
-    while let Ok(crate::journal::Feed::Appended(appended)) = feed.try_recv() {
+    while let Ok(appended) = feed.try_recv() {
         announced.push((appended.seq.0, appended.agent_id, appended.pos.0));
     }
     assert_eq!(

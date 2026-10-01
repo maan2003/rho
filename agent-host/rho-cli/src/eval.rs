@@ -149,35 +149,46 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         _ => None,
     };
     emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir}))?;
+    // Subscribed before the prompt goes, so its work is seen starting.
+    let mut statuses = agent.statuses();
     agent.send_user_message(prompt);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let mut requests = 0;
     let mut calls = BTreeSet::new();
     let mut final_answer = String::new();
     let mut working = false;
+    // Once the agent stops, only the rows it wrote first are left to read:
+    // each was announced before the status that followed it.
+    let mut finished: Option<Result<(), String>> = None;
     let outcome = loop {
-        let event = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break Err("Evaluation timed out".to_owned()),
-            _ = tokio::signal::ctrl_c() => break Err("Evaluation interrupted".to_owned()),
-            event = feed.recv() => event,
+        let event = match &finished {
+            Some(outcome) => match feed.try_recv() {
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break outcome.clone(),
+                event => event.map_err(|error| error.to_string()),
+            },
+            None => tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break Err("Evaluation timed out".to_owned()),
+                _ = tokio::signal::ctrl_c() => break Err("Evaluation interrupted".to_owned()),
+                changed = statuses.changed() => {
+                    if changed.is_err() {
+                        break Err("Evaluation agent stopped".to_owned());
+                    }
+                    let runtime = statuses.borrow_and_update().runtime.clone();
+                    if runtime.is_working() {
+                        working = true;
+                    } else if working {
+                        finished = Some(match runtime.inference {
+                            rho_agent::InferenceState::Failed { error } => Err(error),
+                            _ => Ok(()),
+                        });
+                    }
+                    continue;
+                }
+                event = feed.recv() => event.map_err(|error| error.to_string()),
+            },
         };
         let appended = match event {
-            Ok(rho_agent::journal::Feed::Appended(event)) if event.agent_id == id => event,
-            Ok(rho_agent::journal::Feed::Status {
-                agent_id, status, ..
-            }) if agent_id == id => {
-                if status.runtime.is_working() {
-                    working = true;
-                    continue;
-                }
-                if !working {
-                    continue;
-                }
-                break match &status.runtime.inference {
-                    rho_agent::InferenceState::Failed { error } => Err(error.clone()),
-                    _ => Ok(()),
-                };
-            }
+            Ok(event) if event.agent_id == id => event,
             Ok(_) => continue,
             Err(error) => break Err(format!("Evaluation feed lost: {error}")),
         };

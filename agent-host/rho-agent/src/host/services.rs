@@ -86,16 +86,11 @@ impl Services {
             }),
         );
         write.commit();
+        self.status.send_replace(status);
         if let Some(pool) = self.pool.upgrade() {
             pool.settle_turn(self.agent).await;
-            crate::journal::tell_status(
-                &self.db,
-                self.agent,
-                Arc::new(status.clone()),
-                Some(Arc::from([])),
-            );
+            pool.status_changed(self.agent, &self.status);
         }
-        self.status.send_replace(status);
     }
 
     pub(crate) async fn publish_failure(&self, error: String) {
@@ -177,24 +172,15 @@ impl Services {
                                 }
                                 continue;
                             }
-                            Message::Status { mut status, queue } => {
+                            // The worker sends a status only once the rows it
+                            // reflects are committed, so a client that sends
+                            // rows before statuses never shows one ahead of them.
+                            Message::Status { mut status, queue: _ } => {
                                 status.runtime.stale = self.stale;
-                                // Only focused clients receive the response body. Avoid
-                                // cloning its growing text for an unfocused publication.
-                                let snapshot = if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    status.clone()
-                                } else {
-                                    crate::AgentStatus {
-                                        runtime: status.runtime.clone(),
-                                        response: None,
-                                        draft: None,
-                                        queued: status.queued,
-                                    }
-                                };
-                                crate::journal::tell_status(
-                                    &self.db, self.agent, Arc::new(snapshot), queue.map(Arc::from),
-                                );
                                 self.status.send_replace(status);
+                                if let Some(pool) = self.pool.upgrade() {
+                                    pool.status_changed(self.agent, &self.status);
+                                }
                                 continue;
                             }
                             Message::Request { id, body } => (id, body),

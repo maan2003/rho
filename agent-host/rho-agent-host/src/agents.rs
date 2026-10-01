@@ -268,7 +268,7 @@ where
                 }
                 // Focus is what this client is looking at, nothing more: it
                 // never loads an agent. The pool unions it across streams
-                // into the live set; a loaded agent in it tells its tail.
+                // into the live set; a loaded agent in it shows its response.
                 services
                     .pool
                     .set_live_wants(stream_id, agent_ids.into_iter().collect())
@@ -306,72 +306,54 @@ where
     result
 }
 
+/// One pipe per connection: rows and live statuses go out in one order.
 /// Rows are read from the journal, never from the feed: an append only
 /// says a row landed, and the connection pages the journal from the last
 /// seq it sent. A lagged subscription does the same. Rows the transcript
 /// leaves behind (`strip` says nothing) advance the seq without a message.
 ///
-/// Catch-up is followed by full live snapshots. No connection-local delta
-/// encoder is needed: repeated snapshots replace the same ephemeral state.
+/// Statuses are full snapshots, the latest per agent: an unsent one is
+/// replaced rather than queued, so a slow connection never falls behind.
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     since: Seq,
 ) -> tokio::task::JoinHandle<()> {
-    use rho_agent::journal::Feed;
     tokio::spawn(async move {
-        // Subscribed before the catch-up read, so a row appended during it
-        // is queued rather than lost; the seq drops the duplicates.
+        // Both subscribed before the first read, so nothing that lands
+        // during it is lost; the seq drops duplicate rows.
+        let statuses = services.pool.watch_statuses().await;
         let mut feed = rho_agent::journal::feed(&services.db);
         let mut sent = since;
-        if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
-            return;
-        }
-        services.pool.tell_tails().await;
         loop {
-            match feed.recv().await {
-                Ok(Feed::Status {
-                    agent_id,
-                    status,
-                    queue,
-                }) => {
-                    if let Some(queue) = queue {
-                        let live = rho_agents_client::protocol::transcript::Live::Queued {
-                            items: queue.iter().map(crate::transcript::queued_item).collect(),
-                        };
-                        if outgoing_tx
-                            .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    let live = rho_agents_client::protocol::transcript::Live::Snapshot {
-                        state: status.runtime.clone(),
-                        response: status.response.clone(),
-                        draft: status.draft.clone(),
-                    };
-                    if outgoing_tx
-                        .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
-                        .is_err()
-                    {
-                        return;
-                    }
+            // Taken before the rows are read: an agent's status arrives
+            // after the rows it reflects commit, so they go out first.
+            let changed = statuses.take();
+            if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
+                return;
+            }
+            for (agent_id, status) in changed {
+                let live = rho_agents_client::protocol::transcript::Live::Snapshot {
+                    state: status.runtime.clone(),
+                    response: status.response.clone(),
+                    draft: status.draft.clone(),
+                };
+                if outgoing_tx
+                    .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
+                    .is_err()
+                {
+                    return;
                 }
-                Ok(Feed::Appended(appended)) => {
-                    if appended.seq > sent
-                        && !send_journal_from(&services.db, &outgoing_tx, &mut sent).await
-                    {
-                        return;
-                    }
+            }
+            loop {
+                tokio::select! {
+                    appended = feed.recv() => match appended {
+                        Ok(appended) if appended.seq <= sent => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    },
+                    () = statuses.changed() => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
-                        return;
-                    }
-                    services.pool.tell_tails().await;
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     })
