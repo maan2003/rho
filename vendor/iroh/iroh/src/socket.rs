@@ -112,7 +112,8 @@ pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// Rho's authenticated sessions deliberately survive laptop sleep and longer
 /// network changes. Pre-authentication connections are closed by the bounded
-/// application authentication exchange.
+/// application authentication exchange. noq also uses this timeout when validating
+/// new paths, so failed candidates can retain multipath slots for this window.
 pub(crate) const PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// The maximum time a relay path can stay idle before being closed.
