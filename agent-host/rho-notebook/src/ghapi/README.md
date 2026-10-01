@@ -1,23 +1,50 @@
-# Selected ghapi Python sources
+# Octo-backed ghapi Python sources
 
-Copied from [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5, commit
-`81b28a5325b311e9878a676a57fef801093242f6` (Apache-2.0; see `LICENSE`).
+Based on [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5,
+[`81b28a5`](https://github.com/AnswerDotAI/ghapi/commit/81b28a5325b311e9878a676a57fef801093242f6)
+(Apache-2.0; see `LICENSE`).
 
-`core.py` retains the upstream `GhApi` operation generation, response
-decoding, owner/repo overrides, and `pr_status`/`check_status` presentation. `check_status` fetches all
-check-run pages instead of treating the first page as the whole verdict. The constructor and request transport are adapted to use the host's Octo
-Unix socket without Python-side GitHub credentials. `gh_spec.py` contains
-complete endpoint metadata for the supported issue/PR reads, PR creation/updates,
-conversation comments, reviews, inline-thread replies, commit status,
-PR files, review metadata and an Octo-only GraphQL-backed review-decision read,
-check details and annotations, Actions runs and jobs, job and run
-log downloads, and job/failed-jobs/whole-run reruns. `all.py` exports
-that selection, not all upstream helpers. Standard endpoint metadata matches the
-pinned upstream version. Status/check reads accept commit SHAs, branch names and
-tag names, including slash-containing refs. The custom review-decision endpoint
-is Octo-only.
+`gh_spec.json` contains complete, unmodified upstream metadata for 103 REST
+operations: PR collaboration, all issue and search endpoints, plus the existing
+CI/check/log/rerun operations. It also defines Octo-only `pulls.review_decision`
+and `pulls.set_draft` helpers backed by fixed, typed GraphQL operations.
 
-Octo validates each request independently. The selected package and its `fastcore`, `fastspec`, and `fasttransport` dependencies
-are installed in the Nix Python site-packages closure. The notebook uses that
-closure; standalone Python must use the same environment. This does not expose
-unrestricted GitHub API access: Octo still validates every request.
+Each supported REST operation has a distinct typed Rust handler.
+`octo-server/generate-gh.py` generates its path/query/body/response models and
+handler from the selected, pinned official GitHub OpenAPI schemas.
+The compact schema source and generated handlers are checked in; regeneration
+needs no network. Unknown request fields and wrong types are rejected before
+Octo acquires credentials. Response DTOs expose declared fields rather than arbitrary upstream JSON.
+They tolerate absent fields but check the type of every present field; object
+unions project their combined declared fields rather than guess a variant.
+Optional nullable fields preserve null versus omission.
+
+The selected PR surface excludes merging (sync/async), head-branch updates,
+and dismissing another review. Generic GraphQL, Git ref writes, repository
+administration, and credential operations are not exposed. API availability
+does not authorize a live write: agents still need the user's specific approval.
+
+`core.py` retains upstream operation generation, response decoding,
+owner/repo overrides, and `pr_status`/`check_status` presentation.
+`check_status` fetches all check-run pages. `pr_status(number)` remains CI for
+one PR, not the gh CLI's personal PR overview.
+
+Requests use the host's Octo Unix socket without Python-side credentials.
+Both async and sync generated methods reject unknown keywords, missing required
+parameters, and undeclared `query_`/`body_` fields. Use `result['items']` for
+search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
+`headers_={"Accept": "application/vnd.github.diff"}` or
+`application/vnd.github.patch`. Draft/ready transitions use
+`await api.pulls.set_draft(number, draft=True/False)`.
+
+Octo preserves selected pagination/cache/rate-limit headers, empty responses,
+and explicitly requested text media. Existing job/run log download redirects
+are fetched once on the host without credentials; signed URLs never reach the
+agent. Repository responses nested in PR/search data omit `temp_clone_token`.
+This is not a detector for arbitrary secrets in repository content or logs.
+
+The package JSON and its `fastcore`, `fastspec`, and `fasttransport` dependencies
+are installed in the Nix Python site-packages closure. Standalone Python must
+use the same environment. `all.py` exports the client and CI helpers, not every
+upstream helper module. See the GitHub workflow skill for usage and approval
+rules.

@@ -13,6 +13,8 @@ base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 url.workspace = true
+percent-encoding.workspace = true
+serde_urlencoded.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 rustls.workspace = true
 serde.workspace = true

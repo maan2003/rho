@@ -347,7 +347,7 @@
           paths = buildPaths;
         };
 
-        # The selected ghapi sources use upstream's OpenAPI operation machinery.
+        # The ghapi sources use upstream's OpenAPI operation machinery.
         # Package its Python dependencies without vendoring their repositories.
         pythonPackages = pkgs.python3.withPackages (
           ps:
@@ -419,7 +419,7 @@
               installPhase = ''
                 runHook preInstall
                 mkdir -p "$out/${pkgs.python3.sitePackages}/ghapi"
-                cp *.py "$out/${pkgs.python3.sitePackages}/ghapi/"
+                cp *.py *.json "$out/${pkgs.python3.sitePackages}/ghapi/"
                 runHook postInstall
               '';
               dependencies = [ fastcore fastspec fasttransport ];

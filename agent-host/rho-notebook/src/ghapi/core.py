@@ -1,8 +1,9 @@
-"""Selected ghapi 2.1.5 client and CI helpers, adapted for Octo transport.
+"""ghapi 2.1.5 client and CI helpers, adapted for Octo transport.
 
 Copyright (c) the ghapi contributors. Apache-2.0; see LICENSE.
 Upstream: https://github.com/AnswerDotAI/ghapi (81b28a5325b311e9878a676a57fef801093242f6).
 """
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime
 import os
@@ -90,8 +91,43 @@ def gh_patch(fn):
     return patch(splice_sig(_f, fn, 'self'))
 
 # %% ../nbs/00_core.ipynb #83e8a9ce
+class GhOpFunc(OpFunc):
+    "Generated operation with strict schema keywords and query/body mapping fields."
+    def _split(self, kwargs):
+        for p in self.required_params:
+            if p in self.op_spec.param_defaults:
+                kwargs.setdefault(self.sparams[p], self.op_spec.param_defaults[p])
+        parts = super()._split(kwargs)
+        _, _, route, query, body, files = parts
+        values = {**route, **query, **(body or {}), **files}
+        missing = [p for p in self.required_params
+                   if values.get(p, UNSET) is UNSET or p in self.route_params and values[p] is None]
+        if missing:
+            raise TypeError(f"{self.name}: missing required parameter(s): {', '.join(missing)}")
+        return parts
+
+    def _prep(self, args, kwargs):
+        controls = {'headers_', 'query_', 'body_', 'raw_', 'stream'}
+        if self.media_url: controls.update(('media', 'media_type'))
+        unknown = kwargs.keys() - (self.sparams.keys() | set(self.sparams.values()) | controls)
+        if unknown:
+            raise TypeError(f"{self.name}: unexpected keyword argument(s): {', '.join(sorted(unknown))}")
+        for option, fields in (('query_', self.query_params), ('body_', self.body_params)):
+            extra = kwargs.get(option, {})
+            if not isinstance(extra, Mapping):
+                raise TypeError(f"{self.name}: {option} must be a mapping")
+            unknown = extra.keys() - set(fields)
+            if unknown:
+                raise TypeError(f"{self.name}: unsupported {option} field(s): {', '.join(sorted(unknown))}")
+        return super()._prep(args, kwargs)
+
+
+class GhSyncOpFunc(SyncOpFunc, GhOpFunc):
+    "Sync twin using the same operation validation before blocking requests."
+
+
 class GhApi(OpenAPIClient):
-    "Octo-backed client generated from the selected ghapi endpoint metadata."
+    "Octo-backed client generated from the selected pinned ghapi REST metadata."
     def __init__(self, owner=None, repo=None, *, debug=None, limit_cb=None,
                  timeout=60.0, sync=False):
         kwargs = {}
@@ -99,7 +135,7 @@ class GhApi(OpenAPIClient):
         if repo: kwargs['repo'] = repo
         self.headers = {'Accept': 'application/vnd.github+json'}
         self.token, self.gh_host = None, GH_HOST
-        tcls, fcls = (GhSyncTransport, SyncOpFunc) if sync else (GhTransport, OpFunc)
+        tcls, fcls = (GhSyncTransport, GhSyncOpFunc) if sync else (GhTransport, GhOpFunc)
         socket = Path(os.environ['RHO_SOCKET_PATH']).with_name('octo.sock')
         transport = (httpx2.HTTPTransport if sync else httpx2.AsyncHTTPTransport)(uds=str(socket))
         client = (httpx2.Client if sync else httpx2.AsyncClient)(transport=transport, follow_redirects=False, timeout=timeout)
