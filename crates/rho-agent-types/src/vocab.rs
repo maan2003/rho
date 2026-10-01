@@ -98,6 +98,22 @@ impl AgentRole {
             Self::Advisor { .. } => "adv",
         }
     }
+
+    /// The agent's full id behind its role's prefix ("eng-…"), as agents
+    /// see it in `$RHO_AGENT_ID`.
+    pub fn full_handle(self, agent_id: AgentId) -> String {
+        format!("{}-{}", self.handle_prefix(), agent_id.encoded())
+    }
+}
+
+/// The agent a full handle ("eng-…") names. A bare full id parses too.
+pub fn parse_full_handle(text: &str) -> Option<AgentId> {
+    let id = match text.split_once('-') {
+        Some(("eng" | "adv", id)) => id,
+        Some(_) => return None,
+        None => text,
+    };
+    AgentId::from_encoded(id).ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
@@ -170,5 +186,24 @@ impl std::ops::Add<std::time::Duration> for UnixMs {
 
     fn add(self, later: std::time::Duration) -> Self {
         Self(self.0.saturating_add(later.as_millis() as u64))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_handle_round_trips_and_rejects_other_prefixes() {
+        let agent = AgentId::from_counter(7, &AgentIdDomain(3)).unwrap();
+        let advisor = AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Low,
+        };
+        let handle = advisor.full_handle(agent);
+        assert_eq!(handle, format!("adv-{}", agent.encoded()));
+        assert_eq!(parse_full_handle(&handle), Some(agent));
+        assert_eq!(parse_full_handle(&agent.encoded()), Some(agent));
+        assert_eq!(parse_full_handle(&format!("pm-{}", agent.encoded())), None);
+        assert_eq!(parse_full_handle(&handle[..8]), None);
     }
 }

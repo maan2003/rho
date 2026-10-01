@@ -39,7 +39,7 @@ pub(crate) fn host_tools(
     original_images: bool,
 ) -> (ShellTools, Vec<Export>) {
     let shell = ShellTools::in_directory(cwd.to_owned(), Default::default())
-        .with_env("RHO_AGENT_ID", agent_id.encoded())
+        .with_env("RHO_AGENT_ID", role.full_handle(agent_id))
         .with_env(
             "RIPGREP_CONFIG_PATH",
             format!("{}/etc/ripgreprc", rho_fs_view::AGENT_BASE),
