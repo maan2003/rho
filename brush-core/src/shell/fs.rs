@@ -8,7 +8,7 @@ use crate::{
     ExecutionParameters, ShellFd,
     env::{EnvironmentLookup, EnvironmentScope},
     error, openfiles, pathsearch,
-    sys::{fs::PathExt as _, users},
+    sys::users,
     variables,
 };
 
@@ -81,11 +81,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         }
     }
 
-    /// Finds executables in the shell's current default PATH, matching the given glob pattern.
+    /// Finds executables with the given name in the shell's current PATH, yielding each match
+    /// in search order.
     ///
     /// # Arguments
     ///
-    /// * `required_glob_pattern` - The glob pattern to match against.
+    /// * `filename` - The name of the executable to look for.
     pub fn find_executables_in_path<'a>(
         &'a self,
         filename: &'a str,
@@ -123,14 +124,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         &self,
         candidate_name: S,
     ) -> Option<PathBuf> {
-        let path = self.env_str("PATH").unwrap_or_default();
-        for one_dir in crate::sys::fs::split_paths(path.as_ref()) {
-            let candidate_path = one_dir.join(candidate_name.as_ref());
-            if candidate_path.executable() {
-                return Some(candidate_path);
-            }
-        }
-        None
+        self.find_executables_in_path(candidate_name.as_ref())
+            .next()
     }
 
     /// Uses the shell's hash-based path cache to check whether the given filename is the name
@@ -156,6 +151,45 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         } else {
             None
         }
+    }
+
+    /// Resolves a command name by searching the shell's current PATH.
+    ///
+    /// Unlike [`Self::find_first_executable_in_path`], a non-executable entry in the PATH
+    /// resolves as the command; the shell reports it as the command and then fails to run it.
+    /// See [`pathsearch::resolve_command`].
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate_name` - The name of the command to resolve.
+    pub fn resolve_command_in_path<S: AsRef<str>>(&self, candidate_name: S) -> Option<PathBuf> {
+        let path_var = self.env.get_str("PATH", self).unwrap_or_default();
+        let paths = crate::sys::fs::split_paths(path_var.as_ref());
+        pathsearch::resolve_command(paths, candidate_name.as_ref())
+    }
+
+    /// Like [`Self::resolve_command_in_path`], but consults the shell's hash-based path cache
+    /// first and caches whatever a search turns up.
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate_name` - The name of the command to resolve.
+    pub fn resolve_command_in_path_using_cache<S: AsRef<str>>(
+        &mut self,
+        candidate_name: S,
+    ) -> Option<PathBuf>
+    where
+        String: From<S>,
+    {
+        if let Some(cached_path) = self.program_location_cache.get(&candidate_name) {
+            return Some(cached_path);
+        }
+
+        let found_path = self.resolve_command_in_path(candidate_name.as_ref())?;
+        self.program_location_cache
+            .set(candidate_name, found_path.clone());
+
+        Some(found_path)
     }
 
     /// Gets the absolute form of the given path.
@@ -195,16 +229,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
         let path_to_open = self.absolute_path(path.as_ref());
 
-        // See if this is a reference to a file descriptor, in which case the actual
-        // /dev/fd* file path for this process may not match with what's in the execution
-        // parameters.
-        if let Some(parent) = path_to_open.parent()
-            && parent == Path::new("/dev/fd")
-            && let Some(filename) = path_to_open.file_name()
-            && let Ok(fd_num) = filename.to_string_lossy().to_string().parse::<ShellFd>()
+        // See if this is a reference to a file descriptor. These paths should
+        // reflect the shell's current execution fds, which can differ from the
+        // host process fds after redirections like here-docs.
+        if let Some(fd_num) = shell_fd_path_to_fd(&path_to_open)
             && let Some(open_file) = params.try_fd(self, fd_num)
         {
-            return open_file.try_clone();
+            return Ok(open_file);
         }
 
         Ok(options.open(path_to_open)?.into())
@@ -225,5 +256,23 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
     pub(crate) const fn persistent_open_files(&self) -> &openfiles::OpenFiles {
         &self.open_files
+    }
+}
+
+fn shell_fd_path_to_fd(path: &Path) -> Option<ShellFd> {
+    match path.to_str()? {
+        "/dev/stdin" => return Some(openfiles::OpenFiles::STDIN_FD),
+        "/dev/stdout" => return Some(openfiles::OpenFiles::STDOUT_FD),
+        "/dev/stderr" => return Some(openfiles::OpenFiles::STDERR_FD),
+        _ => {}
+    }
+
+    if let Some(parent) = path.parent()
+        && parent == Path::new("/dev/fd")
+        && let Some(filename) = path.file_name()
+    {
+        filename.to_string_lossy().parse::<ShellFd>().ok()
+    } else {
+        None
     }
 }

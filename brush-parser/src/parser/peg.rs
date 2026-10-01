@@ -19,7 +19,7 @@ peg::parser! {
         rule complete_command() -> ast::CompleteCommand =
             first:and_or() remainder:(s:separator_op() l:and_or() { (s, l) })* last_sep:separator_op()? {
                 let mut and_ors = vec![first];
-                let mut seps = vec![];
+                let mut seps = Vec::with_capacity(remainder.len());
 
                 for (sep, ao) in remainder {
                     seps.push(sep);
@@ -29,10 +29,7 @@ peg::parser! {
                 // N.B. We default to synchronous if no separator op is given.
                 seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
 
-                let mut items = vec![];
-                for (i, ao) in and_ors.into_iter().enumerate() {
-                    items.push(ast::CompoundListItem(ao, seps[i].clone()));
-                }
+                let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
                 ast::CompoundList(items)
             }
@@ -73,7 +70,7 @@ peg::parser! {
             c:(c:command() r:&pipe_extension_redirection()? {? // check for `|&` without consuming the stream.
                 let mut c = c;
                 if r.is_some() {
-                    add_pipe_extension_redirection(&mut c)?;
+                    add_pipe_extension_redirection(&mut c);
                 }
                 Ok(c)
             }) ** (pipe_operator() linebreak()) {
@@ -92,12 +89,11 @@ peg::parser! {
             f:function_definition() { ast::Command::Function(f) } /
             c:simple_command() { ast::Command::Simple(c) } /
             c:compound_command() r:redirect_list()? { ast::Command::Compound(c, r) } /
-            // N.B. Extended test commands are bash extensions.
-            non_posix_extensions_enabled() c:extended_test_command() r:redirect_list()? { ast::Command::ExtendedTest(c, r) } /
             expected!("command")
 
         // N.B. The arithmetic command is a non-sh extension.
         // N.B. The arithmetic for clause command is a non-sh extension.
+        // N.B. The extended test command is a non-sh extension.
         pub(crate) rule compound_command() -> ast::CompoundCommand =
             non_posix_extensions_enabled() a:arithmetic_command() { ast::CompoundCommand::Arithmetic(a) } /
             non_posix_extensions_enabled() c:coproc_clause() { ast::CompoundCommand::Coprocess(c) } /
@@ -109,6 +105,7 @@ peg::parser! {
             w:while_clause() { ast::CompoundCommand::WhileClause(w) } /
             u:until_clause() { ast::CompoundCommand::UntilClause(u) } /
             non_posix_extensions_enabled() c:arithmetic_for_clause() { ast::CompoundCommand::ArithmeticForClause(c) } /
+            non_posix_extensions_enabled() c:extended_test_command() { ast::CompoundCommand::ExtendedTest(c) } /
             expected!("compound command")
 
         pub(crate) rule arithmetic_command() -> ast::ArithmeticCommand =
@@ -132,6 +129,11 @@ peg::parser! {
             // command instead.
             !arithmetic_end() !specific_operator(")") [_] {}
 
+        // The tokenizer reads `;;` as a single operator, so in the header of an arithmetic for
+        // loop, an expression must also stop in front of `;;`.
+        rule arithmetic_for_expression() -> ast::UnexpandedArithmeticExpr =
+            raw_expr:$((!specific_operator(";;") arithmetic_expression_piece())*) { ast::UnexpandedArithmeticExpr { value: raw_expr } }
+
         // TODO(arithmetic): evaluate arithmetic end; the semicolon is used in arithmetic for loops.
         rule arithmetic_end() -> () =
             specific_operator(")") specific_operator(")") {} /
@@ -146,7 +148,7 @@ peg::parser! {
         rule compound_list() -> ast::CompoundList =
             linebreak() first:and_or() remainder:(s:separator() l:and_or() { (s, l) })* last_sep:separator()? {
                 let mut and_ors = vec![first];
-                let mut seps = vec![];
+                let mut seps = Vec::with_capacity(remainder.len());
 
                 for (sep, ao) in remainder {
                     seps.push(sep.unwrap_or(SeparatorOperator::Sequence));
@@ -157,10 +159,7 @@ peg::parser! {
                 let last_sep = last_sep.unwrap_or(None);
                 seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
 
-                let mut items = vec![];
-                for (i, ao) in and_ors.into_iter().enumerate() {
-                    items.push(ast::CompoundListItem(ao, seps[i].clone()));
-                }
+                let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
                 ast::CompoundList(items)
             }
@@ -183,9 +182,9 @@ peg::parser! {
         rule arithmetic_for_clause() -> ast::ArithmeticForClauseCommand =
             s:specific_word("for")
             specific_operator("(") specific_operator("(")
-                initializer:arithmetic_expression()? specific_operator(";")
-                condition:arithmetic_expression()? specific_operator(";")
-                updater:arithmetic_expression()?
+                initializer:arithmetic_for_expression()?
+                condition:arithmetic_for_condition()
+                updater:arithmetic_for_expression()?
             specific_operator(")") specific_operator(")")
             body:arithmetic_for_body() {
                 let start = s.location();
@@ -194,12 +193,19 @@ peg::parser! {
                 ast::ArithmeticForClauseCommand { initializer, condition, updater, body, loc }
             }
 
+        // The condition of an arithmetic for loop, along with the `;` on each side of it. When the
+        // condition is empty and there is no space between the semicolons, the tokenizer has
+        // already combined them into a single `;;` operator.
+        rule arithmetic_for_condition() -> Option<ast::UnexpandedArithmeticExpr> =
+            specific_operator(";") condition:arithmetic_expression()? specific_operator(";") { condition } /
+            specific_operator(";;") { Some(ast::UnexpandedArithmeticExpr { value: String::new() }) }
+
         rule arithmetic_for_body() -> ast::DoGroupCommand =
             sequential_sep()? body:do_group() { body } /
             body:brace_group() { ast::DoGroupCommand { list: body.list, loc: body.loc } }
 
         rule extended_test_command() -> ast::ExtendedTestExprCommand =
-            s:specific_word("[[") linebreak() expr:extended_test_expression() linebreak() e:specific_word("]]") {
+            s:specific_word("[[") linebreak() expr:extended_test_expression() e:specific_word("]]") {
                 let start = s.location();
                 let end = e.location();
                 let loc = SourceSpan::within(start, end);
@@ -207,28 +213,41 @@ peg::parser! {
                 ast::ExtendedTestExprCommand { expr, loc }
             }
 
+        // N.B. The placement of linebreak() here matches bash's handling of newlines
+        // within `[[ ]]` conditionals. Newlines are consumed (1) at the start of every
+        // term (after `[[`, `(`, `&&`, `||`, `!`), and (2) trailing after a *complete*
+        // binary test, unary-predicate test, or parenthesized expression -- but never
+        // after a bare-word string test (e.g. `[[ x \n ]]` is a syntax error in bash).
         rule extended_test_expression() -> ast::ExtendedTestExpr = precedence! {
-            left:(@) linebreak() specific_operator("||") linebreak() right:@ { ast::ExtendedTestExpr::Or(Box::from(left), Box::from(right)) }
+            left:(@) specific_operator("||") linebreak() right:@ { ast::ExtendedTestExpr::Or(Box::from(left), Box::from(right)) }
             --
-            left:(@) linebreak() specific_operator("&&") linebreak() right:@ { ast::ExtendedTestExpr::And(Box::from(left), Box::from(right)) }
+            left:(@) specific_operator("&&") linebreak() right:@ { ast::ExtendedTestExpr::And(Box::from(left), Box::from(right)) }
             --
-            specific_word("!") e:@ { ast::ExtendedTestExpr::Not(Box::from(e)) }
+            specific_word("!") linebreak() e:@ { ast::ExtendedTestExpr::Not(Box::from(e)) }
             --
-            specific_operator("(") e:extended_test_expression() specific_operator(")") { ast::ExtendedTestExpr::Parenthesized(Box::from(e)) }
+            specific_operator("(") linebreak() e:extended_test_expression() specific_operator(")") linebreak() { ast::ExtendedTestExpr::Parenthesized(Box::from(e)) }
             --
+            e:extended_test_binary_predicate() linebreak() { e }
+            --
+            p:extended_unary_predicate() f:word() linebreak() { ast::ExtendedTestExpr::UnaryTest(p, ast::Word::from(f)) }
+            --
+            w:word() { ast::ExtendedTestExpr::UnaryTest(ast::UnaryPredicate::StringHasNonZeroLength, ast::Word::from(w)) }
+        }
+
+        rule extended_test_binary_predicate() -> ast::ExtendedTestExpr =
             // Arithmetic operators
-            left:word() specific_word("-eq") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticEqualTo, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-ne") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticNotEqualTo, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-lt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticLessThan, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-le") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticLessThanOrEqualTo, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-gt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticGreaterThan, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-ge") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo, ast::Word::from(left), ast::Word::from(right)) }
+            left:word() specific_word("-eq") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticEqualTo, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-ne") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticNotEqualTo, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-lt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticLessThan, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-le") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticLessThanOrEqualTo, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-gt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticGreaterThan, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-ge") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::ArithmeticGreaterThanOrEqualTo, ast::Word::from(left), ast::Word::from(right)) } /
             // Non-arithmetic binary operators
-            left:word() specific_word("-ef") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::FilesReferToSameDeviceAndInodeNumbers, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-nt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftFileIsNewerOrExistsWhenRightDoesNot, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("-ot") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftFileIsOlderOrDoesNotExistWhenRightDoes, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() (specific_word("==") / specific_word("=")) right:word()  { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::StringExactlyMatchesPattern, ast::Word::from(left), ast::Word::from(right)) }
-            left:word() specific_word("!=") right:word()  { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::StringDoesNotExactlyMatchPattern, ast::Word::from(left), ast::Word::from(right)) }
+            left:word() specific_word("-ef") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::FilesReferToSameDeviceAndInodeNumbers, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-nt") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftFileIsNewerOrExistsWhenRightDoesNot, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("-ot") right:word() { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftFileIsOlderOrDoesNotExistWhenRightDoes, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() (specific_word("==") / specific_word("=")) right:word()  { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::StringExactlyMatchesPattern, ast::Word::from(left), ast::Word::from(right)) } /
+            left:word() specific_word("!=") right:word()  { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::StringDoesNotExactlyMatchPattern, ast::Word::from(left), ast::Word::from(right)) } /
             left:word() specific_word("=~") right:regex_word()  {
                 if right.value.starts_with(['\'', '\"']) {
                     // TODO(test): Confirm it ends with that too?
@@ -236,14 +255,9 @@ peg::parser! {
                 } else {
                     ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::StringMatchesRegex, ast::Word::from(left), right)
                 }
-            }
-            left:word() specific_operator("<") right:word()   { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftSortsBeforeRight, ast::Word::from(left), ast::Word::from(right)) }
+            } /
+            left:word() specific_operator("<") right:word()   { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftSortsBeforeRight, ast::Word::from(left), ast::Word::from(right)) } /
             left:word() specific_operator(">") right:word()   { ast::ExtendedTestExpr::BinaryTest(ast::BinaryPredicate::LeftSortsAfterRight, ast::Word::from(left), ast::Word::from(right)) }
-            --
-            p:extended_unary_predicate() f:word() { ast::ExtendedTestExpr::UnaryTest(p, ast::Word::from(f)) }
-            --
-            w:word() { ast::ExtendedTestExpr::UnaryTest(ast::UnaryPredicate::StringHasNonZeroLength, ast::Word::from(w)) }
-        }
 
         rule extended_unary_predicate() -> ast::UnaryPredicate =
             specific_word("-a") { ast::UnaryPredicate::FileExists } /
@@ -358,7 +372,7 @@ peg::parser! {
         rule if_clause() -> ast::IfClauseCommand =
             s:specific_word("if") condition:compound_list() specific_word("then") then:compound_list() elses:else_part()? e:specific_word("fi") {
                 let start = s.location();
-                let end = s.location();
+                let end = e.location();
                 let loc = SourceSpan::within(start, end);
 
                 ast::IfClauseCommand {
@@ -371,10 +385,8 @@ peg::parser! {
 
         rule else_part() -> Vec<ast::ElseClause> =
             cs:_conditional_else_part()+ u:_unconditional_else_part()? {
-                let mut parts = vec![];
-                for c in cs {
-                    parts.push(c);
-                }
+                let mut parts = Vec::with_capacity(cs.len() + 1);
+                parts.extend(cs);
 
                 if let Some(uncond) = u {
                     parts.push(uncond);
@@ -446,6 +458,7 @@ peg::parser! {
         pub(crate) rule function_parens_and_body() -> ast::FunctionBody =
             specific_operator("(") specific_operator(")") linebreak() body:function_body() { body }
 
+        // N.B. A function body must be a compound command per POSIX grammar.
         rule function_body() -> ast::FunctionBody =
             c:compound_command() r:redirect_list()? { ast::FunctionBody(c, r) }
 
@@ -653,7 +666,7 @@ peg::parser! {
 
         pub(crate) rule assignment_word() -> (ast::Assignment, ast::Word) =
             non_posix_extensions_enabled() [Token::Word(w, l)] specific_operator("(") elements:array_elements() end:specific_operator(")") {?
-                let mut parsed = word::parse_array_assignment(w.as_str(), elements.as_slice())?;
+                let mut parsed = word::parse_array_assignment(w.as_str(), elements.as_slice(), parser_options)?;
 
                 let mut all_as_word = w.to_owned();
                 all_as_word.push('(');
@@ -670,9 +683,17 @@ peg::parser! {
                 Ok((parsed, ast::Word::with_location(&all_as_word, &loc)))
             } /
             [Token::Word(w, l)] {?
-                let mut parsed = word::parse_assignment_word(w.as_str()).map_err(|_| "not assignment word")?;
+                let mut parsed = word::parse_scalar_assignment(w.as_str(), parser_options).map_err(|_| "not assignment word")?;
                 parsed.loc = l.clone();
                 Ok((parsed, ast::Word::with_location(w, l)))
+            }
+
+        // A standalone compound assignment value, i.e. the `(...)` half of an array assignment.
+        // Used to reinterpret text that only became recognizable as a compound value after
+        // expansion.
+        pub(crate) rule compound_assignment_value() -> Vec<&'input String> =
+            non_posix_extensions_enabled() specific_operator("(") elements:array_elements() specific_operator(")") {
+                elements
             }
 
         rule array_elements() -> Vec<&'input String> =
@@ -690,9 +711,13 @@ peg::parser! {
             [Token::Word(w, num_loc) if w.chars().all(|c: char| c.is_ascii_digit())]
             &([Token::Operator(o, redir_loc) if
                     o.starts_with(['<', '>']) &&
-                    locations_are_contiguous(num_loc, redir_loc)]) {
+                    locations_are_contiguous(num_loc, redir_loc)]) {?
 
-                w.parse().unwrap()
+                // A run of ASCII digits still need not fit in an `IoFd`; e.g.
+                // `echo 99999999999999999999>&1` overflows. Decline the rule
+                // instead of unwrapping, so the token is reconsidered as an
+                // ordinary word rather than panicking the parser.
+                w.parse().map_err(|_| "io number out of range")
             }
 
         //
@@ -710,7 +735,7 @@ peg::parser! {
 }
 
 // add `2>&1` to the command if the pipeline is `|&`
-fn add_pipe_extension_redirection(c: &mut ast::Command) -> Result<(), &'static str> {
+fn add_pipe_extension_redirection(c: &mut ast::Command) {
     fn add_to_redirect_list(l: &mut Option<ast::RedirectList>, r: ast::IoRedirect) {
         if let Some(l) = l {
             l.0.push(r);
@@ -737,10 +762,7 @@ fn add_pipe_extension_redirection(c: &mut ast::Command) -> Result<(), &'static s
         }
         ast::Command::Compound(_, l) => add_to_redirect_list(l, r),
         ast::Command::Function(f) => add_to_redirect_list(&mut f.body.1, r),
-        ast::Command::ExtendedTest(..) => return Err("|& unimplemented for extended tests"),
     }
-
-    Ok(())
 }
 
 #[inline]

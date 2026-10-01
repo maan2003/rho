@@ -1,5 +1,5 @@
 #
-# This workflow was based on https://docs.zizmor.sh/usage/#use-in-github-actions
+# This workflow was based on https://docs.zizmor.sh/integrations/
 #
 
 name: GitHub Actions Security Analysis with zizmor 🌈
@@ -12,6 +12,15 @@ on:
 
 permissions: {}
 
+# N.B. This is the *online* zizmor pass: it runs the audits that need network
+# access and uploads SARIF to code scanning for stateful triage in the Security
+# tab, and it deliberately does not fail the build.
+#
+# The complementary offline pass -- which does fail, and fails fast -- is the
+# `zizmor` hook in .pre-commit-config.yaml, run in CI by hooks.yaml and locally
+# by `cargo xtask check hooks workflows`. The two are not redundant; do not
+# collapse them without checking which audits each one actually runs.
+
 # Only allow one run of the workflow per branch / PR at a time.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -19,28 +28,18 @@ concurrency:
 
 jobs:
   zizmor:
-    name: zizmor latest via PyPI
+    name: zizmor latest via zizmor-action
     runs-on: ubuntu-latest
     permissions:
       security-events: write # needed for SARIF uploads
-      contents: read # only needed for private repos
-      actions: read # only needed for private repos
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-
+      # Reporting pass: uploads SARIF to code scanning, giving us stateful
+      # analysis and incremental triage in the Security tab. Does not fail
+      # with non-zero result but reports them.
       - name: Run zizmor 🌈
-        run: uvx zizmor --format=sarif . > results.sarif
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
-        with:
-          sarif_file: results.sarif
-          category: zizmor
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
