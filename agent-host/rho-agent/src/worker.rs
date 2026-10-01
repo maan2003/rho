@@ -56,6 +56,7 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         .enable_all()
         .build()?
         .block_on(async {
+            tokio::spawn(crate::heap::dump_on_sigusr1());
             runtime::run(
                 tokio::net::UnixStream::from_std(socket)?,
                 tokio::net::UnixStream::from_std(requests)?,
