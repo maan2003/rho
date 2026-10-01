@@ -3,8 +3,18 @@ import * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import {
+	type Computed,
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { type Baseline, Estimator } from "../jitter";
 import type { AudioFrame, Capture, Format } from "./capture";
 import { Gain } from "./gain";
 import { Resampler } from "./resampler";
@@ -155,11 +165,32 @@ export class Encoder {
 	// discontinuity and re-anchors on.
 	#pipeline: Pipeline | undefined;
 
+	// Where the next frame submitted to the AudioEncoder starts, i.e. the exclusive end of the
+	// newest one, where a demand gap's discontinuity marker goes. Cleared once the marker is written.
+	#next: Time.Micro | undefined;
+
+	// The newest demand gap's marker. The AudioEncoder outlives a gap too brief to skip a frame, so
+	// chunks it still held when demand disappeared surface after the resume; they sit below the
+	// marker and are dropped.
+	#floor: Time.Micro | undefined;
+
 	// The fatal error an AudioEncoder reported, if any. That instance can never encode again and
 	// reconfiguring it would be a retry, so the rendition stays down for the life of this encoder.
 	#fatal = new Signal<Error | undefined>(undefined);
 
+	// How many resolution runs threw for their current inputs (e.g. invalid codec settings), so no
+	// config is coming until one reruns.
+	#failures = new Signal(0);
+
+	/**
+	 * @internal Whether the catalog config resolved, or can't until something outside the encoder
+	 * changes: a failed encoder or capture, invalid codec settings, or a capture waiting on the page's
+	 * first gesture. `<moq-publish>` holds its first announce until this is set.
+	 */
+	readonly settled: Computed<boolean>;
+
 	#signals = new Effect();
+	#estimator = new Estimator();
 
 	constructor(name: string, props?: EncoderProps) {
 		// `source` moved to Audio.Capture, which renditions share. TypeScript catches this, but a
@@ -186,9 +217,28 @@ export class Encoder {
 			effect.proxy(this.#out.root, capture.out.root);
 		});
 
+		this.settled = this.#signals.computed((effect) => {
+			if (effect.get(this.#out.catalog) !== undefined) return true;
+			if (effect.get(this.#fatal) !== undefined || effect.get(this.#failures) > 0) return true;
+			const capture = effect.get(this.in.capture);
+			return capture !== undefined && !!effect.get(capture.blocked);
+		});
+
 		this.#signals.run(this.#runCapture.bind(this));
-		this.#signals.run(this.#runConfig.bind(this));
-		this.#signals.run(this.#runCatalog.bind(this));
+
+		// Every step that resolves the config counts a throw as a failure, so a bad input settles the
+		// gate instead of holding the announce forever.
+		for (const run of [this.#runConfig, this.#runCatalog]) {
+			this.#signals.run((effect) => {
+				try {
+					run.call(this, effect);
+				} catch (err) {
+					this.#failures.update((n) => n + 1);
+					effect.cleanup(() => this.#failures.update((n) => n - 1));
+					throw err;
+				}
+			});
+		}
 		this.#signals.run(this.#runRegister.bind(this));
 	}
 
@@ -213,7 +263,7 @@ export class Encoder {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await Promise.race([reader.read(), effect.cancel]);
+				const next = await effect.race(reader.read());
 				if (!next?.value) break;
 
 				const format = capture.out.format.peek();
@@ -255,7 +305,25 @@ export class Encoder {
 			const fatal = effect.get(this.#fatal);
 			if (!enabled || !format || fatal) return;
 
-			this.#encode(rendition.track, format, effect);
+			this.#encode(rendition.track, broadcast.baseline, format, effect);
+		});
+
+		// When demand disappears, end the epoch with a discontinuity marker (see
+		// Container.Legacy.Producer.cut) so a later subscriber resumes on the same track without the
+		// pre-gap frames reading as live. Its empty payload marks where the submitted media ends.
+		effect.run((effect) => {
+			const track = effect.get(rendition.track);
+			if (!track) return;
+			effect.cleanup(() => {
+				const end = this.#next;
+				this.#next = undefined;
+				if (end === undefined || track.closed.peek() !== undefined) return;
+				this.#floor = end;
+				track.writeFrame({
+					payload: Container.Legacy.encodeFrame(new Uint8Array(), end),
+					timestamp: Time.Timestamp.fromMicros(end),
+				});
+			});
 		});
 
 		effect.run((effect) => {
@@ -319,7 +387,10 @@ export class Encoder {
 
 		const decoder = effect.get(this.#decoderDescription);
 		const catalog = decoder?.config === config ? { ...config, description: decoder.description } : config;
-		effect.set(this.#out.catalog, catalog);
+		effect.set(this.#out.catalog, {
+			...catalog,
+			...this.#estimator.estimate,
+		});
 	}
 
 	// Collect the encode-only Opus knobs that are set, reading the codec through the effect so the
@@ -339,7 +410,7 @@ export class Encoder {
 
 	// Encode captured audio frames into whichever track producer is live. The broadcast owns the
 	// track's lifetime, so this never closes it; a fatal encoder error is reported through #fatal.
-	#encode(track: Getter<Moq.Track.Producer | undefined>, format: Format, effect: Effect): void {
+	#encode(track: Getter<Moq.Track.Producer | undefined>, baseline: Baseline, format: Format, effect: Effect): void {
 		effect.spawn(async () => {
 			// We're using an async polyfill temporarily for Safari support.
 			await Util.Libav.polyfill();
@@ -384,10 +455,17 @@ export class Encoder {
 
 						// Each audio frame is its own group so the relay can forward it without
 						// waiting for a group boundary. Loss is handled by the codec's PLC.
-						track.peek()?.writeFrame({
+						const live = track.peek();
+						if (!live) return;
+						if (this.#floor !== undefined && frame.timestamp < this.#floor) return;
+						live.writeFrame({
 							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
 							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
 						});
+						if (this.#estimator.flush(frame.timestamp, baseline)) {
+							const catalog = this.#out.catalog.peek();
+							if (catalog) this.#out.catalog.set({ ...catalog, ...this.#estimator.estimate });
+						}
 					},
 					error: (err) => {
 						console.error("encoder error", err);
@@ -404,16 +482,34 @@ export class Encoder {
 				console.debug("encoding audio", encoderConfig);
 				encoder.configure(encoderConfig);
 
+				// Where the next frame starts if it continues the last one encoded.
+				let contiguous: Time.Micro | undefined;
+
 				const pipeline: Pipeline = {
 					channelCount: config.numberOfChannels,
 					push: (captured: AudioFrame) => {
 						const input = resampler ? resampler.push(captured) : captured;
 						if (!input) return;
 
-						for (const data of framer.push(input)) {
+						const frames = framer.push(input);
+						for (const [i, data] of frames.entries()) {
 							// The demand gate. The framer still consumes every sample so its timestamps stay
 							// on the capture clock, but there is nowhere to send a chunk with no subscriber.
 							if (!track.peek()) continue;
+
+							// Round to whole microseconds once, here, so a chunk's timestamp and the marker
+							// placed at the next frame's start agree exactly.
+							const timestamp = Math.round(data.timestamp) as Time.Micro;
+
+							// Chrome stamps encoder output from the first input's timestamp plus the samples
+							// encoded since, ignoring any later jump. Across a gap (demand, or a capture
+							// discontinuity) the output would trail the capture clock by the gap, and the
+							// next demand gap's marker would then sit ahead of everything encoded after it.
+							// Restarting re-bases the output clock; the chunks it drops predate the gap.
+							if (contiguous !== undefined && timestamp !== contiguous) {
+								encoder.reset();
+								encoder.configure(encoderConfig);
+							}
 
 							const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
 							const joined = new Float32Array(joinedLength);
@@ -428,13 +524,16 @@ export class Encoder {
 								sampleRate: config.sampleRate,
 								numberOfFrames: data.channels[0].length,
 								numberOfChannels: data.channels.length,
-								timestamp: data.timestamp,
+								timestamp,
 								data: joined,
 								transfer: [joined.buffer],
 							});
 
 							encoder.encode(frame);
 							frame.close();
+							// One input can complete several frames, and the framer has already advanced past all of them.
+							contiguous = Math.round(frames[i + 1]?.timestamp ?? framer.next) as Time.Micro;
+							this.#next = contiguous;
 						}
 					},
 				};
@@ -508,8 +607,6 @@ export function resolve(captured: Format, selected: Codec): Resolved {
 				container: { kind: "legacy" } as const,
 				// Frames are raw (no ADTS header), so the decoder needs the AudioSpecificConfig to init.
 				description: Util.Hex.fromBytes(Util.Aac.audioSpecificConfig(rate, captured.channelCount)),
-				// Each AAC-LC frame is 1024 samples; report that duration as the jitter hint.
-				jitter: Catalog.u53(Math.ceil((AAC_FRAME_SAMPLES / rate) * 1000)),
 			},
 		};
 	}
@@ -528,9 +625,6 @@ export function resolve(captured: Format, selected: Codec): Resolved {
 			numberOfChannels,
 			bitrate: Catalog.u53(codec.bitrate ?? captured.channelCount * OPUS_BITRATE_PER_CHANNEL),
 			container: { kind: "legacy" } as const,
-			// jitter is an integer upper bound on how long a decoder waits for the next frame, so a
-			// 2.5ms Opus frame rounds up to 3 rather than down. The encoder uses the exact value.
-			jitter: Catalog.u53(Math.ceil(frameDuration)),
 		},
 		frameDuration: Time.Micro.fromMilli(frameDuration),
 	};

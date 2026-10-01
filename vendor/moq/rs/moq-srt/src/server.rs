@@ -29,7 +29,7 @@ use srt_tokio::access::{AccessControlList, ConnectionMode, RejectReason, Standar
 use srt_tokio::options::{PacketCount, SocketOptions, StreamId};
 use srt_tokio::{ConnectionRequest, SrtIncoming, SrtListener, SrtSocket};
 
-use crate::Result;
+use crate::{Program, Result};
 
 /// Why an SRT publish or subscribe was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +182,7 @@ pub struct Server {
 	/// Held to keep the listener (and its UDP socket) alive for the server's lifetime.
 	_listener: SrtListener,
 	incoming: SrtIncoming,
+	local_addr: SocketAddr,
 	/// The negotiated SRT receive latency, reused as the egress skip threshold on
 	/// each [`Subscribe`] (see [`crate::ts::Subscriber::new`]).
 	latency: Duration,
@@ -195,16 +196,32 @@ impl Server {
 	/// threshold for [`Subscribe`] requests.
 	pub async fn bind(addr: SocketAddr, latency: impl Into<Option<Duration>>) -> Result<Self> {
 		let latency = latency.into().unwrap_or(DEFAULT_LATENCY);
+
+		// srt-tokio refuses to listen on port 0 and never reports the port it bound,
+		// so bind the UDP socket first (with srt-tokio's own buffer sizing) and hand
+		// it over under its resolved address.
+		let mut options = SocketOptions::default();
+		options.connect.local = addr;
+		let socket = srt_tokio::bind_socket(&options).await?;
+		let local_addr = socket.local_addr()?;
+
 		let (listener, incoming) = SrtListener::builder()
+			.socket(socket)
 			.latency(latency)
 			.set(configure_buffers)
-			.bind(addr)
+			.bind(local_addr)
 			.await?;
 		Ok(Self {
 			_listener: listener,
 			incoming,
+			local_addr,
 			latency,
 		})
+	}
+
+	/// The address the listener is bound to, with any `:0` port resolved.
+	pub fn local_addr(&self) -> SocketAddr {
+		self.local_addr
 	}
 
 	/// Wait for the next connection that wants to publish or subscribe.
@@ -231,6 +248,7 @@ impl Server {
 				latency: self.latency,
 				max_age: None,
 				bandwidth: moq_net::bandwidth::Allocator::unlimited(),
+				program: None,
 			};
 
 			// `m=request` reads a broadcast out; everything else publishes one in.
@@ -263,6 +281,8 @@ struct Pending {
 	/// Connection allocator each ingested track claims its peak-hold bitrate on.
 	/// Override with [`Publish::with_bandwidth`].
 	bandwidth: moq_net::bandwidth::Allocator,
+	/// The programs of a multiplex an ingest publishes. Override with [`Publish::with_program`].
+	program: Option<Program>,
 }
 
 /// What an accepted SRT connection wants: to contribute media ([`Publish`]) or to
@@ -361,6 +381,13 @@ impl Publish {
 		self
 	}
 
+	/// Publish one program of a multi-program feed, or each as its own broadcast under the
+	/// accepted path. `None` (the default) fails an ingest whose PAT lists more than one.
+	pub fn with_program(mut self, program: impl Into<Option<Program>>) -> Self {
+		self.0.program = program.into();
+		self
+	}
+
 	/// Accept the publish: announce a broadcast at `path` in `origin` and pump the
 	/// connection's MPEG-TS into it until the client disconnects.
 	///
@@ -375,10 +402,14 @@ impl Publish {
 		let config = moq_mux::catalog::Config::default()
 			.with_max_age(self.0.max_age)
 			.with_bandwidth(self.0.bandwidth);
-		serve_publish(origin, path.as_str(), socket, config).await
+		serve_publish(origin, path.as_str(), socket, config, self.0.program).await
 	}
 
 	/// Reject the publish with a verdict the client can distinguish on the wire.
+	///
+	/// This hands the verdict to the listener rather than sending it: the [`Server`]
+	/// has to outlive the client's handshake, or the packet is never transmitted and
+	/// the client times out instead of learning why it was refused.
 	pub async fn reject(self, reason: Reject) -> Result<()> {
 		Ok(self.0.request.reject(reason.reason()).await?)
 	}
@@ -426,6 +457,9 @@ impl Subscribe {
 	}
 
 	/// Reject the subscribe with a verdict the client can distinguish on the wire.
+	///
+	/// As with a publish, the [`Server`] has to outlive the client's handshake for
+	/// the verdict to reach the wire.
 	pub async fn reject(self, reason: Reject) -> Result<()> {
 		Ok(self.0.request.reject(reason.reason()).await?)
 	}
@@ -445,10 +479,11 @@ pub(crate) async fn serve_publish(
 	path: &str,
 	mut socket: SrtSocket,
 	config: moq_mux::catalog::Config,
+	program: Option<Program>,
 ) -> Result<()> {
 	use futures::TryStreamExt;
 
-	let mut publisher = crate::ts::Publisher::new(origin, path, config)?;
+	let mut publisher = crate::ts::Publisher::new(origin, path, config, program)?;
 
 	// Run the read/feed loop so an error surfaces here instead of unwinding past
 	// the publisher, which would drop it (and its tracks) with a bare Error::Dropped.
@@ -575,7 +610,6 @@ fn parse_stream_id(stream_id: Option<&StreamId>) -> Option<(String, ConnectionMo
 mod tests {
 	use super::*;
 	use bytes::Bytes;
-	use std::net::SocketAddr;
 	use std::time::Duration;
 
 	#[test]
@@ -616,13 +650,12 @@ mod tests {
 	/// (see [`configure_buffers`]).
 	#[tokio::test]
 	async fn accepted_socket_sends_a_burst_larger_than_srt_tokio_default() {
-		let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		let addr: SocketAddr = probe.local_addr().unwrap();
-		drop(probe);
-
 		// TSBPD holds every payload for the negotiated latency before releasing it, so
 		// ask for a short one: this asserts buffering, not delay.
-		let mut server = Server::bind(addr, Duration::from_millis(50)).await.unwrap();
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), Duration::from_millis(50))
+			.await
+			.unwrap();
+		let addr = server.local_addr();
 		let caller = tokio::spawn(async move {
 			SrtSocket::builder()
 				.call(addr, Some("#!::r=buffer-test,m=request"))
@@ -874,11 +907,8 @@ mod tests {
 			}
 		}
 
-		let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		let addr: SocketAddr = probe.local_addr().unwrap();
-		drop(probe);
-
-		let mut server = Server::bind(addr, LATENCY).await.unwrap();
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap(), LATENCY).await.unwrap();
+		let addr = server.local_addr();
 		let caller = tokio::spawn(async move {
 			SrtSocket::builder()
 				.call(addr, Some("#!::r=rewind,m=request"))
@@ -943,7 +973,9 @@ mod tests {
 	/// packet with it and nothing else.
 	fn flags_a_break(payload: &[u8]) -> bool {
 		payload
-			.chunks_exact(188)
+			.as_chunks::<188>()
+			.0
+			.iter()
 			.any(|packet| packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x80 != 0)
 	}
 

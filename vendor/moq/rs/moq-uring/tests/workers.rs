@@ -5,7 +5,7 @@
 //! being told which. Whichever worker the Initial hashes to owns the
 //! connection, and the prefix keeps every later packet (handshake
 //! continuation included) on that worker; a wrong prefix stalls the
-//! handshake, so every dial completing is what proves the steering.
+//! handshake, so every dial being accepted is what proves the steering.
 //!
 //! Kernel-gated: skips loudly below the Linux 6.12 floor (GitHub-hosted CI),
 //! and runs everywhere else.
@@ -96,6 +96,9 @@ fn a_steered_group_serves_a_shared_port() {
 	// One stop each: the wakers are per-thread, so a shared slot would let one
 	// worker's registration clobber the other's.
 	let stops: Vec<Arc<Stop>> = (0..WORKERS).map(|_| Arc::new(Stop::default())).collect();
+	// Each worker reports in once serving, so a setup failure fails here
+	// instead of as the dials hashed to it idling out.
+	let (ready, started) = std::sync::mpsc::channel();
 
 	let threads: Vec<_> = members
 		.into_iter()
@@ -105,6 +108,7 @@ fn a_steered_group_serves_a_shared_port() {
 			let stop = stop.clone();
 			let cert = certs.cert.clone();
 			let key = certs.key.clone();
+			let ready = ready.clone();
 			std::thread::spawn(move || {
 				let shard = member.shard();
 				let mut worker = Worker::new(Config::default()).expect("worker");
@@ -119,19 +123,25 @@ fn a_steered_group_serves_a_shared_port() {
 					.expect("endpoint");
 
 				handle.spawn(async move {
-					// Accepted connections are dropped once counted; the
-					// client is what closes them.
-					while endpoint.accept().await.is_ok() {
+					// Each accepted connection is counted, then closed: that
+					// close is how the client learns this side accepted it.
+					while let Ok(mut conn) = endpoint.accept().await {
 						accepted[usize::from(shard.index())].fetch_add(1, Ordering::AcqRel);
+						web_transport_trait::poll::Session::close(&mut conn, 0, "done");
 					}
 				});
+				ready.send(()).expect("test alive");
 				worker.block_on(stop.wait()).expect("worker loop");
 			})
 		})
 		.collect();
+	drop(ready);
+	for _ in 0..WORKERS {
+		started.recv().expect("a worker thread failed to start");
+	}
 
-	// Dial the shared port repeatedly from one client worker. Every handshake
-	// completing is the steering assertion (see the module docs).
+	// Dial the shared port repeatedly from one client worker. Every dial being
+	// accepted is the steering assertion (see the module docs).
 	let mut client_worker = client_worker;
 	let handle = client_worker.handle();
 	let mut dial = quic::client::Config::new(addr, "localhost");
@@ -150,38 +160,30 @@ fn a_steered_group_serves_a_shared_port() {
 					Some(ALPN),
 					"negotiated ALPN"
 				);
-				web_transport_trait::poll::Session::close(&mut conn, 0, "done");
-			}
-
-			// The server side counts a connection when its accept loop takes
-			// it, which can trail the client's handshake; wait for the tally.
-			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-			loop {
-				let total: usize = accepted.iter().map(|count| count.load(Ordering::Acquire)).sum();
-				if total == DIALS {
-					break;
+				// The client's handshake completes a flight before the
+				// server's, so closing here could discard the client's Finished
+				// (still behind the pacer, say) and the server would never
+				// accept. The server's close is the proof it did.
+				match std::future::poll_fn(|cx| web_transport_trait::poll::Session::poll_closed(&mut conn, cx)).await {
+					quic::Error::App { code: 0, .. } => {}
+					other => panic!("the client saw {other:?} instead of the server's close"),
 				}
-				assert!(
-					std::time::Instant::now() < deadline,
-					"only {total} of {DIALS} dials were accepted"
-				);
-				moq_uring::Timer::after(&handle, std::time::Duration::from_millis(10))
-					.wait()
-					.await;
 			}
 		})
 		.expect("client worker");
-
-	// Every member has to have been fed, or the group is steering into a
-	// subset and the rest sit idle.
-	for (index, count) in accepted.iter().enumerate() {
-		assert!(count.load(Ordering::Acquire) > 0, "worker {index} accepted nothing");
-	}
 
 	for stop in &stops {
 		stop.stop();
 	}
 	for thread in threads {
 		thread.join().expect("worker thread");
+	}
+
+	// Every member has to have been fed, or the group is steering into a
+	// subset and the rest sit idle.
+	let total: usize = accepted.iter().map(|count| count.load(Ordering::Acquire)).sum();
+	assert_eq!(total, DIALS, "every dial is accepted exactly once");
+	for (index, count) in accepted.iter().enumerate() {
+		assert!(count.load(Ordering::Acquire) > 0, "worker {index} accepted nothing");
 	}
 }

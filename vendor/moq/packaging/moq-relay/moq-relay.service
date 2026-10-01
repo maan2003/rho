@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/moq-relay --file /etc/moq-relay/relay.toml
+ExecStart=/usr/bin/moq-relay /etc/moq-relay/relay.toml
 # Escalating restart backoff: 5s after the first failure, stepping up to a minute. A relay that
 # dies on a bad config or an unbindable port would otherwise restart every 5s forever, which buries
 # the real error under a restart loop and hammers whatever it dials. RestartSteps and
@@ -17,6 +17,9 @@ RestartSec=5s
 RestartSteps=5
 RestartMaxDelaySec=1min
 LimitNOFILE=1048576
+# io_uring workers charge their rings to RLIMIT_MEMLOCK (~56 KiB each), and hosts still on the old
+# 64 KiB default fit one worker at most.
+LimitMEMLOCK=infinity
 
 # Sandboxing. DynamicUser allocates a transient UID, StateDirectory creates
 # /var/lib/moq-relay owned by that UID so cert/key/jwk files placed there are

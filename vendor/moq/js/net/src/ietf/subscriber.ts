@@ -1,23 +1,25 @@
+import { race, Signal } from "@moq/signals";
 import * as announce from "../announced.ts";
 import * as broadcast from "../broadcast.ts";
 import { BroadcastCache } from "../consume.ts";
-import { error, ProtocolViolation, reason } from "../error.ts";
+import { closeError, controlTimeout, error, ProtocolViolation, reason, sessionCause } from "../error.ts";
 import * as netGroup from "../group.ts";
-import { Cost, type Route, routesEqual, UNKNOWN_HOP } from "../hop.ts";
-import { scopeCaptures, scopeHead, scopeOverlaps } from "../internal.ts";
+import { Cost, type Route, randomHop, routesEqual, stampHops, UNKNOWN_HOP } from "../hop.ts";
+import { hiddenBelow, hooks, scopeCaptures, scopeHead, scopeOverlaps } from "../internal.ts";
 import * as Path from "../path.ts";
-import type { Reader, Stream } from "../stream.ts";
+import type { Cursor, Reader, Stream } from "../stream.ts";
+import { Tail } from "../tail.ts";
 import { type Timescale, Timestamp } from "../time.ts";
 import type * as track from "../track.ts";
-import { withTimeout } from "../util/timeout.ts";
+import { TimeoutError, withTimeout } from "../util/timeout.ts";
 import { overrideBroadcastWire, wireOf } from "../wire.ts";
 import type { Session } from "./adapter.ts";
 import { DuplicateTrackAlias, RetiredTrackAlias, TrackAliases } from "./aliases.ts";
 import * as Cluster from "./cluster.ts";
 import { requestReason, toRequestCode } from "./error.ts";
 import { Frame, type Group as GroupMessage } from "./object.ts";
-import { toWire } from "./priority.ts";
-import { type Publish, PublishError } from "./publish.ts";
+import { fromWire, toWire } from "./priority.ts";
+import { type Publish, PublishDone, PublishError, publishDoneClean } from "./publish.ts";
 import {
 	type PublishNamespace,
 	PublishNamespaceDone,
@@ -42,6 +44,17 @@ import { Version } from "./version.ts";
 // concurrent QUIC streams (Chrome ~100); past the cap openBi() silently
 // blocks. The timeout turns that into a clear error.
 const SUBSCRIBE_OK_TIMEOUT_MS = 10_000;
+
+// A live subscription, as the track alias its data streams name resolves to.
+type Subscription = {
+	// The write side incoming group streams are routed into.
+	track: track.Producer;
+	// The group streams received, so the subscription can wait for the ones PUBLISH_DONE
+	// says are still owed.
+	tail: Tail;
+	// The track's exclusive end, once an END_OF_TRACK declares it.
+	end?: number;
+};
 
 // Out-parameter for #openSubscribe: lets the caller observe partial progress
 // (stream opened, trackAlias registered) so it can clean up on timeout even
@@ -69,6 +82,14 @@ type SubscribeSetupState = {
 	rejected?: boolean;
 };
 
+/** A local announce reader's filter: its scope, the prefix it asked for, and its hidden opt-in. */
+type Filter = { scope: Path.Pattern; prefix: Path.Valid; hidden: boolean };
+
+/** Whether a reader with `filter` sees an announcement at `path`. */
+function sees(filter: Filter, path: Path.Valid): boolean {
+	return scopeOverlaps(filter.scope, path) && (filter.hidden || !hiddenBelow(filter.prefix, path));
+}
+
 /**
  * Handles subscribing to broadcasts using moq-transport protocol.
  * Uses the stream-per-request pattern (real bidi streams for v17, virtual for v14-v16).
@@ -78,13 +99,17 @@ type SubscribeSetupState = {
 export class Subscriber {
 	#session: Session;
 
+	// The transport, so a request cut off by the session's close ends with the session's
+	// error. Optional for tests that drive a bare session.
+	#quic?: WebTransport;
+
 	// The Hop IDs this session declared; see {@link Cluster}. What the peer declared is what
 	// says whether an advertisement carries a hop path, and ours is what a path looping back
 	// to us contains.
 	#cluster?: Cluster.Hops;
 
 	// Publisher-chosen aliases used by incoming group streams.
-	#aliases = new TrackAliases<track.Producer>();
+	#aliases = new TrackAliases<Subscription>();
 
 	// Units for each track's object Timestamps, from the TIMESCALE Track Property in
 	// SUBSCRIBE_OK. A track missing from this map declared no timeline, so the publisher
@@ -93,6 +118,10 @@ export class Subscriber {
 
 	// Dedup consumed broadcasts per path: repeat consume() calls share one subscription.
 	#consumes = new BroadcastCache();
+
+	// A random Hop ID of this connection's own, written as the first hop of any path that
+	// names no publisher, so a publisher that reconnects reads as a new one.
+	#stamp = randomHop();
 
 	// Paths with a legacy PUBLISH_NAMESPACE request in flight, reserved synchronously.
 	// The count below is only taken once the OK is written, and two requests that both
@@ -109,7 +138,10 @@ export class Subscriber {
 	#announced = new Map<Path.Valid, { count: number; route: Route }>();
 
 	// Any consumers that want each new announcement, keyed by their local filter.
-	#announcedConsumers = new Map<announce.Producer, Path.Pattern>();
+	#announcedConsumers = new Map<announce.Producer, Filter>();
+
+	// Whether the peer understands the HIDDEN parameter (MoQ Hidden).
+	#hidden: boolean;
 
 	/**
 	 * Creates a new Subscriber instance.
@@ -118,15 +150,23 @@ export class Subscriber {
 	 */
 	constructor({
 		session,
+		quic,
 		cluster,
+		hidden = false,
 	}: {
 		/** The session abstraction for bidi streams and request IDs. */
 		session: Session;
+		/** The transport the session runs on. */
+		quic?: WebTransport;
 		/** The Hop IDs the SETUP exchange settled (MoQ Cluster). */
 		cluster?: Cluster.Hops;
+		/** Whether the peer understands the HIDDEN parameter (MoQ Hidden). */
+		hidden?: boolean;
 	}) {
 		this.#session = session;
+		this.#quic = quic;
 		this.#cluster = cluster;
+		this.#hidden = hidden;
 	}
 
 	/**
@@ -141,10 +181,16 @@ export class Subscriber {
 		return advert !== undefined && this.#cluster !== undefined && Cluster.loops(advert, this.#cluster.self);
 	}
 
-	/** The route an advertisement carries; one without a path is anonymous and free. */
+	/**
+	 * The route an advertisement carries; one without a path is free. A path that names no
+	 * publisher, or none at all, gets this connection's stamp in front of a 0.
+	 */
 	#route(advert: Cluster.Advert | undefined): Route {
-		if (advert === undefined) return { hops: [UNKNOWN_HOP], cost: Cost.zero };
-		return { hops: advert.hops, cost: { warm: advert.cost, cold: advert.cost } };
+		if (advert === undefined) return { hops: [this.#stamp, UNKNOWN_HOP], cost: Cost.zero };
+		// A full chain, or a stamp colliding with an entry (a 1-in-2^53 draw), keeps the
+		// path as sent.
+		const hops = stampHops(advert.hops, this.#stamp) ?? [...advert.hops];
+		return { hops, cost: { warm: advert.cost, cold: advert.cost } };
 	}
 
 	/**
@@ -154,13 +200,19 @@ export class Subscriber {
 	 * The peer is asked with SUBSCRIBE_NAMESPACE regardless of what it declared, and an
 	 * unsolicited PUBLISH_NAMESPACE lands here too, so a peer that only tells and one
 	 * that only answers are both discovered.
+	 *
+	 * Hidden routes (a `.`-prefixed segment below the scope's head) are left out unless
+	 * `options.hidden` opts in. The opt-in rides the SUBSCRIBE_NAMESPACE when the peer
+	 * understands it (MoQ Hidden); the rule is also applied here, since an unsolicited
+	 * PUBLISH_NAMESPACE or a peer that never heard of it hides nothing.
 	 */
-	announced(scope: Path.Pattern = Path.Pattern.all()): announce.Consumer {
+	announced(scope: Path.Pattern = Path.Pattern.all(), options?: announce.Options): announce.Consumer {
 		// The wire speaks announce interest by prefix.
 		const prefix = scopeHead(scope);
+		const filter = { scope, prefix, hidden: options?.hidden ?? false };
 		const announced = new announce.Producer();
 		for (const [active, info] of this.#announced) {
-			if (!scopeOverlaps(scope, active)) continue;
+			if (!sees(filter, active)) continue;
 			announced.append({
 				prefix: active,
 				captures: scopeCaptures(scope, active),
@@ -168,9 +220,9 @@ export class Subscriber {
 				route: info.route,
 			});
 		}
-		this.#announcedConsumers.set(announced, scope);
+		this.#announcedConsumers.set(announced, filter);
 
-		void this.#runAnnounced(announced, prefix).finally(() => {
+		void this.#runAnnounced(announced, prefix, filter.hidden && this.#hidden).finally(() => {
 			this.#announcedConsumers.delete(announced);
 			announced.close();
 		});
@@ -191,8 +243,9 @@ export class Subscriber {
 		this.#announced.set(path, { count: 1, route });
 
 		console.debug(`announced: broadcast=${path} active=true`);
-		for (const [consumer, scope] of this.#announcedConsumers) {
-			if (!scopeOverlaps(scope, path)) continue;
+		for (const [consumer, filter] of this.#announcedConsumers) {
+			if (!sees(filter, path)) continue;
+			const scope = filter.scope;
 			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "announced", route });
 		}
 	}
@@ -201,14 +254,19 @@ export class Subscriber {
 	 * Replace the stored route for a path that is already announced. A no-op when the
 	 * hops and cost did not change; otherwise consumers hear `updated` so a forwarder
 	 * can reprice without retracting.
+	 *
+	 * A new first hop is a new publisher: holders keep their broadcast to drain, but the
+	 * next consume starts fresh rather than reusing the old publisher's cached track info.
 	 */
 	#updateAnnounce(path: Path.Valid, route: Route) {
 		const existing = this.#announced.get(path);
 		if (existing === undefined || routesEqual(existing.route, route)) return;
+		if (existing.route.hops[0] !== route.hops[0]) this.#consumes.evict(path);
 		existing.route = route;
 		console.debug(`announced: broadcast=${path} rerouted`);
-		for (const [consumer, scope] of this.#announcedConsumers) {
-			if (!scopeOverlaps(scope, path)) continue;
+		for (const [consumer, filter] of this.#announcedConsumers) {
+			if (!sees(filter, path)) continue;
+			const scope = filter.scope;
 			consumer.append({ prefix: path, captures: scopeCaptures(scope, path), kind: "updated", route });
 		}
 	}
@@ -231,8 +289,9 @@ export class Subscriber {
 		this.#consumes.evict(path);
 		console.debug(`announced: broadcast=${path} active=false`);
 
-		for (const [consumer, scope] of this.#announcedConsumers) {
-			if (!scopeOverlaps(scope, path)) continue;
+		for (const [consumer, filter] of this.#announcedConsumers) {
+			if (!sees(filter, path)) continue;
+			const scope = filter.scope;
 			try {
 				consumer.append({
 					prefix: path,
@@ -246,7 +305,7 @@ export class Subscriber {
 		}
 	}
 
-	async #runAnnounced(announced: announce.Producer, prefix: Path.Valid) {
+	async #runAnnounced(announced: announce.Producer, prefix: Path.Valid, hidden: boolean) {
 		const version = this.#session.version;
 
 		// Suffixes live on this stream, so a repeat is recognized as an update to the
@@ -283,10 +342,16 @@ export class Subscriber {
 					version === Version.DRAFT_17
 				) {
 					await stream.writer.u53(SubscribeNamespaceLegacy.id);
-					await new SubscribeNamespaceLegacy({ namespace: prefix, requestId }).encode(stream.writer, version);
+					await new SubscribeNamespaceLegacy({ namespace: prefix, requestId, hidden }).encode(
+						stream.writer,
+						version,
+					);
 				} else {
 					await stream.writer.u53(SubscribeNamespace.id);
-					await new SubscribeNamespace({ namespace: prefix, requestId }).encode(stream.writer, version);
+					await new SubscribeNamespace({ namespace: prefix, requestId, hidden }).encode(
+						stream.writer,
+						version,
+					);
 				}
 				console.debug(`subscribe_namespace written: requestId=${requestId}`);
 
@@ -365,7 +430,7 @@ export class Subscriber {
 				});
 
 				// Wait for either the read loop or the announced to close
-				await Promise.race([readLoop, announced.closed]);
+				await race([readLoop, announced.closed]);
 
 				// For v14/v15: send UnsubscribeNamespace before closing
 				if (version === Version.DRAFT_14 || version === Version.DRAFT_15) {
@@ -438,32 +503,47 @@ export class Subscriber {
 		return consumer;
 	}
 
+	// The adapter is gone. If the transport has already closed, that close is the
+	// error. A still-open transport, such as a GOAWAY drain, has no peer code yet,
+	// so this does not wait for it.
+	async #closedSession(): Promise<Error> {
+		const quic = this.#quic;
+		if (!quic) return new Error("session closed");
+		return Promise.race([
+			closeError(quic),
+			new Promise<Error>((resolve) => queueMicrotask(() => resolve(new Error("session closed")))),
+		]);
+	}
+
 	async #runSubscribe(broadcast: Path.Valid, request: track.Request) {
 		const requestId = await this.#session.nextRequestId();
 		if (requestId === undefined) {
-			request.reject(new Error("session closed"));
+			request.reject(await this.#closedSession());
 			return;
 		}
 
 		console.debug(`subscribe start: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 
-		// IETF negotiates group order in SUBSCRIBE_OK; this implementation only supports
-		// descending (newest-first), which is what moq-lite fixes group order to, so the
-		// mapping needs nothing here. (There's no per-frame timescale either, so every
-		// property stays at its default.) This resolves the consumer's track.info() and
-		// gives us the write side that incoming object streams are routed into.
-		const producer = request.accept({});
+		// Keep the request pending until SUBSCRIBE_OK supplies immutable track metadata.
+		// Group streams already wait on the alias, so early data stays behind this response.
+		const producer = hooks.pendingTrackProducer(request);
+		const subscription: Subscription = { track: producer, tail: new Tail() };
 
 		// Open the stream and wait for SUBSCRIBE_OK under a timeout. State
 		// flows back via `state` so the timeout path can clean up the stream
 		// and any registration if setup eventually finishes.
 		const state: SubscribeSetupState = {};
-		const setup = this.#openSubscribe(state, broadcast, request, producer, requestId);
+		const setup = this.#openSubscribe(state, broadcast, request, subscription, requestId);
 
 		// The publisher can be serving before it answers, so waiting only on the response
 		// would miss the local side going away and leave it serving a track nobody reads.
 		// Demand returning before we commit is not abandonment, matching the serving loop.
 		const waitAbandoned = async (): Promise<null> => {
+			// An info-only lookup attaches no subscriber yet still waits on SUBSCRIBE_OK for
+			// the track info, so only demand that arrived and then left is abandonment.
+			while (!producer.used.peek() && producer.closed.peek() === undefined) {
+				await Signal.race(producer.used, producer.closed);
+			}
 			for (;;) {
 				await producer.unused();
 				if (producer.closed.peek() !== undefined || !producer.used.peek()) return null;
@@ -473,7 +553,7 @@ export class Subscriber {
 		let stream: Stream;
 		let trackAlias: bigint;
 		try {
-			const result = await Promise.race([
+			const result = await race([
 				withTimeout(
 					setup,
 					SUBSCRIBE_OK_TIMEOUT_MS,
@@ -488,8 +568,9 @@ export class Subscriber {
 			trackAlias = result.alias;
 			console.debug(`subscribe ok: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 		} catch (err) {
-			const e = error(err);
-			producer.close(e);
+			// A control request that timed out is not late content, so it carries its own code.
+			const e = err instanceof TimeoutError ? controlTimeout(err) : await sessionCause(this.#quic, err);
+			request.reject(e);
 			console.warn(
 				`subscribe error: id=${requestId} broadcast=${broadcast} track=${request.name} error=${reason(e)}`,
 			);
@@ -500,7 +581,7 @@ export class Subscriber {
 			const cleanup = async (afterSetup: boolean) => {
 				state.cancelled = true;
 
-				if (state.registeredAlias !== undefined && this.#aliases.retire(state.registeredAlias, producer)) {
+				if (state.registeredAlias !== undefined && this.#aliases.retire(state.registeredAlias, subscription)) {
 					this.#timescales.delete(state.registeredAlias);
 				}
 
@@ -541,10 +622,10 @@ export class Subscriber {
 			const localEnded = Symbol("local");
 			const idle = Symbol("idle");
 
-			// Terminal conditions settle at most once (stream close = PublishDone, track close =
-			// local unsubscribe); race them once so the demand loop doesn't re-subscribe each pass.
-			const done = Promise.race([
-				stream.reader.closed.then(() => publisherEnded),
+			// Terminal conditions settle at most once (PublishDone, track close = local
+			// unsubscribe); race them once so the demand loop doesn't re-subscribe each pass.
+			const done = race([
+				this.#runPublishDone(stream, subscription).then(() => publisherEnded),
 				producer.closed.then(() => localEnded),
 			]);
 
@@ -553,7 +634,7 @@ export class Subscriber {
 			// down resumes on the same stream.
 			let terminal = localEnded;
 			for (;;) {
-				const reason = await Promise.race([done, producer.unused().then(() => idle)]);
+				const reason = await race([done, producer.unused().then(() => idle)]);
 				if (reason === idle && producer.closed.peek() === undefined && producer.used.peek()) continue;
 				terminal = reason;
 				break;
@@ -572,7 +653,7 @@ export class Subscriber {
 			stream.close();
 			console.debug(`subscribe close: id=${requestId} broadcast=${broadcast} track=${request.name}`);
 		} catch (err) {
-			const e = error(err);
+			const e = await sessionCause(this.#quic, err);
 			producer.close(e);
 			stream.abort(e);
 			console.warn(
@@ -581,8 +662,35 @@ export class Subscriber {
 		} finally {
 			// Only the owner tears down the alias metadata: a later subscription may have
 			// reclaimed the alias and installed its own timescale.
-			if (this.#aliases.retire(trackAlias, producer)) this.#timescales.delete(trackAlias);
+			if (this.#aliases.retire(trackAlias, subscription)) this.#timescales.delete(trackAlias);
 		}
+	}
+
+	/**
+	 * Read the PUBLISH_DONE that ends a subscription, then wait for the data streams it counts.
+	 *
+	 * An error status aborts the track with it. A clean one leaves streams in flight, since
+	 * QUIC does not order them, so wait until the Stream Count many have been read, or a
+	 * bounded grace for the ones that never arrive (the draft says to use a timeout). The count
+	 * is only a hint: a peer may send 0 regardless, so 0 waits out the grace. A request
+	 * stream that FINs without PUBLISH_DONE is a protocol violation.
+	 */
+	async #runPublishDone(stream: Stream, subscription: Subscription): Promise<void> {
+		const version = this.#session.version;
+		if (await stream.reader.done()) throw new ProtocolViolation("subscribe stream ended without PUBLISH_DONE");
+		const typeId = await stream.reader.u53();
+		if (typeId !== PublishDone.id) {
+			throw new ProtocolViolation(`unexpected message on a subscription: 0x${typeId.toString(16)}`);
+		}
+		const done = await PublishDone.decode(stream.reader, version);
+		if (!publishDoneClean(done.statusCode, version)) {
+			throw new Error(`publish done: status=0x${done.statusCode.toString(16)} reason=${done.reasonPhrase}`);
+		}
+		const count = done.streamCount;
+
+		const { tail, track } = subscription;
+		const complete = () => count > 0n && BigInt(tail.streams) >= count;
+		await tail.settle(complete, track.closed);
 	}
 
 	/**
@@ -614,7 +722,7 @@ export class Subscriber {
 		state: SubscribeSetupState,
 		broadcast: Path.Valid,
 		request: track.Request,
-		producer: track.Producer,
+		subscription: Subscription,
 		requestId: bigint,
 	): Promise<{ stream: Stream; alias: bigint }> {
 		const version = this.#session.version;
@@ -668,9 +776,11 @@ export class Subscriber {
 		}
 
 		const ok = await SubscribeOk.decode(state.stream.reader, version);
+		if (state.cancelled) throw new Error("subscribe cancelled before acceptance");
+		request.accept({ priority: fromWire(ok.properties.priority ?? 128) });
 
 		try {
-			this.#aliases.set(ok.trackAlias, producer, { broadcast, name: request.name });
+			this.#aliases.set(ok.trackAlias, subscription, { broadcast, name: request.name });
 			const timescale = ok.properties.timescale;
 			if (timescale !== undefined) {
 				this.#timescales.set(ok.trackAlias, timescale);
@@ -801,20 +911,7 @@ export class Subscriber {
 						throw new ProtocolViolation("cluster parameters on a session that negotiated none");
 					}
 				} else {
-					// A different original publisher is a different advertisement, which the
-					// draft has withdrawn and made again: its content is not continuous with
-					// what is held. Refusing the update closes the stream, which is that
-					// withdrawal.
-					if (update.update.hops !== undefined && update.update.hops[0] !== held.hops[0]) {
-						console.warn(`publish_namespace update changes the publisher: broadcast=${path}`);
-						await stream.writer.u53(RequestError.id);
-						await new RequestError({
-							errorCode: toRequestCode("not_supported", "publish_namespace", version),
-							reasonPhrase: "a new publisher is a new advertisement",
-						}).encode(stream.writer, version);
-						stream.close();
-						return;
-					}
+					// A different original publisher applies in place too, as it does inline.
 					held = Cluster.apply(held, update.update);
 				}
 
@@ -899,46 +996,10 @@ export class Subscriber {
 			throw new Error("subgroups are not supported");
 		}
 
-		// FIRST_OBJECT clear says this stream starts partway through the group, which the
-		// draft lets a publisher do to answer a filter. Nothing above here can use it: the
-		// objects that would arrive are not decodable without the missing head, and a group
-		// is the unit an application resyncs on. Drop it and pick up at the next group, the
-		// same degradation as a publisher that no longer holds the head.
-		//
-		// This only saves reading a stream we would throw away. The bit is the publisher's
-		// claim, so what is enforced is the object ids themselves: `Frame.decode` holds every
-		// object to starting at 0 and incrementing by 1, whatever the header said and on the
-		// drafts that have no such bit to read.
-		if (!group.flags.firstObject) {
-			console.debug(`dropping a group with no head: alias=${group.trackAlias} group=${group.groupId}`);
-			stream.stop(new Error("a group must start at object 0"));
-			return;
-		}
-
-		const producer = new netGroup.Producer(group.groupId);
-
+		let subscription: Subscription;
 		try {
 			// The control message establishing this alias can arrive after the data stream.
-			const track = await this.#aliases.get(group.trackAlias);
-
-			track.writeGroup(producer);
-
-			for (;;) {
-				const done = await Promise.race([stream.done(), producer.closed, track.closed]);
-				if (done !== false) break;
-
-				const frame = await Frame.decode(
-					stream,
-					group.flags,
-					this.#timescales.get(group.trackAlias),
-					this.#session.version,
-				);
-				if (frame.payload === undefined) break;
-
-				producer.writeFrame({ payload: frame.payload, timestamp: frame.timestamp ?? Timestamp.now() });
-			}
-
-			producer.close();
+			subscription = await this.#aliases.get(group.trackAlias);
 		} catch (err: unknown) {
 			const e = error(err);
 			// Ours: we cancelled the subscription and the publisher has not stopped yet.
@@ -947,8 +1008,103 @@ export class Subscriber {
 			if (e instanceof RetiredTrackAlias) {
 				console.debug(`dropping group for a cancelled subscription: alias=${group.trackAlias}`);
 			}
-			producer.close(e);
 			stream.stop(e);
+			return;
+		}
+
+		const { track, tail } = subscription;
+		// Every data stream counts toward PUBLISH_DONE's Stream Count, even one dropped below.
+		const read = tail.open(group.groupId);
+
+		// Created on the first object rather than the header: an END_OF_TRACK at object 0
+		// means the group does not exist at all.
+		let producer: netGroup.Producer | undefined;
+		const open = () => {
+			if (!producer) {
+				// The publisher contradicted its own end, which no later group can repair.
+				if (subscription.end !== undefined && group.groupId >= subscription.end) {
+					throw new ProtocolViolation(
+						`group ${group.groupId} is at or past the declared end ${subscription.end}`,
+					);
+				}
+				producer = new netGroup.Producer(group.groupId);
+				track.writeGroup(producer);
+			}
+			return producer;
+		};
+
+		try {
+			// FIRST_OBJECT clear says this stream starts partway through the group, which the
+			// draft lets a publisher do to answer a filter. Nothing above here can use it: the
+			// objects that would arrive are not decodable without the missing head, and a group
+			// is the unit an application resyncs on. Drop it and pick up at the next group, the
+			// same degradation as a publisher that no longer holds the head.
+			//
+			// This only saves reading a stream we would throw away. The bit is the publisher's
+			// claim, so what is enforced is the object ids themselves: `Frame.decode` holds every
+			// object to starting at 0 and incrementing by 1, whatever the header said and on the
+			// drafts that have no such bit to read.
+			if (!group.flags.firstObject) {
+				console.debug(`dropping a group with no head: alias=${group.trackAlias} group=${group.groupId}`);
+				stream.stop(new Error("a group must start at object 0"));
+				return;
+			}
+
+			// The alias binds after SUBSCRIBE_OK commits the track property; an omitted
+			// header priority inherits it (draft-21 section 10.4).
+			if (!group.flags.hasPriority) group.publisherPriority = toWire((await track.info()).priority);
+
+			const decode = (c: Cursor) => Frame.decode(c, group.flags, this.#timescales.get(group.trackAlias));
+			for (;;) {
+				// Every object already buffered is written without an await, so the reader wakes
+				// once per batch rather than once per object. Only the group's own stream ends it:
+				// a track that closes first has already closed (or aborted) this group through its
+				// cache.
+				const frame =
+					stream.tryDecode(decode) ??
+					(await (producer
+						? race([stream.decodeMaybe(decode), producer.closed])
+						: stream.decodeMaybe(decode)));
+				if (!frame || frame instanceof Error) break;
+
+				if (frame.endOfTrack) {
+					// No object at or past this location exists: after the group's last object
+					// the track ends with it, and at object 0 it ends before it.
+					const end = producer ? group.groupId + 1 : group.groupId;
+					producer?.close();
+					try {
+						track.finishAt(end);
+					} catch (err: unknown) {
+						throw new ProtocolViolation(`invalid END_OF_TRACK: ${reason(error(err))}`);
+					}
+					subscription.end ??= end;
+					return;
+				}
+				if (frame.payload === undefined) break;
+
+				open().writeFrame({ payload: frame.payload, timestamp: frame.timestamp ?? Timestamp.now() });
+			}
+
+			// A group with no objects still exists.
+			open().close();
+		} catch (err: unknown) {
+			const e = error(err);
+			if (e instanceof ProtocolViolation) {
+				// The publisher broke the track's end, which no later group can repair.
+				producer?.close(e);
+				track.close(e);
+			} else {
+				// A stream that fails before its first object still names a group, which the
+				// reader sees fail rather than silently go missing.
+				try {
+					open().close(e);
+				} catch {
+					// The track has already closed or ended below this group.
+				}
+			}
+			stream.stop(e);
+		} finally {
+			read();
 		}
 	}
 }

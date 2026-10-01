@@ -24,14 +24,13 @@ pub(crate) enum Event {
 ///
 /// Groups can arrive on the wire out of order. The consumer always reads frames *within*
 /// a group in arrival order, but across groups it advances by sequence number, skipping
-/// stalled or missing groups when the difference between the oldest pending timestamp
-/// and the newest available timestamp exceeds the configured max age. With the default
-/// max age of zero, the consumer skips aggressively. Any group that has a newer
-/// alternative is dropped. With a non-zero max age, slow groups are tolerated up to that
-/// budget before being skipped. A missing sequence gets the same tolerance: there is no
-/// way to tell a stream that lost the delivery race from one the cache evicted, so the
-/// consumer waits for it until everything it could still present (bounded by where the
-/// next group begins) falls a full budget behind the newest content.
+/// a stalled or missing group once everything it could still present (bounded by where
+/// the next group begins) falls a full budget behind the newest content, the same reach
+/// [`moq_net::track::Subscription::max_age`] measures. With the default max age of zero,
+/// the consumer skips aggressively: any group that has a newer alternative is dropped.
+/// With a non-zero max age, slow groups are tolerated up to that budget before being
+/// skipped. A missing sequence gets the same tolerance: there is no way to tell a stream
+/// that lost the delivery race from one the cache evicted.
 ///
 /// Delivery starts at the [`Subscription::start`](moq_net::track::Subscription::start)
 /// floor when one is named, waiting for that group under the budget; without one it
@@ -257,6 +256,12 @@ impl<F: Container> Consumer<F> {
 						// group live or cleanly finished. A decode error is real and the caller
 						// must see it, not have the group silently dropped.
 						if !group.poll_aborted(waiter) {
+							tracing::warn!(
+								track = self.track.name(),
+								group = group.group.sequence,
+								error = ?e,
+								"group payload failed to decode; ending the reader"
+							);
 							return Poll::Ready(Err(e));
 						}
 						// The group aged out of the relay cache (`Error::Old`) or was otherwise
@@ -264,7 +269,12 @@ impl<F: Container> Consumer<F> {
 						// evicted alongside it, so jump straight to that group instead of
 						// stepping one-by-one and then blocking on a sequence gap of groups
 						// that will never arrive.
-						tracing::warn!(error = ?e, "current group evicted; skipping to next buffered group");
+						tracing::warn!(
+							track = self.track.name(),
+							group = group.group.sequence,
+							error = ?e,
+							"current group evicted; skipping to next buffered group"
+						);
 						self.pending.pop_front();
 						self.current = self.pending.front().map_or(self.current + 1, |g| g.sequence);
 						continue 'read;
@@ -286,17 +296,16 @@ impl<F: Container> Consumer<F> {
 				}
 			}
 
-			// Get the current group's min timestamp (the reference for age
-			// comparison) and its furthest presentation point (timestamp + duration).
-			let (oldest_timestamp, current_end) = if let Some(current) = self.pending.front_mut()
+			// The current group's furthest presentation point (timestamp + duration).
+			let current_end = if let Some(current) = self.pending.front_mut()
 				&& current.sequence <= self.current
 			{
 				match current.poll_min_timestamp(waiter, &self.format) {
-					Poll::Ready(Ok(ts)) => (Some(std::time::Duration::from(ts)), current.max_end),
-					_ => (None, None),
+					Poll::Ready(Ok(_)) => current.max_end,
+					_ => None,
 				}
 			} else {
-				(None, None)
+				None
 			};
 
 			// Find the first newer group with data (our skip target) and where it starts.
@@ -348,24 +357,18 @@ impl<F: Container> Consumer<F> {
 				continue;
 			}
 
-			let should_skip = if let Some((_, next_start)) = next_group {
-				if let Some(oldest) = oldest_timestamp {
-					// Current group is blocking. Skip if newer groups have pulled past
-					// the max age budget, or if the current group has already presented
-					// up to where the next group begins (duration coverage) so there's
-					// nothing left worth waiting for.
-					let over_max_age = max_timestamp.saturating_sub(oldest) >= self.max_age;
-					let covered = current_end.is_some_and(|end| end >= next_start);
-					over_max_age || covered
-				} else {
-					// The current group has arrived but has no frame yet. Its content
-					// is bounded by where the next stamped group begins the same way a
-					// missing one's is, so give it the same budget before giving up.
-					max_timestamp.saturating_sub(next_start) >= self.max_age
-				}
-			} else {
-				false
-			};
+			// The current group is blocking. Everything it could still present ends
+			// where the next group begins, so skip once that reach falls a full budget
+			// behind the newest content, the same measure as a missing group. Its own
+			// first frame is no bound: a group longer than the budget would be cut
+			// short whenever it blocks behind a newer one, as a join's backlog does
+			// while the newer groups race ahead on their own streams. Skip early too
+			// once it has presented up to where the next group begins (duration
+			// coverage), since nothing is left worth waiting for.
+			let should_skip = next_group.is_some_and(|(_, next_start)| {
+				max_timestamp.saturating_sub(next_start) >= self.max_age
+					|| current_end.is_some_and(|end| end >= next_start)
+			});
 
 			if let Some((new_idx, next_start)) = next_group
 				&& should_skip
@@ -428,7 +431,17 @@ impl<F: Container> Consumer<F> {
 	// Returns Pending until all groups have been consumed.
 	fn poll_read_finish(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), F::Error>> {
 		loop {
-			let Some(group) = ready!(self.track.poll_recv_group(waiter)?) else {
+			// The whole track is gone, so there is no group to skip to and the reader ends. Log it
+			// here: the caller only gets the bare error, with nothing to say which track died.
+			let next = match ready!(self.track.poll_recv_group(waiter)) {
+				Ok(next) => next,
+				Err(err) => {
+					tracing::warn!(track = self.track.name(), error = ?err, "track failed; ending the reader");
+					return Poll::Ready(Err(err.into()));
+				}
+			};
+
+			let Some(group) = next else {
 				// Track is finished.
 				return Poll::Ready(Ok(()));
 			};
@@ -1084,6 +1097,62 @@ mod tests {
 		finisher.await.expect("finisher task panicked");
 	}
 
+	/// A group longer than the budget that blocks for a moment behind a newer group is
+	/// not cut short while what it could still present (up to where the newer group
+	/// begins) is within the budget. A join's backlog does exactly this: the newer group
+	/// races ahead on its own stream while the older one is still arriving.
+	#[test]
+	fn a_long_group_blocked_behind_a_newer_one_is_not_cut_short() {
+		let waiter = kio::Waiter::noop();
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = container_max_age_only(track.subscribe(None), Duration::from_secs(2));
+		let write = |group: &mut moq_net::group::Producer, timestamp: Timestamp| {
+			let frame = Frame {
+				timestamp,
+				payload: Bytes::from_static(&[0xDE, 0xAD]),
+				keyframe: false,
+				duration: None,
+			};
+			Container::Legacy(crate::container::Kind::Data)
+				.write(group, &[frame])
+				.unwrap();
+		};
+		let read = |consumer: &mut Consumer<Container>| match consumer.poll_read(&waiter) {
+			Poll::Ready(Ok(Some(frame))) => Some(frame.timestamp),
+			Poll::Pending => None,
+			other => panic!(
+				"unexpected read: {:?}",
+				other.map(|r| r.map(|f| f.map(|f| f.timestamp)))
+			),
+		};
+
+		// A 2.5 s group, half arrived, and the next one already 0.5 s in.
+		let mut group0 = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		write(&mut group0, ts(0));
+		write(&mut group0, ts(500_000));
+		let mut group1 = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		write(&mut group1, ts(2_500_000));
+		write(&mut group1, ts(3_000_000));
+
+		assert_eq!(read(&mut consumer), Some(ts(0)));
+		assert_eq!(read(&mut consumer), Some(ts(500_000)));
+		// Group 0's reach (2.5 s) is 0.5 s behind the newest frame: wait for it.
+		assert_eq!(read(&mut consumer), None, "cut group 0 short");
+		write(&mut group0, ts(1_000_000));
+		assert_eq!(read(&mut consumer), Some(ts(1_000_000)));
+		group0.finish().unwrap();
+		assert_eq!(read(&mut consumer), Some(ts(2_500_000)));
+
+		// Once the reach falls a full budget behind, the stalled group is skipped.
+		let mut group2 = track.create_group(moq_net::group::Info { sequence: 2 }).unwrap();
+		write(&mut group2, ts(5_000_000));
+		write(&mut group2, ts(7_000_000));
+		assert_eq!(read(&mut consumer), Some(ts(3_000_000)));
+		assert_eq!(read(&mut consumer), Some(ts(5_000_000)));
+		group1.finish().unwrap();
+		group2.finish().unwrap();
+	}
+
 	// ---- Malformed rewind ----
 
 	#[tokio::test]
@@ -1319,7 +1388,7 @@ mod tests {
 		assert_eq!(micros, vec![0, 100_000], "markers skipped, next group reached");
 	}
 
-	/// LOC consumers skip an empty payload so later producers can write the duration marker.
+	/// LOC video consumers skip an empty payload: it is the duration marker, not media.
 	#[tokio::test]
 	async fn loc_empty_payload_is_skipped() {
 		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));

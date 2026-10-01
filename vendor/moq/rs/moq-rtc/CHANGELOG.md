@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.8...moq-rtc-v0.3.9) - 2026-09-30
+
+### Fixed
+
+- *(rtc)* redact WHIP and WHEP client URLs in logs ([#4457](https://github.com/moq-dev/moq/pull/4457))
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.7...moq-rtc-v0.3.8) - 2026-09-27
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.6...moq-rtc-v0.3.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.5...moq-rtc-v0.3.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.5](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.4...moq-rtc-v0.3.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.3.4](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.3...moq-rtc-v0.3.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.3](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.2...moq-rtc-v0.3.3) - 2026-09-25
+
+### Added
+
+- *(gateway)* expose the loop and handler the gateway binaries run ([#3964](https://github.com/moq-dev/moq/pull/3964))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.1...moq-rtc-v0.3.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-rtc-v0.3.0...moq-rtc-v0.3.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-tokio, hang, moq-mux
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-rtc-v0.2.11...moq-rtc-v0.3.0) - 2026-09-23
+
+### Added
+
+- *(gateway)* [**breaking**] align embedding APIs ([#3818](https://github.com/moq-dev/moq/pull/3818))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+
+### Other
+
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- Merge origin/main into dev
+
 ## [0.2.11](https://github.com/moq-dev/moq/compare/moq-rtc-v0.2.10...moq-rtc-v0.2.11) - 2026-09-17
 
 ### Other

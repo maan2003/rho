@@ -20,6 +20,7 @@ import {
 	type WebTransportProps as WebTransportPropsType,
 } from "./connect.ts";
 import type { Established as EstablishedType } from "./established.ts";
+import type { GoawayProps, Redirect as RedirectType } from "./goaway.ts";
 import { Reload, type ReloadDelay, type ReloadStatus } from "./reload.ts";
 import type { Probe as ProbeType, Stats as StatsType } from "./stats.ts";
 import type { Transport as TransportType } from "./transport.ts";
@@ -45,11 +46,9 @@ export interface ConnectionProps {
 	linger?: Time.Milli;
 
 	/**
-	 * Share a pooled transport keyed on the URL (default: true).
-	 *
-	 * Options the pool cannot honor (transport options, discovery, delay, a pinned
-	 * certificate, caller-owned origins) require `share: false` and get a private
-	 * reconnect loop with the same handle semantics.
+	 * Share a pooled transport keyed on the URL. By default, options specific to this
+	 * handle use a private reconnect loop; otherwise connections share by URL.
+	 * Explicit `true` refuses options a pool cannot honor.
 	 */
 	share?: boolean;
 
@@ -62,14 +61,21 @@ export interface ConnectionProps {
 	/** Whether the relay supports broadcast discovery. */
 	discovery?: boolean;
 
-	/** The origin whose broadcasts are served, spanning reconnects. Requires {@link ConnectionProps.share} `false`. */
+	/** The origin whose broadcasts are served, spanning reconnects. Implies a private loop. */
 	publish?: Origin.Consumer;
 
-	/** The origin fed with the peer's announced broadcasts, spanning reconnects. Requires {@link ConnectionProps.share} `false`. */
+	/** The origin fed with the peer's announced broadcasts, spanning reconnects. Implies a private loop. */
 	consume?: Origin.Producer;
 
 	/** Backoff settings for the reconnect loop; an unset field uses its default. */
 	delay?: ReloadDelay;
+
+	/**
+	 * How to react to the relay's GOAWAY; an unset field uses its default. Every connection
+	 * migrates on GOAWAY, dialing the replacement while the old session finishes its groups.
+	 * This only tunes where it may go and for how long the old session serves.
+	 */
+	goaway?: GoawayProps;
 
 	/** A Connection owns the abort signal for each connection attempt. */
 	signal?: never;
@@ -95,9 +101,13 @@ export interface ConnectionProps {
  * connection so the next handle dials fresh; a new URL on this handle starts another
  * sequence. {@link closed} settles only when this handle is released.
  *
- * Options the pool cannot honor (transport options, discovery, delay, a pinned
- * certificate, caller-owned origins) take `share: false` and get a private loop. A
- * supplied transport cannot reconnect at all; pass it to {@link Connection.connect}
+ * A relay's GOAWAY migrates rather than drops: the replacement dials at once while the old
+ * session finishes its groups, and the handle and its origin carry across. A redirect the
+ * {@link ConnectionProps.goaway} policy refuses stops the loop like an auth rejection does.
+ *
+ * Options the pool cannot honor (transport options, discovery, delay, goaway, a pinned
+ * certificate, caller-owned origins) use a private loop. An explicit `share: true`
+ * refuses them. A supplied transport cannot reconnect at all; pass it to {@link Connection.connect}
  * instead.
  *
  * @public
@@ -179,7 +189,7 @@ export class Connection {
 	readonly #origin = new Signal<Origin.Producer | undefined>(undefined);
 	readonly #bandwidth = new Signal<Handle | undefined>(undefined);
 	readonly #error = new Signal<Error | undefined>(undefined);
-	#signals = new Effect();
+	#signals: Effect;
 
 	/**
 	 * Take a handle on the connection for {@link ConnectionProps.url}.
@@ -191,6 +201,7 @@ export class Connection {
 	 */
 	constructor(props?: ConnectionProps) {
 		refuse(props);
+		this.#signals = new Effect();
 
 		this.url = Signal.from(props?.url);
 		this.enabled = Signal.from(props?.enabled ?? true);
@@ -207,7 +218,7 @@ export class Connection {
 		// instance must not release and redial.
 		const href = this.#signals.computed((effect) => effect.get(this.url)?.href);
 
-		if (props?.share === false) {
+		if (props && (props.share === false || requiresPrivate(props))) {
 			this.#runPrivate(props, href);
 			return;
 		}
@@ -247,6 +258,7 @@ export class Connection {
 			// A handle nobody watches wants unlimited retries; an auth rejection still
 			// stops this URL, and a new one starts another sequence.
 			delay: { timeout: Time.Milli(0), ...props.delay },
+			goaway: props.goaway,
 		});
 		this.#signals.cleanup(() => loop.close());
 
@@ -266,7 +278,7 @@ export class Connection {
 	 * and URL switches: a switch retracts everything from
 	 * the old relay's origin, then the new one's arrivals stream in.
 	 */
-	announced(scope: Path.Pattern = Path.Pattern.all()): Announce.Consumer {
+	announced(scope: Path.Pattern = Path.Pattern.all(), options?: Announce.Options): Announce.Consumer {
 		const producer = new Announce.Producer();
 		const consumer = producer.consume();
 
@@ -284,7 +296,7 @@ export class Connection {
 			const origin = effect.get(this.#origin);
 			if (!origin) return;
 
-			const upstream = origin.announced(scope);
+			const upstream = origin.announced(scope, options);
 			effect.cleanup(() => upstream.close());
 
 			// Track what this origin announced so a URL switch retracts it; the last
@@ -294,7 +306,7 @@ export class Connection {
 			effect.spawn(async () => {
 				try {
 					for (;;) {
-						const entry = await Promise.race([effect.cancel, upstream.next()]);
+						const entry = await effect.race(upstream.next());
 						if (!entry) break;
 						if (Announce.isActive(entry.kind)) active.set(entry.prefix, entry);
 						else active.delete(entry.prefix);
@@ -340,6 +352,10 @@ export namespace Connection {
 	export type AcceptProps = AcceptPropsType;
 	/** Backoff settings for a private reconnect loop. */
 	export type Backoff = ReloadDelay;
+	/** How a connection reacts to the relay's GOAWAY. */
+	export type Goaway = GoawayProps;
+	/** What to do with the URI a relay names in its GOAWAY. */
+	export type Redirect = RedirectType;
 	/** Current state of a {@link Connection}. */
 	export type Status = ReloadStatus;
 	/** The current connection's PROBE estimates. */
@@ -369,7 +385,7 @@ function refuse(props?: ConnectionProps): void {
 	if (extra.signal) {
 		throw new Error("a Connection owns its abort signal; do not pass one");
 	}
-	if (props.share === false) return;
+	if (props.share !== true || !requiresPrivate(props)) return;
 
 	if (props.publish || props.consume) {
 		throw new Error("caller-owned origins cannot be shared; pass share: false");
@@ -390,10 +406,28 @@ function refuse(props?: ConnectionProps): void {
 	if (props.delay !== undefined) {
 		throw new Error("delay cannot be shared; pass share: false");
 	}
+	if (props.goaway !== undefined) {
+		throw new Error("goaway cannot be shared; pass share: false");
+	}
+}
+
+/** Options tied to one handle cannot be represented by a URL-keyed shared entry. */
+function requiresPrivate(props: ConnectionProps): boolean {
+	return (
+		props.webtransport !== undefined ||
+		props.websocket !== undefined ||
+		props.discovery !== undefined ||
+		props.delay !== undefined ||
+		props.goaway !== undefined ||
+		props.publish !== undefined ||
+		props.consume !== undefined
+	);
 }
 
 /** One shared connection and the handles keeping it alive. */
 interface Entry {
+	/** The pool key: the dialed URL, which a GOAWAY redirect moves. */
+	key: string;
 	origin: Origin.Producer;
 	connection: Reload;
 	refs: number;
@@ -420,14 +454,25 @@ function acquire(key: string, linger?: Time.Milli): Entry & { release: () => voi
 			delay: { timeout: Time.Milli(0) },
 		});
 
-		const created: Entry = { origin, connection, refs: 0, linger: linger ?? LINGER_MS };
+		const created: Entry = { key, origin, connection, refs: 0, linger: linger ?? LINGER_MS };
 
-		// The loop only stops on a peer saying these credentials will never work. Drop the
-		// entry so a later handle dials fresh rather than joining a loop that has stopped;
-		// handles already on it keep it until they release, since a redial would be refused
-		// the same way.
+		// The loop only stops on a peer saying these credentials will never work, or on a
+		// GOAWAY redirect it refused. Drop the entry so a later handle dials fresh rather
+		// than joining a loop that has stopped; handles already on it keep it until they
+		// release.
 		connection.error.subscribe((err) => {
-			if (err !== undefined && pool.get(key) === created) pool.delete(key);
+			if (err !== undefined && pool.get(created.key) === created) pool.delete(created.key);
+		});
+
+		// An accepted redirect moves the entry to the URL it now dials, so a later handle
+		// configured with that URL shares it, and one asking for the old URL dials fresh.
+		// A live entry already at the target wins: this one leaves the pool and serves only
+		// the handles it has until they release it.
+		connection.redirect.subscribe((redirect) => {
+			if (!redirect || redirect.href === created.key) return;
+			if (pool.get(created.key) === created) pool.delete(created.key);
+			created.key = redirect.href;
+			if (!pool.has(created.key)) pool.set(created.key, created);
 		});
 
 		entry = created;
@@ -453,7 +498,7 @@ function acquire(key: string, linger?: Time.Milli): Entry & { release: () => voi
 			if (taken.refs > 0) return;
 
 			taken.timer = setTimeout(() => {
-				if (pool.get(key) === taken) pool.delete(key);
+				if (pool.get(taken.key) === taken) pool.delete(taken.key);
 				taken.connection.close();
 				taken.origin.close();
 			}, taken.linger);

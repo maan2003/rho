@@ -134,6 +134,7 @@ type Catalog = {
 ~~~
 
 Additional fields MAY be added based on the application.
+An application SHOULD name its own root sections with a namespaced key, such as a reverse-DNS name (`com.example.telemetry`), so they cannot collide with a section a later version of this specification defines.
 The catalog SHOULD be mostly static, delegating any dynamic content to other tracks.
 
 For example, a chat entry should name a chat track, not carry individual chat messages.
@@ -304,10 +305,10 @@ type TextSchema = {
 }
 
 type TextConfig = {
-	"format": "vtt" | "ttml" | "utf8" | string,
-	"role": "subtitle" | "caption" | string | undefined,
-	"lang": string | undefined,
-	// plus the common rendition fields
+  "format": "vtt" | "ttml" | "utf8" | string,
+  "role": "subtitle" | "caption" | string | undefined,
+  "lang": string | undefined,
+  // plus the common rendition fields
 }
 ~~~
 
@@ -388,6 +389,9 @@ type JsonSchema = {
   "compression": Compression | undefined,
   "schema": string | undefined,
   "broadcast": string | undefined,
+  "bitrate": number | undefined,
+  "jitter": number | undefined,
+  "delay": number | undefined,
 }
 ~~~
 
@@ -401,6 +405,9 @@ type BinarySchema = {
   "compression": Compression | undefined,
   "mime": string | undefined,
   "broadcast": string | undefined,
+  "bitrate": number | undefined,
+  "jitter": number | undefined,
+  "delay": number | undefined,
 }
 ~~~
 
@@ -456,6 +463,15 @@ A `snapshot` group covers a single value (plus any deltas), so its window spans 
 ### broadcast {#data-shared}
 The `broadcast` field carries the same meaning here as it does for a media rendition ({{field-broadcast}}).
 
+### bitrate, jitter, and delay {#data-estimates}
+The optional `bitrate` field is the track's maximum bitrate in bits per second.
+The optional `jitter` and `delay` fields carry the same meaning and rules as they do for a media rendition ({{field-jitter}}, {{field-delay}}), with a payload in place of a frame.
+
+A payload's presentation timestamp is its capture time on the broadcast's clock, the one its media renditions use, when the publisher knows it (a datagram's arrival, a sensor read), and otherwise the time the publisher wrote it.
+A publisher measures `jitter` and `delay` only from payloads that carry a capture time, and MUST omit both for a track written without one.
+A publisher MUST NOT use a timestamp on an unrelated clock, such as a device's own uptime, since it would report a meaningless lateness and, through the broadcast-wide minimum, distort every other rendition's `delay`.
+A `snapshot` update that writes no frame, such as an unchanged JSON value, is not a flush and is not measured.
+
 ## Binary Fields {#binary}
 A decoder config field carrying raw bytes, notably `description` (an `AllowSharedBufferSource` in WebCodecs), is carried in the catalog as a hex string ({{!RFC4648, Section 8}}).
 A publisher SHOULD emit lowercase hexadecimal characters and MUST NOT emit a `0x` prefix or any separators.
@@ -472,6 +488,7 @@ type CommonExtensions = {
   "label": string | undefined,
   "container": Container,
   "jitter": number | undefined,
+  "delay": number | undefined,
 }
 ~~~
 
@@ -502,13 +519,14 @@ The container used to frame this rendition's media, as described in {{container}
 If absent, it defaults to `{ "kind": "legacy" }`.
 
 ### jitter {#field-jitter}
-The maximum delay, in milliseconds, between a frame being ready and the publisher flushing it.
+The maximum delay, in milliseconds, that a publisher has measured before handing a frame to the transport.
 A consumer's jitter buffer SHOULD be at least this large to avoid stalling.
-If absent, a consumer SHOULD assume each frame is flushed immediately.
+If absent, a consumer SHOULD assume no publisher delay has been measured.
 
-It is measured at the publisher: how far behind the media clock a frame is when the publisher hands it to the transport, whether an encoder, a reorder buffer, or a segmenter held it.
-An importer can estimate this delay from the media span of a batch, such as a run of audio PES packets between video packets in TS or an fMP4 fragment, without measuring the time spent waiting for input.
-It is never a measurement of the network, which a consumer observes for itself and which no two consumers of the same broadcast would agree on.
+An encoder compares each frame's flush time with its media timestamp and subtracts the smallest lateness recently observed on the same rendition.
+The field is the spread above that minimum, so neither a constant encoder delay, a fixed clock offset, nor long-term drift counts as jitter.
+A container importer instead estimates the delay from the media span of a batch, such as a run of audio PES packets between video packets in TS or an fMP4 fragment, without measuring the time spent waiting for input.
+A publisher does not count ingest network delay in this field; a consumer measures network delay separately.
 
 A publisher MUST round the value up to a whole number of milliseconds, so a consumer sizing a buffer against it is never handed a bound below the real one.
 A publisher MUST NOT advertise `0`; a track that flushes each frame immediately omits the field instead.
@@ -517,13 +535,23 @@ A publisher MUST NOT lower a previously advertised value, since a burst it emitt
 
 For example:
 
-- If each frame is flushed immediately, a video track's `jitter` is `1000/framerate` rounded up: 34 at 30 fps.
-- If up to 3 B-frames may be emitted in a row, it is `3 * 1000/framerate`.
-- If frames are buffered into 2 second segments, it is `2000`.
-- If frames are flushed several at a time, it is the media span of the whole burst, not of one frame.
+- A frame flushed without extra delay contributes no `jitter`, regardless of frame rate.
+- An encoder that consistently flushes 200 milliseconds late contributes no `jitter`; only variation above its own minimum counts.
+- A fragment or packet batch contributes the media span between its earliest timestamp and flush point.
+- Reordered frames contribute the delay they were held before flushing, without treating a decode-order presentation timestamp gap as delay by itself.
 
-An audio frame's duration is codec dependent.
-AAC often uses 1024 samples per frame, so at 44100Hz an immediately-flushed track's `jitter` is 24.
+### delay {#field-delay}
+The maximum amount, in milliseconds, by which a rendition's minimum flush lateness ({{field-jitter}}) has trailed the smallest minimum among the broadcast's renditions that measure it.
+If absent, a consumer SHOULD assume the rendition does not trail the others.
+
+A publisher measures each rendition's minimum over the same recent window it uses for `jitter`, from one clock shared by every rendition, and advertises the largest difference observed.
+A container importer does not measure `delay`.
+The rounding, `0`, and never-lower rules of `jitter` apply unchanged.
+
+A consumer SHOULD hold at least the largest `delay` plus `jitter` among the renditions it plays together.
+A consumer MUST NOT subtract one rendition's `delay` from another's: each is a maximum over the life of the stream, so two values need not share an origin.
+
+For example, a video encoder that flushes 200 milliseconds after the audio encoder for the same media time advertises a video `delay` of 200 and no audio `delay`.
 
 # Container {#container}
 Audio, video, and text tracks use a container to encapsulate the media payload.
@@ -547,6 +575,7 @@ A group with no decodable frames is a walk-now discontinuity: one empty codec pa
 A consumer MUST NOT submit the marker to a decoder.
 Empty groups (zero objects) are permitted and mean nothing.
 After a discontinuity the timeline continues forward.
+A publisher that stops producing and may resume on the same track (e.g. an encoder idle for lack of demand) SHOULD publish a discontinuity marker when it stops, so the group before the pause does not reach across the gap and read as live.
 A group whose timestamps fall below the live edge earlier groups reached is malformed.
 A delivered sequence hole is a playhead event unless the boundary is contiguous within 1 ms.
 A consumer re-applies startup delay and skip at a playhead event; it does not reset codec state.
@@ -565,8 +594,8 @@ A consumer MUST skip it and MUST NOT submit it to a decoder.
 It does not mean the track ended.
 
 For audio, an empty codec payload retains its terminal-trimming meaning: its timestamp is the exclusive endpoint of the source media.
-When a codec must receive additional packets to emit buffered source samples, the marker MUST precede those terminal packets.
-A consumer MUST NOT submit the marker to the codec decoder, MUST decode the terminal packets, and MUST discard decoded samples at or after the endpoint.
+When a codec must receive additional packets to emit buffered source samples, the marker MUST precede those terminal packets in the same group.
+A consumer MUST NOT submit the marker to the codec decoder, MUST decode the terminal packets, and MUST discard decoded samples at or after the endpoint until a later group begins.
 Audio publishers do not append per-group duration markers because the codec defines each packet's duration.
 Data tracks retain empty payloads as data, without endpoint semantics.
 
@@ -1059,9 +1088,10 @@ This document has no IANA actions.
 ## moq-hang-03
 {:numbered="false"}
 
+- Defined encoder `jitter` as flush lateness above the rendition's own recent minimum, replacing fixed frame-duration hints; container batches retain media-span estimates.
 - Clarified that CMAF audio samples are sync samples independently of publisher group boundaries.
 - Clarified that container importers can estimate jitter from batch media spans without measuring input wait time.
-- Specified the `jitter` field's computation: the publisher's own structure rather than the network, rounded up to whole milliseconds, never `0` (a consumer treats `0` as absent), and never lowered once advertised. The 30 fps and 44.1 kHz AAC examples became 34 and 24.
+- Specified the `jitter` field's computation: the publisher's own structure rather than the network, rounded up to whole milliseconds, never `0` (a consumer treats `0` as absent), and never lowered once advertised.
 - For video, an empty codec payload is the exclusive end of the frame before it. A video publisher SHOULD end each group with one when the exclusive end is known. Audio retains its terminal-trimming marker before codec drain packets.
 A publisher MAY estimate an unknown final duration from the frame cadence, but MUST NOT use batching or reorder delay as that duration. A consumer skips it and does not submit it to a decoder. Audio terminal-packet trimming is unchanged.
 - Specified version 1 recording objects: JSON track properties and binary group/frame tables with ascending, delta-encoded group sequences.
@@ -1072,7 +1102,13 @@ A publisher MAY estimate an unknown final duration from the frame cadence, but M
 - Required exclusive DVR restart recovery to remove unreferenced group objects left by interrupted expiration.
 - Replaced the catalog root `timeline` field with `archive`, carrying the timeline track plus optional `replay`, `store`, and recording `version`.
 - A marker group of one empty frame declares a discontinuity. Empty groups mean nothing. Timestamps only move forward; a group below the live edge is malformed. A delivered sequence hole is a playhead event unless contiguous within 1 ms.
+- A publisher that stops producing and may resume on the same track SHOULD publish a discontinuity marker when it stops.
+- An audio endpoint bounds only the terminal packets that follow it in its own group.
 - Replaced the archive timeline `wall` field with a root `clock` section (`wall` plus `timescale`): one fixed broadcast mapping every track and the archive index convert into, independent of any archive. Zero timescales and walls past the JSON-safe integer range are refused.
+- Added optional `bitrate` and `jitter` fields to `json` and `binary` track entries.
+- Added the optional `delay` rendition field: how far a rendition's minimum flush lateness trails the broadcast's earliest rendition, never lowered once advertised and never subtracted across renditions.
+- Recommended namespaced keys for application root sections.
+- Added the optional `delay` field to `json` and `binary` track entries, measured only from payloads stamped with their capture time on the broadcast clock.
 
 # Acknowledgments
 {:numbered="false"}

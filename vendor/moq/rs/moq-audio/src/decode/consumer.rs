@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 use super::decoder::{Config, Decoder};
-use crate::resample::{Resampler, remix, validate_remix};
+use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Format, Frame, Layout};
 
 /// Where a consumer starts on a track that already holds groups.
@@ -63,6 +63,8 @@ pub struct Consumer {
 	decoder: Decoder,
 	track: moq_mux::container::Consumer<moq_mux::catalog::hang::Container>,
 	resampler: Option<Resampler>,
+	/// Converts the decoded layout to the output's, when they differ.
+	remix: Option<Remix>,
 	options: Options,
 	max_age: std::time::Duration,
 	resolved_sample_rate: u32,
@@ -111,7 +113,9 @@ impl Consumer {
 		let decoder = Decoder::new(catalog, &options.decoder)?;
 		let sample_rate = options.output.sample_rate.unwrap_or_else(|| decoder.sample_rate());
 		let layout = options.output.layout.unwrap_or_else(|| decoder.layout());
-		validate_remix(decoder.layout(), layout)?;
+		let remix = (decoder.layout() != layout)
+			.then(|| Remix::new(decoder.layout(), layout))
+			.transpose()?;
 
 		let resampler = if sample_rate == decoder.sample_rate() {
 			None
@@ -165,6 +169,7 @@ impl Consumer {
 			decoder,
 			track,
 			resampler,
+			remix,
 			options,
 			max_age,
 			resolved_sample_rate: sample_rate,
@@ -180,6 +185,11 @@ impl Consumer {
 			terminal_start: None,
 			discontinuity: 0,
 		})
+	}
+
+	/// The decoder backend name in use, e.g. `"libopus"` or `"symphonia"`.
+	pub fn name(&self) -> &str {
+		self.decoder.name()
 	}
 
 	/// The options this consumer was built with.
@@ -438,10 +448,9 @@ impl Consumer {
 
 	/// Remix and pack decoded PCM into an output frame.
 	fn frame(&self, pcm: Vec<f32>, timestamp: moq_net::Timestamp, activity: Activity) -> Result<Frame, Error> {
-		let pcm = if self.decoder.layout() == self.resolved_layout {
-			pcm
-		} else {
-			remix(&pcm, self.decoder.layout(), self.resolved_layout)?
+		let pcm = match &self.remix {
+			Some(remix) => remix.process(&pcm),
+			None => pcm,
 		};
 
 		let bytes = self
@@ -571,8 +580,50 @@ mod tests {
 		let frame = consumer.read().await.unwrap().expect("decoded frame");
 		let samples = Format::F32.as_interleaved_f32(&frame.data, 2).unwrap();
 		assert_eq!(samples.len(), (960 - 312) * 2);
-		for pair in samples.chunks_exact(2) {
+		for pair in samples.as_chunks::<2>().0.iter() {
 			assert_eq!(pair[0], pair[1]);
+		}
+	}
+
+	/// An imported 44.1 kHz Opus stream decodes on the 48 kHz clock: the pre-skip
+	/// is trimmed once as padding before the first packet, and every later frame
+	/// is stamped where its samples fall.
+	#[tokio::test]
+	async fn opus_timestamps_follow_the_48k_clock() {
+		use crate::decode::decoder::tests::{opus_catalog, opus_packets};
+
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let subscriber = broadcast.consume();
+
+		let catalog = opus_catalog(moq_mux::codec::opus::Config::new(44_100, 1).with_pre_skip(312));
+		let mut producer = moq_mux::container::Producer::new(
+			track,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio),
+		);
+		let mut consumer = Consumer::new(&subscriber, &catalog, "audio", Options::new())
+			.await
+			.unwrap();
+		assert_eq!(consumer.sample_rate(), 48_000);
+
+		for (packet, payload) in opus_packets(3).into_iter().enumerate() {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_micros(packet as u64 * 20_000).unwrap(),
+					duration: None,
+					payload,
+					keyframe: packet == 0,
+				})
+				.unwrap();
+		}
+
+		// 312 samples at 48 kHz is 6.5 ms.
+		for (micros, frames) in [(0, 960 - 312), (13_500, 960), (33_500, 960)] {
+			let frame = consumer.read().await.unwrap().expect("decoded frame");
+			assert_eq!(frame.timestamp.as_micros(), micros);
+			assert_eq!(frame.data.len() / size_of::<f32>(), frames);
 		}
 	}
 

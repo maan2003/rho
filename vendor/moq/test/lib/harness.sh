@@ -12,7 +12,7 @@
 # Usage:
 #
 #     source "$(dirname "${BASH_SOURCE[0]}")/../lib/harness.sh"
-#     harness_begin smoke "just test smoke"
+#     harness_begin interop "just test interop"
 #     harness_port relay
 #     harness_spawn relay "$HARNESS_RUN/relay.log" "$RELAY" "$HARNESS_RUN/relay.toml"
 #     harness_endpoint relay "http://127.0.0.1:$HARNESS_PORT"
@@ -56,7 +56,7 @@ harness_argv() {
 }
 
 # Print the environment overrides among NAMES that are set, as a requoted prefix
-# for the rerun command: `harness_env SMOKE_PORT SMOKE_PROFILE`. Timing, port,
+# for the rerun command: `harness_env INTEROP_PORT INTEROP_PROFILE`. Timing, port,
 # and profile knobs arrive this way rather than in argv, so a command built from
 # argv alone reruns with the defaults and reproduces a different test.
 #
@@ -86,6 +86,9 @@ harness_begin() {
     # owner even where the temp root itself is world-readable.
     chmod 700 "$HARNESS_RUN"
     HARNESS_RERUN="$rerun"
+    # The browser drivers cannot see a shell variable, and a Playwright trace has
+    # to land beside the logs it explains, so the path rides the environment.
+    export MOQ_TEST_RUN="$HARNESS_RUN"
 
     # Cancellation needs its own traps: children run in their own process groups
     # (see `harness_spawn`), so a ^C aimed at this shell's group never reaches
@@ -102,13 +105,11 @@ harness_begin() {
 # Where port reservations live. Shared across worktrees on purpose: the point is
 # that a run in one worktree cannot hand out a port another already took.
 #
-# The default is suffixed with the user id, like the run root. On Linux TMPDIR is
-# usually unset, so both would land in a world-writable /tmp under a fixed name
-# owned by whoever ran first: a second user's `mkdir` would then fail for every
-# port and the walk would report the whole range taken with nothing reserved. Two
-# worktrees still share, because they run as the same user.
+# Nix shells give TMPDIR a private directory, but their sockets still share the
+# host network. Keep claims in /tmp regardless of each shell's scratch root.
+# The user id avoids ownership conflicts with another user's harnesses.
 harness_port_root() {
-    local root="${MOQ_TEST_PORTS:-${TMPDIR:-/tmp}}"
+    local root="${MOQ_TEST_PORTS:-/tmp}"
     root="${root%/}"
     [[ -n "${MOQ_TEST_PORTS:-}" ]] || root="$root/moq-test-ports-$(id -u)"
     echo "$root"
@@ -127,7 +128,7 @@ harness_valid_port() {
 # Reserve a port for this run, held until it exits, and set HARNESS_PORT.
 #
 # `harness_port <label> [wanted]`. With `wanted` that exact port is taken or the
-# call fails, which is what an explicit SMOKE_PORT/WASM_PORT asks for; without it
+# call fails, which is what an explicit INTEROP_PORT/WASM_PORT asks for; without it
 # the search walks up from MOQ_TEST_PORT_BASE.
 #
 # The answer lands in a variable rather than on stdout because `$(harness_port)`
@@ -143,7 +144,13 @@ harness_port() {
     local label="$1" wanted="${2:-}"
     local root port last status
     root=$(harness_port_root)
-    mkdir -p "$root"
+    # Only the reservation root needs private permissions, not its parents.
+    # shellcheck disable=SC2174
+    mkdir -m 700 -p "$root"
+    if [[ -L "$root" || ! -O "$root" ]]; then
+        echo "error: port reservation root must be owned by this user and not a symlink: $root" >&2
+        return 2
+    fi
 
     if [[ -n "$wanted" ]]; then
         harness_valid_port "$wanted" || {
@@ -188,16 +195,25 @@ harness_port() {
 
 # Claim one port. Private; `harness_port` is the entry point.
 harness_port_take() {
-    local root="$1" port="$2" lock="$1/.lock-$2"
+    local root="$1" port="$2"
+    harness_locked "$root/.lock-$port" "$HARNESS_LIB/reserve.sh" "$root" "$port" "$$" "$HARNESS_RUN" || return $?
+    HARNESS_PORTS+=("$root/$port")
+}
+
+# Run CMD holding an exclusive advisory lock on FILE: `harness_locked <file> <cmd...>`.
+# CMD is an executable, not a shell function. For a step that writes somewhere every
+# run shares, so concurrent runs take turns instead of clobbering each other.
+harness_locked() {
+    local lock="$1"
+    shift
     if command -v flock >/dev/null 2>&1; then
-        flock "$lock" "$HARNESS_LIB/reserve.sh" "$root" "$port" "$$" "$HARNESS_RUN" || return $?
+        flock "$lock" "$@"
     elif command -v lockf >/dev/null 2>&1; then
-        lockf -k "$lock" "$HARNESS_LIB/reserve.sh" "$root" "$port" "$$" "$HARNESS_RUN" || return $?
+        lockf -k "$lock" "$@"
     else
-        echo "error: port reservations require flock or lockf" >&2
+        echo "error: the test harness requires flock or lockf" >&2
         return 2
     fi
-    HARNESS_PORTS+=("$root/$port")
 }
 
 # Record an endpoint this run stood up: `harness_endpoint <label> <url>`.
@@ -381,16 +397,18 @@ harness_finish() {
 
     [[ -n "$HARNESS_RUN" ]] || return "$status"
 
-    if [[ "${MOQ_TEST_KEEP:-0}" == 0 ]]; then
+    # A failing run is exactly when the logs matter, so keep it without asking;
+    # MOQ_TEST_KEEP does the same for a passing run you want to inspect.
+    if [[ "${MOQ_TEST_KEEP:-0}" == 0 && "$status" -eq 0 ]]; then
         rm -rf "$HARNESS_RUN"
     else
         # The ports are already released and the children are gone, so a retained
         # directory is evidence only. Say so rather than implying a live session.
         echo "kept: $HARNESS_RUN (children reaped, ports released)" >&2
         echo "remove it with: rm -rf $HARNESS_RUN" >&2
-    fi
-    if [[ -n "$HARNESS_RERUN" && ("$status" -ne 0 || "${MOQ_TEST_KEEP:-0}" != 0) ]]; then
-        echo "rerun: $HARNESS_RERUN" >&2
+        if [[ -n "$HARNESS_RERUN" ]]; then
+            echo "rerun: $HARNESS_RERUN" >&2
+        fi
     fi
     return "$status"
 }

@@ -76,6 +76,7 @@ mod test {
 			track,
 			consumer::Config {
 				compression: Compression::Deflate,
+				..Default::default()
 			},
 		)
 	}
@@ -87,6 +88,23 @@ mod test {
 			.unwrap();
 		let consumer = track.subscribe(None);
 		(Producer::new(track, config), consumer)
+	}
+
+	/// Demand follows the track's subscribers, so a producer can idle while nobody is watching.
+	#[test]
+	fn demand_follows_subscribers() {
+		let (producer, consumer) = producer(Config::default());
+		let demand = producer.demand();
+		let waiter = kio::Waiter::noop();
+		assert!(matches!(demand.poll_used(&waiter), Poll::Ready(Ok(()))));
+
+		drop(consumer);
+		assert!(matches!(demand.poll_unused(&waiter), Poll::Ready(Ok(()))));
+		assert!(demand.poll_used(&waiter).is_pending());
+
+		let _consumer = producer.consume();
+		assert!(matches!(demand.poll_used(&waiter), Poll::Ready(Ok(()))));
+		assert!(demand.poll_unused(&waiter).is_pending());
 	}
 
 	/// Drain every value currently available from a plaintext consumer without blocking.
@@ -102,6 +120,65 @@ mod test {
 			out.push(value);
 		}
 		out
+	}
+
+	/// A snapshot group the transport can no longer serve -- `Old` when the relay reclaims a
+	/// superseded group, `Evicted` under memory pressure, `Lagged` past the drift budget -- is not
+	/// fatal. A snapshot reader only wants the newest value, so it drops the group and takes the
+	/// replacement. Regression test for `moq export ts` exiting on `Error: json: old` when a
+	/// catalog group aged out of the relay cache underneath it.
+	#[test]
+	fn a_lost_group_waits_for_its_replacement() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let mut consumer = Consumer::<Value>::new(track.subscribe(None), consumer::Config::default());
+		let waiter = kio::Waiter::noop();
+
+		// Group 0 delivers a value, then stays open with the reader parked on its next frame.
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(br#"{"a":1}"#))
+			.unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(Some(v))) if v == json!({ "a": 1 })));
+		assert!(consumer.poll_next(&waiter).is_pending());
+
+		// The relay reclaims the group out from under the reader.
+		group.abort(moq_net::Error::Old).unwrap();
+		assert!(
+			consumer.poll_next(&waiter).is_pending(),
+			"a lost group must not end the reader"
+		);
+
+		// The replacement arrives and the reader picks up where the value now lives.
+		let mut group = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(br#"{"a":2}"#))
+			.unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(Some(v))) if v == json!({ "a": 2 })));
+	}
+
+	/// Nothing replaces a lost group once the track is finished, so the reader ends cleanly on the
+	/// last value it reconstructed instead of reporting the eviction as a failure.
+	#[test]
+	fn a_lost_group_on_a_finished_track_ends_cleanly() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let mut consumer = Consumer::<Value>::new(track.subscribe(None), consumer::Config::default());
+		let waiter = kio::Waiter::noop();
+
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(br#"{"a":1}"#))
+			.unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(Some(v))) if v == json!({ "a": 1 })));
+
+		group.abort(moq_net::Error::Old).unwrap();
+		track.finish().unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(None))));
 	}
 
 	#[test]
@@ -231,12 +308,42 @@ mod test {
 	#[test]
 	fn unchanged_value_writes_nothing() {
 		let (mut producer, track) = producer(Config::default());
-		producer.update(&json!({ "a": 1 })).unwrap();
-		producer.update(&json!({ "a": 1 })).unwrap();
+		assert_eq!(producer.update(&json!({ "a": 1 })).unwrap(), Some(7));
+		assert_eq!(
+			producer.update(&json!({ "a": 1 })).unwrap(),
+			None,
+			"an unchanged value reports that nothing was written"
+		);
 		producer.finish().unwrap();
 
 		assert_eq!(track.latest(), Some(0));
 		assert_eq!(drain(track), vec![json!({ "a": 1 })]);
+	}
+
+	/// A stamped value is written at its capture time, snapshot and delta alike, and the returned
+	/// size is the encoded frame.
+	#[test]
+	fn a_stamped_update_writes_its_capture_time() {
+		let (mut producer, _track) = producer(cfg(100));
+		let mut groups = producer.consume();
+		let first = moq_net::Timestamp::from_millis(1_000).unwrap();
+		let second = moq_net::Timestamp::from_millis(2_000).unwrap();
+		let value = json!({ "a": 1, "b": "x".repeat(64) });
+		let size = producer.update(moq_net::Timed::from(&value).at(first)).unwrap();
+		let changed = json!({ "a": 2, "b": "x".repeat(64) });
+		let delta = producer.update(moq_net::Timed::from(&changed).at(second)).unwrap();
+
+		let waiter = kio::Waiter::noop();
+		let Poll::Ready(Ok(Some(mut group))) = groups.poll_recv_group(&waiter) else {
+			panic!("expected a group");
+		};
+		for (stamp, size) in [(first, size), (second, delta)] {
+			let Poll::Ready(Ok(Some(frame))) = group.poll_read_frame(&waiter) else {
+				panic!("expected a frame");
+			};
+			assert_eq!(frame.timestamp.as_micros(), stamp.as_micros());
+			assert_eq!(size, Some(frame.payload.len()));
+		}
 	}
 
 	#[test]
@@ -401,6 +508,65 @@ mod test {
 	}
 
 	#[test]
+	fn mutate_composes_independent_owners() {
+		// The closure form of the guard: the JS `Producer.mutate` rules, in Rust.
+		#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+		struct Doc {
+			#[serde(skip_serializing_if = "Option::is_none")]
+			video: Option<String>,
+			#[serde(skip_serializing_if = "Option::is_none")]
+			scte35: Option<u32>,
+		}
+
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let consumer = track.subscribe(None);
+		let mut producer = Producer::<Doc>::new(track, cfg(0));
+
+		producer.mutate(|doc| doc.video = Some("v1".to_string())).unwrap();
+
+		// The second owner starts from the latest value and adds its own field without clobbering.
+		producer.mutate(|doc| doc.scte35 = Some(42)).unwrap();
+
+		// A closure that changes nothing publishes nothing: deltas are off, so each publish would
+		// otherwise open a group of its own.
+		producer.mutate(|_| {}).unwrap();
+		assert_eq!(consumer.latest(), Some(1));
+
+		producer.finish().unwrap();
+
+		let mut consumer = Consumer::<Doc>::new(consumer, consumer::Config::default());
+		let waiter = kio::Waiter::noop();
+		let mut last = None;
+		while let Poll::Ready(Ok(Some(value))) = consumer.poll_next(&waiter) {
+			last = Some(value);
+		}
+		assert_eq!(
+			last.unwrap(),
+			Doc {
+				video: Some("v1".to_string()),
+				scte35: Some(42),
+			}
+		);
+	}
+
+	#[test]
+	fn mutate_returns_the_publish_error() {
+		// Unlike a dropped guard, the closure form hands the failure back to the caller.
+		let (mut producer, _track) = producer(cfg(0));
+		producer.update(&json!({ "keep": true })).unwrap();
+
+		assert!(matches!(
+			producer.mutate(|value| {
+				*value = json!({ "big": "x".repeat(moq_net::group::MAX_CACHE_BYTES as usize + 1) });
+			}),
+			Err(crate::Error::Net(moq_net::Error::FrameTooLarge))
+		));
+	}
+
+	#[test]
 	fn a_dropped_edit_publishes_a_snapshot_then_a_delta() {
 		let (mut producer, track) = producer(cfg(100));
 
@@ -434,10 +600,15 @@ mod test {
 
 		*producer.modify().unwrap() = json!({ "big": "x".repeat(moq_net::group::MAX_CACHE_BYTES as usize + 1) });
 
-		// The publisher learns the cause at its next edit, the consumer from the aborted track.
+		// The publisher learns the cause at its next edit. The consumer drains the snapshot
+		// that finished, then learns it from the aborted track.
 		assert!(matches!(
 			producer.modify(),
 			Err(crate::Error::Net(moq_net::Error::FrameTooLarge))
+		));
+		assert!(matches!(
+			subscriber.poll_next_group(&kio::Waiter::noop()),
+			Poll::Ready(Ok(Some(_)))
 		));
 		assert!(matches!(
 			subscriber.poll_next_group(&kio::Waiter::noop()),

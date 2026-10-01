@@ -6,6 +6,7 @@ import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { publint } from "publint";
 import { formatMessage } from "publint/utils";
+import { problems } from "./declarations.ts";
 
 console.log("✍️  Rewriting package.json...");
 const pkg = JSON.parse(readFileSync("package.json", "utf8"));
@@ -60,12 +61,17 @@ if (pkg.files) {
 	pkg.files = pkg.files.map((p: string) => rewritePath(p, "js"));
 }
 
+// npm normalizes bin targets to drop the leading "./" and warns when it has to.
+function rewriteBin(p: string): string {
+	return rewritePath(p, "js").replace(/^\.\//, "");
+}
+
 if (pkg.bin) {
 	if (typeof pkg.bin === "string") {
-		pkg.bin = rewritePath(pkg.bin, "js");
+		pkg.bin = rewriteBin(pkg.bin);
 	} else if (typeof pkg.bin === "object") {
 		for (const key in pkg.bin) {
-			pkg.bin[key] = rewritePath(pkg.bin[key], "js");
+			pkg.bin[key] = rewriteBin(pkg.bin[key]);
 		}
 	}
 }
@@ -112,6 +118,18 @@ if (messages.length > 0) {
 	for (const message of messages) {
 		console.error(formatMessage(message, lintPkg));
 	}
+	process.exit(1);
+}
+
+console.log("🔍 Checking declaration imports...");
+const declarations = new Map<string, string>();
+for (const rel of new Bun.Glob("**/*.d.ts").scanSync("dist")) {
+	const file = resolve("dist", rel);
+	declarations.set(file, readFileSync(file, "utf8"));
+}
+const unresolved = problems(resolve("dist"), declarations);
+if (unresolved.length > 0) {
+	for (const problem of unresolved) console.error(problem);
 	process.exit(1);
 }
 
@@ -177,6 +195,9 @@ function writeJsrConfig() {
 		...(license ? { license } : {}),
 		exports,
 		...(Object.keys(imports).length ? { imports } : {}),
+		// A sibling @moq package is published to npm minutes before its dependents
+		// in the same release, and Deno otherwise refuses npm versions under 24h old.
+		minimumDependencyAge: 0,
 		// dist is gitignored, so un-ignore it with a "!" negation; JSR honors
 		// .gitignore otherwise and would drop the whole build from the graph.
 		publish: { include: ["dist", "README.md", "LICENSE*"], exclude: ["!dist"] },

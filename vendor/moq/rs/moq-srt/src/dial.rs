@@ -23,8 +23,8 @@ use std::time::Duration;
 use moq_net::origin;
 use srt_tokio::SrtSocket;
 
-use crate::Result;
 use crate::server::{DEFAULT_LATENCY, configure_buffers, serve_publish, serve_subscribe};
+use crate::{Program, Result};
 
 /// An SRT caller that can publish a MoQ broadcast or pull a remote stream.
 ///
@@ -57,6 +57,9 @@ pub struct Client {
 	/// Connection allocator each ingested track claims its peak-hold bitrate on.
 	/// [`pull`] only; [`publish`] reads a broadcast someone else declared.
 	bandwidth: moq_net::bandwidth::Allocator,
+
+	/// The programs of a multi-program remote [`pull`] publishes, or `None` to refuse one.
+	program: Option<Program>,
 }
 
 impl Client {
@@ -69,6 +72,7 @@ impl Client {
 			latency: DEFAULT_LATENCY,
 			max_age: None,
 			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
+			program: None,
 		}
 	}
 
@@ -90,6 +94,13 @@ impl Client {
 		self
 	}
 
+	/// Publish one program of a multi-program stream [`pull`](Self::pull) receives, or each as
+	/// its own broadcast under the pulled path. `None` (the default) refuses a multiplex.
+	pub fn with_program(mut self, program: impl Into<Option<Program>>) -> Self {
+		self.program = program.into();
+		self
+	}
+
 	/// Push a MoQ broadcast out to the remote as MPEG-TS until the broadcast ends.
 	pub async fn publish(&self, origin: &origin::Consumer, path: impl moq_net::AsPath) -> Result<()> {
 		let path = path.as_path();
@@ -104,7 +115,7 @@ impl Client {
 		let catalog = moq_mux::catalog::Config::default()
 			.with_max_age(self.max_age)
 			.with_bandwidth(self.bandwidth.clone());
-		serve_publish(origin, path.as_str(), socket, catalog).await
+		serve_publish(origin, path.as_str(), socket, catalog, self.program).await
 	}
 
 	async fn call(&self, mode: Mode) -> Result<SrtSocket> {
@@ -165,11 +176,11 @@ mod tests {
 	use super::*;
 	use crate::server::{Reject, Request, Server};
 
-	/// Grab a free UDP port by binding `:0` and releasing it. Racy in principle, but
-	/// the window before the SRT server rebinds it is tiny; good enough for a test.
-	async fn free_udp_addr() -> SocketAddr {
-		let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		sock.local_addr().unwrap()
+	/// An SRT server on an ephemeral loopback port.
+	async fn loopback() -> (Server, SocketAddr) {
+		let server = Server::bind("127.0.0.1:0".parse().unwrap(), None).await.unwrap();
+		let addr = server.local_addr();
+		(server, addr)
 	}
 
 	/// Loopback: dial the crate's own server with `m=publish`. The server classifies it
@@ -179,8 +190,7 @@ mod tests {
 	/// integration coverage; the TS bridge itself is shared with the tested server path.)
 	#[tokio::test]
 	async fn publish_caller_connects_and_routes() {
-		let addr = free_udp_addr().await;
-		let mut server = Server::bind(addr, None).await.unwrap();
+		let (mut server, addr) = loopback().await;
 
 		// Server accepts the publish so the caller's handshake completes; it ingests into
 		// a throwaway origin and returns the routed direction + resource.
@@ -219,8 +229,7 @@ mod tests {
 	/// routes to a server [`Request::Subscribe`].
 	#[tokio::test]
 	async fn request_caller_connects_and_routes() {
-		let addr = free_udp_addr().await;
-		let mut server = Server::bind(addr, None).await.unwrap();
+		let (mut server, addr) = loopback().await;
 
 		// Empty origin: the subscribe accept parks waiting for the broadcast, which is
 		// fine -- the caller still connects, and the test aborts the wait.
@@ -253,22 +262,31 @@ mod tests {
 		assert!(is_subscribe, "m=request should route to a server Subscribe request");
 	}
 
+	/// Reject a caller server-side and hand back the error it saw.
+	///
+	/// The server is driven inline rather than on its own task: [`Publish::reject`]
+	/// only hands the verdict to the listener, so dropping the [`Server`] before the
+	/// caller's handshake completes stops the listener that still owes it the
+	/// rejection packet, and the caller times out instead.
 	async fn rejected(mode: Mode, reason: Reject, code: i32) {
-		let addr = free_udp_addr().await;
-		let mut server = Server::bind(addr, None).await.unwrap();
-		let server_task = tokio::spawn(async move {
-			match (mode, server.accept().await.expect("a request")) {
-				(Mode::Publish, Request::Publish(request)) => request.reject(reason).await.unwrap(),
-				(Mode::Request, Request::Subscribe(request)) => request.reject(reason).await.unwrap(),
-				_ => panic!("request routed in the wrong direction"),
-			}
-		});
+		let (mut server, addr) = loopback().await;
+		let client = Client::new(addr, "cam0");
 
-		let err = match Client::new(addr, "cam0").call(mode).await {
+		let (_, err) = tokio::join!(
+			async {
+				match (mode, server.accept().await.expect("a request")) {
+					(Mode::Publish, Request::Publish(request)) => request.reject(reason).await.unwrap(),
+					(Mode::Request, Request::Subscribe(request)) => request.reject(reason).await.unwrap(),
+					_ => panic!("request routed in the wrong direction"),
+				}
+			},
+			client.call(mode),
+		);
+
+		let err = match err {
 			Ok(_) => panic!("rejected SRT caller connected"),
 			Err(err) => err,
 		};
-		server_task.await.unwrap();
 		let crate::Error::Io(err) = err else {
 			panic!("SRT rejection was not an I/O error: {err}");
 		};

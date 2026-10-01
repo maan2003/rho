@@ -18,7 +18,9 @@
 //! as a JWT) owns that policy.
 //!
 //! RTMPS (RTMP over TLS): [`Server::with_tls`] makes the listener terminate TLS
-//! before the RTMP handshake, so `rtmps://` clients work with no other change.
+//! before the RTMP handshake for any client that opens with a ClientHello, so
+//! `rtmps://` and `rtmp://` clients share one port with no other change.
+//! [`Server::with_plaintext`] can refuse the plaintext ones.
 //! If you'd rather own the transport (custom TLS, a non-TCP socket, a test
 //! pipe), accept the connection and complete any handshake yourself, then hand
 //! the established stream to [`accept_stream`]; everything here is generic over
@@ -31,8 +33,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::rml::amf0::Amf0Value;
 use crate::rml::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use crate::rml::rml_amf0::Amf0Value;
 use crate::rml::sessions::{
 	FourCcSupport, ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
@@ -40,9 +42,10 @@ use crate::rml::time::RtmpTimestamp;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use hang::catalog::{AudioCodec, VideoCodec};
+use hang::catalog::{AudioCodec, VideoCodecKind, VideoConfig};
 use moq_mux::catalog::{CatalogFormat, Stream as CatalogStream};
 use moq_mux::container::flv::{Export as FlvExport, Import as FlvImport};
+use moq_mux::select;
 use moq_net::origin;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -175,7 +178,7 @@ pub enum Conn {
 	/// A plaintext TCP connection (`rtmp://`).
 	Plain(TcpStream),
 
-	/// A TLS connection (`rtmps://`), established by [`Server::with_tls`]. Boxed
+	/// A TLS connection (`rtmps://`), sniffed and terminated by [`Server::with_tls`]. Boxed
 	/// because a `TlsStream` is large relative to a bare `TcpStream`.
 	#[cfg(feature = "tls")]
 	Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
@@ -225,17 +228,20 @@ const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// An RTMP server that yields each connection's pending request as a [`Request`].
 ///
-/// Build it with [`bind`](Self::bind), optionally enable RTMPS with
-/// [`with_tls`](Self::with_tls), then loop on [`accept`](Self::accept). The
+/// Build it with [`bind`](Self::bind), optionally enable RTMPS with `with_tls`
+/// (the `tls` feature), then loop on [`accept`](Self::accept). The
 /// handshake and the connect exchange happen inside `accept`, so a [`Request`] is
 /// only produced once a client actually wants to publish or play.
 pub struct Server {
 	listener: TcpListener,
 
-	/// When set, each accepted connection is TLS-terminated (RTMPS) before the
-	/// RTMP handshake.
+	/// When set, each accepted connection that opens with a ClientHello is
+	/// TLS-terminated (RTMPS) before the RTMP handshake.
 	#[cfg(feature = "tls")]
 	tls: Option<tokio_rustls::TlsAcceptor>,
+
+	/// Whether a connection that is not TLS is served as plaintext RTMP.
+	plaintext: bool,
 
 	/// In-flight handshakes; each resolves to a ready [`Request`], or `None` if
 	/// the connection closed or errored before issuing a publish or play.
@@ -261,20 +267,48 @@ impl Server {
 			listener,
 			#[cfg(feature = "tls")]
 			tls: None,
+			plaintext: true,
 			pending: FuturesUnordered::new(),
 			accept_delay: ACCEPT_RETRY_MIN,
 			accept_retry: None,
 		})
 	}
 
-	/// Terminate TLS on every accepted connection, turning this into an RTMPS
-	/// listener (`rtmps://`). Pass a `rustls::ServerConfig` (e.g. from
+	/// Serve RTMPS (`rtmps://`) alongside plaintext RTMP on this one port: a
+	/// connection that opens with a TLS ClientHello is TLS-terminated, any other is
+	/// served as plaintext unless [`with_plaintext`](Self::with_plaintext) refuses it.
+	/// Pass a `rustls::ServerConfig` (e.g. from
 	/// `moq_tokio::tls::Listen::server_config` with an empty ALPN list), or
-	/// `None` to leave it plaintext.
+	/// `None` to serve plaintext only.
 	#[cfg(feature = "tls")]
 	pub fn with_tls(mut self, tls: impl Into<Option<std::sync::Arc<rustls::ServerConfig>>>) -> Self {
 		self.tls = tls.into().map(tokio_rustls::TlsAcceptor::from);
 		self
+	}
+
+	/// Whether to accept plaintext `rtmp://` (the default). Pass `false` to refuse it and
+	/// serve `rtmps://` only, so stream keys never cross the network unencrypted: a
+	/// client that does not open with a TLS ClientHello is dropped at its first byte.
+	/// That needs `with_tls`, or [`accept`](Self::accept) refuses to run.
+	pub fn with_plaintext(mut self, allow: bool) -> Self {
+		self.plaintext = allow;
+		self
+	}
+
+	/// Refuse a server that would accept no connection at all: plaintext turned off with
+	/// no TLS to serve instead.
+	pub(crate) fn check(&self) -> Result<()> {
+		#[cfg(feature = "tls")]
+		let tls = self.tls.is_some();
+		#[cfg(not(feature = "tls"))]
+		let tls = false;
+
+		if !self.plaintext && !tls {
+			return Err(crate::Error::Session(
+				"plaintext RTMP is refused but no TLS config is set, so no client could connect".to_string(),
+			));
+		}
+		Ok(())
 	}
 
 	/// The local address the listener is bound to.
@@ -287,8 +321,14 @@ impl Server {
 	/// New connections are accepted and handshaked concurrently; this returns the
 	/// next one to reach its `publish` or `play` command. Connections that close or
 	/// error before either are dropped without surfacing here. Returns `None` only
-	/// if the listener itself stops (it currently never does).
+	/// if the listener itself stops (it currently never does) or the server refuses
+	/// plaintext without TLS, which is logged as an error.
 	pub async fn accept(&mut self) -> Option<Request<Conn>> {
+		if let Err(err) = self.check() {
+			tracing::error!(%err, "RTMP server misconfigured; not accepting connections");
+			return None;
+		}
+
 		loop {
 			// Copied out so the timer arm below doesn't borrow `self` alongside the other two.
 			let retry = self.accept_retry;
@@ -311,20 +351,24 @@ impl Server {
 						self.accept_delay = ACCEPT_RETRY_MIN;
 						configure_socket(&stream, peer);
 						#[cfg(feature = "tls")]
-						let tls = self.tls.clone();
+						let (tls, plaintext) = (self.tls.clone(), self.plaintext);
 						self.pending.push(Box::pin(async move {
 							// The TLS handshake (if any) and the RTMP handshake share one
 							// budget, so a client that stalls either is dropped.
 							let outcome = tokio::time::timeout(REQUEST_TIMEOUT, async move {
 								#[cfg(feature = "tls")]
 								let conn = match tls {
-									Some(acceptor) => Conn::Tls(Box::new(
+									Some(acceptor) if starts_tls(&stream).await? => Conn::Tls(Box::new(
 										acceptor
 											.accept(stream)
 											.await
 											.map_err(|e| anyhow::anyhow!("rtmps tls handshake: {e}"))?,
 									)),
-									None => Conn::Plain(stream),
+									_ if !plaintext => {
+										tracing::warn!(%peer, "refusing plaintext RTMP: this listener requires TLS (rtmps://)");
+										return Ok(None);
+									}
+									_ => Conn::Plain(stream),
 								};
 								#[cfg(not(feature = "tls"))]
 								let conn = Conn::Plain(stream);
@@ -364,6 +408,21 @@ impl Server {
 			}
 		}
 	}
+}
+
+/// The first byte of a TLS record carrying a ClientHello. RTMP's C0 is `0x03` (or `0x06`
+/// for the legacy encrypted variant), so one byte tells the two apart.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// Whether the client opened with a TLS ClientHello, peeked without consuming it.
+#[cfg(feature = "tls")]
+async fn starts_tls(stream: &TcpStream) -> io::Result<bool> {
+	let mut first = [0u8; 1];
+	if stream.peek(&mut first).await? == 0 {
+		return Err(io::ErrorKind::UnexpectedEof.into());
+	}
+	Ok(first[0] == TLS_HANDSHAKE_RECORD)
 }
 
 /// Sleep until `at`, or park forever when there is nothing to wait for.
@@ -759,10 +818,13 @@ impl<S: Stream> Play<S> {
 				}
 			}
 		};
-		if let Err(reason) = check_play_capabilities(&catalog, &self.capabilities) {
-			tracing::debug!(peer = %self.peer, %path, %reason, "rejecting RTMP play: unsupported client capabilities");
-			return self.reject(&reason).await;
-		}
+		let select = match play_selection(&catalog, &self.capabilities) {
+			Ok(select) => select,
+			Err(reason) => {
+				tracing::debug!(peer = %self.peer, %path, %reason, "rejecting RTMP play: unsupported client capabilities");
+				return self.reject(&reason).await;
+			}
+		};
 
 		// The export re-resolves the broadcast (and any sibling broadcast a rendition's
 		// catalog `broadcast` field references) through the origin.
@@ -770,7 +832,8 @@ impl<S: Stream> Play<S> {
 			.await
 			.map_err(|e| anyhow::anyhow!("init FLV export: {e}"))?
 			.with_max_age(self.latency)
-			.with_multitrack(self.capabilities.multitrack);
+			.with_multitrack(self.capabilities.multitrack)
+			.with_select(select);
 
 		// Resolve the catalog and codec headers before Play.Start, too. Otherwise a
 		// broadcast that never produces a playable FLV header looks successful to the
@@ -851,24 +914,34 @@ impl<S: Stream> Play<S> {
 	}
 }
 
-fn check_play_capabilities(
+/// Narrow a play to the video the client can decode, or refuse it.
+///
+/// A multitrack client receives every rendition, so it must play them all. A
+/// single-track client receives the best video rendition it can play.
+fn play_selection(
 	catalog: &moq_mux::catalog::hang::Catalog,
 	capabilities: &ClientCapabilities,
-) -> std::result::Result<(), String> {
-	let limit = if capabilities.multitrack { usize::MAX } else { 1 };
-
-	for config in catalog.video.renditions.values().take(limit) {
-		let Some(fourcc) = video_fourcc(&config.codec, capabilities.multitrack) else {
-			continue;
-		};
-		if !capabilities.supports_video(&fourcc) {
-			return Err(format!(
+) -> std::result::Result<select::Broadcast, String> {
+	let playable = |config: &VideoConfig| plays_video(capabilities, config.codec.kind());
+	let refused = if capabilities.multitrack {
+		catalog.video.renditions.values().find(|config| !playable(config))
+	} else if catalog.video.renditions.values().any(playable) {
+		None
+	} else {
+		catalog.video.ranked().next().map(|(_, config)| config)
+	};
+	if let Some(config) = refused {
+		return Err(match video_fourcc(config.codec.kind(), capabilities.multitrack) {
+			Some(fourcc) => format!(
 				"client did not advertise required RTMP FourCC {}",
 				fourcc_label(&fourcc)
-			));
-		}
+			),
+			None => format!("RTMP can't carry video codec {}", config.codec),
+		});
 	}
 
+	// Audio is still the first rendition by name for a single-track client.
+	let limit = if capabilities.multitrack { usize::MAX } else { 1 };
 	for config in catalog.audio.renditions.values().take(limit) {
 		let Some(fourcc) = audio_fourcc(&config.codec, capabilities.multitrack) else {
 			continue;
@@ -881,16 +954,40 @@ fn check_play_capabilities(
 		}
 	}
 
-	Ok(())
+	let mut video = select::Video::default();
+	let mut any = false;
+	for kind in [
+		VideoCodecKind::H264,
+		VideoCodecKind::H265,
+		VideoCodecKind::AV1,
+		VideoCodecKind::VP9,
+	] {
+		if plays_video(capabilities, kind) {
+			video = video.codec(kind);
+			any = true;
+		}
+	}
+	// An empty codec list would select every codec, so a client that plays none gets no video.
+	let select = select::Broadcast::default().audio(select::Audio::default());
+	Ok(if any { select.video(video) } else { select })
 }
 
-fn video_fourcc(codec: &VideoCodec, multitrack: bool) -> Option<[u8; 4]> {
-	match codec {
-		VideoCodec::H264(_) if multitrack => Some(*b"avc1"),
-		VideoCodec::H265(_) => Some(*b"hvc1"),
-		VideoCodec::AV1(_) => Some(*b"av01"),
-		VideoCodec::VP9(_) => Some(*b"vp09"),
-		VideoCodec::H264(_) | VideoCodec::VP8 | VideoCodec::Unknown(_) => None,
+/// Whether a client with `capabilities` can play `kind` over FLV.
+fn plays_video(capabilities: &ClientCapabilities, kind: VideoCodecKind) -> bool {
+	match video_fourcc(kind, capabilities.multitrack) {
+		Some(fourcc) => capabilities.supports_video(&fourcc),
+		// Every client plays H.264 by its legacy CodecID; nothing else goes without a FourCC.
+		None => kind == VideoCodecKind::H264,
+	}
+}
+
+/// The enhanced-RTMP FourCC a client must advertise to play `kind`, if any.
+fn video_fourcc(kind: VideoCodecKind, multitrack: bool) -> Option<[u8; 4]> {
+	match kind {
+		VideoCodecKind::H264 if multitrack => Some(*b"avc1"),
+		VideoCodecKind::H265 => Some(*b"hvc1"),
+		VideoCodecKind::AV1 => Some(*b"av01"),
+		VideoCodecKind::VP9 => Some(*b"vp09"),
 		_ => None,
 	}
 }
@@ -1284,11 +1381,11 @@ async fn run_handshake<S: Stream>(stream: &mut S, peer: SocketAddr) -> anyhow::R
 /// An active publish: the moq-mux FLV importer, which owns the origin-created
 /// [`BroadcastProducer`](moq_net::broadcast::Producer) it publishes into.
 /// Either [`Self::finish`] or dropping it closes the broadcast and unannounces
-/// the path, the former without the dropped-without-finish warning.
+/// the path.
 struct Publisher {
 	importer: FlvImport,
-	// A clone of the importer's producer, so a deliberate end can finish() the
-	// broadcast (prompt unannounce) even though the importer owns it.
+	// A clone of the importer's producer, so an end can close the broadcast
+	// (prompt unannounce) even though the importer owns it.
 	broadcast: moq_net::broadcast::Producer,
 }
 
@@ -1326,7 +1423,7 @@ impl Publisher {
 	/// the broadcast so the origin unannounces it immediately.
 	fn finish(&mut self) -> anyhow::Result<()> {
 		self.importer.finish()?;
-		self.broadcast.finish();
+		self.broadcast.close();
 		Ok(())
 	}
 
@@ -1334,9 +1431,10 @@ impl Publisher {
 	/// (the client disconnected, a protocol error) rather than a generic
 	/// `Error::Dropped` from the importer being dropped.
 	///
-	/// Consumes the publisher: the broadcast is done.
+	/// Consumes the publisher and closes the broadcast.
 	fn abort(self, err: moq_net::Error) {
 		self.importer.abort(err);
+		self.broadcast.close();
 	}
 }
 
@@ -1751,6 +1849,68 @@ mod tests {
 		server_task.await.unwrap();
 	}
 
+	/// A single-track client gets the best rendition it can decode, whatever the
+	/// names; a multitrack client must decode every rendition.
+	#[test]
+	fn play_selection_picks_the_best_playable_rendition() {
+		fn rendition(codec: impl Into<hang::catalog::VideoCodec>, height: u32) -> VideoConfig {
+			let mut config = VideoConfig::new(codec);
+			config.coded_width = Some(height * 16 / 9);
+			config.coded_height = Some(height);
+			config
+		}
+		let h264 = hang::catalog::H264 {
+			profile: 0x42,
+			constraints: 0,
+			level: 0x1e,
+			inline: false,
+		};
+
+		let mut catalog = moq_mux::catalog::hang::Catalog::default();
+		// Name order would pick the lowest rendition.
+		catalog
+			.video
+			.renditions
+			.insert("a".to_string(), rendition(h264.clone(), 360));
+		catalog.video.renditions.insert(
+			"b".to_string(),
+			rendition(
+				hang::catalog::H265 {
+					in_band: false,
+					profile_space: 0,
+					profile_idc: 1,
+					profile_compatibility_flags: [0x60, 0, 0, 0],
+					tier_flag: false,
+					level_idc: 120,
+					constraint_flags: [0x90, 0, 0, 0, 0, 0],
+				},
+				1080,
+			),
+		);
+		catalog.video.renditions.insert("c".to_string(), rendition(h264, 720));
+
+		let best = |capabilities: &ClientCapabilities| {
+			let select = play_selection(&catalog, capabilities).unwrap();
+			let mut catalog = catalog.clone();
+			select.retain(&mut catalog);
+			catalog.video.ranked().next().map(|(name, _)| name.clone())
+		};
+
+		let legacy = ClientCapabilities::default();
+		assert_eq!(best(&legacy).as_deref(), Some("c"));
+
+		let hevc = FourCcSupport {
+			any: false,
+			fourccs: vec![*b"hvc1"],
+		};
+		let enhanced = ClientCapabilities::new(0, hevc.clone(), FourCcSupport::default());
+		assert_eq!(best(&enhanced).as_deref(), Some("b"));
+
+		// Multitrack carries every rendition, so one the client can't decode refuses the play.
+		let multitrack = ClientCapabilities::new(CAPS_EX_MULTITRACK, hevc, FourCcSupport::default());
+		assert!(play_selection(&catalog, &multitrack).is_err());
+	}
+
 	#[test]
 	fn play_capability_check_uses_per_kind_decode_support() {
 		let mut catalog = moq_mux::catalog::hang::Catalog::default();
@@ -1768,7 +1928,7 @@ mod tests {
 			fourccs: vec![*b"vp09"],
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, video_support, FourCcSupport::default())
 			)
@@ -1780,7 +1940,7 @@ mod tests {
 			fourccs: vec![*b"vp09"],
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, FourCcSupport::default(), audio_support)
 			)
@@ -1792,7 +1952,7 @@ mod tests {
 			fourccs: Vec::new(),
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, wildcard, FourCcSupport::default())
 			)
@@ -2100,19 +2260,17 @@ mod tests {
 		client.abort();
 	}
 
-	/// The same publish flow, but over TLS: prove [`Server::with_tls`] terminates
-	/// RTMPS and yields an identical [`Request`]. Gated on `tls` (RTMPS support);
-	/// the cert is generated by the `moq-tokio` dev-dependency.
+	/// A throwaway self-signed server config for `localhost` plus a client connector that
+	/// trusts anything. The cert is generated by the `moq-tokio` dev-dependency.
 	#[cfg(feature = "tls")]
-	#[tokio::test]
-	async fn rtmps_accept_yields_publish_request() {
+	fn tls_fixture() -> (std::sync::Arc<rustls::ServerConfig>, tokio_rustls::TlsConnector) {
 		use std::sync::Arc;
 
 		use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 		use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 		use rustls::{DigitallySignedStruct, SignatureScheme};
 
-		// Accept any server cert: the test uses a throwaway self-signed cert.
+		// Accept any server cert: the tests use a throwaway self-signed cert.
 		#[derive(Debug)]
 		struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
@@ -2153,26 +2311,28 @@ mod tests {
 
 		let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
-		// Server: a self-signed cert for `localhost`, fronting the RTMP listener.
 		let mut tls = moq_tokio::tls::Listen::default();
 		tls.generate = vec!["localhost".to_string()];
 		let server_config = tls.server_config(vec![]).expect("build RTMPS server config");
 
-		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
-			.await
+		let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+			.with_safe_default_protocol_versions()
 			.unwrap()
-			.with_tls(server_config);
-		let addr = server.local_addr().unwrap();
+			.dangerous()
+			.with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+			.with_no_client_auth();
 
-		// Client: TLS-connect (no verify), then run the ordinary RTMP client.
+		(server_config, tokio_rustls::TlsConnector::from(Arc::new(client_config)))
+	}
+
+	/// Publish over TLS: prove the server terminates RTMPS and yields an identical
+	/// [`Request`].
+	#[cfg(feature = "tls")]
+	async fn rtmps_publish(server: &mut Server, connector: tokio_rustls::TlsConnector) {
+		use rustls::pki_types::ServerName;
+
+		let addr = server.local_addr().unwrap();
 		let client = tokio::spawn(async move {
-			let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-				.with_safe_default_protocol_versions()
-				.unwrap()
-				.dangerous()
-				.with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-				.with_no_client_auth();
-			let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 			let tcp = TcpStream::connect(addr).await.unwrap();
 			let server_name = ServerName::try_from("localhost").unwrap();
 			let stream = connector.connect(server_name, tcp).await.unwrap();
@@ -2192,5 +2352,84 @@ mod tests {
 		};
 		publish.reject("test rejection").await.unwrap();
 		client.abort();
+	}
+
+	/// By default a server with TLS terminates RTMPS and still serves a plaintext client on the
+	/// same port. Gated on `tls` (RTMPS support).
+	#[cfg(feature = "tls")]
+	#[tokio::test]
+	async fn rtmps_and_rtmp_share_one_port() {
+		let (server_config, connector) = tls_fixture();
+
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_tls(server_config);
+		let addr = server.local_addr().unwrap();
+
+		rtmps_publish(&mut server, connector).await;
+
+		let plain = tokio::spawn(async move {
+			let stream = TcpStream::connect(addr).await.unwrap();
+			run_client(stream, ClientMode::Play).await;
+		});
+		let request = tokio::time::timeout(Duration::from_secs(5), server.accept())
+			.await
+			.expect("plaintext accept timed out")
+			.expect("server yielded a plaintext request");
+		let Request::Play(play) = request else {
+			panic!("expected a play request");
+		};
+		play.reject("test rejection").await.unwrap();
+		plain.abort();
+	}
+
+	/// With plaintext turned off, a server refuses a plaintext client at its first byte,
+	/// without waiting for the request timeout, and keeps serving RTMPS afterwards.
+	#[cfg(feature = "tls")]
+	#[tokio::test]
+	async fn rtmps_required_refuses_plaintext() {
+		let (server_config, connector) = tls_fixture();
+
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_tls(server_config)
+			.with_plaintext(false);
+		let addr = server.local_addr().unwrap();
+
+		// The connection is handled inside `accept`, so drive it while the plaintext client
+		// opens with an RTMP C0.
+		let plain = tokio::spawn(async move {
+			let mut stream = TcpStream::connect(addr).await.unwrap();
+			stream.write_all(&[0x03]).await.unwrap();
+			// A refusal closes the socket: EOF, or a reset when unread bytes were pending.
+			// A served client would instead be sent the handshake S0/S1.
+			let mut buf = [0u8; 1];
+			matches!(stream.read(&mut buf).await, Ok(0) | Err(_))
+		});
+
+		// The refusal comes well inside REQUEST_TIMEOUT, so a client that stayed open
+		// (a bug) fails the outer timeout rather than passing quietly.
+		let refused = tokio::select! {
+			refused = tokio::time::timeout(Duration::from_secs(5), plain) => refused,
+			request = server.accept() => panic!("plaintext client yielded a request: {}", request.is_some()),
+		};
+		assert!(refused.expect("plaintext client was not refused").unwrap());
+
+		rtmps_publish(&mut server, connector).await;
+	}
+
+	/// Refusing plaintext with no TLS to serve instead would listen for nothing, so the
+	/// server refuses to run rather than dropping every client.
+	#[tokio::test]
+	async fn plaintext_off_without_tls_is_refused() {
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_plaintext(false);
+
+		assert!(server.check().is_err());
+		assert!(server.accept().await.is_none());
 	}
 }

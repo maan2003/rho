@@ -15,7 +15,10 @@ JSON over [`@moq/net`](/lib/js/net) tracks, in three modes:
 
 On Snapshot and Stream, `Config` is the codec options. `Producer.Config` /
 `Consumer.Config` add the track. Compression is a shared `"none" | "deflate"`
-enum, not a boolean: both sides set the same field. Window still uses
+enum, not a boolean: both sides set the same field. `Stream.Config` also
+accepts a `schema` for record validation on encode and decode. A delta without
+a snapshot raises `MissingSnapshot`; an uncommitted compressed stream frame
+raises `Desync`. Unexpected frame read errors propagate to the caller. Window still uses
 `ProducerConfig` / `ConsumerConfig` and a boolean `compression` flag.
 
 ```ts
@@ -29,5 +32,8 @@ for await (const value of consumer) {
     console.log(value);
 }
 ```
+
+A value is stamped when written, unless you pass its capture time:
+`producer.update(value, at)`.
 
 The Rust twin is [`moq-json`](/lib/rs/moq-json).
