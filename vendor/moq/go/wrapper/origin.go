@@ -11,6 +11,11 @@ import (
 // OriginProducer publishes broadcasts under paths and hands out consumers that
 // discover them. Wire one as both a client's/server's publish source and
 // consume sink for a full-duplex peer.
+//
+// There is no Close: the origin ends once the collector reaches every owner
+// (each producer, published broadcast, and [OriginDynamic]), and its consumers
+// then fail with [ErrClosed]. Keep an owner reachable for as long as the origin
+// should live.
 type OriginProducer struct {
 	inner *ffi.MoqOriginProducer
 }
@@ -47,11 +52,10 @@ func (o *OriginProducer) Dynamic(prefix string, route Route) (*OriginDynamic, er
 // CreateBroadcast creates a broadcast at the given path, returning the producer
 // that feeds it.
 //
-// The broadcast starts unadvertised: reachable by exact path, but not visible
-// to announcement streams. Advertise it with [BroadcastProducer.Announce]
-// after populating tracks. Finish unpublishes immediately, while dropping the
-// producer without finishing also unpublishes but reads to subscribers as a
-// failure rather than a deliberate end.
+// The broadcast is invisible and unroutable, for this origin's consumers and
+// peers alike, until [BroadcastProducer.Announce]. Announce it after
+// populating tracks. [BroadcastProducer.Close] ends it for good; dropping the
+// last handle does the same.
 func (o *OriginProducer) CreateBroadcast(path string) (*BroadcastProducer, error) {
 	inner, err := o.inner.CreateBroadcast(path)
 	if err != nil {
@@ -125,6 +129,8 @@ type AnnounceOptions struct {
 	Prefix string
 	// Filter is a pattern relative to Prefix. Nil matches every path beneath it.
 	Filter *string
+	// Hidden also lists paths with a segment starting with "." below Prefix.
+	Hidden bool
 }
 
 // Announced streams routes under a literal prefix matching an optional pattern filter.
@@ -132,6 +138,7 @@ func (o *OriginConsumer) Announced(options AnnounceOptions) (*AnnounceConsumer, 
 	inner, err := o.inner.Announced(ffi.MoqAnnounceConfig{
 		Prefix: options.Prefix,
 		Filter: options.Filter,
+		Hidden: options.Hidden,
 	})
 	if err != nil {
 		return nil, err
@@ -149,10 +156,11 @@ func (o *OriginConsumer) AnnouncedBroadcast(path string) (*AnnouncedBroadcast, e
 	return &AnnouncedBroadcast{inner: inner}, nil
 }
 
-// RequestBroadcast resolves a broadcast at path as soon as it can be served: a
-// local broadcast at the exact path, the best announced route covering it
-// (served on demand by the session that announced it), or a dynamic fallback on
-// the origin; errors if nothing can serve it. Unlike AnnouncedBroadcast, it
+// RequestBroadcast resolves a broadcast at path as soon as it can be served,
+// through the best announced route covering it: an announced broadcast on this
+// origin, a route a session announced (served on demand by that session), or a
+// dynamic handler on the origin; errors if nothing can serve it, including a
+// broadcast created but not announced. Unlike AnnouncedBroadcast, it
 // does not wait for a future announcement. Blocks until resolved.
 func (o *OriginConsumer) RequestBroadcast(ctx context.Context, path string) (*BroadcastConsumer, error) {
 	inner, err := o.inner.RequestBroadcast(ctx, path)

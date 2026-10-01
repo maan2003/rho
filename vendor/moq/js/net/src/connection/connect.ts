@@ -254,8 +254,8 @@ async function connectTransport(url: URL, session: WebTransport, wiring: Session
 // Negotiate the MoQ protocol over an established transport. The caller races this against
 // the session closing so a close code is not lost behind a failed or stalled SETUP stream.
 async function negotiate(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
-	// qmux Session exposes the negotiated protocol directly (as "" when there is none);
-	// native WebTransport doesn't have a standard .protocol property yet.
+	// The DOM lib has no `protocol` property yet. It is "" when none was negotiated, and
+	// undefined in a browser that predates subprotocols (Firefox before 155).
 	const protocol: string | undefined = (session as { protocol?: string }).protocol || undefined;
 	if (dev()) console.debug(redact(url), "negotiated ALPN:", protocol ?? "(none)");
 
@@ -281,7 +281,9 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 		setupVersion = Ietf.Version.DRAFT_16;
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		setupVersion = Ietf.Version.DRAFT_15;
-	} else if (protocol === Lite.ALPN_06_WIP) {
+	} else if (protocol === Lite.ALPN_07_WIP) {
+		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_07, ...wiring });
+	} else if (protocol === Lite.ALPN_06) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_06, ...wiring });
 	} else if (protocol === Lite.ALPN_05) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_05, ...wiring });
@@ -295,7 +297,7 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 		throw new Error(`unsupported WebTransport protocol: ${protocol}`);
 	}
 
-	const stream = await Stream.open(session);
+	const stream = await Stream.open(session, { version: setupVersion });
 	await stream.writer.u53(Lite.StreamId.ClientCompat);
 
 	const encoder = new TextEncoder();
@@ -304,6 +306,7 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
 	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
 	Ietf.solicitIntoSetup(params);
+	Ietf.hiddenIntoSetup(params);
 
 	const client = new Ietf.ClientSetup({
 		versions:
@@ -342,6 +345,7 @@ async function negotiate(url: URL, session: WebTransport, wiring: SessionProps):
 			maxRequestId,
 			version: server.version as Ietf.IetfVersion,
 			solicit: Ietf.solicitFromSetup(server.parameters),
+			hidden: Ietf.hiddenFromSetup(server.parameters),
 		});
 	} else {
 		throw new Error(`unsupported server version: ${server.version.toString()}`);
@@ -358,7 +362,7 @@ async function handshakeAlpn(
 	version: Ietf.IetfVersion,
 	wiring: SessionProps,
 ): Promise<Established> {
-	const { control, solicit, cluster } = await exchangeSetup(session, version, "moq-lite-js");
+	const { control, solicit, hidden, cluster } = await exchangeSetup(session, version, "moq-lite-js");
 
 	return new Ietf.Connection({
 		...wiring,
@@ -367,6 +371,7 @@ async function handshakeAlpn(
 		quic: session,
 		control,
 		solicit,
+		hidden,
 		cluster,
 		// v17+ uses NativeSession which manages its own request IDs; maxRequestId is unused.
 		maxRequestId: 0n,
@@ -433,8 +438,9 @@ async function connectWebTransport(
 		allowPooling: false,
 		congestionControl: "low-latency",
 		protocols: [
-			// Lite.ALPN_06_WIP is intentionally omitted: lite-06 is work-in-progress and
-			// not advertised by default (connect.ts still accepts it if a server negotiates it).
+			// Lite.ALPN_07_WIP is intentionally omitted: lite-07 is work-in-progress and
+			// not advertised by default (negotiate still accepts it if a server selects it).
+			Lite.ALPN_06,
 			Lite.ALPN_05,
 			Lite.ALPN_04,
 			Lite.ALPN_03,
@@ -520,7 +526,8 @@ async function connectWebSocket(url: URL, delay: number, cancel: Promise<void>):
 	// advertises every QMux draft it knows about and the server picks one.
 	// Insertion order is the negotiation preference on the wire.
 	const versions = {
-		// Lite.ALPN_06_WIP omitted on purpose: lite-06 is work-in-progress, not advertised by default.
+		// Lite.ALPN_07_WIP omitted on purpose: lite-07 is work-in-progress, not advertised by default.
+		[Lite.ALPN_06]: null,
 		[Lite.ALPN_05]: null,
 		[Lite.ALPN_04]: null,
 		[Lite.ALPN_03]: null,

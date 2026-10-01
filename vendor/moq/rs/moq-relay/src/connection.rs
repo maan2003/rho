@@ -79,7 +79,6 @@ impl Connection {
 	/// Admits and serves this connection until it closes.
 	#[tracing::instrument("conn", skip_all, fields(id = self.id, remote = self.request.remote_addr().map(tracing::field::display), session = tracing::field::Empty))]
 	pub async fn run(self) -> anyhow::Result<()> {
-		let peer_hop = self.request.peer_hop();
 		let (lease, registration) = match self.admit().await {
 			Ok(admitted) => admitted,
 			Err(err) => {
@@ -95,7 +94,8 @@ impl Connection {
 
 		let transport = self.request.transport();
 		let role = self.request.role();
-		let grants = match authorize(&self.cluster, lease.token(), role, &transport) {
+		let cluster_peer = self.request.peer_identity().is_some() || cluster::Cluster::is_lan_path(self.request.path());
+		let grants = match authorize(&self.cluster, lease.token(), role, cluster_peer, &transport) {
 			Ok(grants) => grants,
 			Err(err) => {
 				let _ = self.request.reject(moq_tokio::server::Reject::Forbidden).await;
@@ -110,15 +110,15 @@ impl Connection {
 		//
 		// moq-net defaults the unset side to a fresh no-op origin, which is fine for a
 		// publish-only or subscribe-only session.
+		let lease = lease.with_stats(grants.stats.clone());
 		let mut request = self.request.with_stats(grants.stats);
 		if let Some(subscribe) = grants.subscribe {
-			request = request.with_publisher(&subscribe);
+			request = request.with_publisher(subscribe);
 		}
 		if let Some(publish) = grants.publish {
 			request = request.with_subscriber(publish);
 		}
 		let session = request.ok().await?;
-		let _node_connection = peer_hop.map(|origin| self.cluster.nodes.connect_inbound(self.id, origin));
 
 		tracing::info!(version = %session.version(), %transport, "negotiated");
 
@@ -177,10 +177,10 @@ impl Connection {
 /// What an authorized session may serve: the token-scoped origin pair, pruned
 /// to the advertised role, plus its stats context.
 pub(crate) struct Grants {
-	/// What the client may subscribe to (we publish it).
-	pub(crate) publish: Option<moq_net::origin::Producer>,
 	/// What the client may publish (we subscribe to it).
-	pub(crate) subscribe: Option<moq_net::origin::Producer>,
+	pub(crate) publish: Option<moq_net::origin::Producer>,
+	/// What the client may subscribe to (we publish it).
+	pub(crate) subscribe: Option<moq_net::origin::Consumer>,
 	/// The session's billing/attribution context.
 	pub(crate) stats: moq_net::stats::Session,
 }
@@ -188,17 +188,25 @@ pub(crate) struct Grants {
 /// Authorize an admitted session and resolve what it may serve, however
 /// its transport is driven (the shared runtime or a QUIC worker).
 ///
-/// The client advertises which direction it intends to use (moq-lite-05
-/// SETUP). A bidirectional connection (e.g. a cluster peer) advertises
+/// The client advertises which direction it intends to use in SETUP
+/// (moq-lite-05 and newer). A bidirectional connection (e.g. a cluster peer) advertises
 /// nothing, so the only requirement is that the token grants *something*. But
 /// a gateway that only publishes or only subscribes says so, and a token
 /// missing that direction's scope is rejected here during the handshake,
 /// instead of being accepted and then silently carrying no media (the bug
 /// that motivated the role hint).
+///
+/// `cluster_peer` marks an authenticated cluster peer (a verified client
+/// certificate or the LAN credential), which discovers hidden routes whether
+/// or not it asks. A peer that predates the hidden opt-in (below moq-lite-07-wip,
+/// or moq-transport without MoQ Hidden) would otherwise lose every dot path
+/// during a rolling upgrade.
+// TODO: drop the exemption once deployed peers all opt in.
 pub(crate) fn authorize(
 	cluster: &cluster::Cluster,
 	token: &auth::Token,
 	role: Option<moq_net::Role>,
+	cluster_peer: bool,
 	transport: &dyn std::fmt::Display,
 ) -> anyhow::Result<Grants> {
 	let publish = cluster.publisher(token);
@@ -248,6 +256,7 @@ pub(crate) fn authorize(
 		// Bidirectional or an unrecognized future role: keep whatever the token grants.
 		None | Some(_) => (publish, subscribe),
 	};
+	let subscribe = subscribe.map(|subscribe| subscribe.consume().with_hidden(cluster_peer));
 
 	Ok(Grants {
 		publish,
@@ -268,7 +277,7 @@ pub(crate) fn authorize(
 /// the session ([`auth::Lease::ended`]) the session closes with the reason, and
 /// the session's own close is reported back through the lease as the `end` event.
 /// Either way, a relay shutdown drains the session with a GOAWAY instead of
-/// cutting it off.
+/// cutting it off, and does not exit before this returns or the drain deadline.
 ///
 /// The session handle is `Send + Sync` whatever transport carries it, so this
 /// runs on the shared runtime even for sessions a pinned QUIC worker drives.
@@ -278,6 +287,7 @@ pub async fn supervise(
 	mut shutdown: crate::shutdown::Observer,
 	registration: Option<crate::session::Registration>,
 ) -> anyhow::Result<()> {
+	let _serving = shutdown.serve();
 	loop {
 		let nudged = async {
 			match &registration {

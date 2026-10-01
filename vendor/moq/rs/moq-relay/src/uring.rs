@@ -68,6 +68,8 @@ struct Serve {
 	alpns: Arc<Vec<String>>,
 	/// The negotiated-version restriction, when the operator set one.
 	versions: moq_net::Versions,
+	/// The address every worker socket shares, reported as a session's `local`.
+	local: SocketAddr,
 }
 
 /// A bound group of io_uring QUIC workers sharing one port.
@@ -195,8 +197,7 @@ impl Workers {
 		while let Some(member) = group.member().context("failed to clone a reuseport member")? {
 			members.push(member);
 		}
-		// Whatever the first member bound, which is the requested address unless
-		// it asked for an ephemeral port.
+		// The requested address, with an ephemeral port resolved.
 		let addr = group.addr();
 
 		// The moq-lite ALPNs this listener speaks: the operator's version
@@ -308,6 +309,7 @@ impl Workers {
 			tokio: tokio::runtime::Handle::current(),
 			alpns: self.alpns.clone(),
 			versions: self.versions.clone(),
+			local: self.addr,
 		};
 
 		let cores = match self.pin {
@@ -604,9 +606,11 @@ async fn serve_connection(
 ) -> anyhow::Result<()> {
 	use web_transport_trait::poll::Session as _;
 
+	// Read the link facts now: the handshake below consumes the connection.
+	let remote = conn.remote_addr();
+	let sni = conn.server_name().map(str::to_owned);
 	// TLS validated this against the configured roots before the connection
-	// existed, so a chain here is an authenticated peer. Read it now: the
-	// handshake below consumes the connection.
+	// existed, so a chain here is an authenticated peer.
 	let identity = conn.peer_chain().map(|chain| {
 		let chain = chain
 			.into_iter()
@@ -670,7 +674,8 @@ async fn serve_connection(
 	};
 	let path = if path.is_empty() { "/".to_string() } else { path };
 	let mut registration = None;
-	let lease = if cluster::Cluster::is_lan_path(&path) {
+	let lan = cluster::Cluster::is_lan_path(&path);
+	let lease = if lan {
 		match cluster::Cluster::lan_credential(&path) {
 			Some(presented) => match serve.cluster.verify_lan_credential(presented) {
 				Some(true) => serve.auth.admit_fixed("/", serve.cluster.lan_peer_grant()),
@@ -691,8 +696,15 @@ async fn serve_connection(
 	} else {
 		let mut auth_request = serve.auth.request(moq_auth::Transport::Quic, path);
 		auth_request.query = query;
-		// moq-uring's connection does not expose the peer address or SNI yet, so
-		// the request carries the protocol alone; see quest/next/uring-link-facts.md.
+		auth_request.remote = Some(remote);
+		auth_request.local = Some(serve.local);
+		// Like the tokio listener: the SNI, else the host a WebTransport client addressed.
+		auth_request.server_name = sni.or_else(|| {
+			url.as_ref()
+				.and_then(|url| url.host_str())
+				.filter(|host| !host.is_empty())
+				.map(str::to_owned)
+		});
 		auth_request.alpn = alpn.clone();
 		auth_request.role = request.role().map(|role| match role {
 			moq_net::Role::Publisher => moq_auth::Role::Publisher,
@@ -736,19 +748,24 @@ async fn serve_connection(
 	};
 
 	let role = request.role();
-	let grants =
-		match crate::connection::authorize(&serve.cluster, lease.token(), role, &moq_tokio::server::Transport::Quic) {
-			Ok(grants) => grants,
-			Err(err) => {
-				request.close(moq_net::Error::Unauthorized);
-				return Err(err);
-			}
-		};
+	let grants = match crate::connection::authorize(
+		&serve.cluster,
+		lease.token(),
+		role,
+		identity.is_some() || lan,
+		&moq_tokio::server::Transport::Quic,
+	) {
+		Ok(grants) => grants,
+		Err(err) => {
+			request.close(moq_net::Error::Unauthorized);
+			return Err(err);
+		}
+	};
 
-	let peer_hop = request.peer_hop();
+	let lease = lease.with_stats(grants.stats.clone());
 	let mut request = request.with_stats(grants.stats);
 	if let Some(subscribe) = grants.subscribe {
-		request = request.with_publisher(&subscribe);
+		request = request.with_publisher(subscribe);
 	}
 	if let Some(publish) = grants.publish {
 		request = request.with_subscriber(publish);
@@ -761,7 +778,6 @@ async fn serve_connection(
 			err => tracing::debug!(%err, "session driver ended"),
 		}
 	});
-	let node_connection = peer_hop.map(|origin| serve.cluster.nodes.connect_inbound(id, origin));
 
 	tracing::info!(id, version = %session.version(), transport = %moq_tokio::server::Transport::Quic, "negotiated");
 
@@ -770,7 +786,6 @@ async fn serve_connection(
 	// and the shutdown broadcast on the shared runtime.
 	let shutdown = serve.shutdown.clone();
 	serve.tokio.spawn(async move {
-		let _node_connection = node_connection;
 		if let Err(err) = crate::connection::supervise(session, lease, shutdown, registration).await {
 			tracing::warn!(id, %err, "connection closed");
 		}

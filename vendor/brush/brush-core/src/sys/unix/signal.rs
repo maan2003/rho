@@ -35,6 +35,20 @@ pub fn kill_process(
     Ok(())
 }
 
+/// Checks whether a specific process exists and can be signaled.
+///
+/// # Arguments
+/// * `pid` - The process ID to signal-zero check.
+pub fn check_signalable(pid: sys::process::ProcessId) -> Result<(), error::Error> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).map_err(|errno| match errno {
+        nix::errno::Errno::ESRCH => error::ErrorKind::NoSuchProcess,
+        nix::errno::Errno::EPERM => error::ErrorKind::PermissionDenied,
+        _ => error::ErrorKind::FailedToSendSignal,
+    })?;
+
+    Ok(())
+}
+
 pub(crate) fn lead_new_process_group() -> Result<(), error::Error> {
     nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))?;
     Ok(())
@@ -92,11 +106,20 @@ pub(crate) fn poll_for_stopped_children() -> Result<bool, error::Error> {
     Ok(found_stopped)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "netbsd", target_os = "openbsd")))]
 fn waitid_all(
     flags: nix::sys::wait::WaitPidFlag,
 ) -> Result<nix::sys::wait::WaitStatus, nix::errno::Errno> {
     nix::sys::wait::waitid(nix::sys::wait::Id::All, flags)
+}
+
+// nix does not expose `waitid` on NetBSD/OpenBSD; `waitpid` for any child is
+// equivalent for the flags used here.
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn waitid_all(
+    flags: nix::sys::wait::WaitPidFlag,
+) -> Result<nix::sys::wait::WaitStatus, nix::errno::Errno> {
+    nix::sys::wait::waitpid(None, Some(flags))
 }
 
 //

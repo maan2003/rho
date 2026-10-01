@@ -10,7 +10,9 @@
 //! other codecs through unchanged.
 //!
 //! By default FLV carries a single video and a single audio stream, so only the
-//! first rendition of each kind is muxed and the rest are ignored. With
+//! best video rendition (see [`Video::ranked`](hang::catalog::Video::ranked)) and
+//! the first audio rendition are muxed and the rest are ignored. The video pick
+//! follows the catalog until the stream header goes out, then stays. With
 //! [`with_multitrack`](Export::with_multitrack) every rendition is muxed instead,
 //! each as an enhanced-RTMP multitrack track addressed by its own track id (use
 //! this only for a player that advertised the `Multitrack` capability).
@@ -105,8 +107,10 @@ pub struct Export {
 	catalog: Option<crate::catalog::Consumer>,
 	max_age: std::time::Duration,
 	/// Emit every rendition as an enhanced-RTMP multitrack track, rather than only
-	/// the first video + first audio rendition.
+	/// the best video + first audio rendition.
 	multitrack: bool,
+	/// Only mux the renditions this selects, or every rendition when unset.
+	select: Option<crate::select::Broadcast>,
 
 	video: Vec<FlvTrack>,
 	audio: Vec<FlvTrack>,
@@ -181,6 +185,7 @@ impl Export {
 			catalog: Some(catalog),
 			max_age: std::time::Duration::ZERO,
 			multitrack: false,
+			select: None,
 			video: Vec::new(),
 			audio: Vec::new(),
 			header_emitted: false,
@@ -198,7 +203,7 @@ impl Export {
 	}
 
 	/// Mux every rendition as an enhanced-RTMP multitrack track (one FLV stream
-	/// carrying several video and/or audio tracks), rather than only the first
+	/// carrying several video and/or audio tracks), rather than only the best
 	/// video + first audio rendition.
 	///
 	/// Only enable this for a player that advertised the enhanced-RTMP
@@ -206,6 +211,15 @@ impl Export {
 	/// parse the multitrack framing. Defaults to off.
 	pub fn with_multitrack(mut self, multitrack: bool) -> Self {
 		self.multitrack = multitrack;
+		self
+	}
+
+	/// Only mux the renditions `select` keeps, such as the codecs a player can decode.
+	///
+	/// A single-track stream then carries the best video rendition among them.
+	/// Defaults to every rendition.
+	pub fn with_select(mut self, select: crate::select::Broadcast) -> Self {
+		self.select = Some(select);
 		self
 	}
 
@@ -304,41 +318,60 @@ impl Export {
 
 	fn update_catalog(&mut self, mut catalog: Catalog) -> anyhow::Result<()> {
 		self.source.retain_valid_media(&mut catalog);
+		if let Some(select) = &self.select {
+			select.retain(&mut catalog);
+		}
 
-		// A single-track FLV stream binds only the first rendition of each kind;
-		// multitrack binds them all. Bind newly-seen renditions in name order (the
-		// catalog is a BTreeMap) so each keeps a stable track id.
+		// A single-track FLV stream binds one rendition of each kind; multitrack
+		// binds them all.
 		//
 		// Only bind before the header is emitted: the sequence-header (config) tags
 		// go out with the header, and there's no in-band way to introduce a new
 		// track's config mid-stream, so a rendition first seen afterward is left
-		// unmuxed rather than emitted as undecodable config-less frames. (This
-		// mirrors the single-track path ignoring extra renditions.)
+		// unmuxed rather than emitted as undecodable config-less frames. Until then a
+		// single-track stream rebinds to a better-ranked video rendition.
 		if !self.header_emitted {
 			self.bind_video(&catalog)?;
 			self.bind_audio(&catalog)?;
-		} else if catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len()
+		} else if self.multitrack
+			&& (catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len())
 		{
 			tracing::warn!("ignoring FLV rendition that appeared after the stream header");
 		}
 
-		// A bound track vanishing from the catalog is a layout change FLV can't express.
-		for track in self.tracks() {
-			let present = if is_video_flavor(track.flavor) {
-				catalog.video.renditions.contains_key(&track.name)
-			} else {
-				catalog.audio.renditions.contains_key(&track.name)
-			};
-			anyhow::ensure!(present, "FLV track '{}' removed mid-stream", track.name);
-		}
-
+		// A bound track leaving the catalog is read to its own end rather than refused. A
+		// publisher retires a rendition as its track finishes or drops, and the catalog
+		// update races that end on another stream, so only the track's end can say which it
+		// was: a finish ends it cleanly, and a drop is the error the export reports.
 		Ok(())
 	}
 
 	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
-		for (name, config) in &catalog.video.renditions {
+		let renditions: Vec<_> = if self.multitrack {
+			// Name order (the catalog is a BTreeMap), so each keeps a stable track id.
+			catalog.video.renditions.iter().collect()
+		} else {
+			// The best rendition FLV can carry, whatever the names. The rest follow in
+			// rank order so a catalog with nothing FLV carries fails on its best one.
+			let mut ranked: Vec<_> = catalog.video.ranked().collect();
+			ranked.sort_by_key(|(_, config)| {
+				video_flavor(config).is_err() || !matches!(config.container, Container::Legacy | Container::Loc)
+			});
+			ranked
+		};
+
+		// Before the header, a single-track stream follows the best rendition, so a
+		// snapshot that lacks it doesn't fix the pick. Dropping the bound track
+		// unsubscribes it; nothing was emitted from it yet.
+		if !self.multitrack
+			&& let Some((best, _)) = renditions.first()
+			&& self.video.first().is_some_and(|t| &t.name != *best)
+		{
+			self.video.clear();
+		}
+
+		for (name, config) in renditions {
 			if !self.multitrack && !self.video.is_empty() {
-				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
 				break;
 			}
 			if self.video.iter().any(|t| &t.name == name) {
@@ -655,10 +688,6 @@ fn ensure_legacy(container: &Container, kind: &str, name: &str) -> anyhow::Resul
 			unknown.kind().unwrap_or("<missing>")
 		),
 	}
-}
-
-fn is_video_flavor(flavor: Flavor) -> bool {
-	matches!(flavor, Flavor::Avc | Flavor::Hevc | Flavor::Av1 | Flavor::Vp9)
 }
 
 fn video_flavor(config: &hang::catalog::VideoConfig) -> anyhow::Result<Flavor> {

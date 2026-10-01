@@ -56,7 +56,9 @@
 //!   those took the datagram path.
 //! * `sessions_started` / `sessions_ended` ([`Presence`]): cumulative count of
 //!   sessions connected/disconnected under an auth root on this tier.
-//!   Driven by [`Handle::session`] (the [`Session`] context).
+//!   Driven by [`Handle::session`] (the [`Session`] context); a
+//!   [`Session::set_tier`] ends the session on the old tier and starts it on
+//!   the new one.
 //!
 //! Counters are strictly monotonic (only `fetch_add`); a counter going
 //! backwards across reads means the underlying entry was garbage collected
@@ -73,7 +75,8 @@
 //!
 //! # Garbage collection
 //!
-//! [`Registry::report`] returns the current per-broadcast detail and prunes
+//! [`Registry::report`] refills a caller-owned [`Report`] with the current
+//! per-broadcast detail and prunes
 //! entries no longer referenced by any guard, so a publisher draining the
 //! registry on an interval keeps it bounded. A registry that is never
 //! drained accumulates one entry per broadcast path ever seen; call
@@ -709,9 +712,9 @@ impl Snapshot {
 	}
 }
 
-/// The per-broadcast detail returned by [`Registry::report`]: one traffic
-/// entry per `(broadcast, tier)` and one session entry per `(tier, root)`.
-/// Entries are unordered.
+/// The per-broadcast detail [`Registry::report`] fills: one traffic entry per
+/// `(broadcast, tier)` and one session entry per `(tier, root)`. Entries are
+/// unordered. Reuse one across drains to keep its capacity.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct Report {
@@ -791,6 +794,9 @@ pub struct Registry {
 
 /// State shared by every clone of a [`Registry`].
 struct Shared {
+	/// Completed entries folded by tier before pruning. Lock before either map
+	/// so a snapshot sees each entry either here or live, never both or neither.
+	retired: Lock<Snapshot>,
 	entries: Lock<HashMap<PathOwned, Arc<BroadcastEntry>>>,
 	/// Connected-session gauges keyed by `(tier, auth root)`. Independent of any
 	/// broadcast; surfaced on the per-tier session tracks. A tier's inner map is
@@ -800,8 +806,9 @@ struct Shared {
 
 /// Per-broadcast counters, lazily split by tier. A tier's [`TierCounters`] is
 /// created the first time a guard records under that label, so the set of tiers
-/// is fully dynamic. Bump-path call sites resolve the `Arc<TierCounters>` once
-/// (at guard creation) and hold it, so the per-byte path never touches this map.
+/// is fully dynamic. A [`Scope`] resolves the `Arc<TierCounters>` once per session
+/// tier and hands it to the guards and meters it creates, so the per-byte path
+/// never touches this map.
 struct BroadcastEntry {
 	tiers: Mutex<HashMap<Tier, Arc<TierCounters>>>,
 }
@@ -840,6 +847,7 @@ impl Registry {
 		Self {
 			exclude,
 			shared: Some(Arc::new(Shared {
+				retired: Lock::default(),
 				entries: Lock::default(),
 				sessions: Default::default(),
 			})),
@@ -918,12 +926,14 @@ impl Registry {
 	/// all-zero snapshot for a disabled registry.
 	///
 	/// Unlike [`Registry::report`], this collapses per-broadcast detail into
-	/// node totals (what a `/metrics`-style scrape wants) and never prunes.
+	/// node lifetime totals (what a `/metrics`-style scrape wants) and never prunes.
+	/// Retired entries remain in these totals after [`Self::report`] prunes them.
 	pub fn snapshot(&self) -> Snapshot {
-		let mut snap = Snapshot::default();
 		let Some(shared) = self.shared.as_ref() else {
-			return snap;
+			return Snapshot::default();
 		};
+		let retired = shared.retired.lock();
+		let mut snap = retired.clone();
 		{
 			let entries = shared.entries.lock();
 			for entry in entries.values() {
@@ -947,20 +957,23 @@ impl Registry {
 		snap
 	}
 
-	/// Take a per-broadcast [`Report`] and prune dead entries.
+	/// Refill `report` with the per-broadcast detail and prune dead entries.
 	///
-	/// Returns every `(broadcast, tier)` traffic readout and every `(tier,
-	/// root)` session gauge, then drops the entries no guard references
-	/// anymore (their final values are still in the returned report, so a
-	/// publisher draining on an interval emits the closing readout exactly
-	/// once). A pruned path that sees traffic again restarts from zero; see
-	/// the module docs on counter resets. Returns an empty report for a
-	/// disabled registry.
-	pub fn report(&self) -> Report {
-		let mut report = Report::default();
+	/// Clears `report`, keeping its capacity so a caller draining on an
+	/// interval reuses one report instead of allocating per drain, then fills
+	/// every `(broadcast, tier)` traffic readout and every `(tier, root)`
+	/// session gauge. Entries no guard references anymore are then dropped
+	/// (their final values are still in the report, so a publisher draining on
+	/// an interval emits the closing readout exactly once). A pruned path that
+	/// sees traffic again restarts from zero; see the module docs on counter
+	/// resets. Leaves the report empty for a disabled registry.
+	pub fn report(&self, report: &mut Report) {
+		report.traffic.clear();
+		report.sessions.clear();
 		let Some(shared) = self.shared.as_ref() else {
-			return report;
+			return;
 		};
+		let mut retired = shared.retired.lock();
 		{
 			let mut entries = shared.entries.lock();
 			for (path, entry) in entries.iter() {
@@ -983,7 +996,15 @@ impl Registry {
 					return true;
 				}
 				let mut tiers = entry.tiers.lock().expect("stats tiers poisoned");
-				tiers.retain(|_, counters| Arc::strong_count(counters) > 1);
+				tiers.retain(|tier, counters| {
+					if Arc::strong_count(counters) > 1 {
+						return true;
+					}
+					let totals = retired.traffic.entry(tier.clone()).or_default();
+					totals[Role::Publisher.idx()].add(counters.publisher.snapshot());
+					totals[Role::Subscriber.idx()].add(counters.subscriber.snapshot());
+					false
+				});
 				!tiers.is_empty()
 			});
 		}
@@ -998,12 +1019,21 @@ impl Registry {
 					});
 				}
 			}
-			for roots in sessions.values_mut() {
-				roots.retain(|_, counters| Arc::strong_count(counters) > 1);
+			for (tier, roots) in sessions.iter_mut() {
+				roots.retain(|_, counters| {
+					if Arc::strong_count(counters) > 1 {
+						return true;
+					}
+					retired
+						.sessions
+						.entry(tier.clone())
+						.or_default()
+						.add(counters.snapshot());
+					false
+				});
 			}
 			sessions.retain(|_, roots| !roots.is_empty());
 		}
-		report
 	}
 }
 
@@ -1039,7 +1069,7 @@ impl Handle {
 	/// session that merely connects is still billable. Surfaced on the session
 	/// track for this tier, keyed by `root`.
 	pub fn session(&self, root: impl AsPath) -> Session {
-		Session::new(self.clone(), self.stats.session_counters(&self.tier, root))
+		Session::new(self.stats.clone(), self.tier.clone(), root)
 	}
 }
 
@@ -1083,6 +1113,10 @@ impl Side {
 /// * the egress viewer refcount map (first/last active subscription per broadcast),
 ///   driving `broadcasts_started` / `broadcasts_ended`.
 ///
+/// [`Session::set_tier`] moves a live context to another tier: presence and traffic
+/// recorded afterwards land there, while what was already counted stays put and an
+/// open subscription or announce closes on the tier it opened on.
+///
 /// [`Session::default`] is the no-op context (disabled registry / untagged caller):
 /// every bump reached through it is silently dropped, so a handle can hold one
 /// unconditionally instead of threading an `Option`.
@@ -1095,32 +1129,72 @@ pub struct Session {
 /// The shared state behind a [`Session`]. Its `Drop` (on the last clone) records
 /// the session as closed.
 struct SessionInner {
-	/// Registry + tier, so derived model handles resolve `(path, tier)` counters.
-	handle: Handle,
-	/// The presence gauge for `(tier, root)`, or `None` for a disabled registry.
-	presence: Option<Arc<SessionCounters>>,
+	registry: Registry,
+	/// The auth root the presence gauge is keyed by.
+	root: PathOwned,
+	/// The current tier and its presence gauge, swapped together by [`Session::set_tier`].
+	current: Mutex<Current>,
+	/// Bumped on every tier change, so a [`Scope`] notices without taking a lock.
+	generation: AtomicU64,
 	/// Egress viewer refcount, keyed by absolute broadcast path: the first active
 	/// subscription this context opens for a broadcast bumps `broadcasts_started`, the last
-	/// to close bumps `broadcasts_ended`.
-	viewers: Mutex<HashMap<PathOwned, u32>>,
+	/// to close bumps `broadcasts_ended` on the same counters, even across a tier change.
+	viewers: Mutex<HashMap<PathOwned, Viewer>>,
+}
+
+/// The tier a [`Session`] records under right now.
+struct Current {
+	tier: Tier,
+	/// The presence gauge for `(tier, root)`, or `None` for a disabled registry.
+	presence: Option<Arc<SessionCounters>>,
+}
+
+/// One broadcast's viewer refcount within a [`Session`].
+struct Viewer {
+	subscriptions: u32,
+	/// The counters `broadcasts_started` bumped on, where `broadcasts_ended` lands too.
+	counters: Arc<TierCounters>,
 }
 
 impl Session {
-	fn new(handle: Handle, presence: Option<Arc<SessionCounters>>) -> Self {
+	fn new(registry: Registry, tier: Tier, root: impl AsPath) -> Self {
+		let root = root.as_path().to_owned();
+		let presence = registry.session_counters(&tier, &root);
 		if let Some(presence) = &presence {
 			presence.sessions_started.fetch_add(1, Ordering::Relaxed);
 		}
 		Self {
 			inner: Some(Arc::new(SessionInner {
-				handle,
-				presence,
+				registry,
+				root,
+				current: Mutex::new(Current { tier, presence }),
+				generation: AtomicU64::new(0),
 				viewers: Mutex::new(HashMap::new()),
 			})),
 		}
 	}
 
+	/// Record this session's presence and later traffic under `tier` from now on.
+	pub fn set_tier(&self, tier: Tier) {
+		let Some(inner) = &self.inner else { return };
+		let mut current = inner.current.lock().expect("stats session poisoned");
+		if current.tier == tier {
+			return;
+		}
+		let presence = inner.registry.session_counters(&tier, &inner.root);
+		if let Some(presence) = &presence {
+			presence.sessions_started.fetch_add(1, Ordering::Relaxed);
+		}
+		if let Some(old) = std::mem::replace(&mut current.presence, presence) {
+			// Release pairs with the readout's Acquire load of `sessions_ended`.
+			old.sessions_ended.fetch_add(1, Ordering::Release);
+		}
+		current.tier = tier;
+		inner.generation.fetch_add(1, Ordering::Release);
+	}
+
 	/// Egress (publisher / reads) scope for a broadcast path. The path is the
-	/// absolute broadcast name; counters are resolved once here.
+	/// absolute broadcast name.
 	pub(crate) fn egress(&self, path: impl AsPath) -> Scope {
 		self.scope(path, Side::Publisher)
 	}
@@ -1135,53 +1209,69 @@ impl Session {
 			return Scope::default();
 		};
 		let path = path.as_path().to_owned();
-		let counters = inner
-			.handle
-			.stats
-			.entry(&path)
-			.map(|entry| entry.tier(&inner.handle.tier));
+		let resolved = inner.resolve(&path);
 		Scope {
 			session: self.clone(),
-			counters,
+			resolved: Some(Box::new(Mutex::new(resolved))),
 			side,
 			path,
 		}
 	}
 
-	/// Register one active egress subscription to `path`, returning `true` if it was
-	/// the first (so the caller bumps `broadcasts_started`).
-	fn viewer_open(&self, path: &PathOwned) -> bool {
-		let Some(inner) = &self.inner else { return false };
+	/// Register one active egress subscription to `path` recording on `counters`.
+	/// The first bumps `broadcasts_started` there.
+	fn viewer_open(&self, path: &PathOwned, counters: &Arc<TierCounters>) {
+		let Some(inner) = &self.inner else { return };
 		let mut viewers = inner.viewers.lock().expect("stats viewers poisoned");
-		let n = viewers.entry(path.clone()).or_insert(0);
-		let first = *n == 0;
-		*n += 1;
-		first
+		let viewer = viewers.entry(path.clone()).or_insert_with(|| {
+			counters.publisher.broadcasts_started.fetch_add(1, Ordering::Relaxed);
+			Viewer {
+				subscriptions: 0,
+				counters: counters.clone(),
+			}
+		});
+		viewer.subscriptions += 1;
 	}
 
-	/// Release one active egress subscription to `path`, returning `true` if it was
-	/// the last (so the caller bumps `broadcasts_ended`).
-	fn viewer_close(&self, path: &PathOwned) -> bool {
-		let Some(inner) = &self.inner else { return false };
+	/// Release one active egress subscription to `path`. The last bumps
+	/// `broadcasts_ended` on the counters the first opened on.
+	fn viewer_close(&self, path: &PathOwned) {
+		let Some(inner) = &self.inner else { return };
 		let mut viewers = inner.viewers.lock().expect("stats viewers poisoned");
-		match viewers.get_mut(path) {
-			Some(n) => {
-				*n -= 1;
-				if *n == 0 {
-					viewers.remove(path);
-					true
-				} else {
-					false
-				}
-			}
-			None => false,
+		let Some(viewer) = viewers.get_mut(path) else { return };
+		viewer.subscriptions -= 1;
+		if viewer.subscriptions == 0
+			&& let Some(viewer) = viewers.remove(path)
+		{
+			// Release pairs with the readout's Acquire load of `broadcasts_ended`.
+			viewer
+				.counters
+				.publisher
+				.broadcasts_ended
+				.fetch_add(1, Ordering::Release);
+		}
+	}
+}
+
+impl SessionInner {
+	/// The counters `path` records on under the current tier, tagged with the
+	/// generation they were resolved at.
+	fn resolve(&self, path: &PathOwned) -> Resolved {
+		let (generation, tier) = {
+			let current = self.current.lock().expect("stats session poisoned");
+			(self.generation.load(Ordering::Relaxed), current.tier.clone())
+		};
+		Resolved {
+			generation,
+			counters: self.registry.entry(path).map(|entry| entry.tier(&tier)),
 		}
 	}
 }
 
 impl Drop for SessionInner {
 	fn drop(&mut self) {
-		if let Some(presence) = &self.presence {
+		let current = self.current.get_mut().expect("stats session poisoned");
+		if let Some(presence) = &current.presence {
 			// Release pairs with the readout's Acquire load of `sessions_ended`
 			// (see the module-level "Snapshot atomicity" note).
 			presence.sessions_ended.fetch_add(1, Ordering::Release);
@@ -1193,9 +1283,10 @@ impl Drop for SessionInner {
 // Model-layer carriers
 //
 // These are what a tagged `origin::{Consumer, Producer}` threads down through the
-// derived handles (broadcast -> track -> group -> frame). A tagged origin resolves
-// the per-`(path, tier)` counters once into a [`Scope`]; child handles carry a
-// cheap [`Meter`] for the payload bumps. All of them are no-ops when empty (a
+// derived handles (broadcast -> track -> group -> frame). A tagged origin creates a
+// [`Scope`] per broadcast, which resolves the per-`(path, tier)` counters again
+// only after [`Session::set_tier`]; child handles carry a cheap [`Meter`] for the
+// payload bumps, fixed to the tier the group started under. All of them are no-ops when empty (a
 // disabled registry, an excluded path, or an untagged caller), so an untagged
 // handle pays nothing.
 // ---------------------------------------------------------------------------
@@ -1267,31 +1358,64 @@ impl Meter {
 	}
 }
 
-/// A per-`(broadcast, tier, side)` scope, carried by the broadcast and track model
-/// handles. Resolved once by a tagged origin at the broadcast handoff; hands out
+/// A per-`(broadcast, side)` scope, carried by the broadcast and track model
+/// handles. Created by a tagged origin at the broadcast handoff; hands out
 /// [`Meter`]s for the payload path and RAII guards for the subscription / announce
-/// lifecycle. Cheap to clone; empty (no-op) when the broadcast is untracked.
-#[derive(Clone, Default)]
+/// lifecycle, each recording under the session's tier at the time. Cheap to clone;
+/// empty (no-op) when the broadcast is untracked.
+#[derive(Default)]
 pub(crate) struct Scope {
-	/// The owning context, kept for the egress viewer refcount map.
+	/// The owning context: its tier, and the egress viewer refcount map.
 	session: Session,
-	/// Resolved counters for `(path, tier)`, or `None` when untracked.
-	counters: Option<Arc<TierCounters>>,
+	/// The counters for `(path, tier)`, re-resolved when the session changes tier.
+	/// Per clone, so tracks sharing a broadcast never contend on the per-group path;
+	/// boxed to keep every track handle small. `None` for the no-op context.
+	resolved: Option<Box<Mutex<Resolved>>>,
 	side: Side,
 	/// Absolute broadcast path, used to key the viewer refcount and as the
 	/// `announced_bytes` length.
 	path: PathOwned,
 }
 
+/// A [`Scope`]'s counters and the session tier generation they belong to.
+#[derive(Clone)]
+struct Resolved {
+	generation: u64,
+	/// `None` when untracked.
+	counters: Option<Arc<TierCounters>>,
+}
+
+impl Clone for Scope {
+	fn clone(&self) -> Self {
+		Self {
+			session: self.session.clone(),
+			resolved: self
+				.resolved
+				.as_ref()
+				.map(|r| Box::new(Mutex::new(r.lock().expect("stats scope poisoned").clone()))),
+			side: self.side,
+			path: self.path.clone(),
+		}
+	}
+}
+
 impl Scope {
-	fn counters(&self) -> Option<&Counters> {
-		self.counters.as_ref().map(|c| self.side.counters(c))
+	/// The counters for the session's current tier. Skips the registry unless the
+	/// tier changed since the last call, so the per-group path stays cheap.
+	fn counters(&self) -> Option<Arc<TierCounters>> {
+		let inner = self.session.inner.as_ref()?;
+		let generation = inner.generation.load(Ordering::Acquire);
+		let mut resolved = self.resolved.as_ref()?.lock().expect("stats scope poisoned");
+		if resolved.generation != generation {
+			*resolved = inner.resolve(&self.path);
+		}
+		resolved.counters.clone()
 	}
 
 	/// A payload [`Meter`] for a group/frame derived from this scope.
 	pub(crate) fn meter(&self) -> Meter {
 		Meter {
-			counters: self.counters.clone(),
+			counters: self.counters(),
 			side: self.side,
 		}
 	}
@@ -1300,23 +1424,22 @@ impl Scope {
 	/// `subscriptions_ended` on drop. On the egress (publisher) side it also drives
 	/// the context's viewer refcount (`broadcasts_started` / `broadcasts_ended`).
 	pub(crate) fn subscribe(&self) -> Subscription {
-		if let Some(counters) = self.counters() {
-			counters.subscriptions_started.fetch_add(1, Ordering::Relaxed);
-		}
-		// Viewer refcount is egress-only: `broadcasts_started` counts distinct sessions
-		// watching a broadcast.
-		let viewer = if matches!(self.side, Side::Publisher) && self.counters.is_some() {
-			if self.session.viewer_open(&self.path)
-				&& let Some(counters) = self.counters()
-			{
-				counters.broadcasts_started.fetch_add(1, Ordering::Relaxed);
+		let counters = self.counters();
+		let mut viewer = None;
+		if let Some(counters) = &counters {
+			self.side
+				.counters(counters)
+				.subscriptions_started
+				.fetch_add(1, Ordering::Relaxed);
+			// Viewer refcount is egress-only: `broadcasts_started` counts distinct sessions
+			// watching a broadcast.
+			if matches!(self.side, Side::Publisher) {
+				self.session.viewer_open(&self.path, counters);
+				viewer = Some((self.session.clone(), self.path.clone()));
 			}
-			Some((self.session.clone(), self.path.clone()))
-		} else {
-			None
-		};
+		}
 		Subscription {
-			counters: self.counters.clone(),
+			counters,
 			side: self.side,
 			viewer,
 		}
@@ -1325,7 +1448,7 @@ impl Scope {
 	/// Bump the `fetches` counter once (a coalesced group fetch served).
 	pub(crate) fn fetch(&self) {
 		if let Some(counters) = self.counters() {
-			counters.fetches.fetch_add(1, Ordering::Relaxed);
+			self.side.counters(&counters).fetches.fetch_add(1, Ordering::Relaxed);
 		}
 	}
 
@@ -1335,12 +1458,14 @@ impl Scope {
 	/// route-transition (un)announces.
 	pub(crate) fn announce(&self) -> Announce {
 		let len = self.path.as_str().len() as u64;
-		if let Some(counters) = self.counters() {
+		let counters = self.counters();
+		if let Some(counters) = &counters {
+			let counters = self.side.counters(counters);
 			counters.announces_started.fetch_add(1, Ordering::Relaxed);
 			counters.announced_bytes.fetch_add(len, Ordering::Relaxed);
 		}
 		Announce {
-			counters: self.counters.clone(),
+			counters,
 			side: self.side,
 			len,
 		}
@@ -1360,15 +1485,8 @@ pub(crate) struct Subscription {
 
 impl Drop for Subscription {
 	fn drop(&mut self) {
-		if let Some((session, path)) = &self.viewer
-			&& session.viewer_close(path)
-			&& let Some(counters) = &self.counters
-		{
-			// Release pairs with the readout's Acquire load of `broadcasts_ended`.
-			self.side
-				.counters(counters)
-				.broadcasts_ended
-				.fetch_add(1, Ordering::Release);
+		if let Some((session, path)) = &self.viewer {
+			session.viewer_close(path);
 		}
 		if let Some(counters) = &self.counters {
 			// Release pairs with the readout's Acquire load of `subscriptions_ended`.
@@ -1516,6 +1634,32 @@ mod tests {
 		assert_eq!(sessions(Tier::new("region/sjc")).sessions_started, 1);
 	}
 
+	fn drain(stats: &Registry) -> Report {
+		let mut report = Report::default();
+		stats.report(&mut report);
+		report
+	}
+
+	#[test]
+	fn report_reuses_capacity() {
+		// A reused report is cleared, not appended to, and keeps its buffers.
+		let stats = test_stats();
+		let ctx = stats.tier(Tier::default()).session("root");
+		let _scopes: Vec<_> = (0..8).map(|i| ctx.egress(format!("b/{i}").as_str())).collect();
+
+		let mut report = Report::default();
+		stats.report(&mut report);
+		assert_eq!(report.traffic.len(), 8);
+		assert_eq!(report.sessions.len(), 1);
+		let (traffic, sessions) = (report.traffic.as_ptr(), report.sessions.as_ptr());
+
+		stats.report(&mut report);
+		assert_eq!(report.traffic.len(), 8, "refilled, not appended");
+		assert_eq!(report.sessions.len(), 1);
+		assert_eq!(report.traffic.as_ptr(), traffic, "traffic buffer reused");
+		assert_eq!(report.sessions.as_ptr(), sessions, "sessions buffer reused");
+	}
+
 	#[test]
 	fn report_returns_detail_and_prunes() {
 		// report() surfaces per-broadcast rows while a guard is held, keeps the
@@ -1528,7 +1672,7 @@ mod tests {
 		let sub = scope.subscribe();
 		scope.meter().bytes(42);
 
-		let report = stats.report();
+		let report = drain(&stats);
 		let row = report
 			.traffic
 			.iter()
@@ -1547,7 +1691,7 @@ mod tests {
 
 		// The drain after the last guard drops still returns the final values,
 		// then prunes the entry.
-		let report = stats.report();
+		let report = drain(&stats);
 		let row = report
 			.traffic
 			.iter()
@@ -1559,7 +1703,7 @@ mod tests {
 			!stats.shared().entries.lock().contains_key(&key),
 			"fully-closed entry pruned"
 		);
-		assert!(stats.report().traffic.is_empty(), "nothing left after the prune");
+		assert!(drain(&stats).traffic.is_empty(), "nothing left after the prune");
 	}
 
 	#[test]
@@ -1574,7 +1718,7 @@ mod tests {
 		let guard = scope.announce();
 
 		for _ in 0..3 {
-			let report = stats.report();
+			let report = drain(&stats);
 			assert!(
 				report.traffic.iter().any(|row| row.path == key),
 				"announced-but-idle broadcast stays while the guard is held"
@@ -1583,7 +1727,7 @@ mod tests {
 
 		drop(guard);
 		drop(scope);
-		let report = stats.report();
+		let report = drain(&stats);
 		let row = report.traffic.iter().find(|row| row.path == key).expect("final report");
 		assert!(row.publisher.is_idle());
 		assert!(!stats.shared().entries.lock().contains_key(&key));
@@ -1596,7 +1740,7 @@ mod tests {
 		let stats = test_stats();
 		let session = stats.tier(Tier::default()).session("acme");
 
-		let report = stats.report();
+		let report = drain(&stats);
 		let row = report
 			.sessions
 			.iter()
@@ -1605,15 +1749,102 @@ mod tests {
 		assert_eq!(row.presence.active(), 1);
 
 		drop(session);
-		let report = stats.report();
+		let report = drain(&stats);
 		let row = report
 			.sessions
 			.iter()
 			.find(|row| row.root.as_str() == "acme")
 			.expect("final gauge reported once");
 		assert_eq!(row.presence.active(), 0);
-		assert!(stats.report().sessions.is_empty(), "root pruned after the last drain");
+		assert!(drain(&stats).sessions.is_empty(), "root pruned after the last drain");
 		assert!(session_snapshot(&stats, &Tier::default(), "acme").is_none());
+	}
+
+	#[test]
+	fn snapshot_preserves_retired_counters() {
+		let stats = test_stats();
+		let tier = Tier::default();
+		let live = stats.tier(tier.clone()).session("live");
+		let scope = live.egress("live/video");
+		let _live_sub = scope.subscribe();
+		for _ in 0..2 {
+			let session = stats.tier(tier.clone()).session("retired");
+			let scope = session.egress("retired/video");
+			let sub = scope.subscribe();
+			scope.meter().bytes(100);
+			drop(sub);
+			drop(scope);
+			drop(session);
+			let before = stats.snapshot();
+			drain(&stats);
+			assert_eq!(stats.snapshot(), before, "pruning must not reset host counters");
+		}
+		let snap = stats.snapshot();
+		let traffic = snap
+			.traffic()
+			.into_iter()
+			.find(|(_, role, _)| *role == Role::Publisher)
+			.unwrap()
+			.2;
+		assert_eq!(traffic.bytes, 200);
+		assert_eq!(traffic.subscriptions_started, 3);
+		assert_eq!(traffic.subscriptions_ended, 2);
+		let sessions = snap.sessions().into_iter().find(|(label, _)| label == &tier).unwrap().1;
+		assert_eq!(sessions.sessions_started, 3);
+		assert_eq!(sessions.sessions_ended, 2);
+		assert_eq!(stats.shared().entries.lock().len(), 1, "retired paths are still pruned");
+		assert_eq!(
+			stats.shared().sessions.lock()[&tier].len(),
+			1,
+			"retired roots are still pruned"
+		);
+		let retired = stats.shared().retired.lock();
+		assert_eq!(retired.traffic.len(), 1, "retain only a total per tier");
+		assert_eq!(retired.sessions.len(), 1);
+	}
+
+	#[cfg(not(target_family = "wasm"))]
+	#[test]
+	fn snapshot_and_report_transfer_counters_once() {
+		let stats = test_stats();
+		let worker_stats = stats.clone();
+		let worker = std::thread::spawn(move || {
+			for i in 0..256 {
+				let path = format!("root/{i}");
+				let session = worker_stats.tier(Tier::default()).session(path.as_str());
+				session.ingress(path.as_str()).meter().bytes(1);
+				drop(session);
+				drain(&worker_stats);
+			}
+		});
+		let mut previous = 0;
+		while !worker.is_finished() {
+			let bytes: u64 = stats
+				.snapshot()
+				.traffic()
+				.iter()
+				.map(|(_, _, traffic)| traffic.bytes)
+				.sum();
+			assert!(
+				bytes >= previous,
+				"retiring an entry must not double-count or lose its bytes"
+			);
+			assert!(bytes <= 256);
+			previous = bytes;
+		}
+		worker.join().unwrap();
+		let snap = stats.snapshot();
+		assert_eq!(
+			snap.traffic().iter().map(|(_, _, traffic)| traffic.bytes).sum::<u64>(),
+			256
+		);
+		assert_eq!(snap.sessions()[0].1.sessions_started, 256);
+		assert_eq!(snap.sessions()[0].1.sessions_ended, 256);
+		assert!(stats.shared().entries.lock().is_empty());
+		assert!(stats.shared().sessions.lock().is_empty());
+		let retired = stats.shared().retired.lock();
+		assert_eq!(retired.traffic.len(), 1);
+		assert_eq!(retired.sessions.len(), 1);
 	}
 
 	#[test]
@@ -1640,7 +1871,7 @@ mod tests {
 		scope.meter().bytes(100);
 		let _guard = scope.announce();
 		let _sub = scope.subscribe();
-		assert!(stats.report().traffic.is_empty());
+		assert!(drain(&stats).traffic.is_empty());
 		assert!(stats.snapshot().traffic().is_empty());
 	}
 
@@ -1741,6 +1972,66 @@ mod tests {
 		assert_eq!(snap("acme"), Some((1, 0)));
 		drop(clone);
 		assert_eq!(snap("acme"), Some((1, 1)));
+	}
+
+	#[test]
+	fn set_tier_moves_presence() {
+		let stats = test_stats();
+		let gold = Tier::new("gold");
+		let snap = |tier: &Tier| session_snapshot(&stats, tier, "acme").map(|p| (p.sessions_started, p.sessions_ended));
+
+		let ctx = stats.tier(Tier::default()).session("acme");
+		ctx.set_tier(Tier::default());
+		assert_eq!(snap(&Tier::default()), Some((1, 0)), "the same tier is a no-op");
+
+		ctx.set_tier(gold.clone());
+		assert_eq!(snap(&Tier::default()), Some((1, 1)));
+		assert_eq!(snap(&gold), Some((1, 0)));
+
+		drop(ctx);
+		assert_eq!(snap(&gold), Some((1, 1)), "the session closes on its current tier");
+	}
+
+	#[test]
+	fn set_tier_moves_subsequent_traffic() {
+		let stats = test_stats();
+		let gold = Tier::new("gold");
+		let ctx = stats.tier(Tier::default()).session("acme");
+		let scope = ctx.egress("demo/bbb");
+		let clone = scope.clone();
+
+		let before = scope.meter();
+		let sub = scope.subscribe();
+		let announce = scope.announce();
+		before.bytes(10);
+
+		ctx.set_tier(gold.clone());
+		// A meter handed out earlier keeps its tier; everything after moves.
+		before.bytes(1);
+		scope.meter().bytes(5);
+		clone.meter().bytes(7);
+		let sub2 = scope.subscribe();
+		scope.fetch();
+
+		drop(sub);
+		drop(sub2);
+		drop(announce);
+
+		let old = tier_counters(&stats, "demo/bbb", &Tier::default()).publisher.snapshot();
+		let new = tier_counters(&stats, "demo/bbb", &gold).publisher.snapshot();
+		assert_eq!(old.bytes, 11);
+		assert_eq!(new.bytes, 12);
+		assert_eq!((old.fetches, new.fetches), (0, 1));
+
+		// Each guard closes on the tier it opened on, so neither tier leaks a gauge.
+		assert_eq!((old.subscriptions_started, old.subscriptions_ended), (1, 1));
+		assert_eq!((new.subscriptions_started, new.subscriptions_ended), (1, 1));
+		assert_eq!((old.announces_started, old.announces_ended), (1, 1));
+		// The viewer opened on the old tier and closes there, even though the
+		// session's last subscription was opened under the new one.
+		assert_eq!((old.broadcasts_started, old.broadcasts_ended), (1, 1));
+		assert_eq!((new.broadcasts_started, new.broadcasts_ended), (0, 0));
+		assert!(old.is_idle() && new.is_idle());
 	}
 
 	#[test]

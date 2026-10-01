@@ -35,10 +35,13 @@ async fn run_func(shell: &mut brush_core::Shell, suppress_stdout: bool) -> Resul
     }
 
     let result = shell
-        .invoke_function("hello", std::iter::once("arg"), &params)
+        .invoke_function("hello", std::iter::once("arg"), params)
         .await?;
 
-    eprintln!("[Function invocation result: {result}]");
+    eprintln!(
+        "[Function invocation result: {}]",
+        u8::from(result.exit_code)
+    );
 
     Ok(())
 }

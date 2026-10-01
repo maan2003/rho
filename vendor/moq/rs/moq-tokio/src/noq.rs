@@ -8,11 +8,11 @@ use crate::quic::Resolved;
 use crate::quic::ServerId;
 use crate::tls::{FingerprintVerifier, ServeCerts};
 use std::net;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
-use web_transport_noq::noq;
-
-pub use web_transport_noq;
+use web_transport_moq::noq;
 
 /// Attach a qlog factory writing into the configured directory, if any.
 ///
@@ -203,7 +203,7 @@ pub enum Error {
 		message: String,
 		/// The HTTP status the server answered the CONNECT with, when it answered with one.
 		///
-		/// Read at conversion time rather than kept as a `web-transport-noq` error, so the
+		/// Read at conversion time rather than kept as a `web-transport-moq` error, so the
 		/// classification survives without that crate appearing in this crate's public API.
 		status: Option<u16>,
 	},
@@ -253,7 +253,7 @@ impl crate::failover::Aggregate for Error {
 crate::error::from_message! {
 	noq::ConnectError => Connect,
 	noq::ConnectionError => Connection,
-	web_transport_noq::ServerError => Server,
+	web_transport_moq::ServerError => Server,
 	hex::FromHexError => InvalidFingerprint,
 }
 
@@ -263,8 +263,8 @@ impl From<noq::crypto::rustls::NoInitialCipherSuite> for Error {
 	}
 }
 
-impl From<web_transport_noq::ClientError> for Error {
-	fn from(err: web_transport_noq::ClientError) -> Self {
+impl From<web_transport_moq::ClientError> for Error {
+	fn from(err: web_transport_moq::ClientError) -> Self {
 		Self::Client {
 			status: client_status(&err),
 			message: crate::error::message(err),
@@ -325,17 +325,29 @@ impl NoqClient {
 		})
 	}
 
+	/// Close every connection, then wait until each has sent its close to the peer.
+	pub async fn close(self) {
+		self.quic.close(noq::VarInt::from_u32(0), b"client shutdown");
+		// Not `wait_idle`, which also sits out each connection's 3 PTO closing
+		// period: that only repeats the close to a peer that already has it.
+		self.quic.wait_all_draining().await;
+	}
+
 	pub async fn connect(
 		&self,
 		tls: &rustls::ClientConfig,
 		addr: crate::connect::Addr,
 		versions: &moq_net::Versions,
-	) -> Result<web_transport_noq::Session> {
+	) -> Result<web_transport_moq::Session> {
 		let mut url = addr.url().clone();
 		let mut config = tls.clone();
 
 		let target = url.host().ok_or(Error::InvalidDnsName)?;
-		let host = target.to_string();
+		// URL brackets delimit IPv6 literals, but aren't part of the TLS server name.
+		let host = match &target {
+			url::Host::Ipv6(ip) => ip.to_string(),
+			_ => target.to_string(),
+		};
 		let port = url.port().unwrap_or(443);
 
 		// Resolve, adapted to the local socket's family; the dial below races the
@@ -385,7 +397,7 @@ impl NoqClient {
 		}
 
 		let alpns: Vec<Vec<u8>> = match url.scheme() {
-			"https" => vec![web_transport_noq::ALPN.as_bytes().to_vec()],
+			"https" => vec![web_transport_moq::ALPN.as_bytes().to_vec()],
 			"moqt" | "moql" => versions.alpns().iter().map(|alpn| alpn.as_bytes().to_vec()).collect(),
 			_ => return Err(Error::InvalidScheme),
 		};
@@ -416,15 +428,15 @@ impl NoqClient {
 
 		let session = match url.scheme() {
 			"https" => {
-				let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
+				let mut request = web_transport_moq::proto::ConnectRequest::new(url.clone());
 				for alpn in versions.alpns() {
 					request = request.with_protocol(alpn.to_string());
 				}
-				web_transport_noq::Session::connect(connection, request)
+				web_transport_moq::Session::connect(connection, request)
 					.await
 					.map_err(map_client_error)?
 			}
-			"moqt" | "moql" => web_transport_noq::Session::raw(connection),
+			"moqt" | "moql" => web_transport_moq::Session::raw(connection),
 			_ => return Err(Error::UnsupportedScheme(url.scheme().to_string())),
 		};
 
@@ -470,7 +482,7 @@ impl Error {
 	}
 }
 
-fn map_client_error(err: web_transport_noq::ClientError) -> Error {
+fn map_client_error(err: web_transport_moq::ClientError) -> Error {
 	match client_status(&err).and_then(crate::ConnectError::from_status_u16) {
 		Some(rejected) => rejected.into(),
 		None => err.into(),
@@ -484,25 +496,25 @@ fn map_client_error(err: web_transport_noq::ClientError) -> Error {
 /// [`crate::ConnectError`], and [`Error::status`] hands it to the caller, whose backoff consults
 /// the status. A `404` or `405` is the server's settled answer, so retrying
 /// it just burns the reconnect budget on a URL that will never work.
-fn client_status(err: &web_transport_noq::ClientError) -> Option<u16> {
+fn client_status(err: &web_transport_moq::ClientError) -> Option<u16> {
 	match err {
-		web_transport_noq::ClientError::HttpError(err) => connect_status(err),
+		web_transport_moq::ClientError::HttpError(err) => connect_status(err),
 		_ => None,
 	}
 }
 
-fn connect_status(err: &web_transport_noq::ConnectError) -> Option<u16> {
+fn connect_status(err: &web_transport_moq::ConnectError) -> Option<u16> {
 	match err {
-		web_transport_noq::ConnectError::ErrorStatus(status) => Some(status.as_u16()),
-		web_transport_noq::ConnectError::ProtoError(err) => proto_status(err),
+		web_transport_moq::ConnectError::ErrorStatus(status) => Some(status.as_u16()),
+		web_transport_moq::ConnectError::ProtoError(err) => proto_status(err),
 		_ => None,
 	}
 }
 
-fn proto_status(err: &web_transport_noq::proto::ConnectError) -> Option<u16> {
+fn proto_status(err: &web_transport_moq::proto::ConnectError) -> Option<u16> {
 	match err {
-		web_transport_noq::proto::ConnectError::ErrorStatus(status)
-		| web_transport_noq::proto::ConnectError::WrongStatus(Some(status)) => Some(status.as_u16()),
+		web_transport_moq::proto::ConnectError::ErrorStatus(status)
+		| web_transport_moq::proto::ConnectError::WrongStatus(Some(status)) => Some(status.as_u16()),
 		_ => None,
 	}
 }
@@ -512,7 +524,141 @@ fn proto_status(err: &web_transport_noq::proto::ConnectError) -> Option<u16> {
 pub(crate) struct NoqServer {
 	pub quic: noq::Endpoint,
 	pub certs: Arc<ServeCerts>,
+	socket: Socket,
 	_reload: crate::tls::Reload,
+}
+
+/// The server's UDP socket, which [`NoqServer::shutdown`] closes even while noq
+/// still holds references to it.
+///
+/// noq gives each connection a sender sharing the socket, and a connection lives
+/// as long as anything holds its handle, so dropping the endpoint leaves the port
+/// bound until every accepted session is gone too. Taking the socket out of this
+/// slot closes it regardless.
+#[derive(Clone, Debug)]
+struct Socket {
+	io: Arc<RwLock<Option<Arc<tokio::net::UdpSocket>>>>,
+	state: Arc<noq::udp::UdpSocketState>,
+	local: net::SocketAddr,
+	/// Wakes every sender blocked on a full send buffer from the socket's single
+	/// write-readiness registration.
+	blocked: Arc<Blocked>,
+}
+
+impl Socket {
+	fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
+		let state = noq::udp::UdpSocketState::new((&socket).into())?;
+		let local = socket.local_addr()?;
+		let io = tokio::net::UdpSocket::from_std(socket)?;
+		Ok(Self {
+			io: Arc::new(RwLock::new(Some(Arc::new(io)))),
+			state: Arc::new(state),
+			local,
+			blocked: Default::default(),
+		})
+	}
+
+	/// Close the socket, unless a [`crate::server::SocketRetainer`] still holds it.
+	fn release(&self) {
+		self.io.write().unwrap().take();
+	}
+
+	/// A handle keeping the socket open after it is released, or `None` once it is.
+	fn retain(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+		self.io.read().unwrap().clone()
+	}
+}
+
+impl noq::AsyncUdpSocket for Socket {
+	fn create_sender(&self) -> Pin<Box<dyn noq::UdpSender>> {
+		Box::pin(self.clone())
+	}
+
+	fn poll_recv(
+		&mut self,
+		cx: &mut Context<'_>,
+		bufs: &mut [std::io::IoSliceMut<'_>],
+		meta: &mut [noq::udp::RecvMeta],
+	) -> Poll<std::io::Result<usize>> {
+		let io = self.io.read().unwrap();
+		// Released: nothing arrives again, and the endpoint stops through its close.
+		let Some(io) = io.as_deref() else {
+			return Poll::Pending;
+		};
+		// Only the endpoint driver receives, so the one readiness waker is enough.
+		loop {
+			ready!(io.poll_recv_ready(cx))?;
+			if let Ok(res) = io.try_io(tokio::io::Interest::READABLE, || self.state.recv(io.into(), bufs, meta)) {
+				return Poll::Ready(Ok(res));
+			}
+		}
+	}
+
+	fn local_addr(&self) -> std::io::Result<net::SocketAddr> {
+		Ok(self.local)
+	}
+
+	fn max_receive_segments(&self) -> std::num::NonZeroUsize {
+		self.state.gro_segments()
+	}
+
+	fn may_fragment(&self) -> bool {
+		self.state.may_fragment()
+	}
+}
+
+impl noq::UdpSender for Socket {
+	fn poll_send(
+		self: Pin<&mut Self>,
+		transmit: &noq::udp::Transmit<'_>,
+		cx: &mut Context<'_>,
+	) -> Poll<std::io::Result<()>> {
+		let io = self.io.read().unwrap();
+		// Released: the datagram is lost, which UDP always allows.
+		let Some(io) = io.as_deref() else {
+			return Poll::Ready(Ok(()));
+		};
+		loop {
+			match io.try_io(tokio::io::Interest::WRITABLE, || self.state.send(io.into(), transmit)) {
+				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+				res => return Poll::Ready(res),
+			}
+			// Every connection sends from its own task, but tokio keeps one waker per
+			// direction, so register a fan-out to all of them instead of this task's.
+			self.blocked.push(cx.waker());
+			let waker = Waker::from(self.blocked.clone());
+			ready!(io.poll_send_ready(&mut Context::from_waker(&waker)))?;
+		}
+	}
+
+	fn max_transmit_segments(&self) -> std::num::NonZeroUsize {
+		self.state.max_gso_segments()
+	}
+}
+
+/// The tasks waiting for a [`Socket`] to become writable.
+#[derive(Debug, Default)]
+struct Blocked(Mutex<Vec<Waker>>);
+
+impl Blocked {
+	fn push(&self, waker: &Waker) {
+		let mut wakers = self.0.lock().unwrap();
+		if !wakers.iter().any(|w| w.will_wake(waker)) {
+			wakers.push(waker.clone());
+		}
+	}
+}
+
+impl std::task::Wake for Blocked {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		for waker in std::mem::take(&mut *self.0.lock().unwrap()) {
+			waker.wake();
+		}
+	}
 }
 
 impl NoqServer {
@@ -547,7 +693,7 @@ impl NoqServer {
 			.iter()
 			.map(|alpn| alpn.as_bytes().to_vec())
 			.collect();
-		alpns.push(web_transport_noq::ALPN.as_bytes().to_vec());
+		alpns.push(web_transport_moq::ALPN.as_bytes().to_vec());
 
 		tls.alpn_protocols = alpns;
 		tls.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -620,13 +766,21 @@ impl NoqServer {
 		};
 
 		// Create the generic QUIC endpoint.
-		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime).map_err(Error::CreateEndpoint)?;
+		let socket = Socket::new(socket).map_err(Error::CreateEndpoint)?;
+		let quic =
+			noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(tls), Box::new(socket.clone()), runtime)
+				.map_err(Error::CreateEndpoint)?;
 
 		// Spawn the cert reload watcher only after endpoint creation succeeds,
 		// so we don't leave a dangling watcher on failure.
 		let _reload = crate::tls::Reload::spawn(certs.clone(), config.tls.clone());
 
-		Ok(Self { quic, certs, _reload })
+		Ok(Self {
+			quic,
+			certs,
+			socket,
+			_reload,
+		})
 	}
 
 	pub fn accept(&self) -> impl std::future::Future<Output = Option<noq::Incoming>> + '_ {
@@ -644,6 +798,21 @@ impl NoqServer {
 	pub fn close(&self) {
 		self.quic.close(noq::VarInt::from_u32(0), b"server shutdown");
 	}
+
+	/// Close every connection, wait until each has sent its close to the peer,
+	/// then release the socket.
+	pub async fn shutdown(self) {
+		self.close();
+		// Not `wait_idle`, which also sits out each connection's 3 PTO closing
+		// period: that only repeats the close to a peer that already has it.
+		self.quic.wait_all_draining().await;
+		self.socket.release();
+	}
+
+	/// A handle keeping the socket open after this server is gone.
+	pub fn retain(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+		self.socket.retain()
+	}
 }
 
 // ── NoqRequest ──────────────────────────────────────────────────────
@@ -657,7 +826,7 @@ impl NoqServer {
 pub(crate) async fn accept(
 	conn: noq::Incoming,
 	alpns: Vec<&'static str>,
-) -> Result<crate::server::Accepted<web_transport_noq::Session>> {
+) -> Result<crate::server::Accepted<web_transport_moq::Session>> {
 	let mut conn = conn.accept()?;
 
 	let handshake = conn
@@ -690,10 +859,10 @@ pub(crate) async fn accept(
 	};
 
 	match alpn.as_str() {
-		web_transport_noq::ALPN => {
+		web_transport_moq::ALPN => {
 			// Wait for the CONNECT request, then capture its URL and mTLS identity before
 			// the response consumes it.
-			let request = web_transport_noq::Request::accept(conn)
+			let request = web_transport_moq::Request::accept(conn)
 				.await
 				.map_err(|err| Error::RecvRequest(crate::error::message(err)))?;
 			let url = Some(request.url.clone());
@@ -701,7 +870,7 @@ pub(crate) async fn accept(
 			// The authority the client put in its CONNECT URL.
 			let authority = request.url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
 
-			let mut response = web_transport_noq::proto::ConnectResponse::OK;
+			let mut response = web_transport_moq::proto::ConnectResponse::OK;
 			let mut link = link;
 			if let Some(protocol) = request.protocols.iter().find(|p| alpns.contains(&p.as_str())) {
 				response = response.with_protocol(protocol);
@@ -721,14 +890,14 @@ pub(crate) async fn accept(
 		}
 		// Recognize any moq ALPN this server actually offered (its configured versions),
 		// not the global default set. rustls only negotiates an ALPN the server offered, so
-		// this covers opt-in / work-in-progress versions (e.g. moq-lite-06-wip) that are
-		// deliberately absent from `moq_net::ALPNS`.
+		// this also covers versions omitted from `moq_net::ALPNS` but enabled
+		// in this server's configuration.
 		alpn if alpns.contains(&alpn) => {
 			let identity = crate::tls::PeerIdentity::from_any(conn.peer_identity());
 			// Raw QUIC carries no request URL; the path rides the SETUP. The TLS SNI is the
 			// only authority the client can offer here, and it is optional.
 			let authority = (!host.is_empty()).then_some(host);
-			let session = web_transport_noq::Session::raw(conn);
+			let session = web_transport_moq::Session::raw(conn);
 			Ok(crate::server::Accepted {
 				session,
 				url: None,
@@ -817,6 +986,61 @@ impl noq::ConnectionIdGenerator for ServerIdGenerator {
 mod tests {
 	use super::*;
 	use url::Url;
+
+	#[tokio::test]
+	async fn pinned_ipv6_connection() {
+		pinned_connection("[::1]:0", None).await;
+	}
+
+	#[tokio::test]
+	async fn pinned_ipv4_connection() {
+		pinned_connection("127.0.0.1:0", None).await;
+	}
+
+	#[tokio::test]
+	async fn pinned_ipv6_connection_with_host_override() {
+		pinned_connection("[::1]:0", Some("localhost")).await;
+	}
+
+	async fn pinned_connection(bind: &str, host_name: Option<&str>) {
+		let quic = crate::quic::Config::default();
+		let server = NoqServer::new(
+			listen::Config {
+				bind: Some(bind.parse().unwrap()),
+				tls: crate::tls::Listen {
+					generate: vec!["localhost".into()],
+					..Default::default()
+				},
+				..Default::default()
+			},
+			&quic,
+			None,
+		)
+		.expect("server init");
+		let addr = server.local_addr().expect("local addr");
+		let mut tls_config = crate::tls::Connect::default();
+		tls_config.fingerprint = server.certificates().fingerprints();
+		assert!(!tls_config.fingerprint.is_empty());
+		tls_config.host_name = host_name.map(str::to_owned);
+		let config = connect::Config {
+			bind: Some(bind.parse().unwrap()),
+			tls: tls_config,
+			..Default::default()
+		};
+		let tls = config.tls.build().expect("tls config");
+		let client = NoqClient::new(&config, &quic).expect("client init");
+		let url: Url = format!("moqt://{addr}/.cluster/test").parse().unwrap();
+		let versions = moq_net::Versions::default();
+		let dial = client.connect(&tls, url.into(), &versions);
+		let accept = async {
+			let incoming = server.accept().await.expect("incoming connection");
+			super::accept(incoming, versions.alpns()).await
+		};
+		let result = tokio::time::timeout(Duration::from_secs(5), async { tokio::try_join!(dial, accept) })
+			.await
+			.expect("handshake timed out");
+		let (_client, _server) = result.expect("pinned connection failed");
+	}
 
 	/// noq exposes no getters for the flow-control windows, but its `Debug` prints
 	/// them, which is enough to prove each one reached the transport config and that
@@ -909,7 +1133,7 @@ mod tests {
 				.await
 				.expect("connect failed");
 
-			// web_transport_noq::Session derefs to the noq connection.
+			// web_transport_moq::Session derefs to the noq connection.
 			assert!(is_bbr3(&session), "client connection is not running BBRv3");
 			assert!(
 				accepted.await.expect("server task panicked"),

@@ -3,19 +3,28 @@
 ## Goal
 
 Keep the repository's living work organized as visible, versioned quests,
-grouped by the branch they land on and ordered by priority.
+grouped into milestones ordered by priority.
 
 ## Plan
 
-`main` and `dev` mirror those branches: work under either merges there,
-directly or through its questline's branch. `next` and `future` are the
-roadmap and have no branch; starting a quest moves it under the branch it
-targets. Published API and wire breaks go under `dev`, everything else under
-`main`. `dev` merges into `main` once its questline is empty.
+m0 is everything in flight now: relay hardening and IETF interop ahead of
+Seattle, wildcard routing, and audio playout (jitter target and quality
+harness). m1 is the next wave across reliability, features, performance, and
+planning. m2 holds later features, design studies, and experiments. m3 is
+gated on the outside world: hardware, a partner, a consumer, or a provider's
+offer. m4 waits on an upstream release. Priority is
+separate from branch targeting: published API and wire breaks still land on dev
+under the repository rules.
 
-## Quests
+A quest waiting on the outside world, in any milestone, requires a small quest
+beside it that names the condition. That condition quest stays ready, so
+every `/quest-spawn` resurfaces it; when the condition clears, delete it and
+move the blocked quest to the milestone its priority belongs in.
 
-- [main](/quest/main/README.md) - work landing on main now: additive changes and the 0.0.x contracts
-- [dev](/quest/dev/README.md) - published API and wire breaks, landed as one merge into main
-- [next](/quest/next/README.md) - the next wave, in priority order
-- [future](/quest/future/README.md) - later work, studies, and quests gated on the outside world
+## Required
+
+- [m0: immediate priorities](/quest/m0/README.md) - everything in flight now: relay hardening and IETF interop for Seattle, wildcard routing, and audio playout
+- [m1: next wave](/quest/m1/README.md) - reliability, capabilities, performance, and the planning that settles their contracts
+- [m2: later work](/quest/m2/README.md) - deferred features, design studies, and experiments
+- [m3: deferred](/quest/m3/README.md) - gated on the outside world: hardware, a partner, a consumer, or a provider's offer
+- [m4: upstream](/quest/m4/README.md) - waiting on an upstream release, re-checked periodically

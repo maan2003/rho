@@ -322,6 +322,9 @@ impl Message for SubscribeStart {
 #[derive(Clone, Debug)]
 pub struct SubscribeEnd {
 	pub group: u64,
+	/// The number of group streams the publisher opened for this subscription.
+	/// Lite07+ only; not on the wire before, where it decodes as 0.
+	pub streams: u64,
 }
 
 impl Message for SubscribeEnd {
@@ -329,16 +332,23 @@ impl Message for SubscribeEnd {
 		if !version.has_track_stream() {
 			return Err(DecodeError::Version);
 		}
-		Ok(Self {
-			group: u64::decode(r, version)?,
-		})
+		let group = u64::decode(r, version)?;
+		let streams = match version.has_stream_count() {
+			true => u64::decode(r, version)?,
+			false => 0,
+		};
+		Ok(Self { group, streams })
 	}
 
 	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
 		if !version.has_track_stream() {
 			return Err(EncodeError::Version);
 		}
-		self.group.encode(w, version)
+		self.group.encode(w, version)?;
+		if version.has_stream_count() {
+			self.streams.encode(w, version)?;
+		}
+		Ok(())
 	}
 }
 
@@ -429,7 +439,7 @@ impl Message for SubscribeUpdate {
 /// The range `[start, end]` is inclusive on both ends. For example,
 /// `start = 5, end = 7` means groups 5, 6, and 7 were dropped.
 ///
-/// Lite03+ only.
+/// Lite03 to Lite06 only: Lite07 counts group streams in [`SubscribeEnd`] instead.
 #[derive(Clone, Debug)]
 pub struct SubscribeDrop {
 	/// The first absolute group sequence in the dropped range.
@@ -449,6 +459,7 @@ impl Message for SubscribeDrop {
 			Version::Lite01 | Version::Lite02 => {
 				return Err(DecodeError::Version);
 			}
+			_ if version.has_stream_count() => return Err(DecodeError::Version),
 			_ => {}
 		}
 
@@ -464,6 +475,7 @@ impl Message for SubscribeDrop {
 			Version::Lite01 | Version::Lite02 => {
 				return Err(EncodeError::Version);
 			}
+			_ if version.has_stream_count() => return Err(EncodeError::Version),
 			_ => {}
 		}
 
@@ -480,8 +492,9 @@ impl Message for SubscribeDrop {
 ///
 /// The discriminator is version-dependent:
 /// - Lite03/04: `0x0` SUBSCRIBE_OK, `0x1` SUBSCRIBE_DROP.
-/// - Lite05+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
+/// - Lite05/06: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
 ///   (SUBSCRIBE_OK was removed; acceptance is implicit).
+/// - Lite07+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END (SUBSCRIBE_DROP was removed).
 #[derive(Clone, Debug)]
 pub enum SubscribeResponse {
 	Ok(SubscribeOk),
@@ -525,8 +538,8 @@ impl Encode<Version> for SubscribeResponse {
 			_ => match self {
 				Self::Start(start) => encode_typed(w, 0, start, version)?,
 				Self::End(end) => encode_typed(w, 1, end, version)?,
-				Self::Drop(drop) => encode_typed(w, 2, drop, version)?,
-				Self::Ok(_) => return Err(EncodeError::Version),
+				Self::Drop(drop) if !version.has_stream_count() => encode_typed(w, 2, drop, version)?,
+				Self::Drop(_) | Self::Ok(_) => return Err(EncodeError::Version),
 			},
 		}
 
@@ -551,7 +564,7 @@ impl Decode<Version> for SubscribeResponse {
 				match typ {
 					0 => Ok(Self::Start(SubscribeStart::decode(buf, version)?)),
 					1 => Ok(Self::End(SubscribeEnd::decode(buf, version)?)),
-					2 => Ok(Self::Drop(SubscribeDrop::decode(buf, version)?)),
+					2 if !version.has_stream_count() => Ok(Self::Drop(SubscribeDrop::decode(buf, version)?)),
 					_ => Err(DecodeError::InvalidMessage(typ)),
 				}
 			}
@@ -577,14 +590,51 @@ mod test {
 
 	#[test]
 	fn subscribe_end_roundtrips_on_lite05() {
-		let resp = SubscribeResponse::End(SubscribeEnd { group: 7 });
+		let resp = SubscribeResponse::End(SubscribeEnd { group: 7, streams: 3 });
 		let mut buf = Vec::new();
 		resp.encode(&mut buf, Version::Lite05).unwrap();
+		// Type, length, group: no stream count before lite-07.
+		assert_eq!(buf, [1, 1, 7]);
 		let mut slice = buf.as_slice();
 		match SubscribeResponse::decode(&mut slice, Version::Lite05).unwrap() {
-			SubscribeResponse::End(end) => assert_eq!(end.group, 7),
+			SubscribeResponse::End(end) => assert_eq!((end.group, end.streams), (7, 0)),
 			other => panic!("expected End, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn subscribe_end_carries_the_stream_count_on_lite07() {
+		let resp = SubscribeResponse::End(SubscribeEnd { group: 7, streams: 3 });
+		let mut buf = Vec::new();
+		resp.encode(&mut buf, Version::Lite07).unwrap();
+		assert_eq!(buf, [1, 2, 7, 3]);
+		let mut slice = buf.as_slice();
+		match SubscribeResponse::decode(&mut slice, Version::Lite07).unwrap() {
+			SubscribeResponse::End(end) => assert_eq!((end.group, end.streams), (7, 3)),
+			other => panic!("expected End, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn subscribe_drop_is_gone_on_lite07() {
+		let resp = SubscribeResponse::Drop(SubscribeDrop {
+			start: 1,
+			end: 3,
+			error: 0,
+		});
+		let mut buf = Vec::new();
+		assert!(matches!(
+			resp.encode(&mut buf, Version::Lite07),
+			Err(EncodeError::Version)
+		));
+
+		// A lite-06 DROP is an unknown response type on lite-07.
+		let mut buf = Vec::new();
+		resp.encode(&mut buf, Version::Lite06).unwrap();
+		assert!(matches!(
+			SubscribeResponse::decode(&mut buf.as_slice(), Version::Lite07),
+			Err(DecodeError::InvalidMessage(2))
+		));
 	}
 
 	#[test]
@@ -636,8 +686,8 @@ mod test {
 	fn subscribe_frame_bounds_roundtrip() {
 		let msg = subscribe_sample();
 		let mut buf = Vec::new();
-		msg.encode_msg(&mut buf, Version::Lite06Wip).unwrap();
-		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut buf, Version::Lite06).unwrap();
+		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06).unwrap();
 		assert_eq!((got.start_group, got.start_frame), (Some(7), 4));
 		assert_eq!((got.end_group, got.end_frame), (Some(9), Some(2)));
 	}
@@ -655,7 +705,7 @@ mod test {
 		let mut lite05 = Vec::new();
 		msg.encode_msg(&mut lite05, Version::Lite05).unwrap();
 		let mut lite06 = Vec::new();
-		msg.encode_msg(&mut lite06, Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut lite06, Version::Lite06).unwrap();
 
 		// The two layouts diverge in exactly one place: the retired byte lite-05 still
 		// reserves. A deployed peer's field offsets depend on it being there and zero.
@@ -688,10 +738,10 @@ mod test {
 		let mut lite05 = Vec::new();
 		msg.encode_msg(&mut lite05, Version::Lite05).unwrap();
 		let mut lite06 = Vec::new();
-		msg.encode_msg(&mut lite06, Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut lite06, Version::Lite06).unwrap();
 
 		let on05 = Subscribe::decode_msg(&mut lite05.as_slice(), Version::Lite05).unwrap();
-		let on06 = Subscribe::decode_msg(&mut lite06.as_slice(), Version::Lite06Wip).unwrap();
+		let on06 = Subscribe::decode_msg(&mut lite06.as_slice(), Version::Lite06).unwrap();
 		assert_eq!(on05.start_group, Some(7));
 		assert_eq!(on06.start_group, Some(7));
 		// The raw byte differs: 7 on the wire, not 7 + 1.
@@ -701,12 +751,12 @@ mod test {
 		// byte-identical on the wire, and canonicalized to absent on decode.
 		msg.start_group = None;
 		let mut absent = Vec::new();
-		msg.encode_msg(&mut absent, Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut absent, Version::Lite06).unwrap();
 		msg.start_group = Some(0);
 		let mut zero = Vec::new();
-		msg.encode_msg(&mut zero, Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut zero, Version::Lite06).unwrap();
 		assert_eq!(absent, zero);
-		let got = Subscribe::decode_msg(&mut zero.as_slice(), Version::Lite06Wip).unwrap();
+		let got = Subscribe::decode_msg(&mut zero.as_slice(), Version::Lite06).unwrap();
 		assert_eq!(got.start_group, None);
 
 		// On the pre-06 wire the vacuous floor folds to absent (the latest group).
@@ -725,8 +775,8 @@ mod test {
 		msg.start_frame = 4;
 
 		let mut buf = Vec::new();
-		msg.encode_msg(&mut buf, Version::Lite06Wip).unwrap();
-		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06Wip).unwrap();
+		msg.encode_msg(&mut buf, Version::Lite06).unwrap();
+		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06).unwrap();
 		assert_eq!((got.start_group, got.start_frame), (Some(0), 4));
 	}
 
@@ -749,14 +799,14 @@ mod test {
 
 		let mut buf = Vec::new();
 		assert!(matches!(
-			msg.encode_msg(&mut buf, Version::Lite06Wip),
+			msg.encode_msg(&mut buf, Version::Lite06),
 			Err(EncodeError::InvalidState)
 		));
 
 		msg.start_frame = 0;
 		msg.end_frame = Some(7);
 		assert!(matches!(
-			msg.encode_msg(&mut buf, Version::Lite06Wip),
+			msg.encode_msg(&mut buf, Version::Lite06),
 			Err(EncodeError::InvalidState)
 		));
 	}

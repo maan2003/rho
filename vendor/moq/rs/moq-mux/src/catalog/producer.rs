@@ -182,6 +182,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// Connection allocator passthrough tracks claim their peak-hold bitrate on.
 	/// See [`Config::with_bandwidth`].
 	bandwidth: moq_net::bandwidth::Allocator,
+	/// The minimum flush lateness across this catalog's renditions, which each rendition's
+	/// advertised `delay` is measured against.
+	baseline: super::estimate::Baseline,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -194,6 +197,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			timeline: self.timeline.clone(),
 			max_age: self.max_age,
 			bandwidth: self.bandwidth.clone(),
+			baseline: self.baseline.clone(),
 		}
 	}
 }
@@ -342,6 +346,7 @@ impl<E: CatalogExt> Producer<E> {
 			timeline,
 			max_age: config.max_age,
 			bandwidth: config.bandwidth,
+			baseline: Default::default(),
 		})
 	}
 
@@ -371,11 +376,27 @@ impl<E: CatalogExt> Producer<E> {
 		}
 	}
 
+	/// Edit the catalog in place and publish the result.
+	///
+	/// The closure receives the current catalog, composed from every owner so far. Edit it in place;
+	/// on return the result is published, a no-op if the closure changed nothing. Independent owners
+	/// can each edit only their own sections, so they compose instead of clobbering one another.
+	///
+	/// This is [`modify`](Self::modify) opened and committed for you; take the guard to hold the lock
+	/// across several edits, or to reach a [`Guard`] method like
+	/// [`set_section`](Guard::set_section).
+	pub fn mutate(&mut self, f: impl FnOnce(&mut Catalog<E>)) -> crate::Result<()> {
+		let mut guard = self.modify()?;
+		f(&mut guard);
+		guard.commit()
+	}
+
 	/// Get mutable access to the catalog, publishing it after any changes.
 	///
-	/// The publish happens when the returned [`Guard`] drops. Fails once the catalog tracks are
-	/// closed, the one publication failure that happens in normal operation, so nothing is left to
-	/// check after the guard drops. Anything else that stops the drop from publishing (an extension
+	/// The publish happens when the returned [`Guard`] drops. Use [`mutate`](Self::mutate) for a
+	/// single edit, which is this guard opened and committed for you. Fails once the catalog tracks
+	/// are closed, the one publication failure that happens in normal operation, so nothing is left
+	/// to check after the guard drops. Anything else that stops the drop from publishing (an extension
 	/// that won't serialize, a catalog too large for a frame) aborts the catalog tracks with that
 	/// error: consumers see it instead of a stale catalog, and the next `modify` returns it here.
 	/// Call [`Guard::commit`] to get the error back immediately instead.
@@ -599,6 +620,11 @@ impl<E: CatalogExt> Producer<E> {
 			.with_bandwidth(self.bandwidth.clone()))
 	}
 
+	/// A fresh estimator whose `delay` is measured against this catalog's other renditions.
+	pub(crate) fn estimator(&self) -> super::Estimator {
+		super::Estimator::with_broadcast(self.baseline.clone())
+	}
+
 	/// The allocator passthrough tracks claim on. fMP4 writes groups by hand, so it reads this itself.
 	pub(crate) fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
 		self.bandwidth.clone()
@@ -637,20 +663,28 @@ impl<E: CatalogExt> Producer<E> {
 	/// Publish `track` as a latest-value JSON track, advertising it in the catalog.
 	///
 	/// The caller creates the track on the broadcast, as it does for a media track; this writes its
-	/// catalog entry and removes the
-	/// entry when the returned handle drops. The catalog key is [`track.name()`](moq_net::track::Producer::name)
-	/// verbatim, with no `.z` suffix even when compressed, since the entry's compression flag is
-	/// what a consumer reads.
+	/// catalog entry and removes the entry when the returned handle drops. The catalog key is
+	/// [`track.name()`](moq_net::track::Producer::name) verbatim, with no `.z` suffix even when
+	/// compressed, since the entry's compression flag is what a consumer reads.
 	///
-	/// Errors if the catalog already carries an entry under that name, for example one seeded
-	/// through [`Config::with_catalog`] or one pointing at a sibling broadcast.
+	/// `config` is a [`json::Config`](crate::json::Config) for the `json` section, or an
+	/// application's own entry embedding a [`JsonConfig`](hang::catalog::JsonConfig) (see
+	/// [`IntoRendition`](super::IntoRendition)). The producer sets its `mode`, encodes the track
+	/// with its `compression`, and fills an absent `bitrate` from what it writes. A
+	/// [`delta_ratio`](crate::json::Config::delta_ratio) on `json::Config` selects the snapshot
+	/// encoder; it is not written into the catalog entry. The config is `'static` so that ratio
+	/// can be read off the builder.
+	///
+	/// Errors if the entry's section already carries that name, for example an entry seeded
+	/// through [`Config::with_catalog`] or one pointing at a sibling broadcast, or if the entry
+	/// declares a compression this build can't write or references another broadcast.
 	pub fn json_snapshot<T: serde::Serialize>(
 		&self,
 		track: moq_net::track::Producer,
-		config: crate::json::Config,
+		config: impl super::IntoRendition<E, hang::catalog::JsonConfig> + 'static,
 	) -> crate::Result<crate::json::Snapshot<T, E>> {
 		let rendition = self.data_entry(track.name())?;
-		crate::json::Snapshot::new(track, rendition, &config)
+		crate::json::Snapshot::new(track, rendition, config)
 	}
 
 	/// Publish `track` as an append-log JSON track, advertising it in the catalog.
@@ -660,36 +694,37 @@ impl<E: CatalogExt> Producer<E> {
 	pub fn json_stream<T: serde::Serialize>(
 		&self,
 		track: moq_net::track::Producer,
-		config: crate::json::Config,
+		config: impl super::IntoRendition<E, hang::catalog::JsonConfig>,
 	) -> crate::Result<crate::json::Stream<T, E>> {
 		let rendition = self.data_entry(track.name())?;
-		crate::json::Stream::new(track, rendition, &config)
+		crate::json::Stream::new(track, rendition, config.into_rendition())
 	}
 
 	/// Publish `track` as a latest-value binary track, advertising it in the catalog.
 	///
 	/// See [`json_snapshot`](Self::json_snapshot) for the lifecycle; this differs only in that the
-	/// payloads are opaque bytes.
+	/// payloads are opaque bytes, and `config` is a [`binary::Config`](crate::binary::Config) or an
+	/// entry embedding a [`BinaryConfig`](hang::catalog::BinaryConfig).
 	pub fn binary_snapshot(
 		&self,
 		track: moq_net::track::Producer,
-		config: crate::binary::Config,
+		config: impl super::IntoRendition<E, hang::catalog::BinaryConfig>,
 	) -> crate::Result<crate::binary::Snapshot<E>> {
 		let rendition = self.data_entry(track.name())?;
-		crate::binary::Snapshot::new(track, rendition, &config)
+		crate::binary::Snapshot::new(track, rendition, config.into_rendition())
 	}
 
 	/// Publish `track` as an append-log binary track, advertising it in the catalog.
 	///
-	/// See [`json_snapshot`](Self::json_snapshot) for the lifecycle; this differs only in that the
-	/// payloads are opaque bytes and every one is preserved rather than superseded.
+	/// See [`binary_snapshot`](Self::binary_snapshot); this differs only in that every payload is
+	/// preserved rather than superseded.
 	pub fn binary_stream(
 		&self,
 		track: moq_net::track::Producer,
-		config: crate::binary::Config,
+		config: impl super::IntoRendition<E, hang::catalog::BinaryConfig>,
 	) -> crate::Result<crate::binary::Stream<E>> {
 		let rendition = self.data_entry(track.name())?;
-		crate::binary::Stream::new(track, rendition, &config)
+		crate::binary::Stream::new(track, rendition, config.into_rendition())
 	}
 
 	/// Reserve the catalog entry a data producer owns, keyed by its track name.
@@ -916,6 +951,7 @@ fn to_msf_media<E: CatalogExt>(catalog: &hang::Catalog) -> moq_msf::Catalog<E> {
 		track.max_grp_sap_starting_type = sap_type;
 		track.max_obj_sap_starting_type = sap_type;
 		track.jitter = config.jitter;
+		track.delay = config.delay;
 		tracks.push(track);
 	}
 
@@ -946,6 +982,7 @@ fn to_msf_media<E: CatalogExt>(catalog: &hang::Catalog) -> moq_msf::Catalog<E> {
 		track.max_grp_sap_starting_type = Some(1);
 		track.max_obj_sap_starting_type = Some(1);
 		track.jitter = config.jitter;
+		track.delay = config.delay;
 		tracks.push(track);
 	}
 
@@ -1058,6 +1095,43 @@ mod test {
 
 		assert_eq!(got_plain, expected);
 		assert_eq!(got_compressed, expected);
+	}
+
+	#[test]
+	fn mutate_composes_independent_owners() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let mut catalog = Producer::new(&mut broadcast, Config::default()).unwrap();
+		let mut plain = Consumer::new(catalog.outputs.hang.consume());
+
+		catalog
+			.mutate(|c| {
+				c.audio
+					.renditions
+					.insert("audio0".to_string(), AudioConfig::new(AudioCodec::Opus, 48_000, 2));
+			})
+			.unwrap();
+
+		// The second owner starts from the published catalog and adds its own section.
+		catalog
+			.mutate(|c| {
+				c.video.renditions.insert("video0".to_string(), h264_config());
+			})
+			.unwrap();
+
+		// A closure that changes nothing publishes nothing: the catalog track runs one snapshot per
+		// group, so a third publish would open a third group.
+		catalog.mutate(|_| {}).unwrap();
+		assert_eq!(catalog.outputs.hang_track.latest(), Some(1));
+
+		let expected = catalog.snapshot();
+		let waiter = kio::Waiter::noop();
+		let mut last = None;
+		while let Poll::Ready(Ok(Some(c))) = plain.poll_next(&waiter) {
+			last = Some(c);
+		}
+		assert_eq!(last.unwrap(), expected);
+		assert!(expected.audio.renditions.contains_key("audio0"));
+		assert!(expected.video.renditions.contains_key("video0"));
 	}
 
 	#[test]
@@ -1546,6 +1620,7 @@ mod test {
 		video_config.framerate = Some(30.0);
 		video_config.container = Container::Legacy;
 		video_config.jitter = Some(std::time::Duration::from_millis(100));
+		video_config.delay = Some(std::time::Duration::from_millis(200));
 
 		let mut video_renditions = BTreeMap::new();
 		video_renditions.insert("video0".to_string(), video_config);
@@ -1553,6 +1628,7 @@ mod test {
 		let mut audio_config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		audio_config.container = Container::Legacy;
 		audio_config.jitter = Some(std::time::Duration::from_millis(40));
+		audio_config.delay = Some(std::time::Duration::from_millis(80));
 
 		let mut audio_renditions = BTreeMap::new();
 		audio_renditions.insert("audio0".to_string(), audio_config);
@@ -1569,12 +1645,14 @@ mod test {
 		assert_eq!(video.max_grp_sap_starting_type, Some(2));
 		assert_eq!(video.max_obj_sap_starting_type, Some(2));
 		assert_eq!(video.jitter, Some(std::time::Duration::from_millis(100)));
+		assert_eq!(video.delay, Some(std::time::Duration::from_millis(200)));
 
 		let audio = &msf.tracks[1];
 		assert_eq!(audio.role, Some(moq_msf::Role::Audio));
 		assert_eq!(audio.max_grp_sap_starting_type, Some(1));
 		assert_eq!(audio.max_obj_sap_starting_type, Some(1));
 		assert_eq!(audio.jitter, Some(std::time::Duration::from_millis(40)));
+		assert_eq!(audio.delay, Some(std::time::Duration::from_millis(80)));
 	}
 
 	#[test]

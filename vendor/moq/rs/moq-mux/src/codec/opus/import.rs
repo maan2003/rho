@@ -42,9 +42,19 @@ impl Import {
 		self.track.track().name()
 	}
 
+	/// The exclusive presentation end earlier groups have reached, if any.
+	pub(crate) fn live_edge(&self) -> Option<moq_net::Timestamp> {
+		self.track.live_edge()
+	}
+
 	/// A watch-only handle to this track's subscriber demand.
 	pub fn demand(&self) -> moq_net::track::Demand {
 		self.track.track().demand()
+	}
+
+	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> crate::Result<()> {
+		self.track.flush(timestamp, now)
 	}
 
 	/// Finish the track, flushing the current group.
@@ -102,19 +112,23 @@ impl Import {
 }
 
 /// Build a catalog config from an OpusHead. Errors on a malformed or empty buffer.
+///
+/// The catalog rate is the decoder's 48 kHz output, not the OpusHead's informational input rate.
 pub fn config(init: &[u8]) -> crate::Result<hang::catalog::AudioConfig> {
 	let mut buf = init;
-	Ok(Config::parse(&mut buf)?.into())
+	let mut config: hang::catalog::AudioConfig = Config::parse(&mut buf)?.into();
+	// Publish the head as given: a re-encode would rewrite its version byte.
+	config.description = Some(bytes::Bytes::copy_from_slice(init));
+	Ok(config)
 }
 
 impl From<Config> for hang::catalog::AudioConfig {
 	/// Build a catalog config from a config resolved out of band (e.g. gstreamer caps).
+	///
+	/// The catalog describes the decoder's output: Opus always decodes at 48 kHz, whatever the
+	/// informational input rate in [`Config::sample_rate`] claims.
 	fn from(config: Config) -> Self {
-		let mut audio = hang::catalog::AudioConfig::new(
-			hang::catalog::AudioCodec::Opus,
-			config.sample_rate,
-			config.channel_count,
-		);
+		let mut audio = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, config.channel_count);
 		audio.description = config.encode().ok();
 		audio.container = hang::catalog::Container::Legacy;
 		audio
@@ -126,6 +140,18 @@ mod tests {
 	use std::time::Duration;
 
 	use moq_net::Timestamp;
+
+	#[test]
+	fn catalog_rate_is_decoder_rate() {
+		// A 44.1 kHz input rate is informational; the description keeps it, the catalog does not.
+		let head = super::Config::new(44_100, 2).encode().unwrap();
+		let config = super::config(&head).unwrap();
+		assert_eq!(config.sample_rate, 48_000);
+		assert_eq!(config.description.as_deref(), Some(head.as_ref()));
+
+		let config: hang::catalog::AudioConfig = super::Config::new(44_100, 2).into();
+		assert_eq!(config.sample_rate, 48_000);
+	}
 
 	#[tokio::test(start_paused = true)]
 	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {

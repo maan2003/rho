@@ -4,21 +4,25 @@
  * @module
  */
 import { type GetPromise, Once, Signal } from "@moq/signals";
+import { NotFound } from "./error.ts";
 import type { Consumer as GroupConsumer } from "./group.ts";
 import { Route } from "./hop.ts";
 import { hooks, type TrackSequence } from "./internal.ts";
+import * as Path from "./path.ts";
 import * as track from "./track.ts";
+import { untilAborted } from "./util/abort.ts";
 import { registerWire, trackOf, type Broadcast as Wire } from "./wire.ts";
 
 /** The origin callback a created broadcast uses to advertise its exact path. @internal */
 export interface Announcer {
 	/** Advertise or re-price this broadcast's path. */
 	announce(route: Route): void;
-	/** Retract the advertisement, leaving the broadcast reachable by exact path. */
+	/** Retract the advertisement from local consumers and peers alike. */
 	unannounce(): void;
 }
 
 let attachAnnouncer: (producer: Producer, announcer: Announcer) => void;
+let stampProducer: (producer: Producer, path: Path.Valid) => void;
 
 /** Reactive backing state shared by broadcast producers and consumers. */
 class BroadcastState {
@@ -126,12 +130,13 @@ async function fetchGroup(
 	sequence: number,
 	options: track.FetchGroupOptions = {},
 ): Promise<GroupConsumer> {
+	options.signal?.throwIfAborted();
 	const subscriber = subscribe(state, name, { priority: options.priority });
 	hooks.exemptFetch(subscriber);
 	try {
 		for (;;) {
-			const group = await subscriber.recvGroup();
-			if (!group) throw new Error(`group not found: ${sequence}`);
+			const group = await untilAborted(subscriber.recvGroup(), options.signal);
+			if (!group) throw new NotFound(`group ${sequence}`);
 			if (group.sequence === sequence) {
 				// Close the subscription when the returned group finishes, not now: an
 				// in-progress group must keep receiving frames for its lifetime (mirrors
@@ -141,7 +146,7 @@ async function fetchGroup(
 			}
 
 			group.close();
-			if (group.sequence > sequence) throw new Error(`group not found: ${sequence}`);
+			if (group.sequence > sequence) throw new NotFound(`group ${sequence}`);
 		}
 	} catch (err) {
 		subscriber.close();
@@ -157,6 +162,7 @@ async function fetchGroup(
 export class Producer {
 	#state = new BroadcastState();
 	#announcer?: Announcer;
+	#path = Path.empty();
 
 	constructor() {
 		registerWire(this, this.#wire(false));
@@ -167,6 +173,9 @@ export class Producer {
 			producer.#announcer = announcer;
 		};
 		hooks.attachAnnouncer = attachAnnouncer;
+		stampProducer = (producer, path) => {
+			producer.#path = path;
+		};
 	}
 
 	/**
@@ -177,9 +186,9 @@ export class Producer {
 		return this.#state.closed;
 	}
 
-	/** A read handle for this broadcast. */
+	/** A read handle for this broadcast, named by the path the origin created it at. */
 	consume(): Consumer {
-		return makeConsumer(this.#state);
+		return makeConsumer({ state: this.#state, path: this.#path });
 	}
 
 	async #requested(): Promise<track.Request | undefined> {
@@ -244,8 +253,8 @@ export class Producer {
 	/**
 	 * Advertise this broadcast's exact path, or re-price a standing advertisement in place.
 	 *
-	 * Call it once the tracks a subscriber needs first (a catalog) exist. The broadcast is
-	 * reachable by exact path either way; announcing only makes it discoverable. Retracts on
+	 * Call it once the tracks a subscriber needs first (a catalog) exist. Until then the
+	 * broadcast exists for nobody, on its own origin or at a peer. Retracts on
 	 * {@link unannounce} or {@link close}. Throws if this producer was not created through an
 	 * origin, or if the broadcast is already closed.
 	 */
@@ -257,12 +266,18 @@ export class Producer {
 		this.#announcer.announce(Route.normalize(route));
 	}
 
-	/** Retract the advertisement of this broadcast's path, if any. */
+	/**
+	 * Retract the advertisement of this broadcast's path, if any, from local consumers and
+	 * peers alike. {@link announce} brings it back.
+	 */
 	unannounce(): void {
 		this.#announcer?.unannounce();
 	}
 
-	/** Close the broadcast, optionally with an error to abort waiters. Idempotent. */
+	/** End the broadcast for good: retract it, serve no new tracks, and refuse a later {@link announce}. Idempotent. */
+	close(): void;
+	/** @deprecated A broadcast end carries no cause; call `close()` without one. */
+	close(abort?: Error): void;
 	close(abort?: Error) {
 		this.#announcer?.unannounce();
 		this.#announcer = undefined;
@@ -270,9 +285,15 @@ export class Producer {
 	}
 }
 
+// What a new consumer handle inherits: the shared broadcast plus the path naming it.
+interface Shared {
+	state: BroadcastState;
+	path: Path.Valid;
+}
+
 // Constructs a Consumer from within this module without exposing a public constructor
 // that would leak the unexported BroadcastState. Assigned in the class's static block.
-let makeConsumer: (state: BroadcastState) => Consumer;
+let makeConsumer: (shared: Shared) => Consumer;
 
 /**
  * The read side of a broadcast.
@@ -284,13 +305,15 @@ let makeConsumer: (state: BroadcastState) => Consumer;
  */
 export class Consumer {
 	#state: BroadcastState;
+	#path: Path.Valid;
 
 	// Guards against a double close() on this handle over-decrementing the consumer count.
 	#closed = false;
 
-	protected constructor(state?: never);
-	protected constructor(state?: BroadcastState) {
-		this.#state = state ?? new BroadcastState();
+	protected constructor(shared?: never);
+	protected constructor(shared?: Shared) {
+		this.#state = shared?.state ?? new BroadcastState();
+		this.#path = shared?.path ?? Path.empty();
 		this.#state.consumers++;
 		registerWire(this, {
 			subscribe: (name, options) => subscribe(this.#state, name, options, true),
@@ -301,7 +324,23 @@ export class Consumer {
 	}
 
 	static {
-		makeConsumer = (state) => new Consumer(state as never);
+		makeConsumer = (shared) => new Consumer(shared as never);
+		hooks.stampPath = (target, path) => {
+			if (target instanceof Consumer) target.#path = path;
+			else stampProducer(target, path);
+		};
+	}
+
+	/**
+	 * The path this handle names the broadcast by, which relative references in its catalog
+	 * (hang's `broadcast` field) resolve against.
+	 *
+	 * An origin stamps each handle it hands out with the path it was requested at, relative to
+	 * that origin handle's scope root, and a broadcast it created with the path it was created at.
+	 * Empty for a standalone broadcast, which is then its own root: any `..` reference escapes.
+	 */
+	get path(): Path.Valid {
+		return this.#path;
 	}
 
 	/**
@@ -318,8 +357,8 @@ export class Consumer {
 	/**
 	 * Return another handle to the same broadcast, reference-counted with this one.
 	 *
-	 * Both handles read the same tracks and share one {@link closed} state; the broadcast
-	 * closes only once *every* handle has {@link close}d. Used by the connection's per-path
+	 * Both handles read the same tracks, carry the same {@link path}, and share one {@link closed}
+	 * state; the broadcast closes only once *every* handle has {@link close}d. Used by the connection's per-path
 	 * consume cache to share one subscription across callers. Subclasses that resolve info over
 	 * the wire override this to preserve their type (see the wire layer's consumed broadcast).
 	 */
@@ -327,10 +366,10 @@ export class Consumer {
 		return new Consumer(this.shareState());
 	}
 
-	// Hand this consumer's backing state to a clone. Opaque (`never`) so the state type stays
-	// unexported; a subclass passes it straight back into its own `super(...)`.
+	// Hand this consumer's backing state and path to a clone. Opaque (`never`) so the state type
+	// stays unexported; a subclass passes it straight back into its own `super(...)`.
 	protected shareState(): never {
-		return this.#state as never;
+		return { state: this.#state, path: this.#path } satisfies Shared as never;
 	}
 
 	/** Get a lazy handle for a track on this broadcast. Repeat subscriptions dedupe onto one upstream subscription. */
@@ -352,9 +391,12 @@ export class Consumer {
 	}
 
 	/**
-	 * Release this handle. The broadcast is closed (optionally with an error to abort waiters)
-	 * once this was the last live handle; while other {@link clone}s remain open it stays live.
+	 * Release this handle. The broadcast is closed once this was the last live handle;
+	 * while other {@link clone}s remain open it stays live.
 	 */
+	close(): void;
+	/** @deprecated A broadcast end carries no cause; call `close()` without one. */
+	close(abort?: Error): void;
 	close(abort?: Error) {
 		if (this.#closed) return;
 		this.#closed = true;

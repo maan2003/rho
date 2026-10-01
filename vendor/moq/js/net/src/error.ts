@@ -82,6 +82,8 @@ export const StreamCode = Object.freeze(
 		TooFarBehind: 0x5 as StreamCode,
 		/** The track's content could not be parsed. */
 		MalformedTrack: 0x12 as StreamCode,
+		/** The peer took too long to answer a control request. */
+		ControlTimeout: 0x31 as StreamCode,
 		/** The requested broadcast or track does not exist at the peer. */
 		NotFound: 0x33 as StreamCode,
 		/** The group was superseded by a newer one and dropped. */
@@ -245,6 +247,21 @@ export class NotFound extends Stream {
 }
 
 /**
+ * A peer's GOAWAY named a redirect the connection refuses, or one it could not parse.
+ *
+ * Terminal: the peer is leaving, so the connection stops rather than redialing the old
+ * address. Mirrors the Rust `Error::RefusedRedirect`.
+ *
+ * @public
+ */
+export class RefusedRedirect extends Error {
+	constructor(reason: string) {
+		super(`GOAWAY redirect refused: ${reason}`);
+		this.name = "RefusedRedirect";
+	}
+}
+
+/**
  * A peer broke the protocol in a way the spec says must end the session.
  *
  * Thrown where the violation is detected, rather than handled there: a decoder has no session
@@ -314,6 +331,20 @@ function localStreamCode(err: unknown): StreamCode {
 	// Session-scoped: the peer learns which rule it broke from the session close, not from here.
 	if (err instanceof ProtocolViolation) return StreamCode.SessionClosed;
 	return StreamCode.Internal;
+}
+
+/**
+ * The {@link StreamCode.ControlTimeout} error for a control request the peer never answered.
+ *
+ * A control request that outlives its deadline is not late content, so it does not go out as
+ * {@link StreamCode.DeliveryTimeout} the way a bare {@link TimeoutError} would. Callers that
+ * bound a request's response build this instead.
+ *
+ * @internal
+ */
+export function controlTimeout(cause: unknown): Stream {
+	const message = cause instanceof Error && cause.message ? cause.message : "control request timed out";
+	return new Stream(StreamCode.ControlTimeout, { cause, message });
 }
 
 /**
@@ -406,6 +437,31 @@ export function fromClose(info: WebTransportCloseInfo): Session | null {
 	const code = (info.closeCode ?? SessionCode.Cancel) as SessionCode;
 	if (code === SessionCode.Cancel) return null;
 	return new Session(code, { reason: info.reason });
+}
+
+/**
+ * The session's close as the error it ends everything with, carrying the peer's code. A clean
+ * close code is still an error here: whatever the close cut off did not end.
+ *
+ * @internal
+ */
+export function closeError(quic: WebTransport): Promise<Error> {
+	return quic.closed.then(
+		(info) => fromClose(info) ?? new Session(SessionCode.Cancel, { reason: info.reason }),
+		(err: unknown) => error(err),
+	);
+}
+
+/**
+ * Report a failure the session's close caused as the session's own error, which carries the
+ * peer's close code; any other failure passes through.
+ *
+ * @internal
+ */
+export async function sessionCause(quic: WebTransport | undefined, err: unknown): Promise<Error> {
+	const source = typeof err === "object" && err !== null ? (err as { source?: unknown }).source : undefined;
+	if (quic && source === "session") return closeError(quic);
+	return error(err);
 }
 
 /**

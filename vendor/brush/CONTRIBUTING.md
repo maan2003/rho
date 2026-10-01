@@ -20,10 +20,10 @@ All types of contributions are encouraged and valued. See the [Table of Contents
   - [Reporting Bugs](#reporting-bugs)
   - [Suggesting Enhancements](#suggesting-enhancements)
   - [Your First Code Contribution](#your-first-code-contribution)
+  - [Development Setup and Checks](#development-setup-and-checks)
   - [Improving The Documentation](#improving-the-documentation)
 - [Styleguides](#styleguides)
   - [Commit Messages](#commit-messages)
-- [Join The Project Team](#join-the-project-team)
 
 ## Code of Conduct
 
@@ -105,7 +105,7 @@ Once it's filed:
 
 ### Suggesting Enhancements
 
-This section guides you through submitting an enhancement suggestion for {{=it.project.name}}, **including completely new features and minor improvements to existing functionality**. Following these guidelines will help maintainers and the community to understand your suggestion and find related suggestions.
+This section guides you through submitting an enhancement suggestion for brush, **including completely new features and minor improvements to existing functionality**. Following these guidelines will help maintainers and the community to understand your suggestion and find related suggestions.
 
 <!-- omit in toc -->
 #### Before Submitting an Enhancement
@@ -123,10 +123,57 @@ Enhancement suggestions are tracked as [GitHub issues](https://github.com/reuben
 - Use a **clear and descriptive title** for the issue to identify the suggestion.
 - Provide a **step-by-step description of the suggested enhancement** in as many details as possible.
 - **Describe the current behavior** and **explain which behavior you expected to see instead** and why. At this point you can also tell which alternatives do not work for you.
-- **Explain why this enhancement would be useful** to most {{=it.project.name}} users. You may also want to point out the other projects that solved it better and which could serve as inspiration.
+- **Explain why this enhancement would be useful** to most brush users. You may also want to point out the other projects that solved it better and which could serve as inspiration.
 
 ### Your First Code Contribution
 We're excited to see your first contribution! We don't bite, so we'd much rather you publish something  than not. If you submit your PR as a draft we're happy to give it a quick scan and provide some early input. Once the PR is marked "ready for review" we'll look through it more carefully.
+
+### Development Setup and Checks
+Building brush needs nothing but [rustup](https://rustup.rs/). `rust-toolchain.toml`
+pins the exact toolchain, along with the `rustfmt` and `clippy` components, and
+rustup installs it automatically the first time you run `cargo` in the repository,
+so a fresh clone is ready to go after `cargo build`. The pin keeps formatting and
+lint results identical between your machine and CI; Dependabot bumps it as new
+Rust releases ship.
+
+All development tasks run through `cargo xtask`, which is the single entry point
+and is what CI invokes too:
+
+| Command | When | Needs |
+|---|---|---|
+| `cargo xtask ci quick` | Inner loop (~7s warm): fmt, build, clippy, unit tests | Rust toolchain only |
+| `cargo xtask ci full` | Before opening a PR (~60s warm): adds the pre-commit hooks, schemas, integration tests | also `prek` |
+| `cargo xtask check <name>` | One check at a time; `cargo xtask check --help` lists them | varies |
+
+`cargo xtask ci full` also runs the third-party linters -- spelling (typos),
+GitHub Actions analysis (zizmor), link checking (lychee), dependency auditing
+(cargo-deny), and assorted file hygiene. Those are defined and version-pinned in
+`.pre-commit-config.yaml` and executed by [prek](https://prek.j178.dev):
+
+```bash
+cargo binstall prek   # or: uv tool install prek / brew install prek
+```
+
+If you would rather not install it, `cargo xtask ci full --no-hooks` skips that
+portion; CI will still run it.
+
+`cargo xtask ci full` reproduces every check CI performs that does not need a
+different machine or toolchain. CI additionally covers the three-OS matrix, the
+MSRV toolchain, cross-compilation, coverage, benchmarks, the bash-completion
+suite, the nightly-only checks, and CodeQL -- so a green local run is a strong
+signal, not a guarantee.
+
+#### Git hooks (optional)
+Git hooks are entirely optional; the commands above are the supported path. If
+you want them:
+
+```bash
+prek install
+```
+
+That wires up formatting and hygiene fixes on commit, Conventional Commits
+validation on the commit message, and `cargo xtask ci quick` on push -- the same
+command you would otherwise run by hand.
 
 ### Improving The Documentation
 We appreciate documentation updates as much as code updates! We try to follow the [Diátaxis](https://diataxis.fr/) approach to technical docs. The short version is we recognize the need for tutorials, how-to guides, reference material, and sometimes longer-form explanation docs--*and* we recognize the value of being intentional about organizing by those categories.

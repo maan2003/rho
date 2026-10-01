@@ -75,6 +75,67 @@ mod test {
 		out
 	}
 
+	/// A snapshot group the transport can no longer serve -- `Old` when the relay reclaims a
+	/// superseded group, `Evicted` under memory pressure, `Lagged` past the drift budget -- is not
+	/// fatal. A snapshot reader only wants the newest value, so it drops the group and takes the
+	/// replacement rather than ending the reader.
+	#[test]
+	fn a_lost_group_waits_for_its_replacement() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", None)
+			.unwrap();
+		let mut consumer = consume(track.subscribe(None), false);
+		let waiter = kio::Waiter::noop();
+
+		// Group 0 delivers a value, then stays open with the reader parked on its next frame.
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(b"one"))
+			.unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(Some(v))) if v == "one"));
+		assert!(consumer.poll_next(&waiter).is_pending());
+
+		// The relay reclaims the group out from under the reader.
+		group.abort(moq_net::Error::Old).unwrap();
+		assert!(
+			consumer.poll_next(&waiter).is_pending(),
+			"a lost group must not end the reader"
+		);
+
+		// The replacement arrives and the reader picks up where the value now lives.
+		let mut group = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(b"two"))
+			.unwrap();
+		assert!(matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(Some(v))) if v == "two"));
+	}
+
+	/// A stamped payload is written at its capture time, and the returned size is the encoded frame
+	/// on the wire rather than the payload handed in.
+	#[test]
+	fn a_stamped_update_writes_its_capture_time() {
+		let (mut producer, track) = producer(true);
+		let mut groups = producer.consume();
+		let captured = moq_net::Timestamp::from_millis(1_234).unwrap();
+		let payload = Bytes::from(vec![7u8; 4096]);
+		let size = producer
+			.update(moq_net::Timed::from(payload.clone()).at(captured))
+			.unwrap();
+
+		let waiter = kio::Waiter::noop();
+		let Poll::Ready(Ok(Some(mut group))) = groups.poll_recv_group(&waiter) else {
+			panic!("expected a group");
+		};
+		let Poll::Ready(Ok(Some(frame))) = group.poll_read_frame(&waiter) else {
+			panic!("expected a frame");
+		};
+		assert_eq!(frame.timestamp.as_micros(), captured.as_micros());
+		assert_eq!(size, frame.payload.len());
+		assert!(size < payload.len(), "the size is the compressed frame");
+		assert_eq!(drain(consume(track, true)), vec![payload]);
+	}
+
 	#[test]
 	fn one_group_per_update() {
 		let (mut producer, track) = producer(false);

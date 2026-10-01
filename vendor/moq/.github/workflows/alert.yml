@@ -18,23 +18,28 @@ on:
   workflow_run:
     # Matched by workflow `name:`, not filename. Every workflow that can run
     # outside a pull request belongs here; the pull-request-only ones (Check,
-    # macOS, Windows) are omitted so they don't spawn a skipped Alert run on
-    # every push to every PR. `just gh check` enforces both halves of that.
+    # Android) are omitted so they don't spawn a skipped Alert run on every
+    # push to every PR. `just gh check` enforces both halves of that.
     #
-    # Swift is here despite also running on pull requests: it warms its own
-    # Rust cache on `main`, and that push run is nobody's check, so a break in
-    # it would otherwise go unseen. The cost is a skipped Alert run per Swift
-    # pull request.
+    # Swift, OBS, and Platform are here despite also running on pull requests:
+    # Swift warms its own Rust cache on `main`, and OBS and Platform build every
+    # merge to `main` and `dev`. Those push runs are nobody's check, so a break in them
+    # would otherwise go unseen. The cost is a skipped Alert run per pull
+    # request.
     workflows:
       - apt-repo
       - Cache
       - Cachix
       - Docker
+      - Interop
       - libmoq
       - moq-cli
       - moq-gst
       - moq-relay
       - Nightly
+      - OBS
+      - Platform
+      - Quest
       - release-brew
       - Release Dart
       - Release Dart FFI
@@ -50,7 +55,6 @@ on:
       - Release Swift Lib
       - release-winget
       - rpm-repo
-      - Smoke
       - Swift
     types:
       - completed
@@ -78,6 +82,8 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: ./.github/actions/just
+
       - name: Post to Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -88,4 +94,4 @@ jobs:
           RUN_REF: ${{ github.event.workflow_run.head_branch }}
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
           RUN_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
-        run: .github/scripts/alert.sh discord
+        run: just gh alert discord

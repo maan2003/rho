@@ -165,14 +165,14 @@ generate_bindings() {
 
     for lang in kotlin swift python; do
         echo "  Generating $lang bindings..."
-        cargo run --locked --release --package moq-ffi --bin uniffi-bindgen --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
+        cargo run --locked --release --package uniffi-bindgen --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
             generate --library "$lib_path" \
             --language "$lang" --out-dir "$OUTPUT_DIR/bindings/$lang"
     done
 
     # Go uses a separate, third-party bindgen. Upstream has no uniffi 0.32
     # release yet, so install the compatible generator fork with:
-    # cargo install --locked uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev v0.9.0+v0.32.0
+    # cargo install --locked uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev v0.10.0-kixelated.1+v0.32.0
     if command -v uniffi-bindgen-go >/dev/null 2>&1; then
         echo "  Generating go bindings..."
         uniffi-bindgen-go --library "$lib_path" --out-dir "$OUTPUT_DIR/bindings/go"

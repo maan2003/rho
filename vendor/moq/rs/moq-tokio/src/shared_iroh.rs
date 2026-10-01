@@ -595,6 +595,7 @@ mod tests {
 		let bi_router = tokio::spawn(async move { far.receive_bi().await });
 		let origin = crate::origin::spawn();
 		let broadcast = origin.create_broadcast("desktop")?;
+		broadcast.announce(Default::default())?;
 		let relay = origin.consume().request_broadcast("desktop").await?;
 		let mut cx = Context::from_waker(futures::task::noop_waker_ref());
 		// A checkpoint group is already live while obsolete states are reset.

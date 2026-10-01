@@ -3,6 +3,7 @@ use std::sync::Arc;
 use moq_mux::catalog::hang::Extra;
 
 use crate::consumer::{MoqBroadcastConsumer, MoqGroupConsumer, MoqSubscription, MoqTrackConsumer};
+use crate::demand::MoqTrackDemand;
 use crate::error::MoqError;
 use crate::ffi::Task;
 use crate::media::{MoqAudioInit, MoqContainerFormat, MoqContainerInit, MoqFrame, MoqVideoInit, MoqVideoProperties};
@@ -10,11 +11,12 @@ use crate::media::{MoqAudioInit, MoqContainerFormat, MoqContainerInit, MoqFrame,
 /// Publisher-side track properties, mirroring [`moq_net::track::Info`].
 ///
 /// Construct with the fields you care about; the rest use raw-track defaults
-/// (priority 0, the publisher's default max age, microsecond timescale).
+/// (priority 127, the publisher's default max age, microsecond timescale).
 #[derive(Clone, uniffi::Record)]
 pub struct MoqTrackInfo {
 	/// Priority, used only to break ties between subscriptions of equal subscriber priority.
-	#[uniffi(default = 0)]
+	/// Higher is more urgent; the default 127 is the midpoint.
+	#[uniffi(default = 127)]
 	pub priority: u8,
 	/// Maximum age of a non-latest group before the publisher evicts it, in
 	/// microseconds. Null uses the default. This is the publisher-side half of
@@ -169,7 +171,7 @@ impl MoqBroadcastProducer {
 	}
 
 	/// Run `f` against the open broadcast and catalog. Errors with
-	/// [`MoqError::Closed`] if `finish()` has already run. Used by
+	/// [`MoqError::Closed`] if `close()` has already run. Used by
 	/// sibling modules (e.g. `audio`) that need joint access.
 	pub(crate) fn with_state<R>(
 		&self,
@@ -237,10 +239,9 @@ impl MoqBroadcastProducer {
 
 	/// Advertise this broadcast's exact path as a route.
 	///
-	/// Announcing again re-prices the route in place. An unannounced broadcast
-	/// stays reachable by exact path for subscribes and fetches; announcing only
-	/// makes the path discoverable. Errors with `Closed` on a standalone
-	/// broadcast (no origin to announce on).
+	/// Until announced, the broadcast is invisible and unroutable for local
+	/// consumers and peers alike. Announcing again re-prices the route in place.
+	/// Errors with `Closed` on a standalone broadcast (no origin to announce on).
 	pub fn announce(&self, route: crate::origin::MoqRoute) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		let route: moq_net::origin::Route = route.try_into()?;
@@ -252,8 +253,9 @@ impl MoqBroadcastProducer {
 
 	/// Retract this broadcast's exact-path advertisement, if any.
 	///
-	/// The broadcast stays reachable by exact path. Errors with `Closed` on a
-	/// standalone broadcast (no origin to announce on).
+	/// Local consumers and peers alike stop discovering and requesting it;
+	/// tracks already in flight carry on. Announcing again brings it back. A no-op
+	/// on a standalone broadcast.
 	pub fn unannounce(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		self.with_state(|state| {
@@ -316,19 +318,17 @@ impl MoqBroadcastProducer {
 
 	/// Publish one audio codec as a new track.
 	///
-	/// The track is named after the format (`0.opus`), so the catalog is how a subscriber finds it.
-	/// [`MoqAudioInit::data`] is required: audio resolves its rendition entirely from those bytes.
-	pub fn publish_audio(&self, init: MoqAudioInit) -> Result<Arc<MoqMediaProducer>, MoqError> {
+	/// The track is [`MoqAudioInit::track`], or else named after the format (`0.opus`), so the
+	/// catalog is how a subscriber finds it. [`MoqAudioInit::data`] is required: audio resolves its
+	/// rendition entirely from those bytes.
+	pub fn publish_audio(&self, mut init: MoqAudioInit) -> Result<Arc<MoqMediaProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		let guard = self.state.lock().unwrap();
 		let state = guard.as_ref().ok_or(MoqError::Closed)?;
 
+		let track = init.track.take();
 		let init: moq_mux::import::AudioInit = init.into();
-		let broadcast = state.broadcast.clone();
-		let name = broadcast.unique_name(&format!(".{}", init.format));
-		let request = broadcast
-			.reserve_track(name)
-			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
+		let request = reserve_track(&state.broadcast, track, &init.format)?;
 
 		let import = moq_mux::import::Track::audio(request, state.catalog.reserve(), init)
 			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
@@ -340,17 +340,14 @@ impl MoqBroadcastProducer {
 	/// Named as in [`publish_audio`](Self::publish_audio). [`MoqVideoInit::data`] may be empty for a
 	/// format that resolves in band; a hint carrying the codec publishes the catalog before the
 	/// first keyframe.
-	pub fn publish_video(&self, init: MoqVideoInit) -> Result<Arc<MoqMediaProducer>, MoqError> {
+	pub fn publish_video(&self, mut init: MoqVideoInit) -> Result<Arc<MoqMediaProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		let guard = self.state.lock().unwrap();
 		let state = guard.as_ref().ok_or(MoqError::Closed)?;
 
+		let track = init.track.take();
 		let init: moq_mux::import::VideoInit = init.into();
-		let broadcast = state.broadcast.clone();
-		let name = broadcast.unique_name(&format!(".{}", init.format));
-		let request = broadcast
-			.reserve_track(name)
-			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
+		let request = reserve_track(&state.broadcast, track, &init.format)?;
 
 		let import = moq_mux::import::Track::video(request, state.catalog.reserve(), init)
 			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
@@ -386,6 +383,9 @@ impl MoqBroadcastProducer {
 		let guard = self.state.lock().unwrap();
 		let state = guard.as_ref().ok_or(MoqError::Closed)?;
 
+		if init.track.is_some() {
+			return Err(MoqError::Codec("a requested track already has a name".into()));
+		}
 		let request = request.take()?;
 		let import = moq_mux::import::Track::audio(request, state.catalog.reserve(), init.into())
 			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
@@ -403,6 +403,9 @@ impl MoqBroadcastProducer {
 		let guard = self.state.lock().unwrap();
 		let state = guard.as_ref().ok_or(MoqError::Closed)?;
 
+		if init.track.is_some() {
+			return Err(MoqError::Codec("a requested track already has a name".into()));
+		}
 		let request = request.take()?;
 		let import = moq_mux::import::Track::video(request, state.catalog.reserve(), init.into())
 			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
@@ -413,17 +416,14 @@ impl MoqBroadcastProducer {
 	///
 	/// Only the self-delimiting formats work here (`Avc3`, `Hev1`, `Av01`); the rest need length
 	/// prefixes or an out-of-band config record. There is no audio counterpart for the same reason.
-	pub fn publish_video_stream(&self, init: MoqVideoInit) -> Result<Arc<MoqMediaStreamProducer>, MoqError> {
+	pub fn publish_video_stream(&self, mut init: MoqVideoInit) -> Result<Arc<MoqMediaStreamProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		let guard = self.state.lock().unwrap();
 		let state = guard.as_ref().ok_or(MoqError::Closed)?;
 
+		let track = init.track.take();
 		let init: moq_mux::import::VideoInit = init.into();
-		let broadcast = state.broadcast.clone();
-		let name = broadcast.unique_name(&format!(".{}", init.format));
-		let request = broadcast
-			.reserve_track(name)
-			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
+		let request = reserve_track(&state.broadcast, track, &init.format)?;
 
 		let import = moq_mux::import::TrackStream::video(request, state.catalog.reserve(), init)
 			.map_err(|err| MoqError::Codec(format!("init failed: {err}")))?;
@@ -471,17 +471,26 @@ impl MoqBroadcastProducer {
 		}))
 	}
 
-	/// Finish this publisher, finalizing the catalog stream and cleanly closing the
-	/// broadcast so subscribers see a normal end rather than `Error::Dropped`.
-	pub fn finish(&self) -> Result<(), MoqError> {
+	/// End the broadcast for good: retract it, serve no new tracks, and finalize the catalog.
+	///
+	/// Tracks already subscribed carry on to their own end. Every later call on this
+	/// producer fails with `Closed`; closing again is a no-op.
+	pub fn close(&self) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
+		// Hold the lock through shutdown so a concurrent close() returns only once it is done.
 		let mut guard = self.state.lock().unwrap();
-		let mut state = guard.take().ok_or(MoqError::Closed)?;
-		// Finish the broadcast first so the clean end reaches subscribers even if
-		// finalizing the catalog fails.
-		state.broadcast.finish();
+		let Some(mut state) = guard.take() else {
+			return Ok(());
+		};
+		// Close the broadcast first so it ends even if finalizing the catalog fails.
+		state.broadcast.close();
 		state.catalog.finish()?;
 		Ok(())
+	}
+
+	/// Deprecated: use `close()`. A broadcast end carries no cause.
+	pub fn finish(&self) -> Result<(), MoqError> {
+		self.close()
 	}
 }
 
@@ -664,7 +673,7 @@ pub struct MoqTrackProducer {
 }
 
 impl MoqTrackProducer {
-	pub(crate) fn demand(&self) -> Result<moq_net::track::Demand, MoqError> {
+	pub(crate) fn track_demand(&self) -> Result<moq_net::track::Demand, MoqError> {
 		let guard = self.inner.lock().unwrap();
 		let track = guard.as_ref().ok_or(MoqError::Closed)?;
 		Ok(track.demand())
@@ -692,13 +701,22 @@ impl MoqTrackProducer {
 		Ok(Arc::new(MoqTrackDynamic::new(track.dynamic())))
 	}
 
+	/// A watch-only handle to whether this track has subscribers.
+	pub fn demand(&self) -> Result<Arc<MoqTrackDemand>, MoqError> {
+		Ok(MoqTrackDemand::new(self.track_demand()?))
+	}
+
 	/// Wait until this track has at least one active consumer.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn used(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
 		crate::ffi::detached(async move { track.used().await }).await
 	}
 
 	/// Wait until this track has no active consumers.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn unused(&self) -> Result<(), MoqError> {
 		let track = self.inner.lock().unwrap().as_ref().ok_or(MoqError::Closed)?.clone();
 		crate::ffi::detached(async move { track.unused().await }).await
@@ -894,7 +912,17 @@ impl MoqMediaProducer {
 		Ok(media.demand.name().to_string())
 	}
 
+	/// A watch-only handle to whether this track has subscribers.
+	pub fn demand(&self) -> Result<Arc<MoqTrackDemand>, MoqError> {
+		let guard = self.inner.lock().unwrap();
+		Ok(MoqTrackDemand::new(
+			guard.as_ref().ok_or(MoqError::Closed)?.demand.clone(),
+		))
+	}
+
 	/// Wait until this track has at least one active consumer.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn used(&self) -> Result<(), MoqError> {
 		let demand = self
 			.inner
@@ -908,6 +936,8 @@ impl MoqMediaProducer {
 	}
 
 	/// Wait until this track has no active consumers.
+	///
+	/// Prefer [`demand`](Self::demand), a handle that can wait without borrowing this producer.
 	pub async fn unused(&self) -> Result<(), MoqError> {
 		let demand = self
 			.inner
@@ -935,6 +965,31 @@ impl MoqMediaProducer {
 			.decode(&frame.payload, Some(timestamp))
 			.map_err(|err| MoqError::Codec(format!("decode failed: {err}")))?;
 
+		Ok(())
+	}
+
+	/// Record a locally encoded frame's handoff for catalog jitter measurement.
+	///
+	/// `timestamp_us` is on the broadcast media clock. Call this after `write_frame` only for
+	/// encoder output; imported files, pipes, and network media stay clock-free.
+	pub fn flush(&self, timestamp_us: u64) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let timestamp = moq_net::Timestamp::from_micros(timestamp_us)?;
+		let mut guard = self.inner.lock().unwrap();
+		let media = guard.as_mut().ok_or(MoqError::Closed)?;
+		media.import.flush(timestamp, std::time::Instant::now())?;
+		Ok(())
+	}
+
+	/// Mark a timeline break and restart handoff measurement without lowering advertised jitter.
+	///
+	/// Publishes a discontinuity marker; resumed frames must continue the broadcast media clock,
+	/// and video must resume on a keyframe.
+	pub fn discontinuity(&self) -> Result<(), MoqError> {
+		let _guard = crate::ffi::enter();
+		let mut guard = self.inner.lock().unwrap();
+		let media = guard.as_mut().ok_or(MoqError::Closed)?;
+		media.import.discontinuity()?;
 		Ok(())
 	}
 
@@ -1098,4 +1153,16 @@ impl MoqContainerStreamProducer {
 			.map_err(|err| MoqError::Codec(format!("finish failed: {err}")))?;
 		Ok(())
 	}
+}
+
+/// Reserve the named track, or a unique one named after the format.
+fn reserve_track(
+	broadcast: &moq_net::broadcast::Producer,
+	track: Option<String>,
+	format: &impl std::fmt::Display,
+) -> Result<moq_net::track::Request, MoqError> {
+	let name = track.unwrap_or_else(|| broadcast.unique_name(&format!(".{format}")));
+	broadcast
+		.reserve_track(name)
+		.map_err(|err| MoqError::Codec(format!("init failed: {err}")))
 }
