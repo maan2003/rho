@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::entry::{Entry, Party};
 use rho_agent::{AgentEvent, StartPlace};
-use rho_agent_types::{AgentRole, EngineerIntelligence, Place, TurnEdge, TurnOutcome};
+use rho_agent_types::{AgentRole, EngineerIntelligence, Place};
 use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
@@ -154,6 +154,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     let mut requests = 0;
     let mut calls = BTreeSet::new();
     let mut final_answer = String::new();
+    let mut working = false;
     let outcome = loop {
         let event = tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break Err("Evaluation timed out".to_owned()),
@@ -162,6 +163,21 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         };
         let appended = match event {
             Ok(rho_agent::journal::Feed::Appended(event)) if event.agent_id == id => event,
+            Ok(rho_agent::journal::Feed::Status {
+                agent_id, status, ..
+            }) if agent_id == id => {
+                if status.runtime.is_working() {
+                    working = true;
+                    continue;
+                }
+                if !working {
+                    continue;
+                }
+                break match &status.runtime.inference {
+                    rho_agent::InferenceState::Failed { error } => Err(error.clone()),
+                    _ => Ok(()),
+                };
+            }
             Ok(_) => continue,
             Err(error) => break Err(format!("Evaluation feed lost: {error}")),
         };
@@ -207,16 +223,6 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 }
                 _ => {}
             },
-            AgentEvent::Turn {
-                edge: TurnEdge::Ended(outcome),
-                ..
-            } => {
-                break match outcome {
-                    TurnOutcome::Completed => Ok(()),
-                    TurnOutcome::Cancelled => Err("Agent turn cancelled".into()),
-                    TurnOutcome::Errored { message } => Err(message),
-                };
-            }
             _ => {}
         }
     };

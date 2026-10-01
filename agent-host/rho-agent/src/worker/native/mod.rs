@@ -19,9 +19,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{
-    AgentId, AgentRole, ContentPart, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMs,
-};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, SendKind, UnixMs};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -808,7 +806,7 @@ impl Agent {
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
         let at = UnixMs::now();
         match outbound {
-            Outbound::Send { cell, text } => {
+            Outbound::Send { cell, text, kind } => {
                 if let Some(latest) = &mut self.cell
                     && latest.cell.source_id() == cell
                 {
@@ -825,15 +823,17 @@ impl Agent {
                     id: MessageId::new(),
                     to,
                     text: text.clone(),
+                    kind,
                 })
                 .await?;
                 // Whoever is subscribed to this agent's answers gets it as
-                // mail, and the sidecar reads what it asks of the person.
+                // mail; a status is the agent's line, not mail.
                 self.flush().await?;
-                self.host.message_sent(text).await?;
+                if kind != SendKind::Status {
+                    self.host.message_sent(text).await?;
+                }
                 Ok(())
             }
-            Outbound::Status(text) => self.append(Entry::Status { at, text }).await,
             Outbound::Archive => {
                 self.archived = true;
                 self.backoff = None;
@@ -842,10 +842,7 @@ impl Agent {
                     notebook.shutdown().await.map_err(anyhow::Error::msg)?;
                 }
                 self.cell = None;
-                if self.awaiting {
-                    self.awaiting = false;
-                    self.append(Entry::StoppedAwaitingHuman { at }).await?;
-                }
+                self.awaiting = false;
                 self.append(Entry::Notice {
                     at,
                     notice: Notice::Archived,
@@ -854,11 +851,8 @@ impl Agent {
             }
             Outbound::EndTurn => {
                 self.progress.ended = true;
-                if self.awaiting {
-                    return Ok(());
-                }
                 self.awaiting = true;
-                self.append(Entry::AwaitingHuman { at }).await
+                Ok(())
             }
         }
     }
@@ -1407,18 +1401,15 @@ impl Agent {
         let status = self.status();
         let working = status.runtime.is_working();
         if working != self.working {
-            let edge = if working {
-                TurnEdge::Started
-            } else {
-                TurnEdge::Ended(match &self.stopped {
-                    Some(Stopped::Failed(error)) => TurnOutcome::Errored {
-                        message: error.to_string(),
-                    },
-                    _ => TurnOutcome::Completed,
+            if !working && let Some(Stopped::Failed(error)) = &self.stopped {
+                let notice = Notice::Stopped(error.to_string());
+                self.append(Entry::Notice {
+                    at: UnixMs::now(),
+                    notice,
                 })
-            };
+                .await?;
+            }
             self.flush().await?;
-            self.host.turn(rho_agent_types::UnixMs::now(), edge).await?;
             if !working {
                 self.host.settled().await?;
             }

@@ -34,10 +34,19 @@ exec is your only tool. Every response is exactly one exec call holding Python t
 persistent notebook. Text outside the call reaches nobody, and the user sees only what you send,
 not your code, output, or reasoning.
 
-human.send(text)        Send the user a message.
-human.status(text)      Set your one-line status, replacing the last one.
+human.send(text, *, kind)  Send the user a message.
 end_turn()              End your turn when this exec returns; you then wait on the user.
 archive()               Shut down the notebook and stay quiet until the user writes.
+
+Every send has a kind: the first of these that fits, asked in order.
+
+1. "ask": it asks the user for something the work needs, such as a decision, an approval,
+   information, or an action, even while you keep working. Offering work beyond what was asked
+   is not an ask.
+2. "result": it delivers what the user asked for: an answer to their question, or finished work.
+3. "status": it acknowledges or reports progress ("on it", "tests running"). It is your status
+   line until the next message from either side.
+4. "other": anything else.
 
 Send when you have a result, question, or decision for the user. Say it once, plainly. Call
 end_turn() when you are done or blocked on someone: after sending a result, a question, or a
@@ -510,9 +519,10 @@ Lead with the outcome. Do not restate edits file by file or summarize the diff, 
 to review a change. Report what the diff cannot show: why the change is right, how you verified it
 and what you could not verify, and the decisions the user may want to veto.
 
-Keep human.status current with what you are doing, so the user can follow ongoing work without
-messages. Use human.send for what the user should read: a consequential assumption, a finding,
-a change in direction, a question, or the result. Do not send routine progress narration.
+Keep a status current with what you are doing, so the user can follow ongoing work without
+messages. Send what the user should read with its own kind: a consequential assumption, a
+finding, a change in direction, a question, or the result. Do not narrate routine progress
+beyond the status.
 
 After asking a question, end your turn rather than guessing, unless other work does not
 depend on the answer.
@@ -1428,7 +1438,7 @@ mod tests {
         assert!(!prompt.contains("transcript"));
         assert!(!prompt.contains("commentary"));
         assert!(prompt.contains("Every response is exactly one exec call"));
-        assert!(prompt.contains("human.send(text)"));
+        assert!(prompt.contains("human.send(text, *, kind)"));
         assert!(prompt.contains("end_turn()"));
         assert!(!prompt.contains(".reply()"));
         assert!(prompt.contains("Task.from_session_id(session_id: int) → Task"));
@@ -1622,7 +1632,7 @@ mod tests {
                 assert!(prompt.contains(rule), "{rule}");
             }
         }
-        assert!(claude[0].contains("human.send(text)"));
+        assert!(claude[0].contains("human.send(text, *, kind)"));
         for prompt in &claude {
             assert!(prompt.contains("mcp__py__exec"));
             assert!(prompt.contains("The check-in comes 120 seconds after your last response"));
@@ -1717,7 +1727,8 @@ mod tests {
             assert!(prompt.find("### Engineers\n").unwrap() < prompt.find(signature).unwrap());
             // Whoever spawned it, an Engineer the user manages talks to the user.
             assert!(
-                prompt.contains("human.send(text)") && prompt.contains("## Working with the user")
+                prompt.contains("human.send(text, *, kind)")
+                    && prompt.contains("## Working with the user")
             );
         }
         for prompt in [

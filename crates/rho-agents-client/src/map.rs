@@ -39,9 +39,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::HostId;
-use rho_agent_types::{AgentId, AgentWant};
+use rho_agent_types::AgentId;
 
-use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
+use crate::fold::{AgentIdentity, Digest, MirroredAgent, Verdict};
 use crate::now_ms;
 #[cfg(test)]
 use crate::protocol::transcript::LogEntry;
@@ -79,19 +79,9 @@ pub struct AgentFiling {
 /// itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
-    pub turn_running: bool,
+    /// What its host says it is doing now; `None` while unheard.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
-    pub awaiting_human: Option<rho_agent_types::UnixMs>,
-    pub last_message_sent: Option<rho_agent_types::UnixMs>,
-    /// When the running turn began, when the client saw it start.
-    pub turn_started_at: Option<rho_agent_types::UnixMs>,
-    pub last_turn_ended: Option<rho_agent_types::UnixMs>,
     pub last_user_message_at: rho_agent_types::UnixMs,
-    /// The last turn said it wants something only the user can give.
-    pub needs_you_hint: bool,
-    /// The last turn died. Nobody but the user can restart it, so this
-    /// waits on the user as much as a question does.
-    pub errored: bool,
 }
 
 type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;
@@ -109,7 +99,6 @@ pub struct AgentMap {
     /// What the user said about each agent; attention is derived from
     /// this and the digest, never stored.
     verdicts: BTreeMap<AgentId, Verdict>,
-    activities: BTreeMap<AgentId, String>,
     /// Ephemeral snapshots, never part of the mirror or persisted filing.
     runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
     disconnected_hosts: BTreeSet<HostId>,
@@ -245,7 +234,6 @@ impl AgentMap {
             self.unindex_agent(*agent_id);
             self.agents.remove(agent_id);
             self.verdicts.remove(agent_id);
-            self.activities.remove(agent_id);
             self.mirror.remove(agent_id);
             self.filing.remove(agent_id);
             self.last_active.remove(agent_id);
@@ -417,18 +405,9 @@ impl AgentMap {
         let host = mirrored.host;
         let identity = &mirrored.identity;
         let digest = &mirrored.digest;
-        let activity = digest.activity.clone();
         let last_active = digest.last_active.max(identity.created_at);
         let now = (identity.parent, identity.role.handle_prefix());
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
-        match activity {
-            Some(activity) => {
-                self.activities.insert(agent_id, activity);
-            }
-            None => {
-                self.activities.remove(&agent_id);
-            }
-        }
         let active = self
             .last_active
             .entry(agent_id)
@@ -542,47 +521,13 @@ impl AgentMap {
     pub fn agent_verdict(&self, agent_id: AgentId) -> Verdict {
         self.verdicts.get(&agent_id).copied().unwrap_or_default()
     }
-    pub fn set_activity(&mut self, agent_id: AgentId, activity: String) {
-        self.activities.insert(agent_id, activity);
-    }
-    pub fn agent_activity(&self, agent_id: AgentId) -> Option<&str> {
-        self.activities.get(&agent_id).map(String::as_str)
-    }
-    /// What the agent's last finished turn says it wants, while the ball
-    /// is still the user's.
-    pub fn agent_wants(&self, agent_id: AgentId) -> Option<&Wants> {
-        matches!(
-            self.attention(agent_id),
-            Attention::Pending | Attention::Quiet
-        )
-        .then(|| self.agent_digest(agent_id)?.wants.as_ref())
-        .flatten()
-    }
-    /// Derived from the digest and the verdict, never stored.
-    pub fn attention(&self, agent_id: AgentId) -> Attention {
-        match self.agent_digest(agent_id) {
-            Some(digest) => {
-                let mut facts = digest.attention_facts();
-                facts.runtime = self.runtime.get(&agent_id).cloned();
-                if let Some(state) = &facts.runtime {
-                    if !state.awaiting_human {
-                        facts.awaiting_at = None;
-                    }
-                    if state.is_working() {
-                        facts.turn_running = true;
-                        facts.errored = None;
-                    }
-                } else if self
-                    .host_of_agent(agent_id)
-                    .is_some_and(|host| self.disconnected_hosts.contains(&host))
-                {
-                    facts.turn_running = false;
-                    facts.awaiting_at = None;
-                }
-                attention(facts, self.agent_verdict(agent_id))
-            }
-            None => Attention::Quiet,
-        }
+    /// The agent's status line: its newest status, until any later
+    /// message from either side.
+    pub fn agent_status(&self, agent_id: AgentId) -> Option<&str> {
+        self.agent_digest(agent_id)?
+            .status
+            .as_ref()
+            .map(|(_, text)| text.as_str())
     }
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
@@ -718,16 +663,6 @@ impl AgentMap {
             .get(&agent_id)
             .map_or(&[][..], |filing| filing.labels.as_slice())
     }
-    pub fn agent_attention_reason(&self, agent_id: AgentId) -> Option<&str> {
-        self.agent_digest(agent_id)
-            .and_then(|digest| digest.wants.as_ref())
-            .and_then(|wants| wants.summary.as_deref())
-            .or_else(|| {
-                self.agent_digest(agent_id)
-                    .map(|digest| digest.last_user_message_text.as_str())
-            })
-            .filter(|reason| !reason.trim().is_empty())
-    }
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_types::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }
@@ -737,25 +672,8 @@ impl AgentMap {
             return AgentFacts::default();
         };
         AgentFacts {
-            turn_running: digest.turn_running
-                && !self
-                    .host_of_agent(agent_id)
-                    .is_some_and(|host| self.disconnected_hosts.contains(&host)),
             runtime: self.runtime.get(&agent_id).cloned(),
-            awaiting_human: digest.awaiting_human.map(|(_, since)| since).filter(|_| {
-                self.runtime
-                    .get(&agent_id)
-                    .is_some_and(|state| state.awaiting_human)
-            }),
-            last_message_sent: digest.message_sent.map(|(_, at)| at),
-            turn_started_at: digest.turn_started_at,
-            last_turn_ended: digest.last_turn_ended,
             last_user_message_at: digest.last_user_message_at,
-            needs_you_hint: digest
-                .wants
-                .as_ref()
-                .is_some_and(|wants| wants.want == AgentWant::Ask),
-            errored: digest.errored.is_some(),
         }
     }
     /// What the agent is called: the name the user gave it if they gave
@@ -904,7 +822,7 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, AgentPos, Seq, TurnEdge, TurnOutcome, UnixMs};
+    use rho_agent_types::{AgentIdDomain, AgentPos, SendKind, Seq, UnixMs};
 
     use super::*;
     use crate::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
@@ -948,57 +866,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_status_replaces_stale_durable_activity_and_disconnect_clears_it() {
-        use crate::protocol::transcript::{InferenceState, RuntimeState};
+    fn runtime_status_is_live_and_disconnect_clears_it() {
+        use crate::protocol::transcript::RuntimeState;
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.tell(
-            host,
-            &log(
-                agent(1),
-                0,
-                vec![
-                    created(1),
-                    TranscriptEvent::Turn {
-                        edge: TurnEdge::Started,
-                        at: UnixMs(2),
-                    },
-                    TranscriptEvent::AwaitingHuman {
-                        since: Some(UnixMs(3)),
-                        at: UnixMs(3),
-                    },
-                    TranscriptEvent::NotebookActivity {
-                        responding: true,
-                        running_tasks: 9,
-                        checkin_at: None,
-                        archived: false,
-                        at: UnixMs(4),
-                    },
-                ],
-            ),
-        );
-        map.set_runtime(
-            agent(1),
-            RuntimeState {
-                inference: InferenceState::Retrying {
-                    at: UnixMs(10),
-                    error: "temporary".into(),
-                },
-                ..Default::default()
-            },
-        );
-        assert_eq!(map.attention(agent(1)), Attention::Working);
-        assert_eq!(map.agent_facts(agent(1)).awaiting_human, None);
-        map.set_runtime(
-            agent(1),
-            RuntimeState {
-                awaiting_human: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(map.attention(agent(1)), Attention::NeedsInput);
-        map.set_runtime(agent(1), RuntimeState::default());
-        assert_eq!(map.attention(agent(1)), Attention::Quiet);
+        map.tell(host, &log(agent(1), 0, vec![created(1)]));
         map.set_runtime(
             agent(1),
             RuntimeState {
@@ -1006,13 +878,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(map.attention(agent(1)), Attention::Working);
+        assert_eq!(
+            map.agent_facts(agent(1))
+                .runtime
+                .map(|runtime| runtime.running_tasks),
+            Some(2)
+        );
         map.clear_host_runtime(host);
-        assert_eq!(map.attention(agent(1)), Attention::Quiet);
-        assert!(!map.agent_facts(agent(1)).turn_running);
         assert!(map.agent_facts(agent(1)).runtime.is_none());
     }
-
     #[test]
     fn an_agent_working_for_an_agent_belongs_to_it() {
         let mut registry = AgentMap::default();
@@ -1069,68 +943,35 @@ mod tests {
     fn a_verdict_said_twice_changes_nothing_the_second_time() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let mut registry = AgentMap::default();
-
         registry.mark_known(agent_id);
-        registry.set_activity(agent_id, "writing tests".to_owned());
-        registry.touch_agent(agent_id);
-        assert_eq!(registry.attention(agent_id), Attention::Quiet);
-
-        // A turn that ends asking for the user moves attention by itself.
-        let host = HostId::default();
-        registry.set_host_data(host, 0, 1);
-        registry.tell(
-            host,
-            &log(
-                agent_id,
-                0,
-                vec![
-                    created(1),
-                    TranscriptEvent::Wants {
-                        want: AgentWant::Ask,
-                        summary: None,
-                        at: UnixMs(2),
-                    },
-                    TranscriptEvent::Turn {
-                        edge: TurnEdge::Ended(TurnOutcome::Completed),
-                        at: UnixMs(3),
-                    },
-                ],
-            ),
-        );
-        assert_eq!(registry.attention(agent_id), Attention::Pending);
-
-        // Dealing with it is the user's verdict; saying it again is not.
         let handled = Verdict {
             handled_through: AgentPos(3),
             muted: false,
         };
         assert!(registry.set_agent_verdict(agent_id, handled));
-        assert_eq!(registry.attention(agent_id), Attention::Quiet);
         assert!(!registry.set_agent_verdict(agent_id, handled));
-        assert_eq!(registry.attention(agent_id), Attention::Quiet);
+        assert_eq!(registry.agent_verdict(agent_id), handled);
     }
-
-    /// The rails read the log, not the agent host: a turn that starts and
-    /// ends asking for something leaves the fold saying exactly that.
+    /// The rails read the log, not the agent host: what the agent put to
+    /// the user since they wrote is what the fold says.
     #[test]
     fn the_log_is_what_the_rails_read() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let host = HostId::default();
         let mut registry = AgentMap::default();
         registry.set_host_data(host, 0, 1);
+        let sent = |kind, text: &str, at| TranscriptEvent::MessageSent {
+            to: None,
+            text: text.to_owned(),
+            kind,
+            at: UnixMs(at),
+        };
         // A row before the creation says nothing.
         assert!(
             registry
                 .tell(
                     host,
-                    &log(
-                        agent_id,
-                        1,
-                        vec![TranscriptEvent::Turn {
-                            edge: TurnEdge::Started,
-                            at: UnixMs(11),
-                        }]
-                    )
+                    &log(agent_id, 1, vec![sent(SendKind::Ask, "early", 11)])
                 )
                 .is_empty()
         );
@@ -1147,62 +988,50 @@ mod tests {
                             text: "do the thing\nand then some".to_owned(),
                             at: UnixMs(10),
                         },
-                        TranscriptEvent::Turn {
-                            edge: TurnEdge::Started,
-                            at: UnixMs(11),
-                        },
+                        sent(SendKind::Status, "reading", 11),
                     ],
                 )
             ),
             [agent_id]
         );
-        assert!(registry.agent_facts(agent_id).turn_running);
-        assert_eq!(
-            registry.agent_attention_reason(agent_id),
-            Some("do the thing")
-        );
+        let digest = registry.agent_digest(agent_id).unwrap();
+        assert_eq!(digest.last_user_message_text, "do the thing");
+        assert!(digest.unread.is_empty(), "a status is not unread");
+        assert_eq!(registry.agent_status(agent_id), Some("reading"));
         assert_eq!(registry.all_mirrored().len(), 1);
         assert_eq!(registry.host_of_agent(agent_id), Some(host));
 
+        let to_agent = TranscriptEvent::MessageSent {
+            to: Some(agent_id),
+            text: "mail".to_owned(),
+            kind: SendKind::Ask,
+            at: UnixMs(12),
+        };
         registry.tell(
             host,
             &log(
                 agent_id,
                 3,
-                vec![
-                    TranscriptEvent::Wants {
-                        want: AgentWant::Ask,
-                        summary: Some("needs a decision".to_owned()),
-                        at: UnixMs(12),
-                    },
-                    TranscriptEvent::Turn {
-                        edge: TurnEdge::Ended(TurnOutcome::Completed),
-                        at: UnixMs(13),
-                    },
-                ],
+                vec![to_agent, sent(SendKind::Ask, "which one?", 13)],
             ),
         );
-        let facts = registry.agent_facts(agent_id);
-        assert!(!facts.turn_running);
-        assert!(facts.needs_you_hint);
+        let digest = registry.agent_digest(agent_id).unwrap();
         assert_eq!(
-            registry.agent_attention_reason(agent_id),
-            Some("needs a decision")
+            digest.unread,
+            [crate::Unread {
+                pos: AgentPos(4),
+                at: UnixMs(13),
+                said: crate::Said::Ask,
+            }],
+            "mail to another agent is not the user's"
         );
+        assert_eq!(registry.agent_status(agent_id), None, "a send hides it");
         // Replaying a range the fold already holds changes nothing.
         assert!(
             registry
                 .tell(
                     host,
-                    &log(
-                        agent_id,
-                        3,
-                        vec![TranscriptEvent::Wants {
-                            want: AgentWant::Ask,
-                            summary: Some("needs a decision".to_owned()),
-                            at: UnixMs(12),
-                        }]
-                    )
+                    &log(agent_id, 4, vec![sent(SendKind::Ask, "which one?", 13)])
                 )
                 .is_empty()
         );
@@ -1211,7 +1040,6 @@ mod tests {
         registry.reset_host(host);
         assert_eq!(registry.all_mirrored().len(), 0);
     }
-
     /// The order is what the user moves through, and it is handed out
     /// once: an agent that arrives later goes to the front and moves
     /// nobody, and one that arrives again does not move at all. Before the
@@ -1245,8 +1073,10 @@ mod tests {
             &log(
                 agent(1),
                 1,
-                vec![TranscriptEvent::Turn {
-                    edge: TurnEdge::Started,
+                vec![TranscriptEvent::MessageSent {
+                    to: None,
+                    text: "news".to_owned(),
+                    kind: rho_agent_types::SendKind::Result,
                     at: UnixMs(40),
                 }],
             ),

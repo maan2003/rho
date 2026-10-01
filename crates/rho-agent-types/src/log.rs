@@ -32,6 +32,25 @@ impl Seq {
     }
 }
 
+/// What a send to the user is for, as the agent classed it: the dealer
+/// ranks the conversation on this alone (`rho-dealer/cases.md`, A1–A6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum SendKind {
+    /// Asks the user for something the work needs.
+    Ask,
+    /// Delivers what the user asked for. Sends from before kinds existed
+    /// read as this.
+    #[default]
+    Result,
+    /// Acknowledgement or progress: the agent's status line until any
+    /// later message.
+    Status,
+    Other,
+}
+
+// The three below are read only by the agent host's conversation
+// migration (`rho-agent/src/db/conversation_migration.rs`); they go with it.
+
 /// What a turn asks of the person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentWant {

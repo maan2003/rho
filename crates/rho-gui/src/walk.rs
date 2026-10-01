@@ -1010,7 +1010,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
             blocks,
             status: UiAgentStatus::Streaming,
             runtime: None,
-            awaiting_human: None,
             context_used: None,
             usage: Default::default(),
         };
@@ -1047,7 +1046,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
         runtime: None,
-        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }

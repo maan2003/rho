@@ -194,10 +194,6 @@ pub struct AgentHead {
     pub title_attempted: bool,
     /// A generated title. A spawn name always takes precedence.
     pub generated_title: Option<String>,
-    /// The last durable, model-derived activity label.
-    pub activity: Option<String>,
-    /// Whether a turn is running, folded from the log's turn events.
-    pub turn_running: bool,
     /// The agent that spawned this one.
     pub parent: Option<AgentId>,
     /// The user has messaged this agent directly (agent mail doesn't count).
@@ -206,7 +202,6 @@ pub struct AgentHead {
     pub user_interacted: bool,
     /// What a `Notice` said, until a user message has carried it.
     pub pending_notice: Option<String>,
-    pub last_turn_ended: Option<UnixMs>,
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
 }
@@ -471,9 +466,9 @@ pub struct NativeRecovery {
 /// events on the agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
-    /// A turn started or stopped: the edge both runtimes cross.
-    Turn {
-        edge: TurnEdge,
+    /// A row whose fact the log no longer keeps. Rows are rewritten, never
+    /// deleted: the journal points at positions.
+    Retired {
         at: UnixMs,
     },
     /// The lifetime naming opportunity was consumed, before network dispatch.
@@ -483,12 +478,6 @@ pub enum AgentEvent<'a> {
     /// Generated naming metadata; a spawn or user name always takes precedence.
     Titled {
         title: Option<String>,
-        at: UnixMs,
-    },
-    /// What the last turn asks of the person.
-    Wants {
-        want: AgentWant,
-        summary: Option<String>,
         at: UnixMs,
     },
     /// Everything from `to` up to this event is no longer the agent's
@@ -583,6 +572,17 @@ pub enum AgentEvent<'a> {
     /// One of the Rho runtime's own rows.
     #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
+    // Read only by the conversation migration (`db/conversation_migration.rs`),
+    // which rewrites every one; nothing writes them. They go with it.
+    Turn {
+        edge: TurnEdge,
+        at: UnixMs,
+    },
+    Wants {
+        want: AgentWant,
+        summary: Option<String>,
+        at: UnixMs,
+    },
 }
 
 /// Leased notebook contributions transferred to durable host ownership before
@@ -725,7 +725,7 @@ pub struct TranscriptCall {
 
 #[cfg(test)]
 mod encoding_tests {
-    use rho_agent_types::{AgentWant, TurnEdge, UnixMs};
+    use rho_agent_types::UnixMs;
     use senax_encoder::{Decoder as _, Encoder as _};
 
     use super::*;
@@ -739,20 +739,17 @@ mod encoding_tests {
                 from: entry::Party::Human,
                 body: vec![entry::Block::Text("current log".into())],
             }),
-            AgentEvent::Turn {
-                edge: TurnEdge::Ended(rho_agent_types::TurnOutcome::Errored {
-                    message: "boom".to_owned(),
-                }),
-                at: UnixMs(12),
-            },
+            AgentEvent::Entry(entry::Entry::Sent {
+                at: UnixMs(10),
+                id: entry::MessageId(42),
+                to: entry::Party::Human,
+                text: "reading".to_owned(),
+                kind: rho_agent_types::SendKind::Status,
+            }),
+            AgentEvent::Retired { at: UnixMs(12) },
             AgentEvent::Titled {
                 title: Some("title".to_owned()),
                 at: UnixMs(13),
-            },
-            AgentEvent::Wants {
-                want: AgentWant::Ask,
-                summary: Some("which one?".to_owned()),
-                at: UnixMs(14),
             },
             AgentEvent::Rewound {
                 to: crate::log::AgentEventPos::new(3),

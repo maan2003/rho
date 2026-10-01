@@ -659,7 +659,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         pool.adopt(handoff.workers).await;
         phases.mark("adopt");
     }
-    pool.end_orphaned_turns().await;
     pool.replace_stale_worksets();
     let services = Arc::new(
         Services::new(

@@ -54,7 +54,6 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             title: title
                 .clone()
                 .map_or(PresentationField::Clear, PresentationField::Set),
-            activity: PresentationField::Unchanged,
             at: *at,
         },
         AgentEvent::ExecObserved { id, milestone, at } => TranscriptEvent::ExecObserved {
@@ -162,15 +161,9 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             text: text.to_string(),
             at: *at,
         },
-        AgentEvent::Turn { edge, at } => TranscriptEvent::Turn {
-            edge: edge.clone(),
-            at: *at,
-        },
-        AgentEvent::Wants { want, summary, at } => TranscriptEvent::Wants {
-            want: *want,
-            summary: summary.clone(),
-            at: *at,
-        },
+        AgentEvent::Retired { .. } | AgentEvent::Turn { .. } | AgentEvent::Wants { .. } => {
+            return None;
+        }
         AgentEvent::Rewound { to, at } => TranscriptEvent::Rewound {
             to: (*to).into(),
             at: *at,
@@ -243,31 +236,21 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             }),
             at: *at,
         },
-        Entry::Sent { to, text, at, .. } => TranscriptEvent::MessageSent {
+        Entry::Sent {
+            to, text, kind, at, ..
+        } => TranscriptEvent::MessageSent {
             to: match to {
                 Party::Human => None,
                 Party::Agent(id) => Some(*id),
             },
             text: text.clone(),
+            kind: *kind,
             at: *at,
         },
-        Entry::Status { text, at } => TranscriptEvent::Presented {
-            title: PresentationField::Unchanged,
-            activity: PresentationField::Set(text.clone()),
-            at: *at,
-        },
-        Entry::AwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
-            since: Some(*at),
-            at: *at,
-        },
-        Entry::StoppedAwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
-            since: None,
-            at: *at,
-        },
-        Entry::LegacyAwaiting { since, at } => TranscriptEvent::AwaitingHuman {
-            since: *since,
-            at: *at,
-        },
+        Entry::Status { .. }
+        | Entry::AwaitingHuman { .. }
+        | Entry::StoppedAwaitingHuman { .. }
+        | Entry::LegacyAwaiting { .. } => return None,
         Entry::Notice {
             notice: Notice::Error(error),
             at,
@@ -277,12 +260,19 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             retrying: true,
             at: *at,
         },
+        Entry::Notice {
+            notice: Notice::Stopped(error),
+            at,
+        } => TranscriptEvent::Stopped {
+            error: error.clone(),
+            at: *at,
+        },
         Entry::Notice { notice, at } => TranscriptEvent::Notice {
             text: match notice {
                 Notice::Restarted => "rho restarted; the notebook was lost",
                 Notice::Archived => "archived",
                 Notice::FreshNotebook => "started a fresh notebook",
-                Notice::Error(_) => unreachable!("matched above"),
+                Notice::Error(_) | Notice::Stopped(_) => unreachable!("matched above"),
             }
             .to_owned(),
             at: *at,
@@ -524,12 +514,14 @@ mod tests {
                     id: MessageId(7),
                     to: Party::Human,
                     text: "hello".into(),
+                    kind: rho_agent_types::SendKind::Ask,
                 }),
                 None
             ),
             Some(TranscriptEvent::MessageSent {
                 to: None,
                 text: "hello".into(),
+                kind: rho_agent_types::SendKind::Ask,
                 at: UnixMs(5)
             })
         );
@@ -546,30 +538,6 @@ mod tests {
                 None
             ),
             None
-        );
-    }
-
-    #[test]
-    fn wait_is_projected() {
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::AwaitingHuman { at: UnixMs(10) }),
-                None
-            ),
-            Some(TranscriptEvent::AwaitingHuman {
-                at: UnixMs(10),
-                since: Some(UnixMs(10))
-            })
-        );
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::StoppedAwaitingHuman { at: UnixMs(14) }),
-                None
-            ),
-            Some(TranscriptEvent::AwaitingHuman {
-                at: UnixMs(14),
-                since: None
-            })
         );
     }
 

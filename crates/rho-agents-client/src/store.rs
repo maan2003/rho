@@ -145,12 +145,6 @@ impl Layered {
             None => self.fold.status,
         };
         self.state.runtime = self.tail.runtime.clone();
-        self.state.awaiting_human = self.fold.awaiting_human.filter(|_| {
-            self.tail
-                .runtime
-                .as_ref()
-                .is_some_and(|state| state.awaiting_human)
-        });
         self.state.context_used = self.fold.context_used;
         self.state.usage = self.fold.usage.clone();
         self.state.exec_timings = self.fold.exec_timings.clone();
@@ -268,7 +262,6 @@ impl AgentStore {
             }
         }
         layered.fold.status = delta.status;
-        layered.fold.awaiting_human = delta.awaiting_human;
         layered.fold.context_used = delta.context_used;
         layered.fold.usage = delta.usage;
         layered.fold.exec_timings = delta.exec_timings;
@@ -419,11 +412,6 @@ pub fn turn_open(status: UiAgentStatus) -> bool {
         | UiAgentStatus::Retrying { .. }
         | UiAgentStatus::ToolCalling { .. }
         | UiAgentStatus::UnfinishedTurn { .. } => true,
-        // The mirror's word for a turn in progress. It never says `Streaming`
-        // - it is not the live tail and cannot claim to be - so a running
-        // turn read back from the story arrives here, and the rows a reader
-        // came for are the last few of it.
-        UiAgentStatus::Unloaded => true,
         UiAgentStatus::Idle | UiAgentStatus::Error => false,
     }
 }
@@ -434,7 +422,6 @@ fn empty_state() -> UiAgentState {
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
         runtime: None,
-        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }
@@ -772,6 +759,7 @@ mod tests {
             &TranscriptEvent::MessageSent {
                 to: None,
                 text: "other cell".into(),
+                kind: rho_agent_types::SendKind::Result,
                 at: UnixMs(1),
             },
         );

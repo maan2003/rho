@@ -10,7 +10,7 @@ use redb::TableDefinition;
 use redb_derive::{Key, Value as RedbValue};
 #[cfg(test)]
 use rho_agent_types::{AdvisorIntelligence, EngineerIntelligence};
-use rho_agent_types::{AgentId, AgentIdDomain, AgentRole, AgentWant, Place, Seq, TurnEdge, UnixMs};
+use rho_agent_types::{AgentId, AgentIdDomain, AgentRole, Place, Seq, UnixMs};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use crate::log::{
     SessionBinding, usage_model_of,
 };
 
-mod awaiting_migration;
+mod conversation_migration;
 mod native;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -83,17 +83,11 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "1f34dc6c";
-/// Exposed-only worksets, before waits had a start and a stop.
-const WORKSETS_AGENT_DB_FORMAT: &str = "a3f26d91";
-/// The format immediately before the PR monitor tables were retired.
-const PR_MONITOR_AGENT_DB_FORMAT: &str = "e3a95c07";
+const CURRENT_AGENT_DB_FORMAT: &str = "b85e2d07";
+/// The log before the dealer read the conversation alone: statuses, waits
+/// and turn edges were rows of their own.
+const TURNS_AGENT_DB_FORMAT: &str = "1f34dc6c";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
-
-fn remove_pr_monitor_tables(write: &mut WriteTxn) {
-    write.delete_table("pr_watches");
-    write.delete_table("pr_feedback");
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -269,16 +263,6 @@ pub trait AgentWriteTxnExt {
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`). Returns where it was told.
     fn rewind_agent(&mut self, now: UnixMs, agent_id: AgentId, to: AgentEventPos) -> AgentEventPos;
-
-    fn tell_turn(&mut self, now: UnixMs, agent_id: AgentId, edge: TurnEdge);
-
-    fn tell_wants(
-        &mut self,
-        now: UnixMs,
-        agent_id: AgentId,
-        want: AgentWant,
-        summary: Option<String>,
-    );
 
     fn set_agent_response_subscription(
         &mut self,
@@ -809,27 +793,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.append_agent_event(agent_id, &AgentEvent::Rewound { to, at: now })
     }
 
-    fn tell_turn(&mut self, now: UnixMs, agent_id: AgentId, edge: TurnEdge) {
-        self.append_agent_event(agent_id, &AgentEvent::Turn { edge, at: now });
-    }
-
-    fn tell_wants(
-        &mut self,
-        now: UnixMs,
-        agent_id: AgentId,
-        want: AgentWant,
-        summary: Option<String>,
-    ) {
-        self.append_agent_event(
-            agent_id,
-            &AgentEvent::Wants {
-                want,
-                summary,
-                at: now,
-            },
-        );
-    }
-
     fn set_agent_response_subscription(
         &mut self,
         subscriber: AgentId,
@@ -1044,12 +1007,9 @@ fn created_head(event: &AgentEvent<'_>, pos: AgentEventPos) -> AgentHead {
         config: created_config(event),
         title_attempted: false,
         generated_title: None,
-        activity: None,
-        turn_running: false,
         parent: *parent,
         user_interacted: false,
         pending_notice: None,
-        last_turn_ended: None,
         next: pos.next(),
     }
 }
@@ -1144,21 +1104,13 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             head.title_attempted = true;
             head.generated_title = title.clone();
         }
-        AgentEvent::Turn { edge, at } => match edge {
-            TurnEdge::Started => head.turn_running = true,
-            TurnEdge::Ended(_) => {
-                head.turn_running = false;
-                head.last_turn_ended = Some(*at);
-            }
-        },
-        AgentEvent::Entry(crate::entry::Entry::Status { text, .. }) => {
-            head.activity = (!text.is_empty()).then(|| text.clone());
-        }
         event if carries_notice(event) => {
             head.user_interacted = true;
             head.pending_notice = None;
         }
-        AgentEvent::Wants { .. }
+        AgentEvent::Retired { .. }
+        | AgentEvent::Turn { .. }
+        | AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
         | AgentEvent::ClaudeOutput { .. }
         | AgentEvent::ClaudeOutputHandedOff { .. }
@@ -1193,7 +1145,7 @@ pub async fn prepare(db: &rho_db::RhoDb) {
     }
     let from = stored.as_deref().unwrap_or_default();
     let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
-    let needs_savepoint = matches!(from, WORKSETS_AGENT_DB_FORMAT | PR_MONITOR_AGENT_DB_FORMAT)
+    let needs_savepoint = from == TURNS_AGENT_DB_FORMAT
         && (!read.has_table("recovery_savepoints")
             || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
@@ -1365,11 +1317,7 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
-        Some(WORKSETS_AGENT_DB_FORMAT) => {
-            awaiting_migration::migrate(write);
-            remove_pr_monitor_tables(write);
-        }
-        Some(PR_MONITOR_AGENT_DB_FORMAT) => remove_pr_monitor_tables(write),
+        Some(TURNS_AGENT_DB_FORMAT) => conversation_migration::migrate(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \

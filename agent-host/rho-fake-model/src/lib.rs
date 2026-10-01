@@ -764,7 +764,7 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source = format!("human.send({text:?})\nend_turn()");
+        let source = format!("human.send({text:?}, kind=\"result\")\nend_turn()");
         append_tool_call(
             events,
             state,

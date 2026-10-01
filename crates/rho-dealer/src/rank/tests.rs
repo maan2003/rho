@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned};
-use rho_agent_types::{AgentId, AgentIdDomain, AgentPos, AgentWant, TurnEdge, TurnOutcome, UnixMs};
+use rho_agent_types::{AgentId, AgentIdDomain, AgentPos, SendKind, UnixMs};
 use rho_agents_client::fold::MirroredAgent;
 use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, Speaker, TranscriptEvent};
 use rho_agents_client::{AgentMap, HostId};
@@ -162,45 +162,39 @@ impl World {
         node.agent().unwrap()
     }
 
-    fn turn(&mut self, node: &NodeId, edge: TurnEdge) {
-        let at = UnixMs(self.ms());
-        self.log(Self::id(node), TranscriptEvent::Turn { edge, at });
-    }
-
-    fn starts(&mut self, node: &NodeId) {
-        self.turn(node, TurnEdge::Started);
-    }
-
-    fn ends(&mut self, node: &NodeId, outcome: TurnOutcome) {
-        self.turn(node, TurnEdge::Ended(outcome));
-    }
-
-    /// A whole turn, finished.
-    fn finishes(&mut self, node: &NodeId) {
-        self.starts(node);
-        self.ends(node, TurnOutcome::Completed);
-    }
-
-    fn asks(&mut self, node: &NodeId) {
-        self.starts(node);
+    fn sends(&mut self, node: &NodeId, kind: SendKind) {
         let at = UnixMs(self.ms());
         self.log(
             Self::id(node),
-            TranscriptEvent::Wants {
-                want: AgentWant::Ask,
-                summary: None,
+            TranscriptEvent::MessageSent {
+                to: None,
+                text: "update".into(),
+                kind,
                 at,
             },
         );
-        self.ends(node, TurnOutcome::Completed);
     }
 
-    fn errors(&mut self, node: &NodeId) {
-        self.starts(node);
-        self.ends(
-            node,
-            TurnOutcome::Errored {
-                message: "boom".into(),
+    fn finishes(&mut self, node: &NodeId) {
+        self.sends(node, SendKind::Result);
+    }
+
+    fn asks(&mut self, node: &NodeId) {
+        self.sends(node, SendKind::Ask);
+    }
+
+    /// Says what it is doing: nothing the dealer reads.
+    fn works(&mut self, node: &NodeId) {
+        self.sends(node, SendKind::Status);
+    }
+
+    fn stops(&mut self, node: &NodeId) {
+        let at = UnixMs(self.ms());
+        self.log(
+            Self::id(node),
+            TranscriptEvent::Stopped {
+                error: "boom".into(),
+                at,
             },
         );
     }
@@ -441,67 +435,186 @@ fn close(a: f64, b: f64) -> bool {
 // Agents
 
 #[test]
-fn a1_a_finished_agent_is_low_and_gone_in_three_days() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    assert_eq!(w.hand(), "a · finished · 0m ago");
-    assert!(w.priority(&a).unwrap() < LAMP_THRESHOLD);
-    w.pass(hours(71));
-    assert_eq!(w.hand(), "a · finished · 3.0d ago");
-    w.pass(hours(1));
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a2_an_agent_asking_rises() {
+fn a1_an_unread_ask_rises() {
     let mut w = world();
     let a = w.agent("a");
     w.asks(&a);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
+    assert_eq!(w.hand(), "a · asks · 0m");
     let first = w.priority(&a).unwrap();
+    assert!(first >= AGENT_BLOCKED_HEAD_START);
     w.pass(hours(1));
     assert!(w.priority(&a).unwrap() > first);
 }
 
 #[test]
-fn a3_an_errored_agent_waits_on_the_user() {
+fn a2_a_result_is_below_an_ask_and_gone_in_three_days() {
     let mut w = world();
     let a = w.agent("a");
-    w.errors(&a);
-    assert_eq!(w.hand(), "a · errored · 0m ago");
+    let b = w.agent("b");
+    w.finishes(&a);
+    w.asks(&b);
+    assert_eq!(w.hand(), "b · asks · 0m\na · result · 0m ago");
+    assert!(w.priority(&a).unwrap() < LAMP_THRESHOLD);
+    w.pass(hours(71));
+    assert!(w.hand().ends_with("a · result · 3.0d ago"), "{}", w.hand());
+    w.pass(hours(1));
+    assert_eq!(w.hand(), "b · asks · 3.0d");
+}
+
+#[test]
+fn a3_anything_else_is_below_a_result_and_gone_within_the_day() {
+    let mut w = world();
+    let a = w.agent("a");
+    let b = w.agent("b");
+    w.sends(&a, SendKind::Other);
+    w.finishes(&b);
+    assert_eq!(w.hand(), "b · result · 0m ago\na · message · 0m ago");
+    w.pass(hours(23));
+    assert!(w.priority(&a).is_some());
+    w.pass(hours(1));
+    assert!(w.priority(&a).is_none());
+    assert!(w.priority(&b).is_some());
+}
+
+#[test]
+fn a4_a_status_is_no_card() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.works(&a);
+    assert_eq!(w.hand(), "");
+    w.finishes(&a);
+    w.works(&a);
+    assert_eq!(w.hand(), "a · result · 0m ago", "nor does it hide one");
+}
+
+#[test]
+fn a5_several_unread_sends_are_one_card_of_the_strongest_from_its_oldest() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.finishes(&a);
+    w.pass(hours(1));
+    w.asks(&a);
+    w.pass(hours(1));
+    w.sends(&a, SendKind::Other);
+    w.asks(&a);
+    assert_eq!(w.hand(), "a · asks · 1.0h");
+}
+
+#[test]
+fn a6_done_or_writing_holds_until_a_newer_send_that_is_not_a_status() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.finishes(&a);
+    w.done(&a);
+    assert_eq!(w.hand(), "");
+    w.pass(hours(2));
+    w.works(&a);
+    assert_eq!(w.hand(), "", "a status reads as nothing new");
+    w.finishes(&a);
+    assert_eq!(w.hand(), "a · result · 0m ago");
+    w.pass(mins(1));
+    w.writes_to(&a);
+    assert_eq!(w.hand(), "", "writing reads it too");
+}
+
+#[test]
+fn a7_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.writes_to(&a);
+    w.pass(mins(5));
+    let d = w.dm("D1", "U1");
+    w.finishes(&a);
+    assert_eq!(w.top().as_deref(), Some("a"));
+    assert!(w.priority(&a).unwrap() >= CHIME_THRESHOLD);
+    assert!(w.priority(&d).is_some());
+}
+
+#[test]
+fn a8_an_agent_that_stopped_on_an_error_asks() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.finishes(&a);
+    w.stops(&a);
+    assert_eq!(w.hand(), "a · stopped · 0m ago");
     assert!(w.priority(&a).unwrap() >= AGENT_BLOCKED_HEAD_START);
 }
 
 #[test]
-fn a4_an_agent_at_work_or_holding_the_users_message_has_no_card() {
+fn a9_an_error_the_host_retries_is_nothing() {
     let mut w = world();
     let a = w.agent("a");
-    w.starts(&a);
+    let at = UnixMs(w.ms());
+    w.log(
+        World::id(&a),
+        TranscriptEvent::Failed {
+            text: String::new(),
+            error: "overloaded".into(),
+            retrying: true,
+            at,
+        },
+    );
     assert_eq!(w.hand(), "");
-    let b = w.agent("b");
-    w.finishes(&b);
-    w.pass(mins(1));
-    w.writes_to(&b);
-    assert_eq!(w.hand(), "", "the message is queued, the ball is with b");
 }
 
 #[test]
-fn r4_an_errored_agent_rises_with_nothing_sent() {
+fn a10_an_engineer_started_for_the_user_deals_by_its_own_sends() {
     let mut w = world();
+    let parent = w.agent("parent");
     let a = w.agent("a");
-    let agent = World::id(&a);
-    w.agents.set_runtime(
-        agent,
-        rho_agents_client::protocol::transcript::RuntimeState {
-            running_tasks: 0,
-            checkin_at: None,
-            archived: false,
-            ..Default::default()
+    let at = UnixMs(w.ms());
+    w.log(
+        World::id(&a),
+        TranscriptEvent::Received {
+            id: 1,
+            from: Some(World::id(&parent)),
+            text: "the brief".into(),
+            at,
         },
     );
-    w.errors(&a);
-    assert_eq!(w.hand(), "a · errored · 0m ago");
+    assert_eq!(w.hand(), "", "its brief is context, never unread");
+    w.asks(&a);
+    assert_eq!(w.hand(), "a · asks · 0m");
+}
+
+#[test]
+fn a11_an_agent_made_by_an_agent_has_no_card_of_its_own() {
+    let mut w = world();
+    let parent = w.agent("parent");
+    let child = w.agent_under("child", Some(World::id(&parent)));
+    w.asks(&child);
+    assert_eq!(w.hand(), "");
+}
+
+#[test]
+fn a12_running_waiting_or_idle_changes_nothing() {
+    let mut w = world();
+    let a = w.agent("a");
+    let b = w.agent("b");
+    runtime(&mut w, &a, 2, false, false);
+    runtime(&mut w, &b, 0, true, false);
+    assert_eq!(w.hand(), "");
+    w.finishes(&a);
+    w.asks(&b);
+    let hand = w.hand();
+    for (running, waiting, archived) in [(0, false, false), (3, true, true)] {
+        runtime(&mut w, &a, running, waiting, archived);
+        runtime(&mut w, &b, running, waiting, archived);
+        assert_eq!(w.hand(), hand);
+    }
+}
+
+#[test]
+fn a13_a_muted_agent_or_one_whose_host_is_gone_has_nothing() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.asks(&a);
+    w.say(&a, Said::Mute);
+    assert_eq!(w.hand(), "");
+    w.say(&a, Said::Unmute);
+    assert_eq!(w.hand(), "a · asks · 0m");
+    w.agents.detach_host(w.host);
+    assert_eq!(w.hand(), "");
 }
 
 /// The agent's live state, as the runtime publishes it.
@@ -515,178 +628,6 @@ fn runtime(w: &mut World, node: &NodeId, running_tasks: u32, awaiting_human: boo
             ..Default::default()
         },
     );
-}
-
-fn sends(w: &mut World, node: &NodeId) {
-    let at = UnixMs(w.ms());
-    w.log(
-        World::id(node),
-        TranscriptEvent::MessageSent {
-            to: None,
-            text: "update".into(),
-            at,
-        },
-    );
-}
-
-/// The wire keeps the old shape: a start carries `since`, a stop does not.
-fn waits(w: &mut World, node: &NodeId, waiting: bool) {
-    let at = UnixMs(w.ms());
-    w.log(
-        World::id(node),
-        TranscriptEvent::AwaitingHuman {
-            since: waiting.then_some(at),
-            at,
-        },
-    );
-}
-
-#[test]
-fn r1_a_message_waits_until_the_agent_stops_working() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 2, false, false);
-    sends(&mut w, &a);
-    assert_eq!(w.hand(), "", "it is still working");
-    w.pass(mins(30));
-    runtime(&mut w, &a, 0, false, false);
-    w.ends(&a, TurnOutcome::Completed);
-    assert_eq!(
-        w.hand(),
-        "a · message · 0m ago",
-        "new from when it stopped, not from when it was sent"
-    );
-}
-
-#[test]
-fn r2_a_message_it_waits_on_rises_even_beside_other_work() {
-    let mut w = world();
-    let a = w.agent("a");
-    let b = w.agent("b");
-    for node in [&a, &b] {
-        runtime(&mut w, node, 0, false, false);
-        sends(&mut w, node);
-    }
-    runtime(&mut w, &a, 2, true, false);
-    waits(&mut w, &a, true);
-    assert_eq!(w.hand(), "a · waiting on you · 0m\nb · message · 0m ago");
-    let early = w.priority(&a).unwrap();
-    w.pass(hours(3));
-    assert!(w.priority(&a).unwrap() > early, "a wait rises");
-    assert!(
-        w.priority(&a).unwrap() > w.priority(&b).unwrap(),
-        "a wait outranks a message"
-    );
-    assert!(
-        w.hand().starts_with("a · waiting on you · 3.0h"),
-        "{}",
-        w.hand()
-    );
-}
-
-#[test]
-fn r2_a_todo_on_an_agent_waiting_on_the_user_is_not_hidden_as_work() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 1, true, false);
-    waits(&mut w, &a, true);
-    w.todo(&a, None);
-    assert_eq!(w.hand(), "a · todo · 0m");
-}
-
-#[test]
-fn r3_a_wait_with_nothing_sent_is_no_card() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 1, true, false);
-    waits(&mut w, &a, true);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn r6_done_holds_through_waiting_again_until_a_new_message() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 1, true, false);
-    sends(&mut w, &a);
-    waits(&mut w, &a, true);
-    w.done(&a);
-    assert_eq!(w.hand(), "");
-    waits(&mut w, &a, false);
-    waits(&mut w, &a, true);
-    assert_eq!(w.hand(), "", "waiting again asks nothing new");
-    sends(&mut w, &a);
-    assert_eq!(w.hand(), "a · waiting on you · 0m");
-}
-
-#[test]
-fn r5_archiving_makes_its_last_message_the_result() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 1, false, false);
-    sends(&mut w, &a);
-    assert_eq!(w.hand(), "");
-    runtime(&mut w, &a, 1, false, true);
-    assert_eq!(w.hand(), "a · message · 0m ago");
-}
-
-#[test]
-fn r6_the_user_writing_clears_what_it_sent() {
-    let mut w = world();
-    let a = w.agent("a");
-    runtime(&mut w, &a, 0, false, false);
-    sends(&mut w, &a);
-    w.pass(mins(1));
-    w.writes_to(&a);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a5_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.writes_to(&a);
-    w.starts(&a);
-    w.pass(mins(5));
-    let d = w.dm("D1", "U1");
-    w.ends(&a, TurnOutcome::Completed);
-    assert_eq!(w.top().as_deref(), Some("a"));
-    assert!(w.priority(&a).unwrap() >= CHIME_THRESHOLD);
-    assert!(w.priority(&d).is_some());
-}
-
-#[test]
-fn a6_done_holds_until_a_newer_turn_ends() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.done(&a);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(2));
-    w.finishes(&a);
-    assert_eq!(w.hand(), "a · finished · 0m ago");
-}
-
-#[test]
-fn a7_an_agent_made_by_an_agent_has_no_card_of_its_own() {
-    let mut w = world();
-    let parent = w.agent("parent");
-    let child = w.agent_under("child", Some(World::id(&parent)));
-    w.asks(&child);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a8_a_muted_agent_or_one_whose_host_is_gone_has_nothing() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.asks(&a);
-    w.say(&a, Said::Mute);
-    assert_eq!(w.hand(), "");
-    w.say(&a, Said::Unmute);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
-    w.agents.detach_host(w.host);
-    assert_eq!(w.hand(), "");
 }
 
 // Snoozes
@@ -724,7 +665,7 @@ fn z3_a_snooze_ending_on_a_node_that_wants_nothing_brings_nothing() {
     w.snooze(&a, hours(1));
     w.pass(mins(5));
     w.writes_to(&a);
-    w.starts(&a);
+    w.works(&a);
     let d = w.dm("D1", "U1");
     w.snooze(&d, hours(1));
     w.read(&d);
@@ -740,19 +681,19 @@ fn z4_a_reply_within_the_hour_of_the_users_message_comes_through_a_snooze() {
     w.snooze(&a, hours(4));
     w.pass(mins(30));
     w.writes_to(&a);
-    w.starts(&a);
+    w.works(&a);
     w.pass(mins(30));
     w.asks(&a);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
+    assert_eq!(w.hand(), "a · asks · 0m");
 
     let b = w.agent("b");
     w.finishes(&b);
     w.snooze(&b, hours(4));
     w.pass(mins(30));
     w.writes_to(&b);
-    w.starts(&b);
+    w.works(&b);
     w.pass(mins(61));
-    w.ends(&b, TurnOutcome::Completed);
+    w.finishes(&b);
     assert!(
         w.priority(&b).is_none(),
         "an hour and more is not a conversation"
@@ -810,7 +751,7 @@ fn p1_a_card_on_a_pile_stays_there_whatever_its_source_says() {
     w.pass(mins(1));
     w.post("D1", None, "U1", "still there?");
     w.writes_to(&a);
-    w.starts(&a);
+    w.works(&a);
     w.pass(mins(5));
     w.asks(&a);
     w.pass(SignedDuration::from_hours(24 * 30));
@@ -942,18 +883,16 @@ fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
 }
 
 #[test]
-fn t4_a_todo_on_an_agent_hides_while_it_works() {
+fn t4_a_todo_on_an_agent_stays_whatever_the_agent_is_doing() {
     let mut w = world();
     let a = w.agent("a");
     w.finishes(&a);
     w.todo(&a, None);
     assert_eq!(w.hand(), "a · todo · 0m");
     w.writes_to(&a);
-    w.starts(&a);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(1));
-    w.ends(&a, TurnOutcome::Completed);
-    assert_eq!(w.deal().cards.len(), 1);
+    w.works(&a);
+    runtime(&mut w, &a, 2, false, false);
+    assert_eq!(w.hand(), "a · todo · 0m");
 }
 
 #[test]
@@ -1111,7 +1050,7 @@ fn x1_a_node_is_one_card_at_its_strongest() {
             lead_days: 3,
         },
     );
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
+    assert_eq!(w.hand(), "a · asks · 0m");
 }
 
 #[test]
@@ -1189,7 +1128,8 @@ enum Step {
     Pass(i64),
     Finishes(usize),
     Asks(usize),
-    Starts(usize),
+    Works(usize),
+    Stops(usize),
     WritesTo(usize),
     Dm(usize),
     Read(usize),
@@ -1206,7 +1146,8 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
         (1i64..600).prop_map(Step::Pass),
         (0usize..3).prop_map(Step::Finishes),
         (0usize..3).prop_map(Step::Asks),
-        (0usize..3).prop_map(Step::Starts),
+        (0usize..3).prop_map(Step::Works),
+        (0usize..3).prop_map(Step::Stops),
         (0usize..3).prop_map(Step::WritesTo),
         (0usize..2).prop_map(Step::Dm),
         (0usize..2).prop_map(Step::Read),
@@ -1238,7 +1179,8 @@ proptest::proptest! {
                 Step::Pass(minutes) => w.pass(mins(minutes)),
                 Step::Finishes(i) => w.finishes(&agents[i]),
                 Step::Asks(i) => w.asks(&agents[i]),
-                Step::Starts(i) => w.starts(&agents[i]),
+                Step::Works(i) => w.works(&agents[i]),
+                Step::Stops(i) => w.stops(&agents[i]),
                 Step::WritesTo(i) => w.writes_to(&agents[i]),
                 Step::Dm(i) => { w.dm(dms[i], ["U1", "U2"][i]); }
                 Step::Read(i) => {
@@ -1303,7 +1245,7 @@ fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
         outcome(&asking)
     );
     assert!(outcome(&snoozed).starts_with("no card: snoozed until"));
-    assert_eq!(outcome(&quiet), "no card: seen through its newest");
+    assert_eq!(outcome(&quiet), "no card: nothing unread");
     assert!(
         trace.nodes[&asking]
             .inputs

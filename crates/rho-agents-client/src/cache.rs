@@ -31,7 +31,7 @@ use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; an agent host with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v8");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v9");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v5");
 /// One agent's mirror, ordered by position, agent first: a range read
@@ -55,12 +55,14 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v7: code-first explicit messages and notebook reports replace old
 /// projections.
 /// v8: typed report migration remaps log positions and journal sequence.
+/// v9: sends carry their kind, and turn edges, waits and wants are gone.
+/// Positions are unchanged, so verdicts keep their cursors.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
-    TableDefinition::new("gui_mirror_events_v8");
+    TableDefinition::new("gui_mirror_events_v9");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-    TableDefinition::new("gui_agent_digest_v5");
+    TableDefinition::new("gui_agent_digest_v6");
 /// What the user last said about an agent, so Home ranks the same way on
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
@@ -80,7 +82,10 @@ const DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_d
 
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 25] = [
+const RETIRED_TABLES: [&str; 28] = [
+    "gui_mirror_host_v8",
+    "gui_mirror_events_v8",
+    "gui_agent_digest_v5",
     "gui_mirror_host_v7",
     "gui_mirror_events_v7",
     // Code-first projection and host migration remap historical row positions.
@@ -726,7 +731,6 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{TurnEdge, TurnOutcome};
 
     use super::*;
     use crate::protocol::transcript::{RuntimeKind, SpawnedBy};
@@ -756,8 +760,10 @@ mod tests {
                 text: "have a look".to_owned(),
                 at: rho_agent_types::UnixMs(1_000),
             },
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Completed),
+            TranscriptEvent::MessageSent {
+                to: None,
+                text: "looked".to_owned(),
+                kind: rho_agent_types::SendKind::Result,
                 at: rho_agent_types::UnixMs(2_000),
             },
         ]

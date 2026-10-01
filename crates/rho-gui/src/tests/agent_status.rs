@@ -18,8 +18,6 @@ fn notebook_status_does_not_treat_a_message_as_a_finished_turn() {
             archived: false,
             stale: false,
         }),
-        turn_running: true,
-        last_message_sent: Some(UnixMs((now_ms - 120_000) as u64)),
         ..AgentFacts::default()
     };
     // Running tasks are the agent's business; the check-in is the reader's.
@@ -32,14 +30,6 @@ fn notebook_status_does_not_treat_a_message_as_a_finished_turn() {
         crate::attention::agent_state_label(&facts, now).as_deref(),
         Some("waiting on you")
     );
-    facts.runtime.as_mut().unwrap().awaiting_human = false;
-    facts.awaiting_human = Some(UnixMs((now_ms - 60_000) as u64));
-    facts.runtime.as_mut().unwrap().awaiting_human = true;
-    assert_eq!(
-        crate::attention::agent_state_label(&facts, now).as_deref(),
-        Some("waiting on you · 1m")
-    );
-    facts.awaiting_human = None;
     facts.runtime.as_mut().unwrap().awaiting_human = false;
     facts.runtime.as_mut().unwrap().running_tasks = 0;
     facts.runtime.as_mut().unwrap().archived = true;

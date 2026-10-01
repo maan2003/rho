@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_agent_types::transcript::{ContextBlock, ContextItemEvent, PendingInferenceResponse};
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, SendKind};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -852,30 +852,15 @@ impl ClaudeLoop {
                 self.published();
                 stream_dirty = false;
             }
-            let started = !initial_runtime.is_working() && current.is_working();
             let settled = (initial_runtime.is_working() && !current.is_working())
                 || (self.execution_generation != initial_execution_generation
                     && !current.is_working());
-            if started {
-                self.host
-                    .turn(
-                        rho_agent_types::UnixMs::now(),
-                        rho_agent_types::TurnEdge::Started,
-                    )
-                    .await?;
-            } else if settled {
-                let outcome = match &current.inference {
-                    InferenceState::Failed { error } => rho_agent_types::TurnOutcome::Errored {
-                        message: error.clone(),
-                    },
-                    _ => rho_agent_types::TurnOutcome::Completed,
-                };
-                self.host
-                    .turn(
-                        rho_agent_types::UnixMs::now(),
-                        rho_agent_types::TurnEdge::Ended(outcome),
-                    )
-                    .await?;
+            if settled && let InferenceState::Failed { error } = &current.inference {
+                self.entry(Entry::Notice {
+                    at: rho_agent_types::UnixMs::now(),
+                    notice: Notice::Stopped(error.clone()),
+                })
+                .await?;
             }
             if settled {
                 self.host.settled().await?;
@@ -1156,7 +1141,7 @@ impl ClaudeLoop {
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
         let at = rho_agent_types::UnixMs::now();
         match outbound {
-            Outbound::Send { cell, text } => {
+            Outbound::Send { cell, text, kind } => {
                 if self.python.as_mut().is_some_and(|python| python.sent(cell)) {
                     self.draft = None;
                 }
@@ -1171,19 +1156,19 @@ impl ClaudeLoop {
                     id: MessageId::new(),
                     to,
                     text: text.clone(),
+                    kind,
                 })
                 .await?;
-                self.host.message_sent(text).await?;
+                // A status is the agent's line, not mail for a subscriber.
+                if kind != SendKind::Status {
+                    self.host.message_sent(text).await?;
+                }
             }
-            Outbound::Status(text) => self.entry(Entry::Status { at, text }).await?,
             Outbound::EndTurn if !self.archived => {
                 if let Some(python) = self.python.as_mut() {
                     python.end_turn();
                 }
-                if !self.awaiting {
-                    self.awaiting = true;
-                    self.entry(Entry::AwaitingHuman { at }).await?;
-                }
+                self.awaiting = true;
             }
             Outbound::EndTurn => {}
             Outbound::Archive => {
@@ -1231,10 +1216,7 @@ impl ClaudeLoop {
                         compact: false,
                     }).await?;
                 }
-                if self.awaiting {
-                    self.awaiting = false;
-                    self.entry(Entry::StoppedAwaitingHuman { at }).await?;
-                }
+                self.awaiting = false;
                 self.python_recheck = None;
                 self.queued_turns.clear();
                 self.state.queued_inputs.clear();

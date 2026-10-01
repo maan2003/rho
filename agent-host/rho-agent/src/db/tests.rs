@@ -1,4 +1,4 @@
-use rho_agent_types::{Place, TurnOutcome, UnixMs};
+use rho_agent_types::{Place, UnixMs};
 use rho_db::RhoDb;
 
 use super::*;
@@ -579,47 +579,17 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
-async fn migration_removes_retired_pr_monitor_tables() {
+async fn migration_takes_one_savepoint() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
-    // The retired tables' contents are deliberately not decoded by this build.
-    let watches = TableDefinition::<String, String>::new("pr_watches");
-    let feedback = TableDefinition::<String, String>::new("pr_feedback");
-    let unrelated = TableDefinition::<String, String>::new("unrelated");
-
     let mut write = db.write().await;
-    write.open_table(FORMAT).insert(&(), &"e3a95c07".to_owned());
-    write
-        .open_table(watches)
-        .insert(&"watch".to_owned(), &"old".to_owned());
-    write
-        .open_table(feedback)
-        .insert(&"comment".to_owned(), &"old".to_owned());
-    write
-        .open_table(unrelated)
-        .insert(&"keep".to_owned(), &"value".to_owned());
+    write.open_table(FORMAT).insert(&(), &"1f34dc6c".to_owned());
     write.commit();
-
+    prepare(&db).await;
     assert_eq!(
         db.read().open_table(FORMAT).get(&()).unwrap().value(),
-        "e3a95c07"
-    );
-    prepare(&db).await;
-    let read = db.read();
-    assert!(!read.has_table("pr_watches"));
-    assert!(!read.has_table("pr_feedback"));
-    assert_eq!(
-        read.open_table(unrelated)
-            .get(&"keep".to_owned())
-            .unwrap()
-            .value(),
-        "value"
-    );
-    assert_eq!(
-        read.open_table(FORMAT).get(&()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT
     );
-    drop(read);
     assert_eq!(savepoints(&db).await.len(), 1);
 
     // A second open does not run the migration or create another savepoint.
@@ -640,7 +610,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format 7f24a9d3, this build expects 1f34dc6c")]
+#[should_panic(expected = "database format 7f24a9d3, this build expects b85e2d07")]
 async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -651,7 +621,7 @@ async fn init_agent_tables_rejects_older_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format deadbeef, this build expects 1f34dc6c")]
+#[should_panic(expected = "database format deadbeef, this build expects b85e2d07")]
 async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -886,7 +856,7 @@ async fn a_rewind_hides_rows_and_is_itself_visible() {
 }
 
 #[tokio::test]
-async fn the_head_folds_title_turns_and_user_contact() {
+async fn the_head_folds_title_and_user_contact() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
@@ -894,7 +864,6 @@ async fn the_head_folds_title_turns_and_user_contact() {
     write.init_agent_tables();
     let root = create(&mut write, None, None);
     let child = create(&mut write, Some("named"), Some(root));
-    write.tell_turn(UnixMs(2), child, TurnEdge::Started);
     write.append_agent_event(
         child,
         &AgentEvent::Titled {
@@ -909,21 +878,13 @@ async fn the_head_folds_title_turns_and_user_contact() {
     assert_eq!(head.title(), Some("named"));
     assert_eq!(head.generated_title.as_deref(), Some("story-log"));
     assert!(head.title_attempted);
-    assert!(head.turn_running);
     assert!(!head.user_interacted);
-    assert_eq!(head.last_turn_ended, None);
 
     let mut write = db.write().await;
-    write.tell_turn(UnixMs(5), child, TurnEdge::Ended(TurnOutcome::Completed));
     write.append_agent_event(child, &user_event("the user speaks"));
-    write.tell_wants(UnixMs(6), child, AgentWant::Ask, Some("which?".to_owned()));
     write.commit();
 
-    // The label described work that just stopped.
     let head = db.read().get_agent(child);
-    assert!(!head.turn_running);
-    assert_eq!(head.activity, None);
-    assert_eq!(head.last_turn_ended, Some(UnixMs(5)));
     assert!(head.user_interacted);
     assert!(!db.read().get_agent(root).user_interacted);
 }
@@ -1304,9 +1265,12 @@ async fn native_recovery_notices_follow_visible_branch() {
     let entry = |entry| AgentEvent::Entry(entry);
     write.append_agent_event(
         agent,
-        &entry(crate::entry::Entry::Status {
+        &entry(crate::entry::Entry::Sent {
             at: UnixMs(2),
+            id: crate::entry::MessageId(1),
+            to: crate::entry::Party::Human,
             text: "working".into(),
+            kind: rho_agent_types::SendKind::Status,
         }),
     ); // 1
     write.append_agent_event(
@@ -1350,50 +1314,84 @@ async fn native_recovery_notices_follow_visible_branch() {
 }
 
 #[tokio::test]
-async fn migration_splits_old_waits_into_starts_and_stops() {
-    use crate::entry::Entry;
+async fn migration_rewrites_the_conversation_in_place() {
+    use rho_agent_types::{SendKind, TurnEdge, TurnOutcome};
+
+    use crate::entry::{Entry, Notice, Party};
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
     let agent = create(&mut write, None, None);
-    for (at, since) in [(2, Some(UnixMs(2))), (3, None)] {
-        write.append_agent_event(
-            agent,
-            &AgentEvent::Entry(Entry::LegacyAwaiting {
-                at: UnixMs(at),
-                since,
-            }),
-        );
+    let errored = |message: &str, at| AgentEvent::Turn {
+        edge: TurnEdge::Ended(TurnOutcome::Errored {
+            message: message.to_owned(),
+        }),
+        at: UnixMs(at),
+    };
+    for event in [
+        AgentEvent::Turn {
+            edge: TurnEdge::Started,
+            at: UnixMs(2),
+        },
+        AgentEvent::Entry(Entry::Status {
+            at: UnixMs(3),
+            text: "reading".to_owned(),
+        }),
+        AgentEvent::Entry(Entry::Status {
+            at: UnixMs(4),
+            text: String::new(),
+        }),
+        errored("quota", 5),
+        errored("the agent host stopped during this turn", 6),
+        AgentEvent::Entry(Entry::AwaitingHuman { at: UnixMs(7) }),
+        AgentEvent::Entry(Entry::StoppedAwaitingHuman { at: UnixMs(8) }),
+        AgentEvent::Entry(Entry::LegacyAwaiting {
+            at: UnixMs(9),
+            since: None,
+        }),
+        AgentEvent::Wants {
+            want: rho_agent_types::AgentWant::Ask,
+            summary: None,
+            at: UnixMs(10),
+        },
+        user_event("untouched"),
+    ] {
+        write.append_agent_event(agent, &event);
     }
-    write
-        .open_table(TableDefinition::<String, String>::new("pr_watches"))
-        .insert(&"watch".to_owned(), &"old".to_owned());
-    write.open_table(FORMAT).insert(&(), &"a3f26d91".to_owned());
+    write.open_table(FORMAT).insert(&(), &"1f34dc6c".to_owned());
     write.commit();
+    let before = db.read().agent_events(agent).1.len();
+
     prepare(&db).await;
+
     let read = db.read();
-    assert!(!read.has_table("pr_watches"));
     assert_eq!(
         read.open_table(FORMAT).get(&()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT
     );
-    let waits: Vec<_> = read
-        .agent_events(agent)
-        .1
-        .into_iter()
-        .filter_map(|event| match event {
-            AgentEvent::Entry(entry) => Some(entry),
-            _ => None,
-        })
-        .collect();
+    let events = read.agent_events(agent).1;
+    assert_eq!(events.len(), before, "rows are rewritten, never removed");
+    let retired = |at| AgentEvent::Retired { at: UnixMs(at) };
+    assert_eq!(events[1], retired(2));
+    assert!(matches!(
+        &events[2],
+        AgentEvent::Entry(Entry::Sent { at: UnixMs(3), to: Party::Human, text, kind: SendKind::Status, .. })
+            if text == "reading"
+    ));
+    assert_eq!(events[3], retired(4));
     assert_eq!(
-        waits,
-        vec![
-            Entry::AwaitingHuman { at: UnixMs(2) },
-            Entry::StoppedAwaitingHuman { at: UnixMs(3) },
-        ]
+        events[4],
+        AgentEvent::Entry(Entry::Notice {
+            at: UnixMs(5),
+            notice: Notice::Stopped("quota".to_owned()),
+        })
     );
+    assert_eq!(
+        events[5..10],
+        [retired(6), retired(7), retired(8), retired(9), retired(10)]
+    );
+    assert_eq!(events[10], user_event("untouched"));
 }
 
 #[tokio::test]

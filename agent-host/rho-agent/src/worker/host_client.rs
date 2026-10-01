@@ -4,7 +4,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
+use rho_agent_types::{AgentRole, UnixMs};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
@@ -483,9 +483,6 @@ impl HostClient {
     }
     pub(crate) async fn rewind(&self, at: UnixMs, to: AgentEventPos) -> Result<(), StoreError> {
         self.change(Request::Rewind { at, to }).await
-    }
-    pub(crate) async fn turn(&self, at: UnixMs, edge: TurnEdge) -> Result<(), StoreError> {
-        self.change(Request::Turn { at, edge }).await
     }
     async fn change(&self, request: Request<'_>) -> Result<(), StoreError> {
         match self.request(request).await.map_err(StoreError)? {

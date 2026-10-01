@@ -310,6 +310,24 @@ async fn run_async(args: Args) -> Result<()> {
                 } else {
                     responding.remove(&agent_id);
                 }
+                // Each time an agent comes to wait on the user, the baseline
+                // writes to it again.
+                if !state.awaiting_human {
+                    awaiting.remove(&agent_id);
+                } else if awaiting.insert(agent_id)
+                    && args.scenario == Scenario::Baseline
+                    && Instant::now() < deadline
+                {
+                    let cycle = cycles.entry(agent_id).or_default();
+                    *cycle += 1;
+                    client.send(AgentCommand::Send {
+                        agent_id,
+                        messages: vec![UserMessage {
+                            id: *cycle,
+                            content: prompt(0, *cycle),
+                        }],
+                    });
+                }
             }
             Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
@@ -389,25 +407,6 @@ async fn run_async(args: Args) -> Result<()> {
                                     .await?;
                             }
                             report_at.insert(entry.agent_id, at);
-                        }
-                        TranscriptEvent::AwaitingHuman { since, .. } => {
-                            if since.is_some() {
-                                awaiting.insert(entry.agent_id);
-                                if args.scenario == Scenario::Baseline && Instant::now() < deadline
-                                {
-                                    let cycle = cycles.entry(entry.agent_id).or_default();
-                                    *cycle += 1;
-                                    client.send(AgentCommand::Send {
-                                        agent_id: entry.agent_id,
-                                        messages: vec![UserMessage {
-                                            id: *cycle,
-                                            content: prompt(0, *cycle),
-                                        }],
-                                    });
-                                }
-                            } else {
-                                awaiting.remove(&entry.agent_id);
-                            }
                         }
                         TranscriptEvent::MessageSent { to, text, .. } => {
                             ensure!(to.is_none(), "fake agent sent mail to another agent");

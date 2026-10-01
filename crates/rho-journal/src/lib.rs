@@ -703,12 +703,11 @@ pub enum Event {
     AgentChanged {
         agent: String,
         title: String,
-        turn_running: bool,
-        turn_started_at: Option<u64>,
-        last_turn_ended: Option<u64>,
         last_user_message_at: u64,
-        needs_you: bool,
-        errored: bool,
+        last_sent_at: Option<u64>,
+        /// The strongest kind the agent put to the user since they last
+        /// wrote: `ask`, `stopped`, `result` or `other`.
+        unread: Option<String>,
     },
     /// A menu item run, by its key or by a tap.
     MenuRan {

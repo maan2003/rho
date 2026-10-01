@@ -17,7 +17,6 @@ pub struct UiAgentState {
     pub status: UiAgentStatus,
     /// Latest ephemeral runtime snapshot; absent when disconnected.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
-    pub awaiting_human: Option<UnixMs>,
     /// Tokens occupying the model's context window after the latest
     /// response; `None` until the agent's first response.
     pub context_used: Option<u64>,
@@ -110,15 +109,6 @@ pub enum UiAgentStatus {
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
-    /// The agent host is not streaming to this client, and a turn was running
-    /// when it last heard. Retained transcript content is still displayed
-    /// and is no longer being updated.
-    ///
-    /// Only the mirror produces this, and only for a turn it saw running, so
-    /// [`crate::store::turn_open`] treats it as an open turn. A settled agent
-    /// read back from the story is `Idle`; do not widen this variant to cover
-    /// one without moving that decision with it.
-    Unloaded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

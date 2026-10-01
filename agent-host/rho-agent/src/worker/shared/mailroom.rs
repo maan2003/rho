@@ -11,6 +11,7 @@ use std::sync::Arc;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use rho_agent_types::SendKind;
 use rho_notebook::Export;
 use tokio::sync::mpsc;
 
@@ -20,8 +21,8 @@ pub(crate) enum Outbound {
     Send {
         cell: u64,
         text: String,
+        kind: SendKind,
     },
-    Status(String),
     Archive,
     /// The current exec ends the model's turn.
     EndTurn,
@@ -66,12 +67,23 @@ struct Bridge(Arc<Mailroom>);
 
 #[pymethods]
 impl Bridge {
-    fn send(&self, py: Python<'_>, text: String) -> PyResult<()> {
+    fn send(&self, py: Python<'_>, text: String, kind: &str) -> PyResult<()> {
         if text.trim().is_empty() {
             return Err(PyValueError::new_err("a message needs text"));
         }
+        let kind = match kind {
+            "ask" => SendKind::Ask,
+            "result" => SendKind::Result,
+            "status" => SendKind::Status,
+            "other" => SendKind::Other,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "kind is one of \"ask\", \"result\", \"status\" or \"other\"",
+                ));
+            }
+        };
         let cell = rho_notebook::current_source_id(py)?;
-        let _ = self.0.outbox.send(Outbound::Send { cell, text });
+        let _ = self.0.outbox.send(Outbound::Send { cell, text, kind });
         Ok(())
     }
 
@@ -82,10 +94,6 @@ impl Bridge {
     fn end_turn(&self) {
         let _ = self.0.outbox.send(Outbound::EndTurn);
     }
-
-    fn status(&self, text: String) {
-        let _ = self.0.outbox.send(Outbound::Status(text));
-    }
 }
 
 const SOURCE: &std::ffi::CStr = cr#"
@@ -95,13 +103,9 @@ class Human:
     def __init__(self, bridge):
         self._bridge = bridge
 
-    def send(self, text):
-        """Send the human a message."""
-        self._bridge.send(str(text))
-
-    def status(self, text):
-        """Set your one-line status, replacing the last one."""
-        self._bridge.status(str(text))
+    def send(self, text, *, kind):
+        """Send the human a message: kind is "ask", "result", "status" or "other"."""
+        self._bridge.send(str(text), kind)
 
     def __repr__(self):
         return "<human>"

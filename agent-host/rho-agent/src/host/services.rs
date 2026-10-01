@@ -65,8 +65,6 @@ impl Services {
     }
 
     pub(crate) async fn worker_failed(&self, error: String) {
-        use rho_agent_types::{TurnEdge, TurnOutcome};
-
         use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             runtime: crate::RuntimeState {
@@ -80,10 +78,12 @@ impl Services {
         // The supervisor knows the process ended, not which unrecorded Python
         // statements ran. Record only that coarse lifecycle fact.
         let mut write = self.db.write().await;
-        write.tell_turn(
-            rho_agent_types::UnixMs::now(),
+        write.append_agent_event(
             self.agent,
-            TurnEdge::Ended(TurnOutcome::Errored { message: error }),
+            &crate::AgentEvent::Entry(crate::entry::Entry::Notice {
+                at: rho_agent_types::UnixMs::now(),
+                notice: crate::entry::Notice::Stopped(error),
+            }),
         );
         write.commit();
         if let Some(pool) = self.pool.upgrade() {
@@ -470,12 +470,6 @@ impl Services {
             }
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
             Request::UsageTotal => Reply::Usage(self.db.read().agent_usage_total(self.agent)),
-            Request::Turn { at, edge } => {
-                let mut write = self.db.write().await;
-                write.tell_turn(at, self.agent, edge);
-                write.commit();
-                Reply::Done
-            }
         };
         Ok(reply)
     }

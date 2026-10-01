@@ -1410,13 +1410,10 @@ impl Workspace {
         let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
         // An agent working for another agent belongs to it and is not the
         // reader's to watch; only the ones the reader manages are listed.
-        // Nor one the user put away. A running turn decides how loudly an
-        // agent may ask; a mute and a snooze decide whether it may ask at
-        // all, and neither is a cursor, so a turn starting does not take
-        // either back. This list read neither, which is why muting or
-        // snoozing a working agent did nothing a reader could see until
-        // the turn ended.
-        let running = self
+        // Nor one the user put away: a mute and a snooze are not cursors,
+        // and a list that ignored them would keep showing what the reader
+        // asked not to see.
+        let mut recent = self
             .registry
             .known_agents()
             .copied()
@@ -1428,26 +1425,25 @@ impl Workspace {
                         .get(&rho_dealer::NodeId::Agent(*agent_id))
                         .facts()
                         .put_away(now)
-                    && {
-                        let facts = self.registry.agent_facts(*agent_id);
-                        facts
-                            .runtime
-                            .map_or(facts.turn_running, |activity| activity.is_busy())
-                    }
+            })
+            .filter_map(|agent_id| {
+                let sent = self.registry.agent_digest(agent_id)?.last_sent_at?;
+                Some((sent, agent_id))
             })
             .collect::<Vec<_>>();
-        // Sorted by what the row shows, or the order is of something the
-        // reader cannot see. Only the name: what it is doing is in the
-        // transcript, and Home says only that it is.
-        let mut running = running
+        recent.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.recent = recent
             .into_iter()
-            .map(|agent_id| crate::home::RunningRow {
+            .take(crate::home::HOME_CAP)
+            .map(|(sent, agent_id)| crate::home::RecentRow {
                 agent_id,
                 name: name(agent_id),
+                label: format!(
+                    "{} ago",
+                    crate::home::elapsed_label(sent.0 as i64, now.as_millisecond())
+                ),
             })
-            .collect::<Vec<_>>();
-        running.sort_by(|a, b| a.name.cmp(&b.name));
-        rows.running = running;
+            .collect();
         let local = jiff::Zoned::now();
         rows.piles = self
             .attention
@@ -1481,6 +1477,10 @@ impl Workspace {
             // A running agent is not a card: its row opens the agent.
             crate::home::HomeTarget::Agent(agent_id) => {
                 self.select_agent_inner(Some(agent_id), true, window, cx);
+                return;
+            }
+            crate::home::HomeTarget::Recent => {
+                view.update(cx, |view, cx| view.toggle_recent(cx));
                 return;
             }
             crate::home::HomeTarget::Pile(name) => {
@@ -1812,16 +1812,25 @@ impl Workspace {
                     return;
                 }
                 for agent_id in &changed {
-                    let facts = self.registry.agent_facts(*agent_id);
+                    let digest = self.registry.agent_digest(*agent_id);
                     rho_journal::record(rho_journal::Event::AgentChanged {
                         agent: agent_id.encoded(),
                         title: self.registry.agent_display_label(*agent_id),
-                        turn_running: facts.turn_running,
-                        turn_started_at: facts.turn_started_at.map(|at| at.0),
-                        last_turn_ended: facts.last_turn_ended.map(|at| at.0),
-                        last_user_message_at: facts.last_user_message_at.0,
-                        needs_you: facts.needs_you_hint,
-                        errored: facts.errored,
+                        last_user_message_at: self
+                            .registry
+                            .agent_facts(*agent_id)
+                            .last_user_message_at
+                            .0,
+                        last_sent_at: digest.and_then(|digest| digest.last_sent_at).map(|at| at.0),
+                        unread: digest
+                            .and_then(|digest| {
+                                digest
+                                    .unread
+                                    .iter()
+                                    .map(|unread| unread.said)
+                                    .min_by_key(|said| said.strength())
+                            })
+                            .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
                 // Their marks go with them: an agent that just arrived may
@@ -2397,7 +2406,7 @@ impl Workspace {
 
     /// The agent's status line, at the end of its transcript.
     fn show_status(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let text = self.registry.agent_activity(agent_id).map(str::to_owned);
+        let text = self.registry.agent_status(agent_id).map(str::to_owned);
         self.show(agent_id, TranscriptFrame::Status(text), cx);
     }
 
@@ -5041,7 +5050,6 @@ impl Workspace {
                 blocks: Vec::new(),
                 status: rho_agents_client::state::UiAgentStatus::Idle,
                 runtime: None,
-                awaiting_human: None,
                 context_used: None,
                 usage: Default::default(),
             })
