@@ -756,7 +756,7 @@ async fn response_subscriptions_are_persistent_edges() {
     );
 }
 
-pub(super) fn create(
+pub(crate) fn create(
     write: &mut rho_db::WriteTxn,
     spawn_name: Option<&str>,
     parent: Option<AgentId>,

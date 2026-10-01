@@ -480,6 +480,45 @@ impl AgentPool {
         Ok(())
     }
 
+    /// Ends every turn the log left open on an agent this pool is not
+    /// running. Its workset process died with an earlier agent host, which
+    /// could not say so as it does for a process that dies under it
+    /// (`Services::worker_failed`); until something does, the turn reads as
+    /// running forever. Called once at startup, after [`AgentPool::adopt`].
+    pub async fn end_orphaned_turns(&self) {
+        use rho_agent_types::{TurnEdge, TurnOutcome, UnixMs};
+
+        let loaded = self
+            .agents
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let orphaned = self
+            .db
+            .read()
+            .list_agents()
+            .into_iter()
+            .filter(|(agent_id, head)| head.turn_running && !loaded.contains(agent_id))
+            .map(|(agent_id, _)| agent_id)
+            .collect::<Vec<_>>();
+        if orphaned.is_empty() {
+            return;
+        }
+        let mut write = self.db.write().await;
+        for agent_id in orphaned {
+            write.tell_turn(
+                UnixMs::now(),
+                agent_id,
+                TurnEdge::Ended(TurnOutcome::Errored {
+                    message: "the agent host stopped during this turn".to_owned(),
+                }),
+            );
+        }
+        write.commit();
+    }
+
     pub fn worksets(&self) -> &Arc<Worksets> {
         &self.worksets
     }
@@ -1189,6 +1228,48 @@ mod tests {
         )
         .await;
         (pool, place)
+    }
+
+    #[tokio::test]
+    async fn turns_left_open_by_a_stopped_host_end_at_startup() {
+        use rho_agent_types::{TurnEdge, TurnOutcome, UnixMs};
+
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, place) = test_pool(directory.path()).await;
+        let (live, _client) = pool
+            .create(AgentRole::default(), None, StartPlace::new(place))
+            .await
+            .unwrap();
+        let mut write = pool.db.write().await;
+        let [open, ended, idle] =
+            std::array::from_fn(|_| crate::db::tests::create(&mut write, None, None));
+        write.tell_turn(UnixMs(2), open, TurnEdge::Started);
+        write.tell_turn(UnixMs(2), live, TurnEdge::Started);
+        write.tell_turn(UnixMs(2), ended, TurnEdge::Started);
+        write.tell_turn(UnixMs(3), ended, TurnEdge::Ended(TurnOutcome::Completed));
+        write.commit();
+        let before = |agent_id| pool.db.read().get_agent(agent_id).next;
+        let (live_next, ended_next, idle_next) = (before(live), before(ended), before(idle));
+
+        pool.end_orphaned_turns().await;
+
+        let read = pool.db.read();
+        assert!(!read.get_agent(open).turn_running);
+        let (_, events) = read.agent_events(open);
+        assert!(matches!(
+            events.last(),
+            Some(crate::log::AgentEvent::Turn {
+                edge: TurnEdge::Ended(TurnOutcome::Errored { .. }),
+                ..
+            })
+        ));
+        assert_eq!(
+            read.get_agent(live).next,
+            live_next,
+            "a running agent's turn is its own"
+        );
+        assert_eq!(read.get_agent(ended).next, ended_next);
+        assert_eq!(read.get_agent(idle).next, idle_next);
     }
 
     #[tokio::test]
