@@ -4343,7 +4343,15 @@ pub async fn receive_fixed_group<R: crate::transport::poll::RecvStream>(
 		sequence: header.sequence,
 	})?);
 	// Fixed tracks always carry wire timestamps; the legacy receive clock is unused.
-	let mut ingest = FrameIngest::new(crate::time::Clock::new(std::time::Instant::now()), Some(timescale));
+	let mut ingest = FrameIngest {
+		runtime: crate::time::Clock::new(std::time::Instant::now()),
+		timescale: Some(timescale),
+		prev_ts: 0,
+		phase: IngestPhase::Timing,
+		// Fixed streams have no shared session budget. Grow with received bytes
+		// instead of reserving a separate upfront allocation for every stream.
+		budget: frame::Budget::new(0),
+	};
 	let result = kio::wait(|waiter| {
 		if let Poll::Ready(err) = track.poll_closed(waiter) {
 			return Poll::Ready(Err(err));

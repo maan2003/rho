@@ -2936,6 +2936,7 @@ mod serve_group_test {
 				track_priority_seen: 0,
 				version: Version::Lite05,
 				timescale: Some(crate::Timescale::default()),
+				opens: Default::default(),
 			};
 			let track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
 			let mut producer = track.append_group().unwrap();
@@ -3494,12 +3495,17 @@ mod serve_group_test {
 
 		track.start_at(0).unwrap();
 		relay.settle();
-		assert_eq!(relay.opened(), 1, "the held group is served");
+		// Rho expires handed-out groups below the updated floor, including one
+		// held before its stream opened. Upstream ordinarily still serves it.
+		assert_eq!(relay.opened(), 0, "served the superseded held group");
 
 		// Group 6 is below the updated floor.
 		write_group(&mut track, 6, 6);
 		relay.settle();
-		assert_eq!(relay.opened(), 1, "served a group below the floor");
+		assert_eq!(relay.opened(), 0, "served a group below the floor");
+		write_group(&mut track, 7, 7);
+		relay.settle();
+		assert_eq!(relay.opened(), 1, "the updated floor is still served");
 	}
 
 	/// A source whose feed starts below the subscriber's floor serves the floor's group, so
@@ -4096,6 +4102,7 @@ pub async fn publish_fixed<S: crate::transport::poll::Session + Unpin>(
 		track_priority_seen: 0,
 		version: Version::Lite05,
 		timescale: Some(track.info().timescale),
+		opens: Default::default(),
 	};
 	position_cursor(&mut track, Version::Lite05, None);
 	let mut children = Box::new(kio::Tasks::new());
