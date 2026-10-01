@@ -1135,7 +1135,6 @@ mod tests {
             },
             started_at: rho_agent_types::UnixMs(1),
             finished_at: rho_agent_types::UnixMs(2),
-            metadata: None,
         };
 
         assert_eq!(detail_result(&result).output, "complete host record");

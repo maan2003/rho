@@ -112,30 +112,6 @@ pub enum UiAgentStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiToolMetadata {
-    ApplyPatch(UiApplyPatchMetadata),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiApplyPatchMetadata {
-    pub changes: Vec<UiToolFileChange>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiToolFileChange {
-    pub path: String,
-    pub status: UiToolFileStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiToolFileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Moved,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiTool {
     pub id: String,
     pub name: String,
@@ -146,7 +122,6 @@ pub struct UiTool {
     pub error: Option<String>,
     pub started_at: Option<UnixMs>,
     pub finished_at: Option<UnixMs>,
-    pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
     pub timing: rho_agent_types::ExecTiming,
     /// Whether `arguments` is JSON or the raw text the model wrote. A text

@@ -387,7 +387,6 @@ fn tool_result(
         },
         started_at,
         finished_at,
-        metadata: None,
     })
 }
 

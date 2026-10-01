@@ -26,7 +26,6 @@ fn ran(command: &str) -> UiBlock {
         error: None,
         started_at: Some(rho_agent_types::UnixMs(10)),
         finished_at: Some(rho_agent_types::UnixMs(20)),
-        metadata: None,
     })
 }
 

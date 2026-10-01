@@ -28,7 +28,6 @@ fn the_caret_moves_through_visible_activity_calls(cx: &mut TestAppContext) {
             error: None,
             started_at: Some(rho_agent_types::UnixMs(1_000)),
             finished_at: Some(rho_agent_types::UnixMs(3_500)),
-            metadata: None,
         })
     }));
     feed_frame(&workspace, cx, agent(1), state(history, Vec::new()));

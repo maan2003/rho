@@ -2245,7 +2245,6 @@ mod tests {
             error: None,
             started_at: None,
             finished_at: None,
-            metadata: None,
         }))
     }
 

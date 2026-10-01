@@ -212,7 +212,6 @@ pub fn block(item: &Item) -> UiBlock {
             error: None,
             started_at: None,
             finished_at: None,
-            metadata: None,
             // Set when the event carrying its result closes it.
         }),
     }

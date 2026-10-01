@@ -1442,7 +1442,6 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     error: None,
                     started_at: None,
                     finished_at: None,
-                    metadata: None,
                 }),
             )
         });
@@ -2331,7 +2330,6 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 error: None,
                 started_at: None,
                 finished_at: None,
-                metadata: None,
             })],
         ),
     );
@@ -2413,7 +2411,6 @@ fn burst_of_pending_tools_keeps_every_code_row_visible(cx: &mut TestAppContext) 
                 error: None,
                 started_at: None,
                 finished_at: None,
-                metadata: None,
             })
         })
         .collect();
@@ -4102,7 +4099,6 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         error: None,
         started_at: Some(rho_agent_types::UnixMs(10)),
         finished_at: Some(rho_agent_types::UnixMs(20)),
-        metadata: None,
     });
     feed_frame(
         &workspace,
@@ -5876,7 +5872,6 @@ fn tool(
         error: None,
         started_at: started_at.map(UnixMs),
         finished_at: finished_at.map(UnixMs),
-        metadata: None,
     }
 }
 
