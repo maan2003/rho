@@ -1,9 +1,9 @@
 //! HTTP server part of iroh-dns-server
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -17,6 +17,7 @@ use axum::{
 };
 use n0_error::{Result, StdResultExt, anyerr, bail_any};
 use serde::{Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{net::TcpListener, task::JoinSet};
 use tower_http::{
     cors::{self, CorsLayer},
@@ -33,13 +34,31 @@ mod tls;
 pub use self::{rate_limiting::RateLimitConfig, tls::CertMode};
 use crate::state::AppState;
 
+/// How long a connection may be idle before keepalive probing starts.
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_mins(1);
+
+/// Interval between keepalive probes once probing starts.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Enable TCP keepalive on `listener`, which accepted connections inherit.
+///
+/// Without it, connections whose peer vanished without closing are never
+/// reaped: they accumulate for the lifetime of the process until it is
+/// OOM-killed.
+fn set_keepalive(listener: &std::net::TcpListener) -> std::io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    SockRef::from(listener).set_tcp_keepalive(&keepalive)
+}
+
 /// Configuration for the HTTP listener.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[non_exhaustive]
 pub struct HttpConfig {
     /// Port to bind the HTTP listener to.
     pub port: u16,
-    /// Address to bind the HTTP listener to (defaults to `0.0.0.0`).
+    /// Address to bind the HTTP listener to (defaults to `::`, i.e. IPv6 wildcard which also covers IPv4).
     pub bind_addr: Option<IpAddr>,
 }
 
@@ -51,7 +70,7 @@ pub struct HttpConfig {
 pub struct HttpsConfig {
     /// Port to bind the HTTPS listener to.
     pub port: u16,
-    /// Address to bind the HTTPS listener to (defaults to `0.0.0.0`).
+    /// Address to bind the HTTPS listener to (defaults to `::`, i.e. IPv6 wildcard which also covers IPv4).
     pub bind_addr: Option<IpAddr>,
     /// Domains for which TLS certificates are issued or loaded.
     pub domains: Vec<String>,
@@ -70,6 +89,7 @@ pub struct HttpsConfig {
 }
 
 /// The HTTP(S) server part of iroh-dns-server
+#[derive(Debug)]
 pub(crate) struct HttpServer {
     tasks: JoinSet<std::io::Result<()>>,
     http_addr: Option<SocketAddr>,
@@ -96,7 +116,7 @@ impl HttpServer {
         // launch http
         let http_addr = if let Some(config) = http_config {
             let bind_addr = SocketAddr::new(
-                config.bind_addr.unwrap_or(Ipv4Addr::UNSPECIFIED.into()),
+                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
                 config.port,
             );
             let app = app.clone();
@@ -106,6 +126,7 @@ impl HttpServer {
                 .into_std()
                 .anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
+            set_keepalive(&listener).anyerr()?;
             let fut = axum_server::from_tcp(listener)?
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>());
             info!("HTTP server listening on {bind_addr}");
@@ -118,7 +139,7 @@ impl HttpServer {
         // launch https
         let https_addr = if let Some(config) = https_config {
             let bind_addr = SocketAddr::new(
-                config.bind_addr.unwrap_or(Ipv4Addr::UNSPECIFIED.into()),
+                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
                 config.port,
             );
             let acceptor = {
@@ -146,6 +167,7 @@ impl HttpServer {
                 .into_std()
                 .anyerr()?;
             let bound_addr = listener.local_addr().anyerr()?;
+            set_keepalive(&listener).anyerr()?;
             let fut = axum_server::from_tcp(listener)?
                 .acceptor(acceptor)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>());
@@ -216,7 +238,7 @@ async fn healthz() -> Json<Health> {
     Json(Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
-        git_hash: option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        git_hash: "unknown",
     })
 }
 
@@ -305,20 +327,12 @@ async fn metrics_middleware(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr},
-        sync::Arc,
-    };
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use hickory_resolver::{
-        config::{NameServerConfig, ResolverConfig},
-        net::runtime::TokioRuntimeProvider,
-    };
-    use hickory_server::proto::rr::RecordType;
     use iroh::{
         RelayUrl, SecretKey,
         address_lookup::{EndpointInfo, PkarrRelayClient},
-        dns::DnsResolver,
+        dns::{DNS_TIMEOUT, DnsResolver, NameserverConfig},
         tls::{CaTlsConfig, default_provider},
     };
     use n0_error::StdResultExt;
@@ -411,34 +425,26 @@ mod tests {
         assert_eq!(res.answer[0].name, format!("_iroh.{name_z32}."));
         assert_eq!(res.answer[0].data, format!("relay={RELAY_URL}"));
 
-        // Fetch over HTTPS via hickory-resolver
-        let client = {
+        // Fetch over DNS-over-HTTPS.
+        let resolver = {
             let https_addr = server.https_addr().expect("https is bound");
-            let mut name_server =
-                NameServerConfig::https(https_addr.ip(), Arc::from("localhost"), None);
-            for connection in &mut name_server.connections {
-                connection.port = https_addr.port();
-            }
-            let config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
-
-            hickory_resolver::Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-                .with_tls_config(self::tls::insecure_tls_config())
+            DnsResolver::builder()
+                .add_nameserver_config(
+                    NameserverConfig::https(https_addr.ip())
+                        .with_port(https_addr.port())
+                        .with_tls_server_name("localhost"),
+                )
+                .tls_client_config(self::tls::insecure_tls_config())
+                .disable_fallback()
                 .build()
-                .anyerr()?
         };
 
-        let res = client
-            .txt_lookup(format!("_iroh.{name_z32}."))
-            .await
-            .anyerr()?;
-        let records = res.answers();
+        let records: Vec<_> = resolver
+            .lookup_txt(format!("_iroh.{name_z32}."), DNS_TIMEOUT)
+            .await?
+            .collect();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record_type(), RecordType::TXT);
-        let txt_data = match &records[0].data {
-            hickory_server::proto::rr::RData::TXT(txt) => &txt.txt_data,
-            other => panic!("expected TXT record, got {other:?}"),
-        };
-        assert_eq!(&txt_data[0][..], format!("relay={RELAY_URL}").as_bytes());
+        assert_eq!(records[0].to_string(), format!("relay={RELAY_URL}"));
 
         server.shutdown().await?;
         Ok(())
