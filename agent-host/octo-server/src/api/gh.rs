@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_optional_nulls_are_omitted_without_changing_nullable_issue_edits() {
+    async fn writes_preserve_omission_nullable_nulls_and_falsy_values() {
         let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let captured = calls.clone();
         let (upstream, upstream_task) = serve(Router::new().fallback(any(
@@ -1123,50 +1123,36 @@ mod tests {
             (
                 Method::POST,
                 "pulls",
-                json!({"head":"topic","base":"main","issue":7,"title":null,"body":null,"head_repo":null,"draft":false,"maintainer_can_modify":false}),
+                json!({"head":"topic","base":"main","issue":7,"draft":false,"maintainer_can_modify":false}),
                 json!({"head":"topic","base":"main","issue":7,"draft":false,"maintainer_can_modify":false}),
                 StatusCode::CREATED,
             ),
             (
-                Method::POST,
-                "pulls",
-                json!({"head":"topic","base":"main","title":"Fix","body":"","issue":null,"draft":null,"maintainer_can_modify":null}),
-                json!({"head":"topic","base":"main","title":"Fix","body":""}),
-                StatusCode::CREATED,
-            ),
-            (
                 Method::PATCH,
                 "pulls/7",
-                json!({"base":"release/next","title":null,"body":null,"state":null,"maintainer_can_modify":false}),
-                json!({"base":"release/next","maintainer_can_modify":false}),
-                StatusCode::OK,
-            ),
-            (
-                Method::PATCH,
-                "pulls/7",
-                json!({"body":"","base":null,"title":null,"state":null,"maintainer_can_modify":null}),
-                json!({"body":""}),
+                json!({"body":"","base":"release/next","maintainer_can_modify":false}),
+                json!({"body":"","base":"release/next","maintainer_can_modify":false}),
                 StatusCode::OK,
             ),
             (
                 Method::POST,
                 "actions/jobs/19/rerun",
-                json!({"enable_debug_logging":false,"enable_debugger":null}),
-                json!({"enable_debug_logging":false}),
+                json!({"enable_debug_logging":false,"enable_debugger":true}),
+                json!({"enable_debug_logging":false,"enable_debugger":true}),
                 StatusCode::CREATED,
             ),
             (
                 Method::POST,
                 "actions/runs/23/rerun",
-                json!({"enable_debug_logging":null}),
+                json!({}),
                 json!({}),
                 StatusCode::CREATED,
             ),
             (
                 Method::POST,
                 "actions/runs/23/rerun-failed-jobs",
-                json!({"enable_debug_logging":null}),
-                json!({}),
+                json!({"enable_debug_logging":false}),
+                json!({"enable_debug_logging":false}),
                 StatusCode::CREATED,
             ),
             (
@@ -1190,7 +1176,7 @@ mod tests {
             assert_eq!(last.1, format!("/repos/acme/widget/{path}"));
             assert_eq!(last.2, expected, "{path}");
         }
-        assert_eq!(calls.lock().await.len(), 8);
+        assert_eq!(calls.lock().await.len(), 6);
         task.abort();
         upstream_task.abort();
     }
@@ -1266,6 +1252,31 @@ mod tests {
                 Method::POST,
                 "repos/acme/widget/actions/runs/23/rerun",
                 json!({"enable_debug_logging":"false"}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/pulls",
+                json!({"head":"topic","base":"main","issue":7,"title":null}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/pulls/7",
+                json!({"body":null}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/jobs/19/rerun",
+                json!({"enable_debugger":null}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/runs/23/rerun",
+                json!({"enable_debug_logging":null}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/runs/23/rerun-failed-jobs",
+                json!({"enable_debug_logging":null}),
             ),
             (
                 Method::POST,

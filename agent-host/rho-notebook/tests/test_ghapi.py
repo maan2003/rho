@@ -86,6 +86,13 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(request.call_args.kwargs["json"], {"body": "positional"})
                     await invoke(api.issues.update_comment, 7, body_={"body": "mapped"})
                     self.assertEqual(request.call_args.kwargs["json"], {"body": "mapped"})
+                    await invoke(api.pulls.create, head="topic", base="main", issue=7, title=UNSET)
+                    self.assertEqual(request.call_args.kwargs["json"],
+                                     {"head": "topic", "base": "main", "issue": 7})
+                    await invoke(api.pulls.update, 7, body=UNSET, maintainer_can_modify=False)
+                    self.assertEqual(request.call_args.kwargs["json"], {"maintainer_can_modify": False})
+                    await invoke(api.pulls.update, 7, body=None)
+                    self.assertEqual(request.call_args.kwargs["json"], {"body": None})
                     await invoke(api.issues.update_comment, 7, body=None)
                     self.assertEqual(request.call_args.kwargs["json"], {"body": None})
                     await invoke(api.search.repos, query_={"q": None})

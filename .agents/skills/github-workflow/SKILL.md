@@ -29,7 +29,10 @@ are fixed Octo-only helpers.
 Pass declared parameters directly as keywords. Unknown keywords, missing
 required parameters, and undeclared `query_`/`body_` fields raise `TypeError`
 before a request. The host checks write request schemas. Read queries and
-responses pass through to GitHub without schema validation. List/search operations
+responses pass through to GitHub without schema validation. Omit a parameter
+(or use `UNSET`) to leave it out. `None` sends JSON null and is accepted only
+for nullable write fields; PR create/edit and CI rerun options do not treat
+`None` as omission. List/search operations
 may require pagination; use `result['items']` for search rows (`.items` is a
 dict method).
 

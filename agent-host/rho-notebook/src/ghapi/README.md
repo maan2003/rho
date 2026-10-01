@@ -17,8 +17,10 @@ Writes are explicitly dispatched to handwritten Rust request types in
 `octo-server/src/api/gh_writes.rs`. Unknown fields, wrong types, and missing
 required fields are rejected before Octo acquires credentials. The original
 JSON is forwarded after validation, preserving null versus omission and the
-caller's union representation. Legacy PR create/edit and CI rerun parameters
-retain the baseline behavior: optional `None` values are omitted before forwarding.
+caller's union representation. Omission or `UNSET` leaves a field out; `None`
+sends JSON null and is accepted only for nullable fields. `False`, `0`, and `""`
+are forwarded as values. Unlike the old host, PR create/edit and CI rerun
+parameters no longer silently drop `None`: omit those nonnullable fields instead.
 There is no schema generator or REST response model.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
