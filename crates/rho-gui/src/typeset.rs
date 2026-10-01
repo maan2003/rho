@@ -1,9 +1,13 @@
 //! How Rho Font sets text: letters by their ink, lines by their paragraph.
 //!
-//! Inside a word, each letter sits so the white between it and its neighbour
-//! is one optical gap, the font's own between two `n`s: the mean gap across
-//! the x-height between their ink profiles, capped where a letter opens like
-//! `c` or `r`. A word takes whatever width that gives; nothing is on a grid.
+//! Inside a word, each letter is spaced by its own ink, as a type designer
+//! sets sidebearings: each side measures where its ink reaches farthest and
+//! the mean white behind that across the x-height, capped where a letter
+//! opens like `c` or `r`, and takes the spacing that gives it the white of an
+//! `n`'s side. A word starts and ends the same way, so nothing is on a grid
+//! and a narrow letter's wide advance never shows as space. Measured against
+//! Source Sans's hand spacing of the same sans letters, this lands about
+//! twice as close as spacing each pair by its shared closest point.
 //!
 //! Every letter of a line takes the line's MONO value, its stretch, as in
 //! font expansion. The line wrapper asks this typesetter to break each
@@ -34,7 +38,7 @@ const SCANLINES: usize = 12;
 /// Scanlines from descender to ascender, where ink must keep `CLEAR` apart.
 const WHOLE: usize = 24;
 const CLEAR: f32 = 0.04;
-/// How far into an opening the optical gap looks, in ems.
+/// How far behind a side's farthest ink its white is counted, in ems.
 const DEPTH: f32 = 0.1;
 /// Rows remembered per font size before they are all forgotten.
 const ROWS: usize = 100_000;
@@ -58,8 +62,10 @@ struct Face {
     /// The face at each MONO value a letter takes.
     at: Vec<(f32, FontId)>,
     duo_i: Option<GlyphId>,
-    /// The optical gap between letters, in ems.
-    gap: f32,
+    /// The spacing an `n` has, in ems: from its right side's farthest ink
+    /// plus white to its advance, and from its origin to its left side's.
+    right: f32,
+    left: f32,
 }
 
 impl Face {
@@ -72,15 +78,57 @@ impl Face {
     }
 }
 
-/// A glyph in one font instance: its advance and ink edges at each scanline, in
-/// ems.
+/// A glyph in one font instance, in ems.
 #[derive(Clone)]
 struct Glyph {
     advance: f32,
-    left: [Option<f32>; SCANLINES],
-    right: [Option<f32>; SCANLINES],
+    /// `None` when the side has ink on fewer than half the x-height's
+    /// scanlines, like a hyphen or a period, whose missing scanlines would
+    /// read as white; it keeps its advance.
+    left: Option<Side>,
+    right: Option<Side>,
     /// Ink's left and right edges at scanlines from descender to ascender.
     whole: [Option<(f32, f32)>; WHOLE],
+}
+
+/// One side of a glyph's ink across the x-height.
+#[derive(Clone, Copy)]
+struct Side {
+    /// How far its ink reaches outward, from the origin.
+    reach: f32,
+    /// The mean white between that reach and the ink, at most `DEPTH`.
+    white: f32,
+}
+
+impl Side {
+    fn of(edges: [Option<f32>; SCANLINES], outward: f32) -> Option<Self> {
+        if edges.iter().flatten().count() * 2 < SCANLINES {
+            return None;
+        }
+        let reach = edges.iter().flatten().map(|x| x * outward).fold(f32::MIN, f32::max);
+        let white = edges
+            .iter()
+            .map(|x| x.map_or(DEPTH, |x| (reach - x * outward).min(DEPTH)))
+            .sum::<f32>()
+            / SCANLINES as f32;
+        Some(Side {
+            reach: reach * outward,
+            white,
+        })
+    }
+}
+
+impl Glyph {
+    /// Where the next letter's spacing starts, from this one's origin.
+    fn after(&self, face: &Face) -> f32 {
+        self.right
+            .map_or(self.advance, |s| s.reach - s.white + face.right)
+    }
+
+    /// Where this letter's origin sits, from where its spacing starts.
+    fn before(&self, face: &Face) -> f32 {
+        self.left.map_or(0., |s| face.left - s.reach - s.white)
+    }
 }
 
 /// A glyph of a line, flattened out of its run.
@@ -102,11 +150,12 @@ impl Cache {
             let n = ts.glyph_for_char(font, 'n')?;
             let preferred = at.iter().find(|(m, _)| *m == PREFERRED)?.1;
             let n = self.glyph(ts, preferred, n).clone();
-            let gap = n.advance + optical(&n, &n)?;
+            let (left, right) = (n.left?, n.right?);
             Some(Face {
                 at,
                 duo_i: ts.glyph_for_char(font, DUO_I),
-                gap,
+                right: n.advance - right.reach + right.white,
+                left: left.reach + left.white,
             })
         })();
         self.faces.insert(font, face.clone());
@@ -140,8 +189,8 @@ impl Cache {
             });
             Glyph {
                 advance,
-                left,
-                right,
+                left: Side::of(left, -1.),
+                right: Side::of(right, 1.),
                 whole,
             }
         })
@@ -199,16 +248,19 @@ impl Cache {
                     _ => (face.at(mono), placed.glyph.id),
                 };
                 let glyph = self.glyph(ts, form, id).clone();
-                if let Some(prev) = &prev {
-                    let even = optical(prev, &glyph).map_or(prev.advance, |c| face.gap - c);
-                    x += even.max(clearance(prev, &glyph));
+                match &prev {
+                    Some(prev) => {
+                        let even = prev.after(&face) + glyph.before(&face);
+                        x += even.max(clearance(prev, &glyph));
+                    }
+                    None => x = glyph.before(&face),
                 }
                 placed.font = form;
                 placed.glyph.id = id;
                 placed.glyph.position.x = px(pen + x * em);
                 prev = Some(glyph);
             }
-            pen += (x + prev.map_or(0., |p| p.advance)) * em;
+            pen += (x + prev.map_or(0., |p| p.after(&face))) * em;
             start = end;
         }
         pen
@@ -276,28 +328,6 @@ fn crossings(curve: &gpui::QuadraticCurve, y: f32) -> impl Iterator<Item = f32> 
         .flatten()
         .filter(|t| (0. ..1.).contains(t))
         .map(move |t| (1. - t) * (1. - t) * p0.x + 2. * t * (1. - t) * p1.x + t * t * p2.x)
-}
-
-/// The optical gap between `a` and `b` drawn with origins one em-unit apart,
-/// minus that distance, or `None` when either has ink on fewer than half the
-/// scanlines, like a hyphen or a period, whose missing scanlines would read as
-/// white.
-fn optical(a: &Glyph, b: &Glyph) -> Option<f32> {
-    let inked = |edges: &[Option<f32>]| edges.iter().flatten().count() * 2 >= SCANLINES;
-    if !inked(&a.right) || !inked(&b.left) {
-        return None;
-    }
-    let gaps: Vec<Option<f32>> = (0..SCANLINES)
-        .map(|s| Some(b.left[s]? - a.right[s]?))
-        .collect();
-    let closest = gaps.iter().flatten().copied().reduce(f32::min)?;
-    let cap = closest + DEPTH;
-    Some(
-        gaps.iter()
-            .map(|g| g.map_or(cap, |g| g.min(cap)))
-            .sum::<f32>()
-            / SCANLINES as f32,
-    )
 }
 
 /// The least distance between the origins of `a` and `b` that keeps their ink
@@ -585,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn letters_keep_one_optical_gap() -> anyhow::Result<()> {
+    fn letters_take_their_forms() -> anyhow::Result<()> {
         let (ts, font) = rho()?;
         let text = "minimum illicit, wow rhythm";
         let shaped = shape(&ts, text, font);
@@ -603,46 +633,67 @@ mod tests {
         let duo = ts
             .glyph_for_char(font, DUO_I)
             .expect("Rho Font carries Duo's i");
-        let mut gaps = 0;
-        for (i, (form, glyph)) in after.iter().enumerate() {
-            let ch = &text[glyph.index..glyph.index + 1];
-            match ch {
+        for (form, glyph) in &after {
+            match &text[glyph.index..glyph.index + 1] {
                 "i" => assert_eq!(glyph.id, duo),
                 "m" | "w" => assert_eq!(*form, face.at(0.), "m and w take their sans form"),
                 " " => assert_eq!(*form, font),
                 _ => assert_eq!(*form, face.at(PREFERRED)),
             }
-            let Some((next_form, next)) = after.get(i + 1) else {
-                continue;
-            };
-            let next_ch = &text[next.index..next.index + 1];
-            if ch == " " {
-                let was = f32::from(before[i + 1].1.position.x - before[i].1.position.x);
-                assert!(
-                    (f32::from(next.position.x - glyph.position.x) - was).abs() < 1e-3,
-                    "spaces keep their width"
-                );
-            } else if next_ch != " " && next_ch != "," {
-                let (a, b) = (
-                    cache.glyph(&ts, *form, glyph.id).clone(),
-                    cache.glyph(&ts, *next_form, next.id).clone(),
-                );
-                let distance = f32::from(next.position.x - glyph.position.x) / EM;
-                let gap = distance + optical(&a, &b).expect("letters share the x-height");
-                assert!(
-                    (gap - face.gap).abs() < 1e-4,
-                    "{ch}{next_ch}: gap {gap}, want {}",
-                    face.gap
-                );
-                gaps += 1;
-            }
         }
-        assert_eq!(gaps, 19);
-        assert!(
-            face.gap > 0.05 && face.gap < 0.3,
-            "an ordinary letter gap: {}",
-            face.gap
-        );
+        Ok(())
+    }
+
+    /// Where `word`'s ink across the x-height starts, and how far past it the
+    /// word ends, in ems.
+    fn margins(ts: &CosmicTextSystem, font: FontId, word: &str) -> (f32, f32) {
+        let typesetter = RhoTypesetter::default();
+        let mut set = shape(ts, word, font);
+        typesetter.typeset(ts, word, &mut set);
+        let mut cache = typesetter.0.lock().unwrap();
+        let placed = glyphs(&set);
+        let mut ink = |i: usize| {
+            let (form, glyph) = &placed[i];
+            let glyph_ink = cache.glyph(ts, *form, glyph.id);
+            let (left, right) = (glyph_ink.left.unwrap(), glyph_ink.right.unwrap());
+            let x = f32::from(glyph.position.x) / EM;
+            (x + left.reach, x + right.reach)
+        };
+        (ink(0).0, f32::from(set.width) / EM - ink(placed.len() - 1).1)
+    }
+
+    #[test]
+    fn an_n_keeps_its_own_spacing() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        let typesetter = RhoTypesetter::default();
+        let mut set = shape(&ts, "nnn", font);
+        typesetter.typeset(&ts, "nnn", &mut set);
+        let mut cache = typesetter.0.lock().unwrap();
+        let face = cache.face(&ts, font).expect("Rho Font");
+        let n = ts.glyph_for_char(font, 'n').unwrap();
+        let advance = cache.glyph(&ts, face.at(PREFERRED), n).advance;
+        let placed = glyphs(&set);
+        assert!(f32::from(placed[0].1.position.x).abs() < 1e-4);
+        for pair in placed.windows(2) {
+            let distance = f32::from(pair[1].1.position.x - pair[0].1.position.x) / EM;
+            assert!((distance - advance).abs() < 1e-4, "{distance} against {advance}");
+        }
+        assert!((f32::from(set.width) / EM - 3. * advance).abs() < 1e-4);
+        Ok(())
+    }
+
+    /// A narrow letter's mono form is wide, with room around its ink; a word
+    /// starting or ending with one must not show that room as space: no more
+    /// than an `n`'s, give or take the white behind the farthest ink.
+    #[test]
+    fn words_start_and_end_at_their_ink() -> anyhow::Result<()> {
+        let (ts, font) = rho()?;
+        let (n_start, n_end) = margins(&ts, font, "nown");
+        for word in ["lowl", "iowi", "town"] {
+            let (start, end) = margins(&ts, font, word);
+            assert!(start < n_start + 0.02, "{word} starts {start}, n {n_start}");
+            assert!(end < n_end + 0.02, "{word} ends {end}, n {n_end}");
+        }
         Ok(())
     }
 
@@ -791,5 +842,6 @@ mod tests {
         assert_eq!(pairs, 9);
         Ok(())
     }
+
 
 }

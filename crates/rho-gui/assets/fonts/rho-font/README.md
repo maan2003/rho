@@ -16,7 +16,7 @@ families, such as `i`, `l`, `g` and `0`. For those, the mono master
 gets the sans outline centred in the mono advance. The mono outline
 becomes a `.mono` alternate, used only from `MONO` 0.5 up. The `.mono`
 alternates keep the sans advance at `MONO` 0, so every advance
-interpolates. The font keeps the whole `MONO` axis, defaulting to 0.82,
+interpolates. The font keeps the whole `MONO` axis, defaulting to 0.6,
 with `wght` from 400 to 700. Kerning comes
 from the sans, and OpenType features are dropped.
 
@@ -26,13 +26,14 @@ matches Duo's, and existing font-size settings read as they did.
 
 The OFL reserves "Source", "Plex" and "iA Writer", so the result carries rho's own name.
 
-The typesetter sets every line of Rho Font itself. Each letter sits so
-the optical gap to its neighbour matches the gap between two `n`s, so a
-word's width comes from its letters, not from a grid. When the editor
+The typesetter sets every line of Rho Font itself. Each letter side is
+spaced by its own ink, the way a designer sets sidebearings, to have the
+white of an `n`'s side, so a word's width comes from its letters, not
+from a grid. When the editor
 wraps a paragraph, the typesetter chooses the breaks and each line's
 `MONO` value between 0.5 and 0.7 together, keeping the right edge even
 (Knuth–Plass, with `MONO` as font expansion). `m` and `w` take their
-sans form; in the mono master they get one and a half cells, as in Duo.
+sans form.
 
 Plex's slab `i`, as drawn for iA Writer Duo and scaled to 942 units per
 em, sits at U+E000 in the upright font. The typesetter draws every
