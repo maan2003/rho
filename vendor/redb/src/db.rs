@@ -1,15 +1,21 @@
+use crate::BackendError;
 use crate::io;
 use crate::transaction_tracker::{TransactionId, TransactionTracker};
+#[cfg(feature = "experimental-multiprocess")]
+use crate::transactions::AllocatorStateLatch;
+#[cfg(feature = "experimental-multiprocess")]
+use crate::tree_store::HeaderGuard;
 #[cfg(not(redb_no_std))]
 use crate::tree_store::ReadOnlyBackend;
+#[cfg(feature = "experimental-multiprocess")]
+use crate::tree_store::WriterLock;
 use crate::tree_store::{
     AllocationPolicy, BtreeHeader, InternalTableDefinition, PAGE_SIZE, PageHint, PageNumber,
     PageResolver, ShrinkPolicy, TableTree, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
 use crate::{
-    CompactionError, DatabaseError, Error, ReadOnlyTable, ReadableTable, SavepointError,
-    StorageError, TableError,
+    CompactionError, DatabaseError, ReadOnlyTable, ReadableTable, StorageError, TableError,
 };
 use crate::{ReadTransaction, Result, WriteTransaction};
 use alloc::boxed::Box;
@@ -20,6 +26,7 @@ use core::fmt::{Debug, Display, Formatter};
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
+use core::ops::{Bound, Range};
 #[cfg(not(redb_no_std))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(redb_no_std))]
@@ -40,7 +47,30 @@ use log::{debug, warn};
 #[allow(clippy::len_without_is_empty)]
 /// Implements persistent storage for a database.
 ///
-/// Failures are reported as [`io::Error`], which is [`std::io::Error`] whenever std is available.
+/// I/O failures are reported as [`io::Error`], which is [`std::io::Error`] whenever std is
+/// available. Locking operations use [`BackendError`] to distinguish unsupported operations.
+///
+/// Locking is optional. Backends that implement it must override the lock methods. Locks belong to
+/// a backend instance and must conflict with locks held by independently opened instances,
+/// including those in the same process. All locks must be released by [`Self::close`].
+/// redb never acquires overlapping locks on the same backend. Failed or refused acquisitions
+/// must not acquire any locks or change existing locks.
+///
+/// Lock bounds refer to byte offsets and may extend beyond the current length of the storage.
+/// An unbounded start means offset zero; an unbounded end includes all future growth. Bounds
+/// must describe a nonempty range. Implementations may reject offsets or lengths that their
+/// underlying locking API cannot represent with [`BackendError::Io`].
+///
+/// redb never queries backend-reserved ranges and only locks them during whole-storage fallback.
+/// See the [design document](https://github.com/cberner/redb/blob/master/docs/design.md#lock-bytes).
+///
+/// Backends that support locking must support one of the following levels:
+/// 1) All representable ranges requested by redb are supported. All concurrency modes will work.
+/// 2) Only whole-storage locks (`Unbounded, Unbounded` or `Included(0), Unbounded`) are
+///    supported. Other ranges return [`BackendError::Unsupported`]. Only the `ExclusiveWriter`
+///    concurrency mode will work.
+/// 3) All inputs return [`BackendError::Unsupported`]. Only the `ExclusiveWriter` concurrency
+///    mode will work, and redb will log a warning on open if logging is enabled.
 pub trait StorageBackend: 'static + Debug + Send + Sync {
     /// Gets the current length of the storage.
     fn len(&self) -> core::result::Result<u64, io::Error>;
@@ -63,12 +93,124 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
 
     /// Release any resources held by the backend
     ///
+    /// Must release all locks acquired by one of the lock methods.
+    ///
     /// Note: redb will not access the backend after calling this method and will call it exactly
     /// once: when the [`Database`] is dropped, or, if a [`WriteTransaction`] was live at that
     /// point, when that transaction completes, or if opening the database fails
     fn close(&self) -> core::result::Result<(), io::Error> {
         Ok(())
     }
+
+    /// Attempts to acquire an exclusive byte-range lock.
+    ///
+    /// Returns `Ok(true)` on acquisition, `Ok(false)` on a conflicting lock, or an error.
+    /// Defaults to [`BackendError::Unsupported`].
+    fn try_lock_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Attempts to acquire a shared byte-range lock.
+    ///
+    /// Returns `Ok(true)` on acquisition, `Ok(false)` on a conflicting lock, or an error.
+    /// Defaults to [`BackendError::Unsupported`].
+    fn try_lock_shared_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Acquires an exclusive byte-range lock, waiting for conflicting locks to be released.
+    ///
+    /// Defaults to [`BackendError::Unsupported`].
+    fn lock_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Acquires a shared byte-range lock, waiting for conflicting locks to be released.
+    ///
+    /// Defaults to [`BackendError::Unsupported`].
+    fn lock_shared_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Releases the lock acquired over exactly this range.
+    ///
+    /// The range passed will exactly match a range successfully locked by one of the lock methods.
+    ///
+    /// Defaults to [`BackendError::Unsupported`].
+    fn unlock_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Reports whether an exclusive lock over the range would conflict with a lock held elsewhere.
+    ///
+    /// The queried range will not overlap any lock currently held by this backend.
+    /// Defaults to [`BackendError::Unsupported`].
+    fn query_lock_range(
+        &self,
+        _start: Bound<u64>,
+        _end: Bound<u64>,
+    ) -> core::result::Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+}
+
+#[cfg_attr(redb_no_std, allow(dead_code))]
+pub(crate) const FULL_RANGE: (Bound<u64>, Bound<u64>) = (Bound::Unbounded, Bound::Unbounded);
+
+#[cfg_attr(not(any(windows, unix, target_os = "wasi")), allow(dead_code))]
+const LOCK_BASE: u64 = 1 << 62;
+/// Reserved for backend locking. Core only covers these bytes with a whole-storage fallback lock.
+pub(crate) const BACKEND_LOCK_RANGE: Range<u64> = LOCK_BASE + 896..LOCK_BASE + 1024;
+
+/// Held exclusively by the writing process in single-writer mode.
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) const WRITER_BYTE: u64 = LOCK_BASE;
+/// Whether the database is open for a single writer (held exclusively by it) or for many (held
+/// shared by each writing process while the database is open).
+#[cfg_attr(not(any(windows, unix, target_os = "wasi")), allow(dead_code))]
+pub(crate) const SHARED_WRITER_BYTE: u64 = LOCK_BASE + 1;
+/// Held shared by every read-only multi-process handle while the database is open, so that a
+/// exclusive-writer open conflicts with a live reader no matter what the reader is doing.
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) const SHARED_READER_BYTE: u64 = LOCK_BASE + 2;
+/// Held shared by a read-only exclusive-writer handle as part of its whole-file lock. Such a
+/// handle leaves `SHARED_WRITER_BYTE` free, so a multi-writer open, which takes only that byte,
+/// must probe this one to find it.
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) const WHOLE_FILE_READER_BYTE: u64 = LOCK_BASE + 3;
+/// Held shared by a writing process from the moment its open is complete -- past recovery and
+/// the allocator load -- until it closes: the file is consistent, and the recovery flag, set from
+/// here on, means only that a writer is live. `SHARED_WRITER_BYTE` is taken before recovery, so
+/// it cannot say that; this byte can.
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) const CONSISTENT_BYTE: u64 = LOCK_BASE + 4;
+/// Base of the "active transaction range": a handle reading transaction `t` holds `TXN_BASE + t`
+/// shared for as long as it is reading it
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) const TXN_BASE: u64 = LOCK_BASE + 1024;
+
+pub(crate) fn byte_range(offset: u64) -> (Bound<u64>, Bound<u64>) {
+    (Bound::Included(offset), Bound::Included(offset))
 }
 
 pub trait TableHandle: Sealed {
@@ -284,14 +426,43 @@ impl CacheStats {
     }
 }
 
+// The write slot, taken ahead of the writer byte and held until the transaction ends. Releases
+// it on drop, and performs the close a `Database::drop()` deferred to that end
+pub(crate) struct WriteSlot {
+    tracker: Arc<TransactionTracker>,
+}
+
+impl WriteSlot {
+    fn take(tracker: Arc<TransactionTracker>) -> Self {
+        tracker.take_write_slot();
+        Self { tracker }
+    }
+}
+
+impl Drop for WriteSlot {
+    fn drop(&mut self) {
+        if let Some(mem) = self.tracker.end_write_transaction() {
+            close_database(&self.tracker, &mem);
+        }
+    }
+}
+
 pub(crate) enum TransactionGuard {
     Read {
         tracker: Arc<TransactionTracker>,
         transaction_id: TransactionId,
+        // `Some` while this guard owns the transaction's reference, carrying what the tracker
+        // needs to release it. `None` when a savepoint becomes persistent: the database
+        // owns the reference from then on and releases it when the savepoint is deleted
+        reference: Option<Arc<TransactionalMemory>>,
     },
     Write {
-        tracker: Arc<TransactionTracker>,
         transaction_id: TransactionId,
+        // Dropped ahead of the slot, in this order: a thread waiting on the slot would take the
+        // same byte on this file description, and this release would free theirs
+        #[cfg(feature = "experimental-multiprocess")]
+        _writer_lock: Arc<WriterLock>,
+        slot: WriteSlot,
     },
     // Used for internal accesses that happen outside of any tracked transaction,
     // such as opening the database, repairing it, and running integrity checks.
@@ -302,28 +473,69 @@ impl TransactionGuard {
     pub(crate) fn new_read(
         transaction_id: TransactionId,
         tracker: Arc<TransactionTracker>,
+        mem: &Arc<TransactionalMemory>,
     ) -> Self {
         Self::Read {
             tracker,
             transaction_id,
+            reference: Some(mem.clone()),
         }
     }
 
+    // A guard for a transaction whose reference the database already owns
+    pub(crate) fn new_read_unowned(
+        transaction_id: TransactionId,
+        tracker: Arc<TransactionTracker>,
+    ) -> Self {
+        Self::Read {
+            tracker,
+            transaction_id,
+            reference: None,
+        }
+    }
+
+    // Leak the reference to the transaction. The caller becomes responsible for decrementing the
+    // reference count.
+    // Dropping this guard then releases nothing.
+    pub(crate) fn release_to_database(&mut self) {
+        let Self::Read { reference, .. } = self else {
+            unreachable!("only a read transaction's reference may be leaked")
+        };
+        drop(reference.take());
+    }
+
+    pub(crate) fn owns_reference(&self) -> bool {
+        matches!(self, Self::Read { reference, .. } if reference.is_some())
+    }
+
+    pub(crate) fn tracker(&self) -> &Arc<TransactionTracker> {
+        match self {
+            Self::Read { tracker, .. } => tracker,
+            Self::Write { slot, .. } => &slot.tracker,
+            Self::Untracked => unreachable!("an untracked guard has no tracker"),
+        }
+    }
+
+    // Returns a read guard and the data root its registration protects.
     pub(crate) fn allocate_read(
         tracker: Arc<TransactionTracker>,
-        mem: &TransactionalMemory,
-    ) -> Result<Self> {
-        let id = tracker.register_read_transaction(mem)?;
-        Ok(Self::new_read(id, tracker))
+        mem: &Arc<TransactionalMemory>,
+    ) -> Result<(Self, Option<BtreeHeader>)> {
+        let (id, root) = tracker.register_read_transaction(mem)?;
+
+        Ok((Self::new_read(id, tracker, mem), root))
     }
 
     pub(crate) fn new_write(
         transaction_id: TransactionId,
-        tracker: Arc<TransactionTracker>,
+        slot: WriteSlot,
+        #[cfg(feature = "experimental-multiprocess")] writer_lock: Arc<WriterLock>,
     ) -> Self {
         Self::Write {
-            tracker,
             transaction_id,
+            #[cfg(feature = "experimental-multiprocess")]
+            _writer_lock: writer_lock,
+            slot,
         }
     }
 
@@ -349,16 +561,20 @@ impl Drop for TransactionGuard {
             Self::Read {
                 tracker,
                 transaction_id,
-            } => tracker.deallocate_read_transaction(*transaction_id),
-            Self::Write {
-                tracker,
-                transaction_id,
+                reference,
             } => {
-                if let Some(mem) = tracker.end_write_transaction(*transaction_id) {
-                    // The Database was dropped while this transaction was live, deferring
-                    // the database close to the end of this transaction
-                    close_database(tracker, &mem);
+                if let Some(mem) = reference {
+                    tracker.deallocate_read_transaction(mem, *transaction_id);
                 }
+            }
+            Self::Write {
+                #[cfg(feature = "experimental-multiprocess")]
+                slot,
+                ..
+            } => {
+                // Leave `Live` before the fields drop the writer lock and then the slot.
+                #[cfg(feature = "experimental-multiprocess")]
+                slot.tracker.begin_finalizing();
             }
             Self::Untracked => {}
         }
@@ -389,6 +605,11 @@ pub trait ReadableDatabase: SealedInApi5 {
 ///
 /// Multiple processes may open a [`ReadOnlyDatabase`], but it may not be opened concurrently
 /// with a [`Database`].
+#[cfg_attr(
+    feature = "experimental-multiprocess",
+    doc = "",
+    doc = "`SingleWriter` and `MultiWriter` are the exception: a reader shares the file with the writer and follows its commits. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+)]
 ///
 /// # Examples
 ///
@@ -435,15 +656,12 @@ impl Sealed for ReadOnlyDatabase {}
 #[cfg(not(redb_no_std))]
 impl ReadableDatabase for ReadOnlyDatabase {
     fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        let id = self
-            .transaction_tracker
-            .register_read_transaction(&self.mem)?;
+        let (guard, root) =
+            TransactionGuard::allocate_read(self.transaction_tracker.clone(), &self.mem)?;
         #[cfg(feature = "logging")]
-        debug!("Beginning read transaction id={id:?}");
+        debug!("Beginning read transaction id={:?}", guard.id());
 
-        let guard = TransactionGuard::new_read(id, self.transaction_tracker.clone());
-
-        ReadTransaction::new(self.mem.clone(), guard)
+        ReadTransaction::new(self.mem.clone(), guard, root)
     }
 
     fn cache_stats(&self) -> CacheStats {
@@ -464,31 +682,40 @@ impl ReadOnlyDatabase {
         page_size: usize,
         region_size: Option<u64>,
         cache_size: usize,
+        concurrency_mode: ConcurrencyMode,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
         debug!("Opening database in read-only {:?}", &file_path);
-        let mem = TransactionalMemory::new(
+        let (mem, _writer_lock) = TransactionalMemory::new(
             Box::new(ReadOnlyBackend::new(file)),
             false,
             page_size,
             region_size,
             cache_size,
             true,
+            concurrency_mode,
         )?;
         let mem = Arc::new(mem);
-        // If the last transaction used 2-phase commit and updated the allocator state table, then
-        // we can just load the allocator state from there. Otherwise, we need a full repair
-        if let Some(tree) = Database::get_allocator_state_table(&mem)? {
-            mem.load_allocator_state(&tree)?;
-        } else {
-            #[cfg(feature = "logging")]
-            warn!(
-                "Database {:?} not shutdown cleanly. Repair required",
-                &file_path
-            );
-            return Err(DatabaseError::RepairAborted);
+        // A reader beside a multi-process writer never allocates, so it loads no allocator state
+        #[cfg(feature = "experimental-multiprocess")]
+        let multiprocess_writer = concurrency_mode.is_multi_process_writable();
+        #[cfg(not(feature = "experimental-multiprocess"))]
+        let multiprocess_writer = false;
+        if !multiprocess_writer {
+            // If the last transaction used 2-phase commit and updated the allocator state table, then
+            // we can just load the allocator state from there. Otherwise, we need a full repair
+            if let Some(tree) = Database::get_allocator_state_table(&mem)? {
+                mem.load_allocator_state(&tree)?;
+            } else {
+                #[cfg(feature = "logging")]
+                warn!(
+                    "Database {:?} not shutdown cleanly. Repair required",
+                    &file_path
+                );
+                return Err(DatabaseError::RepairAborted);
+            }
         }
 
         let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
@@ -554,10 +781,11 @@ impl Sealed for Database {}
 
 impl ReadableDatabase for Database {
     fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        let guard = TransactionGuard::allocate_read(self.transaction_tracker.clone(), &self.mem)?;
+        let (guard, root) =
+            TransactionGuard::allocate_read(self.transaction_tracker.clone(), &self.mem)?;
         #[cfg(feature = "logging")]
         debug!("Beginning read transaction id={:?}", guard.id());
-        ReadTransaction::new(self.get_memory(), guard)
+        ReadTransaction::new(self.get_memory(), guard, root)
     }
 
     fn cache_stats(&self) -> CacheStats {
@@ -632,11 +860,17 @@ impl Database {
     /// and `Err(Corrupted)` if the check failed and the file could not be repaired.
     ///
     /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction, or an
-    /// ephemeral [`Savepoint`](crate::Savepoint), is still alive when this method is called.
+    /// ephemeral [`Savepoint`](crate::Savepoint), is still alive on this handle when this method
+    /// is called.
     ///
     /// Transactions committed with [`Durability::None`](crate::Durability::None) that have not yet
     /// been made durable are made durable if the check passes, or rolled back if the database must
     /// be repaired.
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "In the multi-process concurrency modes the check holds the writer lock: it waits for a write transaction in another process to end, and no other process writes to the file until it returns. A read transaction in another process neither blocks the check nor is disturbed by it. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+    )]
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
         if Arc::get_mut(&mut self.mem).is_none() {
             return Err(DatabaseError::TransactionInProgress);
@@ -652,24 +886,33 @@ impl Database {
         self.mem.check_io_errors()?;
         // Once the allocator state has been discarded (by a failed commit or integrity check),
         // the database must be reopened to rebuild it; this check requires one to compare against
-        if !self.mem.allocator_state_loaded() {
+        if self.mem.allocator_state_invalidated() {
             return Err(StorageError::Corrupted(
                 "Allocator state was discarded by a failed integrity check or commit; reopen the database to repair it".to_string(),
             )
             .into());
         }
 
+        // Held until the check returns, so the file it reloads is the file it repairs
+        #[cfg(feature = "experimental-multiprocess")]
+        let writer_lock = self.mem.lock_writer()?;
         // Repairing rebuilds the allocator state, so a failure part way through leaves one that
         // describes neither the file nor anything else. Holding an allocator state must continue
         // to mean it describes the file.
-        let result = self.check_integrity_inner();
+        let result = self.check_integrity_inner(
+            #[cfg(feature = "experimental-multiprocess")]
+            &writer_lock,
+        );
         if result.is_err() {
             self.mem.invalidate_allocator_state();
         }
         result
     }
 
-    fn check_integrity_inner(&mut self) -> Result<bool, DatabaseError> {
+    fn check_integrity_inner(
+        &mut self,
+        #[cfg(feature = "experimental-multiprocess")] writer_lock: &Arc<WriterLock>,
+    ) -> Result<bool, DatabaseError> {
         // A pending Durability::None commit is acknowledged, live data that the reload below would
         // discard. If the live state verifies, promote it to durable rather than losing it -- even
         // if the durable state it replaces turns out to be corrupt, in which case we recover from
@@ -688,11 +931,19 @@ impl Database {
                 // clean only if neither the allocator nor the durable state below needed repair.
                 let durable_clean = self.durable_state_clean()?;
                 let mut txn = self
-                    .begin_write()
+                    .begin_write_with(
+                        #[cfg(feature = "experimental-multiprocess")]
+                        Some(writer_lock),
+                        #[cfg(feature = "experimental-multiprocess")]
+                        None,
+                    )
                     .map_err(|e| DatabaseError::Storage(e.into_storage_error()))?;
                 txn.disable_post_commit_free();
                 txn.commit()
                     .map_err(|e| DatabaseError::Storage(e.into_storage_error()))?;
+                // The rebuild above reclaimed any leaked pages, so the close may record a
+                // clean shutdown again
+                self.mem.clear_needs_repair();
                 return Ok(live_allocator_clean && durable_clean);
             }
             // The live tree is corrupt (or the file size changed), so the reload rolls the commit
@@ -702,10 +953,32 @@ impl Database {
 
         // No pending commit, or fall-through: verify and repair the durable state. Capture the
         // allocator hash to compare against the rebuild below; with the pending case handled above,
-        // the live and durable states are identical here, so this is a valid check.
-        let allocator_hash = self.mem.allocator_hash();
+        // the live and durable states are identical here, so this is a valid check. When the reload
+        // finds another process's commit, the snapshot it recorded is compared instead: that is
+        // what the next open trusts.
+        let own_allocator_hash = self.mem.allocator_hash();
         let mem = Arc::get_mut(&mut self.mem).unwrap();
-        let mut was_clean = mem.clear_cache_and_reload()?;
+        let (mut was_clean, peer_committed) = mem.clear_cache_and_reload()?;
+        let allocator_hash = if peer_committed {
+            match Self::get_allocator_state_table(&self.mem)? {
+                Some(tree) => {
+                    self.mem.load_allocator_state(&tree)?;
+                    Some(self.mem.allocator_hash())
+                }
+                None => None,
+            }
+        } else {
+            Some(own_allocator_hash)
+        };
+        // An interrupted compaction or repair may leave no allocator snapshot. Record one so
+        // the next writer can load it without rebuilding again.
+        #[cfg(feature = "experimental-multiprocess")]
+        if peer_committed
+            && allocator_hash.is_none()
+            && self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter
+        {
+            was_clean = false;
+        }
 
         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
@@ -715,7 +988,7 @@ impl Database {
         })?;
 
         if old_roots != new_roots
-            || allocator_hash != self.mem.allocator_hash()
+            || allocator_hash.is_some_and(|hash| hash != self.mem.allocator_hash())
             || rolling_back_non_durable
         {
             was_clean = false;
@@ -730,12 +1003,70 @@ impl Database {
                 next_transaction_id,
                 true,
                 ShrinkPolicy::Never,
+                #[cfg(feature = "experimental-multiprocess")]
+                None,
+            )?;
+            // Reserve the id, or the next write transaction would commit with the same one,
+            // which crash recovery could then resolve to the wrong slot
+            self.transaction_tracker
+                .reserve_repair_transaction_id(next_transaction_id);
+        }
+
+        // The rebuild reclaimed any leaked pages, so the close may record a clean shutdown
+        // again
+        self.mem.clear_needs_repair();
+        self.mem.begin_writable()?;
+
+        // The tracker holds the persistent savepoints the reloaded tables hold, as the open's does
+        if peer_committed {
+            Self::sync_persistent_savepoints(
+                &self.transaction_tracker,
+                &self.mem,
+                #[cfg(feature = "experimental-multiprocess")]
+                Some(writer_lock),
+            )?;
+        }
+        // In multi-writer mode a repair ends with a commit recording the allocator state, as the
+        // open's does; after the savepoints are held, since a commit frees what nothing pins
+        #[cfg(feature = "experimental-multiprocess")]
+        if !was_clean && self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter {
+            ensure_allocator_state_table_and_trim(
+                &self.transaction_tracker,
+                &self.mem,
+                Some(writer_lock),
+                None,
             )?;
         }
 
-        self.mem.begin_writable()?;
-
         Ok(was_clean)
+    }
+
+    // Synchronizes the tracker state for the file's persistent savepoints. The transaction this
+    // begins is lent `writer_lock`, when the caller holds one
+    fn sync_persistent_savepoints(
+        transaction_tracker: &Arc<TransactionTracker>,
+        mem: &Arc<TransactionalMemory>,
+        #[cfg(feature = "experimental-multiprocess")] writer_lock: Option<&Arc<WriterLock>>,
+    ) -> Result<(), DatabaseError> {
+        let txn = begin_write_with_allocation_policy(
+            transaction_tracker,
+            mem,
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock,
+            #[cfg(feature = "experimental-multiprocess")]
+            None,
+            AllocationPolicy::Default,
+        )
+        .map_err(|e| e.into_storage_error())?;
+        sync_persistent_savepoints(
+            transaction_tracker,
+            #[cfg(feature = "experimental-multiprocess")]
+            mem,
+            &txn,
+        )?;
+        txn.abort()?;
+
+        Ok(())
     }
 
     // Verifies, and repairs in memory, the live (possibly non-durable) state. Returns:
@@ -751,7 +1082,7 @@ impl Database {
             Ok(true) => {
                 let live_allocator_hash = self.mem.allocator_hash();
                 let live_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
-                match Self::rebuild_allocator_state(&mut self.mem, &|_| {}) {
+                match Self::rebuild_allocator_state(&self.mem, &|_| {}) {
                     // Only a durable root can be rewritten from here, so a live root whose table
                     // count was recomputed must be rolled back and repaired by the reload below
                     Ok(roots) if roots != live_roots => Ok(None),
@@ -800,6 +1131,19 @@ impl Database {
         // be diagnosed before read references, because every live savepoint also holds a read
         // reference. The tracker covers persistent savepoints created by previous Database
         // instances, because they are re-registered when the database is opened.
+        // In multi-writer mode the tracker's savepoints go stale: a peer may have deleted one
+        // since this handle last synced, and only a write transaction of this handle's own syncs
+        // them again. Refresh before reporting one as a blocker, unless this process already has
+        // a write transaction live, since beginning another would block on it.
+        #[cfg(feature = "experimental-multiprocess")]
+        if self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter
+            && self.transaction_tracker.any_persistent_savepoint_exists()
+            && !self.transaction_tracker.write_transaction_live()
+        {
+            self.begin_write()
+                .map_err(|e| e.into_storage_error())?
+                .abort()?;
+        }
         if self.transaction_tracker.any_persistent_savepoint_exists() {
             return Err(CompactionError::PersistentSavepointExists);
         }
@@ -809,10 +1153,35 @@ impl Database {
         if self.transaction_tracker.any_user_read_reference_exists() {
             return Err(CompactionError::TransactionInProgress);
         }
+        // Where the file is shared, held until the compaction is over and lent to the
+        // transactions it runs: no other process begins a transaction under them, and one that
+        // already has is a transaction in progress. Taken once a write transaction begun before
+        // this call has ended: its commit would wait on the holds, and in multi-writer mode its
+        // end would release the writer byte from under a hold taken meanwhile
+        #[cfg(feature = "experimental-multiprocess")]
+        let (writer_lock, header_lock) = if self.mem.concurrency_mode().is_multi_process_writable()
+        {
+            self.begin_write()
+                .map_err(|e| e.into_storage_error())?
+                .abort()?;
+            (
+                Some(self.mem.lock_writer()?),
+                Some(self.mem.lock_header_exclusive()?),
+            )
+        } else {
+            (None, None)
+        };
         // Use 2-phase commit to avoid any possible security issues. Plus this compaction is going to be so slow that it doesn't matter.
         // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
         // can cancel the compaction without requiring a full repair afterwards
-        let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+        let txn = self
+            .begin_write_with(
+                #[cfg(feature = "experimental-multiprocess")]
+                writer_lock.as_ref(),
+                #[cfg(feature = "experimental-multiprocess")]
+                header_lock.as_ref(),
+            )
+            .map_err(|e| e.into_storage_error())?;
         // Re-check inside the write transaction: a concurrent writer may have created a
         // savepoint between the checks above and the start of this transaction.
         if txn.list_persistent_savepoints()?.next().is_some() {
@@ -824,26 +1193,60 @@ impl Database {
         if self.transaction_tracker.any_user_read_reference_exists() {
             return Err(CompactionError::TransactionInProgress);
         }
+        // No local read is left to bound the scan, so a pin it finds is a peer's
+        #[cfg(feature = "experimental-multiprocess")]
+        if let Some(header_lock) = &header_lock
+            && self
+                .mem
+                .oldest_active_transaction(None, header_lock)?
+                .is_some()
+        {
+            return Err(CompactionError::TransactionInProgress);
+        }
         txn.abort()?;
         // Commit to free up any pending free pages
-        self.drain_pending_free_pages(ShrinkPolicy::Maximum)?;
+        self.drain_pending_free_pages(
+            ShrinkPolicy::Maximum,
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock.as_ref(),
+            #[cfg(feature = "experimental-multiprocess")]
+            header_lock.as_ref(),
+        )?;
 
         let mut compacted = false;
         // Iteratively compact until no progress is made
         loop {
             let mut progress = false;
 
-            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            let mut txn = self
+                .begin_write_with(
+                    #[cfg(feature = "experimental-multiprocess")]
+                    writer_lock.as_ref(),
+                    #[cfg(feature = "experimental-multiprocess")]
+                    header_lock.as_ref(),
+                )
+                .map_err(|e| e.into_storage_error())?;
+            txn.skip_allocator_state_record();
             if txn.compact_pages()? {
                 progress = true;
-                txn.commit().map_err(|e| e.into_storage_error())?;
+                txn.commit_with(
+                    #[cfg(feature = "experimental-multiprocess")]
+                    header_lock.as_ref(),
+                )
+                .map_err(|e| e.into_storage_error())?;
             } else {
                 txn.abort()?;
             }
 
             // Drain pages freed by compact_pages(), including system pages queued by any
             // post-commit cleanup root updates.
-            self.drain_pending_free_pages(ShrinkPolicy::Maximum)?;
+            self.drain_pending_free_pages(
+                ShrinkPolicy::Maximum,
+                #[cfg(feature = "experimental-multiprocess")]
+                writer_lock.as_ref(),
+                #[cfg(feature = "experimental-multiprocess")]
+                header_lock.as_ref(),
+            )?;
 
             if !progress {
                 break;
@@ -852,23 +1255,55 @@ impl Database {
             compacted = true;
         }
 
+        // In multi-writer mode the file's latest commit records the allocator state, for the
+        // next writer, in any process, to load rather than rebuild: the commit the close makes.
+        // Not in the other modes, where the close records and a second record would leave the
+        // file one record larger, the pages of the one it replaces being freed only by the next
+        // commit
+        #[cfg(feature = "experimental-multiprocess")]
+        if self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter {
+            ensure_allocator_state_table_and_trim(
+                &self.transaction_tracker,
+                &self.mem,
+                writer_lock.as_ref(),
+                header_lock.as_ref(),
+            )?;
+        }
+
         Ok(compacted)
     }
 
-    fn drain_pending_free_pages(&self, shrink_policy: ShrinkPolicy) -> Result {
+    fn drain_pending_free_pages(
+        &self,
+        shrink_policy: ShrinkPolicy,
+        #[cfg(feature = "experimental-multiprocess")] writer_lock: Option<&Arc<WriterLock>>,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+    ) -> Result {
         // Preserve compact()'s empty durable commit, which also publishes pending
         // non-durable roots before checking for pending frees.
         let mut force_commit = true;
         loop {
-            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            let mut txn = self
+                .begin_write_with(
+                    #[cfg(feature = "experimental-multiprocess")]
+                    writer_lock,
+                    #[cfg(feature = "experimental-multiprocess")]
+                    header_lock,
+                )
+                .map_err(|e| e.into_storage_error())?;
             if !force_commit && !txn.pending_free_pages()? {
                 txn.abort()?;
                 return Ok(());
             }
             force_commit = false;
+            txn.skip_allocator_state_record();
             txn.set_two_phase_commit(true);
             txn.set_shrink_policy(shrink_policy);
-            txn.commit().map_err(|e| e.into_storage_error())?;
+            txn.commit_with(
+                #[cfg(feature = "experimental-multiprocess")]
+                header_lock,
+            )
+            .map_err(|e| e.into_storage_error())?;
         }
     }
 
@@ -970,9 +1405,7 @@ impl Database {
     }
 
     #[cfg(debug_assertions)]
-    fn mark_allocated_page_for_debug(
-        mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
-    ) -> Result {
+    fn mark_allocated_page_for_debug(mem: &Arc<TransactionalMemory>) -> Result {
         let data_root = mem.get_data_root();
         {
             let untracked = Arc::new(TransactionGuard::untracked());
@@ -1080,8 +1513,11 @@ impl Database {
     // The returned roots carry table counts recounted from the trees that were walked. These
     // counts are stored in the commit slot rather than in a page, so no page checksum covers
     // them; recounting here is what lets the rest of the codebase trust them.
+    //
+    // Callers must ensure nothing else uses the allocator meanwhile: either no transaction is
+    // live, or the caller holds the write slot (read transactions never allocate or free).
     fn rebuild_allocator_state(
-        mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
+        mem: &Arc<TransactionalMemory>,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
         mem.reset_allocator_state()?;
@@ -1143,35 +1579,74 @@ impl Database {
         root.map(|header| BtreeHeader::new(header.root, header.checksum, length))
     }
 
+    /// Loads the latest allocator snapshot, or rebuilds it if compaction or repair stopped before
+    /// recording one. The caller holds the write slot and writer byte throughout.
+    #[cfg(feature = "experimental-multiprocess")]
+    fn load_synced_allocator_state(
+        mem: &Arc<TransactionalMemory>,
+        _writer_lock: &WriterLock,
+    ) -> Result {
+        if let Some(tree) = Self::get_allocator_state_table(mem)? {
+            mem.load_allocator_state(&tree)?;
+            #[cfg(debug_assertions)]
+            Self::mark_allocated_page_for_debug(mem)?;
+        } else {
+            if !Self::verify_primary_checksums(mem.clone())? {
+                return Err(StorageError::Corrupted(
+                    "Cannot rebuild allocator state: committed trees are corrupted".to_string(),
+                ));
+            }
+            // Freed-page tables retain the pages that readers and persistent savepoints still
+            // reference. Rebuilding must keep those allocated as well as the current trees.
+            let roots = Self::rebuild_allocator_state(mem, &|_| {})
+                .map_err(DatabaseError::into_storage_error_or_corrupted)?;
+            if roots != [mem.get_data_root(), mem.get_system_root()] {
+                return Err(StorageError::Corrupted(
+                    "Committed table counts do not match the database trees".to_string(),
+                ));
+            }
+        }
+        // Loaded or rebuilt, this state holds none of the pages leaked by a transaction that
+        // was dropped while a panic unwound. The next commit can record it again.
+        mem.clear_needs_repair();
+
+        Ok(())
+    }
+
     fn new(
         file: Box<dyn StorageBackend>,
         allow_initialize: bool,
         page_size: usize,
         region_size: Option<u64>,
         cache_size: usize,
+        concurrency_mode: ConcurrencyMode,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
         debug!("Opening database {:?}", &file_path);
-        let mem = TransactionalMemory::new(
+        // The open runs under this lock, which the multi-writer open took for the header read
+        // below and the repair after it, and which the transactions it runs are lent
+        let (mem, writer_lock) = TransactionalMemory::new(
             file,
             allow_initialize,
             page_size,
             region_size,
             cache_size,
             false,
+            concurrency_mode,
         )?;
         let mut mem = Arc::new(mem);
         // If the last transaction used 2-phase commit and updated the allocator state table, then
         // we can just load the allocator state from there. Otherwise, we need a full repair
-        if let Some(tree) = Self::get_allocator_state_table(&mem)? {
+        let repaired = if let Some(tree) = Self::get_allocator_state_table(&mem)? {
             #[cfg(feature = "logging")]
             debug!("Found valid allocator state, full repair not needed");
             mem.load_allocator_state(&tree)?;
             #[cfg(debug_assertions)]
-            Self::mark_allocated_page_for_debug(&mut mem)?;
+            Self::mark_allocated_page_for_debug(&mem)?;
+            false
         } else {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -1188,40 +1663,46 @@ impl Database {
                 next_transaction_id,
                 true,
                 ShrinkPolicy::Never,
+                #[cfg(feature = "experimental-multiprocess")]
+                None,
             )?;
-        }
-
-        mem.begin_writable()?;
-        let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
-
-        let db = Database {
-            mem,
-            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
+            true
         };
 
-        // Restore the tracker state for any persistent savepoints
-        let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-        if let Some(next_id) = txn.next_persistent_savepoint_id()? {
-            db.transaction_tracker
-                .restore_savepoint_counter_state(next_id);
-        }
-        for id in txn.list_persistent_savepoints()? {
-            let savepoint = match txn.get_persistent_savepoint(id) {
-                Ok(savepoint) => savepoint,
-                Err(err) => match err {
-                    SavepointError::InvalidSavepoint
-                    | SavepointError::ImmediateDurabilityRequired => unreachable!(),
-                    SavepointError::Storage(storage) => {
-                        return Err(storage.into());
-                    }
-                },
-            };
-            db.transaction_tracker
-                .register_persistent_savepoint(&savepoint);
-        }
-        txn.abort()?;
+        mem.begin_writable()?;
+        // Past recovery, so a reader finding this byte held knows the flag means a live writer
+        #[cfg(feature = "experimental-multiprocess")]
+        mem.mark_consistent()?;
+        let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
 
-        Ok(db)
+        let transaction_tracker = Arc::new(TransactionTracker::new(next_transaction_id));
+
+        // Restore the tracker state for any persistent savepoints
+        Self::sync_persistent_savepoints(
+            &transaction_tracker,
+            &mem,
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock.as_ref(),
+        )?;
+        // In multi-writer mode a repair ends with a commit recording the allocator state, as
+        // compaction and the integrity check do, so that the next open, in any process, loads it
+        #[cfg(feature = "experimental-multiprocess")]
+        if repaired && concurrency_mode == ConcurrencyMode::MultiWriter {
+            ensure_allocator_state_table_and_trim(
+                &transaction_tracker,
+                &mem,
+                writer_lock.as_ref(),
+                None,
+            )?;
+        }
+        #[cfg(not(feature = "experimental-multiprocess"))]
+        let _ = (repaired, writer_lock);
+        // Construct only after initialization succeeds: Database::drop takes the writer lock,
+        // which the open still holds, and assumes the savepoint tracker is complete.
+        Ok(Database {
+            mem,
+            transaction_tracker,
+        })
     }
 
     fn get_allocator_state_table(
@@ -1281,51 +1762,169 @@ impl Database {
     /// database open: if the [`Database`] is dropped while the transaction is live, the
     /// transaction remains usable and the database closes when the transaction completes.
     pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
+        self.begin_write_with(
+            #[cfg(feature = "experimental-multiprocess")]
+            None,
+            #[cfg(feature = "experimental-multiprocess")]
+            None,
+        )
+    }
+
+    fn begin_write_with(
+        &self,
+        #[cfg(feature = "experimental-multiprocess")] writer_lock: Option<&Arc<WriterLock>>,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+    ) -> Result<WriteTransaction, TransactionError> {
         begin_write_with_allocation_policy(
             &self.transaction_tracker,
             &self.mem,
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock,
+            #[cfg(feature = "experimental-multiprocess")]
+            header_lock,
             AllocationPolicy::Default,
         )
     }
 }
 
-// The allocation policy is fixed for the lifetime of the transaction; every page allocation
-// this transaction makes goes through it.
+// Syncs the file's persistent savepoints, which another process may have created or
+// deleted since the tracker last saw the file, and continues savepoint ids past the file's.
+fn sync_persistent_savepoints(
+    transaction_tracker: &TransactionTracker,
+    #[cfg(feature = "experimental-multiprocess")] mem: &TransactionalMemory,
+    txn: &WriteTransaction,
+) -> Result {
+    if let Some(next_id) = txn.next_persistent_savepoint_id()? {
+        transaction_tracker.restore_savepoint_counter_state(next_id);
+    }
+    let current = txn.persistent_savepoint_transactions()?;
+    #[cfg(feature = "experimental-multiprocess")]
+    for &transaction_id in current.values() {
+        // The file names its persistent savepoints, so the transaction each points at is
+        // untrusted: one outside the lock range would be tracked as a read this process holds
+        mem.check_active_transaction_id(transaction_id)?;
+    }
+    transaction_tracker.sync_persistent_savepoints(&current)
+}
+
+/// Brings this handle up to the file's latest commit, in multi-writer mode, when it is not
+/// already on it. That is the case when another process has committed since this handle last
+/// read the file, and when a panic latched a repair, which leaves this handle's allocator state
+/// holding pages that the file's latest commit does not.
+///
+/// `writer_lock` proves that the caller holds the writer byte, so that no other process commits
+/// while the header is read and the allocator state loaded from it; `header_lock` is the header
+/// lock the caller already holds, if any.
+///
+/// Returns `None` when the handle was already on the file's latest commit. Otherwise returns a
+/// latch that discards the allocator state unless the caller finishes the sync.
+#[cfg(feature = "experimental-multiprocess")]
+fn sync_to_latest_commit(
+    mem: &Arc<TransactionalMemory>,
+    writer_lock: &WriterLock,
+    header_lock: Option<&HeaderGuard<'_>>,
+) -> Result<Option<AllocatorStateLatch>> {
+    if mem.concurrency_mode() != ConcurrencyMode::MultiWriter {
+        return Ok(None);
+    }
+    let synced = {
+        let hold = mem.header_hold(header_lock)?;
+        mem.reload_for_write(writer_lock, &hold)?
+    };
+    if !synced {
+        return Ok(None);
+    }
+    // Armed before the load, because a load that stops part way leaves an allocator state that
+    // describes neither the commit it came from nor the one it was going to
+    let latch = AllocatorStateLatch::arm(mem.clone());
+    Database::load_synced_allocator_state(mem, writer_lock)?;
+    // Loading the allocator state cleared the recovery flag that a live writer keeps set, and a
+    // peer's close may have cleared it in the file as well. Set it again, so that the next
+    // commit writes it back and a crash of this handle is still recovered from.
+    mem.mark_recovery_required();
+
+    Ok(Some(latch))
+}
+
+// Takes the write slot and the writer byte, syncs to the file's latest commit, and builds the
+// transaction on them.
+//
+// A caller that already holds the writer byte lends its lock as `writer_lock`. Taking the writer
+// byte again from this file description would return that same lock, and the end of this
+// transaction would then release the caller's. A caller that holds the header lock lends it as
+// `header_lock`, because the in-process half of that lock cannot be taken twice.
+//
+// The allocation policy is fixed for the lifetime of the transaction; every page allocation the
+// transaction makes goes through it.
 fn begin_write_with_allocation_policy(
     transaction_tracker: &Arc<TransactionTracker>,
     mem: &Arc<TransactionalMemory>,
+    #[cfg(feature = "experimental-multiprocess")] writer_lock: Option<&Arc<WriterLock>>,
+    #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
     allocation_policy: AllocationPolicy,
 ) -> Result<WriteTransaction, TransactionError> {
     // Fail early if there has been an I/O error -- nothing can be committed in that case
     mem.check_io_errors()?;
-    let guard = TransactionGuard::new_write(
-        transaction_tracker.start_write_transaction(),
-        transaction_tracker.clone(),
-    );
+    // The slot ahead of the byte: locks on the byte from one file description are one lock, so
+    // the slot is what orders this process's writers. An error return drops both
+    let slot = WriteSlot::take(transaction_tracker.clone());
+    #[cfg(feature = "experimental-multiprocess")]
+    let writer_lock = writer_lock.map_or_else(|| mem.lock_writer(), |lent| Ok(lent.clone()))?;
+    #[cfg(feature = "experimental-multiprocess")]
+    let latch = sync_to_latest_commit(mem, &writer_lock, header_lock)?;
     // Re-checked after acquiring the write slot: the writer this call blocked on can fail its
     // commit, latching an I/O error and discarding the allocator state. The I/O check comes
-    // first so a backend failure is not misreported as corruption. Returning drops the guard,
-    // releasing the slot.
+    // first so a backend failure is not misreported as corruption
     mem.check_io_errors()?;
-    if !mem.allocator_state_loaded() {
+    if mem.allocator_state_invalidated() {
         return Err(StorageError::Corrupted(
             "Allocator state was discarded by a failed integrity check or commit; reopen the database to repair it".to_string(),
         )
         .into());
     }
-    WriteTransaction::new(
+    // Issued once the sync is done, so that the id follows the file's latest commit
+    let transaction_id = transaction_tracker.issue_write_transaction_id(
+        mem.get_last_committed_transaction_id()?,
+        #[cfg(feature = "experimental-multiprocess")]
+        &writer_lock,
+    );
+    let guard = TransactionGuard::new_write(
+        transaction_id,
+        slot,
+        #[cfg(feature = "experimental-multiprocess")]
+        writer_lock,
+    );
+    let transaction = WriteTransaction::new(
         guard,
         transaction_tracker.clone(),
         mem.clone(),
         allocation_policy,
-    )
-    .map_err(|e| e.into())
+    )?;
+    // The file's persistent savepoints are synced here, before this transaction frees anything,
+    // so that the transactions they point at stay pinned. If the sync fails, the transaction is
+    // aborted and the latch then discards the allocator state.
+    #[cfg(feature = "experimental-multiprocess")]
+    if latch.is_some() {
+        sync_persistent_savepoints(transaction_tracker, mem, &transaction)?;
+    }
+    #[cfg(feature = "experimental-multiprocess")]
+    if let Some(latch) = latch {
+        latch.disarm();
+    }
+
+    Ok(transaction)
 }
 
+// Records the allocator state in a commit that also trims the file: the close's last commit,
+// compaction's, and the one ending a repair in the open or the integrity check. `writer_lock`
+// and `header_lock` are the ones the caller lends, when it holds them; nothing is waiting on the
+// write slot in any of these cases
 fn ensure_allocator_state_table_and_trim(
     transaction_tracker: &Arc<TransactionTracker>,
     mem: &Arc<TransactionalMemory>,
-) -> Result<(), Error> {
+    #[cfg(feature = "experimental-multiprocess")] writer_lock: Option<&Arc<WriterLock>>,
+    #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+) -> Result {
     // Make a new quick-repair commit to update the allocator state table
     #[cfg(feature = "logging")]
     debug!("Writing allocator state table");
@@ -1333,12 +1932,24 @@ fn ensure_allocator_state_table_and_trim(
     // commit's writes at high page indices (see AllocationPolicy::Lowest)
     // and try_shrink can't reclaim the growth. See
     // https://github.com/cberner/redb/issues/1165
-    let mut tx =
-        begin_write_with_allocation_policy(transaction_tracker, mem, AllocationPolicy::Lowest)?;
+    let mut tx = begin_write_with_allocation_policy(
+        transaction_tracker,
+        mem,
+        #[cfg(feature = "experimental-multiprocess")]
+        writer_lock,
+        #[cfg(feature = "experimental-multiprocess")]
+        header_lock,
+        AllocationPolicy::Lowest,
+    )
+    .map_err(|e| e.into_storage_error())?;
     tx.set_quick_repair(true);
     tx.disable_post_commit_free();
     tx.set_shrink_policy(ShrinkPolicy::Maximum);
-    tx.commit()?;
+    tx.commit_with(
+        #[cfg(feature = "experimental-multiprocess")]
+        header_lock,
+    )
+    .map_err(|e| e.into_storage_error())?;
 
     Ok(())
 }
@@ -1350,14 +1961,49 @@ fn ensure_allocator_state_table_and_trim(
 // transaction can be started concurrently and the commit in here cannot block on the
 // write-transaction slot.
 fn close_database(transaction_tracker: &Arc<TransactionTracker>, mem: &Arc<TransactionalMemory>) {
-    if !crate::panicking()
-        && ensure_allocator_state_table_and_trim(transaction_tracker, mem).is_err()
-    {
+    // No saved allocator state when it needs repair: the next open must rebuild it instead
+    // of trusting the saved one. Nor after a latched I/O failure, decided ahead of the lock,
+    // which waits on a peer holding the writer byte
+    let writing = !crate::panicking() && !mem.needs_repair() && mem.check_io_errors().is_ok();
+    // One hold across the allocator state's commit and the shutdown header: a commit another
+    // process made between them would be overwritten by the header. Without the hold, neither
+    // is written: the commit would take one of its own and release it, and the header would
+    // then overwrite a commit made between them
+    #[cfg(feature = "experimental-multiprocess")]
+    let writer_lock = if writing {
+        mem.lock_writer().ok()
+    } else {
+        None
+    };
+    #[cfg(feature = "experimental-multiprocess")]
+    let writing = writing && writer_lock.is_some();
+    let recorded = writing
+        && ensure_allocator_state_table_and_trim(
+            transaction_tracker,
+            mem,
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock.as_ref(),
+            #[cfg(feature = "experimental-multiprocess")]
+            None,
+        )
+        .is_ok();
+    if writing && !recorded {
         #[cfg(feature = "logging")]
         warn!("Failed to write allocator state table. Repair may be required at restart.");
     }
+    // The shutdown header describes this handle, which matches the file only once the commit
+    // above has synced to the file's latest commit. Without that commit, write no header, and
+    // leave the file for the next open to recover.
+    #[cfg(feature = "experimental-multiprocess")]
+    let writer_lock = writer_lock.filter(|_| recorded);
 
-    if mem.close().is_err() {
+    if mem
+        .close(
+            #[cfg(feature = "experimental-multiprocess")]
+            writer_lock.as_ref(),
+        )
+        .is_err()
+    {
         #[cfg(feature = "logging")]
         warn!("Failed to flush database file. Repair may be required at restart.");
     }
@@ -1410,11 +2056,47 @@ impl RepairSession {
     }
 }
 
+/// How processes share a database: the regime a writer operates under. Whether a given handle
+/// writes is chosen by `open()` against `open_read_only()`, not by the mode.
+///
+/// Every process opening one database concurrently must use a compatible mode: one
+/// `SingleWriter` writer or any number of `MultiWriter` writers, plus read-only handles in either
+/// case. Those two modes need byte-range file locks, so they are supported on Linux, the Apple
+/// platforms and Windows; elsewhere, opening a database in one of them fails. `ExclusiveWriter`
+/// locks the whole file and works everywhere.
+#[cfg_attr(
+    not(feature = "experimental-multiprocess"),
+    allow(dead_code, unreachable_pub, clippy::enum_variant_names)
+)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum ConcurrencyMode {
+    /// A writer excludes every other process; read-only handles share the file with each other
+    /// and exclude any writer. Enforced by locking the whole file. The default.
+    #[default]
+    ExclusiveWriter,
+    /// One process writes; any number of processes may, concurrently, open the database read-only
+    /// and follow its commits.
+    SingleWriter,
+    /// Any number of processes may, concurrently, open the database for reading and writing.
+    /// Only one write transaction may be open at a time.
+    MultiWriter,
+}
+
+#[cfg(feature = "experimental-multiprocess")]
+impl ConcurrencyMode {
+    /// Whether another process may have the database open, concurrently, and one process
+    /// (possibly this one) is a writer
+    pub(crate) fn is_multi_process_writable(self) -> bool {
+        !matches!(self, ConcurrencyMode::ExclusiveWriter)
+    }
+}
+
 /// Configuration builder of a redb [Database].
 pub struct Builder {
     page_size: usize,
     region_size: Option<u64>,
     cache_size: usize,
+    concurrency_mode: ConcurrencyMode,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
 }
 
@@ -1432,6 +2114,7 @@ impl Builder {
             // It is part of the file format, so can be enabled in the future.
             page_size: PAGE_SIZE,
             region_size: None,
+            concurrency_mode: ConcurrencyMode::ExclusiveWriter,
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
         }
@@ -1472,6 +2155,13 @@ impl Builder {
         self
     }
 
+    /// Set how processes may share this database. Defaults to [`ConcurrencyMode::ExclusiveWriter`].
+    #[cfg(feature = "experimental-multiprocess")]
+    pub fn set_concurrency_mode(&mut self, mode: ConcurrencyMode) -> &mut Self {
+        self.concurrency_mode = mode;
+        self
+    }
+
     #[cfg(any(test, fuzzing))]
     pub fn set_region_size(&mut self, size: u64) -> &mut Self {
         assert!(size.is_power_of_two());
@@ -1498,6 +2188,7 @@ impl Builder {
             self.page_size,
             self.region_size,
             self.cache_size,
+            self.concurrency_mode,
             &self.repair_callback,
         )
     }
@@ -1513,6 +2204,7 @@ impl Builder {
             self.page_size,
             None,
             self.cache_size,
+            self.concurrency_mode,
             &self.repair_callback,
         )
     }
@@ -1522,6 +2214,11 @@ impl Builder {
     /// If the file has been opened for writing (i.e. as a [`Database`]) [`DatabaseError::DatabaseAlreadyOpen`]
     /// will be returned on platforms which support file locks (macOS, Windows, Linux). On other platforms,
     /// the caller MUST avoid calling this method when the database is open for writing.
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "Only an `ExclusiveWriter` writer is refused: in `SingleWriter` and `MultiWriter` a reader opened in the same mode as the writer shares the file with it and picks up its commits. See [`Self::set_concurrency_mode`]."
+    )]
     #[cfg(not(redb_no_std))]
     pub fn open_read_only(
         &self,
@@ -1530,10 +2227,11 @@ impl Builder {
         let file = OpenOptions::new().read(true).open(path)?;
 
         ReadOnlyDatabase::new(
-            Box::new(FileBackend::new_internal(file, true)?),
+            Box::new(FileBackend::new(file)?),
             self.page_size,
             None,
             self.cache_size,
+            self.concurrency_mode,
         )
     }
 
@@ -1548,6 +2246,7 @@ impl Builder {
             self.page_size,
             self.region_size,
             self.cache_size,
+            self.concurrency_mode,
             &self.repair_callback,
         )
     }
@@ -1563,6 +2262,7 @@ impl Builder {
             self.page_size,
             self.region_size,
             self.cache_size,
+            self.concurrency_mode,
             &self.repair_callback,
         )
     }
@@ -1645,6 +2345,47 @@ mod test {
         fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
             self.decrement_countdown()?;
             self.inner.write(offset, data)
+        }
+    }
+
+    #[test]
+    fn read_snapshot_survives_commits_before_construction() {
+        use super::{ReadTransaction, TransactionGuard};
+
+        const TABLE: TableDefinition<u64, u64> = TableDefinition::new("snapshot");
+        for durability in [Durability::Immediate, Durability::None] {
+            let tmpfile = crate::create_tempfile();
+            let db = Database::create(tmpfile.path()).unwrap();
+            let mut write = db.begin_write().unwrap();
+            write.set_durability(durability).unwrap();
+            write.open_table(TABLE).unwrap().insert(0, 0).unwrap();
+            write.commit().unwrap();
+
+            let (guard, root) =
+                TransactionGuard::allocate_read(db.transaction_tracker.clone(), &db.mem).unwrap();
+            assert_eq!(
+                guard.id(),
+                db.mem.get_last_committed_transaction_id().unwrap()
+            );
+
+            // Commits between registration and construction must not change this read's root.
+            for value in 1..4 {
+                let mut write = db.begin_write().unwrap();
+                write.set_durability(durability).unwrap();
+                write.open_table(TABLE).unwrap().insert(0, value).unwrap();
+                write.commit().unwrap();
+            }
+
+            let read = ReadTransaction::new(db.mem.clone(), guard, root).unwrap();
+            assert_eq!(
+                read.open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                0
+            );
         }
     }
 
@@ -2005,5 +2746,1537 @@ mod test {
                 if err.kind() == ErrorKind::InvalidData => {}
             err => panic!("Unexpected error for empty file: {err}"),
         }
+    }
+}
+
+/// Probed directly, since the public API reports every lock conflict the same way and so
+/// cannot say which byte caused one.
+#[cfg(all(
+    test,
+    feature = "experimental-multiprocess",
+    any(target_os = "linux", target_vendor = "apple", windows)
+))]
+mod writer_byte_test {
+    use super::{ConcurrencyMode, Database, WRITER_BYTE, byte_range};
+    use crate::TableDefinition;
+    use crate::tree_store::HEADER_LOCK;
+    use crate::tree_store::file_backend::range_lock::RangeLock;
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+
+    const TABLE: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    fn create(path: &Path, mode: ConcurrencyMode) -> Database {
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(mode);
+        builder.create(path).unwrap()
+    }
+
+    /// A separate description, so its locks conflict with the database's exactly as another
+    /// process's would
+    fn probe(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    fn commit_one(db: &Database) {
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(0, 0).unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    /// Whether the file is unclean, as a shared reader sees it: it is refused an unclean file
+    /// no live writer holds
+    fn left_unclean(path: &Path) -> bool {
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        match builder.open_read_only(path) {
+            Err(super::DatabaseError::RepairAborted) => true,
+            Err(err) => panic!("{err}"),
+            Ok(_) => false,
+        }
+    }
+
+    /// The shutdown header is written under the writer byte, or not at all: written without it,
+    /// it would overwrite a commit another process makes meanwhile
+    #[test]
+    fn the_shutdown_header_is_written_under_the_writer_byte_or_not_at_all() {
+        // The memory's close alone, without the database's, which would write the header itself
+        fn close(path: &Path, under_the_byte: bool) {
+            let db = create(path, ConcurrencyMode::MultiWriter);
+            commit_one(&db);
+            let mem = db.mem.clone();
+            std::mem::forget(db);
+            if under_the_byte {
+                let writer_lock = mem.lock_writer().unwrap();
+                mem.close(Some(&writer_lock)).unwrap();
+            } else {
+                mem.close(None).unwrap();
+            }
+        }
+
+        let tmpfile = crate::create_tempfile();
+        close(tmpfile.path(), false);
+        assert!(
+            left_unclean(tmpfile.path()),
+            "a header was written without the byte"
+        );
+
+        let tmpfile = crate::create_tempfile();
+        close(tmpfile.path(), true);
+        assert!(
+            !left_unclean(tmpfile.path()),
+            "no header was written under the byte"
+        );
+    }
+
+    /// The close takes the byte once, for its commit and for the header after it
+    #[test]
+    fn a_close_leaves_a_clean_file() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        commit_one(&db);
+        drop(db);
+        assert!(
+            !left_unclean(tmpfile.path()),
+            "the close left the file unclean"
+        );
+    }
+
+    /// A multi-writer repair, the create's included, ends with a commit recording the allocator
+    /// state it rebuilt, for the next open to load
+    #[test]
+    fn a_multi_writer_repair_records_the_allocator_state() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Rebuilding keeps live readers and the peer's persistent savepoints usable, even if the
+    /// first transaction using that allocator aborts.
+    #[test]
+    fn a_sync_rebuilds_a_missing_allocator_state() {
+        use crate::{ReadableDatabase, ReadableTable};
+
+        let tmpfile = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .set_cache_size(0);
+        let db = builder.create(tmpfile.path()).unwrap();
+        commit_one(&db);
+        let old_read = db.begin_read().unwrap();
+        let peer = builder.open(tmpfile.path()).unwrap();
+        let mut write = peer.begin_write().unwrap();
+        let savepoint_id = write.persistent_savepoint().unwrap();
+        write.skip_allocator_state_record();
+        write.open_table(TABLE).unwrap().insert(0, 1).unwrap();
+        write.commit().unwrap();
+
+        let mut write = db.begin_write().unwrap();
+        {
+            let table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(0).unwrap().unwrap().value(), 1);
+        }
+        let savepoint = write.get_persistent_savepoint(savepoint_id).unwrap();
+        write.restore_savepoint(&savepoint).unwrap();
+        write.abort().unwrap();
+
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(0).unwrap().unwrap().value(), 1);
+            table.insert(0, 2).unwrap();
+        }
+        write.commit().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        let old_table = old_read.open_table(TABLE).unwrap();
+        assert_eq!(old_table.get(0).unwrap().unwrap().value(), 0);
+
+        let mut write = peer.begin_write().unwrap();
+        let savepoint = write.get_persistent_savepoint(savepoint_id).unwrap();
+        write.restore_savepoint(&savepoint).unwrap();
+        write.commit().unwrap();
+        let read = peer.begin_read().unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), 0);
+    }
+
+    /// Exit after compaction's initial drain, before its final allocator snapshot. The surviving
+    /// writer must resume without reopening, including while a peer reads the published commit.
+    #[test]
+    fn a_writer_recovers_after_interrupted_compaction() {
+        use crate::tree_store::ShrinkPolicy;
+        use crate::{ReadableDatabase, ReadableTable};
+        use std::process::Command;
+
+        const CHILD_PATH: &str = "REDB_TEST_INTERRUPTED_COMPACTION_PATH";
+        let mut builder = Database::builder();
+        builder
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .set_cache_size(0);
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let db = builder.open(path).unwrap();
+            let write = db.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+            write.commit().unwrap();
+            let writer = db.mem.lock_writer().unwrap();
+            let header = db.mem.lock_header_exclusive().unwrap();
+            db.drain_pending_free_pages(ShrinkPolicy::Maximum, Some(&writer), Some(&header))
+                .unwrap();
+            assert!(
+                Database::get_allocator_state_table(&db.mem)
+                    .unwrap()
+                    .is_none()
+            );
+            std::process::exit(42);
+        }
+
+        let tmpfile = crate::create_tempfile();
+        let db = builder.create(tmpfile.path()).unwrap();
+        commit_one(&db);
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::writer_byte_test::a_writer_recovers_after_interrupted_compaction",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, tmpfile.path())
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(42), "{child:?}");
+
+        let reader = builder.open_read_only(tmpfile.path()).unwrap();
+        let old_read = reader.begin_read().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(1).unwrap().unwrap().value(), 1);
+            table.insert(2, 2).unwrap();
+        }
+        write.commit().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        let old_table = old_read.open_table(TABLE).unwrap();
+        assert_eq!(old_table.get(1).unwrap().unwrap().value(), 1);
+        assert!(old_table.get(2).unwrap().is_none());
+
+        builder
+            .set_repair_callback(|_| panic!("the recovered writer did not record its allocator"));
+        let peer = builder.open(tmpfile.path()).unwrap();
+        let read = peer.begin_read().unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        for key in 0..3u64 {
+            assert_eq!(table.get(key).unwrap().unwrap().value(), key);
+        }
+    }
+
+    /// A missing snapshot permits rebuilding the allocator, but never trusting damaged roots.
+    #[test]
+    fn a_sync_refuses_corruption_without_an_allocator_snapshot() {
+        use crate::tree_store::ShrinkPolicy;
+        use crate::{StorageError, TransactionError};
+
+        for corrupt_checksum in [true, false] {
+            let tmpfile = crate::create_tempfile();
+            let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+            let peer = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+            commit_one(&peer);
+            let writer = peer.mem.lock_writer().unwrap();
+            let mut root = peer.mem.get_data_root().unwrap();
+            if corrupt_checksum {
+                root.checksum ^= 1;
+            } else {
+                root.length += 1;
+            }
+            peer.mem
+                .commit(
+                    Some(root),
+                    peer.mem.get_system_root(),
+                    peer.mem.get_last_committed_transaction_id().unwrap().next(),
+                    true,
+                    ShrinkPolicy::Never,
+                    None,
+                )
+                .unwrap();
+            peer.mem.invalidate_allocator_state();
+            drop(writer);
+
+            assert!(matches!(
+                db.begin_write(),
+                Err(TransactionError::Storage(StorageError::Corrupted(_)))
+            ));
+            assert!(!db.mem.allocator_state_loaded());
+            assert!(matches!(
+                db.begin_write(),
+                Err(TransactionError::Storage(StorageError::Corrupted(_)))
+            ));
+        }
+    }
+
+    /// A transaction dropped while a panic unwinds leaks its pages, which latches a repair.
+    /// Syncing to a peer's commit replaces the allocator state with the file's, which does not
+    /// hold those pages, so the next commit records the state again.
+    #[test]
+    fn syncing_to_a_peers_commit_releases_the_repair_a_panic_latched() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let peer = builder.open(tmpfile.path()).unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let write = db.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+            panic!("unwinding through the transaction");
+        }));
+        assert!(unwound.is_err());
+        assert!(db.mem.needs_repair());
+
+        commit_one(&peer);
+        commit_one(&db);
+        assert!(!db.mem.needs_repair());
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The first transaction after a panic releases the repair latch, so its commit records the
+    /// allocator state without making a peer rebuild it.
+    #[test]
+    fn a_transaction_releases_the_repair_a_panic_latched_without_a_peers_commit() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let peer = builder.open(tmpfile.path()).unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let write = db.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+            panic!("unwinding through the transaction");
+        }));
+        assert!(unwound.is_err());
+        assert!(db.mem.needs_repair());
+
+        commit_one(&db);
+        assert!(!db.mem.needs_repair());
+        peer.begin_write()
+            .expect("the peer syncs to a commit that recorded the allocator state")
+            .abort()
+            .unwrap();
+    }
+
+    /// An open reads the file's length under the header lock, so a create holding that lock is
+    /// waited for and its result read, rather than the file being sampled part way through it.
+    /// Before, the length was sampled outside any lock: an empty file was called empty and a
+    /// resized one not a redb database, however far the create had got by the time it was read
+    #[test]
+    fn an_open_waits_behind_a_creator_instead_of_calling_the_file_empty() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        // What the create will have produced by the time it releases the lock
+        let initialized = crate::create_tempfile();
+        drop(create(initialized.path(), ConcurrencyMode::MultiWriter));
+        let mut bytes = Vec::new();
+        File::open(initialized.path())
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let tmpfile = crate::create_tempfile();
+        let probe = probe(tmpfile.path());
+        // Stands in for a create holding the header lock across its initialization
+        assert!(probe.try_lock_range(HEADER_LOCK).unwrap());
+
+        let path = tmpfile.path().to_path_buf();
+        let (opened, opens) = mpsc::channel();
+        let opening = thread::spawn(move || {
+            let mut builder = Database::builder();
+            builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+            let result = builder.open(&path);
+            opened.send(()).unwrap();
+            result
+        });
+
+        assert!(
+            opens.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the open read the file while the creator held the header lock"
+        );
+        // The create finishes: from here the file is a database, as it would be at the release.
+        // Written through the handle that holds the lock, as a create writes under its own: on
+        // Windows a byte-range lock is mandatory, and excludes writes from every other handle
+        (&probe).seek(SeekFrom::Start(0)).unwrap();
+        (&probe).write_all(&bytes).unwrap();
+        probe.sync_all().unwrap();
+        probe.unlock_range(HEADER_LOCK).unwrap();
+
+        opens
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the open never took the header lock");
+        // A length sampled before the lock would still be the zero it read at the start
+        opening
+            .join()
+            .unwrap()
+            .expect("the open used a length it read before the creator finished");
+    }
+
+    /// A multi-writer open runs under the writer byte, so that two processes do not repair the
+    /// same file at once and commit over each other
+    #[test]
+    fn a_multi_writer_open_waits_for_the_writer_byte() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        // A commit recording nothing leaves the file for the next open to repair. The handle
+        // stays open, since its close would record
+        let mut write = db.begin_write().unwrap();
+        write.skip_allocator_state_record();
+        write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        write.commit().unwrap();
+
+        let probe = probe(tmpfile.path());
+        assert!(probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
+        let path = tmpfile.path().to_path_buf();
+        let (repairing, repairs) = mpsc::channel();
+        let opening = thread::spawn(move || {
+            let mut builder = Database::builder();
+            builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+            builder.set_repair_callback(move |_| {
+                let _ = repairing.send(());
+            });
+            builder.open(&path).unwrap()
+        });
+
+        assert!(
+            repairs.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the open repaired while the writer byte was held"
+        );
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
+        repairs
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the repair runs once the byte is free");
+        opening.join().unwrap();
+    }
+
+    /// A peer can commit while an open waits for the writer byte. The open reads the file only
+    /// once it holds the byte, so it sees that commit and repairs nothing it recorded.
+    #[test]
+    fn a_multi_writer_open_reads_the_file_a_peer_committed_while_it_waited() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let mut write = db.begin_write().unwrap();
+        write.skip_allocator_state_record();
+        write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        write.commit().unwrap();
+        // Holds the byte across the open, and records the allocator state when it commits
+        let held = db.begin_write().unwrap();
+        held.open_table(TABLE).unwrap().insert(2, 2).unwrap();
+
+        let path = tmpfile.path().to_path_buf();
+        let (repairing, repairs) = mpsc::channel();
+        let (opened, opens) = mpsc::channel();
+        let opening = thread::spawn(move || {
+            let mut builder = Database::builder();
+            builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+            builder.set_repair_callback(move |_| {
+                let _ = repairing.send(());
+            });
+            let db = builder.open(&path).unwrap();
+            opened.send(()).unwrap();
+            db
+        });
+
+        assert!(
+            opens.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the open did not wait for the byte"
+        );
+        held.commit().unwrap();
+        opens
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the open takes the byte the commit released");
+        let peer = opening.join().unwrap();
+
+        assert!(
+            repairs.try_recv().is_err(),
+            "the open repaired a file the commit had recorded"
+        );
+        // A repair from the header read before that commit would have committed over it
+        let read = super::ReadableDatabase::begin_read(&peer).unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        assert_eq!(
+            crate::ReadableTable::get(&table, 2)
+                .unwrap()
+                .unwrap()
+                .value(),
+            2
+        );
+    }
+    /// A multi-writer compaction ends with a commit recording the allocator state, for the next
+    /// writer, in any process, to load rather than rebuild
+    #[test]
+    fn a_multi_writer_compaction_records_the_allocator_state() {
+        let tmpfile = crate::create_tempfile();
+        let mut db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        commit_one(&db);
+
+        db.compact().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Held for the transaction and no longer, which is what lets the next writer in
+    #[test]
+    fn a_multi_writer_transaction_holds_the_byte_and_gives_it_back() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        let write = db.begin_write().unwrap();
+        assert!(
+            !probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "the byte was free while a write transaction was open"
+        );
+        write.commit().unwrap();
+
+        assert!(
+            probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "the byte was still held after the transaction ended"
+        );
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
+    }
+
+    /// This mode settles who writes at open instead, so the byte is held from then until the
+    /// database closes. A transaction taking it again would convert that hold and drop what
+    /// remained on release, so it holds the open's instead.
+    #[test]
+    fn a_single_writer_open_holds_the_byte_for_its_lifetime() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::SingleWriter);
+        let probe = probe(tmpfile.path());
+
+        assert!(
+            !probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "the open did not take the writer byte"
+        );
+        commit_one(&db);
+        assert!(
+            !probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "a write transaction punctured the open's hold on the writer byte"
+        );
+
+        drop(db);
+        assert!(
+            probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "the byte was still held after the database closed"
+        );
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
+    }
+
+    /// A transaction that outlives the database keeps the lock, and the deferred close writes
+    /// the allocator state under it
+    #[test]
+    fn a_transaction_outliving_the_database_keeps_the_writer_lock() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::SingleWriter);
+        let probe = probe(tmpfile.path());
+
+        let write = db.begin_write().unwrap();
+        drop(db);
+        assert!(
+            !probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "dropping the database released the byte from under a live transaction"
+        );
+
+        write.commit().unwrap();
+        assert!(
+            probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap(),
+            "the byte was still held after the deferred close"
+        );
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
+    }
+}
+
+/// The consistent byte, probed directly: a byte-range lock is invisible through the public API.
+#[cfg(all(
+    test,
+    feature = "experimental-multiprocess",
+    any(target_os = "linux", target_vendor = "apple", windows)
+))]
+mod consistent_byte_test {
+    use super::{CONSISTENT_BYTE, ConcurrencyMode, Database, byte_range};
+    use crate::backends::FileBackend;
+    use crate::tree_store::file_backend::range_lock::RangeLock;
+    use crate::{StorageBackend, TableDefinition};
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const TABLE: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    fn builder(mode: ConcurrencyMode) -> crate::Builder {
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(mode);
+        builder
+    }
+
+    /// A separate description, so its locks conflict with the database's exactly as another
+    /// process's would
+    fn probe(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    /// True when some writer asserts the database is consistent
+    fn held(probe: &File) -> bool {
+        let taken = probe.try_lock_range(byte_range(CONSISTENT_BYTE)).unwrap();
+        if taken {
+            probe.unlock_range(byte_range(CONSISTENT_BYTE)).unwrap();
+        }
+        !taken
+    }
+
+    /// Power loss: once armed, every write silently does nothing, so the close writes neither
+    /// the allocator record nor the clean-shutdown header
+    #[derive(Debug)]
+    struct CrashBackend {
+        inner: FileBackend,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl StorageBackend for CrashBackend {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.write(offset, data)
+        }
+    }
+
+    /// Leaves the file as a crashed writer would: a committed transaction, no allocator record
+    /// and the recovery flag still set, so the next open has to repair it. Built through a
+    /// caller-supplied backend, which takes no locks, so nothing of this handle outlives it.
+    fn dirty(path: &Path) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let dead = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .create_with_backend(CrashBackend {
+                inner: FileBackend::new(file).unwrap(),
+                dead: Arc::clone(&dead),
+            })
+            .unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(0, 0).unwrap();
+        }
+        write.commit().unwrap();
+        // Nothing this handle does from here on reaches the file, its close included
+        dead.store(true, Ordering::SeqCst);
+        drop(db);
+    }
+
+    #[test]
+    fn a_shared_writable_open_asserts_consistency_until_it_closes() {
+        for mode in [ConcurrencyMode::SingleWriter, ConcurrencyMode::MultiWriter] {
+            let tmpfile = crate::create_tempfile();
+            let db = builder(mode).create(tmpfile.path()).unwrap();
+            let probe = probe(tmpfile.path());
+            assert!(held(&probe), "{mode:?} open did not take the byte");
+
+            drop(db);
+            assert!(!held(&probe), "{mode:?} close did not release the byte");
+        }
+    }
+
+    /// The byte's whole purpose. `SHARED_WRITER_BYTE` is taken before recovery runs, so during a
+    /// repair it says a writer is here while the file is still the one the last writer left. This
+    /// byte is taken after, so it says nothing until the file is consistent.
+    #[test]
+    fn a_repairing_open_asserts_consistency_only_once_the_repair_is_done() {
+        let tmpfile = crate::create_tempfile();
+        dirty(tmpfile.path());
+
+        let probe = Arc::new(Mutex::new(probe(tmpfile.path())));
+        let during: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+
+        let db = {
+            let probe = probe.clone();
+            let during = during.clone();
+            let mut builder = builder(ConcurrencyMode::MultiWriter);
+            builder.set_repair_callback(move |_| {
+                let mut during = during.lock().unwrap();
+                if during.is_none() {
+                    *during = Some(held(&probe.lock().unwrap()));
+                }
+            });
+            builder.open(tmpfile.path()).unwrap()
+        };
+
+        assert_eq!(
+            during.lock().unwrap().take(),
+            Some(false),
+            "the byte was held while the open was still repairing"
+        );
+        assert!(held(&probe.lock().unwrap()), "the open never took the byte");
+        drop(db);
+    }
+}
+
+/// The "active transaction range" locks a read transaction publishes, probed directly: a
+/// byte-range lock is invisible through the public API
+#[cfg(all(
+    test,
+    feature = "experimental-multiprocess",
+    any(target_os = "linux", target_vendor = "apple", windows)
+))]
+mod active_transaction_test {
+    use super::{ConcurrencyMode, Database, ReadableDatabase, TXN_BASE, WRITER_BYTE, byte_range};
+    use crate::tree_store::HEADER_LOCK;
+    use crate::tree_store::file_backend::range_lock::RangeLock;
+    use crate::{Durability, SavepointError, SetDurabilityError, TableDefinition};
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+
+    const TABLE: TableDefinition<u64, u64> = TableDefinition::new("x");
+    // The ids a freshly created database can have committed, with room for a few more commits
+    const SEARCHED: std::ops::Range<u64> = 0..16;
+
+    fn create(path: &Path, mode: ConcurrencyMode) -> Database {
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(mode);
+        let db = builder.create(path).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(0, 0).unwrap();
+        }
+        write.commit().unwrap();
+        db
+    }
+
+    /// A separate description, so its locks conflict with the database's exactly as another
+    /// process's would
+    fn probe(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Probed exclusively, since the byte is held shared and another process may hold the same
+    /// one. Reports the whole-file lock a exclusive-writer open holds as well, which is what
+    /// `an_exclusive_writer_read_does_not_puncture_the_whole_file_lock` relies on
+    fn is_held(probe: &File, id: u64) -> bool {
+        let free = probe.try_lock_range(byte_range(TXN_BASE + id)).unwrap();
+        if free {
+            probe.unlock_range(byte_range(TXN_BASE + id)).unwrap();
+        }
+        !free
+    }
+
+    fn held_ids(probe: &File) -> Vec<u64> {
+        SEARCHED.filter(|id| is_held(probe, *id)).collect()
+    }
+
+    #[test]
+    fn a_read_transaction_locks_the_id_it_reads_until_it_ends() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+        assert!(held_ids(&probe).is_empty());
+
+        let read = db.begin_read().unwrap();
+        assert_eq!(
+            held_ids(&probe).len(),
+            1,
+            "a read transaction locked {:?}",
+            held_ids(&probe)
+        );
+
+        drop(read);
+        assert!(
+            held_ids(&probe).is_empty(),
+            "a lock outlived the read transaction that took it"
+        );
+    }
+
+    /// Two readers of one snapshot take the byte once, since it does not nest through a single
+    /// file description: it is released only as the last of them ends
+    #[test]
+    fn concurrent_readers_of_one_snapshot_share_the_lock() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        let first = db.begin_read().unwrap();
+        let second = db.begin_read().unwrap();
+        let held = held_ids(&probe);
+        assert_eq!(held.len(), 1, "expected one active id: {held:?}");
+
+        drop(first);
+        assert!(is_held(&probe, held[0]), "released early");
+        drop(second);
+        assert!(!is_held(&probe, held[0]), "never released");
+    }
+
+    /// A read-only handle is a participant like any other: its snapshot is exactly what a
+    /// writer in another process must not reclaim
+    #[test]
+    fn a_read_only_handle_locks_what_it_reads() {
+        let tmpfile = crate::create_tempfile();
+        // Dropped, so the read-only open is the only handle: it takes SHARED_READER_BYTE, and
+        // the writer that created the file would otherwise hold the whole storage
+        drop(create(tmpfile.path(), ConcurrencyMode::MultiWriter));
+        let probe = probe(tmpfile.path());
+
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let db = builder.open_read_only(tmpfile.path()).unwrap();
+        let read = db.begin_read().unwrap();
+        assert_eq!(
+            held_ids(&probe).len(),
+            1,
+            "a read-only handle locked {:?}",
+            held_ids(&probe)
+        );
+
+        drop(read);
+        assert!(held_ids(&probe).is_empty(), "the lock outlived the reader");
+    }
+
+    #[test]
+    fn read_only_snapshot_survives_new_read_before_construction() {
+        use super::{ReadTransaction, TransactionGuard};
+        use crate::ReadableTable;
+
+        for mode in [ConcurrencyMode::SingleWriter, ConcurrencyMode::MultiWriter] {
+            let tmpfile = crate::create_tempfile();
+            let writer = create(tmpfile.path(), mode);
+            let db = Database::builder()
+                .set_concurrency_mode(mode)
+                .set_cache_size(0)
+                .open_read_only(tmpfile.path())
+                .unwrap();
+            let (guard, root) =
+                TransactionGuard::allocate_read(db.transaction_tracker.clone(), &db.mem).unwrap();
+
+            for value in 1..4 {
+                let write = writer.begin_write().unwrap();
+                write.open_table(TABLE).unwrap().insert(0, value).unwrap();
+                write.commit().unwrap();
+            }
+            // Another read observes the peer's commit before the first read is constructed.
+            let latest = db.begin_read().unwrap();
+            assert_eq!(
+                latest
+                    .open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                3
+            );
+
+            let read = ReadTransaction::new(db.mem.clone(), guard, root).unwrap();
+            assert_eq!(
+                read.open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                0
+            );
+        }
+    }
+
+    #[cfg(feature = "cache_metrics")]
+    #[test]
+    fn read_only_file_snapshots_preserve_memory_state_and_reuse_cache() {
+        use super::TransactionGuard;
+        use crate::ReadableTable;
+
+        for mode in [ConcurrencyMode::SingleWriter, ConcurrencyMode::MultiWriter] {
+            let tmpfile = crate::create_tempfile();
+            let writer = create(tmpfile.path(), mode);
+            let db = Database::builder()
+                .set_concurrency_mode(mode)
+                .open_read_only(tmpfile.path())
+                .unwrap();
+            let original_id = db.mem.get_last_committed_transaction_id().unwrap();
+            let original_root = db.mem.get_data_root();
+            let read = db.begin_read().unwrap();
+            assert_eq!(
+                read.open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                0
+            );
+            let cached_bytes = db.cache_stats().used_bytes();
+            assert!(cached_bytes > 0);
+
+            let (same, _) =
+                TransactionGuard::allocate_read(db.transaction_tracker.clone(), &db.mem).unwrap();
+            assert_eq!(same.id(), original_id);
+            assert_eq!(db.cache_stats().used_bytes(), cached_bytes);
+
+            let write = writer.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(0, 1).unwrap();
+            write.commit().unwrap();
+
+            let (latest, _) =
+                TransactionGuard::allocate_read(db.transaction_tracker.clone(), &db.mem).unwrap();
+            assert!(latest.id() > original_id);
+            assert_eq!(db.cache_stats().used_bytes(), 0);
+            assert_eq!(
+                db.mem.get_last_committed_transaction_id().unwrap(),
+                original_id
+            );
+            assert_eq!(db.mem.get_data_root(), original_root);
+
+            let current = db.begin_read().unwrap();
+            assert_eq!(
+                current
+                    .open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                1
+            );
+            let cached_bytes = db.cache_stats().used_bytes();
+            assert!(cached_bytes > 0);
+            let (repeated, _) =
+                TransactionGuard::allocate_read(db.transaction_tracker.clone(), &db.mem).unwrap();
+            assert_eq!(repeated.id(), latest.id());
+            assert_eq!(db.cache_stats().used_bytes(), cached_bytes);
+            assert_eq!(
+                read.open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                0
+            );
+        }
+    }
+
+    #[cfg(feature = "cache_metrics")]
+    #[test]
+    fn a_multi_writer_commit_keeps_its_read_cache() {
+        use crate::ReadableTable;
+
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        {
+            let read = db.begin_read().unwrap();
+            assert_eq!(
+                read.open_table(TABLE)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                0
+            );
+        }
+
+        let write = db.begin_write().unwrap();
+        write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        write.commit().unwrap();
+        let cached_bytes = db.cache_stats().used_bytes();
+        assert!(cached_bytes > 0);
+
+        let _read = db.begin_read().unwrap();
+        assert_eq!(db.cache_stats().used_bytes(), cached_bytes);
+    }
+
+    /// A savepoint holds a read transaction live, so its snapshot stays active for as long as
+    /// the savepoint does. In the shared mode that supports an ephemeral one
+    #[test]
+    fn an_ephemeral_savepoint_locks_the_snapshot_it_references() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::SingleWriter);
+        let probe = probe(tmpfile.path());
+        assert!(held_ids(&probe).is_empty());
+
+        let write = db.begin_write().unwrap();
+        let savepoint = write.ephemeral_savepoint().unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            held_ids(&probe).len(),
+            1,
+            "a savepoint locked {:?}",
+            held_ids(&probe)
+        );
+
+        drop(savepoint);
+        assert!(
+            held_ids(&probe).is_empty(),
+            "the lock outlived the savepoint"
+        );
+    }
+
+    /// A persistent savepoint bounds this process's reclamation, but takes no byte: the file
+    /// names it, so every process protects it by syncing, and a byte would go on pinning the
+    /// transaction after another process deleted the savepoint, until this one next synced
+    #[test]
+    fn a_persistent_savepoint_takes_no_active_transaction_byte() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        // Nothing else references the savepoint's transaction, so the byte is the savepoint's to
+        // take or leave
+        let pinned = db.mem.get_last_committed_transaction_id().unwrap();
+        let write = db.begin_write().unwrap();
+        let savepoint = write.persistent_savepoint().unwrap();
+        write.commit().unwrap();
+        assert!(
+            held_ids(&probe).is_empty(),
+            "the savepoint locked {:?}",
+            held_ids(&probe)
+        );
+        assert_eq!(
+            db.transaction_tracker.oldest_local_referenced_transaction(),
+            Some(pinned),
+            "the savepoint stopped bounding this process's reclamation"
+        );
+        // The probe does see a byte where there is one to see
+        let read = db.begin_read().unwrap();
+        assert_eq!(held_ids(&probe).len(), 1);
+        drop(read);
+        assert!(held_ids(&probe).is_empty());
+
+        let write = db.begin_write().unwrap();
+        assert!(write.delete_persistent_savepoint(savepoint).unwrap());
+        write.commit().unwrap();
+        assert_eq!(
+            db.transaction_tracker.oldest_local_referenced_transaction(),
+            None,
+            "the deleted savepoint kept its reference"
+        );
+        assert!(held_ids(&probe).is_empty());
+    }
+
+    /// The same for a savepoint this handle adopted rather than created: the open syncs the
+    /// file's persistent savepoints, and references them without locking them either
+    #[test]
+    fn a_synced_persistent_savepoint_takes_no_active_transaction_byte() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let write = db.begin_write().unwrap();
+        write.persistent_savepoint().unwrap();
+        write.commit().unwrap();
+        drop(db);
+
+        let probe = probe(tmpfile.path());
+        assert!(
+            held_ids(&probe).is_empty(),
+            "the closed database left a lock"
+        );
+
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        assert!(
+            held_ids(&probe).is_empty(),
+            "the open locked {:?} for the file's savepoint",
+            held_ids(&probe)
+        );
+        assert!(
+            db.transaction_tracker
+                .oldest_local_referenced_transaction()
+                .is_some(),
+            "the open did not adopt the file's savepoint"
+        );
+        // The probe does see a byte where there is one to see
+        let read = db.begin_read().unwrap();
+        assert_eq!(held_ids(&probe).len(), 1);
+        drop(read);
+    }
+
+    /// A non-durable commit exists only in this process's memory, so a shared mode refuses it
+    #[test]
+    fn a_shared_mode_refuses_durability_none() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::SingleWriter);
+
+        let mut write = db.begin_write().unwrap();
+        assert!(matches!(
+            write.set_durability(Durability::None),
+            Err(SetDurabilityError::NonDurableCommitUnsupported)
+        ));
+    }
+
+    /// Every multi-writer commit records the allocator state, for the next writer, in any
+    /// process, to load rather than rebuild: turning quick-repair off has no effect there
+    #[test]
+    fn a_multi_writer_commit_records_the_allocator_state_regardless() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+
+        let mut write = db.begin_write().unwrap();
+        write.set_quick_repair(false);
+        write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        write.commit().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// An ephemeral savepoint would be known to this process alone, and a persistent savepoint
+    /// a peer creates could take its id, so multi-writer mode refuses it
+    #[test]
+    fn a_multi_writer_mode_refuses_an_ephemeral_savepoint() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+
+        let write = db.begin_write().unwrap();
+        assert!(matches!(
+            write.ephemeral_savepoint(),
+            Err(SavepointError::EphemeralSavepointUnsupported)
+        ));
+        write.persistent_savepoint().unwrap();
+        write.commit().unwrap();
+    }
+
+    /// An interrupted repair may leave no allocator snapshot. The check records it so the next
+    /// writer can load it without rebuilding again.
+    #[test]
+    fn an_integrity_check_records_a_peers_unrecorded_commit() {
+        let tmpfile = crate::create_tempfile();
+        let mut db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let peer = Database::builder()
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .open(tmpfile.path())
+            .unwrap();
+        // A commit recording no allocator state, as a repair's does. The peer stays open, since
+        // its close would record
+        let mut write = peer.begin_write().unwrap();
+        write.skip_allocator_state_record();
+        write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        write.commit().unwrap();
+
+        assert!(!db.check_integrity().unwrap());
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn a_write_transaction_releases_the_writer_byte_and_slot() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        let txn = db.begin_write().unwrap();
+        assert!(db.transaction_tracker.holds_writer_byte());
+        assert!(db.transaction_tracker.write_transaction_live());
+        assert!(!probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
+
+        txn.abort().unwrap();
+        assert!(!db.transaction_tracker.holds_writer_byte());
+        assert!(!db.transaction_tracker.write_transaction_live());
+        assert!(probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
+    }
+
+    /// A leak another process left in the file is repaired, and the repair records the allocator
+    /// state for the next writer to load
+    #[test]
+    fn an_integrity_check_repairs_a_leak_a_peer_recorded() {
+        use crate::tree_store::{AllocationPolicy, PageAllocator, PageTracker};
+
+        let tmpfile = crate::create_tempfile();
+        let mut db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let peer = Database::builder()
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .open(tmpfile.path())
+            .unwrap();
+        // A page the peer allocates and neither frees nor references: a leak its close's snapshot
+        // records as allocated
+        let allocator = PageAllocator::new(peer.mem.clone(), AllocationPolicy::Default);
+        drop(allocator.allocate(64, &PageTracker::ignore()).unwrap());
+        drop(allocator);
+        drop(peer);
+
+        assert!(!db.check_integrity().unwrap());
+        // The repair recorded the allocator state, for a peer to load
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.check_integrity().unwrap());
+    }
+
+    /// A read-only participant sees what another process committed, not the header it read at open
+    #[test]
+    fn a_read_only_participant_picks_up_a_peers_commit() {
+        let tmpfile = crate::create_tempfile();
+        let writer = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let reader = builder.open_read_only(tmpfile.path()).unwrap();
+        let probe = probe(tmpfile.path());
+
+        let read = reader.begin_read().unwrap();
+        let before = held_ids(&probe);
+        assert_eq!(before.len(), 1, "expected one active id: {before:?}");
+        let before = before[0];
+        drop(read);
+
+        let write = writer.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(1, 1).unwrap();
+        }
+        write.commit().unwrap();
+        drop(writer);
+        assert!(
+            held_ids(&probe).is_empty(),
+            "the closed writer left {:?} locked",
+            held_ids(&probe)
+        );
+
+        let read = reader.begin_read().unwrap();
+        let after = held_ids(&probe);
+        assert_eq!(after.len(), 1, "expected one active id: {after:?}");
+        assert!(
+            after[0] > before,
+            "the reader stayed at {before} after the writer committed"
+        );
+        drop(read);
+    }
+
+    /// A read-only participant takes the primary as recorded: choosing between the slots is a
+    /// repairing writer's job, and a newer secondary it can see is a commit whose pages are not in
+    /// the file yet, or one a repair has just rolled back
+    #[test]
+    fn a_read_only_participant_takes_the_primary_as_recorded() {
+        use std::io::{Read, Write};
+
+        let tmpfile = crate::create_tempfile();
+        drop(create(tmpfile.path(), ConcurrencyMode::ExclusiveWriter));
+
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let reader = builder.open_read_only(tmpfile.path()).unwrap();
+
+        // A newer commit whose pages this file never received: made in a copy, then its slot
+        // spliced into this file's secondary slot
+        let copy = crate::create_tempfile();
+        std::fs::copy(tmpfile.path(), copy.path()).unwrap();
+        let db = Database::open(copy.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(0, 1).unwrap();
+        }
+        write.commit().unwrap();
+        drop(db);
+
+        let header = |path: &Path| -> Vec<u8> {
+            let mut header = vec![0u8; 320];
+            File::open(path).unwrap().read_exact(&mut header).unwrap();
+            header
+        };
+        let slot = |index: usize| 64 + index * 128..64 + (index + 1) * 128;
+        let id = |header: &[u8], index: usize| {
+            u64::from_le_bytes(header[slot(index)][104..112].try_into().unwrap())
+        };
+        let newer = header(copy.path());
+        let mut spliced = header(tmpfile.path());
+        let primary = usize::from(spliced[9] & 1);
+        spliced[slot(1 - primary)].copy_from_slice(&newer[slot(usize::from(newer[9] & 1))]);
+        // The god byte a repair leaves on a 1-phase history: recovery clear, 2-phase clear
+        spliced[9] &= !6;
+        OpenOptions::new()
+            .write(true)
+            .open(tmpfile.path())
+            .unwrap()
+            .write_all(&spliced)
+            .unwrap();
+        assert!(id(&spliced, 1 - primary) > id(&spliced, primary));
+        let probe = probe(tmpfile.path());
+
+        // Reloading into that state, and opening in it
+        let read = reader.begin_read().unwrap();
+        assert_eq!(
+            held_ids(&probe),
+            vec![id(&spliced, primary)],
+            "the reader adopted a slot whose pages the file never received"
+        );
+        drop(read);
+        let opened = builder.open_read_only(tmpfile.path()).unwrap();
+        let read = opened.begin_read().unwrap();
+        assert_eq!(held_ids(&probe), vec![id(&spliced, primary)]);
+        drop(read);
+    }
+
+    /// Sharing the file forces 2-phase, whatever the transaction asked for
+    #[test]
+    fn a_shared_commit_is_two_phase() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+
+        let mut write = db.begin_write().unwrap();
+        write.set_two_phase_commit(false);
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            table.insert(1, 1).unwrap();
+        }
+        write.commit().unwrap();
+
+        assert!(
+            db.mem.used_two_phase_commit(),
+            "a shared commit published without the flush between the header writes"
+        );
+    }
+
+    /// With no writer holding the file, an unclean one is refused: nothing is coming to repair it
+    #[test]
+    fn a_shared_read_refuses_an_unclean_file_with_no_writer() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmpfile = crate::create_tempfile();
+        drop(create(tmpfile.path(), ConcurrencyMode::MultiWriter));
+
+        // The god byte's recovery-required bit, which a clean shutdown clears
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmpfile.path())
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.seek(SeekFrom::Start(9)).unwrap();
+            file.read_exact(&mut byte).unwrap();
+            byte[0] |= 2;
+            file.seek(SeekFrom::Start(9)).unwrap();
+            file.write_all(&byte).unwrap();
+        }
+
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        assert!(matches!(
+            builder.open_read_only(tmpfile.path()),
+            Err(crate::DatabaseError::RepairAborted)
+        ));
+    }
+
+    /// A exclusive-writer open holds the whole file, which covers these bytes. Locking one and
+    /// releasing it would punch a hole in that lock, so this mode locks nothing
+    #[test]
+    fn an_exclusive_writer_read_does_not_puncture_the_whole_file_lock() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::ExclusiveWriter);
+        let probe = probe(tmpfile.path());
+
+        drop(db.begin_read().unwrap());
+
+        assert_eq!(
+            held_ids(&probe),
+            SEARCHED.collect::<Vec<_>>(),
+            "a read transaction punctured the whole-file lock"
+        );
+    }
+
+    /// The floor is the older of this process's oldest read and a peer's pin, and a peer's pin
+    /// only matters below the former, which is where the scan looks
+    #[test]
+    fn the_oldest_active_transaction_is_the_lower_of_ours_and_a_peers() {
+        for mode in [ConcurrencyMode::SingleWriter, ConcurrencyMode::MultiWriter] {
+            let tmpfile = crate::create_tempfile();
+            let db = create(tmpfile.path(), mode);
+            let scan = |local| {
+                let header_lock = db.mem.lock_header_exclusive().unwrap();
+                db.mem
+                    .oldest_active_transaction(local, &header_lock)
+                    .unwrap()
+            };
+            let first = db.mem.get_last_committed_transaction_id().unwrap();
+            assert_eq!(scan(None), None);
+
+            // A peer pins the last committed transaction, as its read of the header would
+            let probe = probe(tmpfile.path());
+            probe
+                .lock_shared_range(byte_range(TXN_BASE + first.raw_id()))
+                .unwrap();
+            assert_eq!(scan(None), Some(first), "{mode:?}");
+
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(TABLE).unwrap();
+                table.insert(1, 1).unwrap();
+            }
+            write.commit().unwrap();
+            let second = db.mem.get_last_committed_transaction_id().unwrap();
+            assert!(first < second);
+            assert_eq!(scan(Some(second)), Some(first), "{mode:?}");
+            probe
+                .unlock_range(byte_range(TXN_BASE + first.raw_id()))
+                .unwrap();
+            assert_eq!(scan(Some(second)), Some(second), "{mode:?}");
+        }
+    }
+
+    /// A transaction that is lent the exclusive header lock syncs to a peer's commit under that
+    /// lock, savepoints included, rather than trying to take the lock a second time.
+    #[test]
+    fn a_lent_header_lock_covers_syncing_to_a_peers_commit() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        fn open(path: &Path) -> Database {
+            let mut builder = Database::builder();
+            builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+            builder.open(path).unwrap()
+        }
+
+        let tmpfile = crate::create_tempfile();
+        create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let peer = open(tmpfile.path());
+        // The handle syncs to the commit under holds it took itself, as compaction does, in a
+        // thread, so that taking the header lock again fails rather than hangs
+        let path = tmpfile.path().to_path_buf();
+        let (opened, wait_for_open) = mpsc::channel();
+        let (committed, wait_for_commit) = mpsc::channel();
+        let (synced, wait_for_sync) = mpsc::channel();
+        let syncing = thread::spawn(move || {
+            let db = open(&path);
+            opened.send(()).unwrap();
+            wait_for_commit.recv().unwrap();
+            let writer_lock = db.mem.lock_writer().unwrap();
+            let header_lock = db.mem.lock_header_exclusive().unwrap();
+            let txn = db
+                .begin_write_with(Some(&writer_lock), Some(&header_lock))
+                .unwrap();
+            let savepoints: Vec<u64> = txn.list_persistent_savepoints().unwrap().collect();
+            txn.abort().unwrap();
+            drop(header_lock);
+            drop(writer_lock);
+            synced.send(savepoints).unwrap();
+        });
+        wait_for_open.recv().unwrap();
+        let txn = peer.begin_write().unwrap();
+        let peers_savepoint = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        // Closed first: otherwise its close would wait on the writer byte that a hung
+        // transaction still holds
+        drop(peer);
+        committed.send(()).unwrap();
+
+        let savepoints = wait_for_sync
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the transaction took the header lock its caller holds");
+        assert_eq!(savepoints, vec![peers_savepoint]);
+        syncing.join().unwrap();
+    }
+
+    /// A transaction that is lent the exclusive header lock begins and commits under it, and
+    /// leaves the lock held afterwards.
+    #[test]
+    fn a_lent_header_hold_outlives_the_commit() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        let header_lock = db.mem.lock_header_exclusive().unwrap();
+        let txn = db.begin_write_with(None, Some(&header_lock)).unwrap();
+        txn.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+        txn.commit_with(Some(&header_lock)).unwrap();
+        assert!(!probe.try_lock_shared_range(HEADER_LOCK).unwrap());
+
+        drop(header_lock);
+        assert!(probe.try_lock_shared_range(HEADER_LOCK).unwrap());
+        probe.unlock_range(HEADER_LOCK).unwrap();
+    }
+
+    /// A transaction lent the writer byte leaves it held when it ends
+    #[test]
+    fn a_lent_writer_byte_outlives_the_transaction() {
+        let tmpfile = crate::create_tempfile();
+        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriter);
+        let probe = probe(tmpfile.path());
+
+        let writer_lock = db.mem.lock_writer().unwrap();
+        let txn = db.begin_write_with(Some(&writer_lock), None).unwrap();
+        txn.abort().unwrap();
+        assert!(!probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
+
+        drop(writer_lock);
+        assert!(probe.try_lock_range(byte_range(WRITER_BYTE)).unwrap());
+        probe.unlock_range(byte_range(WRITER_BYTE)).unwrap();
     }
 }

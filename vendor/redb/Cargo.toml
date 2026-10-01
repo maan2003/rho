@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.90"
 name = "redb"
-version = "4.2.0"
+version = "4.3.0"
 authors = ["Christopher Berner <me@cberner.com>"]
 build = "build.rs"
 exclude = ["fuzz/"]
@@ -32,6 +32,10 @@ repository = "https://github.com/cberner/redb"
 cache_metrics = []
 default = ["std"]
 experimental-api-5 = []
+experimental-multiprocess = [
+    "std",
+    "experimental-api-5",
+]
 experimental_cursor = ["experimental-api-5"]
 logging = ["dep:log"]
 std = []
@@ -52,6 +56,9 @@ optional = true
 [dependencies.uuid]
 version = "1.17.0"
 optional = true
+
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies.libc]
+version = "0.2.174"
 
 [target.'cfg(target_os = "wasi")'.dependencies.libc]
 version = "0.2.174"

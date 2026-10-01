@@ -1,4 +1,7 @@
-use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
+use crate::db::TransactionGuard;
+use crate::transaction_tracker::{
+    LocalSavepointId, SavepointId, TransactionId, TransactionTracker,
+};
 use crate::tree_store::page_store::page_manager::FILE_FORMAT_VERSION3;
 use crate::tree_store::{BtreeHeader, TransactionalMemory};
 use crate::{Result, StorageError, TypeName, Value};
@@ -26,30 +29,27 @@ use core::mem::size_of;
 pub struct Savepoint {
     version: u8,
     id: SavepointId,
+    local_id: LocalSavepointId,
     // Each savepoint has an associated read transaction id to ensure that any pages it references
     // are not freed
-    transaction_id: TransactionId,
+    transaction: TransactionGuard,
     user_root: Option<BtreeHeader>,
-    transaction_tracker: Arc<TransactionTracker>,
-    ephemeral: bool,
 }
 
 impl Savepoint {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_ephemeral(
         mem: &TransactionalMemory,
-        transaction_tracker: Arc<TransactionTracker>,
         id: SavepointId,
-        transaction_id: TransactionId,
+        local_id: LocalSavepointId,
+        transaction: TransactionGuard,
         user_root: Option<BtreeHeader>,
     ) -> Self {
         Self {
             id,
-            transaction_id,
+            local_id,
             version: mem.get_version(),
+            transaction,
             user_root,
-            transaction_tracker,
-            ephemeral: true,
         }
     }
 
@@ -61,8 +61,12 @@ impl Savepoint {
         self.id
     }
 
+    pub(crate) fn get_local_id(&self) -> LocalSavepointId {
+        self.local_id
+    }
+
     pub(crate) fn get_transaction_id(&self) -> TransactionId {
-        self.transaction_id
+        self.transaction.id()
     }
 
     pub(crate) fn get_user_root(&self) -> Option<BtreeHeader> {
@@ -70,20 +74,24 @@ impl Savepoint {
     }
 
     pub(crate) fn db_address(&self) -> *const TransactionTracker {
-        core::ptr::from_ref(self.transaction_tracker.as_ref())
+        core::ptr::from_ref(self.transaction.tracker().as_ref())
     }
 
     pub(crate) fn set_persistent(&mut self) {
-        self.ephemeral = false;
+        self.transaction.release_to_database();
     }
 }
 
 impl Drop for Savepoint {
     fn drop(&mut self) {
-        if self.ephemeral {
-            self.transaction_tracker
-                .deallocate_savepoint(self.get_id(), self.get_transaction_id());
+        // A persistent savepoint outlives its handle: the database record owns both its entry
+        // and the transaction's reference until the savepoint is deleted
+        if self.transaction.owns_reference() {
+            self.transaction
+                .tracker()
+                .remove_savepoint_registration(self.id);
         }
+        // The guard releases the transaction as it drops
     }
 }
 
@@ -93,12 +101,19 @@ pub(crate) enum SerializedSavepoint<'a> {
     Owned(Vec<u8>),
 }
 
+struct PersistentSavepoint {
+    version: u8,
+    id: SavepointId,
+    transaction_id: TransactionId,
+    user_root: Option<BtreeHeader>,
+}
+
 impl SerializedSavepoint<'_> {
     pub(crate) fn from_savepoint(savepoint: &Savepoint) -> Self {
         assert_eq!(savepoint.version, FILE_FORMAT_VERSION3);
         let mut result = vec![savepoint.version];
         result.extend(savepoint.id.0.to_le_bytes());
-        result.extend(savepoint.transaction_id.raw_id().to_le_bytes());
+        result.extend(savepoint.get_transaction_id().raw_id().to_le_bytes());
 
         if let Some(header) = savepoint.user_root {
             result.push(1);
@@ -122,6 +137,30 @@ impl SerializedSavepoint<'_> {
         &self,
         transaction_tracker: Arc<TransactionTracker>,
     ) -> Result<Savepoint> {
+        let savepoint = self.parse()?;
+        let local_id = transaction_tracker
+            .savepoint_local_id(savepoint.id)
+            .ok_or_else(|| {
+                StorageError::Corrupted("Unregistered persistent savepoint".to_string())
+            })?;
+        Ok(Savepoint {
+            version: savepoint.version,
+            id: savepoint.id,
+            local_id,
+            user_root: savepoint.user_root,
+            transaction: TransactionGuard::new_read_unowned(
+                savepoint.transaction_id,
+                transaction_tracker,
+            ),
+        })
+    }
+
+    pub(crate) fn get_ids(&self) -> Result<(SavepointId, TransactionId)> {
+        let savepoint = self.parse()?;
+        Ok((savepoint.id, savepoint.transaction_id))
+    }
+
+    fn parse(&self) -> Result<PersistentSavepoint> {
         let data = self.data();
         let serialized_len =
             2 * size_of::<u8>() + 2 * size_of::<u64>() + BtreeHeader::serialized_size();
@@ -172,13 +211,11 @@ impl SerializedSavepoint<'_> {
         offset += BtreeHeader::serialized_size();
         debug_assert_eq!(offset, data.len());
 
-        Ok(Savepoint {
+        Ok(PersistentSavepoint {
             version,
             id: SavepointId(id),
-            transaction_id: TransactionId::new(transaction_id),
             user_root,
-            transaction_tracker,
-            ephemeral: false,
+            transaction_id: TransactionId::new(transaction_id),
         })
     }
 }
@@ -225,6 +262,9 @@ mod test {
     #[test]
     fn corrupted_record_errors() {
         let tracker = Arc::new(TransactionTracker::new(TransactionId::new(1)));
+        tracker
+            .sync_persistent_savepoints(&[(SavepointId(1), TransactionId::new(1))].into())
+            .unwrap();
 
         let mut record = vec![FILE_FORMAT_VERSION3];
         record.extend(1u64.to_le_bytes());
