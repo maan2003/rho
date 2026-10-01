@@ -8,6 +8,62 @@ use alloc::string::String;
 use core::fmt::{Display, Formatter};
 use core::panic;
 
+/// Errors reported by a [`crate::StorageBackend`] locking operation.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BackendError {
+    /// The underlying storage operation failed.
+    Io(io::Error),
+    /// The backend does not support the requested operation.
+    Unsupported,
+}
+
+impl From<io::Error> for BackendError {
+    /// Preserves unsupported-operation errors as [`Self::Unsupported`] when std is available.
+    fn from(err: io::Error) -> Self {
+        #[cfg(not(redb_no_std))]
+        if err.kind() == std::io::ErrorKind::Unsupported {
+            return Self::Unsupported;
+        }
+        Self::Io(err)
+    }
+}
+
+impl From<BackendError> for io::Error {
+    fn from(err: BackendError) -> Self {
+        match err {
+            BackendError::Io(err) => err,
+            BackendError::Unsupported => {
+                io::unsupported("the storage backend does not support this operation")
+            }
+        }
+    }
+}
+
+impl From<BackendError> for Error {
+    fn from(err: BackendError) -> Self {
+        StorageError::from(err).into()
+    }
+}
+
+impl Display for BackendError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::Unsupported => f.write_str("The storage backend does not support this operation"),
+        }
+    }
+}
+
+impl core::error::Error for BackendError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Unsupported => None,
+        }
+    }
+}
+
 /// General errors directly from the storage layer
 #[derive(Debug)]
 #[non_exhaustive]
@@ -20,6 +76,8 @@ pub enum StorageError {
     #[cfg(feature = "experimental_cursor")]
     UnorderedKey,
     Io(io::Error),
+    /// The backend does not support a required storage operation.
+    Unsupported,
     PreviousIo,
     DatabaseClosed,
     LockPoisoned(&'static panic::Location<'static>),
@@ -37,6 +95,15 @@ impl From<io::Error> for StorageError {
     }
 }
 
+impl From<BackendError> for StorageError {
+    fn from(err: BackendError) -> Self {
+        match err {
+            BackendError::Io(err) => Self::Io(err),
+            BackendError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
 impl From<StorageError> for Error {
     fn from(err: StorageError) -> Error {
         match err {
@@ -45,6 +112,7 @@ impl From<StorageError> for Error {
             #[cfg(feature = "experimental_cursor")]
             StorageError::UnorderedKey => Error::UnorderedKey,
             StorageError::Io(x) => Error::Io(x),
+            StorageError::Unsupported => Error::Unsupported,
             StorageError::PreviousIo => Error::PreviousIo,
             StorageError::DatabaseClosed => Error::DatabaseClosed,
             StorageError::LockPoisoned(location) => Error::LockPoisoned(location),
@@ -75,6 +143,7 @@ impl Display for StorageError {
             StorageError::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
+            StorageError::Unsupported => BackendError::Unsupported.fmt(f),
             StorageError::DatabaseClosed => {
                 write!(f, "Database has been closed")
             }
@@ -251,6 +320,22 @@ impl From<io::Error> for DatabaseError {
     }
 }
 
+impl From<BackendError> for DatabaseError {
+    fn from(err: BackendError) -> Self {
+        Self::Storage(err.into())
+    }
+}
+
+impl DatabaseError {
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(crate) fn into_storage_error_or_corrupted(self) -> StorageError {
+        match self {
+            DatabaseError::Storage(storage) => storage,
+            other => StorageError::Corrupted(other.to_string()),
+        }
+    }
+}
+
 impl From<StorageError> for DatabaseError {
     fn from(err: StorageError) -> DatabaseError {
         DatabaseError::Storage(err)
@@ -300,6 +385,10 @@ pub enum SavepointError {
     /// creating or deleting a persistent savepoint, or restoring an older savepoint while
     /// newer persistent savepoints exist that would need to be deleted.
     ImmediateDurabilityRequired,
+    /// An ephemeral savepoint would be known to this process alone, and a persistent savepoint
+    /// another process creates could take its id
+    #[cfg(feature = "experimental-multiprocess")]
+    EphemeralSavepointUnsupported,
     /// Error from underlying storage
     Storage(StorageError),
 }
@@ -309,6 +398,8 @@ impl From<SavepointError> for Error {
         match err {
             SavepointError::InvalidSavepoint => Error::InvalidSavepoint,
             SavepointError::ImmediateDurabilityRequired => Error::ImmediateDurabilityRequired,
+            #[cfg(feature = "experimental-multiprocess")]
+            SavepointError::EphemeralSavepointUnsupported => Error::EphemeralSavepointUnsupported,
             SavepointError::Storage(storage) => storage.into(),
         }
     }
@@ -330,6 +421,13 @@ impl Display for SavepointError {
                 write!(
                     f,
                     "Operation requires Durability::Immediate for the current transaction."
+                )
+            }
+            #[cfg(feature = "experimental-multiprocess")]
+            SavepointError::EphemeralSavepointUnsupported => {
+                write!(
+                    f,
+                    "Ephemeral savepoints are not supported when the database is shared with other writer processes"
                 )
             }
             SavepointError::Storage(storage) => storage.fmt(f),
@@ -398,18 +496,23 @@ impl Display for CompactionError {
 
 impl core::error::Error for CompactionError {}
 
-/// Errors related to transactions
+/// Errors related to setting a transaction's durability
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SetDurabilityError {
     /// A persistent savepoint was modified
     PersistentSavepointModified,
+    /// A non-durable commit would be invisible to the other processes sharing the database
+    #[cfg(feature = "experimental-multiprocess")]
+    NonDurableCommitUnsupported,
 }
 
 impl From<SetDurabilityError> for Error {
     fn from(err: SetDurabilityError) -> Error {
         match err {
             SetDurabilityError::PersistentSavepointModified => Error::PersistentSavepointModified,
+            #[cfg(feature = "experimental-multiprocess")]
+            SetDurabilityError::NonDurableCommitUnsupported => Error::NonDurableCommitUnsupported,
         }
     }
 }
@@ -421,6 +524,13 @@ impl Display for SetDurabilityError {
                 write!(
                     f,
                     "Persistent savepoint modified. Cannot reduce transaction durability"
+                )
+            }
+            #[cfg(feature = "experimental-multiprocess")]
+            SetDurabilityError::NonDurableCommitUnsupported => {
+                write!(
+                    f,
+                    "Non-durable commits are not supported when the database is shared with other processes"
                 )
             }
         }
@@ -484,7 +594,8 @@ impl core::error::Error for TransactionError {}
 pub enum CommitError {
     /// Error from underlying storage
     Storage(StorageError),
-    /// The transaction was poisoned by a panic and can no longer be committed
+    /// The transaction was poisoned and can no longer be committed: an operation panicked, or
+    /// failed part way through modifying the transaction
     TransactionPoisoned,
 }
 
@@ -517,7 +628,10 @@ impl Display for CommitError {
         match self {
             CommitError::Storage(storage) => storage.fmt(f),
             CommitError::TransactionPoisoned => {
-                write!(f, "Transaction was poisoned by a panic")
+                write!(
+                    f,
+                    "Transaction was poisoned by a panic or a failed operation"
+                )
             }
         }
     }
@@ -542,13 +656,21 @@ pub enum Error {
     RepairAborted,
     /// A persistent savepoint was modified
     PersistentSavepointModified,
+    /// A non-durable commit would be invisible to the other processes sharing the database
+    #[cfg(feature = "experimental-multiprocess")]
+    NonDurableCommitUnsupported,
+    /// An ephemeral savepoint would be known to this process alone, and a persistent savepoint
+    /// another process creates could take its id
+    #[cfg(feature = "experimental-multiprocess")]
+    EphemeralSavepointUnsupported,
     /// A persistent savepoint exists
     PersistentSavepointExists,
     /// An Ephemeral savepoint exists
     EphemeralSavepointExists,
     /// A transaction is still in-progress
     TransactionInProgress,
-    /// The transaction was poisoned by a panic and can no longer be committed
+    /// The transaction was poisoned and can no longer be committed: an operation panicked, or
+    /// failed part way through modifying the transaction
     TransactionPoisoned,
     /// The Database is corrupted
     Corrupted(String),
@@ -582,6 +704,8 @@ pub enum Error {
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
     Io(io::Error),
+    /// The backend does not support a required storage operation.
+    Unsupported,
     DatabaseClosed,
     /// A previous IO error occurred. The database must be closed and re-opened
     PreviousIo,
@@ -605,8 +729,23 @@ impl From<io::Error> for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
+            Error::Unsupported => BackendError::Unsupported.fmt(f),
             Error::Corrupted(msg) => {
                 write!(f, "DB corrupted: {msg}")
+            }
+            #[cfg(feature = "experimental-multiprocess")]
+            Error::NonDurableCommitUnsupported => {
+                write!(
+                    f,
+                    "Non-durable commits are not supported when the database is shared with other processes"
+                )
+            }
+            #[cfg(feature = "experimental-multiprocess")]
+            Error::EphemeralSavepointUnsupported => {
+                write!(
+                    f,
+                    "Ephemeral savepoints are not supported when the database is shared with other writer processes"
+                )
             }
             Error::UpgradeRequired(actual) => {
                 write!(
@@ -710,7 +849,10 @@ impl Display for Error {
                 )
             }
             Error::TransactionPoisoned => {
-                write!(f, "Transaction was poisoned by a panic")
+                write!(
+                    f,
+                    "Transaction was poisoned by a panic or a failed operation"
+                )
             }
             Error::InvalidSavepoint => {
                 write!(f, "Savepoint is invalid or cannot be created.")

@@ -17,9 +17,11 @@ pub struct Secret(pub [u8; 16]);
 
 impl Secret {
     pub fn generate() -> Self {
-        use rand::RngCore as _;
+        use rand::TryRng as _;
         let mut entropy = [0; 16];
-        rand::rngs::OsRng.fill_bytes(&mut entropy);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut entropy)
+            .expect("system entropy");
         Self(entropy)
     }
 
@@ -76,6 +78,17 @@ impl std::fmt::Debug for Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Fixed asymmetric entropy encoded by bip39 2.2.2 before the 3.0 update.
+    #[test]
+    fn phrases_from_the_previous_version_keep_the_same_entropy() {
+        let secret = Secret([
+            5, 18, 31, 44, 57, 70, 83, 96, 109, 122, 135, 148, 161, 174, 187, 200,
+        ]);
+        let words = "agree movie slam income gown rabbit remove extend net aspect puzzle muscle";
+        assert_eq!(secret.to_words(), words);
+        assert_eq!(Secret::from_words(words), Ok(secret));
+    }
 
     #[test]
     fn a_phrase_reads_back_as_the_same_secret() {

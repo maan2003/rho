@@ -19,7 +19,7 @@ pub(crate) fn open(write: &mut WriteTxn) -> StoreId {
         return StoreId(id.value());
     }
     let mut id = [0; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut id).expect("system entropy");
     store.insert((), id);
     StoreId(id)
 }

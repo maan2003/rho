@@ -1,8 +1,8 @@
-# redb 4.2.0, forked for rho
+# redb 4.3.0, forked for rho
 
-Copied from crates.io `redb-4.2.0` with examples, tests and tooling removed.
-One change, in `src/tree_store/page_store/page_manager.rs`,
-`allocate_helper_retry`:
+Copied from crates.io `redb-4.3.0` with examples, tests and tooling removed.
+Rho's allocator repair is in `src/tree_store/page_store/page_manager.rs`,
+`allocate_helper_retry`, with an inline regression test:
 
 The region tracker keeps one "has a free block of this order" bit per region
 and order. redb 4.1 cleared those bits only up to the freed page's own order,

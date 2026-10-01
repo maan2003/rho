@@ -81,21 +81,21 @@ blake3 = "1.8.3"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-stream = "0.3"
 axum = "0.8"
-base64 = "0.22"
-bip39 = { version = "=2.2.2", default-features = false, features = ["alloc"] }
+base64 = "0.23"
+bip39 = { version = "3", default-features = false, features = ["alloc"] }
 brush-builtins = { path = "vendor/brush/brush-builtins" }
 brush-core = { path = "vendor/brush/brush-core" }
 devenv-nix-backend = { path = "vendor/devenv/devenv-nix-backend" }
 buffer_diff = { path = "vendor/zed/crates/buffer_diff" }
 bytes = "1"
 camino = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 clock = { path = "vendor/zed/crates/clock" }
 deno_core = "0.407"
 deno_error = "0.7"
-dirs = { version = "6", default-features = false }
+dirs = { version = "7", default-features = false }
 fnv = "1"
 futures = "0.3"
 futures-util = "0.3"
@@ -113,14 +113,16 @@ pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 pyo3 = "0.29"
 pythonize = "0.29"
-rand = "0.8"
-redb = "4.2.0"
+rand = "0.10"
+redb = "4.3.0"
 redb-derive = "0.1.0"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
   "blocking",
   "json",
-  "rustls-tls-native-roots-no-provider",
+  "query",
+  "form",
+  "rustls-no-provider",
   "stream",
 ] }
 rho-agent = { path = "agent-host/rho-agent", default-features = false }
@@ -186,7 +188,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zbus = "5"
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = { version = "3", default-features = false }
 text = { path = "vendor/zed/crates/text" }
 tokio = { version = "1", features = [
@@ -200,7 +202,7 @@ tokio = { version = "1", features = [
   "sync",
   "time",
 ] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
   "connect",
   "handshake",
   "rustls-tls-native-roots",
