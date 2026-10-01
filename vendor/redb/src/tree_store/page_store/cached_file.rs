@@ -1,12 +1,15 @@
+use crate::db::StorageBackend;
 use crate::sync::{Mutex, MutexGuard, RwLock};
+#[cfg(feature = "experimental-multiprocess")]
+use crate::transaction_tracker::TransactionId;
 use crate::tree_store::page_store::base::PageHint;
 use crate::tree_store::page_store::lru_cache::LRUCache;
-use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
+use crate::{CacheStats, Result, StorageError};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::{Index, IndexMut};
+use core::ops::{Index, IndexMut, RangeBounds};
 use core::slice::SliceIndex;
 #[cfg(feature = "cache_metrics")]
 use core::sync::atomic::AtomicU64;
@@ -145,6 +148,53 @@ impl CheckedBackend {
         }
     }
 
+    fn try_lock_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.check_failure()?;
+        self.file
+            .try_lock_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
+    fn try_lock_shared_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.check_failure()?;
+        self.file
+            .try_lock_shared_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
+    #[cfg(feature = "experimental-multiprocess")]
+    fn lock_range(&self, range: impl RangeBounds<u64>) -> Result {
+        self.check_failure()?;
+        self.file
+            .lock_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
+    #[cfg(feature = "experimental-multiprocess")]
+    fn lock_shared_range(&self, range: impl RangeBounds<u64>) -> Result {
+        self.check_failure()?;
+        self.file
+            .lock_shared_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
+    fn unlock_range(&self, range: impl RangeBounds<u64>) -> Result {
+        // Allow unlocking even if there was an io failure, but not if the file is closed
+        if self.closed.load(Ordering::Acquire) {
+            return Err(StorageError::DatabaseClosed);
+        }
+        self.file
+            .unlock_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
+    fn query_lock_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.check_failure()?;
+        self.file
+            .query_lock_range(range.start_bound().cloned(), range.end_bound().cloned())
+            .map_err(StorageError::from)
+    }
+
     fn check_failure(&self) -> Result<()> {
         if self.io_failed.load(Ordering::Acquire) {
             if self.closed.load(Ordering::Acquire) {
@@ -256,6 +306,8 @@ pub(super) struct PagedCachedFile {
     // A third "total" counter would add contention on every insert/remove for
     // negligible accuracy gain.
     read_cache_bytes: AtomicUsize,
+    #[cfg(feature = "experimental-multiprocess")]
+    read_cache_transaction_id: Mutex<Option<TransactionId>>,
     write_buffer_bytes: AtomicUsize,
     // True when the write buffer holds committed, reader-visible pages, left there by a
     // non-durable commit (see write_barrier()) instead of being written to the file. While set,
@@ -292,7 +344,7 @@ impl PagedCachedFile {
         file: Box<dyn StorageBackend>,
         page_size: u64,
         max_cache_size: usize,
-    ) -> Result<Self, DatabaseError> {
+    ) -> Self {
         let read_cache = (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new()))
             .collect();
@@ -300,10 +352,12 @@ impl PagedCachedFile {
             .map(|_| Arc::new(Mutex::new(LRUWriteCache::new())))
             .collect();
 
-        Ok(Self {
+        Self {
             file: CheckedBackend::new(file),
             page_size,
             read_cache_bytes: AtomicUsize::new(0),
+            #[cfg(feature = "experimental-multiprocess")]
+            read_cache_transaction_id: Mutex::new(None),
             write_buffer_bytes: AtomicUsize::new(0),
             committed_pages_buffered: AtomicBool::new(false),
             max_cache_size,
@@ -320,7 +374,34 @@ impl PagedCachedFile {
             evictions: AtomicU64::default(),
             read_cache,
             write_buffer,
-        })
+        }
+    }
+
+    pub(crate) fn try_lock_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.file.try_lock_range(range)
+    }
+
+    pub(crate) fn try_lock_shared_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.file.try_lock_shared_range(range)
+    }
+
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(crate) fn lock_range(&self, range: impl RangeBounds<u64>) -> Result {
+        self.file.lock_range(range)
+    }
+
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(crate) fn lock_shared_range(&self, range: impl RangeBounds<u64>) -> Result {
+        self.file.lock_shared_range(range)
+    }
+
+    pub(crate) fn unlock_range(&self, range: impl RangeBounds<u64>) -> Result {
+        self.file.unlock_range(range)
+    }
+
+    /// Whether an exclusive lock over the range would conflict with one held elsewhere.
+    pub(crate) fn query_lock_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {
+        self.file.query_lock_range(range)
     }
 
     fn write_buffer_stripe(&self, offset: u64) -> &Arc<Mutex<LRUWriteCache>> {
@@ -516,6 +597,23 @@ impl PagedCachedFile {
         }
     }
 
+    // Whether a commit has left pages in the write buffer instead of writing them to the file.
+    // Only a non-durable commit does that, so this is always false in the multi-process modes,
+    // which refuse `Durability::None`.
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(super) fn has_committed_pages_buffered(&self) -> bool {
+        self.committed_pages_buffered.load(Ordering::Acquire)
+    }
+
+    // Write directly to the file, bypassing the write buffer, so the bytes are on the file when
+    // this returns rather than whenever the buffer is next flushed
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(super) fn write_direct(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.invalidate_cache(offset, data.len());
+        self.cancel_pending_write(offset, data.len());
+        self.file.write(offset, data)
+    }
+
     // Read directly from the file, ignoring any cached data
     pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0; len];
@@ -675,6 +773,22 @@ impl PagedCachedFile {
             self.read_cache_bytes
                 .fetch_sub(removed.len(), Ordering::AcqRel);
         }
+    }
+
+    // The caller holds the header lock across observing this id and updating the cache.
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(super) fn update_transaction_id(&self, transaction_id: TransactionId) {
+        let mut current = self.read_cache_transaction_id.lock().unwrap();
+        if *current != Some(transaction_id) {
+            self.invalidate_cache_all();
+            *current = Some(transaction_id);
+        }
+    }
+
+    // The caller holds the header lock across publishing this local commit and updating the tag.
+    #[cfg(feature = "experimental-multiprocess")]
+    pub(super) fn record_local_transaction_id(&self, transaction_id: TransactionId) {
+        *self.read_cache_transaction_id.lock().unwrap() = Some(transaction_id);
     }
 
     pub(super) fn invalidate_cache_all(&self) {
@@ -905,7 +1019,7 @@ mod test {
     fn cache_leak() {
         let backend = InMemoryBackend::new();
         backend.set_len(1024).unwrap();
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024);
         let cached_file = Arc::new(cached_file);
 
         let t1 = {
@@ -942,8 +1056,7 @@ mod test {
         let page_size: usize = 128;
         let max_cache_size = 1024;
         let budget = max_cache_size / 2;
-        let cached_file =
-            PagedCachedFile::new(Box::new(backend), page_size as u64, max_cache_size).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), page_size as u64, max_cache_size);
 
         // Dirty twice as many pages as the write budget holds. Consecutive page offsets land in
         // different stripes, so each over-budget write finds its own stripe empty and must cover
@@ -970,7 +1083,7 @@ mod test {
     fn resize_preserves_cached_pages() {
         let backend = InMemoryBackend::new();
         backend.set_len(1024).unwrap();
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 4096).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 4096);
 
         // Populate the read cache with two pages from opposite ends of the file.
         cached_file.read(0, 128, PageHint::None).unwrap();
@@ -993,7 +1106,7 @@ mod test {
     #[test]
     fn write_barrier_issues_no_file_writes() {
         let (backend, writes) = CountingBackend::new(1024);
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024);
 
         let mut page = cached_file.write(0, 128, true).unwrap();
         page.mem_mut().fill(0xAB);
@@ -1025,7 +1138,7 @@ mod test {
     #[test]
     fn discard_write_buffer_drops_buffered_pages() {
         let (backend, writes) = CountingBackend::new(1024);
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024);
 
         let mut page = cached_file.write(0, 128, true).unwrap();
         page.mem_mut().fill(0xCD);
@@ -1042,6 +1155,25 @@ mod test {
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 
+    // A direct write is the file's content from the moment it returns, so a buffered write of the
+    // same range must not reach the file after it.
+    #[test]
+    #[cfg(feature = "experimental-multiprocess")]
+    fn write_direct_supersedes_a_buffered_write() {
+        let (backend, _writes) = CountingBackend::new(1024);
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024);
+
+        let mut page = cached_file.write(0, 128, true).unwrap();
+        page.mem_mut().fill(0xAA);
+        drop(page);
+        cached_file.write_barrier();
+
+        cached_file.write_direct(0, &[0xBB; 128]).unwrap();
+        cached_file.flush().unwrap();
+
+        assert_eq!(cached_file.read_direct(0, 128).unwrap(), vec![0xBB; 128]);
+    }
+
     // Pages retained by a non-durable commit must not hold the read cache below its share: they
     // can always be written out, so a read-heavy workload reclaims the space they occupy.
     #[test]
@@ -1051,7 +1183,7 @@ mod test {
         const FILE_LEN: u64 = 16 * 1024;
 
         let (backend, _writes) = CountingBackend::new(FILE_LEN);
-        let cached_file = PagedCachedFile::new(Box::new(backend), PAGE as u64, MAX_CACHE).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), PAGE as u64, MAX_CACHE);
 
         // Fill the write buffer to its half-of-cache cap, then commit non-durably so the pages
         // stay buffered
@@ -1089,7 +1221,7 @@ mod test {
     #[test]
     fn zero_size_cache_stays_empty_after_reclaim() {
         let (backend, _writes) = CountingBackend::new(1024);
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 0).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 0);
 
         let mut page = cached_file.write(0, 128, true).unwrap();
         page.mem_mut().fill(0x22);
@@ -1108,7 +1240,7 @@ mod test {
     fn buffered_pages_spill_under_pressure() {
         let (backend, writes) = CountingBackend::new(1024);
         // A two page budget caps the buffer at one page, so each write() spills an earlier one
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 256).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 256);
 
         for i in 0..4u8 {
             let offset = u64::from(i) * 128;

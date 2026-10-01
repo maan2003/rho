@@ -6,8 +6,8 @@
   target with atomic compare-and-swap -- Cortex-M3 and above, but not Cortex-M0. The file backend
   and everything that opens a database from a path or a `File` are unavailable in that mode, as is
   `ReadOnlyDatabase`; storage is supplied through `Builder::create_with_backend()`, and
-  `StorageBackend` reports failures as `redb::io::Error`, a module redb makes public only in that
-  mode; with std it stays private and the type is `std::io::Error`, as before. The `cache_metrics`,
+  `StorageBackend` reports failures as `redb::io::Error`; the `io` module is public whenever
+  `experimental-api-5` is enabled, and with std it re-exports `std::io::Error`. The `cache_metrics`,
   `chrono_v0_4` and `uuid` features are unavailable there: the first needs 64-bit atomics, and the
   other two link against the standard library. Leaving `experimental-api-5` off keeps the std build
   regardless of the `std` feature, as before.
@@ -29,8 +29,26 @@
   the `experimental-api-5` feature flag, returning a `MultimapCursor` pointing at a gap between
   entries. The type reserves the constructors' signatures in the trait; navigation methods will
   be added behind the `experimental_cursor` feature flag, like the table cursors' were.
+* Under the `experimental-api-5` feature flag, a database file is locked with byte-range locks
+  alone, rather than also with the whole-file lock earlier versions take.
+* Add the `experimental-multiprocess` feature flag, under which `Builder::set_concurrency_mode()`
+  takes a `ConcurrencyMode` configuring how processes may share the database.
+  When `SingleWriter` or `MultiWriter` is configured, commits are always 2-phase,
+  `Durability::None` is refused, and the database may be opened read-only while another process has
+  it open for writing; each new read transaction then sees that process's durable commits, and
+  `Database::compact()` treats a read transaction in another process as a transaction in progress.
+  In `MultiWriter`, every commit records the allocator state, for the next writer to load;
+  compaction's own commits are the exception, and `Database::compact()` ends with one that does.
+  Ephemeral savepoints are refused there, with `SavepointError::EphemeralSavepointUnsupported`,
+  and a write transaction begins from the file as another process last committed it, as do the
+  close and `Database::check_integrity()`, which waits for a write transaction in another process
+  to end.
+* In `MultiWriter`, existing handles recover automatically after another process exits
+  during compaction or repair. They can resume writing without reopening the database.
 
 ### redb-derive (unreleased)
+* Fix `#[derive(Value)]` and `#[derive(Key)]` failing to compile on structs whose lifetimes are
+  named `'a` or `'b`; the generated implementations no longer shadow the struct's lifetimes.
 * Fix the derived implementations calling inherent methods named `fixed_width`, `from_bytes`,
   `as_bytes`, or `type_name` on field types, instead of the `Value` trait methods. The
   generated code now uses fully qualified paths, and no longer requires the `Value` and `Key`
@@ -43,6 +61,46 @@
   tagged in the derived `TypeName`, so structs containing them change type identity: their
   existing tables report `TableTypeMismatch` and must be migrated. Structs whose fields are
   all built-in types are unaffected.
+
+## 4.3.0 - 2026-09-14
+### New features
+* Add optional locking methods to `StorageBackend`. Backends may implement these methods to support
+  locking. Custom backends that wrap `FileBackend` should delegate these methods to the `FileBackend`
+  otherwise file locking functionality will be lost.
+* Add an optional `Key::separator()`, which returns a short byte string that separates two keys.
+  `&[u8]`, `&str`, `String` keys now store minimal prefixes. `Option`, array keys, and tuple keys
+  also store optimized separators when their element type is variable length. Tables with these
+  key types will use slightly less space, and lookups will be faster.
+* Add `Key::min_encoded_key()`, the encoding of a key type's smallest value. Implementing it is
+  optional, and lets container types holding that key store shorter separators.
+* Add experimental support for multi-process read-write access to a single database file, behind
+  the `experimental-multiprocess` feature flag.
+
+### Bug fixes
+* Fix a crash shortly after a commit being able to silently roll that commit back during
+  recovery, if `check_integrity()` had previously repaired the database.
+* Fix `ReadOnlyUntypedTable` and `ReadOnlyUntypedMultimapTable` potentially returning incorrect results
+  if the originating transaction is dropped.
+* Fix iterators silently omitting data when iteration continues after an error. An iterator
+  that yielded `Err(Corrupted)` could yield the rest of the table on later calls, skipping the
+  unreadable entries with no further error. Iterators and read-only cursors now keep returning
+  an error after the first one; re-seeking a cursor resets it.
+* Fix `restore_savepoint()`, `rename_table()`, and `delete_table()` leaving the transaction
+  committable after a storage error. Committing it could corrupt the database or silently lose
+  a table. Such failures now poison the transaction: `commit()` returns an error instead of
+  committing the half-applied state.
+* Fix pages being leaked permanently when a panic unwound through a live write transaction and
+  was caught with `catch_unwind`. The leak survived closing and reopening the database and grew
+  with every such panic; the pages are now reclaimed the next time the database is opened.
+* Fix a Windows-only hang: a write to the database file that reported writing zero bytes made
+  the commit retry it forever. It now fails with a `WriteZero` I/O error.
+* Fix `rename_table()` and `rename_multimap_table()` returning `TableExists` when the new name
+  is the same as the current one. Renaming a table to its own name now succeeds and leaves the
+  table unchanged.
+* Fix `persistent_savepoint()` and `delete_persistent_savepoint()` making the transaction
+  ineligible for further savepoints, so a second savepoint in the same transaction failed with
+  `InvalidSavepoint`. Only opening, renaming, or deleting a data table, or restoring a
+  savepoint, makes a transaction savepoint-ineligible now.
 
 ## 4.2.0 - 2026-08-17
 

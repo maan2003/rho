@@ -1,10 +1,16 @@
+#[cfg(feature = "experimental-multiprocess")]
+use crate::db::ConcurrencyMode;
 use crate::db::TransactionGuard;
 use crate::error::CommitError;
 use crate::multimap_table::ReadOnlyUntypedMultimapTable;
 use crate::sealed::Sealed;
 use crate::sync::Mutex;
 use crate::table::ReadOnlyUntypedTable;
-use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
+use crate::transaction_tracker::{
+    LocalSavepointId, SavepointId, TransactionId, TransactionTracker,
+};
+#[cfg(feature = "experimental-multiprocess")]
+use crate::tree_store::HeaderGuard;
 #[cfg(all(debug_assertions, not(redb_no_std)))]
 use crate::tree_store::PageNumberHashSet;
 use crate::tree_store::{
@@ -551,7 +557,6 @@ impl SystemNamespace {
 
     fn open_system_table<'s, K: Key + 'static, V: Value + 'static>(
         &'s mut self,
-        transaction: &WriteTransaction,
         definition: SystemTableDefinition<K, V>,
     ) -> Result<SystemTable<'s, K, V>> {
         let (root, _) = self
@@ -562,7 +567,8 @@ impl SystemNamespace {
             })?;
         self.table_tree
             .clear_pending_table_update(definition.name());
-        transaction.dirty.store(true, Ordering::Release);
+        // Not marked dirty: savepoints capture only the data root, system trees roll forward
+        // through restores, and system allocations are untracked (see SystemNamespace::new)
 
         let page_allocator = self.table_tree.page_allocator().clone();
         Ok(SystemTable::new(
@@ -735,7 +741,12 @@ impl TableNamespace {
         #[cfg(feature = "logging")]
         debug!("Renaming table: {name} to {new_name}");
         self.set_dirty(transaction);
-        self.inner_rename(name, new_name, TableType::Normal)
+        let result = self.inner_rename(name, new_name, TableType::Normal);
+        // A half-renamed catalog must not be committed, so any storage error poisons
+        if matches!(result, Err(TableError::Storage(_))) {
+            transaction.poison();
+        }
+        result
     }
 
     #[track_caller]
@@ -748,7 +759,12 @@ impl TableNamespace {
         #[cfg(feature = "logging")]
         debug!("Renaming multimap table: {name} to {new_name}");
         self.set_dirty(transaction);
-        self.inner_rename(name, new_name, TableType::Multimap)
+        let result = self.inner_rename(name, new_name, TableType::Multimap);
+        // See rename_table(): a half-renamed catalog must not be committed
+        if matches!(result, Err(TableError::Storage(_))) {
+            transaction.poison();
+        }
+        result
     }
 
     #[track_caller]
@@ -769,7 +785,12 @@ impl TableNamespace {
         #[cfg(feature = "logging")]
         debug!("Deleting table: {name}");
         self.set_dirty(transaction);
-        self.inner_delete(name, TableType::Normal)
+        let result = self.inner_delete(name, TableType::Normal);
+        // The catalog removal is not error-atomic part way through, so any storage error poisons
+        if matches!(result, Err(TableError::Storage(_))) {
+            transaction.poison();
+        }
+        result
     }
 
     #[track_caller]
@@ -781,7 +802,12 @@ impl TableNamespace {
         #[cfg(feature = "logging")]
         debug!("Deleting multimap table: {name}");
         self.set_dirty(transaction);
-        self.inner_delete(name, TableType::Multimap)
+        let result = self.inner_delete(name, TableType::Multimap);
+        // See delete_table(): a partial catalog removal must not be committed
+        if matches!(result, Err(TableError::Storage(_))) {
+            transaction.poison();
+        }
+        result
     }
 
     pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(
@@ -839,11 +865,11 @@ impl SavepointTransactionState {
         // Persistent savepoints whose on-disk entry was deleted: release their
         // tracker refcount now that the deletion is durable.
         for (savepoint, transaction) in self.deleted_persistent.drain(..) {
-            tracker.deallocate_savepoint(savepoint, transaction);
+            tracker.deallocate_persistent_savepoint(savepoint, transaction);
         }
         // Savepoints that restore_savepoint() invalidated: remove them from the
         // shared valid_savepoints map. For persistent savepoints,
-        // deallocate_savepoint above has already removed them; for ephemeral,
+        // deallocate_persistent_savepoint above has already removed them; for ephemeral,
         // the user's Savepoint handle still owns the live_read_transactions
         // refcount and will release it on drop.
         tracker.invalidate_savepoints(core::mem::take(&mut self.invalidated));
@@ -857,7 +883,7 @@ impl SavepointTransactionState {
         // on-disk entries will be rolled back by rollback_uncommitted_writes(),
         // but the shared tracker registration must be released explicitly.
         for (savepoint, transaction) in mem::take(&mut self.created_persistent) {
-            tracker.deallocate_savepoint(savepoint, transaction);
+            tracker.deallocate_persistent_savepoint(savepoint, transaction);
         }
         // Deleted-persistent entries will be rolled back on disk, so the
         // tracker state must NOT be released (it is still valid).
@@ -868,20 +894,22 @@ impl SavepointTransactionState {
     }
 }
 
-// Discards the in-memory allocator state on drop, unless disarmed. An incomplete commit may
-// have returned pages to the allocator that the durable roots still reference through the
-// freed tables; such an allocator state must never be used, or persisted by a clean
-// shutdown, again.
-struct AllocatorStateLatch {
+// Armed around work that would leave the in-memory allocator state unusable if it stopped part
+// way, and disarmed once that work is complete. Three things need it: a commit, which may have
+// freed pages that the durable roots still reference; a load of the allocator state; and a sync
+// of the file's persistent savepoints, before which the state could free pages a savepoint
+// still holds. Dropping it while armed discards the allocator state, so that nothing goes on to
+// use it, and a clean shutdown does not persist it.
+pub(crate) struct AllocatorStateLatch {
     mem: Option<Arc<TransactionalMemory>>,
 }
 
 impl AllocatorStateLatch {
-    fn arm(mem: Arc<TransactionalMemory>) -> Self {
+    pub(crate) fn arm(mem: Arc<TransactionalMemory>) -> Self {
         Self { mem: Some(mem) }
     }
 
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.mem = None;
     }
 }
@@ -953,6 +981,11 @@ impl WriteTransaction {
             poisoned: AtomicBool::new(false),
             durability: InternalDurability::Immediate,
             two_phase_commit: false,
+            // A multi-writer commit records the allocator state, which `set_quick_repair()`
+            // keeps on there
+            #[cfg(feature = "experimental-multiprocess")]
+            quick_repair: mem.concurrency_mode() == ConcurrencyMode::MultiWriter,
+            #[cfg(not(feature = "experimental-multiprocess"))]
             quick_repair: false,
             post_commit_free: PostCommitFree::Enabled,
             restored_transaction: None,
@@ -1054,9 +1087,7 @@ impl WriteTransaction {
         {
             println!("Pending free (in data freed table)");
             let mut system_tables = self.system_tables.lock().unwrap();
-            let data_freed = system_tables
-                .open_system_table(self, DATA_FREED_TABLE)
-                .unwrap();
+            let data_freed = system_tables.open_system_table(DATA_FREED_TABLE).unwrap();
             for entry in data_freed.range::<TransactionIdWithPagination>(..).unwrap() {
                 let (_, entry) = entry.unwrap();
                 let value = entry.value();
@@ -1070,9 +1101,7 @@ impl WriteTransaction {
         {
             println!("Pending free (in system freed table)");
             let mut system_tables = self.system_tables.lock().unwrap();
-            let system_freed = system_tables
-                .open_system_table(self, SYSTEM_FREED_TABLE)
-                .unwrap();
+            let system_freed = system_tables.open_system_table(SYSTEM_FREED_TABLE).unwrap();
             for entry in system_freed
                 .range::<TransactionIdWithPagination>(..)
                 .unwrap()
@@ -1117,28 +1146,40 @@ impl WriteTransaction {
     }
 
     /// Creates a snapshot of the current database state, which can be used to rollback the database.
-    /// This savepoint will exist until it is deleted with `[delete_savepoint()]`.
+    /// This savepoint will exist until it is deleted with
+    /// [`delete_persistent_savepoint()`](Self::delete_persistent_savepoint).
+    ///
+    /// If this transaction is aborted, the savepoint and any handles obtained for it become
+    /// invalid.
     ///
     /// Note that while a savepoint exists, pages that become unused after it was created are not freed.
     /// Therefore, the lifetime of a savepoint should be minimized.
     ///
-    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened),
-    /// or `[SavepointError::ImmediateDurabilityRequired]` if the transaction's durability is less than
-    /// `[Durability::Immediate]`
+    /// Returns [`SavepointError::InvalidSavepoint`] if the transaction is "dirty" (a data
+    /// table has been opened, renamed, or deleted, or a savepoint has been restored), or
+    /// [`SavepointError::ImmediateDurabilityRequired`] if the transaction's durability is less
+    /// than [`Durability::Immediate`]
     pub fn persistent_savepoint(&self) -> Result<u64, SavepointError> {
         if self.durability != InternalDurability::Immediate {
             return Err(SavepointError::ImmediateDurabilityRequired);
         }
 
-        let mut savepoint = self.ephemeral_savepoint()?;
+        let mut savepoint = self.create_savepoint()?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
 
-        let mut next_table = system_tables.open_system_table(self, NEXT_SAVEPOINT_TABLE)?;
-        next_table.insert((), savepoint.get_id().next())?;
+        let mut next_table = system_tables.open_system_table(NEXT_SAVEPOINT_TABLE)?;
+        // Concurrent calls persist their counters in any order, so the stored value only
+        // ratchets up; a lower one could hand an existing savepoint's id out after reopening.
+        // The system_tables lock is held across the read and the write, making them atomic
+        let mut next = savepoint.get_id().next();
+        if let Some(stored) = next_table.get(())? {
+            next = next.max(stored.value());
+        }
+        next_table.insert((), next)?;
         drop(next_table);
 
-        let mut savepoint_table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        let mut savepoint_table = system_tables.open_system_table(SAVEPOINT_TABLE)?;
         savepoint_table.insert(
             savepoint.get_id(),
             SerializedSavepoint::from_savepoint(&savepoint),
@@ -1146,7 +1187,7 @@ impl WriteTransaction {
 
         savepoint.set_persistent();
         self.transaction_tracker
-            .mark_savepoint_persistent(savepoint.get_id());
+            .convert_savepoint_to_persistent(&self.mem, savepoint.get_id());
 
         self.savepoint_state
             .lock()
@@ -1171,6 +1212,22 @@ impl WriteTransaction {
         Ok(value)
     }
 
+    // Read registrations without creating handles: the tracker may not have synced them yet.
+    pub(crate) fn persistent_savepoint_transactions(
+        &self,
+    ) -> Result<BTreeMap<SavepointId, TransactionId>> {
+        Ok(self
+            .read_existing_system_table(SAVEPOINT_TABLE, |table| {
+                let mut savepoints = BTreeMap::new();
+                for entry in table.range::<RangeFull, SavepointId>(&..)? {
+                    let (id, transaction_id) = entry?.value().get_ids()?;
+                    savepoints.insert(id, transaction_id);
+                }
+                Ok(savepoints)
+            })?
+            .unwrap_or_default())
+    }
+
     /// Get a persistent savepoint given its id
     pub fn get_persistent_savepoint(&self, id: u64) -> Result<Savepoint, SavepointError> {
         let Some(value) = self.read_existing_system_table(SAVEPOINT_TABLE, |table| {
@@ -1190,8 +1247,8 @@ impl WriteTransaction {
     /// Note that if the transaction is `abort()`'ed this deletion will be rolled back.
     ///
     /// Returns `true` if the savepoint existed
-    /// Returns `[SavepointError::ImmediateDurabilityRequired]` if the transaction's durability
-    /// is less than `[Durability::Immediate]`
+    /// Returns [`SavepointError::ImmediateDurabilityRequired`] if the transaction's durability
+    /// is less than [`Durability::Immediate`]
     pub fn delete_persistent_savepoint(&self, id: u64) -> Result<bool, SavepointError> {
         if self.durability != InternalDurability::Immediate {
             return Err(SavepointError::ImmediateDurabilityRequired);
@@ -1203,12 +1260,10 @@ impl WriteTransaction {
         {
             return Ok(false);
         }
-        let mut table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
+        let mut table = system_tables.open_system_table(SAVEPOINT_TABLE)?;
         // Parse before removing, so that a corrupted record errors out without staging any change
-        let savepoint = if let Some(serialized) = table.get(SavepointId(id))? {
-            serialized
-                .value()
-                .to_savepoint(self.transaction_tracker.clone())?
+        let (savepoint_id, transaction_id) = if let Some(serialized) = table.get(SavepointId(id))? {
+            serialized.value().get_ids()?
         } else {
             return Ok(false);
         };
@@ -1216,7 +1271,7 @@ impl WriteTransaction {
         self.savepoint_state
             .lock()
             .unwrap()
-            .record_deleted(savepoint.get_id(), savepoint.get_transaction_id());
+            .record_deleted(savepoint_id, transaction_id);
         Ok(true)
     }
 
@@ -1235,20 +1290,37 @@ impl WriteTransaction {
         Ok(savepoints.into_iter())
     }
 
-    fn allocate_savepoint(&self) -> Result<(SavepointId, TransactionId)> {
-        let transaction_id = self
+    fn allocate_savepoint(&self) -> Result<(SavepointId, LocalSavepointId, TransactionGuard)> {
+        // Through the guard, so the savepoint's snapshot is held active like any other reader's
+        let (transaction, _) =
+            TransactionGuard::allocate_read(self.transaction_tracker.clone(), &self.mem)?;
+        let (id, local_id) = self
             .transaction_tracker
-            .register_read_transaction(&self.mem)?;
-        let id = self.transaction_tracker.allocate_savepoint(transaction_id);
-        Ok((id, transaction_id))
+            .allocate_savepoint(transaction.id());
+        Ok((id, local_id, transaction))
     }
 
     /// Creates a snapshot of the current database state, which can be used to rollback the database
     ///
-    /// This savepoint will be freed as soon as the returned `[Savepoint]` is dropped.
+    /// This savepoint will be freed as soon as the returned [`Savepoint`] is dropped.
     ///
-    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened)
+    /// Returns [`SavepointError::InvalidSavepoint`] if the transaction is "dirty" (a data
+    /// table has been opened, renamed, or deleted, or a savepoint has been restored)
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "Refused, with [`SavepointError::EphemeralSavepointUnsupported`], in [`ConcurrencyMode::MultiWriter`](crate::ConcurrencyMode::MultiWriter): the savepoint would be known to this process alone, and a persistent savepoint another process creates could take its id. Persistent savepoints are supported. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+    )]
     pub fn ephemeral_savepoint(&self) -> Result<Savepoint, SavepointError> {
+        #[cfg(feature = "experimental-multiprocess")]
+        if self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter {
+            return Err(SavepointError::EphemeralSavepointUnsupported);
+        }
+        self.create_savepoint()
+    }
+
+    // The savepoint, ephemeral until `persistent_savepoint()` records it
+    fn create_savepoint(&self) -> Result<Savepoint, SavepointError> {
         // Serialize the dirty check and savepoint registration against
         // `TableNamespace::set_dirty()`, which runs under the same tables lock. Without this,
         // a concurrent first table-open (legal since `WriteTransaction: Sync`) can read the
@@ -1256,7 +1328,7 @@ impl WriteTransaction {
         // allocation tracking -- leaving a live savepoint with tracking `Ignore`d. A later
         // `restore_savepoint()` would then fail to free this transaction's pages, leaking them
         // (reclaimed only by a full repair).
-        let (id, transaction_id) = {
+        let (id, local_id, transaction) = {
             let _tables = self.tables.lock().unwrap();
             if self.dirty.load(Ordering::Acquire) {
                 return Err(SavepointError::InvalidSavepoint);
@@ -1264,16 +1336,13 @@ impl WriteTransaction {
             self.allocate_savepoint()?
         };
         #[cfg(feature = "logging")]
-        debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
+        debug!(
+            "Creating savepoint id={id:?}, txn_id={:?}",
+            transaction.id()
+        );
 
         let root = self.mem.get_data_root();
-        let savepoint = Savepoint::new_ephemeral(
-            &self.mem,
-            self.transaction_tracker.clone(),
-            id,
-            transaction_id,
-            root,
-        );
+        let savepoint = Savepoint::new_ephemeral(&self.mem, id, local_id, transaction, root);
 
         Ok(savepoint)
     }
@@ -1281,21 +1350,26 @@ impl WriteTransaction {
     /// Restore the state of the database to the given [`Savepoint`]
     ///
     /// Calling this method invalidates all [`Savepoint`]s created after savepoint
+    ///
+    /// A failure partway through restoring poisons the transaction, so a half-restored state
+    /// can never be committed: [`Self::commit`] rolls the transaction back and returns
+    /// [`CommitError::TransactionPoisoned`]. After an I/O error the storage layer is latched
+    /// and [`Self::commit`] reports that failure instead; reopening the database repairs it.
     pub fn restore_savepoint(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError> {
         // Reject a Savepoint that is from a different Database
         if core::ptr::from_ref(self.transaction_tracker.as_ref()) != savepoint.db_address() {
             return Err(SavepointError::InvalidSavepoint);
         }
 
-        if !self
+        let local_id = self
             .transaction_tracker
-            .is_valid_savepoint(savepoint.get_id())
-            || self
-                .savepoint_state
-                .lock()
-                .unwrap()
-                .is_invalidated(savepoint.get_id())
-        {
+            .savepoint_local_id(savepoint.get_id());
+        let invalidated = self
+            .savepoint_state
+            .lock()
+            .unwrap()
+            .is_invalidated(savepoint.get_id());
+        if local_id != Some(savepoint.get_local_id()) || invalidated {
             return Err(SavepointError::InvalidSavepoint);
         }
 
@@ -1317,6 +1391,17 @@ impl WriteTransaction {
         assert_eq!(self.mem.get_version(), savepoint.get_version());
         self.dirty.store(true, Ordering::Release);
 
+        // From the root swap onward the transaction holds half-restored state which must not be
+        // committed, so any failure poisons the transaction
+        let result = self.restore_savepoint_inner(savepoint);
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
+    // The mutating phase of restore_savepoint(): the caller poisons the transaction on error
+    fn restore_savepoint_inner(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError> {
         // Restoring a savepoint needs to accomplish the following:
         // 1) restore the table tree. This is trivial, since we have the old root
         // 1a) we also filter the freed tree to remove any pages referenced by the old root
@@ -1341,26 +1426,14 @@ impl WriteTransaction {
                 pagination_id: 0,
             };
             let mut system_tables = self.system_tables.lock().unwrap();
-            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
-            let drain = || -> Result<(), StorageError> {
-                let mut iter = data_freed.extract_from_if(lower.., |_, _| true)?;
-                for entry in &mut iter {
-                    entry?;
-                }
-                // Defensive: exhaustion has already closed the iterator and
-                // surfaced any finalization error through the loop; this only
-                // keeps errors from being swallowed if the loop ever gains an
-                // early exit.
-                iter.close()
-            };
-            let result = drain();
-            if result.is_err() {
-                // The table tree root was already restored above, so a partial
-                // purge must not be committed. System-table extract iterators
-                // carry no poison target, so poison the transaction directly.
-                self.poison();
+            let mut data_freed = system_tables.open_system_table(DATA_FREED_TABLE)?;
+            let mut iter = data_freed.extract_from_if(lower.., |_, _| true)?;
+            for entry in &mut iter {
+                entry?;
             }
-            result?;
+            // Defensive: exhaustion already closed the iterator; this only keeps errors from
+            // being swallowed if the loop ever gains an early exit
+            iter.close()?;
             // No need to process the system freed table, because it only rolls forward
         }
 
@@ -1376,7 +1449,7 @@ impl WriteTransaction {
             let mut data_freed_pages = tables.freed_pages.lock().unwrap();
             data_freed_pages.clear();
             let mut system_tables = self.system_tables.lock().unwrap();
-            let data_allocated = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
+            let data_allocated = system_tables.open_system_table(DATA_ALLOCATED_TABLE)?;
             let lower = TransactionIdWithPagination {
                 transaction_id: txn_id,
                 pagination_id: 0,
@@ -1427,6 +1500,11 @@ impl WriteTransaction {
     ///
     /// If a persistent savepoint has been created or deleted, in this transaction, the durability may not
     /// be reduced below [`Durability::Immediate`]
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "[`Durability::None`] is refused, with [`SetDurabilityError::NonDurableCommitUnsupported`], in the multi-process concurrency modes: a commit held only in this process's memory would be invisible to the other processes. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+    )]
     pub fn set_durability(&mut self, durability: Durability) -> Result<(), SetDurabilityError> {
         let persistent_modified = self
             .savepoint_state
@@ -1435,6 +1513,13 @@ impl WriteTransaction {
             .has_created_or_deleted();
         if persistent_modified && !matches!(durability, Durability::Immediate) {
             return Err(SetDurabilityError::PersistentSavepointModified);
+        }
+        // A non-durable commit exists only in this process's memory
+        #[cfg(feature = "experimental-multiprocess")]
+        if matches!(durability, Durability::None)
+            && self.mem.concurrency_mode().is_multi_process_writable()
+        {
+            return Err(SetDurabilityError::NonDurableCommitUnsupported);
         }
 
         self.durability = match durability {
@@ -1484,6 +1569,11 @@ impl WriteTransaction {
     /// database process to crash, can cause the database to crash with the god byte primary bit
     /// pointing to an invalid commit slot, leaving the database in an invalid, potentially attacker-
     /// controlled state.
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "Disabling it has no effect in the multi-process concurrency modes, which always commit in 2 phases. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+    )]
     pub fn set_two_phase_commit(&mut self, enabled: bool) {
         self.two_phase_commit = enabled;
     }
@@ -1498,8 +1588,25 @@ impl WriteTransaction {
     /// as part of each commit (so it doesn't need to be reconstructed), and enables 2-phase commit
     /// (which guarantees that the primary commit slot is valid without needing to look at the
     /// checksums). This means commits are slower, but recovery after a crash is almost instant.
+    #[cfg_attr(
+        feature = "experimental-multiprocess",
+        doc = "",
+        doc = "Disabling it has no effect in [`ConcurrencyMode::MultiWriter`](crate::ConcurrencyMode::MultiWriter), where every commit saves the allocator state, for the next write transaction, in any process, to load rather than reconstruct. See [`Builder::set_concurrency_mode`](crate::Builder::set_concurrency_mode)."
+    )]
     pub fn set_quick_repair(&mut self, enabled: bool) {
+        // A multi-writer commit records the allocator state, for the next writer, in any
+        // process, to load rather than rebuild from the trees
+        #[cfg(feature = "experimental-multiprocess")]
+        if !enabled && self.mem.concurrency_mode() == ConcurrencyMode::MultiWriter {
+            return;
+        }
         self.quick_repair = enabled;
+    }
+
+    // Compaction's commits record no allocator state, whatever the mode: the record is a table
+    // each commit frees and writes anew, which the next round would move again and find pending
+    pub(crate) fn skip_allocator_state_record(&mut self) {
+        self.quick_repair = false;
     }
 
     pub(crate) fn disable_post_commit_free(&mut self) {
@@ -1546,6 +1653,9 @@ impl WriteTransaction {
     }
 
     /// Rename the given table
+    ///
+    /// A storage error partway through poisons the transaction, so a half-renamed state can
+    /// never be committed; see [`Self::restore_savepoint`].
     pub fn rename_table(
         &self,
         definition: impl TableHandle,
@@ -1561,6 +1671,9 @@ impl WriteTransaction {
     }
 
     /// Rename the given multimap table
+    ///
+    /// A storage error partway through poisons the transaction, so a half-renamed state can
+    /// never be committed; see [`Self::restore_savepoint`].
     pub fn rename_multimap_table(
         &self,
         definition: impl MultimapTableHandle,
@@ -1578,6 +1691,9 @@ impl WriteTransaction {
     /// Delete the given table
     ///
     /// Returns a bool indicating whether the table existed
+    ///
+    /// A storage error partway through poisons the transaction, so a half-deleted state can
+    /// never be committed; see [`Self::restore_savepoint`].
     pub fn delete_table(&self, definition: impl TableHandle) -> Result<bool, TableError> {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
@@ -1588,6 +1704,9 @@ impl WriteTransaction {
     /// Delete the given table
     ///
     /// Returns a bool indicating whether the table existed
+    ///
+    /// A storage error partway through poisons the transaction, so a half-deleted state can
+    /// never be committed; see [`Self::restore_savepoint`].
     pub fn delete_multimap_table(
         &self,
         definition: impl MultimapTableHandle,
@@ -1628,38 +1747,69 @@ impl WriteTransaction {
     /// All writes performed in this transaction will be visible to future transactions, and are
     /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
     ///
-    /// Returns [`CommitError::TransactionPoisoned`] if a previous operation panicked and left the
-    /// transaction unable to commit. In that case the transaction is rolled back and the database
-    /// remains usable.
+    /// Returns [`CommitError::TransactionPoisoned`] if a previous operation panicked, or failed
+    /// part way through modifying the transaction, and left it unable to commit. The transaction
+    /// is then rolled back and new transactions may begin, though a corruption error that caused
+    /// the poisoning is in the database itself, and is not repaired by the rollback.
     ///
     /// On any other error the commit did not complete cleanly: the transaction's changes are
     /// applied atomically -- fully or not at all -- but may already have become durable, so they
     /// must not be assumed rolled back. The database refuses further write transactions; closing
     /// and reopening it repairs any internal state left by the failed commit.
-    pub fn commit(mut self) -> Result<(), CommitError> {
+    pub fn commit(self) -> Result<(), CommitError> {
+        self.commit_with(
+            #[cfg(feature = "experimental-multiprocess")]
+            None,
+        )
+    }
+
+    /// `commit()`, under `header_lock` where the caller already holds the header lock
+    pub(crate) fn commit_with(
+        mut self,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+    ) -> Result<(), CommitError> {
         // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
         self.completed = true;
         if self.is_poisoned() {
             self.abort_inner()?;
             return Err(CommitError::TransactionPoisoned);
         }
-        self.commit_inner()
+        self.commit_inner(
+            #[cfg(feature = "experimental-multiprocess")]
+            header_lock,
+        )
     }
 
-    fn commit_inner(&mut self) -> Result<(), CommitError> {
+    fn commit_inner(
+        &mut self,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+    ) -> Result<(), CommitError> {
         // Covers both the error and the panic-unwind path. Without an allocator state,
         // begin_write() refuses new write transactions and the next open repairs.
         let latch = AllocatorStateLatch::arm(self.mem.clone());
-        let result = self.commit_inner_helper();
+        let result = self.commit_inner_helper(
+            #[cfg(feature = "experimental-multiprocess")]
+            header_lock,
+        );
         if result.is_ok() {
             latch.disarm();
         }
         result
     }
 
-    fn commit_inner_helper(&mut self) -> Result<(), CommitError> {
+    fn commit_inner_helper(
+        &mut self,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
+    ) -> Result<(), CommitError> {
         // Quick-repair requires 2-phase commit
         if self.quick_repair {
+            self.two_phase_commit = true;
+        }
+        // Multi-process modes with a writer require 2-phase commit: a 1-phase commit publishes the
+        // secondary slot before flushing the pages it names, which a reader in another process
+        // would then follow
+        #[cfg(feature = "experimental-multiprocess")]
+        if self.mem.concurrency_mode().is_multi_process_writable() {
             self.two_phase_commit = true;
         }
 
@@ -1704,7 +1854,12 @@ impl WriteTransaction {
                 self.non_durable_commit(user_root, allocated_pages, stored_data_freed_pages)?;
                 self.apply_savepoint_state_on_commit();
             }
-            InternalDurability::Immediate => self.durable_commit(user_root, allocated_pages)?,
+            InternalDurability::Immediate => self.durable_commit(
+                user_root,
+                allocated_pages,
+                #[cfg(feature = "experimental-multiprocess")]
+                header_lock,
+            )?,
         }
 
         assert!(
@@ -1756,7 +1911,7 @@ impl WriteTransaction {
         mut freed_pages: Vec<PageNumber>,
     ) -> Result {
         let mut system_tables = self.system_tables.lock().unwrap();
-        let mut freed_table = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+        let mut freed_table = system_tables.open_system_table(DATA_FREED_TABLE)?;
         let mut pagination_counter = 0;
         #[cfg(debug_assertions)]
         let page_allocator = self.page_allocator();
@@ -1820,7 +1975,7 @@ impl WriteTransaction {
 
         let unpersisted = self.mem.take_unpersisted_allocations();
         let mut system_tables = self.system_tables.lock().unwrap();
-        let mut allocated_table = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
+        let mut allocated_table = system_tables.open_system_table(DATA_ALLOCATED_TABLE)?;
         for (txn_id, pages) in unpersisted {
             Self::write_allocated_pages_entry(
                 &mut allocated_table,
@@ -1891,6 +2046,18 @@ impl WriteTransaction {
     }
 
     fn abort_inner(&mut self) -> Result {
+        // A rollback that fails or panics part way leaves this transaction's pages allocated,
+        // so the leak stays latched until it completes
+        let already_needed_repair = self.mem.needs_repair();
+        self.mem.mark_needs_repair();
+        let result = self.abort_inner_impl();
+        if result.is_ok() && !already_needed_repair {
+            self.mem.clear_needs_repair();
+        }
+        result
+    }
+
+    fn abort_inner_impl(&mut self) -> Result {
         #[cfg(feature = "logging")]
         debug!("Aborting transaction id={:?}", self.transaction_id);
         self.tables
@@ -1917,6 +2084,7 @@ impl WriteTransaction {
         &mut self,
         user_root: Option<BtreeHeader>,
         allocated_pages: Vec<PageNumber>,
+        #[cfg(feature = "experimental-multiprocess")] header_lock: Option<&HeaderGuard<'_>>,
     ) -> Result {
         // Write out the freed-page records that earlier non-durable commits kept in memory, so
         // that they survive from here on like any other durable record.
@@ -1924,10 +2092,17 @@ impl WriteTransaction {
             self.store_data_freed_pages_for(transaction_id, pages)?;
         }
 
-        let free_until_transaction = self
-            .transaction_tracker
-            .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| x.next());
+        let free_until_transaction = {
+            #[cfg(feature = "experimental-multiprocess")]
+            let hold = self.mem.header_hold(header_lock)?;
+            self.mem.oldest_active_transaction(
+                self.transaction_tracker
+                    .oldest_local_referenced_transaction(),
+                #[cfg(feature = "experimental-multiprocess")]
+                &hold,
+            )?
+        }
+        .map_or(self.transaction_id, |x| x.next());
         self.process_freed_pages(free_until_transaction)?;
         // Flush allocated pages (including previously unpersisted allocations that are now
         // becoming durable) AFTER process_freed_pages, so that any pages reclaimed here have
@@ -1942,7 +2117,9 @@ impl WriteTransaction {
                 .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
                 .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
 
-            if self.quick_repair {
+            // No snapshot of an allocator state that needs repair: the next open must rebuild
+            // it instead of trusting the snapshot
+            if self.quick_repair && !self.mem.needs_repair() {
                 system_tree.create_table_and_flush_table_root(
                     ALLOCATOR_STATE_TABLE_NAME,
                     |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
@@ -1989,12 +2166,15 @@ impl WriteTransaction {
             self.transaction_id,
             self.two_phase_commit,
             self.shrink_policy,
+            #[cfg(feature = "experimental-multiprocess")]
+            header_lock,
         )?;
         // All of this transaction's allocations are durable; discard the per-txn tracker.
         let _ = page_allocator.take_allocated_since_commit();
 
         // Mark any pending non-durable commits as fully committed.
-        self.transaction_tracker.clear_pending_non_durable_commits();
+        self.transaction_tracker
+            .clear_pending_non_durable_commits(&self.mem);
 
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
@@ -2006,7 +2186,14 @@ impl WriteTransaction {
 
         self.apply_savepoint_state_on_commit();
 
-        if self.post_commit_free == PostCommitFree::Enabled {
+        // The post-commit pass runs after publication, where a peer's pin on the transaction just
+        // superseded lands below any floor the scan above produced, so a multi-process writer's
+        // pages wait for the next durable commit
+        #[cfg(feature = "experimental-multiprocess")]
+        let multiprocess_writer = self.mem.concurrency_mode().is_multi_process_writable();
+        #[cfg(not(feature = "experimental-multiprocess"))]
+        let multiprocess_writer = false;
+        if self.post_commit_free == PostCommitFree::Enabled && !multiprocess_writer {
             self.process_data_freed_pages_after_commit(
                 user_root,
                 &page_allocator,
@@ -2026,10 +2213,10 @@ impl WriteTransaction {
         let epilogue_transaction = self.transaction_id.next();
         let mut free_until = self
             .transaction_tracker
-            .oldest_live_read_transaction()
+            .oldest_local_referenced_transaction()
             .map_or(epilogue_transaction, |x| x.next());
         // Clamp the free horizon to the savepoint horizon captured during the purge. A savepoint
-        // is also a live read, so absent concurrency `oldest_live_read_transaction()` never
+        // is also a live read, so absent concurrency `oldest_local_referenced_transaction()` never
         // exceeds it and this is a no-op. But an ephemeral `Savepoint::drop` racing this commit
         // (legal since `WriteTransaction: Sync`) can land between the purge and here, advancing
         // the oldest live read past the savepoint the purge kept entries for. Freeing those pages
@@ -2043,7 +2230,7 @@ impl WriteTransaction {
         let (system_root, stored_system_freed_pages, extracted_data_transactions) = {
             let mut system_tables = self.system_tables.lock().unwrap();
             let system_freed_pages = system_tables.system_freed_pages();
-            let extracted_data_transactions = self.extract_freed_pages(
+            let extracted_data_transactions = Self::extract_freed_pages(
                 &mut system_tables,
                 DATA_FREED_TABLE,
                 free_until,
@@ -2085,10 +2272,11 @@ impl WriteTransaction {
         self.transaction_tracker
             .reserve_transaction_id(epilogue_transaction, self.transaction_id);
         self.transaction_tracker.register_non_durable_commit(
+            &self.mem,
             epilogue_transaction,
             self.transaction_id,
             stored_system_freed_pages,
-        );
+        )?;
         // The epilogue only extracts DATA_FREED_TABLE entries. It is still correct to clear these
         // ids from the non-durable scan set: ordinary non-durable commits filter unpersisted
         // system pages before writing SYSTEM_FREED_TABLE, and durable commits process any
@@ -2155,10 +2343,11 @@ impl WriteTransaction {
         // Register this as a non-durable transaction to ensure that freed pages are only processed
         // after this transaction has been persisted.
         self.transaction_tracker.register_non_durable_commit(
+            &self.mem,
             self.transaction_id,
             self.mem.get_last_durable_transaction_id()?,
             stored_freed_pages,
-        );
+        )?;
 
         for page in post_commit_frees {
             let removed = self.mem.free_if_unpersisted(page, &PageTracker::ignore());
@@ -2240,7 +2429,7 @@ impl WriteTransaction {
         let page_allocator = self.page_allocator();
         let mut free_page = |page| {
             // These pages cannot be unpersisted: free_until is bounded by
-            // oldest_live_read_transaction, which pins back to the durable_ancestor of every
+            // oldest_local_referenced_transaction, which pins back to the durable_ancestor of every
             // pending non-durable commit (see register_non_durable_commit). As a result, no entry
             // whose pages are still unpersisted is eligible for processing here.
             debug_assert!(!self.mem.unpersisted(page));
@@ -2249,13 +2438,13 @@ impl WriteTransaction {
 
         let extracted_transactions = {
             let mut system_tables = self.system_tables.lock().unwrap();
-            let mut extracted_transactions = self.extract_freed_pages(
+            let mut extracted_transactions = Self::extract_freed_pages(
                 &mut system_tables,
                 DATA_FREED_TABLE,
                 free_until,
                 &mut free_page,
             )?;
-            extracted_transactions.extend(self.extract_freed_pages(
+            extracted_transactions.extend(Self::extract_freed_pages(
                 &mut system_tables,
                 SYSTEM_FREED_TABLE,
                 free_until,
@@ -2270,7 +2459,6 @@ impl WriteTransaction {
     }
 
     fn extract_freed_pages(
-        &self,
         system_tables: &mut SystemNamespace,
         definition: SystemTableDefinition<TransactionIdWithPagination, PageList>,
         free_until: TransactionId,
@@ -2280,7 +2468,7 @@ impl WriteTransaction {
             return Ok(vec![]);
         }
 
-        let mut freed = system_tables.open_system_table(self, definition)?;
+        let mut freed = system_tables.open_system_table(definition)?;
         let key = TransactionIdWithPagination {
             transaction_id: free_until.raw_id(),
             pagination_id: 0,
@@ -2321,7 +2509,7 @@ impl WriteTransaction {
             transaction_id: oldest_unprocessed,
             pagination_id: 0,
         };
-        let mut data_freed = system_tables.open_system_table(self, definition)?;
+        let mut data_freed = system_tables.open_system_table(definition)?;
 
         let mut candidate_transactions = vec![];
         for entry in data_freed.range(first_key..last_key)? {
@@ -2567,7 +2755,18 @@ impl Drop for WriteTransaction {
                 .unwrap()
                 .table_tree
                 .clear_root_updates_and_close();
+        } else if !self.completed {
+            // The abort is skipped while unwinding, leaking this transaction's pages: the
+            // session stays usable, but the leak must not outlive the process
+            assert!(crate::panicking());
+            self.mem.mark_needs_repair();
         }
+        // A failed commit or panic may skip abort_inner(). Retire any remaining registrations
+        // before releasing the writer lock, since peers can reuse their persistent IDs.
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .apply_on_abort(&self.transaction_tracker);
     }
 }
 
@@ -2583,8 +2782,8 @@ impl ReadTransaction {
     pub(crate) fn new(
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,
+        root_page: Option<BtreeHeader>,
     ) -> Result<Self, TransactionError> {
-        let root_page = mem.get_data_root();
         let guard = Arc::new(guard);
         let resolver = PageResolver::new(mem.clone());
         Ok(Self {
@@ -2636,9 +2835,9 @@ impl ReadTransaction {
             } => Ok(ReadOnlyUntypedTable::new(
                 name,
                 table_root,
-                PageHint::Clean,
                 fixed_key_size,
                 fixed_value_size,
+                self.tree.transaction_guard().clone(),
                 PageResolver::new(self.mem.clone()),
             )),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
@@ -2695,9 +2894,9 @@ impl ReadTransaction {
                 name,
                 table_root,
                 table_length,
-                PageHint::Clean,
                 fixed_key_size,
                 fixed_value_size,
+                self.tree.transaction_guard().clone(),
                 PageResolver::new(self.mem.clone()),
             )),
         }
@@ -2747,6 +2946,138 @@ mod test {
 
     const X: TableDefinition<&str, &str> = TableDefinition::new("x");
     const BIG_VALUE: TableDefinition<u64, &[u8]> = TableDefinition::new("big_value");
+
+    // A persistent savepoint takes no "active transaction byte", so nothing on the way in checks
+    // that its transaction id is one the multi-process protocol can represent. The file names it,
+    // so it is untrusted: an id past the lock range must be reported as corruption rather than
+    // tracked as this process's oldest read, where the next commit's scan and `TransactionId::next`
+    // would run past the end of the range.
+    #[cfg(all(
+        feature = "experimental-multiprocess",
+        any(target_os = "linux", target_vendor = "apple", windows)
+    ))]
+    #[test]
+    fn a_savepoint_naming_an_unrepresentable_transaction_is_corruption() {
+        use super::{SAVEPOINT_TABLE, SavepointId, SerializedSavepoint};
+        use crate::tree_store::BtreeHeader;
+        use crate::{ConcurrencyMode, DatabaseError};
+
+        let tmpfile = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_concurrency_mode(ConcurrencyMode::MultiWriter);
+        let db = builder.create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+
+        // The record as the format has it, naming a transaction no lock byte can address
+        let mut record = vec![3u8];
+        record.extend(id.to_le_bytes());
+        record.extend(u64::MAX.to_le_bytes());
+        record.push(0);
+        record.extend([0; BtreeHeader::serialized_size()]);
+
+        let txn = db.begin_write().unwrap();
+        txn.system_tables
+            .lock()
+            .unwrap()
+            .open_system_table(SAVEPOINT_TABLE)
+            .unwrap()
+            .insert(SavepointId(id), SerializedSavepoint::Ref(&record))
+            .unwrap();
+        txn.commit().unwrap();
+        drop(db);
+
+        // The open syncs the file's persistent savepoints, which is where the id arrives
+        assert!(matches!(
+            builder.open(tmpfile.path()),
+            Err(DatabaseError::Storage(StorageError::Corrupted(_)))
+        ));
+    }
+
+    #[cfg(all(
+        feature = "experimental-multiprocess",
+        any(target_os = "linux", target_vendor = "apple", windows)
+    ))]
+    #[test]
+    fn failed_multi_writer_open_releases_locks_without_committing() {
+        use super::{SAVEPOINT_TABLE, SavepointId, SerializedSavepoint};
+        use crate::db::FULL_RANGE;
+        use crate::tree_store::file_backend::range_lock::RangeLock;
+        use crate::tree_store::{PAGE_SIZE, TransactionalMemory};
+        use crate::{ConcurrencyMode, DatabaseError, backends::FileBackend};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmpfile = crate::create_tempfile();
+        let db = Database::builder()
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .create(tmpfile.path())
+            .unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(X).unwrap().insert("key", "value").unwrap();
+        txn.commit().unwrap();
+
+        // A valid tree and allocator snapshot, with a savepoint that fails to deserialize.
+        // The open reaches tracker initialization without latching an I/O error.
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.system_tables
+            .lock()
+            .unwrap()
+            .open_system_table(SAVEPOINT_TABLE)
+            .unwrap()
+            .insert(SavepointId(id), SerializedSavepoint::Ref(&[]))
+            .unwrap();
+        txn.commit().unwrap();
+        let mem = db.get_memory();
+        drop(db);
+        let committed_id = mem.get_last_committed_transaction_id().unwrap();
+        drop(mem);
+
+        let file = tmpfile.reopen().unwrap();
+        let kept_by_caller = file.try_clone().unwrap();
+        let (completed, completion) = mpsc::channel();
+        let opening = thread::spawn(move || {
+            let result = Database::builder()
+                .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+                .set_repair_callback(|_| panic!("the allocator snapshot should be valid"))
+                .create_file(file);
+            completed.send(result).unwrap();
+        });
+        let result = completion
+            .recv_timeout(Duration::from_secs(10))
+            .expect("failed open deadlocked during cleanup");
+        opening.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(DatabaseError::Storage(StorageError::Corrupted(message)))
+                if message == "Corrupted savepoint record"
+        ));
+
+        // A caller's duplicate keeps the file description alive, so dropping the backend's
+        // File alone would leave its locks held on platforms with open-file-description locks.
+        let observer = tmpfile.reopen().unwrap();
+        assert!(observer.try_lock_range(FULL_RANGE).unwrap());
+        observer.unlock_range(FULL_RANGE).unwrap();
+        drop(kept_by_caller);
+
+        let (mem, _writer) = TransactionalMemory::new(
+            Box::new(FileBackend::new(observer).unwrap()),
+            false,
+            PAGE_SIZE,
+            None,
+            0,
+            false,
+            ConcurrencyMode::MultiWriter,
+        )
+        .unwrap();
+        assert_eq!(
+            mem.get_last_committed_transaction_id().unwrap(),
+            committed_id
+        );
+    }
 
     // A commit that stops part way may leave pages returned to the allocator while the durable
     // freed tables still reference them, so commit_inner() discards the allocator state unless
@@ -2831,6 +3162,129 @@ mod test {
         let db2 = Database::create(tmpfile.path()).unwrap();
         let write_txn = db2.begin_write().unwrap();
         assert!(write_txn.transaction_id > first_txn_id);
+    }
+
+    // check_integrity()'s repair commit must reserve its transaction id: recovery orders the
+    // commit slots by id, so committing an id twice could roll back a committed transaction.
+    #[test]
+    fn repair_commit_reserves_transaction_id() {
+        let tmpfile = crate::create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("k1", "v1").unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Align the tracker's counter with the last committed id. The epilogue is disabled so
+        // no pending non-durable commit routes check_integrity() away from the repair commit.
+        let mut txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("k2", "v2").unwrap();
+        }
+        txn.disable_post_commit_free();
+        txn.commit().unwrap();
+
+        // Leak one page straight from the allocator, standing in for any bug that loses track
+        // of a page: the allocator state then disagrees with the rebuild, so check_integrity()
+        // has a repair to commit
+        db.get_memory().allocate_helper(1, false).unwrap();
+
+        let mut db = db;
+        assert!(!db.check_integrity().unwrap());
+        let repair_id = db.get_memory().get_last_committed_transaction_id().unwrap();
+
+        // The next write transaction must not commit with the repair commit's id
+        let txn = db.begin_write().unwrap();
+        assert!(txn.transaction_id > repair_id);
+        txn.abort().unwrap();
+    }
+
+    // A panic unwinding through a live write transaction skips the rollback, leaking the
+    // transaction's pages. The close must not record a clean shutdown, so that the next open
+    // rebuilds the allocator state and reclaims them. Gated on unwinding for catch_unwind.
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn pages_leaked_by_caught_panic_are_reclaimed_on_reopen() {
+        let tmpfile = crate::create_tempfile();
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("baseline", "value").unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        let baseline_pages = txn.stats().unwrap().allocated_pages();
+        txn.abort().unwrap();
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let txn = db.begin_write().unwrap();
+            let mut table = txn.open_table(X).unwrap();
+            let big = "x".repeat(1024);
+            // Several hundred pages, so the leak stands out from bookkeeping noise
+            for i in 0..2000u32 {
+                table
+                    .insert(format!("key{i}").as_str(), big.as_str())
+                    .unwrap();
+            }
+            panic!("simulated panic with a live write transaction");
+        }));
+        assert!(panic_result.is_err());
+
+        // The session stays usable after the caught panic. Quick-repair makes this commit
+        // save an allocator snapshot, which must exclude the leak like the close-time one
+        let mut txn = db.begin_write().unwrap();
+        txn.set_quick_repair(true);
+        {
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("after-panic", "value").unwrap();
+        }
+        txn.commit().unwrap();
+
+        drop(db);
+        let mut db = Database::open(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        let reopened_pages = txn.stats().unwrap().allocated_pages();
+        txn.abort().unwrap();
+        assert!(
+            reopened_pages < baseline_pages + 100,
+            "{reopened_pages} pages allocated after reopen, {baseline_pages} at baseline"
+        );
+        assert!(db.check_integrity().unwrap());
+    }
+
+    // check_integrity() rebuilds the allocator, reclaiming the leak in this process, so the
+    // close may record a clean shutdown again; a read-only open requires one
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn check_integrity_clears_leak_latch() {
+        let tmpfile = crate::create_tempfile();
+        let mut db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("baseline", "value").unwrap();
+        }
+        txn.commit().unwrap();
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let txn = db.begin_write().unwrap();
+            let mut table = txn.open_table(X).unwrap();
+            table.insert("leak", "leak").unwrap();
+            panic!("simulated panic with a live write transaction");
+        }));
+        assert!(panic_result.is_err());
+
+        assert!(!db.check_integrity().unwrap());
+        drop(db);
+
+        let db = crate::ReadOnlyDatabase::open(tmpfile.path()).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(X).unwrap();
+        assert_eq!(table.get("baseline").unwrap().unwrap().value(), "value");
     }
 
     #[test]

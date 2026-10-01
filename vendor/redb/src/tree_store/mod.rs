@@ -22,8 +22,14 @@ pub(crate) use btree_cursor_range::BtreeCursorRange;
 pub(crate) use btree_iters::{AllPageNumbersBtreeIter, encode_bounds};
 pub(crate) use extract_if::BtreeExtractIf;
 pub(crate) use multimap_btree::{DynamicCollection, DynamicCollectionType, multimap_btree_stats};
+#[cfg(all(test, feature = "experimental-multiprocess"))]
+pub(crate) use page_store::HEADER_LOCK;
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) use page_store::HeaderGuard;
 #[cfg(not(redb_no_std))]
 pub(crate) use page_store::ReadOnlyBackend;
+#[cfg(feature = "experimental-multiprocess")]
+pub(crate) use page_store::WriterLock;
 #[cfg(not(redb_no_std))]
 pub use page_store::file_backend;
 pub(crate) use page_store::{
