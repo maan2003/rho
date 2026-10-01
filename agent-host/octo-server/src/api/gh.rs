@@ -12,13 +12,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
 
-#[path = "gh_generated.rs"]
-mod generated;
+#[path = "gh_writes.rs"]
+mod gh_writes;
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
 type Handler = fn(Request) -> HandlerFuture;
@@ -30,39 +30,6 @@ struct Request {
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-}
-
-// Distinguish omission from null in PATCH requests.
-enum Optional<T> {
-    Missing,
-    Present(T),
-}
-
-impl<T> Default for Optional<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
-}
-
-impl<T> Optional<T> {
-    fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Optional<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize(deserializer).map(Self::Present)
-    }
-}
-
-impl<T: Serialize> Serialize for Optional<T> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Missing => serializer.serialize_none(),
-            Self::Present(value) => value.serialize(serializer),
-        }
-    }
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -227,16 +194,15 @@ async fn rest(
     if method == Method::GET {
         return forward(request).await;
     }
-    let Some(handler) = generated::handler(&op.group, &op.name) else {
+    let Some(handler) = gh_writes::handler(&op.group, &op.name) else {
         return forbidden();
     };
     handler(request).await
 }
 
-async fn typed<P, B>(request: Request, body_required: bool, json_body: bool) -> Response
+async fn typed<B>(request: Request, body_required: bool, json_body: bool) -> Response
 where
-    P: DeserializeOwned + Serialize,
-    B: DeserializeOwned + Serialize,
+    B: DeserializeOwned,
 {
     let Request {
         state,
@@ -248,60 +214,24 @@ where
     } = request;
     // Typed schema validation happens before acquiring host credentials.
 
-    let (has_path, path) = {
-        let mut path_fields = url::form_urlencoded::Serializer::new(String::new());
-        let mut has_path = false;
-        for (template, value) in op.path.trim_start_matches('/').split('/').zip(&parts) {
-            if template.starts_with('{') {
-                has_path = true;
-                let name = template
-                    .trim_start_matches('{')
-                    .trim_start_matches('+')
-                    .trim_end_matches('}');
-                if op.param_types.get(name).is_some_and(|kind| kind == "int") && !positive(value) {
-                    return forbidden();
-                }
-                path_fields.append_pair(
-                    template
-                        .trim_start_matches('{')
-                        .trim_start_matches('+')
-                        .trim_end_matches('}'),
-                    value,
-                );
-            }
+    for (template, value) in op.path.trim_start_matches('/').split('/').zip(&parts) {
+        let name = template.trim_start_matches('{').trim_end_matches('}');
+        if op.param_types.get(name).is_some_and(|kind| kind == "int")
+            && !value.parse::<i64>().is_ok_and(|id| id > 0)
+        {
+            return forbidden();
         }
-        (has_path, path_fields.finish())
-    };
-    let valid_path = if has_path {
-        serde_urlencoded::from_str::<P>(&path).is_ok()
-    } else {
-        serde_json::from_value::<P>(Value::Null).is_ok()
-    };
-    if !valid_path {
-        return forbidden();
     }
     // None of the selected write operations accepts query parameters.
     if uri.query().is_some_and(|query| !query.is_empty()) {
         return forbidden();
     }
-    let body = if json_body {
-        if body.is_empty() {
-            if body_required {
-                return forbidden();
-            }
-            body
-        } else {
-            let Ok(value) = serde_json::from_slice::<B>(&body) else {
-                return forbidden();
-            };
-            Bytes::from(serde_json::to_vec(&value).expect("typed body serializes"))
-        }
-    } else {
-        if !body.is_empty() {
-            return forbidden();
-        }
-        body
-    };
+    if body_required && body.is_empty() {
+        return forbidden();
+    }
+    if !body.is_empty() && (!json_body || serde_json::from_slice::<B>(&body).is_err()) {
+        return forbidden();
+    }
     forward(Request {
         state,
         op,
@@ -739,14 +669,14 @@ mod tests {
         Arc::new(|| Ok("host-token-test".into()))
     }
     #[test]
-    fn reads_are_allowlisted_and_only_writes_have_generated_handlers() {
+    fn reads_are_allowlisted_and_writes_have_manual_handlers() {
         let mut reads = 0;
         let mut writes = 0;
         for op in operations() {
             if matches!(op.name.as_str(), "review_decision" | "set_draft") {
                 continue;
             }
-            let handler = generated::handler(&op.group, &op.name);
+            let handler = gh_writes::handler(&op.group, &op.name);
             if op.verb == "GET" {
                 assert!(handler.is_none(), "{}.{}", op.group, op.name);
                 reads += 1;
@@ -955,6 +885,54 @@ mod tests {
                 "repos/acme/widget/pulls/7/requested_reviewers",
                 json!({"reviewers":["alice"],"team_reviewers":["maintainers"]}),
                 StatusCode::CREATED,
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/issues/7",
+                json!({
+                    "title":null,"assignees":[{"suggest":true,"confidence":"medium"}],
+                    "labels":[{"name":"UI","color":null,"confidence":"high"}],
+                    "type":{"value":null,"rationale":"clear suggested type"},
+                    "state":"closed","state_reason":"not_planned",
+                    "issue_field_values":[{"field_id":5,"value":["High","UI"],"suggest":true}]
+                }),
+                StatusCode::OK,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/dependencies/blocked_by",
+                json!({"issue_id":41}),
+                StatusCode::OK,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/sub_issues",
+                json!({"sub_issue_id":43,"replace_parent":true}),
+                StatusCode::OK,
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/issues/7/sub_issues/priority",
+                json!({"sub_issue_id":43,"after_id":19,"before_id":73}),
+                StatusCode::OK,
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/issues/7/issue-field-values",
+                json!({"issue_field_values":[{"field_id":5,"value":9007199254740993u64}]}),
+                StatusCode::OK,
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/pulls/7/reviews/23",
+                json!({"body":"Updated pending review"}),
+                StatusCode::OK,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/pulls/7/reviews/23/events",
+                json!({"event":"REQUEST_CHANGES","body":"Please fix"}),
+                StatusCode::OK,
             ),
         ] {
             let response = client

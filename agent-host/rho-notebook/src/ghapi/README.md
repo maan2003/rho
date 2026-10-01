@@ -13,12 +13,12 @@ Reads use the selected metadata as an explicit GET/path-template allowlist.
 Octo forwards query parameters and response fields without schema validation;
 GitHub validates its API. The Python client still checks declared argument names.
 
-Writes have distinct typed Rust handlers. `octo-server/generate-gh.py` generates
-only write path/body models from selected, pinned official GitHub schemas.
-The compact request schema source and generated handlers are checked in;
-regeneration needs no network. Unknown write fields and wrong types are rejected
-before Octo acquires credentials. Optional nullable request fields preserve
-null versus omission. No REST response models are generated.
+Writes are explicitly dispatched to handwritten Rust request types in
+`octo-server/src/api/gh_writes.rs`. Unknown fields, wrong types, and missing
+required fields are rejected before Octo acquires credentials. The original
+JSON is forwarded after validation, preserving null versus omission and the
+caller's union representation. There is no schema generator or REST response
+model.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
 and dismissing another review. Generic GraphQL, Git ref writes, repository
