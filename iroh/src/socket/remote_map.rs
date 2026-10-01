@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     future::poll_fn,
     hash::Hash,
+    net::SocketAddr,
     sync::Arc,
     task::{Context, Poll, Waker, ready},
 };
@@ -31,12 +32,14 @@ pub(crate) use self::remote_state::{
 use super::{
     DirectAddr, Metrics as SocketMetrics,
     mapped_addrs::{
-        AddrMap, CustomMappedAddr, EndpointIdMappedAddr, MultipathMappedAddr, RelayMappedAddr,
+        AddrMap, CustomMappedAddr, EndpointIdMappedAddr, MappedAddr, MultipathMappedAddr,
+        RelayMappedAddr,
     },
     transports,
 };
 use crate::{
     address_lookup::{self, AddressLookupFailed},
+    endpoint::LocalTransportAddr,
     socket::concurrent_read_map::{ConcurrentReadMap, ReadOnlyMap},
 };
 
@@ -78,6 +81,51 @@ pub(crate) struct MappedAddrs {
     pub(super) custom_addrs: AddrMap<CustomAddr, CustomMappedAddr>,
 }
 
+impl MappedAddrs {
+    /// Converts a possibly mapped-IP address into a [`transports::Addr`].
+    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> Option<transports::Addr> {
+        to_transport_addr(addr, &self.relay_addrs, &self.custom_addrs)
+    }
+
+    /// Converts a possibly mapped-IP 4-tuple into a [`transports::FourTuple`].
+    pub(crate) fn to_transport_tuple(
+        &self,
+        four_tuple: &noq::FourTuple,
+    ) -> Option<transports::FourTuple> {
+        let remote = to_transport_addr(four_tuple.remote(), &self.relay_addrs, &self.custom_addrs)?;
+        let local = LocalTransportAddr::from_noq_local_ip(
+            four_tuple.local_ip(),
+            &remote,
+            &self.custom_addrs,
+        );
+        Some(transports::FourTuple::new(remote, local))
+    }
+
+    /// Converts a [`transports::FourTuple`] to a mapped-IP 4-tuple.
+    pub(crate) fn to_mapped_tuple(&self, four_tuple: &transports::FourTuple) -> noq::FourTuple {
+        let (remote, local) = match four_tuple {
+            transports::FourTuple::Ip { remote, local } => (*remote, *local),
+            transports::FourTuple::Relay { url, endpoint_id } => (
+                self.relay_addrs
+                    .get(&(url.clone(), *endpoint_id))
+                    .private_socket_addr(),
+                None,
+            ),
+            transports::FourTuple::Custom { remote, local } => {
+                let remote = self.custom_addrs.get(remote).private_socket_addr();
+                let local = local.as_ref().map(|custom_addr| {
+                    self.custom_addrs
+                        .get(custom_addr)
+                        .private_socket_addr()
+                        .ip()
+                });
+                (remote, local)
+            }
+        };
+        noq::FourTuple::new(remote, local)
+    }
+}
+
 /// Converts a mapped socket address to a transport address.
 ///
 /// This takes a socket address, converts it into a [`MultipathMappedAddr`] and then tries
@@ -87,7 +135,7 @@ pub(crate) struct MappedAddrs {
 /// if an entry exists in the corresponding map.
 ///
 /// Returns `None` for [`MultipathMappedAddr::Mixed`] addresses or unknown mapped addresses.
-pub(super) fn to_transport_addr(
+fn to_transport_addr(
     addr: impl Into<MultipathMappedAddr>,
     relay_addrs: &AddrMap<(RelayUrl, EndpointId), RelayMappedAddr>,
     custom_addrs: &AddrMap<CustomAddr, CustomMappedAddr>,
@@ -330,8 +378,7 @@ impl Tasks {
         let sender = RemoteStateActor::new(
             eid,
             self.local_direct_addrs.clone(),
-            mapped_addrs.relay_addrs.clone(),
-            mapped_addrs.custom_addrs.clone(),
+            mapped_addrs.clone(),
             self.metrics.clone(),
             self.address_lookup.clone(),
             self.path_selector.clone(),
@@ -378,8 +425,10 @@ pub(crate) enum Source {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, time::Duration};
+    use std::{net::SocketAddr, pin::Pin, time::Duration};
 
+    use bytes::Bytes;
+    use futures_util::StreamExt;
     use iroh_base::{SecretKey, TransportAddr};
     use n0_future::future::now_or_never;
     use n0_tracing_test::traced_test;
@@ -388,7 +437,151 @@ mod tests {
     use tracing::Span;
 
     use super::*;
-    use crate::socket::biased_rtt_path_selector::BiasedRttPathSelector;
+    use crate::socket::{
+        biased_rtt_path_selector::BiasedRttPathSelector,
+        transports::{OwnedTransmit, Transmit},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_initial_send_does_not_block_remote_actor_inbox() {
+        check_initial_send_inbox(256).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncongested_initial_send_keeps_remote_actor_responsive() {
+        check_initial_send_inbox(0).await;
+    }
+
+    async fn check_initial_send_inbox(queued: usize) {
+        let (mut remote_map, _shutdown_token, _guards) = make_remote_map();
+        let (endpoint_id, mut receiver) = enqueue_initials(&mut remote_map, queued, 1).await;
+        let (info_tx, info_rx) = oneshot::channel();
+        remote_map
+            .send_to_actor(endpoint_id, RemoteStateMessage::RemoteInfo(info_tx))
+            .await;
+        // The inbox must respond before the blocked send's three-second deadline.
+        tokio::time::timeout(Duration::from_secs(1), info_rx)
+            .await
+            .expect("pending Initial send blocked the RemoteStateActor inbox")
+            .expect("remote actor dropped the response");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.next())
+                .await
+                .expect("Initial was not sent on an uncongested queue")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_initial_sends_are_cancelled_on_shutdown() {
+        let (mut remote_map, shutdown_token, _guards) = make_remote_map();
+        let (endpoint_id, receiver) = enqueue_initials(&mut remote_map, 256, 1).await;
+        wait_for_inbox(&mut remote_map, endpoint_id).await;
+        shutdown_token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), remote_map.cleanup())
+            .await
+            .expect("actor shutdown blocked by Initial send");
+        let remaining = tokio::time::timeout(Duration::from_secs(1), receiver.count())
+            .await
+            .expect("send task retained the RelaySender after shutdown");
+        assert_eq!(remaining, 256);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_initial_sends_expire_without_sending_late_packets() {
+        let (mut remote_map, _shutdown_token, _guards) = make_remote_map();
+        let (endpoint_id, receiver) = enqueue_initials(&mut remote_map, 256, 1).await;
+        wait_for_inbox(&mut remote_map, endpoint_id).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let remaining = tokio::time::timeout(Duration::from_secs(1), receiver.count())
+            .await
+            .expect("expired Initial still holds the sender");
+        assert_eq!(remaining, 256);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn congested_initial_sends_have_bounded_pending_work() {
+        let (mut remote_map, _shutdown_token, _guards) = make_remote_map();
+        let (endpoint_id, receiver) = enqueue_initials(&mut remote_map, 256, 32).await;
+        wait_for_inbox(&mut remote_map, endpoint_id).await;
+        let remaining = tokio::time::timeout(Duration::from_secs(1), receiver.count())
+            .await
+            .expect("Initial sends did not finish after draining the queue");
+        assert_eq!(remaining, 256 + 16);
+    }
+
+    async fn enqueue_initials(
+        remote_map: &mut RemoteMap,
+        queued: usize,
+        count: usize,
+    ) -> (
+        EndpointId,
+        impl futures_util::Stream<Item = ()> + Unpin + use<>,
+    ) {
+        let endpoint_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let relay_url: RelayUrl = "https://relay.example.invalid".parse().unwrap();
+        let (resolve_tx, resolve_rx) = oneshot::channel();
+        remote_map
+            .resolve_remote(
+                EndpointAddr::from_parts(endpoint_id, [TransportAddr::Relay(relay_url.clone())]),
+                resolve_tx,
+            )
+            .await;
+        assert!(resolve_rx.await.expect("resolve response").is_ok());
+
+        // Hold the receiver to apply backpressure without changing poll_send.
+        let (mut sender, receiver) = transports::TransportsSender::with_bounded_relay(
+            256,
+            #[cfg(not(wasm_browser))]
+            std::iter::empty(),
+        );
+        let transmit = Transmit {
+            ecn: None,
+            contents: b"queued",
+            segment_size: None,
+        };
+        let path = transports::FourTuple::Relay {
+            url: relay_url,
+            endpoint_id,
+        };
+        for _ in 0..queued {
+            poll_fn(|cx| Pin::new(&mut sender).poll_send(cx, &path, &transmit))
+                .await
+                .expect("fill relay queue");
+        }
+        for _ in 0..count {
+            remote_map
+                .send_to_actor(
+                    endpoint_id,
+                    RemoteStateMessage::SendDatagram(
+                        Box::new(sender.clone()),
+                        OwnedTransmit {
+                            ecn: None,
+                            contents: Bytes::from_static(b"initial"),
+                            segment_size: None,
+                        },
+                    ),
+                )
+                .await;
+        }
+        (endpoint_id, receiver)
+    }
+
+    async fn wait_for_inbox(remote_map: &mut RemoteMap, endpoint_id: EndpointId) {
+        // Resolve is queued after the sends, so its reply marks them as handled.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        remote_map
+            .send_to_actor(
+                endpoint_id,
+                RemoteStateMessage::ResolveRemote(BTreeSet::new(), ack_tx),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), ack_rx)
+            .await
+            .expect("inbox stalled")
+            .expect("actor dropped acknowledgement")
+            .expect("resolve acknowledgement");
+    }
 
     fn make_remote_map() -> (RemoteMap, CancellationToken, impl Sized) {
         let metrics = Arc::new(SocketMetrics::default());

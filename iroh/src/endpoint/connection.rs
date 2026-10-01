@@ -25,6 +25,7 @@ use std::{
     task::Poll,
 };
 
+use bytes::Bytes;
 use ed25519_dalek::{VerifyingKey, pkcs8::DecodePublicKey};
 use futures_util::{FutureExt, future::Shared};
 use iroh_base::{EndpointId, RelayUrl};
@@ -32,7 +33,7 @@ use n0_error::{e, stack_error};
 use n0_future::{TryFutureExt, future::Boxed as BoxFuture, time::Duration};
 use noq::WeakConnectionHandle as NoqWeakConnectionHandle;
 use pin_project::pin_project;
-use tracing::{event, warn};
+use tracing::{error, event, warn};
 
 use super::quic::DecryptedInitial;
 use crate::{
@@ -41,8 +42,8 @@ use crate::{
         AfterHandshakeOutcome,
         quic::{
             AcceptBi, AcceptUni, Closed, ConnectionError, ConnectionStats, Controller,
-            ExportKeyingMaterialError, OpenBi, OpenUni, PathId, ReadDatagram, SendDatagram,
-            SendDatagramError, ServerConfig, Side, VarInt,
+            ExportKeyingMaterialError, OpenBi, OpenUni, PathId, ReadDatagram, ReadManyDatagrams,
+            SendDatagram, SendDatagramError, ServerConfig, Side, VarInt,
         },
     },
     socket::{
@@ -201,8 +202,13 @@ impl Incoming {
 
     /// Returns the remote address of this incoming connection.
     pub fn remote_addr(&self) -> IncomingAddr {
+        let remote = self.inner.remote_address();
         self.ep
-            .to_transport_addr(self.inner.remote_address())
+            .to_transport_addr(remote)
+            .unwrap_or_else(|| {
+                error!(mapped_addr = ?remote, "Incoming::remote_addr: invalid mapped address");
+                transports::Addr::Ip(remote)
+            })
             .into()
     }
 
@@ -641,8 +647,13 @@ impl Accepting {
 
     /// Returns the remote address of this connection.
     pub fn remote_addr(&self) -> IncomingAddr {
+        let remote = self.inner.remote_address();
         self.ep
-            .to_transport_addr(self.inner.remote_address())
+            .to_transport_addr(remote)
+            .unwrap_or_else(|| {
+                error!(mapped_addr = ?remote, "Accepting::remote_addr: invalid mapped address");
+                transports::Addr::Ip(remote)
+            })
             .into()
     }
 
@@ -908,6 +919,21 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.read_datagram()
     }
 
+    /// Receives a batch of application datagrams into `out`, in arrival order.
+    ///
+    /// This is the batch analogue of [`read_datagram()`](Self::read_datagram). The returned
+    /// future resolves once at least one datagram is buffered, drains up to `out.len()` of
+    /// them into `out` from the front, and yields the count written. Use this instead of
+    /// `read_datagram()` in a loop when forwarding bursts: a whole batch is taken under a
+    /// single lock hold.
+    #[inline]
+    pub fn read_many_datagrams<'a, 'b>(
+        &'a self,
+        out: &'b mut [Bytes],
+    ) -> ReadManyDatagrams<'a, 'b> {
+        self.inner.read_many_datagrams(out)
+    }
+
     /// Waits for the connection to be closed for any reason.
     ///
     /// Despite the return type's name, closed connections are often not an error condition
@@ -966,8 +992,22 @@ impl<T: ConnectionState> Connection<T> {
     /// of order, and `data` must both fit inside a single QUIC packet and be smaller than
     /// the maximum dictated by the peer.
     #[inline]
-    pub fn send_datagram(&self, data: bytes::Bytes) -> Result<(), SendDatagramError> {
+    pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         self.inner.send_datagram(data)
+    }
+
+    /// Transmits many unreliable, unordered application datagrams in a single call.
+    ///
+    /// This is the batch analogue of [`send_datagram()`](Self::send_datagram): it queues the
+    /// whole batch under one lock hold and wakes the driver once, reducing the per-datagram
+    /// overhead of calling `send_datagram()` repeatedly. Like `send_datagram()`, older queued
+    /// datagrams may be dropped to make room.
+    ///
+    /// Returns the number of datagrams queued. The batch is rejected with
+    /// [`SendDatagramError::TooLarge`] if any datagram exceeds the maximum datagram size.
+    #[inline]
+    pub fn send_many_datagrams(&self, datagrams: &[Bytes]) -> Result<usize, SendDatagramError> {
+        self.inner.send_many_datagrams(datagrams)
     }
 
     /// Transmits `data` as an unreliable, unordered application datagram
@@ -979,7 +1019,7 @@ impl<T: ConnectionState> Connection<T> {
     ///
     /// [`send_datagram()`]: Connection::send_datagram
     #[inline]
-    pub fn send_datagram_wait(&self, data: bytes::Bytes) -> SendDatagram<'_> {
+    pub fn send_datagram_wait(&self, data: Bytes) -> SendDatagram<'_> {
         self.inner.send_datagram_wait(data)
     }
 
