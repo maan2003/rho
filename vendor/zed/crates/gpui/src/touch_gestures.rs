@@ -498,8 +498,60 @@ mod tests {
             panic!("expected momentum scroll")
         };
         // The 100 ms velocity window retains the samples at 100 and 150 ms:
-        // (50 - 20) / 0.05 s = 600 px/s, hence 9.6 px over a 16 ms tick.
-        assert!((delta.x - 9.6).abs() < 0.01);
+        // (50 - 20) / 0.05 s = 600 px/s. Integrate the default exponential
+        // decay over 16 ms, rather than applying velocity once per tick.
+        let expected = 0.6 * (0.998_f64.powi(16) - 1.0) / 0.998_f64.ln();
+        assert!((f64::from(delta.x) - expected).abs() < 0.01);
+        assert_eq!(delta.y, 0.0);
+    }
+
+    #[test]
+    fn fling_distance_is_independent_of_tick_cadence() {
+        fn fling() -> TouchGestureRecognizer {
+            let mut gesture = TouchGestureRecognizer::new(GestureTuning {
+                scroll_physics: crate::ScrollPhysics::Exponential { decay_per_ms: 0.99 },
+                ..GestureTuning::default()
+            });
+            gesture.down(1, pos(0.0, 0.0), at(0));
+            gesture.motion(1, pos(30.0, 40.0), at(100));
+            gesture.up(1, at(100));
+            gesture
+        }
+        let mut coarse = fling();
+        let mut fine = fling();
+        let mut total = Position::default();
+        for time in [103, 117, 140] {
+            let actions = fine.advance(at(time));
+            let [
+                GestureAction::Scroll {
+                    delta,
+                    phase: Phase::Moved,
+                    ..
+                },
+            ] = actions.as_slice()
+            else {
+                panic!("expected momentum")
+            };
+            total.x += delta.x;
+            total.y += delta.y;
+        }
+        let actions = coarse.advance(at(140));
+        let [
+            GestureAction::Scroll {
+                delta,
+                phase: Phase::Moved,
+                ..
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("expected momentum")
+        };
+        // The release velocity is (300, 400) px/s. Integrate independently.
+        let time_factor = (0.99_f64.powi(40) - 1.0) / 0.99_f64.ln() / 1000.0;
+        assert!((f64::from(total.x) - 300.0 * time_factor).abs() < 0.01);
+        assert!((f64::from(total.y) - 400.0 * time_factor).abs() < 0.01);
+        assert!((total.x - delta.x).abs() < 0.01);
+        assert!((total.y - delta.y).abs() < 0.01);
     }
 
     #[test]

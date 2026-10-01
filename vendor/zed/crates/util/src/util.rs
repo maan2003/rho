@@ -718,6 +718,18 @@ pub mod __rust_embed {
     };
 }
 
+#[cfg(all(debug_assertions, not(feature = "debug-embed")))]
+fn fs_embed_root(root_relative: &str) -> Option<std::path::PathBuf> {
+    let root = dev_repo_root()?;
+    // Zed's assets remain relative to its workspace when it is a Rho subtree.
+    let root = if root.join("vendor/zed/Cargo.toml").is_file() {
+        root.join("vendor/zed")
+    } else {
+        root.to_path_buf()
+    };
+    Some(root.join(root_relative))
+}
+
 /// Backs the dev arm of [`fs_embed!`]'s `iter`: every file under the root-relative
 /// directory that passes the same rust_embed include/exclude globs the
 /// release derive uses, so the dev and release file sets are identical. Reuses
@@ -736,7 +748,7 @@ pub fn __fs_embed_iter(
 
 #[cfg(all(debug_assertions, not(feature = "debug-embed")))]
 fn fs_embed_file_names(root_relative: &str, includes: &[&str], excludes: &[&str]) -> Vec<String> {
-    let Some(root) = dev_repo_root().map(|root| root.join(root_relative)) else {
+    let Some(root) = fs_embed_root(root_relative) else {
         return Vec::new();
     };
     let matcher = rust_embed::utils::PathMatcher::new(includes, excludes);
@@ -760,9 +772,8 @@ pub fn __fs_embed_get(
     if !matcher.is_path_included(file_path) {
         return None;
     }
-    let root = dev_repo_root()
-        .expect("dev asset loading requires running from within the checkout")
-        .join(root_relative);
+    let root = fs_embed_root(root_relative)
+        .expect("dev asset loading requires running from within the checkout");
     rust_embed::utils::read_file_from_fs(&root.join(file_path)).ok()
 }
 

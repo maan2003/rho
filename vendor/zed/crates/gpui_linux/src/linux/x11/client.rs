@@ -2027,7 +2027,7 @@ impl X11ClientState {
                             drop(state);
                             window.refresh(RequestFrameOptions {
                                 require_presentation: false,
-                                force_render,
+                                force_render: false,
                                 host_vsync: None,
                             });
                         }

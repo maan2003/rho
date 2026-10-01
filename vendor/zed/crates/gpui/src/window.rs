@@ -8368,7 +8368,7 @@ mod tests {
         DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
         FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
         Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
+        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels, ScrollHandle,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
@@ -8508,6 +8508,7 @@ mod tests {
             force: None,
             timestamp: Duration::from_millis(milliseconds),
             serial: None,
+            predicted_position: None,
         }
     }
 
@@ -9867,7 +9868,7 @@ mod tests {
                                 assert_eq!(underline.bounds, bounds);
                                 assert_eq!(underline.thickness, stroke(thickness));
                                 assert_eq!(underline.wavy, wavy.into());
-                                assert_eq!(underline.color, hsla(0.25, 0.5, 0.75, 0.5));
+                                assert_eq!(underline.color, hsla(0.25, 0.5, 0.75, 0.5).into());
                             }
 
                             let underlines = paint_test_underlines(window, |window| {
@@ -9983,7 +9984,7 @@ mod tests {
                         let original = paint_test_underlines(window, |window| {
                             window.paint_underline(origin, width, &style);
                         })[0];
-                        assert_eq!(original.color, hsla(0.25, 0.5, 0.75, 0.125));
+                        assert_eq!(original.color, hsla(0.25, 0.5, 0.75, 0.125).into());
                         let underlines = paint_test_underlines(window, |window| {
                             window.paint_underline_with_exclusions(
                                 origin,

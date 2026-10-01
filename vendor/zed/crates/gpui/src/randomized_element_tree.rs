@@ -1476,7 +1476,7 @@ mod tests {
                 bounds: quad.bounds,
                 content_mask: quad.content_mask,
                 background: quad.background,
-                border_color: quad.border_color,
+                border_color: quad.border_color.into(),
                 corner_radii: quad.corner_radii,
                 border_widths: quad.border_widths,
             }
