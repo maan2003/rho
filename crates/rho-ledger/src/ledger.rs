@@ -101,7 +101,7 @@ impl Ledger {
         let mut table = write.open_table(SELF);
         if table.get(()).is_none() {
             let mut id = [0; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+            rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut id).expect("system entropy");
             table.insert(
                 (),
                 SenValue::borrowed(&SelfRecord {

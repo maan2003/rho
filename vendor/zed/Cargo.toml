@@ -841,7 +841,7 @@ toml_edit = { version = "0.22", default-features = false, features = [
     "serde",
 ] }
 tower-http = "0.4.4"
-tree-sitter = "0.26.9"
+tree-sitter = "0.27"
 tree-sitter-wasm-feature = { path = "crates/tree_sitter_wasm_feature" }
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.1"

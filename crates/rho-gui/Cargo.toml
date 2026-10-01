@@ -117,7 +117,7 @@ vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 # unprefixed_malloc routes C-library allocations (freetype, fontconfig,
 # drivers) through jemalloc too; profiling stays inert until MALLOC_CONF
 # turns it on.
-tikv-jemallocator = { version = "0.6", features = [
+tikv-jemallocator = { version = "0.7", features = [
   "profiling",
   "unprefixed_malloc_on_supported_platforms",
 ] }
@@ -132,7 +132,7 @@ rho-slack = { workspace = true, features = ["ui", "fake"] }
 # be at the scale the user runs at rather than at a scale chosen here.
 rho-fake-slack.workspace = true
 rho-agent-hosts = { workspace = true, features = ["test-support"] }
-criterion = "0.5"
+criterion = "0.8"
 editor = { path = "../../vendor/zed/crates/editor", features = [
   "wrap-test-support",
 ] }
