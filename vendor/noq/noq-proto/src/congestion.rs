@@ -23,6 +23,12 @@ pub trait Controller: Send + Sync + std::fmt::Debug {
     #[allow(unused_variables)]
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {}
 
+    /// The connection had data to send but was blocked by the congestion window
+    ///
+    /// Reports the spec's `C.is_cwnd_limited` signal to the controller: the sender fully utilized
+    /// the congestion window at this point in the current round trip.
+    fn on_cwnd_limited(&mut self) {}
+
     /// Packet deliveries were confirmed
     ///
     /// `app_limited` indicates whether the connection was blocked on outgoing
@@ -39,7 +45,8 @@ pub trait Controller: Send + Sync + std::fmt::Debug {
     ) {
     }
 
-    /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
+    /// Packets are acked in batches, all with the same `now` argument. This indicates one of those
+    /// batches has completed.
     #[allow(unused_variables)]
     fn on_end_acks(
         &mut self,
@@ -101,8 +108,8 @@ pub trait Controller: Send + Sync + std::fmt::Debug {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
-    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
-    /// This is also used to alter the pacing of the connection with
+    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are
+    /// enabled This is also used to alter the pacing of the connection with
     /// `pacing_rate` and `send_quantum`
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
