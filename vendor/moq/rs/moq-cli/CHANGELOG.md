@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.8...moq-cli-v0.13.0) - 2026-09-30
+
+### Added
+
+- *(srt)* select a program of a multi-program feed ([#4569](https://github.com/moq-dev/moq/pull/4569))
+- *(cli)* linger export ts across a broadcast that leaves and returns ([#4504](https://github.com/moq-dev/moq/pull/4504))
+- *(ts)* import one program of a multiplex, or each as its own broadcast ([#4505](https://github.com/moq-dev/moq/pull/4505))
+- *(srt)* log the TS importer's per-stream counters on ingest ([#4506](https://github.com/moq-dev/moq/pull/4506))
+- *(mux)* report every TS elementary stream's access units and quiet time ([#4502](https://github.com/moq-dev/moq/pull/4502))
+- *(net)* drain queued stream data before a graceful close ([#4430](https://github.com/moq-dev/moq/pull/4430))
+
+### Fixed
+
+- *(cli)* refuse every MoQ-side flag a verb never reads ([#4419](https://github.com/moq-dev/moq/pull/4419))
+- *(cli)* refuse a client CA under --auth-public on a listener ([#4364](https://github.com/moq-dev/moq/pull/4364))
+- *(cli)* schedule play decode by the earliest owed picture ([#4374](https://github.com/moq-dev/moq/pull/4374))
+- *(auth)* [**breaking**] restore 0.14 auth parity ([#4319](https://github.com/moq-dev/moq/pull/4319))
+
+### Other
+
+- flush quiet audio in the documented ffmpeg MPEG-TS line ([#4514](https://github.com/moq-dev/moq/pull/4514))
+
+## [0.12.8](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.7...moq-cli-v0.12.8) - 2026-09-27
+
+### Fixed
+
+- *(auth)* root public and mTLS rules at / ([#4318](https://github.com/moq-dev/moq/pull/4318))
+- *(cli)* close the relay connection on SIGINT and SIGTERM ([#4287](https://github.com/moq-dev/moq/pull/4287))
+- *(cli)* finish the catalog at stdin EOF ([#4303](https://github.com/moq-dev/moq/pull/4303))
+
+## [0.12.7](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.6...moq-cli-v0.12.7) - 2026-09-26
+
+### Fixed
+
+- *(cli)* keep delayed playback at the live edge ([#4241](https://github.com/moq-dev/moq/pull/4241))
+
+## [0.12.6](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.5...moq-cli-v0.12.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-video, moq-auth, hang, moq-mux, moq-tokio, moq-audio, moq-hls, moq-relay, moq-rtc, moq-rtmp, moq-srt, moq-transcode
+
+## [0.12.5](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.4...moq-cli-v0.12.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-mux, moq-tokio, moq-audio, moq-video, moq-auth, hang, moq-hls, moq-relay, moq-rtc, moq-rtmp, moq-srt, moq-transcode
+
+## [0.12.4](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.3...moq-cli-v0.12.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: hang, moq-mux, moq-tokio, moq-audio, moq-video, moq-hls, moq-relay, moq-rtc, moq-rtmp, moq-srt, moq-transcode
+
+## [0.12.3](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.2...moq-cli-v0.12.3) - 2026-09-25
+
+### Added
+
+- *(cli)* add `moq fetch` to read one group of a track ([#3965](https://github.com/moq-dev/moq/pull/3965))
+
+### Fixed
+
+- *(net)* a broadcast exists only while announced ([#4021](https://github.com/moq-dev/moq/pull/4021))
+
+### Other
+
+- ship the moq-cli crate as moq on Docker, Nix, and winget ([#4030](https://github.com/moq-dev/moq/pull/4030))
+
+## [0.12.2](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.1...moq-cli-v0.12.2) - 2026-09-24
+
+### Added
+
+- *(moq-video)* capture cameras through PipeWire ([#4022](https://github.com/moq-dev/moq/pull/4022))
+
+### Fixed
+
+- *(cli)* play a retired audio rendition's tail alongside its replacement ([#3966](https://github.com/moq-dev/moq/pull/3966))
+
+## [0.12.1](https://github.com/moq-dev/moq/compare/moq-cli-v0.12.0...moq-cli-v0.12.1) - 2026-09-23
+
+### Fixed
+
+- *(ci)* repair nightly builds hidden behind the first failure ([#3956](https://github.com/moq-dev/moq/pull/3956))
+
+## [0.12.0](https://github.com/moq-dev/moq/compare/moq-cli-v0.11.2...moq-cli-v0.12.0) - 2026-09-23
+
+### Added
+
+- *(video)* fork v4l in-tree with checked-in V4L2 bindings ([#3867](https://github.com/moq-dev/moq/pull/3867))
+- preserve video capture timing ([#3849](https://github.com/moq-dev/moq/pull/3849))
+- *(moq-mux)* record the TS mux rate and pad export to it ([#3831](https://github.com/moq-dev/moq/pull/3831))
+- *(gateway)* [**breaking**] align embedding APIs ([#3818](https://github.com/moq-dev/moq/pull/3818))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(relay)* push a re-check to live sessions ([#3778](https://github.com/moq-dev/moq/pull/3778))
+- *(auth)* [**breaking**] one type per contract concept ([#3776](https://github.com/moq-dev/moq/pull/3776))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(tokio)* [**breaking**] settle moq-tokio names under their modules ([#3745](https://github.com/moq-dev/moq/pull/3745))
+- *(auth)* [**breaking**] the lease reports what it ended with, and the relay Lease owns the recheck ([#3739](https://github.com/moq-dev/moq/pull/3739))
+- *(relay)* [**breaking**] public modules and typed cluster peer config ([#3670](https://github.com/moq-dev/moq/pull/3670))
+- *(net)* [**breaking**] scope origins with pattern unions ([#3672](https://github.com/moq-dev/moq/pull/3672))
+- *(hang)* [**breaking**] one continuous broadcast clock at the catalog root ([#3675](https://github.com/moq-dev/moq/pull/3675))
+- [**breaking**] refuse released spellings and drop unused deprecated APIs ([#3719](https://github.com/moq-dev/moq/pull/3719))
+- *(drafts)* specify the MPEG-TS catalog extension and carry it over MSF ([#3720](https://github.com/moq-dev/moq/pull/3720))
+- *(relay)* admit every session through a moq-auth lease ([#3688](https://github.com/moq-dev/moq/pull/3688))
+- *(auth)* moq auth serve is the reference auth server ([#3686](https://github.com/moq-dev/moq/pull/3686))
+- *(auth)* moq-auth and @moq/auth own the contract and the token ([#3684](https://github.com/moq-dev/moq/pull/3684))
+- *(net)* [**breaking**] advertise wildcard routes with Pattern events ([#3649](https://github.com/moq-dev/moq/pull/3649))
+- *(relay)* mesh CLI and relay LAN peers through Cluster ([#3648](https://github.com/moq-dev/moq/pull/3648))
+- *(tokio)* [**breaking**] partition LAN discovery by application ([#3621](https://github.com/moq-dev/moq/pull/3621))
+- *(mux)* passthrough imports reserve peak-hold bitrate ([#3617](https://github.com/moq-dev/moq/pull/3617))
+- *(relay)* merge config with recorded provenance ([#3587](https://github.com/moq-dev/moq/pull/3587))
+- *(cli)* accept several adaptive import stages on one connection ([#3578](https://github.com/moq-dev/moq/pull/3578))
+- *(hang)* [**breaking**] empty frames close the previous frame's duration ([#3575](https://github.com/moq-dev/moq/pull/3575))
+- *(cli)* a real playout clock for moq play, with a --delay offset ([#3528](https://github.com/moq-dev/moq/pull/3528))
+
+### Fixed
+
+- *(json)* [**breaking**] fallible modify(), abort the track when a dropped edit fails ([#3644](https://github.com/moq-dev/moq/pull/3644))
+- *(moq-mux)* [**breaking**] make an fMP4 export fragment a group, on every track ([#3573](https://github.com/moq-dev/moq/pull/3573))
+
+### Other
+
+- *(rs)* report the crate version, drop the git-describe build scripts ([#3912](https://github.com/moq-dev/moq/pull/3912))
+- *(video)* [**breaking**] separate decoder output from subscription policy ([#3875](https://github.com/moq-dev/moq/pull/3875))
+- Report dropped playback sample frames ([#3845](https://github.com/moq-dev/moq/pull/3845))
+- *(audio)* [**breaking**] separate configuration contracts ([#3843](https://github.com/moq-dev/moq/pull/3843))
+- *(audio)* [**breaking**] expose demand without track authority ([#3842](https://github.com/moq-dev/moq/pull/3842))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- *(tokio)* make API shapes type-safe ([#3816](https://github.com/moq-dev/moq/pull/3816))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/dev' into merge-main-into-dev-20260914
+- merge main into dev
+- merge main into dev
+- merge main into dev
+- merge main into dev
+
 ### Breaking
 
 - `--listen` needs `--auth-url` or `--auth-public`; a listener admits sessions through the same lease as moq-relay instead of accepting everyone.

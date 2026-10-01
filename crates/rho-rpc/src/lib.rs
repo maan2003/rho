@@ -717,49 +717,6 @@ where
     Ok(Some((payload, allocation)))
 }
 
-/// Reads and decodes one bounded frame while retaining a caller-provided
-/// allocation reservation for the decoded value's lifetime.
-pub async fn read_frame_allocated<R, T, F, Fut, A>(
-    reader: &mut R,
-    max_len: usize,
-    reserve: F,
-) -> anyhow::Result<(T, A, usize)>
-where
-    R: AsyncRead + Unpin,
-    T: Unpacker,
-    F: FnOnce(usize) -> Fut,
-    Fut: Future<Output = A>,
-{
-    let (payload, allocation) = read_frame_with(reader, max_len, reserve).await?;
-    let len = payload.len();
-    let mut payload = payload.as_slice();
-    let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
-    anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok((value, allocation, len))
-}
-
-pub async fn read_frame_allocated_optional<R, T, F, Fut, A>(
-    reader: &mut R,
-    max_len: usize,
-    reserve: F,
-) -> anyhow::Result<Option<(T, A, usize)>>
-where
-    R: AsyncRead + Unpin,
-    T: Unpacker,
-    F: FnOnce(usize) -> Fut,
-    Fut: Future<Output = A>,
-{
-    let Some((payload, allocation)) = read_frame_with_optional(reader, max_len, reserve).await?
-    else {
-        return Ok(None);
-    };
-    let len = payload.len();
-    let mut payload = payload.as_slice();
-    let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
-    anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok(Some((value, allocation, len)))
-}
-
 /// Copies raw stream bytes while flushing every chunk and half-closing the
 /// destination at EOF. This is required when the destination is a streaming
 /// compressor and the byte protocol has request/response boundaries unknown

@@ -1,5 +1,6 @@
 import * as z from "zod/mini";
 import { CompressionSchema } from "./compression";
+import { u53Schema } from "./integers";
 import { ModeSchema } from "./mode";
 import { RelativeBroadcastSchema } from "./path";
 
@@ -28,6 +29,28 @@ export const BinaryConfigSchema = z.looseObject({
 	// An optional media type for each payload (e.g. "image/jpeg"). Purely descriptive:
 	// a consumer that doesn't recognize it can still read the track.
 	mime: z.optional(z.string()),
+
+	// The maximum bitrate of the track in bits per second, if known.
+	bitrate: z.optional(u53Schema),
+
+	// The maximum delay between a payload being ready and the publisher flushing it, in whole
+	// milliseconds rounded up, with the same meaning as a video rendition's `jitter`.
+	jitter: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
+
+	// How far this track's payloads reach the transport behind the broadcast's earliest rendition,
+	// with the same meaning and encoding as a video rendition's `delay`. Only measured for payloads
+	// that carry a capture time.
+	delay: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
 });
 
 /**

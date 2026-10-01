@@ -31,7 +31,7 @@ typealias OriginDynamic = uniffi.moq.MoqOriginDynamic
 typealias BroadcastRequest = uniffi.moq.MoqBroadcastRequest
 /** A stream of route announcements and retractions under a prefix. */
 typealias AnnounceConsumer = uniffi.moq.MoqAnnounceConsumer
-/** A literal prefix plus an optional relative pattern for announcement discovery. */
+/** A literal prefix, an optional relative pattern, and the hidden-path opt-in for announcement discovery. */
 typealias AnnounceConfig = uniffi.moq.MoqAnnounceConfig
 /** A pending wait for a route to cover a specific path. */
 typealias AnnouncedBroadcast = uniffi.moq.MoqAnnouncedBroadcast
@@ -50,6 +50,8 @@ typealias TrackProducer = uniffi.moq.MoqTrackProducer
 typealias TrackRequest = uniffi.moq.MoqTrackRequest
 /** A stream of uncached group requests for one track, for serving fetches on demand. */
 typealias TrackDynamic = uniffi.moq.MoqTrackDynamic
+/** A watch-only handle to whether a published track has subscribers; holding it keeps nothing open. */
+typealias TrackDemand = uniffi.moq.MoqTrackDemand
 /** The read side of a raw track: yields groups in sequence order, skipping ahead if it falls behind. */
 typealias TrackConsumer = uniffi.moq.MoqTrackConsumer
 /** A request to produce one uncached group for a fetch consumer. */
@@ -60,7 +62,7 @@ typealias GroupProducer = uniffi.moq.MoqGroupProducer
 typealias GroupConsumer = uniffi.moq.MoqGroupConsumer
 
 // Media (codec-aware) producers and consumers.
-/** The write side of a media track fed pre-framed payloads. */
+/** The write side of a media track; discontinuity() marks a break between pre-framed payloads. */
 typealias MediaProducer = uniffi.moq.MoqMediaProducer
 /** The write side of a media track fed a raw byte stream, with frame boundaries inferred. */
 typealias MediaStreamProducer = uniffi.moq.MoqMediaStreamProducer
@@ -76,7 +78,7 @@ typealias MediaGroupConsumer = uniffi.moq.MoqMediaGroupConsumer
 typealias AudioProducer = uniffi.moq.MoqAudioProducer
 /** The read side of a raw-audio track: yields decoded PCM frames. */
 typealias AudioConsumer = uniffi.moq.MoqAudioConsumer
-/** The read side of a video track decoded inside the bindings: yields packed I420 frames. */
+/** The read side of a video track decoded inside the bindings: yields packed frames in the layout asked for. */
 typealias VideoConsumer = uniffi.moq.MoqVideoConsumer
 /** The write side of a raw-video track; pixels written here are encoded inside the FFI boundary. */
 typealias VideoProducer = uniffi.moq.MoqVideoProducer
@@ -132,15 +134,15 @@ typealias FetchGroupOptions = uniffi.moq.MoqFetchGroupOptions
 typealias TrackInfo = uniffi.moq.MoqTrackInfo
 /** One audio frame: PCM payload bytes plus a presentation timestamp. */
 typealias AudioFrame = uniffi.moq.MoqAudioFrame
-/** Selects the audio encoder codec. Build one with `AudioCodec.opus()`. */
+/** Selects the audio encoder codec. Build one with `AudioCodec.opus()` or `AudioCodec.aac()`. */
 typealias AudioCodec = uniffi.moq.MoqAudioCodec
 /** A raw PCM sample format, mirroring WebCodecs `AudioData.format`. */
 typealias AudioSampleFormat = uniffi.moq.MoqAudioSampleFormat
 /** The PCM layout an [AudioConsumer] should decode to. */
 typealias AudioDecoderOutput = uniffi.moq.MoqAudioDecoderOutput
-/** What a [VideoConsumer] decodes to: an optional resize plus a latency budget. */
+/** What a [VideoConsumer] decodes to: an optional pixel format and resize, plus a latency budget. */
 typealias VideoDecoderOutput = uniffi.moq.MoqVideoDecoderOutput
-/** One decoded video frame: packed I420, its dimensions, and a timestamp. */
+/** One decoded video frame: packed pixels, the layout they are in, its dimensions, and a timestamp. */
 typealias VideoDecodedFrame = uniffi.moq.MoqVideoDecodedFrame
 /** The PCM layout the caller feeds an [AudioProducer]. */
 typealias AudioEncoderInput = uniffi.moq.MoqAudioEncoderInput
@@ -150,7 +152,7 @@ typealias AudioEncoderOutput = uniffi.moq.MoqAudioEncoderOutput
 typealias VideoFrame = uniffi.moq.MoqVideoFrame
 /** A video codec identifier (H.264 or H.265). */
 typealias VideoCodec = uniffi.moq.MoqVideoCodec
-/** A raw pixel layout (I420 or RGBA) fed to a [VideoProducer]. */
+/** A CPU pixel layout (I420 or RGBA): fed to a [VideoProducer], or delivered by `decodeVideo`. */
 typealias VideoPixelFormat = uniffi.moq.MoqVideoPixelFormat
 /** The pixel layout, resolution, and framerate the caller feeds a [VideoProducer]. */
 typealias VideoEncoderInput = uniffi.moq.MoqVideoEncoderInput

@@ -77,6 +77,10 @@ for media tracks whose timescale should be selected by the importer.
 `WithVideoHint(moq.VideoHint{...})` for video catalog fields that are known
 before the stream reveals them.
 
+`WithAudioTrack(name)` / `WithVideoTrack(name)` name the track instead of
+deriving a unique name from the format. A duplicate name fails, and the
+`OnTrack` variants refuse it because the request already names the track.
+
 JSON tracks are available in two modes. `PublishJSONSnapshot` / `SubscribeJSONSnapshot`
 carry lossy latest state, while `PublishJSONStream` / `SubscribeJSONStream` carry every
 record in order. Producers accept any `encoding/json` value; consumers return
@@ -106,15 +110,15 @@ Raw tracks support best-effort datagrams alongside groups: `TrackProducer.Append
 sends one `Frame` and returns its sequence number, while `TrackConsumer.RecvDatagram`
 and `TrackConsumer.Datagrams` receive them in arrival order. Payloads are capped at
 1200 bytes. Datagram delivery requires a datagram-capable transport and lite-05 or
-newer moq-lite; IETF moq-transport, pre-lite-05, WebSocket, and TCP paths do not
+newer moq-lite, or moq-transport; pre-lite-05, WebSocket, and TCP paths do not
 deliver them, and there is no stream fallback.
 
 ## Versioning
 
-`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR when the wrapper's own API changes. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq.dev/moq-ffi`) just takes the next patch on that line.
+`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR only for a breaking change to the wrapper's own API. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq.dev/moq-ffi`) just takes the next patch on that line.
 
 The committed `go.mod` carries a `require moq.dev/moq-ffi v0.0.0` **placeholder**. Do not "fix" it or add a `replace`: `just go check` injects a local `replace` to the freshly-generated bindings, and CI rewrites the `require` to the latest published `moq.dev/moq-ffi` at release time. Because Go resolves to the maximum version across the build graph, that `require` is a floor. Consumers always get an ffi at least as new as the wrapper was built against.
 
 ## Local development
 
-Run `just go check`: it builds `moq-ffi` for the host, regenerates the bindings, stages both modules into `dist/` with a `replace` wiring the wrapper to the local ffi, and runs `go build`/`go vet`/`go test`. It also runs `scripts/publish-wrapper.test.sh`, which exercises the publisher's release/no-op/recovery paths against a scratch bare repo standing in for the mirror. See [../ffi/README.md](../ffi/README.md) for the `uniffi-bindgen-go` install.
+Run `just go check`: it builds `moq-ffi` for the host, regenerates the bindings, stages both modules into `dist/` with a `replace` wiring the wrapper to the local ffi, and runs `go build`/`go vet`/`go test`. See [../ffi/README.md](../ffi/README.md) for the `uniffi-bindgen-go` install.

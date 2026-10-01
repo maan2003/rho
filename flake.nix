@@ -78,6 +78,14 @@
           doInstallCheck = false;
         });
 
+        # ripgrep defaults for agent commands (RIPGREP_CONFIG_PATH): the path
+        # once per file rather than on every match cuts output by a third,
+        # and a minified line cannot fill a whole output budget.
+        agentRipgreprc = pkgs.writeTextDir "etc/ripgreprc" ''
+          --heading
+          --max-columns=150
+          --max-columns-preview
+        '';
         # The agent's base userland: one store path whose bin/ is the
         # agent's PATH. Agents add to it with `nix profile`.
         agentRegistry = pkgs.writeTextDir "etc/nix/registry.json" (
@@ -206,6 +214,7 @@
             nodejs
             cacert
             agentRegistry
+            agentRipgreprc
           ]);
         };
         # Cargo with a shared, fine-grained build cache: agents' dev shells use

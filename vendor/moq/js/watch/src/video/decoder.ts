@@ -92,7 +92,10 @@ export class Decoder {
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
-	#pendingJitter = new Signal<Time.Milli | undefined>(undefined);
+	// The rendition preparing to replace the active one, with the catalog of the broadcast it
+	// subscribed to. One value so a later source that reuses the track name still notifies:
+	// the name alone would compare equal, and the jitter effect would keep the previous catalog.
+	#pending = new Signal<{ track: string; catalog: Getter<Catalog.Root | undefined> } | undefined>(undefined);
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
 	#signals = new Effect();
@@ -125,9 +128,20 @@ export class Decoder {
 		this.#signals.run(this.#runBuffering.bind(this));
 	}
 
+	// Read from the full catalog entry, which the decoder config omits, so a rising entry resizes Sync.
+	// Each in-flight rendition stays tied to the catalog it subscribed to: during a source switch the
+	// shared catalog already describes the next broadcast, and the same track name there is a
+	// different rendition.
 	#runJitter(effect: Effect): void {
-		const active = effect.get(this.#active)?.jitter;
-		const pending = effect.get(this.#pendingJitter);
+		const floor = (track: string | undefined, catalog: Getter<Catalog.Root | undefined> | undefined) => {
+			if (track === undefined || catalog === undefined) return undefined;
+			const config = effect.get(catalog)?.video?.renditions?.[track];
+			return config && renditionJitter(config);
+		};
+		const activeTrack = effect.get(this.#active);
+		const active = floor(activeTrack?.track, activeTrack?.catalog);
+		const pendingTrack = effect.get(this.#pending);
+		const pending = floor(pendingTrack?.track, pendingTrack?.catalog);
 		effect.set(this.#out.jitter, switchJitter({ active, pending }));
 	}
 
@@ -164,8 +178,9 @@ export class Decoder {
 			track,
 			config: identity.decoder,
 			stats: this.#out.stats,
+			catalog: broadcast.out.catalog,
 		});
-		effect.set(this.#pendingJitter, pending.jitter);
+		effect.set(this.#pending, { track, catalog: broadcast.out.catalog });
 
 		effect.cleanup(() => pending?.close());
 
@@ -185,7 +200,7 @@ export class Decoder {
 			// Upgrade the pending track to active.
 			// #runActive will be in charge of it now.
 			this.#active.set(pending);
-			this.#pendingJitter.set(undefined);
+			this.#pending.set(undefined);
 			pending = undefined;
 
 			// This effect is done; close it to avoid a useless re-run.
@@ -207,12 +222,13 @@ export class Decoder {
 		// proxy() would share the same reference, allowing the source to close our frame.
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
+			if (!frame) return; // A promoted track holds the previous picture until its first frame.
+			this.#out.timestamp.set(Time.Milli.fromMicro(frame.timestamp as Time.Micro));
 			this.#out.frame.update((prev) => {
 				prev?.close();
-				return frame?.clone();
+				return frame.clone();
 			});
 		});
-		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
 	}
 
@@ -267,6 +283,9 @@ interface DecoderTrackProps {
 	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: DecoderConfig;
+	// The broadcast catalog this subscription started from. Updates on that broadcast still apply;
+	// a later source does not.
+	catalog: Getter<Catalog.Root | undefined>;
 
 	stats: Signal<Stats | undefined>;
 }
@@ -276,8 +295,8 @@ class DecoderTrack {
 	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: DecoderConfig;
+	catalog: Getter<Catalog.Root | undefined>;
 	stats: Signal<Stats | undefined>;
-	jitter: Time.Milli | undefined;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
 	frame = new Signal<VideoFrame | undefined>(undefined);
@@ -299,8 +318,8 @@ class DecoderTrack {
 		this.broadcast = props.broadcast;
 		this.track = props.track;
 		this.config = props.config;
+		this.catalog = props.catalog;
 		this.stats = props.stats;
-		this.jitter = renditionJitter(props.config);
 
 		this.#signals.run(this.#run.bind(this));
 	}
@@ -339,8 +358,7 @@ class DecoderTrack {
 					}
 
 					// Returns immediately when the latency is "instant".
-					const wait = this.sync.wait(timestamp).then(() => true);
-					const ok = await Promise.race([wait, effect.cancel]);
+					const ok = await effect.race(this.sync.wait(timestamp).then(() => true));
 					if (!ok) return;
 					if (generation !== this.#discontinuity) return; // a rewind happened while waiting
 
@@ -411,6 +429,7 @@ class DecoderTrack {
 		});
 
 		let previous: Time.Micro | undefined;
+		let latest: number | undefined;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -423,6 +442,16 @@ class DecoderTrack {
 				const { frame } = next;
 				if (!frame) continue; // The group is done
 
+				// An older keyframe would replace the codec references needed by live deltas. Group
+				// sequences only grow within a subscription, so a discontinuity (which a stale marker
+				// can raise) never resets this guard. Rejected payloads still count as received bytes.
+				const stale = latest !== undefined && next.group < latest;
+				this.stats.update((current) => ({
+					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
+					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+				}));
+				if (stale) continue;
+
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 				this.sync.received(timestamp, "video");
@@ -432,12 +461,6 @@ class DecoderTrack {
 					data: frame.payload,
 					timestamp: frame.timestamp,
 				});
-
-				// Track both frame count and bytes received for stats in the UI
-				this.stats.update((current) => ({
-					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
 
 				// Track decode buffer: frames sent to decoder but not yet rendered. Only bridge from
 				// the previous frame when the consumer says nothing is missing in between. Group ids
@@ -450,6 +473,7 @@ class DecoderTrack {
 
 				previous = frame.timestamp;
 
+				latest = next.group;
 				decoder.decode(chunk);
 			}
 		});
@@ -488,6 +512,7 @@ class DecoderTrack {
 		});
 
 		let previous: Time.Micro | undefined;
+		let latest: number | undefined;
 
 		effect.spawn(async () => {
 			for (;;) {
@@ -500,15 +525,19 @@ class DecoderTrack {
 				const { frame } = next;
 				if (!frame) continue;
 
+				// An older keyframe would replace the codec references needed by live deltas. Group
+				// sequences only grow within a subscription, so a discontinuity (which a stale marker
+				// can raise) never resets this guard. Rejected payloads still count as received bytes.
+				const stale = latest !== undefined && next.group < latest;
+				this.stats.update((current) => ({
+					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
+					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+				}));
+				if (stale) continue;
+
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
 				this.sync.received(timestamp, "video");
-
-				// Track stats
-				this.stats.update((current) => ({
-					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
 
 				// Track decode buffer (see #runLegacy: bridge on the consumer's continuity signal,
 				// never on group adjacency, which proves nothing about the timeline).
@@ -519,6 +548,7 @@ class DecoderTrack {
 				previous = frame.timestamp;
 
 				if (decoder.state === "closed") break;
+				latest = next.group;
 				decoder.decode(
 					new EncodedVideoChunk({
 						type: frame.keyframe ? "key" : "delta",

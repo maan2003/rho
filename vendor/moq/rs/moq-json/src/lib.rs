@@ -18,6 +18,7 @@
 //! managing a timeline and a catalog estimate.
 
 mod diff;
+mod merge;
 pub mod snapshot;
 pub mod stream;
 pub mod window;
@@ -83,6 +84,10 @@ pub enum Error {
 	/// a continuous log.
 	#[error("stream rolled to a second group")]
 	Rolled,
+
+	/// A decoded frame or reconstructed snapshot exceeded its configured byte budget.
+	#[error("decoded JSON exceeded {0} bytes")]
+	TooLarge(usize),
 }
 
 impl From<serde_json::Error> for Error {

@@ -4,7 +4,7 @@ This document details `brush`'s compatibility with `bash`, including supported f
 
 ## Overview
 
-`brush` aims for high compatibility with `bash`. We validate this through **1700+ compatibility test cases** that compare behavior against `bash` as an oracle.
+`brush` aims for high compatibility with `bash`. We validate this through **2,500+ compatibility test cases** that compare behavior against `bash` as an oracle, plus [end-to-end suites](../../e2e/README.md) that test popular shell tools (e.g., fzf, atuin, starship, etc.) with `brush`.
 
 **Compatibility snapshot:** Production-ready for most use cases. Your `.bashrc`, aliases, functions, and completions should "just work."
 
@@ -139,6 +139,19 @@ job2 &
 wait -n  # Wait for whichever finishes first
 ```
 
+### `$!` for Background Commands
+
+Bash expands `$!` to the process ID of the most recent asynchronous command.
+Brush currently does not reliably provide this value for background commands,
+so scripts that start a job with `cmd &` and immediately use `$!` may see an
+empty value.
+
+```bash
+# Not yet fully supported
+sleep 10 &
+kill "$!"
+```
+
 ### `BASH_COMMAND` Variable
 
 The special variable `BASH_COMMAND` that contains the currently executing command is currently only available in trap contexts.
@@ -170,13 +183,13 @@ Some advanced `printf` format specifiers behave differently (~8 known cases), pa
 
 ### Aliases
 
-Some complex alias expansion scenarios differ from `bash` (see GitHub issues #57, #286).
+Some complex alias expansion scenarios differ from `bash` (see GitHub issues [#57](https://github.com/reubeno/brush/issues/57), [#286](https://github.com/reubeno/brush/issues/286)).
 
 ## Test Suite Statistics
 
-- **Total test cases:** 1700+
-- **Known failures:** ~125
-- **Most failures are edge cases** in IFS handling and printf
+- **Total test cases:** 2,500+ (plus a small set of `brush`-specific cases)
+- **Known failures:** ~470, marked `known_failure` in the case files so a fix that makes one pass is reported rather than absorbed
+- **Largest groups of known failures:** nameref behavior, `declare` edge cases, `BASH_COMMAND` inside traps, signal handling, `wait` with job specs, and alias expansion
 
 The test suite runs on every PR and compares behavior against `bash` as an oracle.
 
@@ -199,7 +212,7 @@ Found a script that works in `bash` but not in `brush`?
 ## Tracking Progress
 
 - **GitHub Issues:** Track specific compatibility work
-- **Test Suite:** 1700+ tests run on every PR
+- **Test Suite:** 2,500+ tests run on every PR
 - **This Document:** Updated as features are implemented
 
 ## Related Resources

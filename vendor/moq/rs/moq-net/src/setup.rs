@@ -1,3 +1,7 @@
+//! The SETUP exchange, and the credential a peer may present in it.
+//!
+//! Only [`Token`] is public; the SETUP messages themselves are wire internals.
+
 use bytes::Bytes;
 
 use crate::{
@@ -6,15 +10,36 @@ use crate::{
 	ietf, lite,
 };
 
+// SETUP only carries negotiation parameters. Bound it independently of control messages.
+pub(crate) const MAX_SETUP_SIZE: usize = 64 * 1024;
+
 const CLIENT_SETUP: u8 = 0x20;
 const SERVER_SETUP: u8 = 0x21;
 
 /// Draft-17 unified SETUP message type (varint 0x2F00)
 pub(crate) const SETUP_V17: u64 = 0x2F00;
 
+/// A credential a moq-transport peer presented in its SETUP's `AUTHORIZATION TOKEN` option.
+///
+/// The transport never reads the bytes; verifying them is the application's job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+	/// The wire Token Type, naming how [`value`](Self::value) is encoded.
+	pub kind: u64,
+	/// The token itself.
+	pub value: Vec<u8>,
+}
+
+impl Token {
+	/// Token Type 0: a format the endpoints agreed on out of band, such as a JWT.
+	pub const OUT_OF_BAND: u64 = 0x0;
+	/// Token Type 1: a Common Access Token (draft-ietf-moq-c4m).
+	pub const CAT: u64 = 0x1;
+}
+
 /// Draft-17+ unified SETUP message, with the same encoding for both client and server.
 #[derive(Debug, Clone)]
-pub struct Setup {
+pub(crate) struct Setup {
 	pub parameters: Bytes,
 }
 
@@ -50,6 +75,7 @@ impl Decode<Version> for Setup {
 		if kind != SETUP_V17 {
 			return Err(DecodeError::InvalidValue);
 		}
+		// The fixed u16 length is already below MAX_SETUP_SIZE.
 		let size = u16::decode(r, v)? as usize;
 		if r.remaining() < size {
 			return Err(DecodeError::Short);
@@ -88,7 +114,7 @@ impl SetupVersion {
 
 /// A version-agnostic setup message sent by the client.
 #[derive(Debug, Clone)]
-pub struct Client {
+pub(crate) struct Client {
 	/// The list of supported versions in preferred order.
 	pub versions: coding::Versions,
 
@@ -123,9 +149,16 @@ impl Decode<Version> for Client {
 
 		let size = match SetupVersion::from_version(v) {
 			SetupVersion::Draft14 | SetupVersion::Draft15Plus => u16::decode(r, v)? as usize,
-			SetupVersion::LiteLegacy => u64::decode(r, v)? as usize,
+			SetupVersion::LiteLegacy => usize::decode(r, v)?,
 			SetupVersion::Modern | SetupVersion::Unsupported => return Err(DecodeError::Version),
 		};
+
+		if size > MAX_SETUP_SIZE {
+			return Err(DecodeError::MessageTooLarge {
+				size,
+				max: MAX_SETUP_SIZE,
+			});
+		}
 
 		if r.remaining() < size {
 			return Err(DecodeError::Short);
@@ -138,7 +171,9 @@ impl Decode<Version> for Client {
 				// Draft15+: no versions list, parameters only.
 				coding::Versions::from([v.into()])
 			}
-			SetupVersion::Draft14 | SetupVersion::LiteLegacy => coding::Versions::decode(&mut msg, v)?,
+			SetupVersion::Draft14 | SetupVersion::LiteLegacy => {
+				coding::Versions::decode(&mut msg, v).map_err(DecodeError::complete)?
+			}
 			SetupVersion::Modern | SetupVersion::Unsupported => return Err(DecodeError::Version),
 		};
 
@@ -157,6 +192,9 @@ impl Encode<Version> for Client {
 		let mut sizer = Sizer::default();
 		self.encode_inner(&mut sizer, v)?;
 		let size = sizer.size;
+		if size > MAX_SETUP_SIZE {
+			return Err(EncodeError::TooLarge);
+		}
 
 		match SetupVersion::from_version(v) {
 			SetupVersion::Draft14 | SetupVersion::Draft15Plus => {
@@ -171,7 +209,7 @@ impl Encode<Version> for Client {
 
 /// Sent by the server in response to a client setup.
 #[derive(Debug, Clone)]
-pub struct Server {
+pub(crate) struct Server {
 	/// The list of supported versions in preferred order.
 	pub version: coding::Version,
 
@@ -204,6 +242,9 @@ impl Encode<Version> for Server {
 		let mut sizer = Sizer::default();
 		self.encode_inner(&mut sizer, v)?;
 		let size = sizer.size;
+		if size > MAX_SETUP_SIZE {
+			return Err(EncodeError::TooLarge);
+		}
 
 		match SetupVersion::from_version(v) {
 			SetupVersion::Draft14 | SetupVersion::Draft15Plus => {
@@ -227,9 +268,16 @@ impl Decode<Version> for Server {
 
 		let size = match SetupVersion::from_version(v) {
 			SetupVersion::Draft14 | SetupVersion::Draft15Plus => u16::decode(r, v)? as usize,
-			SetupVersion::LiteLegacy => u64::decode(r, v)? as usize,
+			SetupVersion::LiteLegacy => usize::decode(r, v)?,
 			SetupVersion::Modern | SetupVersion::Unsupported => return Err(DecodeError::Version),
 		};
+
+		if size > MAX_SETUP_SIZE {
+			return Err(DecodeError::MessageTooLarge {
+				size,
+				max: MAX_SETUP_SIZE,
+			});
+		}
 
 		if r.remaining() < size {
 			return Err(DecodeError::Short);
@@ -238,7 +286,9 @@ impl Decode<Version> for Server {
 		let mut msg = r.copy_to_bytes(size);
 		let version = match SetupVersion::from_version(v) {
 			SetupVersion::Draft15Plus => v.into(),
-			SetupVersion::Draft14 | SetupVersion::LiteLegacy => coding::Version::decode(&mut msg, v)?,
+			SetupVersion::Draft14 | SetupVersion::LiteLegacy => {
+				coding::Version::decode(&mut msg, v).map_err(DecodeError::complete)?
+			}
 			SetupVersion::Modern | SetupVersion::Unsupported => return Err(DecodeError::Version),
 		};
 
@@ -246,5 +296,31 @@ impl Decode<Version> for Server {
 			version,
 			parameters: msg,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Never emit a legacy SETUP our own receiver would refuse.
+	#[test]
+	fn encode_enforces_the_setup_limit() {
+		let v = Version::Lite(lite::Version::Lite01);
+		let parameters = Bytes::from(vec![0; MAX_SETUP_SIZE]);
+
+		let client = Client {
+			versions: coding::Versions::from([v.into()]),
+			parameters: parameters.clone(),
+		};
+		let mut buf = Vec::new();
+		assert!(matches!(client.encode(&mut buf, v), Err(EncodeError::TooLarge)));
+
+		let server = Server {
+			version: v.into(),
+			parameters,
+		};
+		let mut buf = Vec::new();
+		assert!(matches!(server.encode(&mut buf, v), Err(EncodeError::TooLarge)));
 	}
 }

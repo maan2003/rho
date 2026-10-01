@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.8...moq-rtmp-v0.3.9) - 2026-09-30
+
+### Added
+
+- *(rtmp)* let an RTMP listener refuse plaintext ([#4452](https://github.com/moq-dev/moq/pull/4452))
+
+### Fixed
+
+- *(rtmp)* bound AMF0 nesting ([#4471](https://github.com/moq-dev/moq/pull/4471))
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.7...moq-rtmp-v0.3.8) - 2026-09-27
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.6...moq-rtmp-v0.3.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.5...moq-rtmp-v0.3.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.5](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.4...moq-rtmp-v0.3.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.3.4](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.3...moq-rtmp-v0.3.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.3](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.2...moq-rtmp-v0.3.3) - 2026-09-25
+
+### Added
+
+- *(gateway)* expose the loop and handler the gateway binaries run ([#3964](https://github.com/moq-dev/moq/pull/3964))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.1...moq-rtmp-v0.3.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.3.0...moq-rtmp-v0.3.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-tokio, hang, moq-mux
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.11...moq-rtmp-v0.3.0) - 2026-09-23
+
+### Added
+
+- *(gateway)* [**breaking**] align embedding APIs ([#3818](https://github.com/moq-dev/moq/pull/3818))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(rtmp)* report the connect tcUrl on a publish or play request
+
+### Other
+
+- Merge origin/main into dev
+
 ## [0.2.11](https://github.com/moq-dev/moq/compare/moq-rtmp-v0.2.10...moq-rtmp-v0.2.11) - 2026-09-17
 
 ### Other

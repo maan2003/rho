@@ -1072,19 +1072,6 @@ impl Model {
         self.resync = false;
     }
 
-    /// Where one conversation sits now, and the row to draw there. `None`
-    /// for a conversation that has gone, which is the drawer's cue to take
-    /// its line out.
-    ///
-    /// The place is counted, so this costs the distance from the top of
-    /// the list. Nothing on an event path calls it; it is here for a test
-    /// or a caller that genuinely wants a number.
-    pub fn row_position(&self, channel: &ChannelId) -> Option<(usize, ConversationRow)> {
-        let key = self.placed.get(channel)?;
-        let at = self.order.range(..key).count();
-        Some((at, self.order.get(key)?.clone()))
-    }
-
     /// Puts one conversation back in its place in the list, and nothing
     /// else: the cost of a message, a mark or a mute is the conversation it
     /// happened in.

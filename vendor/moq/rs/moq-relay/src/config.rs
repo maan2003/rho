@@ -91,8 +91,9 @@ pub struct Config {
 
 	/// How long accepted sessions may keep running after a shutdown signal, e.g.
 	/// "10s" or "500ms". The first signal sends every session a GOAWAY and waits
-	/// this long for clients to reconnect elsewhere before force-closing them; a
-	/// second signal exits immediately. Zero closes them at once, with no GOAWAY
+	/// up to this long for clients to reconnect elsewhere before force-closing
+	/// them, exiting as soon as they have all left; a second signal exits
+	/// immediately. Zero closes them at once, with no GOAWAY
 	/// they would have no time to act on. Defaults to 10 seconds.
 	#[usage(skip)]
 	#[serde(with = "crate::duration::serde_duration")]
@@ -165,7 +166,7 @@ impl Default for Config {
 // for completions, docs, and the released-flag test -- is `spec`.
 #[derive(usage::Cli, Clone, Debug)]
 #[usage(unknown_flags = "error", args_override_self = false)]
-#[usage(name = "moq-relay", version = env!("VERSION"))]
+#[usage(name = "moq-relay", version = env!("CARGO_PKG_VERSION"))]
 #[usage(completion, settings)]
 struct Cli {
 	#[usage(flatten)]
@@ -219,7 +220,7 @@ impl Config {
 	/// [`moq_tokio::cli::Merge`]. Presence comes from what the parser and the
 	/// environment actually supplied, so a file that sets a list to empty or a
 	/// bool to false survives.
-	pub(crate) fn parse_and_merge<I, T>(args: I) -> anyhow::Result<Self>
+	pub fn parse_and_merge<I, T>(args: I) -> anyhow::Result<Self>
 	where
 		I: IntoIterator<Item = T>,
 		T: Into<std::ffi::OsString> + Clone,
@@ -261,22 +262,35 @@ impl Config {
 				path: std::path::Path::new(path),
 				value,
 			});
-		// The released CLI spellings live on hidden fields the merge's TOML round-trip
-		// drops, so they are collected from the parse and reported with the file's
-		// own released keys in one message.
-		let mut deprecated = cli.config.deprecated();
-		let (mut config, resolved) = moq_tokio::cli::Merge {
-			registry: crate::settings::Settings::SETTINGS_REGISTRY,
-			cli: &cli_layer,
-			env: &env,
+		let mut config = cli.config;
+		config.merge_into(&cli_layer, &env, file)?;
+		Ok(config)
+	}
+
+	/// Merge CLI, environment, and optional TOML values into this relay fragment.
+	///
+	/// An embedding binary can parse its own flattened CLI once, then merge only
+	/// its `relay` field. Other CLI-only fields remain untouched.
+	pub fn merge_into(
+		&mut self,
+		cli: &usage::config::CliLayer,
+		env: &usage::config::EnvLayer,
+		file: Option<moq_tokio::cli::FileSource<'_>>,
+	) -> anyhow::Result<()> {
+		let mut deprecated = self.deprecated();
+		let (merged, resolved) = moq_tokio::cli::Merge {
+			registry: crate::settings(),
+			cli,
+			env,
 			file,
 		}
-		.apply(cli.config)
+		.apply(self.clone())
 		.map_err(|err| anyhow::anyhow!("{err}"))?;
-		deprecated.extend(config.deprecated());
+		deprecated.extend(merged.deprecated());
 		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
-		config.origins = Some(resolved);
-		Ok(config)
+		*self = merged;
+		self.origins = Some(resolved);
+		Ok(())
 	}
 
 	/// Where a dotted setting key got its value, when this config was loaded
@@ -297,6 +311,7 @@ impl Config {
 		deprecated.extend(self.listen.deprecated());
 		deprecated.extend(self.connect.deprecated());
 		deprecated.extend(self.cluster.deprecated());
+		deprecated.extend(self.auth.deprecated());
 		if let Some(server) = &self.server {
 			deprecated.toml("[server]", "[listen]", None);
 			deprecated.extend(server.deprecated());
@@ -318,7 +333,11 @@ impl Config {
 		let deprecated = self.deprecated();
 		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
 
-		self.quic.max_streams.get_or_insert(crate::DEFAULT_MAX_STREAMS);
+		self.quic
+			.max_streams
+			.get_or_insert(moq_tokio::quic::DEFAULT_MAX_STREAMS);
+		self.drain_timeout = self.drain_timeout();
+		self.drain_timeout_arg = None;
 		Ok(())
 	}
 }
@@ -327,6 +346,17 @@ impl Config {
 mod tests {
 	use super::*;
 	use crate::test_env::EnvGuard;
+
+	#[test]
+	fn packaged_service_arguments() {
+		let unit = include_str!("../../../packaging/moq-relay/moq-relay.service");
+		let command = unit.lines().find_map(|line| line.strip_prefix("ExecStart=")).unwrap();
+		let mut args = command.split_whitespace();
+		assert_eq!(args.next(), Some("/usr/bin/moq-relay"));
+		let args: Vec<_> = args.map(std::ffi::OsStr::new).collect();
+		let cli = Cli::parse_from(&args).expect("packaged service arguments must parse");
+		assert_eq!(cli.config.file.as_deref(), Some("/etc/moq-relay/relay.toml"));
+	}
 
 	/// The relay's own default still applies once the released spellings are gone.
 	#[test]
@@ -404,6 +434,66 @@ max_streams = 64
 		assert!(err.contains("[server.quic] -> [quic]"), "{err}");
 		assert!(err.contains("[client.quic] -> [quic]"), "{err}");
 		assert!(err.contains("both directions"), "{err}");
+	}
+
+	/// A 0.14 `[auth]` config with `key` and `public` would otherwise boot with
+	/// every JWT ignored; each removed key refuses with its replacement named.
+	#[test]
+	fn released_auth_keys_refuse_to_boot() {
+		let toml = r#"
+[auth]
+key = "root.jwk"
+key_dir = "keys/"
+auth_api = "https://api.example.com/auth"
+domains = ["example.com"]
+mtls_tier = "internal"
+public = "anon/**"
+
+[auth.tls]
+root = ["ca.pem"]
+"#;
+		let mut config: Config = toml::from_str(toml).expect("released config must still parse");
+		let err = config.resolve().expect_err("must refuse").to_string();
+		for old in [
+			"[auth] key -> --auth-url to `moq auth serve --key`",
+			"[auth] key_dir -> --auth-url to `moq auth serve --key-dir`",
+			"[auth] auth_api -> ",
+			"[auth] domains -> ",
+			"[auth] mtls_tier -> --auth-url to `moq auth serve --tier`",
+			"[auth.tls] -> --connect-tls-*",
+		] {
+			assert!(err.contains(old), "{old}: {err}");
+		}
+	}
+
+	/// The environment is the half a removed flag silently misses: a relay deployed
+	/// through it never typed the flag.
+	#[test]
+	fn released_auth_env_refuses_to_boot() {
+		let vars = [
+			("MOQ_AUTH_KEY", "--auth-key / MOQ_AUTH_KEY"),
+			("MOQ_AUTH_KEY_DIR", "--auth-key-dir / MOQ_AUTH_KEY_DIR"),
+			("MOQ_AUTH_API", "--auth-api / MOQ_AUTH_API"),
+			("MOQ_AUTH_PUBLIC_API", "--auth-public-api / MOQ_AUTH_PUBLIC_API"),
+			("MOQ_AUTH_DOMAIN", "--auth-domain / MOQ_AUTH_DOMAIN"),
+			("MOQ_AUTH_MTLS_TIER", "--auth-mtls-tier / MOQ_AUTH_MTLS_TIER"),
+			("MOQ_AUTH_TLS_ROOT", "--auth-tls-* / MOQ_AUTH_TLS_*"),
+		];
+		let _env = EnvGuard::clear(&vars.map(|(var, _)| var));
+		for (var, spelling) in vars {
+			unsafe { std::env::set_var(var, "x") };
+			let err = Config::parse_and_merge(["moq-relay", "--auth-public", "**"])
+				.expect_err("must refuse")
+				.to_string();
+			unsafe { std::env::remove_var(var) };
+			assert!(err.contains(spelling), "{var}: {err}");
+		}
+
+		// 0.14 took the bare flag, so it has to parse to be refused by name.
+		let err = Config::parse_and_merge(["moq-relay", "--auth-public", "**", "--auth-tls-disable-verify"])
+			.expect_err("must refuse")
+			.to_string();
+		assert!(err.contains("--auth-tls-* / MOQ_AUTH_TLS_*"), "{err}");
 	}
 
 	/// A released flag and a released table are refused together, in one message.
@@ -1093,6 +1183,25 @@ uid = [1001]
 	fn the_settings_registry_matches_the_cli() {
 		let drift = crate::settings::Settings::SETTINGS_REGISTRY.drift(Cli::SETTINGS_BINDINGS);
 		assert!(drift.is_empty(), "{drift:#?}");
+	}
+
+	/// An embedder can merge its relay fragment without parsing the binary CLI again.
+	#[test]
+	fn merge_into_relay_fragment() {
+		let _env = EnvGuard::clear(&["MOQ_CLUSTER_ID"]);
+		let (parsed, cli) =
+			Cli::parse_from_with_settings(&[std::ffi::OsStr::new("--cluster-id"), std::ffi::OsStr::new("9")]).unwrap();
+		let file = toml::from_str::<toml::Value>("[cluster]\nid = 7\n").unwrap();
+		let source = moq_tokio::cli::FileSource {
+			path: std::path::Path::new("relay.toml"),
+			value: &file,
+		};
+		let mut config = parsed.config;
+		config
+			.merge_into(&cli, &usage::config::EnvLayer::from_process(), Some(source))
+			.unwrap();
+		assert_eq!(config.cluster.id, Some(9));
+		assert_eq!(config.source("cluster.id"), Some("--cluster-id"));
 	}
 
 	/// Presence comes from the source, never from whether a standing value looks empty.

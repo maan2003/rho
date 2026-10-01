@@ -486,16 +486,6 @@ impl RhoDb {
 }
 
 impl ReadTxn {
-    /// Every table's name, for a migration proof looking at a store it
-    /// did not write.
-    pub fn table_names(&self) -> Vec<String> {
-        self.inner
-            .list_tables()
-            .expect("list rho-db tables")
-            .map(|table| table.name().to_owned())
-            .collect()
-    }
-
     pub fn has_table(&self, name: &str) -> bool {
         self.inner
             .list_tables()

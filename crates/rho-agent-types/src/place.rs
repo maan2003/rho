@@ -61,8 +61,4 @@ impl WorkspaceInfo {
             Self::UserCheckout { repo } => Some(repo),
         }
     }
-
-    pub fn is_user_checkout(&self) -> bool {
-        matches!(self, Self::UserCheckout { .. })
-    }
 }

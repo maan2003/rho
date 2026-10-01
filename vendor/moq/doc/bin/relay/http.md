@@ -12,8 +12,8 @@ operational ones that must stay private.
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /announced/<prefix>` | Broadcasts announced under the prefix. |
-| `GET /fetch/<broadcast>/<track>?group=N` | One group from the cache, the latest by default. Useful for catch-up and debugging. |
+| `GET /announced/<prefix>` | Broadcasts announced under the prefix, named relative to it. |
+| `GET /fetch/<broadcast>/<track>?group=N` | One group from the cache, the latest by default, or `404` if the track has no such group. Useful for catch-up and debugging. |
 | `GET /certificate.sha256` | The fingerprint of the first configured TLS certificate, for pinning a self-signed dev certificate. |
 | `GET /health` | `200 ok`, unauthenticated, for load balancers. |
 
@@ -29,6 +29,11 @@ reads as broadcast names.
 A relay configured with more than one certificate has no single fingerprint to
 publish, and this endpoint answers for the first. The others are reachable over
 `https://`, which selects a certificate by SNI at the handshake.
+
+GET responses on the public router receive a wildcard CORS origin unless the
+route sets its own policy. This includes routes merged by an embedding
+application. GET preflights are supported; routes using other methods configure
+their own CORS policy.
 
 Tokens sent over plain HTTP are visible on the wire, so use HTTPS in
 production.
@@ -47,7 +52,13 @@ split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
 on `moq_relay_accept_failures_total{class="exhausted"}`, which means the
 process ran out of a resource `accept` needs. Content dropped for drifting past
 a subscriber's budget is counted separately as `moq_relay_stale_bytes_total`
-and friends. Host CPU and memory belong to a node exporter.
+and friends. During a [shutdown drain](/bin/relay/config#shutdown),
+`moq_relay_draining_sessions` counts the sessions sent a GOAWAY that have not
+left yet. Host CPU and memory belong to a node exporter.
+
+Traffic and session counters accumulate for the node's lifetime, including
+broadcasts and sessions that have ended. The stats publishing prefix (normally
+`.stats`) is excluded to avoid counting the feed's own traffic.
 
 With `--runtime-io-uring`, each QUIC worker thread also reports its own
 `moq_relay_uring_*` counters under a `worker` label: datagrams and syscalls
@@ -83,9 +94,10 @@ curl -X POST 'http://127.0.0.1:9101/sessions/revalidate?id=00ff'
 
 ### GET /nodes
 
-This relay's view of the cluster: each visible node's URL, Hop ID, the route
-its advertisement took, and the connections to it (with the same `conn` id the
-logs use). A route is priced twice: `cost` as the cluster stands, which reads 0
-through a relay already carrying the broadcast, and `cold_cost` with those
-discounts removed, which is what tells two warm relays apart. It is best-effort
-correlation, not authenticated identity.
+The peers this relay dialed and holds a session with: each node's URL, without
+its query, and the connections to it, with the same `conn` id the logs use.
+Peers that dialed this relay are not listed, since they declare no URL.
+
+```json
+{ "nodes": [{ "node": "https://us-east.example.com/", "connections": [{ "id": 3 }] }] }
+```

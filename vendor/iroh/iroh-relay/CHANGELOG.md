@@ -2,6 +2,48 @@
 
 All notable changes to iroh-relay will be documented in this file.
 
+## [1.3.0](https://github.com/n0-computer/iroh/compare/v1.2.0..1.3.0) - 2026-09-28
+
+### ⛰️  Features
+
+- *(metrics)* Lookup/resolver stats ([#4543](https://github.com/n0-computer/iroh/issues/4543)) - ([b29c0a4](https://github.com/n0-computer/iroh/commit/b29c0a424c7bae7831ba1cb7e4a94e08ba04cfd5))
+
+## [1.2.0](https://github.com/n0-computer/iroh/compare/v1.1.0..1.2.0) - 2026-09-09
+
+### ⛰️  Features
+
+- Switch to n0-dns-resolver and make fallback nameservers configurable ([#4419](https://github.com/n0-computer/iroh/issues/4419)) - ([1a68838](https://github.com/n0-computer/iroh/commit/1a68838b34c6c4646ada9fafaf65b29f9577a446))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(*)* Upgrade to `noq`, `noq-proto`, `noq-udp` v1.3.0 ([#4518](https://github.com/n0-computer/iroh/issues/4518)) - ([cb5d12b](https://github.com/n0-computer/iroh/commit/cb5d12b5019966819f0e6eba23233885cd65cf7b))
+
+## [1.1.0](https://github.com/n0-computer/iroh/compare/v1.0.3..1.1.0) - 2026-08-25
+
+### ⛰️  Features
+
+- *(iroh-relay, iroh)* Inform clients when they are rate-limited and warn log in iroh ([#4455](https://github.com/n0-computer/iroh/issues/4455)) - ([e68dbda](https://github.com/n0-computer/iroh/commit/e68dbda9ada25da61a2bcdff5eb12b9bc8e0ba1e))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(*)* Update `noq` and `net-tools` dependencies ([#4487](https://github.com/n0-computer/iroh/issues/4487)) - ([1960e73](https://github.com/n0-computer/iroh/commit/1960e73f1494eb53a730f2dc408f91e599f620e7))
+
+## [1.0.3](https://github.com/n0-computer/iroh/compare/v1.0.2..1.0.3) - 2026-07-20
+
+### 🐛 Bug Fixes
+
+- Remove vergen use from build.rs files ([#4426](https://github.com/n0-computer/iroh/issues/4426)) - ([1795b93](https://github.com/n0-computer/iroh/commit/1795b9363c68820661fd06cf679d94561ec66c0c))
+
+### 📚 Documentation
+
+- *(iroh-relay)* System deps and build command ([#4385](https://github.com/n0-computer/iroh/issues/4385)) - ([403af3c](https://github.com/n0-computer/iroh/commit/403af3c9ed8eeda07f72a4ac4617d67ca053ccb7))
+
+### ⚙️ Miscellaneous Tasks
+
+- Fixes for clippy from rust 1.97 ([#4404](https://github.com/n0-computer/iroh/issues/4404)) - ([8b097b2](https://github.com/n0-computer/iroh/commit/8b097b24880581bc0bd348ac9965fa05e84428c9))
+- Bump cfg_aliases ([#4422](https://github.com/n0-computer/iroh/issues/4422)) - ([4e0a820](https://github.com/n0-computer/iroh/commit/4e0a820d07f9edd7f32caf352dbf82c0a17d4c42))
+- Update to `noq` 1.1.0 - ([e84fe96](https://github.com/n0-computer/iroh/commit/e84fe96ddeb75ef5e408f06c14edde513f2b6be8))
+
 ## [1.0.2](https://github.com/n0-computer/iroh/compare/v1.0.1..1.0.2) - 2026-07-06
 
 ### ⛰️  Features

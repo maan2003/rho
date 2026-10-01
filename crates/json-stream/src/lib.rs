@@ -644,18 +644,6 @@ pub fn parse_stream(json_string: &str) -> Result<Value, String> {
     Ok(stack.pop().unwrap().0)
 }
 
-pub fn parse_stream_with_limits(
-    json_string: &str,
-    max_depth: Option<usize>,
-    max_length: Option<usize>,
-) -> Result<Value, String> {
-    let mut parser = JsonStreamParser::with_limits(max_depth, max_length);
-    for c in json_string.chars() {
-        parser.add_char(c)?;
-    }
-    Ok(parser.stack.pop().unwrap().0)
-}
-
 pub struct JsonStreamParser {
     stack: Vec<(Value, ObjectStatus)>,
     processed_chars: usize,

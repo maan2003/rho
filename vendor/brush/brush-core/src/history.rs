@@ -224,6 +224,11 @@ impl History {
         Ok(Search::new(self, query))
     }
 
+    /// Returns whether the history contains no items.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// Returns an iterator over the history items.
     pub fn iter(&self) -> impl Iterator<Item = &self::Item> {
         Search::all(self)
@@ -462,7 +467,8 @@ impl<'a> Iterator for Search<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(index) = self.next_index {
+            {
+                let index = self.next_index?;
                 // Make sure we haven't hit the end of the history.
                 if index >= self.history.items.len() {
                     return None;
@@ -491,8 +497,6 @@ impl<'a> Iterator for Search<'a> {
                         return Some(item);
                     }
                 }
-            } else {
-                return None;
             }
         }
     }

@@ -4,12 +4,12 @@
 //! or QUIC) or its axum WebSocket path (`serve_ws` over `ws://`), points it at a
 //! scripted auth server, connects a publisher and a subscriber, confirms media
 //! flows, then asserts the relay follows the server's word: a re-check that moves
-//! the tier keeps the session, a narrower grant or a refusal closes it, an outage
-//! keeps it until `expires`, and every close reports `end` with what it moved.
+//! the tier retags the live session's stats, a narrower grant or a refusal closes it,
+//! and every close reports `end` with what it moved.
 //! The last tests swap the server for an in-process decider answering
-//! `Admissions`, and prove the lease it drives reaches the session the same way.
+//! `Admissions`, and prove the lease it drives reaches the session the same way,
+//! including an outage that keeps it until `expires`, on Tokio's paused clock.
 
-use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use moq_auth::{Event, Grant, Pattern, Patterns, Request};
 use moq_relay::{Config, Connection, Relay, auth, cluster, web};
 use moq_tokio::moq_net;
+use moq_tokio::moq_net::stats;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -124,34 +125,25 @@ fn build_auth(url: url::Url) -> moq_relay::auth::Auth {
 		.expect("auth init")
 }
 
-/// Wait for a TCP listener to become dialable, or panic.
-async fn wait_for_listener(port: u16) {
-	let deadline = std::time::Instant::now() + Duration::from_secs(5);
-	while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
-		assert!(
-			std::time::Instant::now() < deadline,
-			"relay listener never became ready on port {port}"
-		);
-		tokio::time::sleep(Duration::from_millis(25)).await;
-	}
-}
-
-fn free_port() -> u16 {
-	let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
-	probe.local_addr().expect("local addr").port()
-}
-
 /// Stand up the relay's accept loop on a plain-TCP qmux listener and return the
 /// port plus an abort handle.
 async fn spawn_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinHandle<()>) {
+	let cluster = cluster::Cluster::new(cluster::Options::default()).expect("cluster init");
+	spawn_relay_with(auth, cluster).await
+}
+
+/// [`spawn_relay`] serving `cluster`.
+async fn spawn_relay_with(
+	auth: moq_relay::auth::Auth,
+	cluster: cluster::Cluster,
+) -> (u16, tokio::task::JoinHandle<()>) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-	let port = free_port();
 
 	let mut config = moq_tokio::listen::Config::default();
-	config.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse addr"));
+	config.tcp.bind = Some("127.0.0.1:0".parse().expect("parse addr"));
 	let server = config.init(Default::default()).expect("server init");
 	let mut server = server.listen().await.expect("listen");
-	let cluster = cluster::Cluster::new(cluster::Options::default()).expect("cluster init");
+	let port = server.tcp_local_addr().expect("TCP listener is configured").port();
 
 	let handle = tokio::spawn(async move {
 		let mut id = 0;
@@ -164,7 +156,6 @@ async fn spawn_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinHand
 		}
 	});
 
-	wait_for_listener(port).await;
 	(port, handle)
 }
 
@@ -172,7 +163,6 @@ async fn spawn_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinHand
 /// port plus an abort handle.
 async fn spawn_ws_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinHandle<()>) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-	let port = free_port();
 	let cluster = cluster::Cluster::new(cluster::Options::default()).expect("cluster init");
 
 	// Stream listeners bind lazily, so this server never opens a socket; only
@@ -187,14 +177,16 @@ async fn spawn_ws_relay(auth: moq_relay::auth::Auth) -> (u16, tokio::task::JoinH
 
 	let mut web_config = web::Config::default();
 	web_config.ws = true;
-	web_config.http.listen = Some(format!("127.0.0.1:{port}").parse().expect("parse listen"));
-	let web = web::Web::new(auth, cluster, certificates, web_config);
+	web_config.http.listen = Some("127.0.0.1:0".parse().expect("parse listen"));
+	let web = web::Web::new(auth, cluster, certificates, web_config)
+		.bind()
+		.expect("bind web listener");
+	let port = web.addrs().http.expect("HTTP listener is configured").port();
 
 	let handle = tokio::spawn(async move {
 		let _ = web.run().await;
 	});
 
-	wait_for_listener(port).await;
 	(port, handle)
 }
 
@@ -357,9 +349,54 @@ async fn admits_and_reports_the_session() {
 	assert!(connect.remote.is_some_and(|addr| addr.ip().is_loopback()));
 	assert!(connect.local.is_some_and(|addr| addr.port() == port));
 	assert!(connect.tls.is_none());
+	assert!(connect.token.is_none(), "moq-lite carries no SETUP token");
 
 	drop(pub_session);
 	drop(sub_session);
+	relay.abort();
+}
+
+/// A moq-transport client's SETUP token reaches the auth server byte for byte.
+#[tokio::test]
+async fn forwards_the_setup_token() {
+	use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
+
+	let script = Script::new(grant(Duration::from_secs(3600)));
+	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
+
+	// No client presents a SETUP token yet, so write a draft-16 CLIENT_SETUP by hand. One
+	// parameter, AUTHORIZATION TOKEN (3), holding USE_VALUE (3), Token Type 0, then a
+	// value that is not text, so any lossy step on the way shows.
+	let value = [0x00, 0xff, 0x80, b'x'];
+	let token = [&[0x03, 0x00][..], &value].concat();
+	let params = [&[0x01, 0x03, token.len() as u8][..], &token].concat();
+	let setup = [&[0x20][..], &(params.len() as u16).to_be_bytes(), &params].concat();
+
+	let session = qmux::tcp::Config::new(qmux::Version::QMux01)
+		.protocols(["moqt-16"])
+		.connect(("127.0.0.1", port))
+		.await
+		.expect("connect");
+	let (mut send, mut recv) = session.open_bi().await.expect("open the control stream");
+	send.write_all(&setup).await.expect("send CLIENT_SETUP");
+
+	// The relay answers SERVER_SETUP only once the auth server has admitted the session.
+	let mut reply = [0u8; 1];
+	tokio::time::timeout(TIMEOUT, recv.read(&mut reply))
+		.await
+		.expect("SERVER_SETUP timeout")
+		.expect("SERVER_SETUP");
+
+	let seen = script.seen.lock().unwrap().clone();
+	let connect = seen.iter().find(|r| r.event == Event::Connect).expect("a connect");
+	assert_eq!(
+		connect.token,
+		Some(moq_auth::Token {
+			kind: moq_auth::Token::OUT_OF_BAND,
+			value: value.to_vec(),
+		})
+	);
+
 	relay.abort();
 }
 
@@ -379,23 +416,130 @@ async fn refusals_and_outages_refuse_at_connect() {
 	relay.abort();
 }
 
-/// A re-check that moves the tier keeps the session: the stats carriers resolve
-/// their counters once at admission, so the new tier applies to the next one.
+/// A re-check that moves the tier keeps the session and retags its stats live:
+/// both sessions' presence leaves the old tier for the new one, and media sent
+/// afterwards records under the new tier in both directions.
 #[tokio::test]
-async fn a_moved_tier_keeps_the_session() {
+async fn a_moved_tier_retags_the_live_session() {
 	let script = Script::new(grant(Duration::from_secs(3600)));
-	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
+	let mut cluster = cluster::Cluster::new(cluster::Options::default()).expect("cluster init");
+	cluster.stats = stats::Registry::new(stats::Config::new());
+	let registry = cluster.stats.clone();
+	let (port, relay) = spawn_relay_with(build_auth(script.spawn().await), cluster).await;
+	let url = room_url("tcp", port);
 
-	let mut moved = grant(Duration::from_secs(3600));
-	moved.tier = Some("moved".into());
-	script.on_revalidate(Answer::Grant(moved));
+	let moved = stats::Tier::new("moved");
+	let active = |tier: &stats::Tier| {
+		registry
+			.snapshot()
+			.sessions()
+			.into_iter()
+			.find(|(t, _)| t == tier)
+			.map_or(0, |(_, presence)| presence.active())
+	};
+	let bytes = |tier: &stats::Tier, role: stats::Role| {
+		registry
+			.snapshot()
+			.traffic()
+			.into_iter()
+			.find(|(t, r, _)| t == tier && *r == role)
+			.map_or(0, |(_, _, traffic)| traffic.bytes)
+	};
 
-	tokio::time::sleep(Duration::from_millis(2500)).await;
-	assert!(
-		script.seen.lock().unwrap().iter().any(|r| r.event == Event::Revalidate),
-		"the relay re-checked"
+	// A publisher whose track stays open across the move, and a subscriber to it.
+	let pub_origin = moq_tokio::origin::spawn();
+	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
+	broadcast.announce(Default::default()).expect("announce broadcast");
+	let track = broadcast.create_track("video", None).expect("create track");
+	let pub_session = tokio::time::timeout(
+		TIMEOUT,
+		client()
+			.with_publisher(pub_origin.consume())
+			.with_reconnect(false)
+			.connect(url.clone())
+			.established(),
+	)
+	.await
+	.expect("publisher connect timeout")
+	.expect("publisher connect failed");
+
+	let sub_origin = moq_tokio::origin::spawn();
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
+	let sub_session = tokio::time::timeout(
+		TIMEOUT,
+		client()
+			.with_subscriber(sub_origin)
+			.with_reconnect(false)
+			.connect(url.clone())
+			.established(),
+	)
+	.await
+	.expect("subscriber connect timeout")
+	.expect("subscriber connect failed");
+	tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("announcement timeout")
+		.expect("origin closed");
+	let bc = sub_consumer
+		.request_broadcast("test")
+		.await
+		.expect("announced broadcast resolves");
+	let mut track_sub = bc.track("video").unwrap().subscribe(None).await.expect("subscribe");
+
+	let mut round_trip = async |payload: &'static [u8]| {
+		let mut group = track.append_group().expect("append group");
+		group
+			.write_frame(moq_net::Timestamp::ZERO, payload)
+			.expect("write frame");
+		group.finish().expect("finish group");
+		let mut group = tokio::time::timeout(TIMEOUT, track_sub.recv_group())
+			.await
+			.expect("recv_group timeout")
+			.expect("recv_group failed")
+			.expect("track closed prematurely");
+		let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.expect("read_frame timeout")
+			.expect("read_frame failed")
+			.expect("group closed prematurely");
+		assert_eq!(&frame.payload[..], payload);
+	};
+
+	round_trip(b"before").await;
+	assert_eq!(active(&stats::Tier::default()), 2);
+	assert_eq!(active(&moved), 0);
+
+	let mut moved_grant = grant(Duration::from_secs(3600));
+	moved_grant.tier = Some("moved".into());
+	script.on_revalidate(Answer::Grant(moved_grant));
+
+	let deadline = tokio::time::Instant::now() + TIMEOUT;
+	while active(&moved) < 2 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the re-checked tier never applied"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert_eq!(active(&stats::Tier::default()), 0, "presence left the old tier");
+
+	let before = (
+		bytes(&stats::Tier::default(), stats::Role::Publisher),
+		bytes(&stats::Tier::default(), stats::Role::Subscriber),
 	);
+	round_trip(b"after").await;
+	assert_eq!(
+		(
+			bytes(&stats::Tier::default(), stats::Role::Publisher),
+			bytes(&stats::Tier::default(), stats::Role::Subscriber),
+		),
+		before,
+		"nothing more records under the old tier"
+	);
+	assert_eq!(bytes(&moved, stats::Role::Subscriber), 5, "ingress from the publisher");
+	assert_eq!(bytes(&moved, stats::Role::Publisher), 5, "egress to the subscriber");
+
 	assert!(
 		tokio::time::timeout(Duration::from_millis(200), pub_session.closed())
 			.await
@@ -603,41 +747,6 @@ async fn http_routes_hold_a_lease() {
 	relay.abort();
 }
 
-/// An outage keeps the session until `expires`, then closes it as expired.
-#[tokio::test]
-async fn an_outage_keeps_the_session_until_expires() {
-	let script = Script::new(grant(Duration::from_secs(4)));
-	let (port, relay) = spawn_relay(build_auth(script.spawn().await)).await;
-	let admitted = std::time::Instant::now();
-	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
-
-	script.on_revalidate(Answer::Status(503));
-
-	// Well into the outage the session is still up...
-	tokio::time::sleep(Duration::from_millis(2000)).await;
-	assert!(
-		tokio::time::timeout(Duration::from_millis(100), pub_session.closed())
-			.await
-			.is_err(),
-		"an outage must not close the publisher before expires"
-	);
-
-	// ...and it closes once the grant expires, not later.
-	assert_closed(pub_session, Duration::from_secs(4), "publisher").await;
-	assert_closed(sub_session, Duration::from_secs(4), "subscriber").await;
-	let elapsed = admitted.elapsed();
-	assert!(elapsed >= Duration::from_secs(3), "closed before expires: {elapsed:?}");
-
-	tokio::time::sleep(Duration::from_millis(200)).await;
-	for end in script.ends() {
-		let Event::End { reason, .. } = &end.event else {
-			unreachable!()
-		};
-		assert_eq!(*reason, moq_auth::lease::Reason::Expired);
-	}
-	relay.abort();
-}
-
 /// A session the client closes reports `end` with its duration and byte counters.
 /// Over QUIC, the one transport whose connection reports its totals.
 #[tokio::test]
@@ -694,7 +803,7 @@ async fn a_certificate_admits_only_what_the_server_grants() {
 	let serve = |policy: moq_auth::serve::Policy| async move {
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let url: url::Url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
-		let server = moq_auth::serve::Server::new(policy);
+		let server = moq_auth::serve::Server::new(policy).unwrap();
 		tokio::spawn(async move { server.serve(listener).await });
 		url
 	};
@@ -726,7 +835,7 @@ async fn a_certificate_admits_only_what_the_server_grants() {
 	)))
 	.await;
 	let (addr, relay) = spawn_quic_relay(build_auth(narrow), Some(root.clone())).await;
-	let url: url::Url = format!("moql://127.0.0.1:{}/room", addr.port()).parse().unwrap();
+	let url: url::Url = format!("moql://127.0.0.1:{}/mine", addr.port()).parse().unwrap();
 	let origin = moq_tokio::origin::spawn();
 	let session = tokio::time::timeout(
 		TIMEOUT,
@@ -747,6 +856,9 @@ async fn a_certificate_admits_only_what_the_server_grants() {
 	);
 	// A subscribe-only client has nothing granted, so it is refused at the handshake.
 	assert_refused_with(mtls_client(), &url).await;
+	// The rules are rooted at `/`, so a certificate dialed outside `mine` gets nothing.
+	let room: url::Url = format!("moql://127.0.0.1:{}/room", addr.port()).parse().unwrap();
+	assert_refused_with(mtls_client(), &room).await;
 	drop(session);
 	relay.abort();
 }
@@ -876,32 +988,123 @@ async fn a_fixed_lease_still_expires() {
 	}
 }
 
+/// A connected `(client, server)` session pair over an in-memory byte stream, so a
+/// test on Tokio's paused clock never waits on a socket: the clock only advances
+/// once every byte in flight has landed.
+async fn memory_sessions() -> (moq_net::Session, moq_net::Session) {
+	let config = || {
+		let mut config = qmux::Config::new(qmux::Version::QMux01);
+		config.protocol = qmux::Protocol::Negotiate(moq_net::ALPNS.iter().map(|alpn| alpn.to_string()).collect());
+		config
+	};
+	let stream = |io| qmux::transport::Stream::new(io, qmux::Version::QMux01, config().max_record_size);
+	let (client, server) = tokio::io::duplex(64 * 1024);
+	let (client, server) = tokio::try_join!(
+		qmux::Session::connect(stream(client), config()),
+		qmux::Session::accept(stream(server), config()),
+	)
+	.expect("qmux handshake");
+
+	let now = tokio::time::Instant::now().into_std();
+	let client = async {
+		let (session, driver) = moq_net::Client::new()
+			.connect(now, moq_tokio::transport::Session::new(client))
+			.await
+			.expect("client handshake");
+		tokio::spawn(moq_net::time::run(driver));
+		session
+	};
+	let server = async {
+		let (session, driver) = moq_net::Server::new()
+			.accept(now, moq_tokio::transport::Session::new(server))
+			.await
+			.expect("server handshake");
+		tokio::spawn(moq_net::time::run(driver));
+		session
+	};
+	tokio::join!(client, server)
+}
+
+/// An outage keeps the session until `expires`, then closes it as expired and
+/// reports that as its end. A decider that never answers again is an outage as
+/// far as the relay can tell, so the relay enforces `expires` itself; how an auth
+/// server's outage keeps the grant is `moq_auth::Client`'s to test.
+#[tokio::test(start_paused = true)]
+async fn an_outage_keeps_the_session_until_expires() {
+	let expires = SystemTime::now() + Duration::from_secs(3);
+	let (auth, mut admissions) = moq_relay::auth::Auth::embedded("test-relay");
+	let decider = tokio::spawn(async move {
+		let admission = admissions.next().await.expect("an admission");
+		let mut grant = Grant::new(all(), all());
+		grant.expires = Some(expires);
+		let (producer, consumer) = moq_auth::lease::Producer::new(grant);
+		admission.grant(consumer);
+		producer
+	});
+
+	// `expires` is wall-clock time, which the relay maps onto Tokio's clock
+	// somewhere inside `admit`, so bracket it: the bounds hold however long it takes.
+	let (wall, tick) = (SystemTime::now(), tokio::time::Instant::now());
+	let lease = auth
+		.admit(auth.request(moq_auth::Transport::Tcp, "/room"))
+		.await
+		.expect("admitted");
+	let earliest = tick + expires.duration_since(SystemTime::now()).unwrap();
+	let latest = tokio::time::Instant::now() + expires.duration_since(wall).unwrap();
+	let producer = decider.await.expect("decider");
+
+	let (client, server) = memory_sessions().await;
+	let supervised = tokio::spawn(moq_relay::supervise(
+		server,
+		lease,
+		moq_relay::shutdown::Observer::disabled(),
+		None,
+	));
+
+	// A millisecond either side for Tokio's timer resolution.
+	let tolerance = Duration::from_millis(1);
+	assert!(
+		tokio::time::timeout_at(earliest - tolerance, client.closed())
+			.await
+			.is_err(),
+		"an outage must not close the session before expires"
+	);
+	tokio::time::timeout_at(latest + tolerance, client.closed())
+		.await
+		.expect("closed at expires, not later");
+	let (reason, _) = producer.closed().await;
+	assert_eq!(reason, moq_auth::lease::Reason::Expired);
+	supervised
+		.await
+		.expect("supervisor")
+		.expect("a lease end is not a session error");
+}
+
 /// A relay whose config names no auth source is the embedder's to decide: `run`
 /// refuses to start until the admissions are taken, and once they are, the
 /// decider's grant admits sessions through the assembled relay.
 #[tokio::test]
 async fn a_relay_without_an_auth_source_is_decided_by_the_embedder() {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-	let config = |port: u16| {
+	let config = || {
 		let mut config = Config::default();
-		config.listen.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse addr"));
+		config.listen.tcp.bind = Some("127.0.0.1:0".parse().expect("parse addr"));
 		// The sessions are gone by the time the trigger fires; no need to wait out the default window.
 		config.drain_timeout = Duration::from_millis(100);
 		config
 	};
 
-	let untaken = Relay::load(config(free_port())).await.expect("load relay");
+	let untaken = Relay::load(config()).await.expect("load relay");
 	let err = untaken.run().await.expect_err("nobody can authenticate");
 	assert!(err.to_string().contains("nobody can authenticate"), "{err}");
 
-	let port = free_port();
-	let mut relay = Relay::load(config(port)).await.expect("load relay");
+	let mut relay = Relay::load(config()).await.expect("load relay");
+	let port = relay.tcp_addr().expect("TCP listener bound").port();
 	let admissions = relay.admissions().expect("an empty [auth] hands over the admissions");
 	assert!(relay.admissions().is_none(), "taken once");
 	let decider = Decider::spawn(admissions, grant(Duration::from_secs(3600)));
 	let trigger = relay.shutdown_trigger().clone();
 	let running = tokio::spawn(relay.run());
-	wait_for_listener(port).await;
 
 	let (pub_session, sub_session) = connect_and_round_trip(&room_url("tcp", port)).await;
 	assert_eq!(decider.seen.lock().unwrap().len(), 2, "one admission per session");

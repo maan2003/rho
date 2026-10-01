@@ -157,7 +157,7 @@ execute_with_shell() {
     local stderr_file="$output_dir/$output_subdir/stderr.txt"
     local trace_file="$output_dir/$output_subdir/trace.txt"
     local exit_code_file="$output_dir/$output_subdir/exit_code.txt"
-    
+
     # Execute the shell with:
     # - BASH_XTRACEFD=3 set in the environment
     # - PS4 set to include script name and line number
@@ -165,12 +165,13 @@ execute_with_shell() {
     # - -x flag to enable tracing
     # - stdout to stdout file
     # - stderr to stderr file
+    # shellcheck disable=SC2016 # PS4 is expanded by the traced shell.
     env BASH_XTRACEFD=3 PS4='+${BASH_SOURCE:-}:${LINENO:-}: ' \
         "$shell_path" -x "$script_path" "${script_args[@]}" \
         >"$stdout_file" \
         2>"$stderr_file" \
         3>"$trace_file"
-    
+
     local exit_code=$?
     echo "$exit_code" > "$exit_code_file"
     return $exit_code

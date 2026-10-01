@@ -8,14 +8,14 @@ import ffi "moq.dev/moq-ffi/moq"
 type (
 	// Audio describes one audio rendition in a broadcast catalog: codec, sample rate, channel count, and container.
 	Audio = ffi.MoqAudio
-	// AudioCodec selects the audio encoder codec. Build one with OpusAudioCodec;
+	// AudioCodec selects the audio encoder codec. Build one with OpusAudioCodec or AacAudioCodec;
 	// adding a codec later adds a constructor, not a breaking enum change.
 	AudioCodec = ffi.MoqAudioCodec
 	// AudioDecoderOutput configures the PCM format, sample rate, and channels DecodeAudio delivers.
 	AudioDecoderOutput = ffi.MoqAudioDecoderOutput
 	// AudioEncoderInput declares the PCM sample format, sample rate, and channel count of frames written to an audio producer.
 	AudioEncoderInput = ffi.MoqAudioEncoderInput
-	// AudioEncoderOutput configures the Opus encoder: codec, optional sample rate, channels, bitrate, and frame duration.
+	// AudioEncoderOutput configures the encoder: codec, optional sample rate, channels, bitrate, and frame duration.
 	AudioEncoderOutput = ffi.MoqAudioEncoderOutput
 	// AudioSampleFormat is a raw PCM sample layout, mirroring WebCodecs AudioData.format.
 	AudioSampleFormat = ffi.MoqAudioSampleFormat
@@ -48,15 +48,16 @@ type (
 	// Subscription holds subscriber-side delivery preferences: priority, ordering, max age, and group range.
 	Subscription = ffi.MoqSubscription
 	// TrackInfo holds publisher-side track properties: priority, ordering, max age, and timescale.
+	// A zero Priority is the least urgent, not the default; set 127 for the midpoint a nil TrackInfo uses.
 	TrackInfo = ffi.MoqTrackInfo
 	// Video describes one catalog rendition, including whether the publisher recommends temporarily avoiding it.
 	Video = ffi.MoqVideo
 	// VideoHint supplies catalog fields a video stream can't reveal itself, such as bitrate, filling only the gaps.
-	// VideoDecodedFrame is one decoded video frame: packed I420, its dimensions, and a timestamp in microseconds.
-	VideoDecodedFrame = ffi.MoqVideoDecodedFrame
-	// VideoDecoderOutput configures what DecodeVideo delivers: an optional resize plus a max age.
-	VideoDecoderOutput = ffi.MoqVideoDecoderOutput
 	VideoHint = ffi.MoqVideoHint
+	// VideoDecodedFrame is one decoded video frame: packed pixels, the layout they are in, their dimensions, and a timestamp in microseconds.
+	VideoDecodedFrame = ffi.MoqVideoDecodedFrame
+	// VideoDecoderOutput configures what DecodeVideo delivers: an optional pixel format and resize, plus a max age.
+	VideoDecoderOutput = ffi.MoqVideoDecoderOutput
 	// AudioFormat is a single audio codec an importer can parse.
 	AudioFormat = ffi.MoqAudioFormat
 	// VideoFormat is a single video codec an importer can parse.
@@ -67,7 +68,7 @@ type (
 	VideoProperties = ffi.MoqVideoProperties
 	// VideoCodec identifies a published video track's codec: H.264 or H.265.
 	VideoCodec = ffi.MoqVideoCodec
-	// VideoPixelFormat is a raw pixel layout (I420 or RGBA) written to a VideoProducer.
+	// VideoPixelFormat is a CPU pixel layout (I420 or RGBA): written to a VideoProducer, or delivered by DecodeVideo.
 	VideoPixelFormat = ffi.MoqVideoPixelFormat
 	// VideoEncoderInput declares the pixel layout, resolution, and framerate of frames written to a video producer.
 	VideoEncoderInput = ffi.MoqVideoEncoderInput
@@ -184,7 +185,14 @@ func OpusAudioCodec() *AudioCodec {
 	return ffi.MoqAudioCodecOpus()
 }
 
-// VideoPixelFormat values: the raw pixel layout fed to the in-process encoder.
+// AacAudioCodec selects AAC-LC through the platform's encoder for EncodeAudio.
+// A host without one refuses it. Leave FrameDurationUs at 0 for AAC's own frame.
+func AacAudioCodec() *AudioCodec {
+	return ffi.MoqAudioCodecAac()
+}
+
+// VideoPixelFormat values: the raw pixel layout fed to the in-process encoder,
+// and the one the in-process decoder delivers.
 const (
 	// VideoPixelFormatI420 is tightly-packed planar I420: Y, then U, then V.
 	VideoPixelFormatI420 = ffi.MoqVideoPixelFormatI420

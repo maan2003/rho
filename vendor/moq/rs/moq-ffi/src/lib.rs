@@ -17,7 +17,9 @@ mod android;
 #[cfg(all(feature = "audio", not(target_arch = "wasm32")))]
 pub mod audio;
 pub mod bandwidth;
+pub mod binary;
 pub mod consumer;
+pub mod demand;
 pub mod error;
 mod ffi;
 pub mod json;

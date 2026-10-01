@@ -108,6 +108,10 @@ pub enum Error {
 		value: u64,
 	},
 
+	/// An export generation had characters a URL path segment can't carry verbatim.
+	#[error("invalid generation {0:?}: expected ASCII letters, digits, '-', or '_'")]
+	InvalidGeneration(String),
+
 	/// A playlist or segment URI could not be resolved against its base.
 	#[error("url parse: {0}")]
 	UrlParse(#[from] url::ParseError),
@@ -137,7 +141,9 @@ impl Error {
 
 impl From<reqwest::Error> for Error {
 	fn from(err: reqwest::Error) -> Self {
-		Error::Reqwest(std::sync::Arc::new(err))
+		// reqwest prints the full URL in its error, and a playlist or segment URL
+		// routinely carries a signed token in its query.
+		Error::Reqwest(std::sync::Arc::new(err.without_url()))
 	}
 }
 
@@ -161,5 +167,23 @@ mod tests {
 		assert_eq!(Error::NoVariants.status(), None);
 		assert_eq!(Error::ParsePlaylist("not a playlist".to_string()).status(), None);
 		assert_eq!(Error::Moq(moq_net::Error::Transport("lost".to_string())).status(), None);
+	}
+
+	#[tokio::test]
+	async fn http_error_redacts_url() {
+		// A freed port refuses the connection, so reqwest fails with the dialed URL attached.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+		let address = listener.local_addr().expect("local address");
+		drop(listener);
+
+		let err: Error = reqwest::get(format!("http://user:pass@{address}/media.m3u8?jwt=secret"))
+			.await
+			.expect_err("dial a closed port")
+			.into();
+
+		let printed = format!("{err} {err:?}");
+		for secret in ["jwt", "secret", "user:pass"] {
+			assert!(!printed.contains(secret), "error leaked {secret}: {printed}");
+		}
 	}
 }

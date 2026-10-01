@@ -571,10 +571,6 @@ fn push_line(target: &mut String, line: &str) {
     target.push_str(line);
 }
 
-pub fn render_block(block: &Value, names: &dyn Names) -> String {
-    render_block_as(Flavour::Mrkdwn, block, names)
-}
-
 /// The same, in the flavour asked for.
 pub fn render_block_as(flavour: Flavour, block: &Value, names: &dyn Names) -> String {
     match string(block, "type") {
@@ -1061,7 +1057,7 @@ mod tests {
     }
 
     fn render(block: Value) -> String {
-        render_block(&block, &Roster)
+        render_block_as(Flavour::Mrkdwn, &block, &Roster)
     }
 
     #[test]

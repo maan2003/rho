@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.9](https://github.com/moq-dev/moq/compare/hang-v0.21.8...hang-v0.21.9) - 2026-09-30
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-json
+
+## [0.21.8](https://github.com/moq-dev/moq/compare/hang-v0.21.7...hang-v0.21.8) - 2026-09-27
+
+### Added
+
+- *(mux)* detect delay and jitter on JSON and binary tracks ([#4270](https://github.com/moq-dev/moq/pull/4270))
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.21.7](https://github.com/moq-dev/moq/compare/hang-v0.21.6...hang-v0.21.7) - 2026-09-26
+
+### Added
+
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+## [0.21.6](https://github.com/moq-dev/moq/compare/hang-v0.21.5...hang-v0.21.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.5](https://github.com/moq-dev/moq/compare/hang-v0.21.4...hang-v0.21.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.4](https://github.com/moq-dev/moq/compare/hang-v0.21.3...hang-v0.21.4) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+## [0.21.3](https://github.com/moq-dev/moq/compare/hang-v0.21.2...hang-v0.21.3) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.2](https://github.com/moq-dev/moq/compare/hang-v0.21.1...hang-v0.21.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.1](https://github.com/moq-dev/moq/compare/hang-v0.21.0...hang-v0.21.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-tokio
+
+## [0.21.0](https://github.com/moq-dev/moq/compare/hang-v0.20.13...hang-v0.21.0) - 2026-09-23
+
+### Added
+
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(hang)* [**breaking**] one continuous broadcast clock at the catalog root ([#3675](https://github.com/moq-dev/moq/pull/3675))
+
+### Fixed
+
+- *(hang)* refuse a malformed text catalog section in JS too
+
+### Other
+
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
 ### Changed
 
 - [**breaking**] Replace the catalog root `timeline` entry with `archive`. The

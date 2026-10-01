@@ -458,12 +458,6 @@ impl AgentModel {
         self.transcript.gap_marker_block()
     }
 
-    /// Whether history is still being composed: what the echo line says
-    /// while a verb waits for the whole transcript.
-    pub fn composing_history(&self) -> bool {
-        self.composing
-    }
-
     /// Asks for more of the transcript's history. Composition runs off the
     /// frame loop, a chunk at a time, so the window keeps drawing while it
     /// catches up and the point lands when what holds it exists.

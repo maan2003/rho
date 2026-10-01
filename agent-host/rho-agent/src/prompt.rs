@@ -134,6 +134,9 @@ A command's stdin is /dev/null, so a program that falls back to reading stdin se
 at once. Pass stdin=True to keep stdin open for write_stdin. Write to a command only when it
 needs input.
 
+rg prints each file's path once above its matches and cuts lines at 150 columns. Pass
+--no-heading when a script parses its output by line.
+
 Send input to a running command. It never reads; more_output does that.
 write_stdin(handle: Command, chars: str) → Awaitable[None]
 

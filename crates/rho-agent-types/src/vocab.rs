@@ -72,12 +72,6 @@ pub enum EngineerIntelligence {
     High1,
 }
 
-impl AgentRole {
-    pub fn uses_notes_rotation(self) -> bool {
-        false
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AdvisorIntelligence {
     Low,

@@ -68,13 +68,6 @@ impl RemoteProjectState {
         self.change_epoch
     }
 
-    pub fn opened_buffers(&self, _cx: &App) -> Vec<(Utf8PathBuf, Entity<Buffer>)> {
-        self.buffers
-            .iter()
-            .filter_map(|(path, entry)| entry.buffer.upgrade().map(|buffer| (path.clone(), buffer)))
-            .collect()
-    }
-
     fn existing_buffer(&self, path: &Utf8PathBuf) -> Option<Entity<Buffer>> {
         self.buffers.get(path)?.buffer.upgrade()
     }
@@ -376,21 +369,6 @@ pub async fn open_file_buffer(
         buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
     }
     Ok(buffer)
-}
-
-pub async fn opened_dirty_file_buffer(
-    remote: &RemoteProject,
-    path: Utf8PathBuf,
-    cx: &mut AsyncApp,
-) -> Result<Option<Entity<Buffer>>> {
-    let path = normalized_path(path)?;
-    Ok(cx.update(|cx| {
-        remote
-            .state
-            .read(cx)
-            .existing_buffer(&path)
-            .filter(|buffer| buffer.read(cx).is_dirty())
-    }))
 }
 
 async fn reload_changed(

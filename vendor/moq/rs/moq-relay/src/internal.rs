@@ -9,7 +9,8 @@
 //! - `/metrics` - this node's own traffic counters as Prometheus text
 //!   exposition, plus the accept-loop health of its TCP listeners
 //!   ([`with_listeners`](Internal::with_listeners)) and the per-worker health of
-//!   its io_uring runtime ([`with_uring`](Internal::with_uring)). A distinct plane
+//!   its io_uring runtime ([`with_uring`](Internal::with_uring)), and the
+//!   progress of a shutdown drain ([`with_shutdown`](Internal::with_shutdown)). A distinct plane
 //!   from both the customer `web` surface and the MoQ `.stats` broadcast: the same
 //!   atomics, but a different transport and audience (an ops scraper, not a
 //!   customer or the dashboard/billing aggregators). The runtime counters are
@@ -17,8 +18,7 @@
 //!   crossing it, so they have no place on the `moq-stats` wire.
 //! - `/health` - a liveness mirror of the public probe, for internal checks
 //!   that don't want to hit the customer port.
-//! - `/nodes` - the cluster nodes visible through gossip plus established
-//!   direct relay connections.
+//! - `/nodes` - the cluster peers this relay dialed and holds a session with.
 //! - `/sessions` and `/sessions/revalidate` - list or nudge live sessions on
 //!   this node. A push only causes a re-check, so a caller on this trusted
 //!   plane gains nothing a scheduled cadence would not do.
@@ -89,6 +89,9 @@ pub struct Internal {
 	health: moq_tokio::accept::Health,
 	listeners: Vec<moq_tokio::accept::Health>,
 	uring: Vec<UringWorker>,
+	shutdown: Option<crate::shutdown::Observer>,
+	listener: Option<net::TcpListener>,
+	addr: Option<net::SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -98,6 +101,7 @@ struct InternalState {
 	sessions: crate::session::Registry,
 	listeners: Vec<moq_tokio::accept::Health>,
 	uring: Vec<UringWorker>,
+	shutdown: Option<crate::shutdown::Observer>,
 }
 
 impl Internal {
@@ -122,7 +126,30 @@ impl Internal {
 			health,
 			listeners,
 			uring: Vec::new(),
+			shutdown: None,
+			listener: None,
+			addr: None,
 		}
+	}
+
+	/// Bind the configured listener now, so [`addr`](Self::addr) reports an ephemeral port before serving.
+	pub fn bind(mut self) -> anyhow::Result<Self> {
+		if let Some(listen) = self.config.listen
+			&& self.listener.is_none()
+		{
+			let listener = moq_tokio::bind::tcp(listen).context("failed to bind internal listener")?;
+			let addr = listener
+				.local_addr()
+				.context("failed to resolve internal bind address")?;
+			self.addr = Some(addr);
+			self.listener = Some(listener);
+		}
+		Ok(self)
+	}
+
+	/// The bound address after [`bind`](Self::bind) or [`crate::Relay::load`], if configured.
+	pub fn addr(&self) -> Option<net::SocketAddr> {
+		self.addr
 	}
 
 	/// Report other listeners' accept health at `/metrics`.
@@ -172,6 +199,12 @@ impl Internal {
 		self
 	}
 
+	/// Report the sessions a shutdown drain is still waiting on at `/metrics`.
+	pub fn with_shutdown(mut self, shutdown: crate::shutdown::Observer) -> Self {
+		self.shutdown = Some(shutdown);
+		self
+	}
+
 	/// Attach the relay cluster used to serve the `/nodes` topology snapshot.
 	pub fn with_cluster(mut self, cluster: &crate::cluster::Cluster) -> Self {
 		self.nodes = Some(cluster.nodes.clone());
@@ -205,6 +238,7 @@ impl Internal {
 				sessions: self.sessions.clone(),
 				listeners: self.listeners.clone(),
 				uring: self.uring.clone(),
+				shutdown: self.shutdown.clone(),
 			})
 	}
 
@@ -220,17 +254,17 @@ impl Internal {
 	/// resolves), so it drops cleanly into a `select!` as a disabled no-op -
 	/// mirroring how the relay treats other optional services.
 	pub async fn serve(self, app: Router) -> anyhow::Result<()> {
-		let Some(listen) = self.config.listen else {
+		let Internal { listener, health, .. } = self.bind()?;
+		let Some(listener) = listener else {
 			std::future::pending::<()>().await;
 			return Ok(());
 		};
 
-		let listener = moq_tokio::bind::tcp(listen).context("failed to bind internal listener")?;
 		// No blanket "…server failed" context here: the caller (main.rs) adds
 		// that single top-level layer, matching `Web::serve` / `Cluster::run`.
 		// No accept-time work: the ops router never hands a connection to qmux, so
 		// capturing a descriptor per health check would spend one for nothing.
-		crate::listener::server(listener, self.health, DefaultAcceptor::new())?
+		crate::listener::server(listener, health, DefaultAcceptor::new())?
 			.serve(app.into_make_service())
 			.await?;
 		Ok(())
@@ -264,15 +298,15 @@ async fn serve_health() -> Response {
 /// current cumulative snapshot; a downstream scraper derives rates and live
 /// counts (`open - closed`).
 async fn serve_metrics(State(state): State<InternalState>) -> Response {
-	let body = render_metrics(&state.stats.snapshot(), &state.listeners, &state.uring);
+	let mut body = render_metrics(&state.stats.snapshot(), &state.listeners, &state.uring);
+	if let Some(shutdown) = &state.shutdown {
+		render_drain(&mut body, shutdown.tally());
+	}
 	([(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
-/// Cluster nodes currently visible through gossip or a direct outbound dial.
-///
-/// Inbound connections appear only after their SETUP origin identity resolves
-/// to a unique `.internal/origins` node advertisement. Sessions without a
-/// unique match are omitted.
+/// Cluster peers this relay dialed and currently holds a session with. Accepted
+/// peer sessions are omitted, since a peer declares no URL to list it under.
 async fn serve_nodes(State(state): State<InternalState>) -> Json<crate::nodes::Snapshot> {
 	Json(state.nodes.map(|nodes| nodes.snapshot()).unwrap_or_default())
 }
@@ -441,6 +475,21 @@ fn render_metrics(
 	render_uring(&mut out, uring);
 
 	out
+}
+
+/// The sessions a shutdown drain is still waiting on: 0 until the drain starts,
+/// and back to 0 when every session has left, which is when the relay exits.
+/// A scrape that last saw it above 0 shortly before the deadline means the
+/// deadline force-closed the rest; the exit log records how many.
+fn render_drain(out: &mut String, tally: crate::shutdown::Tally) {
+	use std::fmt::Write as _;
+
+	let _ = writeln!(
+		out,
+		"# HELP moq_relay_draining_sessions Sessions sent a shutdown GOAWAY that have not left yet."
+	);
+	let _ = writeln!(out, "# TYPE moq_relay_draining_sessions gauge");
+	let _ = writeln!(out, "moq_relay_draining_sessions {}", tally.draining);
 }
 
 /// The accept-loop health of every listener on the node.
@@ -792,32 +841,23 @@ mod tests {
 	/// and forking both the socket options and the disabled-listener contract.
 	#[tokio::test]
 	async fn serve_hosts_merged_routes_alongside_the_defaults() {
-		// A throwaway bind picks a free port, released before `serve` claims it
-		// for real (`bind::tcp` sets SO_REUSEADDR, and nothing ever connected).
-		let listen = std::net::TcpListener::bind("127.0.0.1:0")
-			.expect("probe bind")
-			.local_addr()
-			.expect("probe addr");
-
-		let internal = Internal::new(Config { listen: Some(listen) }, moq_net::stats::Registry::disabled());
+		let listen = Some("127.0.0.1:0".parse().unwrap());
+		let internal = Internal::new(Config { listen }, moq_net::stats::Registry::disabled())
+			.bind()
+			.expect("bind internal listener");
+		let addr = internal.addr().expect("internal listener is configured");
 		let app = internal
 			.routes()
 			.merge(Router::new().route("/embedder", get(async || "embedded\n")));
 		let server = tokio::spawn(internal.serve(app));
 
-		// `serve` binds inside the task, so poll rather than assume it is up the
-		// instant the spawn returns.
 		let client = reqwest::Client::new();
-		let url = format!("http://{listen}");
-		let mut embedder = None;
-		for _ in 0..200 {
-			if let Ok(res) = client.get(format!("{url}/embedder")).send().await {
-				embedder = Some(res);
-				break;
-			}
-			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-		}
-		let embedder = embedder.expect("internal listener never accepted a connection");
+		let url = format!("http://{addr}");
+		let embedder = client
+			.get(format!("{url}/embedder"))
+			.send()
+			.await
+			.expect("embedder request");
 
 		assert_eq!(embedder.status(), reqwest::StatusCode::OK);
 		assert_eq!(embedder.text().await.expect("embedder body"), "embedded\n");
@@ -852,6 +892,7 @@ mod tests {
 			sessions: crate::session::Registry::new(),
 			listeners: Vec::new(),
 			uring: Vec::new(),
+			shutdown: None,
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
@@ -860,8 +901,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn nodes_endpoint_uses_the_attached_cluster_registry() {
-		let origin = moq_tokio::origin::spawn_config(moq_net::origin::Config::new(moq_net::Hop::new(100).unwrap()));
-		let nodes = crate::nodes::Nodes::new(origin);
+		let nodes = crate::nodes::Nodes::default();
 		let _connection = nodes.connect_outbound(0, "https://relay-b.example/");
 		let state = InternalState {
 			stats: moq_net::stats::Registry::disabled(),
@@ -869,6 +909,7 @@ mod tests {
 			sessions: crate::session::Registry::new(),
 			listeners: Vec::new(),
 			uring: Vec::new(),
+			shutdown: None,
 		};
 
 		let Json(snapshot) = serve_nodes(State(state)).await;

@@ -12,6 +12,8 @@ inputs:
 runs:
   using: composite
   steps:
+    # The pinned action saves in a post step guarded by success(), so failed
+    # builds cannot publish a cache even when dispatch saving is enabled.
     - uses: jdx/mr-boxington-action@7234d3dd1a6ca8f6c381eea8e4dfb03f18fcf777 # v1.3.0
       with:
         version: 1.10.0
@@ -28,7 +30,7 @@ runs:
         # whatever the runner image ships: the compiler these jobs build with
         # exists only inside `nix develop`. The `toolchain` input is no help
         # either, since it names a rustup toolchain and probes
-        # `rustc +<name> -vV`, and nothing installs 1.95.0 through rustup.
+        # `rustc +<name> -vV`, and nothing installs that channel through rustup.
         #
         # flake.lock pins that compiler, so hashing the flake identifies it more
         # precisely than `rustc -vV` would, and rolls the cache when the dev
@@ -38,8 +40,8 @@ runs:
         # even though it is kept in sync with the flake.
         #
         # Every segment the generated layout carries has to be carried here too:
-        # the runner pair, so the two architectures the warm job builds cannot
-        # read each other, and `target`, so changing `github-cache-mode` cannot
+        # the runner pair, so a job on an x86 runner cannot restore the ARM64
+        # store, and `target`, so changing `github-cache-mode` cannot
         # restore the other payload. The trailing run id rolls the key on every
         # run, which is what lets a repeated `workflow_dispatch` seed a cold
         # cache against GitHub's immutable entries.
