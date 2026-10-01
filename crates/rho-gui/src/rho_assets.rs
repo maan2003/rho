@@ -20,6 +20,29 @@ struct RhoEmbedded;
 /// surface viewport is the chrome.
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
+/// [`RHO_DEFAULT_SETTINGS`] with `RHO_GUI_FONT_FAMILY`, when set, as the
+/// buffer and UI font: the deployment that supplies a font through
+/// `RHO_GUI_FONTS` makes it the default, and user settings still win.
+pub fn default_settings() -> Cow<'static, str> {
+    match std::env::var("RHO_GUI_FONT_FAMILY") {
+        Ok(family) => Cow::Owned(settings_with_font_family(&family)),
+        Err(_) => Cow::Borrowed(RHO_DEFAULT_SETTINGS),
+    }
+}
+
+fn settings_with_font_family(family: &str) -> String {
+    let family = serde_json::to_string(family).expect("a string serializes");
+    ["buffer_font_family", "ui_font_family"].into_iter().fold(
+        RHO_DEFAULT_SETTINGS.to_string(),
+        |settings, key| {
+            settings.replace(
+                &format!(r#""{key}": "Rho Font""#),
+                &format!(r#""{key}": {family}"#),
+            )
+        },
+    )
+}
+
 pub struct RhoAssets;
 
 impl AssetSource for RhoAssets {
@@ -47,9 +70,14 @@ impl RhoAssets {
     /// Loads the fork's bundled fonts and then rho's, so a transcript reads
     /// the same on a machine with nothing installed. See
     /// `assets/fonts/rho-font/README.md` for what rho ships and why.
+    ///
+    /// Then every `.ttf` and `.otf` in the directory `RHO_GUI_FONTS` names:
+    /// fonts licensed to the user rather than to rho, which the deployment
+    /// supplies and must never enter the repo or the published build.
+    /// Settings pick them by family like any other font.
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
         assets::Assets.load_fonts(cx)?;
-        let fonts = RhoEmbedded::iter()
+        let mut fonts = RhoEmbedded::iter()
             .filter(|asset| asset.ends_with(".ttf"))
             .map(|asset| {
                 RhoEmbedded::get(&asset)
@@ -57,6 +85,21 @@ impl RhoAssets {
                     .with_context(|| format!("loading font at path {asset:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some(dir) = std::env::var_os("RHO_GUI_FONTS") {
+            let entries = std::fs::read_dir(&dir)
+                .with_context(|| format!("reading RHO_GUI_FONTS {dir:?}"))?;
+            for entry in entries {
+                let path = entry?.path();
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "ttf" || ext == "otf")
+                {
+                    let data = std::fs::read(&path)
+                        .with_context(|| format!("loading font at path {path:?}"))?;
+                    fonts.push(Cow::Owned(data));
+                }
+            }
+        }
         cx.text_system().add_fonts(fonts)
     }
 }
@@ -64,6 +107,18 @@ impl RhoAssets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_family_override_replaces_both_defaults() {
+        let settings = settings_with_font_family("ABC \"Quoted\" Sans");
+        for key in ["buffer_font_family", "ui_font_family"] {
+            assert!(
+                settings.contains(&format!(r#""{key}": "ABC \"Quoted\" Sans""#)),
+                "{key} must name the override"
+            );
+            assert!(!settings.contains(&format!(r#""{key}": "Rho Font""#)));
+        }
+    }
 
     fn wcag_relative_luminance(color: gpui::Color) -> f32 {
         let color = gpui::Rgba::from(color);
