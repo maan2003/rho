@@ -1408,6 +1408,15 @@ impl Workspace {
             )
         };
         let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
+        // An agent already shown as a card above is not listed again.
+        let dealt = rows
+            .next
+            .iter()
+            .filter_map(|row| match row.card {
+                rho_dealer::NodeId::Agent(agent_id) => Some(agent_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
         // An agent working for another agent belongs to it and is not the
         // reader's to watch; only the ones the reader manages are listed.
         // Nor one the user put away: a mute and a snooze are not cursors,
@@ -1418,7 +1427,8 @@ impl Workspace {
             .known_agents()
             .copied()
             .filter(|agent_id| {
-                self.registry.owned_by_user(*agent_id)
+                !dealt.contains(agent_id)
+                    && self.registry.owned_by_user(*agent_id)
                     && !self
                         .attention
                         .marks

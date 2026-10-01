@@ -68,8 +68,8 @@ pub(crate) struct PileRow {
 pub(crate) struct HomeRows {
     /// The top of the queue above the cutoff: a preview, not the queue.
     pub next: Vec<HomeRow>,
-    /// The agents that sent lately, newest first. Folded until opened:
-    /// what wants the reader is already a card above.
+    /// The agents that sent lately, newest first, but for those already in
+    /// `next`. Folded until opened: what wants the reader is a card above.
     pub recent: Vec<RecentRow>,
     /// Every pile, all of them: a pile nobody sees is where cards go to die.
     pub piles: Vec<PileRow>,

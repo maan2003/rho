@@ -5589,6 +5589,7 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
 fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(777);
+    let old = agent(779);
     let now = jiff::Timestamp::now().as_millisecond() as u64;
     workspace
         .update(cx, |workspace, window, cx| {
@@ -5596,14 +5597,20 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
                 workspace,
                 HostId::default(),
                 ready_with(
-                    vec![story::UiAgentHead {
-                        generated_title: Some("flaky-ci".to_owned()),
-                        // A status is not a send the reader is owed, so it
-                        // does not make the agent recent.
-                        status: Some("reading tests".to_owned()),
-                        ..ui_head(agent_id)
-                    }],
-                    778,
+                    vec![
+                        story::UiAgentHead {
+                            generated_title: Some("flaky-ci".to_owned()),
+                            // A status is not a send the reader is owed, so it
+                            // does not make the agent recent.
+                            status: Some("reading tests".to_owned()),
+                            ..ui_head(agent_id)
+                        },
+                        story::UiAgentHead {
+                            generated_title: Some("old-docs".to_owned()),
+                            ..ui_head(old)
+                        },
+                    ],
+                    780,
                 ),
                 window,
                 cx,
@@ -5618,31 +5625,32 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                story::story(
-                    agent_id,
-                    vec![story::UiStoryEvent::Sent {
-                        text: "done".to_owned(),
-                        kind: rho_agent_types::SendKind::Result,
-                        at: UnixMs(now - 2 * 3_600_000),
-                    }],
-                ),
-                window,
-                cx,
-            );
+            for (agent_id, hours) in [(agent_id, 2), (old, 5 * 24)] {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story::story(
+                        agent_id,
+                        vec![story::UiStoryEvent::Sent {
+                            text: "done".to_owned(),
+                            kind: rho_agent_types::SendKind::Result,
+                            at: UnixMs(now - hours * 3_600_000),
+                        }],
+                    ),
+                    window,
+                    cx,
+                );
+            }
         })
         .unwrap();
     cx.run_until_parked();
+    // The fresh result is a card in `next`, so only the faded one is
+    // recent: an agent is not listed twice.
     let text = home_text(&workspace, cx);
-    assert_eq!(
-        text.lines()
-            .skip_while(|line| *line != "recent ▸ 1")
-            .collect::<Vec<_>>(),
-        ["recent ▸ 1"],
-        "{text:?}"
-    );
+    let (next, recent) = text.split_once("recent ").expect("a recent heading");
+    assert!(next.contains("flaky-ci"), "{text:?}");
+    assert!(!next.contains("old-docs"), "{text:?}");
+    assert_eq!(recent.lines().next(), Some("▸ 1"), "{text:?}");
     workspace
         .update(cx, |workspace, _, cx| {
             let home = workspace.home_view().expect("home is in view");
@@ -5655,7 +5663,7 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
         text.lines()
             .skip_while(|line| *line != "recent ▾ 1")
             .collect::<Vec<_>>(),
-        ["recent ▾ 1", "  flaky-ci  2.0h ago"],
+        ["recent ▾ 1", "  old-docs  5.0d ago"],
         "{text:?}"
     );
 }
