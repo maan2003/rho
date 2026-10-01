@@ -51,17 +51,17 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             return Ok(String::new());
         }
 
-        // Save (and later restore) the last exit status.
-        let prev_last_result = self.last_exit_status();
-        let prev_last_pipeline_statuses = self.last_pipeline_statuses.clone();
+        // Save (and later restore) the state the last command left behind, so that
+        // expanding here is invisible to it.
+        let saved_status = self.save_command_status();
 
-        // Expand it.
+        // Expand it. We must own the spec here: it borrows `self` (via the
+        // returned `Cow`), and `expand_prompt` needs `&mut self`.
+        let prompt_spec = prompt_spec.into_owned();
         let params = self.default_exec_params();
-        let result = prompt::expand_prompt(self, &params, prompt_spec.into_owned()).await;
+        let result = prompt::expand_prompt(self, &params, &prompt_spec).await;
 
-        // Restore the last exit status.
-        self.last_pipeline_statuses = prev_last_pipeline_statuses;
-        self.set_last_exit_status(prev_last_result);
+        self.restore_command_status(saved_status);
 
         // Strip out special characters that readline would typically drop:
         // \001 and \002 (start and end of non-printing sequences).

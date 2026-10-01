@@ -6,6 +6,9 @@ pub use error::ShellError;
 mod interactive_shell;
 pub use interactive_shell::{InteractiveExecutionResult, InteractiveOptions, InteractiveShell};
 
+mod zsh_hooks;
+pub use zsh_hooks::init as init_zsh_style_hooks;
+
 mod input_backend;
 pub use input_backend::{InputBackend, InteractivePrompt, ReadResult};
 
@@ -15,6 +18,7 @@ pub use options::UIOptions;
 mod refs;
 pub use refs::ShellRef;
 
+mod completeness;
 mod term_detection;
 mod term_integration;
 mod trace_categories;

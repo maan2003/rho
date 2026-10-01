@@ -14,8 +14,9 @@ brush is distributed under the terms of the MIT license. If you encounter any is
 
 For more information, visit https://brush.sh.";
 
+// The second usage form is indented to line up under the first, past clap's "Usage: " prefix.
 const USAGE: &str = color_print::cstr!(
-    "<bold>brush</bold> <italics>[OPTIONS]</italics>... <italics>[SCRIPT_PATH [SCRIPT_ARGS]...]</italics>"
+    "<bold>brush</bold> <italics>[OPTIONS]</italics>... <italics>[SCRIPT_PATH [SCRIPT_ARGS]...]</italics>\n       <bold>brush</bold> <italics>[OPTIONS]</italics>... -c <italics>COMMAND_STRING [NAME [ARGS]...]</italics>"
 );
 
 const VERSION: &str = const_format::concatcp!(
@@ -76,8 +77,18 @@ pub struct CommandLineArgs {
     #[arg(short = 'C', help_heading = HEADING_STANDARD_OPTIONS)]
     pub disallow_overwriting_regular_files_via_output_redirection: bool,
 
-    /// Execute the provided command and then exit.
-    #[arg(short = 'c', value_name = "COMMAND", help_heading = HEADING_STANDARD_OPTIONS)]
+    /// Execute the command given as the first operand and then exit.
+    ///
+    /// Only an input to parsing: `try_parse_from` moves the command string into `command`,
+    /// which is what everything else consults.
+    #[arg(short = 'c', help_heading = HEADING_STANDARD_OPTIONS)]
+    pub(crate) command_string_mode: bool,
+
+    /// The command string to run, taken from the first operand when `-c` is
+    /// given. Not a clap argument itself (hence `skip`): bash parses options
+    /// first and only then takes the command from the first operand, so options
+    /// may sit between the two, as in `bash -c -l 'echo hi'`.
+    #[arg(skip)]
     pub command: Option<String>,
 
     /// Enable error-on-exit behavior.
@@ -243,11 +254,29 @@ impl CommandLineArgs {
         reason = "parsing defaults should not panic"
     )]
     pub fn default_values() -> Self {
-        use clap::Parser;
         // Parse with just the program name to get all defaults.
         // This won't fail because all arguments have defaults or are optional.
         #[allow(clippy::expect_used)]
-        Self::try_parse_from(["brush"]).expect("parsing defaults should never fail")
+        Self::try_parse_from([String::from("brush")]).expect("parsing defaults should never fail")
+    }
+
+    /// Returns whether the shell will read its commands from standard input, as opposed to
+    /// running a command given with `-c` or a script named on the command line.
+    ///
+    /// This is the single source of truth for that question; it decides which shell mode
+    /// `entry::run_in_shell` enters, whether `$-` reports `s`, whether the shell can be
+    /// interactive, and which input backend gets selected.
+    pub const fn will_read_commands_from_stdin(&self) -> bool {
+        if self.command.is_some() {
+            // -c supplies the command.
+            false
+        } else if self.read_commands_from_stdin {
+            // -s makes any non-option arguments positional parameters, not a script to run.
+            true
+        } else {
+            // Otherwise the first non-option argument, if any, names a script to run.
+            self.script_args.is_empty()
+        }
     }
 
     /// Returns whether or not the arguments indicate that the shell should run in interactive mode.
@@ -258,8 +287,8 @@ impl CommandLineArgs {
             return true;
         }
 
-        // If -c or non-option arguments are provided, then we're not in interactive mode.
-        if self.command.is_some() || !self.script_args.is_empty() {
+        // Running a -c command or a named script is not interactive.
+        if !self.will_read_commands_from_stdin() {
             return false;
         }
 
@@ -299,5 +328,49 @@ mod tests {
         assert!(!args.login);
         assert!(args.command.is_none());
         assert!(args.script_args.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_will_read_commands_from_stdin() {
+        // (arguments, whether commands will be read from stdin)
+        let cases = [
+            (vec![], true),
+            (vec!["-i"], true),
+            (vec!["-c", "echo hi"], false),
+            (vec!["-c", "echo hi", "name"], false),
+            // `-i` forces an interactive shell, but `-c` still supplies the commands.
+            (vec!["-i", "-c", "echo hi"], false),
+            // `-c` is a plain flag; the command string is the first non-option argument.
+            (vec!["-cl", "echo hi"], false),
+            (vec!["-c", "-l", "echo hi"], false),
+            (vec!["script.sh"], false),
+            (vec!["-i", "script.sh"], false),
+            // `-s` claims the script slot, so trailing words are positional parameters.
+            (vec!["-s"], true),
+            (vec!["-s", "myarg"], true),
+            (vec!["-i", "-s", "myarg"], true),
+            (vec!["-si", "myarg"], true),
+            // `--` in option position is consumed as the end-of-options marker.
+            (vec!["--", "script.sh"], false),
+            (vec!["-s", "--", "myarg"], true),
+        ];
+
+        for (args, expected) in cases {
+            // NOTE: This deliberately goes through the crate's own `try_parse_from` (which
+            // takes `String`s) and not `clap::Parser::try_parse_from`; only the former
+            // applies brush's `--` handling, so only the former sees what the shell sees.
+            let parsed = CommandLineArgs::try_parse_from(
+                std::iter::once("brush")
+                    .chain(args.iter().copied())
+                    .map(String::from),
+            )
+            .expect("arguments should parse");
+            assert_eq!(
+                parsed.will_read_commands_from_stdin(),
+                expected,
+                "for arguments: {args:?}"
+            );
+        }
     }
 }
