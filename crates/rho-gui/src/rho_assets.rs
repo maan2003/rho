@@ -21,26 +21,42 @@ struct RhoEmbedded;
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
 /// [`RHO_DEFAULT_SETTINGS`] with `RHO_GUI_FONT_FAMILY`, when set, as the
-/// buffer and UI font: the deployment that supplies a font through
-/// `RHO_GUI_FONTS` makes it the default, and user settings still win.
+/// buffer and UI font, and their sizes multiplied by `RHO_GUI_FONT_SCALE`:
+/// the deployment that supplies a font through `RHO_GUI_FONTS` makes it the
+/// default, scaled to read as large as Rho Font, and user settings still win.
 pub fn default_settings() -> Cow<'static, str> {
-    match std::env::var("RHO_GUI_FONT_FAMILY") {
-        Ok(family) => Cow::Owned(settings_with_font_family(&family)),
-        Err(_) => Cow::Borrowed(RHO_DEFAULT_SETTINGS),
+    let family = std::env::var("RHO_GUI_FONT_FAMILY").ok();
+    let scale = std::env::var("RHO_GUI_FONT_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse().ok());
+    if family.is_none() && scale.is_none() {
+        return Cow::Borrowed(RHO_DEFAULT_SETTINGS);
     }
+    Cow::Owned(settings_with_font(family.as_deref(), scale))
 }
 
-fn settings_with_font_family(family: &str) -> String {
-    let family = serde_json::to_string(family).expect("a string serializes");
-    ["buffer_font_family", "ui_font_family"].into_iter().fold(
-        RHO_DEFAULT_SETTINGS.to_string(),
-        |settings, key| {
-            settings.replace(
-                &format!(r#""{key}": "Rho Font""#),
-                &format!(r#""{key}": {family}"#),
-            )
-        },
-    )
+fn settings_with_font(family: Option<&str>, scale: Option<f32>) -> String {
+    let mut settings = RHO_DEFAULT_SETTINGS.to_string();
+    for key in ["buffer_font", "ui_font"] {
+        if let Some(family) = family {
+            let family = serde_json::to_string(family).expect("a string serializes");
+            settings = settings.replace(
+                &format!(r#""{key}_family": "Rho Font""#),
+                &format!(r#""{key}_family": {family}"#),
+            );
+        }
+        if let Some(scale) = scale {
+            let prefix = format!(r#""{key}_size": "#);
+            let start = settings.find(&prefix).expect("defaults set the size") + prefix.len();
+            let end = start
+                + settings[start..]
+                    .find(',')
+                    .expect("the size ends at a comma");
+            let size: f32 = settings[start..end].parse().expect("the size is a number");
+            settings.replace_range(start..end, &(size * scale).to_string());
+        }
+    }
+    settings
 }
 
 pub struct RhoAssets;
@@ -109,8 +125,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn font_family_override_replaces_both_defaults() {
-        let settings = settings_with_font_family("ABC \"Quoted\" Sans");
+    fn font_override_replaces_both_defaults() {
+        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5));
         for key in ["buffer_font_family", "ui_font_family"] {
             assert!(
                 settings.contains(&format!(r#""{key}": "ABC \"Quoted\" Sans""#)),
@@ -118,6 +134,17 @@ mod tests {
             );
             assert!(!settings.contains(&format!(r#""{key}": "Rho Font""#)));
         }
+        assert!(settings.contains(r#""buffer_font_size": 22.5,"#));
+        assert!(settings.contains(r#""ui_font_size": 21,"#));
+        assert!(
+            settings.contains(r#""agent_buffer_font_size": 12,"#),
+            "only the two defaults scale"
+        );
+
+        let unscaled = settings_with_font(Some("ABC Sans"), None);
+        assert!(unscaled.contains(r#""buffer_font_size": 15,"#));
+        let unrenamed = settings_with_font(None, Some(1.5));
+        assert!(unrenamed.contains(r#""ui_font_family": "Rho Font""#));
     }
 
     fn wcag_relative_luminance(color: gpui::Color) -> f32 {
