@@ -372,6 +372,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // The DirectX atlas encodes no vector glyphs.
+                PrimitiveBatch::VectorSprites(_) => unreachable!(),
             }
             .with_context(|| {
                 format!(

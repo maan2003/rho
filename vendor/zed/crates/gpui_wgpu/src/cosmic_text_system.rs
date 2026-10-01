@@ -6,9 +6,9 @@ use cosmic_text::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
-    LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
-    size,
+    LineLayout, Pixels, PlatformTextSystem, Point, QuadraticCurve, RenderGlyphParams,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size,
+    TextRenderingMode, point, size,
 };
 
 use itertools::Itertools;
@@ -18,7 +18,7 @@ use std::{borrow::Cow, ops::Range, sync::Arc};
 use swash::{
     Setting,
     scale::{Render, ScaleContext, Source, StrikeWith},
-    zeno::{Format, Vector},
+    zeno::{Format, Vector, Verb},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -238,6 +238,14 @@ impl PlatformTextSystem for CosmicTextSystem {
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
         self.0.write().rasterize_glyph(params, raster_bounds)
+    }
+
+    fn glyph_outline(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+    ) -> Result<Option<Vec<QuadraticCurve>>> {
+        self.0.write().glyph_outline(font_id, glyph_id)
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
@@ -469,6 +477,72 @@ impl CosmicTextSystemState {
         renderer
             .render(&mut scaler, glyph_id)
             .with_context(|| format!("unable to render glyph via swash for {params:?}"))
+    }
+
+    fn glyph_outline(
+        &mut self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+    ) -> Result<Option<Vec<QuadraticCurve>>> {
+        let loaded_font = &self.loaded_fonts[font_id.0];
+        let font_ref = loaded_font.font.as_swash();
+        // Size zero leaves the outline in font units.
+        let mut scaler = self
+            .swash_scale_context
+            .builder(font_ref)
+            .normalized_coords(
+                font_ref
+                    .variations()
+                    .normalized_coords(loaded_font.variations.iter().copied()),
+            )
+            .build();
+        let Some(outline) = scaler.scale_outline(glyph_id.0.try_into()?) else {
+            return Ok(None);
+        };
+
+        let units_per_em = font_ref.metrics(&[]).units_per_em as f32;
+        let mut points = outline
+            .points()
+            .iter()
+            .map(|p| point(p.x / units_per_em, p.y / units_per_em));
+        let mut next = || points.next().context("glyph outline ends early");
+        let mut curves = Vec::new();
+        let line = |curves: &mut Vec<QuadraticCurve>, from: Point<f32>, to: Point<f32>| {
+            if from != to {
+                curves.push([from, point((from.x + to.x) / 2., (from.y + to.y) / 2.), to]);
+            }
+        };
+        let (mut start, mut current) = (point(0., 0.), point(0., 0.));
+        for verb in outline.verbs() {
+            match verb {
+                Verb::MoveTo => {
+                    line(&mut curves, current, start);
+                    start = next()?;
+                    current = start;
+                }
+                Verb::LineTo => {
+                    let to = next()?;
+                    line(&mut curves, current, to);
+                    current = to;
+                }
+                Verb::QuadTo => {
+                    let (control, to) = (next()?, next()?);
+                    curves.push([current, control, to]);
+                    current = to;
+                }
+                Verb::CurveTo => {
+                    let (c1, c2, to) = (next()?, next()?, next()?);
+                    cubic_to_quadratics(&mut curves, [current, c1, c2, to]);
+                    current = to;
+                }
+                Verb::Close => {
+                    line(&mut curves, current, start);
+                    current = start;
+                }
+            }
+        }
+        line(&mut curves, current, start);
+        Ok(Some(curves))
     }
 
     /// This is used when cosmic_text has chosen a fallback font instead of using the requested
@@ -1172,6 +1246,30 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+/// Approximates a cubic curve with quadratics, one per quarter of the cubic. Font outlines are
+/// mostly quadratic already, and at text sizes a quarter of a cubic is within a hair of a
+/// quadratic.
+fn cubic_to_quadratics(curves: &mut Vec<QuadraticCurve>, cubic: [Point<f32>; 4]) {
+    let lerp =
+        |a: Point<f32>, b: Point<f32>, t: f32| point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+    let mut rest = cubic;
+    for pieces_left in (1..=4).rev() {
+        // Split off the first 1/pieces_left of what remains.
+        let t = 1. / pieces_left as f32;
+        let [p0, p1, p2, p3] = rest;
+        let (a, b, c) = (lerp(p0, p1, t), lerp(p1, p2, t), lerp(p2, p3, t));
+        let (d, e) = (lerp(a, b, t), lerp(b, c, t));
+        let mid = lerp(d, e, t);
+        let piece = [p0, a, d, mid];
+        rest = [mid, e, c, p3];
+        let control = point(
+            (3. * (piece[1].x + piece[2].x) - piece[0].x - piece[3].x) / 4.,
+            (3. * (piece[1].y + piece[2].y) - piece[0].y - piece[3].y) / 4.,
+        );
+        curves.push([piece[0], control, piece[3]]);
+    }
 }
 
 #[cfg(test)]

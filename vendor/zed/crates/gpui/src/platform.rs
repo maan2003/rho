@@ -38,9 +38,10 @@ use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
-    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, QuadraticCurve,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
+    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, VectorGlyph, VectorGlyphKey,
+    Window, WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -1126,6 +1127,15 @@ pub trait PlatformTextSystem: Send + Sync {
     fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
         0
     }
+    /// Returns a glyph's outline as quadratic curves in ems, y up, with the font's variations
+    /// applied, or `None` when the glyph has no outline.
+    fn glyph_outline(
+        &self,
+        _font_id: FontId,
+        _glyph_id: GlyphId,
+    ) -> Result<Option<Vec<QuadraticCurve>>> {
+        Ok(None)
+    }
 }
 
 #[expect(missing_docs)]
@@ -1354,6 +1364,15 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+    /// Returns a glyph's encoding in the atlas glyph buffer, building it on first use. Returns
+    /// `None` when the glyph has no outline or the atlas holds only raster tiles.
+    fn get_or_insert_vector_glyph(
+        &self,
+        _key: &VectorGlyphKey,
+        _build: &mut dyn FnMut() -> Result<Option<(Bounds<f32>, Vec<u32>)>>,
+    ) -> Result<Option<VectorGlyph>> {
+        Ok(None)
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {

@@ -3,7 +3,7 @@ use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    PlatformAtlas, Point, Size, VectorGlyph, VectorGlyphKey,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -37,6 +37,16 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
+    vector_glyphs: VectorGlyphs,
+}
+
+/// Glyph encodings for the vector glyph shader, appended to one storage buffer.
+#[derive(Default)]
+struct VectorGlyphs {
+    by_key: FxHashMap<VectorGlyphKey, Option<VectorGlyph>>,
+    words: Vec<u32>,
+    buffer: Option<wgpu::Buffer>,
+    uploaded_words: usize,
 }
 
 pub struct WgpuTextureInfo {
@@ -58,6 +68,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
+            vector_glyphs: VectorGlyphs::default(),
         }))
     }
 
@@ -72,6 +83,11 @@ impl WgpuAtlas {
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.flush_uploads();
+    }
+
+    /// The storage buffer holding vector glyph encodings, once any glyph has been uploaded.
+    pub fn vector_glyph_buffer(&self) -> Option<wgpu::Buffer> {
+        self.0.lock().vector_glyphs.buffer.clone()
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
@@ -89,6 +105,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.vector_glyphs = VectorGlyphs::default();
     }
 
     /// Handles device lost by clearing all textures and cached tiles.
@@ -101,6 +118,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.vector_glyphs = VectorGlyphs::default();
     }
 }
 
@@ -125,6 +143,29 @@ impl PlatformAtlas for WgpuAtlas {
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
+    }
+
+    fn get_or_insert_vector_glyph(
+        &self,
+        key: &VectorGlyphKey,
+        build: &mut dyn FnMut() -> Result<Option<(Bounds<f32>, Vec<u32>)>>,
+    ) -> Result<Option<VectorGlyph>> {
+        let mut lock = self.0.lock();
+        // WebGL2 has no storage buffers to read the encodings from.
+        if lock.device.limits().max_storage_buffers_per_shader_stage == 0 {
+            return Ok(None);
+        }
+        let glyphs = &mut lock.vector_glyphs;
+        if let Some(glyph) = glyphs.by_key.get(key) {
+            return Ok(*glyph);
+        }
+        let glyph = build()?.map(|(bounds, words)| {
+            let offset = glyphs.words.len() as u32;
+            glyphs.words.extend(words);
+            VectorGlyph { offset, bounds }
+        });
+        glyphs.by_key.insert(*key, glyph);
+        Ok(glyph)
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -259,6 +300,29 @@ impl WgpuAtlasState {
     }
 
     fn flush_uploads(&mut self) {
+        let glyphs = &mut self.vector_glyphs;
+        if glyphs.uploaded_words < glyphs.words.len() {
+            let capacity = glyphs.buffer.as_ref().map_or(0, |buffer| buffer.size() / 4);
+            if glyphs.words.len() as u64 > capacity {
+                let words = glyphs.words.len().next_power_of_two().max(1 << 16);
+                glyphs.buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("vector_glyphs"),
+                    size: words as u64 * 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                glyphs.uploaded_words = 0;
+            }
+            if let Some(buffer) = &glyphs.buffer {
+                self.queue.write_buffer(
+                    buffer,
+                    glyphs.uploaded_words as u64 * 4,
+                    bytemuck::cast_slice(&glyphs.words[glyphs.uploaded_words..]),
+                );
+            }
+            glyphs.uploaded_words = glyphs.words.len();
+        }
+
         for upload in self.pending_uploads.drain(..) {
             let Some(texture) = self.storage.get(upload.id) else {
                 continue;

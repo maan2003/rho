@@ -16,9 +16,10 @@ use crate::{
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TouchEvent, TouchId, TouchPhase, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, profiler, px, rems, size, transparent_black,
+    Underline, UnderlineStyle, VectorGlyphKey, VectorSprite, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, encode_vector_glyph, point, prelude::*, profiler, px, rems,
+    size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -4485,6 +4486,42 @@ impl Window {
             dilation,
         };
 
+        if vector_glyphs_enabled() {
+            let key = VectorGlyphKey { font_id, glyph_id };
+            let glyph = self
+                .sprite_atlas
+                .get_or_insert_vector_glyph(&key, &mut || {
+                    let curves = self.text_system().glyph_outline(font_id, glyph_id)?;
+                    Ok(curves.and_then(|curves| encode_vector_glyph(&curves)))
+                })?;
+            if let Some(glyph) = glyph {
+                // Curves need no subpixel variants: x stays exact, and the baseline keeps the
+                // raster path's vertical snapping.
+                let origin = point(glyph_origin.x, ScaledPixels(quantized_origin.y));
+                let size = font_size.0 * scale_factor;
+                let em = glyph.bounds;
+                // Ems are y up, so `top` is the lowest edge. One pixel of margin keeps the
+                // antialiased edge inside the quad.
+                let bounds = Bounds::from_corners(
+                    origin
+                        + point(em.left() * size - 1., -em.bottom() * size - 1.).map(ScaledPixels),
+                    origin + point(em.right() * size + 1., -em.top() * size + 1.).map(ScaledPixels),
+                );
+                let content_mask = self.snapped_content_mask();
+                self.next_frame.scene.insert_primitive(VectorSprite {
+                    order: 0,
+                    glyph: glyph.offset,
+                    bounds,
+                    content_mask,
+                    color: Color::from(color.opacity(element_opacity)),
+                    origin,
+                    font_size: ScaledPixels(size),
+                    pad: 0,
+                });
+                return Ok(());
+            }
+        }
+
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
             let tile = self
@@ -8392,4 +8429,12 @@ mod tests {
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
     }
+}
+
+/// Draws glyphs from their outlines instead of raster tiles where the atlas supports it.
+/// Experimental, enabled by `RHO_SLUG=1`.
+fn vector_glyphs_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("RHO_SLUG").is_ok_and(|value| value == "1"));
+    *ENABLED
 }

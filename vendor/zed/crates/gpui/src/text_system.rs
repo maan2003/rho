@@ -3,6 +3,7 @@ mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
+mod vector_glyph;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
@@ -11,6 +12,7 @@ pub use line_layout::*;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+pub use vector_glyph::*;
 
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
@@ -340,6 +342,14 @@ impl TextSystem {
         let raster_bounds = self.raster_bounds(params)?;
         self.platform_text_system
             .rasterize_glyph(params, raster_bounds)
+    }
+
+    pub(crate) fn glyph_outline(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+    ) -> Result<Option<Vec<QuadraticCurve>>> {
+        self.platform_text_system.glyph_outline(font_id, glyph_id)
     }
 
     /// Returns the dilation level to use for a glyph painted in the given color.

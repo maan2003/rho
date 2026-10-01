@@ -91,6 +91,7 @@ fn drive_completion(device: Arc<wgpu::Device>, submission: wgpu::SubmissionIndex
 const STORAGE_BUFFER_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
     include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_vector.wgsl"),
 );
 
 /// Shader variant for WebGL2, which has no storage buffers: the shared shader
@@ -340,6 +341,8 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    /// Absent on WebGL2, which cannot read glyph encodings from a storage buffer.
+    vector_sprites: Option<wgpu::RenderPipeline>,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     #[cfg(target_os = "linux")]
@@ -365,12 +368,14 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    vector_sprites: InstanceBinding,
 }
 
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
+    vector_glyphs: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
     #[cfg(target_os = "linux")]
     video: wgpu::BindGroupLayout,
@@ -1033,10 +1038,25 @@ impl WgpuRenderer {
                 },
             ],
         });
+        let vector_glyphs = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vector_glyphs_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
+            vector_glyphs,
             surfaces,
             #[cfg(target_os = "linux")]
             video,
@@ -1394,6 +1414,21 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let vector_sprites = (!uses_webgl_instance_data).then(|| {
+            create_pipeline(
+                "vector_sprites",
+                "vs_vector_sprite",
+                "fs_vector_sprite",
+                &layouts.globals,
+                &layouts.instances,
+                Some(&layouts.vector_glyphs),
+                wgpu::PrimitiveTopology::TriangleStrip,
+                &[Some(color_target.clone())],
+                1,
+                &shader_module,
+            )
+        });
+
         WgpuPipelines {
             quads,
             holes,
@@ -1404,6 +1439,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            vector_sprites,
             surfaces,
             #[cfg(target_os = "linux")]
             video,
@@ -1772,6 +1808,24 @@ impl WgpuRenderer {
                 )
             })?;
 
+        let vector_glyphs = self
+            .atlas
+            .vector_glyph_buffer()
+            .filter(|_| !scene.vector_sprites.is_empty())
+            .map(|buffer| {
+                let resources = self.resources();
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("vector_glyphs_bind_group"),
+                        layout: &resources.bind_group_layouts.vector_glyphs,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: buffer.as_entire_binding(),
+                        }],
+                    })
+            });
+
         #[cfg(target_os = "linux")]
         self.prepare_video(scene)?;
         #[cfg(target_os = "linux")]
@@ -1891,6 +1945,24 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::VectorSprites(range) => {
+                        let resources = self.resources();
+                        if let (Some(pipeline), Some(glyphs)) =
+                            (&resources.pipelines.vector_sprites, &vector_glyphs)
+                        {
+                            let range = instance_range(range);
+                            let instances = &instance_bindings.vector_sprites;
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+                            pass.set_bind_group(1, &instances.bind_group, &[]);
+                            pass.set_bind_group(2, glyphs, &[]);
+                            pass.draw(
+                                0..4,
+                                instances.first_instance + range.start
+                                    ..instances.first_instance + range.end,
+                            );
+                        }
+                    }
                     PrimitiveBatch::Surfaces(surfaces) => {
                         #[cfg(target_os = "linux")]
                         for (index, surface) in scene
@@ -2422,6 +2494,11 @@ impl WgpuRenderer {
                 "polychrome_sprites_bind_group",
                 instance_offset,
                 &scene.polychrome_sprites,
+            )?,
+            vector_sprites: self.write_instance_binding(
+                "vector_sprites_bind_group",
+                instance_offset,
+                &scene.vector_sprites,
             )?,
         })
     }

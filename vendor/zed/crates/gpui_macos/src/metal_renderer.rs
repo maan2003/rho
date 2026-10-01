@@ -732,6 +732,8 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                // The Metal atlas encodes no vector glyphs.
+                PrimitiveBatch::VectorSprites(_) => unreachable!(),
             }
         }
 
