@@ -17,8 +17,9 @@ Writes are explicitly dispatched to handwritten Rust request types in
 `octo-server/src/api/gh_writes.rs`. Unknown fields, wrong types, and missing
 required fields are rejected before Octo acquires credentials. The original
 JSON is forwarded after validation, preserving null versus omission and the
-caller's union representation. There is no schema generator or REST response
-model.
+caller's union representation. Legacy PR create/edit and CI rerun parameters
+retain the baseline behavior: optional `None` values are omitted before forwarding.
+There is no schema generator or REST response model.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
 and dismissing another review. Generic GraphQL, Git ref writes, repository

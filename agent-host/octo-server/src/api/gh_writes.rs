@@ -1,9 +1,9 @@
 //! Explicit GitHub writes and their request types. Reads are relayed in gh.rs.
-//! Validate requests without reconstructing JSON: PATCH omission and null
-//! differ.
+//! Preserve JSON except for legacy PR/rerun parameters, where null means
+//! omitted.
 #![allow(dead_code)] // Request fields are read by serde validation, not by handlers.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{Handler, HandlerFuture, Request};
 
@@ -35,15 +35,39 @@ fn optional<B: serde::de::DeserializeOwned + 'static>(request: Request) -> Handl
     Box::pin(super::typed::<B>(request, false, true))
 }
 
+// Master omitted optional null PR/rerun parameters before sending to GitHub.
+// Keep that compatibility local to these types; nullable issue edits stay
+// intact.
+fn legacy<B: serde::de::DeserializeOwned + Serialize + 'static>(
+    mut request: Request,
+    body_required: bool,
+) -> HandlerFuture {
+    Box::pin(async move {
+        if !request.body.is_empty() {
+            let Ok(body) = serde_json::from_slice::<B>(&request.body) else {
+                return super::forbidden();
+            };
+            request.body = serde_json::to_vec(&body)
+                .expect("validated GitHub request serializes")
+                .into();
+        }
+        super::typed::<B>(request, body_required, true).await
+    })
+}
+
 fn no_body(request: Request) -> HandlerFuture {
     Box::pin(super::typed::<()>(request, false, false))
 }
 
 pub(super) fn handler(group: &str, name: &str) -> Option<Handler> {
     Some(match (group, name) {
-        ("actions", "re_run_job_for_workflow_run") => optional::<Option<RerunJob>>,
-        ("actions", "re_run_workflow") => optional::<Option<RerunWorkflow>>,
-        ("actions", "re_run_workflow_failed_jobs") => optional::<Option<RerunWorkflow>>,
+        ("actions", "re_run_job_for_workflow_run") => {
+            |request| legacy::<Option<RerunJob>>(request, false)
+        }
+        ("actions", "re_run_workflow") => |request| legacy::<Option<RerunWorkflow>>(request, false),
+        ("actions", "re_run_workflow_failed_jobs") => {
+            |request| legacy::<Option<RerunWorkflow>>(request, false)
+        }
         ("issues", "create") => required::<CreateIssue>,
         ("issues", "update") => optional::<UpdateIssue>,
         ("issues", "create_comment") => required::<Comment>,
@@ -75,8 +99,8 @@ pub(super) fn handler(group: &str, name: &str) -> Option<Handler> {
         ("issues", "create_milestone") => required::<CreateMilestone>,
         ("issues", "update_milestone") => optional::<UpdateMilestone>,
         ("issues", "delete_milestone") => no_body,
-        ("pulls", "create") => required::<CreatePull>,
-        ("pulls", "update") => optional::<UpdatePull>,
+        ("pulls", "create") => |request| legacy::<CreatePull>(request, true),
+        ("pulls", "update") => |request| legacy::<UpdatePull>(request, false),
         ("pulls", "create_review_comment") => required::<ReviewComment>,
         ("pulls", "update_review_comment") => required::<Comment>,
         ("pulls", "delete_review_comment") => no_body,
@@ -97,20 +121,20 @@ struct Comment {
     body: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RerunWorkflow {
-    #[serde(default)]
-    enable_debug_logging: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enable_debug_logging: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RerunJob {
-    #[serde(default)]
-    enable_debug_logging: Optional<bool>,
-    #[serde(default)]
-    enable_debugger: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enable_debug_logging: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enable_debugger: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -142,7 +166,7 @@ enum Confidence {
     High,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum State {
     Open,
@@ -514,38 +538,38 @@ struct UpdateMilestone {
     due_on: Optional<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePull {
     head: String,
     base: String,
-    #[serde(default)]
-    title: Optional<String>,
-    #[serde(default)]
-    body: Optional<String>,
-    #[serde(default)]
-    head_repo: Optional<String>,
-    #[serde(default)]
-    issue: Optional<i64>,
-    #[serde(default)]
-    draft: Optional<bool>,
-    #[serde(default)]
-    maintainer_can_modify: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issue: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintainer_can_modify: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UpdatePull {
-    #[serde(default)]
-    title: Optional<String>,
-    #[serde(default)]
-    body: Optional<String>,
-    #[serde(default)]
-    state: Optional<State>,
-    #[serde(default)]
-    base: Optional<String>,
-    #[serde(default)]
-    maintainer_can_modify: Optional<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<State>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintainer_can_modify: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -683,9 +707,9 @@ mod tests {
         assert!(!valid::<UpdateIssue>(json!({"state":null})));
         assert!(!valid::<UpdateIssue>(json!({"assignees":null})));
         assert!(!valid::<CreateIssue>(json!({"title":null})));
-        assert!(!valid::<UpdatePull>(json!({"body":null})));
+        assert!(valid::<UpdatePull>(json!({"body":null})));
         assert!(valid::<Option<RerunJob>>(Value::Null));
-        assert!(!valid::<RerunJob>(json!({"enable_debugger":null})));
+        assert!(valid::<RerunJob>(json!({"enable_debugger":null})));
         assert!(!valid::<RerunWorkflow>(json!({"enable_debugger":true})));
     }
 

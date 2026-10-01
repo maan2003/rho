@@ -378,7 +378,7 @@ async fn relay(
         let content_type = if op.name == "download_job_logs_for_workflow_run" {
             "text/plain; charset=utf-8"
         } else {
-            "application/octet-stream"
+            "application/zip"
         };
         let bytes = match downloaded.bytes().await {
             Ok(bytes) => bytes,
@@ -1091,6 +1091,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_optional_nulls_are_omitted_without_changing_nullable_issue_edits() {
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |method: Method, uri: Uri, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().await.push((
+                        method.clone(),
+                        uri.path().to_owned(),
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                    ));
+                    if uri.path().contains("/actions/") {
+                        StatusCode::CREATED.into_response()
+                    } else {
+                        let status = if method == Method::POST {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        };
+                        (status, Json(json!({"number":7}))).into_response()
+                    }
+                }
+            },
+        )))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        for (method, path, payload, expected, status) in [
+            (
+                Method::POST,
+                "pulls",
+                json!({"head":"topic","base":"main","issue":7,"title":null,"body":null,"head_repo":null,"draft":false,"maintainer_can_modify":false}),
+                json!({"head":"topic","base":"main","issue":7,"draft":false,"maintainer_can_modify":false}),
+                StatusCode::CREATED,
+            ),
+            (
+                Method::POST,
+                "pulls",
+                json!({"head":"topic","base":"main","title":"Fix","body":"","issue":null,"draft":null,"maintainer_can_modify":null}),
+                json!({"head":"topic","base":"main","title":"Fix","body":""}),
+                StatusCode::CREATED,
+            ),
+            (
+                Method::PATCH,
+                "pulls/7",
+                json!({"base":"release/next","title":null,"body":null,"state":null,"maintainer_can_modify":false}),
+                json!({"base":"release/next","maintainer_can_modify":false}),
+                StatusCode::OK,
+            ),
+            (
+                Method::PATCH,
+                "pulls/7",
+                json!({"body":"","base":null,"title":null,"state":null,"maintainer_can_modify":null}),
+                json!({"body":""}),
+                StatusCode::OK,
+            ),
+            (
+                Method::POST,
+                "actions/jobs/19/rerun",
+                json!({"enable_debug_logging":false,"enable_debugger":null}),
+                json!({"enable_debug_logging":false}),
+                StatusCode::CREATED,
+            ),
+            (
+                Method::POST,
+                "actions/runs/23/rerun",
+                json!({"enable_debug_logging":null}),
+                json!({}),
+                StatusCode::CREATED,
+            ),
+            (
+                Method::POST,
+                "actions/runs/23/rerun-failed-jobs",
+                json!({"enable_debug_logging":null}),
+                json!({}),
+                StatusCode::CREATED,
+            ),
+            (
+                Method::PATCH,
+                "issues/7",
+                json!({"milestone":null,"body":null,"type":null,"labels":[]}),
+                json!({"milestone":null,"body":null,"type":null,"labels":[]}),
+                StatusCode::OK,
+            ),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}/repos/acme/widget/{path}"))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            let seen = calls.lock().await;
+            let last = seen.last().unwrap();
+            assert_eq!(last.0, method);
+            assert_eq!(last.1, format!("/repos/acme/widget/{path}"));
+            assert_eq!(last.2, expected, "{path}");
+        }
+        assert_eq!(calls.lock().await.len(), 8);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn invalid_or_authoritative_requests_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1146,6 +1251,21 @@ mod tests {
                 Method::PATCH,
                 "repos/acme/widget/issues/comments/19?future_flag=true",
                 json!({"body":"edited"}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/pulls",
+                json!({"head":null,"base":"main","title":"Fix"}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/pulls/7",
+                json!({"base":"main","unexpected":null}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/runs/23/rerun",
+                json!({"enable_debug_logging":"false"}),
             ),
             (
                 Method::POST,
@@ -1400,6 +1520,15 @@ mod tests {
             let response = client.get(format!("{base}/{path}")).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert!(!response.headers().contains_key(header::LOCATION));
+            let expected_type = if path.contains("/jobs/") {
+                "text/plain; charset=utf-8"
+            } else {
+                "application/zip"
+            };
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                expected_type
+            );
             assert_eq!(
                 response.bytes().await.unwrap().as_ref(),
                 b"\x00\xfe\xffdownload"
