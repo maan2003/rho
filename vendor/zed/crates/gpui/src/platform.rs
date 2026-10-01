@@ -1136,11 +1136,6 @@ pub trait PlatformTextSystem: Send + Sync {
     ) -> Result<Option<Vec<QuadraticCurve>>> {
         Ok(None)
     }
-    /// Returns `font_id`'s face with the variation axis `tag` set to `value`, keeping its other
-    /// variations, or `None` when the face has no such axis.
-    fn font_with_axis(&self, _font_id: FontId, _tag: [u8; 4], _value: f32) -> Option<FontId> {
-        None
-    }
 }
 
 #[expect(missing_docs)]

@@ -1,6 +1,4 @@
-use crate::{
-    FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, Typesetter, point, px,
-};
+use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -453,7 +451,6 @@ pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
-    typesetter: Typesetter,
 }
 
 #[derive(Default)]
@@ -484,21 +481,12 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutCache {
-    pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>, typesetter: Typesetter) -> Self {
+    pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         Self {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
-            typesetter,
         }
-    }
-
-    fn shape(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        let mut layout = self.platform_text_system.layout_line(text, font_size, runs);
-        if let Some(typesetter) = self.typesetter.read().as_ref() {
-            typesetter.typeset(&*self.platform_text_system, text, &mut layout);
-        }
-        layout
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -678,7 +666,9 @@ impl LineLayoutCache {
         } else {
             let text = SharedString::from(text);
             let started = Instant::now();
-            let mut layout = self.shape(&text, font_size, runs);
+            let mut layout = self
+                .platform_text_system
+                .layout_line(&text, font_size, runs);
             let shaped_nanos = started.elapsed().as_nanos() as u64;
             count(|counts| {
                 counts.misses += 1;
@@ -830,7 +820,9 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self.shape(&text, font_size, runs);
+        let mut layout = self
+            .platform_text_system
+            .layout_line(&text, font_size, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);

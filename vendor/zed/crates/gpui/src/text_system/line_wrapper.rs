@@ -56,7 +56,6 @@ impl LineWrapper {
         wrap_width: Pixels,
         indent: Option<u32>,
     ) -> impl Iterator<Item = Boundary> + 'a {
-        let mut typeset = self.typeset(fragments, wrap_width, indent).map(Vec::into_iter);
         let mut width = px(0.);
         let mut first_non_whitespace_ix = None;
         let mut indent = indent.map(|indent| Self::MAX_INDENT.min(indent));
@@ -69,7 +68,7 @@ impl LineWrapper {
             .iter()
             .flat_map(move |fragment| fragment.wrap_boundary_candidates())
             .peekable();
-        let mut greedy = iter::from_fn(move || {
+        iter::from_fn(move || {
             for candidate in candidates.by_ref() {
                 let ix = index;
                 index += candidate.len_utf8();
@@ -147,40 +146,7 @@ impl LineWrapper {
             }
 
             None
-        });
-        iter::from_fn(move || match &mut typeset {
-            Some(typeset) => typeset.next(),
-            None => greedy.next(),
         })
-    }
-
-    /// The text system's typesetter's rows, indented as the greedy wrapper would indent them.
-    fn typeset(
-        &mut self,
-        fragments: &[LineFragment],
-        wrap_width: Pixels,
-        indent: Option<u32>,
-    ) -> Option<Vec<Boundary>> {
-        let typesetter = self.text_system.typesetter.read().clone()?;
-        let indent = Self::MAX_INDENT.min(indent.unwrap_or_else(|| {
-            fragments
-                .iter()
-                .flat_map(|fragment| fragment.wrap_boundary_candidates())
-                .take_while(|candidate| {
-                    matches!(candidate, WrapBoundaryCandidate::Char { character: ' ' })
-                })
-                .count() as u32
-        }));
-        let indent_width = self.width_for_char(' ') * indent as f32;
-        let breaks = typesetter.wrap(
-            &*self.text_system.platform_text_system,
-            self.font_id,
-            self.font_size,
-            fragments,
-            wrap_width,
-            indent_width,
-        )?;
-        Some(breaks.into_iter().map(|ix| Boundary::new(ix, indent)).collect())
     }
 
     /// Returns the width of \`text\` using this wrapper's font and font size.
