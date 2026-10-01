@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore;
-use rand::seq::SliceRandom;
+use rand::Rng;
+use rand::seq::IndexedRandom;
 use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -330,7 +330,7 @@ pub(crate) fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesO
 
 fn generate_client_secret() -> [u8; 32] {
     let mut bytes = [0; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes
 }
 
@@ -532,7 +532,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 
 fn generate_code_verifier() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..64)
         .map(|_| *CHARSET.choose(&mut rng).expect("non-empty charset") as char)
         .collect()
@@ -540,7 +540,7 @@ fn generate_code_verifier() -> String {
 
 fn generate_state() -> String {
     let mut bytes = [0_u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex_encode(&bytes)
 }
 

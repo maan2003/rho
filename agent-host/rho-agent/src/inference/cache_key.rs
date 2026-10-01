@@ -8,7 +8,7 @@ pub struct PromptCacheKey([u8; 8]);
 impl PromptCacheKey {
     pub fn generate() -> Self {
         let mut bytes = [0; 8];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
         Self(bytes)
     }
 
