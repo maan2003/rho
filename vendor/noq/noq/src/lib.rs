@@ -79,7 +79,7 @@ pub use udp;
 
 pub use crate::connection::{
     AcceptBi, AcceptUni, Closed, Connecting, Connection, OnClosed, OpenBi, OpenUni, ReadDatagram,
-    SendDatagram, SendDatagramError, WeakConnectionHandle, ZeroRttAccepted,
+    ReadManyDatagrams, SendDatagram, SendDatagramError, WeakConnectionHandle, ZeroRttAccepted,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::event_stream::{Lagged, NatTraversalUpdates, ObservedExternalAddr, PathEvents};
@@ -113,7 +113,7 @@ enum ConnectionEvent {
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }
 
-fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
+fn udp_transmit<'a>(t: &Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
     udp::Transmit {
         destination: t.destination,
         ecn: t.ecn.map(udp_ecn),
@@ -123,15 +123,17 @@ fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> 
     }
 }
 
-fn udp_ecn(ecn: proto::EcnCodepoint) -> udp::EcnCodepoint {
+fn udp_ecn(ecn: EcnCodepoint) -> udp::EcnCodepoint {
     match ecn {
-        proto::EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
-        proto::EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
-        proto::EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
+        EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
+        EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
+        EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
     }
 }
 
-/// Maximum number of datagrams processed in send/recv calls to make before moving on to other processing
+/// Maximum number of datagrams processed at once in send/recv calls.
+///
+/// This after this the driver moves on to other processing.
 ///
 /// This helps ensure we don't starve anything when the CPU is slower than the link.
 /// Value is selected by picking a low number which didn't degrade throughput in benchmarks.
