@@ -54,6 +54,8 @@ struct CosmicTextSystemState {
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     /// Each variable weight needs its own id because rendered glyphs are cached by `FontId`.
     variable_weight_instances: HashMap<(FontId, u32), FontId>,
+    /// Likewise for each font set at another value of one more axis, by `font_with_axis`.
+    axis_instances: HashMap<(FontId, swash::Tag, u32), FontId>,
     system_font_fallback: String,
 }
 
@@ -78,6 +80,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             variable_weight_instances: HashMap::default(),
+            axis_instances: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
     }
@@ -95,6 +98,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             variable_weight_instances: HashMap::default(),
+            axis_instances: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
     }
@@ -252,6 +256,10 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().layout_line(text, font_size, runs)
     }
 
+    fn font_with_axis(&self, font_id: FontId, tag: [u8; 4], value: f32) -> Option<FontId> {
+        self.0.write().font_with_axis(font_id, tag, value)
+    }
+
     fn recommended_rendering_mode(
         &self,
         _font_id: FontId,
@@ -264,6 +272,32 @@ impl PlatformTextSystem for CosmicTextSystem {
 impl CosmicTextSystemState {
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
+    }
+
+    fn font_with_axis(&mut self, font_id: FontId, tag: [u8; 4], value: f32) -> Option<FontId> {
+        let tag = swash::tag_from_bytes(&tag);
+        let key = (font_id, tag, value.to_bits());
+        if let Some(font_id) = self.axis_instances.get(&key) {
+            return Some(*font_id);
+        }
+        let base = self.loaded_font(font_id);
+        if !base.font.as_swash().variations().any(|axis| axis.tag() == tag) {
+            return None;
+        }
+        let mut variations = base.variations.clone();
+        variations.retain(|setting| setting.tag != tag);
+        variations.push(Setting { tag, value });
+        let loaded_font = LoadedFont {
+            font: Arc::clone(&base.font),
+            variations,
+            features: base.features.clone(),
+            is_known_emoji_font: base.is_known_emoji_font,
+            user_fallback_chain: Arc::clone(&base.user_fallback_chain),
+        };
+        let instance = FontId(self.loaded_fonts.len());
+        self.loaded_fonts.push(loaded_font);
+        self.axis_instances.insert(key, instance);
+        Some(instance)
     }
 
     #[profiling::function]

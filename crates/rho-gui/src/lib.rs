@@ -22,6 +22,7 @@ mod slack_navigation;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod transient;
+pub(crate) mod typeset;
 pub(crate) mod usage;
 pub(crate) mod voice;
 #[cfg(feature = "walk-support")]

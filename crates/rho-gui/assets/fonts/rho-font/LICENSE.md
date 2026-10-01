@@ -6,6 +6,12 @@ Copyright 2010-2024 Adobe (http://www.adobe.com/), with Reserved Font Name 'Sour
 
 Copyright 2010-2020 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'. All Rights Reserved. Source is a trademark of Adobe in the United States and/or other countries.
 
+# iA Writer Duo (the `i` at U+E000)
+
+Copyright © 2018 Information Architects Inc. with Reserved Font Name "iA Writer"
+
+Based on IBM Plex Typeface: Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
+
 # License
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.

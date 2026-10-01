@@ -58,7 +58,17 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    typesetter: Typesetter,
 }
+
+/// An app's own typesetting, applied to every line the platform shapes before it is cached.
+pub trait LineTypesetter: Send + Sync {
+    /// Moves glyphs of `layout`, shaped from `text`, and may swap their glyph or font. Each glyph
+    /// keeps its `index`, and the line keeps its width.
+    fn typeset(&self, text_system: &dyn PlatformTextSystem, text: &str, layout: &mut LineLayout);
+}
+
+pub(crate) type Typesetter = Arc<RwLock<Option<Arc<dyn LineTypesetter>>>>;
 
 impl TextSystem {
     /// Create a new TextSystem with the given platform text system.
@@ -83,7 +93,13 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
+            typesetter: Typesetter::default(),
         }
+    }
+
+    /// Typesets every line laid out from now on, including in windows already open.
+    pub fn set_typesetter(&self, typesetter: Arc<dyn LineTypesetter>) {
+        *self.typesetter.write() = Some(typesetter);
     }
 
     /// Get a list of all available font names from the operating system.
@@ -381,7 +397,10 @@ impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
-            line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
+            line_layout_cache: LineLayoutCache::new(
+                text_system.platform_text_system.clone(),
+                text_system.typesetter.clone(),
+            ),
             text_system,
         }
     }

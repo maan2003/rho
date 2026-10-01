@@ -57,7 +57,10 @@ impl RhoAssets {
                     .with_context(|| format!("loading font at path {asset:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        cx.text_system().add_fonts(fonts)
+        cx.text_system().add_fonts(fonts)?;
+        cx.text_system()
+            .set_typesetter(std::sync::Arc::new(crate::typeset::RhoTypesetter::default()));
+        Ok(())
     }
 }
 
