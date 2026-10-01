@@ -104,7 +104,7 @@ Task.from_session_id(session_id: int) → Task
 
 Run a shell command. Starts immediately and returns a persistent command handle; output arrives
 automatically.
-command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
+command(cmd: str, *, workdir: str | None = None, stdin: bool = False, max_tokens: int = 2000) → Command
 
 Run independent inspections in one exec, without gather or await:
 
@@ -121,8 +121,15 @@ Await only the dependency; the next command starts without awaiting its output:
     if check.exit_code == 0:
         command("cargo test")
 
+A command's stdin is /dev/null, so a program that falls back to reading stdin sees end of input
+at once. Pass stdin=True to keep stdin open for write_stdin. Write to a command only when it
+needs input.
+
 Send input to a running command. It never reads; more_output does that.
 write_stdin(handle: Command, chars: str) → Awaitable[None]
+
+    job = command("read -r name; echo hello $name", stdin=True)
+    write_stdin(job, "rho\n")
 
 Show the next page of a command's retained output. A page starts where the last report or page
 stopped and says how many bytes are left when more remain. Ask for more only when a report says

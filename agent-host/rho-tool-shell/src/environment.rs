@@ -682,7 +682,7 @@ mod tests {
         }
 
         async fn run(&self, cmd: &str, cwd: Option<&str>) -> String {
-            let mut process = self.tools.spawn(cmd, cwd).await.unwrap();
+            let mut process = self.tools.spawn(cmd, cwd, false).await.unwrap();
             let mut text = Vec::new();
             loop {
                 let event = process.next().await;
@@ -847,7 +847,7 @@ mod tests {
             .with_env("RHO_CACHE_TEST_BASE", "other");
         let command = r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#;
         assert!(fixture.run(command, None).await.ends_with("base"));
-        let mut process = other.spawn(command, None).await.unwrap();
+        let mut process = other.spawn(command, None, false).await.unwrap();
         let mut text = Vec::new();
         loop {
             match process.next().await {
@@ -966,7 +966,7 @@ mod tests {
         let mut callers = tokio::task::JoinSet::new();
         for _ in 0..100 {
             let tools = fixture.tools.clone();
-            callers.spawn(async move { tools.spawn("touch must-not-run", None).await });
+            callers.spawn(async move { tools.spawn("touch must-not-run", None, false).await });
         }
         tokio::time::timeout(Duration::from_secs(3), async {
             while !fixture.root.path().join("started").exists() {
@@ -1006,7 +1006,7 @@ mod tests {
         fixture.write("slow/env.sh", "touch started\nsleep 30\n");
         fixture.write("slow/flake.nix", "");
         let tools = fixture.tools.clone();
-        let pending = tokio::spawn(async move { tools.spawn("true", Some("slow")).await });
+        let pending = tokio::spawn(async move { tools.spawn("true", Some("slow"), false).await });
         tokio::time::timeout(Duration::from_secs(3), async {
             while !fixture.root.path().join("slow/started").exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1065,7 +1065,7 @@ mod latency {
             let mut native = Vec::new();
             for _ in 0..51 {
                 let start = std::time::Instant::now();
-                let mut process = tools.spawn(source, None).await.unwrap();
+                let mut process = tools.spawn(source, None, false).await.unwrap();
                 loop {
                     match process.next().await {
                         ProcessEvent::Output(_) => {}
@@ -1097,7 +1097,7 @@ mod latency {
             let tools = tools.clone();
             async move {
                 let start = std::time::Instant::now();
-                let mut process = tools.spawn(source, None).await.unwrap();
+                let mut process = tools.spawn(source, None, false).await.unwrap();
                 let mut text = Vec::new();
                 loop {
                     match process.next().await {

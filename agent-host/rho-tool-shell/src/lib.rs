@@ -563,9 +563,16 @@ impl ShellTools {
     }
 
     /// Start `cmd` the way `exec_command` would, and hand the running process
-    /// over instead of collecting its output.
-    pub async fn spawn(&self, cmd: &str, workdir: Option<&str>) -> Result<SpawnedProcess> {
-        let session = self.spawn_process(cmd, workdir).await?;
+    /// over instead of collecting its output. Without `stdin` the command
+    /// reads `/dev/null`: an open pipe nobody writes to would hang tools that
+    /// fall back to reading stdin, such as `rg` without a path.
+    pub async fn spawn(
+        &self,
+        cmd: &str,
+        workdir: Option<&str>,
+        stdin: bool,
+    ) -> Result<SpawnedProcess> {
+        let session = self.spawn_process(cmd, workdir, stdin).await?;
         Ok(SpawnedProcess {
             session,
             drain_deadline: None,
@@ -580,7 +587,7 @@ impl ShellTools {
         let args: ShellArgs = serde_json::from_str(&call.arguments)?;
         let started = Instant::now();
         let mut session = self
-            .spawn_process(&args.cmd, args.workdir.as_deref())
+            .spawn_process(&args.cmd, args.workdir.as_deref(), true)
             .await?;
         let yield_ms = args
             .yield_time_ms
@@ -603,7 +610,12 @@ impl ShellTools {
         ))
     }
 
-    async fn spawn_process(&self, cmd: &str, workdir: Option<&str>) -> Result<ProcessSession> {
+    async fn spawn_process(
+        &self,
+        cmd: &str,
+        workdir: Option<&str>,
+        stdin: bool,
+    ) -> Result<ProcessSession> {
         let mut command = Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE));
         // An absolute model-supplied cwd wins; a relative one resolves
         // against the tool's working directory (join handles both).
@@ -655,11 +667,16 @@ impl ShellTools {
                 server
             }
         };
-        let (stdin, child_stdin) = tokio::net::unix::pipe::pipe()?;
+        let (stdin, child_stdin) = if stdin {
+            let (stdin, child_stdin) = tokio::net::unix::pipe::pipe()?;
+            (Some(stdin), child_stdin.into_blocking_fd()?)
+        } else {
+            (None, std::fs::File::open("/dev/null")?.into())
+        };
         let (child_stdout, stdout) = tokio::net::unix::pipe::pipe()?;
         let (child_stderr, stderr) = tokio::net::unix::pipe::pipe()?;
         let fds = [
-            child_stdin.into_blocking_fd()?,
+            child_stdin,
             child_stdout.into_blocking_fd()?,
             child_stderr.into_blocking_fd()?,
         ];
@@ -684,7 +701,7 @@ impl ShellTools {
         Ok(ProcessSession {
             stop: Some(stop),
             output_tasks: vec![stdout_task, stderr_task],
-            stdin: Some(stdin),
+            stdin,
             wait_task,
             status: None,
             output_rx,

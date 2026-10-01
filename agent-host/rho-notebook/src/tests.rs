@@ -136,7 +136,7 @@ async fn an_interrupted_stream_keeps_what_ran() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     let (notebook, wake) = notebook();
-    let cell = notebook.run("job = command('read line; echo got $line')".into());
+    let cell = notebook.run("job = command('read line; echo got $line', stdin=True)".into());
     until(&wake, || cell.facts().returned.is_some()).await;
     assert!(cell.facts().finished.is_none());
     let first = notebook.report().unwrap().render().text;
@@ -165,6 +165,24 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     finished(&wake, &page).await;
     let text = notebook.report().unwrap().render().text;
     assert!(text.contains("No more output."), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_reads_dev_null_unless_it_asks_for_stdin() {
+    let (notebook, wake) = notebook();
+    // An open pipe would leave cat waiting until timeout kills it (124).
+    let cell = notebook.run(
+        "job = command('timeout 5 cat; echo cat=$?; readlink /proc/self/fd/0')\n\
+         try:\n    write_stdin(job, 'x')\nexcept RuntimeError as e:\n    print(e)"
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(
+        text.contains("Command has no stdin; start it with command(..., stdin=True)"),
+        "{text}"
+    );
+    assert!(text.contains("cat=0\n/dev/null"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
