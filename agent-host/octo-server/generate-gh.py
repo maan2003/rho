@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the server's typed GitHub handlers; no network access needed.
+"""Generate the server's typed GitHub write handlers; no network access needed.
 
 github-openapi.json is a compact subset of the pinned official OpenAPI files.
 --refresh MAIN GHEC LICENSE rebuilds it from that commit's upstream files.
 Request objects reject undeclared fields unless additionalProperties explicitly
-permits them. Response objects discard unknown fields and tolerate omission, while every
-present declared value remains typed. Object-valued response unions project a
-typed superset so branch-specific fields are not lost. Only unconstrained schemas
-and genuinely open JSON maps use Value. String enums use Rust enums so untagged
-object unions can distinguish discriminator values without dropping fields.
+permits them. Reads use the client metadata as a GET/path allowlist, and responses
+are relayed without generated models.
 """
 import argparse
 import copy
@@ -50,7 +47,7 @@ def opid(op):
 
 def metadata():
     return [o for o in json.loads(SPEC.read_text())["ops"]
-            if (o["group"], o["name"]) not in {("pulls", "review_decision"), ("pulls", "set_draft")}]
+            if o["verb"] != "GET" and (o["group"], o["name"]) != ("pulls", "set_draft")]
 
 
 def refresh(main_file, enterprise_file, license_file):
@@ -95,7 +92,7 @@ def refresh(main_file, enterprise_file, license_file):
         ghec = key not in sources[0]
         source = enterprise if ghec else main
         path, method, op = sources[int(ghec)][key]
-        item = copy_refs(compact(op), source, ghec)
+        item = copy_refs(compact({k: v for k, v in op.items() if k != "responses"}), source, ghec)
         item["operationId"] = key
         parameters = source["paths"][path].get("parameters", [])
         if parameters:
@@ -130,7 +127,6 @@ class Generator:
         self.refs = {}
         self.handlers = []
         self.aliases = []
-        self.response_count = 0
 
     def resolve(self, schema):
         while "$ref" in schema:
@@ -195,72 +191,46 @@ class Generator:
                 schema["type"] = "string"
         return schema
 
-    def named(self, schema, mode, name):
-        typ = self.typ(schema, mode, name)
+    def named(self, schema, name):
+        typ = self.typ(schema, name)
         self.aliases.append(f"pub(super) type {name} = {typ};")
         return name
 
-    def typ(self, schema, mode, hint="Model"):
+    def typ(self, schema, hint="Model"):
         if "$ref" in schema:
             ref = schema["$ref"]
-            key = (ref, mode)
+            key = ref
             if key not in self.refs:
-                name = camel(ref.rsplit("/", 1)[-1]) + {"in": "Input", "out": "Output", "query": "Query"}[mode]
+                name = camel(ref.rsplit("/", 1)[-1]) + "Input"
                 # References are always boxed: recursive component graphs stay finite.
                 self.refs[key] = name
                 self.definitions[name] = ""
-                actual = self.typ(self.resolve(schema), mode, name)
+                actual = self.typ(self.resolve(schema), name)
                 self.definitions[name] = f"pub(super) type {name} = {actual};"
             typ = f"Box<{self.refs[key]}>"
             return f"Option<{typ}>" if schema.get("nullable") else typ
         schema = self.normalize(schema)
         nullable = schema.pop("nullable", False)
-        typ = self.nonnull(schema, mode, hint)
+        typ = self.nonnull(schema, hint)
         return f"Option<{typ}>" if nullable else typ
 
-    def nonnull(self, schema, mode, hint):
+    def nonnull(self, schema, hint):
         combinator = next((k for k in ("oneOf", "anyOf") if k in schema), None)
         if combinator:
             base = {k: v for k, v in schema.items() if k != combinator}
             # Required-only branches constrain the common object, rather than
             # representing unconstrained JSON alternatives.
             branches = [self.merge(base, s) for s in schema[combinator]]
-            if mode == "out":
-                objects = [s for s in branches if s.get("properties")]
-                if len(objects) > 1:
-                    # Response models are typed projections, not oneOf validators.
-                    # First-success object variants lose branch-specific fields.
-                    properties = {}
-                    for obj in objects:
-                        for field, value in obj["properties"].items():
-                            previous = properties.get(field)
-                            if previous is None:
-                                properties[field] = value
-                            elif previous != value:
-                                choices = previous.get("anyOf", [previous])
-                                if value not in choices:
-                                    properties[field] = {"anyOf": [*choices, value]}
-                    projected = {"type": "object", "properties": properties}
-                    extras = [s.get("additionalProperties") for s in objects]
-                    if True in extras:
-                        projected["additionalProperties"] = True
-                    elif any(isinstance(extra, dict) for extra in extras):
-                        projected["additionalProperties"] = {"anyOf": [extra for extra in extras if isinstance(extra, dict)]}
-                    branches = [s for s in branches if s not in objects] + [projected]
-                arrays = [s for s in branches if s.get("type") == "array"]
-                if len(arrays) > 1:
-                    branches = [s for s in branches if s not in arrays] + [
-                        {"type": "array", "items": {"anyOf": [s["items"] for s in arrays]}}]
             branches.sort(key=lambda s: (-len(s.get("required", [])),
                                          -len(s.get("properties", {}))))
             if len(branches) == 1:
-                return self.typ(branches[0], mode, hint)
-            key = (mode, json.dumps({"union": branches}, sort_keys=True))
+                return self.typ(branches[0], hint)
+            key = (json.dumps({"union": branches}, sort_keys=True))
             if key in self.cache:
                 return self.cache[key]
             name = self.unique(hint + "Union", key)
             self.cache[key] = name
-            variants = [self.typ(s, mode, name + f"Variant{i}") for i, s in enumerate(branches)]
+            variants = [self.typ(s, name + f"Variant{i}") for i, s in enumerate(branches)]
             variants = list(dict.fromkeys(variants))
             self.definitions[name] = (
                 "#[derive(Deserialize, Serialize)]\n#[serde(untagged)]\n"
@@ -285,19 +255,18 @@ class Generator:
         if kind in ("integer", "number", "boolean", "null"):
             return {"integer": "i64", "number": "f64", "boolean": "bool", "null": "()"}[kind]
         if kind == "array":
-            return f"Vec<{self.typ(schema['items'], mode, hint + 'Item')}>"
+            return f"Vec<{self.typ(schema['items'], hint + 'Item')}>"
         if kind == "object" or "properties" in schema or "required" in schema or "additionalProperties" in schema:
             props = dict(schema.get("properties", {}))
             # A required but undeclared property is genuinely unconstrained in
             # OpenAPI. Do not guess its shape or silently ignore requiredness.
-            if mode != "out":
-                for name in schema.get("required", []):
-                    props.setdefault(name, {})
+            for name in schema.get("required", []):
+                props.setdefault(name, {})
             additional = schema.get("additionalProperties")
             if not props and additional is not False and schema.get("maxProperties") != 0:
-                item = self.typ(additional, mode, hint + "Value") if isinstance(additional, dict) else "Value"
-                return f"BTreeMap<String, {item}>"
-            key = (mode, json.dumps(schema, sort_keys=True))
+                item = self.typ(additional, hint + "Value") if isinstance(additional, dict) else "serde_json::Value"
+                return f"std::collections::BTreeMap<String, {item}>"
+            key = (json.dumps(schema, sort_keys=True))
             if key in self.cache:
                 return self.cache[key]
             name = self.unique(hint + "Object", key)
@@ -307,27 +276,23 @@ class Generator:
             required = set(schema.get("required", []))
             seen = set()
             for field, sub in sorted(props.items()):
-                if mode != "out" and sub.get("readOnly"):
-                    continue
-                if mode == "out" and sub.get("writeOnly"):
+                if sub.get("readOnly"):
                     continue
                 rust_field = ident(field)
                 assert rust_field not in seen, (name, field)
                 seen.add(rust_field)
-                typ = self.typ(sub, mode, name + camel(field))
+                typ = self.typ(sub, name + camel(field))
                 attrs = [f"rename = {lit(field)}"]
-                if mode == "out" or field not in required:
+                if field not in required:
                     typ = f"Optional<{typ}>"
                     attrs += ["default", 'skip_serializing_if = "Optional::is_missing"']
-                if mode == "query":
-                    attrs.append('deserialize_with = "super::query_value"')
-                elif mode != "out" and field in required:
+                if field in required:
                     attrs.append('deserialize_with = "required"')
                 fields.append(f"    #[serde({', '.join(attrs)})]\n    pub(super) {rust_field}: {typ},")
             if additional is True or isinstance(additional, dict):
-                typ = self.typ(additional, mode, name + "Additional") if isinstance(additional, dict) else "Value"
-                fields.append(f"    #[serde(flatten)]\n    pub(super) additional: BTreeMap<String, {typ}>,")
-            strict = (mode != "out" and additional is not True and not isinstance(additional, dict)) or schema.get("maxProperties") == 0
+                typ = self.typ(additional, name + "Additional") if isinstance(additional, dict) else "serde_json::Value"
+                fields.append(f"    #[serde(flatten)]\n    pub(super) additional: std::collections::BTreeMap<String, {typ}>,")
+            strict = (additional is not True and not isinstance(additional, dict)) or schema.get("maxProperties") == 0
             self.definitions[name] = (
                 "#[derive(Deserialize, Serialize)]\n" +
                 ("#[serde(deny_unknown_fields)]\n" if strict else "") +
@@ -336,7 +301,7 @@ class Generator:
         if kind is not None:
             raise ValueError(f"unsupported type {kind!r}")
         # No declared primitive/object/array/union shape means arbitrary JSON.
-        return "Value"
+        return "serde_json::Value"
 
     def unique(self, hint, key):
         digest = hashlib.sha256(repr(key).encode()).hexdigest()[:10]
@@ -356,39 +321,18 @@ class Generator:
     def generate_operation(self, meta, op):
         fn = meta["group"] + "_" + meta["name"]
         prefix = camel(fn)
-        params = []
-        for location, suffix, mode in (("path", "Path", "in"), ("query", "Query", "query")):
-            schema = self.parameter_schema(op, location)
-            params.append(self.named(schema, mode, prefix + suffix) if schema else "()")
+        schema = self.parameter_schema(op, "path")
+        params = [self.named(schema, prefix + "Path") if schema else "()"]
         body = self.resolve(op["requestBody"]) if "requestBody" in op else {}
         content = body.get("content", {})
         json_body = next((v for k, v in content.items() if k == "application/json" or k.endswith("+json")), None)
-        params.append(self.named(json_body.get("schema", {}), "in", prefix + "Body") if json_body is not None else "()")
-        responses = []
-        for status, response in sorted(op.get("responses", {}).items()):
-            if not status.isdigit() or not 200 <= int(status) < 300:
-                continue
-            response = self.resolve(response)
-            content = response.get("content", {})
-            # Every documented JSON media variant contributes a typed alternative.
-            schemas = [v.get("schema", {}) for k, v in sorted(content.items())
-                       if k == "application/json" or k.endswith("+json")]
-            if not schemas:
-                continue
-            schema = schemas[0] if len(schemas) == 1 else {"anyOf": schemas}
-            typ = self.named(schema, "out", prefix + "Response" + status)
-            responses.append(f"        {status} => serde_json::to_value(serde_json::from_value::<{typ}>(value)?),")
-            self.response_count += 1
-        codec = fn + "_response"
+        params.append(self.named(json_body.get("schema", {}), prefix + "Body") if json_body is not None else "()")
         self.handlers.append(
             f"pub(super) fn {fn}(request: super::Request) -> super::HandlerFuture {{\n"
             "    Box::pin(async move {\n"
             f"        super::typed::<{', '.join(params)}>(request, {str(bool(body.get('required'))).lower()}, "
-            f"{str(json_body is not None).lower()}, {codec}).await\n"
-            "    })\n}\n"
-            f"fn {codec}(status: StatusCode, value: Value) -> Result<Value, serde_json::Error> {{\n"
-            "    match status.as_u16() {\n" + "\n".join(responses) +
-            "\n        _ => Ok(value),\n    }\n}")
+            f"{str(json_body is not None).lower()}).await\n"
+            "    })\n}\n")
 
     def generate(self):
         api = operations(self.source)
@@ -403,12 +347,9 @@ class Generator:
                 raise ValueError(f"{opid(meta)}: {error}") from error
         header = f"""// @generated by generate-gh.py; do not edit.
 // GitHub REST OpenAPI commit {PIN}; MIT license in github-openapi.json.
-// {len(metas)} operation handlers; {self.response_count} documented JSON success responses.
+// {len(metas)} typed write handlers; reads and responses are not generated.
 #![allow(dead_code, non_camel_case_types, non_snake_case)]
-use std::collections::BTreeMap;
-use axum::http::StatusCode;
 use serde::{{Deserialize, Serialize}};
-use serde_json::Value;
 use super::Optional;
 
 // deserialize_with suppresses serde's implicit missing = None for required

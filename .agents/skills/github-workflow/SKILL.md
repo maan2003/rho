@@ -20,15 +20,16 @@ issues = await api.issues.list_for_repo(state="open", per_page=100, page=1)
 ```
 
 The selected client covers PR collaboration, all issue/search endpoints,
-and existing CI/check/log/rerun operations. Each supported REST operation has
-a typed host handler. PR merges, head-branch updates, review dismissal,
+and existing CI/check/log/rerun operations. Reads use an explicit GET/path allowlist;
+writes have typed host handlers. PR merges, head-branch updates, review dismissal,
 Git ref writes, repository administration, and credential APIs are not exposed.
 Generic GraphQL is unavailable; `pulls.review_decision` and `pulls.set_draft`
 are fixed Octo-only helpers.
 
 Pass declared parameters directly as keywords. Unknown keywords, missing
 required parameters, and undeclared `query_`/`body_` fields raise `TypeError`
-before a request. The host also checks request schemas. List/search operations
+before a request. The host checks write request schemas. Read queries and
+responses pass through to GitHub without schema validation. List/search operations
 may require pagination; use `result['items']` for search rows (`.items` is a
 dict method).
 

@@ -9,15 +9,16 @@ operations: PR collaboration, all issue and search endpoints, plus the existing
 CI/check/log/rerun operations. It also defines Octo-only `pulls.review_decision`
 and `pulls.set_draft` helpers backed by fixed, typed GraphQL operations.
 
-Each supported REST operation has a distinct typed Rust handler.
-`octo-server/generate-gh.py` generates its path/query/body/response models and
-handler from the selected, pinned official GitHub OpenAPI schemas.
-The compact schema source and generated handlers are checked in; regeneration
-needs no network. Unknown request fields and wrong types are rejected before
-Octo acquires credentials. Response DTOs expose declared fields rather than arbitrary upstream JSON.
-They tolerate absent fields but check the type of every present field; object
-unions project their combined declared fields rather than guess a variant.
-Optional nullable fields preserve null versus omission.
+Reads use the selected metadata as an explicit GET/path-template allowlist.
+Octo forwards query parameters and response fields without schema validation;
+GitHub validates its API. The Python client still checks declared argument names.
+
+Writes have distinct typed Rust handlers. `octo-server/generate-gh.py` generates
+only write path/body models from selected, pinned official GitHub schemas.
+The compact request schema source and generated handlers are checked in;
+regeneration needs no network. Unknown write fields and wrong types are rejected
+before Octo acquires credentials. Optional nullable request fields preserve
+null versus omission. No REST response models are generated.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
 and dismissing another review. Generic GraphQL, Git ref writes, repository
@@ -38,7 +39,7 @@ search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
 `await api.pulls.set_draft(number, draft=True/False)`.
 
 Octo preserves selected pagination/cache/rate-limit headers, empty responses,
-and explicitly requested text media. Existing job/run log download redirects
+and text/binary response media. Existing job/run log download redirects
 are fetched once on the host without credentials; signed URLs never reach the
 agent. Repository responses nested in PR/search data omit `temp_clone_token`.
 This is not a detector for arbitrary secrets in repository content or logs.

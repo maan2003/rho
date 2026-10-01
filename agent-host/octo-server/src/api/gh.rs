@@ -1,5 +1,5 @@
 //! GitHub REST operations from the same pinned metadata used by ghapi.
-//! Every REST operation has a generated typed handler. Credentials and signed
+//! Reads are allowlisted; writes have typed handlers. Credentials and signed
 //! redirects stay on the host; branch-changing APIs are not exposed.
 use std::future::Future;
 use std::pin::Pin;
@@ -22,7 +22,6 @@ mod generated;
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
 type Handler = fn(Request) -> HandlerFuture;
-type ResponseCodec = fn(StatusCode, Value) -> Result<Value, serde_json::Error>;
 
 struct Request {
     state: Arc<AppState>,
@@ -33,8 +32,7 @@ struct Request {
     body: Bytes,
 }
 
-// Distinguish omission from null in PATCH requests and optional response
-// fields.
+// Distinguish omission from null in PATCH requests.
 enum Optional<T> {
     Missing,
     Present(T),
@@ -67,77 +65,6 @@ impl<T: Serialize> Serialize for Optional<T> {
     }
 }
 
-// URL parameters are strings; schemas decide whether each is text, bool,
-// numeric, or an array. Try the declared type before any coercion so "123"
-// remains text for String fields.
-fn query_value<'de, D: Deserializer<'de>, T: DeserializeOwned>(
-    deserializer: D,
-) -> Result<T, D::Error> {
-    let value = Value::deserialize(deserializer)?;
-    fn scalar(value: &Value) -> Value {
-        if let Value::String(text) = value {
-            if let Ok(value) = serde_json::from_str(text) {
-                return value;
-            }
-            if let Ok(value) = text.parse::<i64>() {
-                return json!(value);
-            }
-            if let Ok(value) = text.parse::<u64>() {
-                return json!(value);
-            }
-        }
-        value.clone()
-    }
-    if let Ok(result) = serde_json::from_value(value.clone()) {
-        return Ok(result);
-    }
-    let mut choices = vec![scalar(&value)];
-    match &value {
-        Value::Array(values) => choices.push(Value::Array(values.iter().map(scalar).collect())),
-        Value::String(text) => {
-            let values: Vec<_> = text
-                .split(',')
-                .map(|part| Value::String(part.to_owned()))
-                .collect();
-            choices.push(Value::Array(values.clone()));
-            choices.push(Value::Array(values.iter().map(scalar).collect()));
-        }
-        _ => {}
-    }
-    for value in choices {
-        if let Ok(result) = serde_json::from_value(value) {
-            return Ok(result);
-        }
-    }
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
-}
-
-fn query_object(uri: &Uri) -> Value {
-    let mut fields = serde_json::Map::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
-        let bracketed = key.ends_with("[]");
-        let key = key.strip_suffix("[]").unwrap_or(&key).to_owned();
-        let value = Value::String(value.into_owned());
-        match fields.entry(key) {
-            serde_json::map::Entry::Vacant(entry) => {
-                entry.insert(if bracketed {
-                    Value::Array(vec![value])
-                } else {
-                    value
-                });
-            }
-            serde_json::map::Entry::Occupied(mut entry) => {
-                let previous = entry.get_mut();
-                match previous {
-                    Value::Array(values) => values.push(value),
-                    _ => *previous = Value::Array(vec![previous.take(), value]),
-                }
-            }
-        }
-    }
-    Value::Object(fields)
-}
-
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -163,8 +90,6 @@ struct Operation {
     name: String,
     path: String,
     verb: String,
-    #[serde(default)]
-    query_params: Vec<String>,
     #[serde(default)]
     param_types: std::collections::BTreeMap<String, String>,
 }
@@ -291,29 +216,26 @@ async fn rest(
     else {
         return forbidden();
     };
-    let Some(handler) = generated::handler(&op.group, &op.name) else {
-        return forbidden();
-    };
-    handler(Request {
+    let request = Request {
         state,
         op,
         parts,
         uri,
         headers,
         body,
-    })
-    .await
+    };
+    if method == Method::GET {
+        return forward(request).await;
+    }
+    let Some(handler) = generated::handler(&op.group, &op.name) else {
+        return forbidden();
+    };
+    handler(request).await
 }
 
-async fn typed<P, Q, B>(
-    request: Request,
-    body_required: bool,
-    json_body: bool,
-    response_codec: ResponseCodec,
-) -> Response
+async fn typed<P, B>(request: Request, body_required: bool, json_body: bool) -> Response
 where
     P: DeserializeOwned + Serialize,
-    Q: DeserializeOwned + Serialize,
     B: DeserializeOwned + Serialize,
 {
     let Request {
@@ -358,15 +280,8 @@ where
     if !valid_path {
         return forbidden();
     }
-    let query = query_object(&uri);
-    let query = if query.as_object().is_some_and(|fields| fields.is_empty())
-        && op.query_params.is_empty()
-    {
-        Value::Null
-    } else {
-        query
-    };
-    if serde_json::from_value::<Q>(query).is_err() {
+    // None of the selected write operations accepts query parameters.
+    if uri.query().is_some_and(|query| !query.is_empty()) {
         return forbidden();
     }
     let body = if json_body {
@@ -387,6 +302,26 @@ where
         }
         body
     };
+    forward(Request {
+        state,
+        op,
+        parts,
+        uri,
+        headers,
+        body,
+    })
+    .await
+}
+
+async fn forward(request: Request) -> Response {
+    let Request {
+        state,
+        op,
+        parts,
+        uri,
+        headers,
+        body,
+    } = request;
     let token = match state.get_token().await {
         Ok(token) => token,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -428,23 +363,11 @@ where
         Ok(response) => response,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let text_media = op.group == "pulls"
-        && op.name == "get"
-        && headers
-            .get(header::ACCEPT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                matches!(
-                    value,
-                    "application/vnd.github.diff" | "application/vnd.github.patch"
-                )
-            });
-    relay(state, upstream, &token, op, response_codec, text_media).await
+    relay(state, upstream, &token, op).await
 }
 
 // Repo metadata and nested search/PR responses can carry ephemeral credentials.
-// Typed response models retain the schema fields; capabilities are removed
-// here.
+// Remove capabilities without restricting the rest of the response schema.
 fn redact(value: &mut Value, token: &str) {
     match value {
         Value::Object(fields) => {
@@ -470,8 +393,6 @@ async fn relay(
     upstream: reqwest::Response,
     token: &str,
     op: &Operation,
-    response_codec: ResponseCodec,
-    text_media: bool,
 ) -> Response {
     let status = upstream.status();
     let mut headers = HeaderMap::new();
@@ -541,26 +462,13 @@ async fn relay(
         }
         return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
     }
-    let json_response = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("json"));
     let bytes = match upstream.bytes().await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
-        if status.is_success() {
-            value = match response_codec(status, value) {
-                Ok(value) => value,
-                Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-            };
-        }
         redact(&mut value, token);
         (status, headers, Json(value)).into_response()
-    } else if !bytes.is_empty() && (json_response || status.is_success() && !text_media) {
-        StatusCode::BAD_GATEWAY.into_response()
     } else if bytes
         .windows(token.len())
         .any(|part| part == token.as_bytes())
@@ -830,99 +738,46 @@ mod tests {
     fn token_provider() -> crate::TokenProvider {
         Arc::new(|| Ok("host-token-test".into()))
     }
-    fn example(operation: &str) -> (StatusCode, Value) {
-        let fixtures: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/github-responses.json"))
-                .unwrap();
-        let fixture = &fixtures["responses"][operation];
-        (
-            StatusCode::from_u16(fixture["status"].as_u64().unwrap() as u16).unwrap(),
-            fixture["value"].clone(),
-        )
-    }
-
     #[test]
-    fn selected_operations_have_typed_handlers_and_exclude_authoritative_writes() {
-        let mut count = 0;
+    fn reads_are_allowlisted_and_only_writes_have_generated_handlers() {
+        let mut reads = 0;
+        let mut writes = 0;
         for op in operations() {
             if matches!(op.name.as_str(), "review_decision" | "set_draft") {
                 continue;
             }
-            assert!(
-                generated::handler(&op.group, &op.name).is_some(),
-                "{}.{}",
-                op.group,
-                op.name
-            );
-            count += 1;
+            let handler = generated::handler(&op.group, &op.name);
+            if op.verb == "GET" {
+                assert!(handler.is_none(), "{}.{}", op.group, op.name);
+                reads += 1;
+            } else {
+                assert!(handler.is_some(), "{}.{}", op.group, op.name);
+                writes += 1;
+            }
         }
-        assert_eq!(count, 103);
+        assert_eq!((reads, writes), (57, 46));
         for name in ["merge", "merge_async", "update_branch", "dismiss_review"] {
-            assert!(generated::handler("pulls", name).is_none(), "{name}");
+            assert!(
+                !operations()
+                    .iter()
+                    .any(|op| op.group == "pulls" && op.name == name)
+            );
         }
         for (group, name) in [
             ("repos", "get"),
             ("git", "create_ref"),
             ("apps", "create_installation_access_token"),
         ] {
-            assert!(generated::handler(group, name).is_none());
+            assert!(
+                !operations()
+                    .iter()
+                    .any(|op| op.group == group && op.name == name)
+            );
         }
     }
 
     #[test]
-    fn requested_reviewers_responses_match_official_and_current_public_samples() {
-        for sample in ["pulls/request-reviewers", "pulls/request-reviewers-current"] {
-            let (_, value) = example(sample);
-            serde_json::from_value::<generated::PullsRequestReviewersResponse201>(value).unwrap();
-        }
-    }
-
-    #[test]
-    fn output_projection_retains_union_fields_and_distinguishes_null_from_omission() {
-        let original = json!({"body":"edited","performed_via_github_app":{"owner":{
-            "id":73,"slug":"enterprise-owner","created_at":"2026-01-02T03:04:05Z",
-            "website_url":"https://example.com"
-        }}});
-        let projected = serde_json::to_value(
-            serde_json::from_value::<generated::IssuesUpdateCommentResponse200>(original.clone())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(projected, original);
-        for (value, expected) in [
-            (json!({}), json!({})),
-            (json!({"milestone":null}), json!({"milestone":null})),
-        ] {
-            let projected = serde_json::to_value(
-                serde_json::from_value::<generated::IssuesUpdateResponse200>(value).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(projected, expected);
-        }
-        assert!(
-            serde_json::from_value::<generated::IssuesUpdateResponse200>(
-                json!({"number":"wrong type"})
-            )
-            .is_err()
-        );
-
-        let events = json!([
-            {"event":"renamed","rename":{"from":"old name","to":"new name"}},
-            {"event":"committed","sha":"commit-73","message":"a change"},
-            {"event":"cross-referenced","source":{"type":"issue","issue":{"number":41,"title":"linked issue"}}}
-        ]);
-        let projected = serde_json::to_value(
-            serde_json::from_value::<generated::IssuesListEventsForTimelineResponse200>(
-                events.clone(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(projected, events);
-    }
-
-    #[test]
-    fn templates_and_query_coercion_preserve_nontrivial_values() {
+    fn templates_preserve_nontrivial_values_and_reject_traversal() {
         assert_eq!(
             match_path(
                 "/repos/{owner}/{repo}/commits/{ref}/status",
@@ -964,22 +819,6 @@ mod tests {
                 "{path}"
             );
         }
-        #[derive(Deserialize)]
-        struct QueryExample {
-            #[serde(deserialize_with = "query_value")]
-            q: String,
-            #[serde(deserialize_with = "query_value")]
-            page: u64,
-            #[serde(deserialize_with = "query_value")]
-            all: bool,
-        }
-        let uri: Uri = "/search?q=123&page=003&all=false".parse().unwrap();
-        let decoded: QueryExample = serde_json::from_value(query_object(&uri)).unwrap();
-        assert_eq!(decoded.q, "123");
-        assert_eq!(decoded.page, 3);
-        assert!(!decoded.all);
-        let uri: Uri = "/search?q=text&page=2&page=3&all=false".parse().unwrap();
-        assert!(serde_json::from_value::<QueryExample>(query_object(&uri)).is_err());
     }
 
     #[tokio::test]
@@ -1008,21 +847,25 @@ mod tests {
                             match_path(&op.path, uri.path().trim_start_matches('/')).is_some()
                         })
                         .unwrap();
-                    let id = format!(
-                        "{}/{}",
-                        op.group.replace('_', "-"),
-                        op.name.replace('_', "-")
-                    );
-                    let (status, mut value) = example(&id);
-                    if let Some(fields) = value.as_object_mut() {
-                        fields.insert("future_field".into(), json!("not a typed response field"));
-                        if fields.contains_key("body") {
-                            fields.insert("body".into(), json!("echo host-token-test end"));
-                        }
-                        if fields.contains_key("closed_at") {
-                            fields.insert("closed_at".into(), json!("2026-01-02T03:04:05Z"));
-                        }
-                    }
+                    let status = if matches!(
+                        op.name.as_str(),
+                        "create"
+                            | "create_label"
+                            | "create_milestone"
+                            | "add_assignees"
+                            | "request_reviewers"
+                    ) {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::OK
+                    };
+                    let value = json!({
+                        "future_field": {"unexpected": [null, 73]},
+                        "body": "echo host-token-test end",
+                        "closed_at": "2026-01-02T03:04:05Z",
+                        "total_count": 2,
+                        "items": [{"new_result_field": true}]
+                    });
                     (
                         status,
                         [
@@ -1127,7 +970,7 @@ mod tests {
             assert_eq!(captured.lock().await.last().unwrap().2, payload, "{path}");
             assert_eq!(response.headers().get(header::ETAG).unwrap(), "\"rev-2\"");
             let value: Value = response.json().await.unwrap();
-            assert!(value.get("future_field").is_none());
+            assert_eq!(value["future_field"], json!({"unexpected": [null, 73]}));
             if let Some(body) = value.get("body") {
                 assert_eq!(body, "echo [redacted] end");
             }
@@ -1186,6 +1029,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_pass_queries_and_response_shapes_but_strip_credentials() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |uri: Uri, headers: HeaderMap, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    assert_eq!(headers.get(header::AUTHORIZATION).unwrap(), "Bearer host-token-test");
+                    assert!(!headers.contains_key(header::COOKIE));
+                    captured.lock().await.push((uri.to_string(), body.to_vec()));
+                    let response = match uri.path() {
+                        "/search/issues" => Json(json!({
+                            "total_count":"upstream decides its types",
+                            "unknown": {"nullable":null},
+                            "items":[{"repository":{"full_name":"acme/widget","temp_clone_token":"ephemeral-secret","future_field":17}}],
+                            "echo":"host-token-test"
+                        })).into_response(),
+                        "/repos/acme/widget/issues/0" =>
+                            (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"message":"upstream rejects zero"}))).into_response(),
+                        "/repos/acme/widget/issues/not-a-number" =>
+                            ([(header::CONTENT_TYPE,"application/json")], "{not valid json").into_response(),
+                        _ => ([(header::CONTENT_TYPE,"application/octet-stream")], b"\x00\xfe\xffraw".to_vec()).into_response(),
+                    };
+                    let (mut parts, body) = response.into_parts();
+                    parts.headers.insert(header::SET_COOKIE, "secret=cookie".parse().unwrap());
+                    parts.headers.insert(header::ETAG, "\"v3\"".parse().unwrap());
+                    Response::from_parts(parts, body)
+                }
+            }
+        ))).await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        let path = "/search/issues?page=next&page=3&future_flag=yes";
+        let response = client
+            .get(format!("{base}{path}"))
+            .header(header::AUTHORIZATION, "Bearer agent-token")
+            .header(header::COOKIE, "agent=cookie")
+            .body("read body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), "\"v3\"");
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "total_count":"upstream decides its types",
+                "unknown":{"nullable":null},
+                "items":[{"repository":{"full_name":"acme/widget","future_field":17}}],
+                "echo":"[redacted]"
+            })
+        );
+        assert_eq!(
+            seen.lock().await[0],
+            (path.to_owned(), b"read body".to_vec())
+        );
+        for (path, status, expected) in [
+            (
+                "/repos/acme/widget/issues/0",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                b"{\"message\":\"upstream rejects zero\"}".as_slice(),
+            ),
+            (
+                "/repos/acme/widget/issues/not-a-number",
+                StatusCode::OK,
+                b"{not valid json".as_slice(),
+            ),
+            (
+                "/repos/acme/widget/pulls/7",
+                StatusCode::OK,
+                b"\x00\xfe\xffraw".as_slice(),
+            ),
+        ] {
+            let response = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+        }
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn invalid_or_authoritative_requests_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1238,6 +1165,11 @@ mod tests {
                 json!({"body":"edited","boddy":"typo"}),
             ),
             (
+                Method::PATCH,
+                "repos/acme/widget/issues/comments/19?future_flag=true",
+                json!({"body":"edited"}),
+            ),
+            (
                 Method::POST,
                 "repos/acme/widget/issues",
                 json!({"title":true}),
@@ -1252,34 +1184,29 @@ mod tests {
                 "repos/acme/widget/pulls/7/reviews",
                 json!({"event":"COMMENT","comments":[{"path":"foo","line":"five","body":"text"}]}),
             ),
-            (Method::GET, "search/issues?page=3", Value::Null),
             (
                 Method::GET,
-                "repos/acme/widget/issues/7",
-                json!({"unexpected":"body"}),
-            ),
-            (
-                Method::GET,
-                "repos/acme/widget/issues?sttae=all",
+                "repos/acme/widget/pulls/7/update-branch",
                 Value::Null,
             ),
+            (Method::GET, "repos/acme/widget/git/refs", Value::Null),
+            (Method::GET, "repos/acme/widget", Value::Null),
+            (Method::HEAD, "repos/acme/widget/issues/7", Value::Null),
             (
-                Method::GET,
-                "repos/acme/widget/issues?page=next",
-                Value::Null,
-            ),
-            (
-                Method::GET,
-                "repos/acme/widget/issues?page=2&page=3",
-                Value::Null,
-            ),
-            (
-                Method::GET,
+                Method::PATCH,
                 "repos/acme/widget/issues/not-a-number",
-                Value::Null,
+                json!({"body":"x"}),
             ),
-            (Method::GET, "repos/acme/widget/issues/0", Value::Null),
-            (Method::GET, "repos/acme/widget/pulls/-1", Value::Null),
+            (
+                Method::PATCH,
+                "repos/acme/widget/issues/0",
+                json!({"body":"x"}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/pulls/-1",
+                json!({"body":"x"}),
+            ),
             (
                 Method::PUT,
                 "repos/acme/widget/pulls/7/draft",
@@ -1354,7 +1281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_empty_errors_and_malformed_typed_responses_keep_their_semantics() {
+    async fn text_empty_errors_and_untyped_responses_keep_their_semantics() {
         let (upstream,upstream_task)=serve(Router::new().fallback(any(
             |method:Method,uri:Uri,headers:HeaderMap| async move {
                 assert_eq!(headers.get(header::AUTHORIZATION).unwrap(),"Bearer host-token-test");
@@ -1403,11 +1330,6 @@ mod tests {
                 "repos/acme/widget/issues/500",
                 StatusCode::BAD_GATEWAY,
             ),
-            (
-                Method::GET,
-                "repos/acme/widget/issues/999",
-                StatusCode::BAD_GATEWAY,
-            ),
         ] {
             let response = client
                 .request(method, format!("{base}/{path}"))
@@ -1418,6 +1340,16 @@ mod tests {
             assert_eq!(response.status(), status, "{path}");
             assert!(response.bytes().await.unwrap().is_empty());
         }
+        let response = client
+            .get(format!("{base}/repos/acme/widget/issues/999"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"number":"not an integer"})
+        );
         let response = client
             .get(format!("{base}/repos/acme/widget/issues/404"))
             .send()
@@ -1502,16 +1434,10 @@ mod tests {
             "repos/acme/widget/actions/runs/7/logs?secret=true",
         ] {
             let response = client.get(format!("{base}/{path}")).send().await.unwrap();
-            // Typed schemas reject undeclared query flags before upstream.
-            let status = if path.contains('?') {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            assert_eq!(response.status(), status);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             assert!(!response.headers().contains_key(header::LOCATION));
         }
-        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+        assert_eq!(downloads.load(Ordering::SeqCst), 4);
         task.abort();
         upstream_task.abort();
         download_task.abort();
