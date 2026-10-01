@@ -488,11 +488,13 @@ mod zed_marks {
                     anchors
                         .iter()
                         .map(|(name, anchors)| {
+                            let snapshot = buffer.read(cx);
                             (
                                 name.clone(),
-                                buffer
-                                    .read(cx)
-                                    .summaries_for_anchors::<Point, _>(anchors.iter().copied())
+                                snapshot
+                                    .summaries_for_anchors_unordered::<Point, _>(
+                                        anchors.iter().copied(),
+                                    )
                                     .collect(),
                             )
                         })

@@ -283,7 +283,7 @@ impl Editor {
         #[cfg(feature = "native")]
         if let Some(inlay_hints) = &mut self.inlay_hints {
             for id_to_remove in to_remove {
-                inlay_hints.added_hints.remove(id_to_remove);
+                inlay_hints.remove_inlay(id_to_remove);
             }
         }
         self.display_map.update(cx, |display_map, cx| {

@@ -738,11 +738,15 @@ impl Editor {
         // Interior anchors in a buffer stop resolving once that buffer is folded,
         // so move its selections before updating the display map.
         let snapshot = self.display_snapshot(cx);
-        self.selections.change_with(&snapshot, |selections| {
+        let previous = self.selections.disjoint_anchors_arc();
+        let (changed, ()) = self.selections.change_with(&snapshot, |selections| {
             for buffer_id in ids_to_fold.iter().copied() {
                 selections.remove_selections_from_buffer(buffer_id);
             }
         });
+        if changed {
+            self.invalidate_add_selection_goals_after_change(Some(&previous));
+        }
 
         self.display_map.update(cx, |display_map, cx| {
             display_map.fold_buffers(ids_to_fold.clone(), cx)
@@ -879,7 +883,7 @@ impl Editor {
                         if current_level < fold_at_level {
                             stack.push((nested_start_row, nested_end_row, current_level + 1));
                         } else if current_level == fold_at_level {
-                            // Fold iff there is no selection completely contained within the fold region
+                            // Fold if and only if there is no selection completely contained within the fold region
                             if !row_ranges_to_keep.iter().any(|selection| {
                                 selection.end >= nested_start_row
                                     && selection.start <= nested_end_row
@@ -888,7 +892,7 @@ impl Editor {
                             }
                         }
 
-                        start_row = nested_end_row + 1;
+                        start_row = (start_row + 1).max(nested_end_row);
                     }
                     None => start_row += 1,
                 }

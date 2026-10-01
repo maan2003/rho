@@ -2,21 +2,27 @@ use super::{
     Highlights,
     dimensions::RowDelta,
     fold_map::{Chunk, ChunkRendererId, FoldRows},
+    invisibles::{is_invisible, is_standalone_grapheme, replacement},
     row_scale_map::RowScaleSnapshot,
     tab_map::{self, TabEdit, TabPoint, TabSnapshot},
 };
 
+use collections::HashMap;
 use futures_lite::future::yield_now;
-use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
-use language::{LanguageAwareStyling, Point};
+use gpui::{
+    App, AppContext as _, Context, Entity, Font, FontId, IndentAdjustment, LineWrapper, Pixels,
+    Task, TextSystem,
+};
+use language::{LanguageAwareStyling, Point, language_settings::SoftWrapIndent};
 use multi_buffer::{Anchor, RowInfo, ToPoint};
 use std::{
     cmp,
     collections::VecDeque,
     mem,
+    num::NonZeroU32,
     ops::Range,
-    sync::LazyLock,
     sync::atomic::{self, AtomicBool},
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
@@ -170,6 +176,7 @@ pub struct WrapMap {
     interpolated_edits: WrapPatch,
     edits_since_sync: WrapPatch,
     wrap_width: Option<Pixels>,
+    soft_wrap_indent: SoftWrapIndent,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
     row_scales: RowScaleSnapshot,
@@ -256,6 +263,61 @@ impl TransformSummary {
 #[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialOrd, PartialEq)]
 pub struct WrapPoint(pub Point);
 
+struct LineFragmentBuilder {
+    text_system: Arc<TextSystem>,
+    font_id: FontId,
+    font_size: Pixels,
+    cached_replacement_widths: HashMap<char, Pixels>,
+}
+
+impl LineFragmentBuilder {
+    fn new(text_system: Arc<TextSystem>, font: &Font, font_size: Pixels) -> Self {
+        let font_id = text_system.resolve_font(font);
+        Self {
+            text_system,
+            font_id,
+            font_size,
+            cached_replacement_widths: HashMap::default(),
+        }
+    }
+
+    fn push_fragments<'a>(&mut self, fragments: &mut Vec<gpui::LineFragment<'a>>, text: &'a str) {
+        let mut prefix_start = 0;
+        for (offset, ch) in text.char_indices() {
+            if !is_invisible(ch) {
+                continue;
+            }
+            let ch_end = offset + ch.len_utf8();
+            if !is_standalone_grapheme(text, offset, ch_end) {
+                continue;
+            }
+            let Some(width) = self.replacement_width(ch) else {
+                continue;
+            };
+            if prefix_start < offset {
+                fragments.push(gpui::LineFragment::text(&text[prefix_start..offset]));
+            }
+            fragments.push(gpui::LineFragment::element(width, ch_end - offset));
+            prefix_start = ch_end;
+        }
+        if prefix_start < text.len() || text.is_empty() {
+            fragments.push(gpui::LineFragment::text(&text[prefix_start..]));
+        }
+    }
+
+    fn replacement_width(&mut self, ch: char) -> Option<Pixels> {
+        let replacement_char = replacement(ch)?;
+        let width = *self
+            .cached_replacement_widths
+            .entry(replacement_char)
+            .or_insert_with(|| {
+                self.text_system
+                    .layout_width(self.font_id, self.font_size, replacement_char)
+            });
+        Some(width)
+    }
+}
+
 pub struct WrapChunks<'a> {
     input_chunks: tab_map::TabChunks<'a>,
     input_chunk: Chunk<'a>,
@@ -305,6 +367,7 @@ impl WrapMap {
             let mut this = Self {
                 font_with_size: (font, font_size),
                 wrap_width: None,
+                soft_wrap_indent: SoftWrapIndent::default(),
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
                 #[cfg(feature = "wrap-test-support")]
@@ -330,8 +393,8 @@ impl WrapMap {
         (handle, snapshot)
     }
 
-    pub(crate) fn is_rewrapping(&self) -> bool {
-        self.background_task.is_some()
+    pub fn is_rewrapping(&self) -> bool {
+        self.background_task.is_some() || (self.wrap_width.is_some() && self.snapshot.interpolated)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -395,6 +458,13 @@ impl WrapMap {
             self.snapshot.interpolated = false;
         }
 
+        debug_assert!(
+            self.background_task.is_some()
+                || self.wrap_width.is_none()
+                || !self.snapshot.interpolated,
+            "an interpolated snapshot must always have a background task rewrapping it, \
+             otherwise is_rewrapping never settles and frozen scrollbar ranges leak"
+        );
         let output_edits = mem::take(&mut self.edits_since_sync);
         #[cfg(feature = "wrap-test-support")]
         {
@@ -560,6 +630,21 @@ impl WrapMap {
     }
 
     #[ztracing::instrument(skip_all)]
+    pub fn set_soft_wrap_indent(&mut self, indent: SoftWrapIndent, cx: &mut Context<Self>) -> bool {
+        if indent == self.soft_wrap_indent {
+            return false;
+        }
+
+        self.soft_wrap_indent = indent;
+        self.rewrap(cx);
+        true
+    }
+
+    fn indent_adjustment(&self, tab_size: NonZeroU32) -> IndentAdjustment {
+        indent_adjustment_for(self.soft_wrap_indent, tab_size)
+    }
+
+    #[ztracing::instrument(skip_all)]
     fn rewrap(&mut self, cx: &mut Context<Self>) {
         self.background_task.take();
         self.interpolated_edits.clear();
@@ -570,6 +655,8 @@ impl WrapMap {
 
             let text_system = cx.text_system();
             let (font, font_size) = self.font_with_size.clone();
+            let mut fragment_builder =
+                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
             let row_scales = self.row_scales.clone();
             let hanging_indents = self.hanging_indents.clone();
@@ -581,6 +668,7 @@ impl WrapMap {
                 new: range,
             }];
 
+            let indent_adjustment = self.indent_adjustment(tab_snapshot.tab_size);
             if cfg!(not(target_family = "wasm")) && total_rows < WRAP_YIELD_ROW_INTERVAL {
                 let (edits, _) = gpui::block_on(new_snapshot.update(
                     tab_snapshot,
@@ -588,7 +676,9 @@ impl WrapMap {
                     wrap_width,
                     &row_scales,
                     &hanging_indents,
+                    indent_adjustment,
                     &mut line_wrapper,
+                    &mut fragment_builder,
                 ));
                 self.snapshot = new_snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&edits);
@@ -601,7 +691,9 @@ impl WrapMap {
                             wrap_width,
                             &row_scales,
                             &hanging_indents,
+                            indent_adjustment,
                             &mut line_wrapper,
+                            &mut fragment_builder,
                         )
                         .await;
                     (new_snapshot, edits)
@@ -711,8 +803,11 @@ impl WrapMap {
             let mut snapshot = self.snapshot.clone();
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
+            let mut fragment_builder =
+                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
             let hanging_indents = self.hanging_indents.clone();
+            let soft_wrap_indent = self.soft_wrap_indent;
             if cfg!(not(target_family = "wasm"))
                 && pending_edits.len() == 1
                 && affected_row_count(&pending_edits[0].2) < WRAP_YIELD_ROW_INTERVAL
@@ -721,13 +816,17 @@ impl WrapMap {
                     .into_iter()
                     .next()
                     .expect("pending_edits has one item");
+                let indent_adjustment =
+                    indent_adjustment_for(soft_wrap_indent, tab_snapshot.tab_size);
                 let (wrap_edits, update_work) = gpui::block_on(snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
                     &row_scales,
                     &hanging_indents,
+                    indent_adjustment,
                     &mut line_wrapper,
+                    &mut fragment_builder,
                 ));
                 walked_items = walked_items.saturating_add(update_work);
                 self.snapshot = snapshot;
@@ -788,6 +887,8 @@ impl WrapMap {
                     let mut edits = Patch::default();
                     let mut walked_items = 0_u64;
                     for (tab_snapshot, row_scales, tab_edits) in pending_edits {
+                        let indent_adjustment =
+                            indent_adjustment_for(soft_wrap_indent, tab_snapshot.tab_size);
                         let (wrap_edits, walked) = snapshot
                             .update(
                                 tab_snapshot,
@@ -795,7 +896,9 @@ impl WrapMap {
                                 wrap_width,
                                 &row_scales,
                                 &hanging_indents,
+                                indent_adjustment,
                                 &mut line_wrapper,
+                                &mut fragment_builder,
                             )
                             .await;
                         walked_items = walked_items.saturating_add(walked);
@@ -1015,7 +1118,9 @@ impl WrapSnapshot {
         wrap_width: Pixels,
         row_scales: &RowScaleSnapshot,
         hanging_indents: &HangingIndentSnapshot,
+        indent_adjustment: IndentAdjustment,
         line_wrapper: &mut LineWrapper,
+        fragment_builder: &mut LineFragmentBuilder,
     ) -> (WrapPatch, u64) {
         #[derive(Debug)]
         struct RowEdit {
@@ -1095,7 +1200,7 @@ impl WrapSnapshot {
                         if let Some(ix) = chunk.text.find('\n') {
                             flush_renderer!();
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
-                            line_fragments.push(gpui::LineFragment::text(prefix));
+                            fragment_builder.push_fragments(&mut line_fragments, prefix);
                             line.push_str(prefix);
                             remaining = Some(Chunk {
                                 text: suffix,
@@ -1129,7 +1234,7 @@ impl WrapSnapshot {
                                 }
                             } else {
                                 flush_renderer!();
-                                line_fragments.push(gpui::LineFragment::text(chunk.text));
+                                fragment_builder.push_fragments(&mut line_fragments, chunk.text);
                             }
                             line.push_str(chunk.text);
                         }
@@ -1151,6 +1256,7 @@ impl WrapSnapshot {
                     for boundary in line_wrapper.wrap_line_with_indent(
                         &line_fragments,
                         wrap_width / row_scale,
+                        indent_adjustment,
                         hanging_indents
                             .indent_for_tab_row(&new_tab_snapshot, edit.new_rows.start + i as u32),
                     ) {
@@ -1456,7 +1562,7 @@ impl WrapSnapshot {
         let (.., item) = self.transforms.find::<WrapPoint, _>(
             (),
             &WrapPoint::new(row + WrapRow(1), 0),
-            Bias::Right,
+            Bias::Left,
         );
         item.and_then(|transform| {
             if transform.is_isomorphic() {
@@ -1711,7 +1817,7 @@ impl WrapPointCursor<'_> {
     #[ztracing::instrument(skip_all)]
     pub fn map(&mut self, point: TabPoint) -> WrapPoint {
         let cursor = &mut self.cursor;
-        if cursor.did_seek() {
+        if cursor.did_seek() && point >= cursor.start().0 {
             cursor.seek_forward(&point, Bias::Right);
         } else {
             cursor.seek(&point, Bias::Right);
@@ -1852,6 +1958,15 @@ impl Iterator for WrapRows<'_> {
         } else {
             buffer_row
         })
+    }
+}
+
+fn indent_adjustment_for(indent: SoftWrapIndent, tab_size: NonZeroU32) -> IndentAdjustment {
+    match indent {
+        SoftWrapIndent::None => IndentAdjustment::NoIndent,
+        SoftWrapIndent::Same => IndentAdjustment::SameIndent,
+        SoftWrapIndent::ExtraOne => IndentAdjustment::ExtraColumns(tab_size.get()),
+        SoftWrapIndent::ExtraTwo => IndentAdjustment::ExtraColumns(tab_size.get() * 2),
     }
 }
 
@@ -2036,7 +2151,11 @@ mod tests {
     use super::*;
     use crate::{
         MultiBuffer,
-        display_map::{fold_map::FoldMap, inlay_map::InlayMap, tab_map::TabMap},
+        display_map::{
+            fold_map::{FoldMap, FoldSnapshot},
+            inlay_map::InlayMap,
+            tab_map::TabMap,
+        },
         test::test_font,
     };
     use futures::stream::StreamExt;
@@ -2118,6 +2237,101 @@ mod tests {
         assert_eq!(replayed.to_string(), snapshot.to_string());
     }
 
+    fn init_wrap_test(
+        text: &str,
+        tab_size: NonZeroU32,
+        soft_wrapping: Option<Pixels>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<WrapMap>, TabMap, FoldSnapshot) {
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let _font_id = text_system.resolve_font(&font);
+        let font_size = px(14.0);
+
+        let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (mut tab_map, _) = TabMap::new(fold_snapshot.clone(), tab_size);
+        let tabs_snapshot = tab_map.set_max_expansion_column(32);
+        let (wrap_map, _) =
+            cx.update(|cx| WrapMap::new(tabs_snapshot, font, font_size, soft_wrapping, cx));
+        (wrap_map, tab_map, fold_snapshot)
+    }
+
+    #[gpui::test]
+    async fn test_soft_wrap_indent(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text = "fn main() {\n    let some_variable = 1;\n    let some_variable = 2;\n}";
+        let (wrap_map, _, _) =
+            init_wrap_test(text, 4.try_into().unwrap(), Some(px(14.0) * 15.0), cx);
+
+        // Test None
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::None, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n1;\n    let some_variable = \n2;\n}"
+        );
+        assert_eq!(wrap_snapshot.soft_wrap_indent(WrapRow(1)), Some(0));
+
+        // Test Same
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::Same, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n    1;\n    let some_variable = \n    2;\n}"
+        );
+
+        // Test ExtraOne
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraOne, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n        1;\n    let some_variable = \n        2;\n}"
+        );
+
+        // Test ExtraTwo
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraTwo, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n            1;\n    let some_variable = \n            2;\n}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_soft_wrap_indent_updates_on_tab_size_change(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text = "    let x = 1;\n";
+        let (wrap_map, mut tab_map, fold_snapshot) =
+            init_wrap_test(text, 4.try_into().unwrap(), Some(px(14.0) * 8.0), cx);
+
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraOne, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(wrap_snapshot.text(), "    let x = \n        1;\n");
+
+        // Change tab_size to 2
+        let (tabs_snapshot, tab_edits) =
+            tab_map.sync(fold_snapshot, Vec::new(), 2.try_into().unwrap());
+        let (wrap_snapshot, _) =
+            wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot, tab_edits, cx));
+        assert_eq!(wrap_snapshot.text(), "    let x = \n      1;\n");
+    }
+
     #[gpui::test]
     async fn test_prev_row_boundary(cx: &mut gpui::TestAppContext) {
         init_test(cx);
@@ -2183,6 +2397,115 @@ mod tests {
         assert_eq!(row.0, 3);
     }
 
+    #[gpui::test]
+    async fn test_invisibles_become_width_measured_elements(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let font_size = px(14.0);
+        let mut fragment_builder = LineFragmentBuilder::new(text_system, &font, font_size);
+
+        let mut fragments = Vec::new();
+        fragment_builder.push_fragments(&mut fragments, "ab\u{7f}cd\u{80}\u{81}e");
+        let shapes = fragments
+            .iter()
+            .map(|fragment| match fragment {
+                LineFragment::Text { text } => (false, text.len()),
+                LineFragment::Element { len_utf8, width } => {
+                    assert!(
+                        *width > px(0.),
+                        "invisible characters must carry the measured width of their \
+                         replacement glyph so the wrapper accounts for what the renderer \
+                         actually draws"
+                    );
+                    (true, *len_utf8)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            vec![
+                (false, 2),
+                (true, 1),
+                (false, 2),
+                (true, 2),
+                (true, 2),
+                (false, 1),
+            ],
+            "invisible chars must become single-char elements with exact utf8 lengths, \
+             keeping the wrapper's byte offsets aligned with the source text"
+        );
+
+        let mut plain_fragments = Vec::new();
+        fragment_builder.push_fragments(&mut plain_fragments, "plain text");
+        assert_eq!(
+            plain_fragments.len(),
+            1,
+            "text without invisibles must stay one fragment"
+        );
+        assert_eq!(
+            plain_fragments.first().map(|fragment| match fragment {
+                LineFragment::Text { text } => text.len(),
+                LineFragment::Element { len_utf8, .. } => *len_utf8,
+            }),
+            Some(10),
+        );
+
+        let mut preserved_fragments = Vec::new();
+        fragment_builder.push_fragments(&mut preserved_fragments, "a\u{200d}b");
+        assert_eq!(
+            preserved_fragments.len(),
+            1,
+            "combining-class invisibles like ZWJ have no replacement and must stay \
+             inside their text fragment"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_invisibles_wrap_at_replacement_glyph_width(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let font_id = text_system.resolve_font(&font);
+        let font_size = px(14.0);
+        let wrap_width = px(140.0);
+
+        let text = "\u{7f}\u{80}\u{81}\u{82}\u{83}\u{84}".repeat(20);
+        let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (mut tab_map, _) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let tabs_snapshot = tab_map.set_max_expansion_column(32);
+        let (_wrap_map, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tabs_snapshot, font, font_size, Some(wrap_width), cx));
+
+        let wrapped_text = wrap_snapshot.text();
+        for row in wrapped_text.split('\n') {
+            let rendered_width = row
+                .chars()
+                .map(|ch| {
+                    let rendered_char = if is_invisible(ch) {
+                        replacement(ch).unwrap_or(ch)
+                    } else {
+                        ch
+                    };
+                    text_system.layout_width(font_id, font_size, rendered_char)
+                })
+                .fold(px(0.), |width, char_width| width + char_width);
+            assert!(
+                rendered_width <= wrap_width,
+                "a soft-wrapped row must fit the wrap width when drawn with the \
+                 replacement glyphs the renderer substitutes for invisible characters, \
+                 but this row renders at {rendered_width:?} against a wrap width of \
+                 {wrap_width:?}: {row:?}"
+            );
+        }
+    }
+
     #[gpui::test(iterations = 100)]
     async fn test_random_wraps(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
         // todo this test is flaky
@@ -2230,7 +2553,13 @@ mod tests {
         log::info!("TabMap text: {:?}", tabs_snapshot.text());
 
         let mut line_wrapper = text_system.line_wrapper(font.clone(), font_size);
-        let expected_text = wrap_text(&tabs_snapshot, wrap_width, &mut line_wrapper);
+        let mut indent_adjustment = IndentAdjustment::default();
+        let expected_text = wrap_text(
+            &tabs_snapshot,
+            wrap_width,
+            indent_adjustment,
+            &mut line_wrapper,
+        );
 
         let (wrap_map, _) =
             cx.update(|cx| WrapMap::new(tabs_snapshot.clone(), font, font_size, wrap_width, cx));
@@ -2267,8 +2596,22 @@ mod tests {
                     } else {
                         Some(px(rng.random_range(0.0..=1000.0)))
                     };
-                    log::info!("Setting wrap width to {:?}", wrap_width);
-                    wrap_map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
+                    let soft_wrap_indent = match rng.random_range(0..=3) {
+                        0 => SoftWrapIndent::None,
+                        1 => SoftWrapIndent::Same,
+                        2 => SoftWrapIndent::ExtraOne,
+                        _ => SoftWrapIndent::ExtraTwo,
+                    };
+                    indent_adjustment = indent_adjustment_for(soft_wrap_indent, tab_size);
+                    log::info!(
+                        "Setting wrap width to {:?}, indent to {:?}",
+                        wrap_width,
+                        soft_wrap_indent
+                    );
+                    wrap_map.update(cx, |map, cx| {
+                        map.set_wrap_width(wrap_width, cx);
+                        map.set_soft_wrap_indent(soft_wrap_indent, cx);
+                    });
                 }
                 20..=39 => {
                     for (fold_snapshot, fold_edits) in fold_map.randomly_mutate(&mut rng) {
@@ -2313,7 +2656,12 @@ mod tests {
             let (tabs_snapshot, tab_edits) = tab_map.sync(fold_snapshot, fold_edits, tab_size);
             log::info!("TabMap text: {:?}", tabs_snapshot.text());
 
-            let expected_text = wrap_text(&tabs_snapshot, wrap_width, &mut line_wrapper);
+            let expected_text = wrap_text(
+                &tabs_snapshot,
+                wrap_width,
+                indent_adjustment,
+                &mut line_wrapper,
+            );
             let (mut snapshot, wrap_edits) =
                 wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot.clone(), tab_edits, cx));
             snapshot.check_invariants();
@@ -2430,6 +2778,7 @@ mod tests {
     fn wrap_text(
         tab_snapshot: &TabSnapshot,
         wrap_width: Option<Pixels>,
+        indent_adjustment: IndentAdjustment,
         line_wrapper: &mut LineWrapper,
     ) -> String {
         if let Some(wrap_width) = wrap_width {
@@ -2440,7 +2789,11 @@ mod tests {
                 }
 
                 let mut prev_ix = 0;
-                for boundary in line_wrapper.wrap_line(&[LineFragment::text(line)], wrap_width) {
+                for boundary in line_wrapper.wrap_line(
+                    &[LineFragment::text(line)],
+                    wrap_width,
+                    indent_adjustment,
+                ) {
                     wrapped_text.push_str(&line[prev_ix..boundary.ix]);
                     wrapped_text.push('\n');
                     wrapped_text.push_str(&" ".repeat(boundary.next_indent as usize));

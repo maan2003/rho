@@ -4,7 +4,6 @@ use crate::GestureTuning;
 
 const VELOCITY_WINDOW: Duration = Duration::from_millis(100);
 const MOMENTUM_INTERVAL: Duration = Duration::from_millis(16);
-const MOMENTUM_STOP_VELOCITY: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Position {
@@ -85,7 +84,8 @@ struct Sample {
 struct Momentum {
     position: Position,
     velocity: Position,
-    last_at: Duration,
+    started_at: Duration,
+    emitted_distance: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -269,7 +269,8 @@ impl TouchGestureRecognizer {
                     self.momentum = Some(Momentum {
                         position: contact.position,
                         velocity,
-                        last_at: at,
+                        started_at: at,
+                        emitted_distance: 0.,
                     });
                 } else {
                     actions.push(GestureAction::Scroll {
@@ -306,25 +307,19 @@ impl TouchGestureRecognizer {
 
     pub fn advance(&mut self, at: Duration) -> Vec<GestureAction> {
         if let Some(momentum) = self.momentum.as_mut() {
-            let elapsed = at.saturating_sub(momentum.last_at);
-            if elapsed.is_zero() {
-                return Vec::new();
-            }
-            let elapsed_ms = elapsed.as_secs_f32() * 1000.0;
-            let decay = self.tuning.momentum_decay_per_ms.powf(elapsed_ms);
-            let delta = momentum.velocity.scale(elapsed.as_secs_f32());
-            momentum.velocity = momentum.velocity.scale(decay);
-            momentum.position = Position {
-                x: momentum.position.x + delta.x,
-                y: momentum.position.y + delta.y,
-            };
-            momentum.last_at = at;
-            if momentum.velocity.magnitude() < MOMENTUM_STOP_VELOCITY {
+            let elapsed = at.saturating_sub(momentum.started_at);
+            let speed = momentum.velocity.magnitude();
+            let distance = self.tuning.scroll_physics.fling_distance(speed, elapsed);
+            let delta = momentum
+                .velocity
+                .scale((distance - momentum.emitted_distance) / speed);
+            momentum.emitted_distance = distance;
+            if elapsed >= self.tuning.scroll_physics.fling_duration(speed) {
                 let position = momentum.position;
                 self.momentum = None;
                 return vec![GestureAction::Scroll {
                     position,
-                    delta: Position::default(),
+                    delta,
                     phase: Phase::Ended,
                 }];
             }

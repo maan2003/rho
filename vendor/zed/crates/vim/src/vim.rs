@@ -1733,6 +1733,12 @@ impl Vim {
         {
             context.add("VimControl");
         }
+        // `vim_mode` is replaced by "operator"/"waiting" while an operator is
+        // pending, so expose helix-ness separately to allow Helix-specific
+        // bindings in those states (e.g. text objects after `mi`/`ma`).
+        if self.mode.is_helix() {
+            context.add("helix_mode");
+        }
         context.set("vim_mode", mode);
         context.set("vim_operator", operator_id);
     }
@@ -2223,7 +2229,7 @@ impl Vim {
             return;
         }
 
-        let newest = editor.read(cx).selections.newest_anchor().clone();
+        let newest = *editor.read(cx).selections.newest_anchor();
         let is_multicursor = editor.read(cx).selections.count() > 1;
         if matches!(self.mode, Mode::Insert | Mode::Replace) && newest.start != newest.end {
             self.update_editor(cx, |_, editor, cx| {
