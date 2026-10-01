@@ -1,13 +1,9 @@
 //! How Rho Font sets text: letters by their ink, lines by their paragraph.
 //!
-//! Inside a word, each letter is spaced by its own ink, as a type designer
-//! sets sidebearings: each side measures where its ink reaches farthest and
-//! the mean white behind that across the x-height, capped where a letter
-//! opens like `c` or `r`, and takes the spacing that gives it the white of an
-//! `n`'s side. A word starts and ends the same way, so nothing is on a grid
-//! and a narrow letter's wide advance never shows as space. Measured against
-//! Source Sans's hand spacing of the same sans letters, this lands about
-//! twice as close as spacing each pair by its shared closest point.
+//! Inside a word, each letter takes its form and keeps that form's advance:
+//! the font is spaced by its ink at every MONO value (its `README.md`), so a
+//! letter from another instance sits as evenly as its neighbours, and nothing
+//! is on a grid. Ink is only kept `CLEAR` of its neighbour's.
 //!
 //! Every letter of a line takes the line's MONO value, its stretch, as in
 //! font expansion. The line wrapper asks this typesetter to break each
@@ -33,13 +29,9 @@ const PREFERRED: f32 = 0.6;
 const STRETCH: f32 = 1.;
 const WIDE: &str = "mwMW";
 const DUO_I: char = '\u{E000}';
-/// Scanlines across the x-height for ink profiles.
-const SCANLINES: usize = 12;
 /// Scanlines from descender to ascender, where ink must keep `CLEAR` apart.
 const WHOLE: usize = 24;
 const CLEAR: f32 = 0.04;
-/// How far behind a side's farthest ink its white is counted, in ems.
-const DEPTH: f32 = 0.1;
 /// Rows remembered per font size before they are all forgotten.
 const ROWS: usize = 100_000;
 
@@ -62,10 +54,6 @@ struct Face {
     /// The face at each MONO value a letter takes.
     at: Vec<(f32, FontId)>,
     duo_i: Option<GlyphId>,
-    /// The spacing an `n` has, in ems: from its right side's farthest ink
-    /// plus white to its advance, and from its origin to its left side's.
-    right: f32,
-    left: f32,
 }
 
 impl Face {
@@ -82,53 +70,8 @@ impl Face {
 #[derive(Clone)]
 struct Glyph {
     advance: f32,
-    /// `None` when the side has ink on fewer than half the x-height's
-    /// scanlines, like a hyphen or a period, whose missing scanlines would
-    /// read as white; it keeps its advance.
-    left: Option<Side>,
-    right: Option<Side>,
     /// Ink's left and right edges at scanlines from descender to ascender.
     whole: [Option<(f32, f32)>; WHOLE],
-}
-
-/// One side of a glyph's ink across the x-height.
-#[derive(Clone, Copy)]
-struct Side {
-    /// How far its ink reaches outward, from the origin.
-    reach: f32,
-    /// The mean white between that reach and the ink, at most `DEPTH`.
-    white: f32,
-}
-
-impl Side {
-    fn of(edges: [Option<f32>; SCANLINES], outward: f32) -> Option<Self> {
-        if edges.iter().flatten().count() * 2 < SCANLINES {
-            return None;
-        }
-        let reach = edges.iter().flatten().map(|x| x * outward).fold(f32::MIN, f32::max);
-        let white = edges
-            .iter()
-            .map(|x| x.map_or(DEPTH, |x| (reach - x * outward).min(DEPTH)))
-            .sum::<f32>()
-            / SCANLINES as f32;
-        Some(Side {
-            reach: reach * outward,
-            white,
-        })
-    }
-}
-
-impl Glyph {
-    /// Where the next letter's spacing starts, from this one's origin.
-    fn after(&self, face: &Face) -> f32 {
-        self.right
-            .map_or(self.advance, |s| s.reach - s.white + face.right)
-    }
-
-    /// Where this letter's origin sits, from where its spacing starts.
-    fn before(&self, face: &Face) -> f32 {
-        self.left.map_or(0., |s| face.left - s.reach - s.white)
-    }
 }
 
 /// A glyph of a line, flattened out of its run.
@@ -147,15 +90,9 @@ impl Cache {
             for mono in MONOS.iter().chain(&[0.]) {
                 at.push((*mono, ts.font_with_axis(font, MONO, *mono)?));
             }
-            let n = ts.glyph_for_char(font, 'n')?;
-            let preferred = at.iter().find(|(m, _)| *m == PREFERRED)?.1;
-            let n = self.glyph(ts, preferred, n).clone();
-            let (left, right) = (n.left?, n.right?);
             Some(Face {
                 at,
                 duo_i: ts.glyph_for_char(font, DUO_I),
-                right: n.advance - right.reach + right.white,
-                left: left.reach + left.white,
             })
         })();
         self.faces.insert(font, face.clone());
@@ -178,21 +115,11 @@ impl Cache {
                     Some(e.map_or((x, x), |(l, r)| (l.min(x), r.max(x))))
                 })
             };
-            let (mut left, mut right) = ([None; SCANLINES], [None; SCANLINES]);
-            for s in 0..SCANLINES {
-                let y = metrics.x_height / upm * (s as f32 + 0.5) / SCANLINES as f32;
-                (left[s], right[s]) = edges(y).unzip();
-            }
             let (low, high) = (metrics.descent / upm, metrics.ascent / upm);
             let whole = std::array::from_fn(|s| {
                 edges(low + (high - low) * (s as f32 + 0.5) / WHOLE as f32)
             });
-            Glyph {
-                advance,
-                left: Side::of(left, -1.),
-                right: Side::of(right, 1.),
-                whole,
-            }
+            Glyph { advance, whole }
         })
     }
 
@@ -248,19 +175,15 @@ impl Cache {
                     _ => (face.at(mono), placed.glyph.id),
                 };
                 let glyph = self.glyph(ts, form, id).clone();
-                match &prev {
-                    Some(prev) => {
-                        let even = prev.after(&face) + glyph.before(&face);
-                        x += even.max(clearance(prev, &glyph));
-                    }
-                    None => x = glyph.before(&face),
+                if let Some(prev) = &prev {
+                    x += prev.advance.max(clearance(prev, &glyph));
                 }
                 placed.font = form;
                 placed.glyph.id = id;
                 placed.glyph.position.x = px(pen + x * em);
                 prev = Some(glyph);
             }
-            pen += (x + prev.map_or(0., |p| p.after(&face))) * em;
+            pen += (x + prev.map_or(0., |p| p.advance)) * em;
             start = end;
         }
         pen
@@ -650,16 +573,27 @@ mod tests {
         let typesetter = RhoTypesetter::default();
         let mut set = shape(ts, word, font);
         typesetter.typeset(ts, word, &mut set);
-        let mut cache = typesetter.0.lock().unwrap();
         let placed = glyphs(&set);
-        let mut ink = |i: usize| {
+        let ink = |i: usize| {
             let (form, glyph) = &placed[i];
-            let glyph_ink = cache.glyph(ts, *form, glyph.id);
-            let (left, right) = (glyph_ink.left.unwrap(), glyph_ink.right.unwrap());
+            let metrics = ts.font_metrics(*form);
+            let x_height = metrics.x_height / metrics.units_per_em as f32;
+            let outline = ts.glyph_outline(*form, glyph.id).unwrap().unwrap();
+            let xs: Vec<f32> = (0..12)
+                .flat_map(|s| {
+                    let y = x_height * (s as f32 + 0.5) / 12.;
+                    outline.iter().flat_map(move |c| crossings(c, y))
+                })
+                .collect();
             let x = f32::from(glyph.position.x) / EM;
-            (x + left.reach, x + right.reach)
+            let left = xs.iter().copied().fold(f32::MAX, f32::min);
+            let right = xs.iter().copied().fold(f32::MIN, f32::max);
+            (x + left, x + right)
         };
-        (ink(0).0, f32::from(set.width) / EM - ink(placed.len() - 1).1)
+        (
+            ink(0).0,
+            f32::from(set.width) / EM - ink(placed.len() - 1).1,
+        )
     }
 
     #[test]
@@ -676,7 +610,10 @@ mod tests {
         assert!(f32::from(placed[0].1.position.x).abs() < 1e-4);
         for pair in placed.windows(2) {
             let distance = f32::from(pair[1].1.position.x - pair[0].1.position.x) / EM;
-            assert!((distance - advance).abs() < 1e-4, "{distance} against {advance}");
+            assert!(
+                (distance - advance).abs() < 1e-4,
+                "{distance} against {advance}"
+            );
         }
         assert!((f32::from(set.width) / EM - 3. * advance).abs() < 1e-4);
         Ok(())
@@ -842,6 +779,4 @@ mod tests {
         assert_eq!(pairs, 9);
         Ok(())
     }
-
-
 }

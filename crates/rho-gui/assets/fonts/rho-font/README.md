@@ -26,10 +26,18 @@ matches Duo's, and existing font-size settings read as they did.
 
 The OFL reserves "Source", "Plex" and "iA Writer", so the result carries rho's own name.
 
-The typesetter sets every line of Rho Font itself. Each letter side is
-spaced by its own ink, the way a designer sets sidebearings, to have the
-white of an `n`'s side, so a word's width comes from its letters, not
-from a grid. When the editor
+The font is spaced by its ink. Source Sans's own glyphs keep the
+designer's spacing. Every glyph rho shows from `MONO` 0.5 up (the mono
+master, the `.mono` forms and Duo's `i`) is respaced the way a designer
+sets sidebearings: each side measures where its ink reaches farthest
+across the x-height and the mean white behind that, up to 0.1 em, and
+gets the white of the Source Sans `n`'s side at the same weight. A small
+correction per letter side, fitted where this and the designer disagree
+on Source Sans's letters, applies too; it brings the spacing within
+about 4 thousandths of an em of the designer's.
+
+The typesetter sets every line of Rho Font itself, keeping each form's
+advance, so a word's width comes from its letters, not from a grid. When the editor
 wraps a paragraph, the typesetter chooses the breaks and each line's
 `MONO` value between 0.5 and 0.7 together, keeping the right edge even
 (Knuth–Plass, with `MONO` as font expansion). `m` and `w` take their
