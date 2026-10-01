@@ -9659,6 +9659,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "percent-encoding",
  "reqwest 0.12.28",
  "rustls",
  "serde",

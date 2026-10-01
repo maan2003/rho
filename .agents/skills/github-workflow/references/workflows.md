@@ -19,6 +19,15 @@ Update a PR with `api.pulls.update(number, base=..., title=..., body=...)`.
 It also accepts `state="open"`/`"closed"` and `maintainer_can_modify`.
 Creating a PR is not proof that CI passed; report its URL before a long wait.
 
+Set draft/ready state with `api.pulls.set_draft(number, draft=True/False)`.
+Read full diffs with `api.pulls.get(number,
+headers_={"Accept": "application/vnd.github.diff"})` (or `.patch` media).
+Manage PR labels/assignees/milestones through `api.issues` using the PR number;
+manage reviewers with `api.pulls.request_reviewers` and
+`api.pulls.remove_requested_reviewers`.
+
+PR merge, branch update and review-dismissal operations are not exposed.
+
 ## Reviews and comments
 
 Poll `api.issues.list_comments(number)` for conversation comments,
@@ -28,13 +37,23 @@ reviewer ID, type and association; inline comments include review ID and
 parent reply ID.
 
 `api.pulls.review_decision(number)` returns GitHub's overall GraphQL verdict
-in `.review_decision` (`NONE` when null). This is an Octo-selected helper,
+in `.review_decision` (`NONE` when null). This is an Octo-only helper,
 not an upstream REST endpoint.
 
 Reply with `api.issues.create_comment(number, body=...)` for a conversation,
 or `api.pulls.create_reply_for_review_comment(number, comment_id, body=...)`
 for an existing inline thread. Re-check the thread before retrying an
 uncertain write: Octo does not deduplicate replies.
+
+Edit existing text with `api.issues.update_comment(comment_id, body=...)` or
+`api.pulls.update_review_comment(comment_id, body=...)`; do not post correction
+comments just because editing was absent from the old client.
+
+`api.issues.create(title=..., body=...)` creates issues;
+`api.issues.update(number, state=..., labels=..., milestone=...)` updates them.
+Explicit `None` clears nullable fields; omission leaves them unchanged.
+Review submission and new inline comments are available through upstream
+methods, but require authorization for that specific live write.
 
 ## Track CI for the current head
 

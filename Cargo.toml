@@ -111,6 +111,7 @@ octo-server = { path = "agent-host/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
+percent-encoding = "2"
 pyo3 = "0.29"
 pythonize = "0.29"
 rand = "0.8"
