@@ -26,7 +26,6 @@ use crate::log::{
     SessionBinding, usage_model_of,
 };
 
-mod conversation_migration;
 mod native;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -84,9 +83,6 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 const CURRENT_AGENT_DB_FORMAT: &str = "b85e2d07";
-/// The log before the dealer read the conversation alone: statuses, waits
-/// and turn edges were rows of their own.
-const TURNS_AGENT_DB_FORMAT: &str = "1f34dc6c";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -1109,8 +1105,6 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             head.pending_notice = None;
         }
         AgentEvent::Retired { .. }
-        | AgentEvent::Turn { .. }
-        | AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
         | AgentEvent::ClaudeOutput { .. }
         | AgentEvent::ClaudeOutputHandedOff { .. }
@@ -1143,18 +1137,7 @@ pub async fn prepare(db: &rho_db::RhoDb) {
              or remove the local rho database if you do not need the saved agents."
         );
     }
-    let from = stored.as_deref().unwrap_or_default();
-    let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
-    let needs_savepoint = from == TURNS_AGENT_DB_FORMAT
-        && (!read.has_table("recovery_savepoints")
-            || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
-    if needs_savepoint {
-        db.persistent_savepoint(|write, id| {
-            write.open_table(RECOVERY).insert(&hop, &id);
-        })
-        .await;
-    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -1317,7 +1300,6 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
-        Some(TURNS_AGENT_DB_FORMAT) => conversation_migration::migrate(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \

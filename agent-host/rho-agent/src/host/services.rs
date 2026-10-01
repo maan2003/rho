@@ -506,9 +506,12 @@ mod tests {
         for _ in 0..3 {
             write.append_agent_event(
                 agent,
-                &AgentEvent::Entry(crate::entry::Entry::Status {
-                    text: "x".repeat(700_000),
+                &AgentEvent::Entry(crate::entry::Entry::Sent {
                     at: UnixMs(2),
+                    id: crate::entry::MessageId::new(),
+                    to: crate::entry::Party::Human,
+                    text: "x".repeat(700_000),
+                    kind: rho_agent_types::SendKind::Status,
                 }),
             );
         }
@@ -556,7 +559,7 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert!(
             entries.iter().all(|entry| matches!(
-                entry, crate::entry::Entry::Status { text, .. } if text.len() == 700_000
+                entry, crate::entry::Entry::Sent { text, .. } if text.len() == 700_000
             )),
             "all native history frames must reach the caller"
         );

@@ -161,9 +161,7 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             text: text.to_string(),
             at: *at,
         },
-        AgentEvent::Retired { .. } | AgentEvent::Turn { .. } | AgentEvent::Wants { .. } => {
-            return None;
-        }
+        AgentEvent::Retired { .. } => return None,
         AgentEvent::Rewound { to, at } => TranscriptEvent::Rewound {
             to: (*to).into(),
             at: *at,
@@ -247,10 +245,6 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             kind: *kind,
             at: *at,
         },
-        Entry::Status { .. }
-        | Entry::AwaitingHuman { .. }
-        | Entry::StoppedAwaitingHuman { .. }
-        | Entry::LegacyAwaiting { .. } => return None,
         Entry::Notice {
             notice: Notice::Error(error),
             at,

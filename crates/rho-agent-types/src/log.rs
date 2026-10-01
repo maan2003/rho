@@ -48,35 +48,6 @@ pub enum SendKind {
     Other,
 }
 
-// The three below are read only by the agent host's conversation
-// migration (`rho-agent/src/db/conversation_migration.rs`); they go with it.
-
-/// What a turn asks of the person.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentWant {
-    /// Something concrete to look at.
-    Show,
-    /// Something only the person can give: a decision, or an act.
-    Ask,
-    /// The person asked a question and this reply answers it.
-    Answer,
-}
-
-/// How a turn stopped.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum TurnOutcome {
-    Completed,
-    Cancelled,
-    Errored { message: String },
-}
-
-/// A turn beginning or ending.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum TurnEdge {
-    Started,
-    Ended(TurnOutcome),
-}
-
 /// One field of a sidecar proposal. `Clear` stays distinct from
 /// `Unchanged` so a stale label can be dropped without inventing a new one.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

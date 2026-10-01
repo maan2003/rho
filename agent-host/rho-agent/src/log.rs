@@ -5,8 +5,7 @@ use std::borrow::Cow;
 use redb_derive::{Key, Value as RedbValue};
 use rho_agent_types::transcript::{MessageSender, PendingInferenceResponse};
 use rho_agent_types::{
-    AdvisorIntelligence, AgentId, AgentRole, AgentWant, ContentPart, EngineerIntelligence, Place,
-    TurnEdge, UnixMs,
+    AdvisorIntelligence, AgentId, AgentRole, ContentPart, EngineerIntelligence, Place, UnixMs,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -572,17 +571,6 @@ pub enum AgentEvent<'a> {
     /// One of the Rho runtime's own rows.
     #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
-    // Read only by the conversation migration (`db/conversation_migration.rs`),
-    // which rewrites every one; nothing writes them. They go with it.
-    Turn {
-        edge: TurnEdge,
-        at: UnixMs,
-    },
-    Wants {
-        want: AgentWant,
-        summary: Option<String>,
-        at: UnixMs,
-    },
 }
 
 /// Leased notebook contributions transferred to durable host ownership before

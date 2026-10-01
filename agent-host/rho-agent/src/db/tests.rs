@@ -579,25 +579,6 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
-async fn migration_takes_one_savepoint() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.open_table(FORMAT).insert(&(), &"1f34dc6c".to_owned());
-    write.commit();
-    prepare(&db).await;
-    assert_eq!(
-        db.read().open_table(FORMAT).get(&()).unwrap().value(),
-        CURRENT_AGENT_DB_FORMAT
-    );
-    assert_eq!(savepoints(&db).await.len(), 1);
-
-    // A second open does not run the migration or create another savepoint.
-    prepare(&db).await;
-    assert_eq!(savepoints(&db).await.len(), 1);
-}
-
-#[tokio::test]
 async fn current_agent_db_format_is_accepted_on_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -1311,87 +1292,6 @@ async fn native_recovery_notices_follow_visible_branch() {
     write.commit();
     let recovery = db.read().agent_native_recovery(agent);
     assert!(!recovery.archived && !recovery.woken);
-}
-
-#[tokio::test]
-async fn migration_rewrites_the_conversation_in_place() {
-    use rho_agent_types::{SendKind, TurnEdge, TurnOutcome};
-
-    use crate::entry::{Entry, Notice, Party};
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent = create(&mut write, None, None);
-    let errored = |message: &str, at| AgentEvent::Turn {
-        edge: TurnEdge::Ended(TurnOutcome::Errored {
-            message: message.to_owned(),
-        }),
-        at: UnixMs(at),
-    };
-    for event in [
-        AgentEvent::Turn {
-            edge: TurnEdge::Started,
-            at: UnixMs(2),
-        },
-        AgentEvent::Entry(Entry::Status {
-            at: UnixMs(3),
-            text: "reading".to_owned(),
-        }),
-        AgentEvent::Entry(Entry::Status {
-            at: UnixMs(4),
-            text: String::new(),
-        }),
-        errored("quota", 5),
-        errored("the agent host stopped during this turn", 6),
-        AgentEvent::Entry(Entry::AwaitingHuman { at: UnixMs(7) }),
-        AgentEvent::Entry(Entry::StoppedAwaitingHuman { at: UnixMs(8) }),
-        AgentEvent::Entry(Entry::LegacyAwaiting {
-            at: UnixMs(9),
-            since: None,
-        }),
-        AgentEvent::Wants {
-            want: rho_agent_types::AgentWant::Ask,
-            summary: None,
-            at: UnixMs(10),
-        },
-        user_event("untouched"),
-    ] {
-        write.append_agent_event(agent, &event);
-    }
-    write.open_table(FORMAT).insert(&(), &"1f34dc6c".to_owned());
-    write.commit();
-    let before = db.read().agent_events(agent).1.len();
-
-    prepare(&db).await;
-
-    let read = db.read();
-    assert_eq!(
-        read.open_table(FORMAT).get(&()).unwrap().value(),
-        CURRENT_AGENT_DB_FORMAT
-    );
-    let events = read.agent_events(agent).1;
-    assert_eq!(events.len(), before, "rows are rewritten, never removed");
-    let retired = |at| AgentEvent::Retired { at: UnixMs(at) };
-    assert_eq!(events[1], retired(2));
-    assert!(matches!(
-        &events[2],
-        AgentEvent::Entry(Entry::Sent { at: UnixMs(3), to: Party::Human, text, kind: SendKind::Status, .. })
-            if text == "reading"
-    ));
-    assert_eq!(events[3], retired(4));
-    assert_eq!(
-        events[4],
-        AgentEvent::Entry(Entry::Notice {
-            at: UnixMs(5),
-            notice: Notice::Stopped("quota".to_owned()),
-        })
-    );
-    assert_eq!(
-        events[5..10],
-        [retired(6), retired(7), retired(8), retired(9), retired(10)]
-    );
-    assert_eq!(events[10], user_event("untouched"));
 }
 
 #[tokio::test]

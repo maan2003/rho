@@ -195,24 +195,6 @@ pub enum Entry {
         #[senax(default)]
         kind: SendKind,
     },
-    // The three rows below are read only by the conversation migration
-    // (`db/conversation_migration.rs`), which rewrites every one of them;
-    // nothing writes them. They go with it.
-    Status {
-        at: UnixMs,
-        text: String,
-    },
-    AwaitingHuman {
-        at: UnixMs,
-    },
-    StoppedAwaitingHuman {
-        at: UnixMs,
-    },
-    #[senax(rename = "Awaiting")]
-    LegacyAwaiting {
-        at: UnixMs,
-        since: Option<UnixMs>,
-    },
     Notice {
         at: UnixMs,
         notice: Notice,
@@ -309,10 +291,6 @@ impl Entry {
             | Entry::RequestSent { at, .. }
             | Entry::Received { at, .. }
             | Entry::Sent { at, .. }
-            | Entry::Status { at, .. }
-            | Entry::AwaitingHuman { at }
-            | Entry::StoppedAwaitingHuman { at }
-            | Entry::LegacyAwaiting { at, .. }
             | Entry::Notice { at, .. }
             | Entry::CompactionTrigger { at, .. } => *at,
         }
