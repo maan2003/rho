@@ -13,7 +13,7 @@ user put away, which they open to be dealt from it.
 
 An agent reaches the user only through their conversation: its sends, the
 user's messages, and the host's notices about it. Its mail with other
-agents, and whether it is running, never rank. Every send names its kind,
+agents is never unread, and whether it is running never ranks. Every send names its kind,
 picked by these questions in order:
 
 ```
@@ -35,13 +35,13 @@ own, reads it through to its end. Opening it reads nothing.
 | A1 | An unread ask | "asks", rises |
 | A2 | An unread result | "result", below an ask, fades, gone after ~3 days |
 | A3 | An unread other | low, fades within a day |
-| A4 | A status | nothing; it replaces the agent's status line |
+| A4 | A status | nothing; it is the agent's status line until any later message, from either side, hides it |
 | A5 | Several unread sends | one card, of the strongest kind, counting from its oldest unread send |
 | A6 | Read | nothing until a newer send that is not a status |
 | A7 | The user wrote within the hour before the send | a bonus, fading over the hour |
 | A8 | Notice: it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask |
 | A9 | Notice: an error the host retries by itself | nothing |
-| A10 | Notice: an engineer another agent started for the user, with its brief | as a result |
+| A10 | An engineer another agent started for the user | its brief opens the conversation as context, never unread; it deals by its own sends |
 | A11 | Made by another agent for its own work | nothing; it belongs to that agent |
 | A12 | Running, waiting, or idle | changes nothing |
 | A13 | Muted, or its host is gone | nothing |
