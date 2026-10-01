@@ -6,8 +6,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::protocol::{AssistantMessage, SystemCompactMetadata, UserOutputMessage};
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionMessagesOptions {
     pub limit: Option<usize>,
@@ -23,13 +21,6 @@ pub struct SessionMessage {
     pub message: Value,
     pub parent_tool_use_id: Option<String>,
     pub timestamp: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionUsageSample {
-    pub timestamp: Option<String>,
-    pub model: Option<String>,
-    pub usage: crate::protocol::TokenUsage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +44,6 @@ struct TranscriptEntry {
     logical_parent_uuid: Option<Uuid>,
     #[serde(default)]
     message: Value,
-    request_id: Option<String>,
     timestamp: Option<String>,
     #[serde(alias = "parent_tool_use_id")]
     parent_tool_use_id: Option<String>,
@@ -85,7 +75,6 @@ enum TranscriptEntryKind {
 #[serde(rename_all = "camelCase")]
 struct CompactMetadata {
     preserved_segment: Option<PreservedSegment>,
-    post_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -171,93 +160,6 @@ fn parse_transcript_entries(text: &str, source: &str) -> Result<Vec<TranscriptEn
     Ok(entries)
 }
 
-/// One line of a session's active branch, in the shape the stream's
-/// event for it has: what a reader of the file gets where a listener
-/// of the stream got an event.
-#[derive(Clone, Debug)]
-pub enum SessionLine {
-    User(UserOutputMessage),
-    Assistant(AssistantMessage),
-    Compacted {
-        uuid: Uuid,
-        timestamp: Option<String>,
-        metadata: SystemCompactMetadata,
-    },
-}
-
-/// The file's active branch, oldest first, as `SessionLine`s.
-pub async fn read_session_lines(transcript_path: &Utf8Path) -> Result<Vec<SessionLine>> {
-    let entries = read_transcript_entries(transcript_path).await?;
-    session_lines(&entries)
-}
-
-/// `read_session_lines` over the file's text.
-pub fn parse_session_lines(text: &str) -> Result<Vec<SessionLine>> {
-    let entries = parse_transcript_entries(text, "<text>")?;
-    session_lines(&entries)
-}
-
-fn session_lines(entries: &[TranscriptEntry]) -> Result<Vec<SessionLine>> {
-    latest_chain(entries)
-        .into_iter()
-        .filter(|entry| entry.visible(true))
-        .filter_map(|entry| to_session_line(entry).transpose())
-        .collect()
-}
-
-fn to_session_line(entry: &TranscriptEntry) -> Result<Option<SessionLine>> {
-    let Some(uuid) = entry.uuid else {
-        return Ok(None);
-    };
-    Ok(Some(match entry.kind {
-        TranscriptEntryKind::Assistant => {
-            if entry.message.is_null() {
-                return Ok(None);
-            }
-            SessionLine::Assistant(AssistantMessage {
-                session_id: entry.session_id,
-                message: serde_json::from_value(entry.message.clone())
-                    .with_context(|| format!("assistant line {uuid}"))?,
-                parent_tool_use_id: entry.parent_tool_use_id.clone(),
-                uuid: Some(uuid.to_string()),
-                timestamp: entry.timestamp.clone(),
-            })
-        }
-        TranscriptEntryKind::User => {
-            if entry.message.is_null() {
-                return Ok(None);
-            }
-            SessionLine::User(UserOutputMessage {
-                session_id: entry.session_id,
-                message: Some(
-                    serde_json::from_value(entry.message.clone())
-                        .with_context(|| format!("user line {uuid}"))?,
-                ),
-                parent_tool_use_id: entry.parent_tool_use_id.clone(),
-                uuid: Some(uuid.to_string()),
-                is_replay: entry.is_replay,
-                is_synthetic: entry.is_synthetic,
-                timestamp: entry.timestamp.clone(),
-            })
-        }
-        TranscriptEntryKind::System if entry.subtype.as_deref() == Some("compact_boundary") => {
-            SessionLine::Compacted {
-                uuid,
-                timestamp: entry.timestamp.clone(),
-                metadata: SystemCompactMetadata {
-                    trigger: None,
-                    pre_tokens: None,
-                    post_tokens: entry
-                        .compact_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.post_tokens),
-                },
-            }
-        }
-        _ => return Ok(None),
-    }))
-}
-
 pub async fn read_session_messages_by_id(
     projects: &Utf8Path,
     session_id: Uuid,
@@ -268,92 +170,6 @@ pub async fn read_session_messages_by_id(
         return Ok(Vec::new());
     };
     read_session_messages(&transcript_path, options).await
-}
-
-/// Reads every recorded assistant usage snapshot, including forked and
-/// sidechain entries that are intentionally omitted from the visible chat.
-pub async fn read_session_usage_by_id(
-    projects: &Utf8Path,
-    session_id: Uuid,
-    cwd: &Utf8Path,
-) -> Result<Vec<SessionUsageSample>> {
-    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
-        return Ok(Vec::new());
-    };
-    let entries = read_transcript_entries(&transcript_path).await?;
-    Ok(session_usage(entries))
-}
-
-fn session_usage(entries: Vec<TranscriptEntry>) -> Vec<SessionUsageSample> {
-    let mut requests = HashMap::<String, SessionUsageSample>::new();
-    for entry in entries {
-        if entry.kind != TranscriptEntryKind::Assistant {
-            continue;
-        }
-        let Some(request_id) = entry.request_id.or_else(|| {
-            entry
-                .message
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }) else {
-            continue;
-        };
-        let Ok(usage) =
-            serde_json::from_value(entry.message.get("usage").cloned().unwrap_or_default())
-        else {
-            continue;
-        };
-        requests
-            .entry(request_id)
-            .and_modify(|sample| {
-                sample.timestamp = sample.timestamp.take().max(entry.timestamp.clone());
-                if sample.model.is_none() {
-                    sample.model = entry
-                        .message
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                }
-                merge_max_usage(&mut sample.usage, &usage);
-            })
-            .or_insert(SessionUsageSample {
-                timestamp: entry.timestamp,
-                model: entry
-                    .message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                usage,
-            });
-    }
-    requests.into_values().collect()
-}
-
-fn merge_max_usage(base: &mut crate::protocol::TokenUsage, update: &crate::protocol::TokenUsage) {
-    base.input_tokens = base.input_tokens.max(update.input_tokens);
-    base.output_tokens = base.output_tokens.max(update.output_tokens);
-    base.cache_creation_input_tokens = base
-        .cache_creation_input_tokens
-        .max(update.cache_creation_input_tokens);
-    base.cache_read_input_tokens = base
-        .cache_read_input_tokens
-        .max(update.cache_read_input_tokens);
-    if base.cache_creation.is_none() {
-        base.cache_creation.clone_from(&update.cache_creation);
-    }
-}
-
-pub async fn read_session_context_used_by_id(
-    projects: &Utf8Path,
-    session_id: Uuid,
-    cwd: &Utf8Path,
-) -> Result<Option<u64>> {
-    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
-        return Ok(None);
-    };
-    let entries = read_transcript_entries(&transcript_path).await?;
-    Ok(latest_context_used(&entries))
 }
 
 /// Where a session's transcript is, under the `projects/` tree the caller
@@ -639,33 +455,6 @@ fn is_auxiliary_user_text(text: &str) -> bool {
         || text.starts_with("<task-notification>")
 }
 
-fn latest_context_used(entries: &[TranscriptEntry]) -> Option<u64> {
-    entries
-        .iter()
-        .filter(|entry| entry.visible(true))
-        .filter_map(entry_context_used)
-        .next_back()
-}
-
-fn entry_context_used(entry: &TranscriptEntry) -> Option<u64> {
-    if entry.kind == TranscriptEntryKind::System
-        && entry.subtype.as_deref() == Some("compact_boundary")
-    {
-        return entry
-            .compact_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.post_tokens);
-    }
-    if entry.kind == TranscriptEntryKind::Assistant {
-        return serde_json::from_value::<crate::protocol::TokenUsage>(
-            entry.message.get("usage")?.clone(),
-        )
-        .ok()
-        .map(|usage| usage.context_total());
-    }
-    None
-}
-
 fn to_session_message(entry: &TranscriptEntry) -> Option<SessionMessage> {
     Some(SessionMessage {
         kind: match entry.kind {
@@ -735,7 +524,6 @@ mod tests {
             parent_uuid,
             logical_parent_uuid: None,
             message: json!({"role": "user", "content": "hello"}),
-            request_id: None,
             timestamp: None,
             parent_tool_use_id: None,
             is_meta: None,
@@ -748,78 +536,6 @@ mod tests {
             subtype: None,
             compact_metadata: None,
         }
-    }
-
-    #[test]
-    fn restores_context_from_latest_compaction_boundary() {
-        let a = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
-        let b = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
-        let mut assistant = entry(TranscriptEntryKind::Assistant, a, None);
-        assistant.message =
-            json!({"role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 5}});
-        let mut compact = entry(TranscriptEntryKind::System, b, Some(a));
-        compact.subtype = Some("compact_boundary".to_owned());
-        compact.compact_metadata = Some(CompactMetadata {
-            preserved_segment: None,
-            post_tokens: Some(7),
-        });
-
-        assert_eq!(latest_context_used(&[assistant, compact]), Some(7));
-    }
-
-    #[test]
-    fn usage_includes_assistant_entries_outside_visible_chain() {
-        let root = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
-        let branch = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
-        let latest = uuid::uuid!("00000000-0000-4000-8000-00000000000c");
-        let snapshot = uuid::uuid!("00000000-0000-4000-8000-00000000000d");
-        let root = entry(TranscriptEntryKind::User, root, None);
-        let mut branch = entry(TranscriptEntryKind::Assistant, branch, root.uuid);
-        branch.is_sidechain = Some(true);
-        branch.request_id = Some("request-branch".to_owned());
-        branch.timestamp = Some("2026-07-02T08:24:49Z".to_owned());
-        branch.message = json!({
-            "model": "claude-opus-5",
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_creation_input_tokens": 12,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 0,
-                    "ephemeral_1h_input_tokens": 12
-                }
-            }
-        });
-        let mut latest = entry(TranscriptEntryKind::Assistant, latest, root.uuid);
-        latest.request_id = Some("request-latest".to_owned());
-        latest.timestamp = Some("2026-07-02T08:24:50Z".to_owned());
-        latest.message = json!({"usage": {"input_tokens": 20, "output_tokens": 7}});
-        let mut snapshot = entry(TranscriptEntryKind::Assistant, snapshot, latest.uuid);
-        snapshot.request_id = Some("request-latest".to_owned());
-        snapshot.timestamp = Some("2026-07-02T08:24:51Z".to_owned());
-        snapshot.message = json!({"usage": {"input_tokens": 25, "output_tokens": 9}});
-
-        let usage = session_usage(vec![root, branch, latest, snapshot]);
-
-        assert_eq!(usage.len(), 2);
-        let opus = usage
-            .iter()
-            .find(|sample| sample.model.as_deref() == Some("claude-opus-5"))
-            .unwrap();
-        assert_eq!(
-            opus.usage
-                .cache_creation
-                .as_ref()
-                .and_then(|cache| cache.ephemeral_1h_input_tokens),
-            Some(12)
-        );
-        assert_eq!(
-            usage
-                .iter()
-                .map(|sample| sample.usage.input_tokens.unwrap_or(0))
-                .sum::<u64>(),
-            35
-        );
     }
 
     #[test]

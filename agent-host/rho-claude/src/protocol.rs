@@ -67,10 +67,6 @@ impl InputMessage {
         Self::User(UserInput::text(text, None))
     }
 
-    pub(crate) fn user_with_uuid(text: impl Into<String>, uuid: String) -> Self {
-        Self::User(UserInput::text(text, Some(uuid)))
-    }
-
     pub(crate) fn user_content_with_uuid(content: Vec<InputContent>, uuid: String) -> Self {
         Self::User(UserInput::content(content, Some(uuid)))
     }

@@ -187,15 +187,6 @@ impl ClaudeCode {
             .await
     }
 
-    pub async fn send_user_message_with_uuid(
-        &mut self,
-        text: impl Into<String>,
-        uuid: String,
-    ) -> Result<()> {
-        self.write_message(&protocol::InputMessage::user_with_uuid(text, uuid))
-            .await
-    }
-
     pub async fn send_user_content_with_uuid(
         &mut self,
         content: Vec<rho_agent_types::ContentPart>,
@@ -219,16 +210,6 @@ impl ClaudeCode {
         self.write_message(&protocol::InputMessage::user_content_with_uuid(
             content, uuid,
         ))
-        .await
-    }
-
-    pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
-        self.write_control_request(serde_json::json!({
-                "subtype": "apply_flag_settings",
-                "settings": {
-                    "effortLevel": effort.as_arg(),
-                },
-        }))
         .await
     }
 
@@ -507,18 +488,6 @@ mod tests {
                 "parent_tool_use_id": null,
                 "uuid": null,
             })
-        );
-    }
-
-    #[test]
-    fn builds_user_message_with_uuid() {
-        assert_eq!(
-            serde_json::to_value(protocol::InputMessage::user_with_uuid(
-                "hello",
-                "prompt-1".to_owned()
-            ))
-            .unwrap()["uuid"],
-            "prompt-1"
         );
     }
 

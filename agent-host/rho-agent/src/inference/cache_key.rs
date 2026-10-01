@@ -15,13 +15,4 @@ impl PromptCacheKey {
     pub fn to_bytes(self) -> [u8; 8] {
         self.0
     }
-
-    pub fn debug_file_stem(self) -> String {
-        let mut stem = String::with_capacity(self.0.len() * 2);
-        for byte in self.0 {
-            use std::fmt::Write as _;
-            let _ = write!(&mut stem, "{byte:02x}");
-        }
-        stem
-    }
 }

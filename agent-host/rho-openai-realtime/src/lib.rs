@@ -99,21 +99,6 @@ impl Sideband {
         Ok(())
     }
 
-    pub async fn append_session(
-        &mut self,
-        channel: ContextChannel,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        for chunk in utf8_chunks(text, CONTEXT_APPEND_MAX_BYTES) {
-            self.send(&ProviderCommand::SessionContextAppend {
-                channel,
-                content: [ProviderCommandContent::InputText { text: chunk }],
-            })
-            .await?;
-        }
-        Ok(())
-    }
-
     async fn send(&mut self, command: &ProviderCommand<'_>) -> anyhow::Result<()> {
         let text = serde_json::to_string(command).context("encode realtime sideband command")?;
         tokio::time::timeout(SEND_TIMEOUT, self.socket.send(Message::Text(text.into())))
@@ -366,19 +351,6 @@ impl TranscriptState {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    pub fn take_tail(&mut self) -> Option<String> {
-        if !self
-            .entries
-            .iter()
-            .any(|entry| entry.role == TranscriptRole::User && !entry.text.trim().is_empty())
-        {
-            self.take_snapshot();
-            return None;
-        }
-        let tail = self.take_snapshot();
-        (!tail.trim().is_empty()).then_some(tail)
     }
 
     fn delta(&mut self, role: TranscriptRole, delta: &str, item_id: Option<&str>) {
@@ -653,11 +625,6 @@ enum ProviderCommand<'a> {
         channel: ContextChannel,
         content: [ProviderCommandContent<'a>; 1],
     },
-    #[serde(rename = "session.context.append")]
-    SessionContextAppend {
-        channel: ContextChannel,
-        content: [ProviderCommandContent<'a>; 1],
-    },
 }
 
 #[derive(Serialize)]
@@ -729,7 +696,7 @@ mod tests {
             text: "all done".to_owned(),
             item_id: Some("a1".to_owned()),
         });
-        assert_eq!(transcript.take_tail(), None);
+        assert_eq!(transcript.take_snapshot(), "assistant: all done");
 
         for (role, id) in [
             (TranscriptRole::User, "u2"),

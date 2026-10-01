@@ -62,10 +62,6 @@ impl Controller {
                 Self::Rho(agent) => agent.retry(),
                 Self::Claude(_) => {}
             },
-            Control::Effort(effort) => match self {
-                Self::Claude(agent) => agent.set_effort(effort).await?,
-                Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
-            },
             Control::Role(role) => match self {
                 Self::Rho(agent) => agent.change_role(role).await?,
                 Self::Claude(agent) => agent.change_role(role).await?,

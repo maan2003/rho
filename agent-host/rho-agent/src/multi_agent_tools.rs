@@ -158,11 +158,6 @@ pub(crate) struct SpawnArgs {
     pub(crate) workdir: Option<String>,
 }
 
-pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
-    anyhow::ensure!(role == "med-eng", "only med-eng spawning is supported");
-    Ok(AgentRole::default())
-}
-
 async fn spawn_engineer(tools: &MultiAgentTools, args: SpawnArgs) -> anyhow::Result<String> {
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
@@ -334,12 +329,6 @@ async fn interrupt_engineer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_spawn_role() {
-        assert_eq!(parse_spawn_role("med-eng").unwrap(), AgentRole::default());
-        assert!(parse_spawn_role("terra").is_err());
-    }
 
     #[test]
     fn engineer_modes_choose_the_requested_advisor_tiers() {

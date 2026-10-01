@@ -36,7 +36,6 @@ pub(crate) enum Control {
     Compact,
     Cancel,
     Retry,
-    Effort(rho_claude::Effort),
     Role(rho_agent_types::AgentRole),
     CacheKey,
     Rewind(u32),

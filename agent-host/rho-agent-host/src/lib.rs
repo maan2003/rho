@@ -31,10 +31,6 @@ pub mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
-pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    rho_rpc::protocol::socket_path()
-}
-
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
     let base = dirs::state_dir().ok_or_else(|| anyhow::anyhow!("state directory not available"))?;
     Ok(base.join("rho").join("rho.redb"))

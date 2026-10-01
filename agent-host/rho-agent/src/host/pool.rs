@@ -531,12 +531,6 @@ impl AgentPool {
         Ok(())
     }
 
-    pub fn is_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool {
-        self.db
-            .read()
-            .is_agent_response_subscribed(subscriber, target)
-    }
-
     /// Execution stopped: the usage it accrued lands now rather than at
     /// the next flush. The turn's edge itself is the log's (`Turn`).
     pub async fn settle_turn(&self, agent_id: AgentId) {

@@ -274,9 +274,6 @@ impl AgentClient {
         })
         .await
     }
-    pub async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
-        self.request(Control::Effort(effort)).await
-    }
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
         self.request(Control::Role(role)).await
     }

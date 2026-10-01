@@ -235,16 +235,6 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("agent loop is closed"))?
     }
 
-    pub async fn set_effort(&self, effort: Effort) -> anyhow::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control
-            .send(ClaudeControl::SetEffort { effort, reply })
-            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
-    }
-
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -295,10 +285,6 @@ enum ClaudeControl {
         uuid: String,
         accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
         source: InputSource,
-    },
-    SetEffort {
-        effort: Effort,
-        reply: oneshot::Sender<anyhow::Result<()>>,
     },
     ChangeRole {
         role: AgentRole,
@@ -1067,13 +1053,6 @@ impl ClaudeLoop {
                     }
                 }
             }
-            ClaudeControl::SetEffort { effort, reply } => {
-                let result = self.set_effort(effort).await;
-                if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
-                    return result;
-                }
-                let _ = reply.send(result);
-            }
             ClaudeControl::ChangeRole { role, reply } => {
                 let result = self.change_role(role).await;
                 if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
@@ -1353,17 +1332,6 @@ impl ClaudeLoop {
                 return Ok(());
             }
         }
-    }
-
-    async fn set_effort(&mut self, effort: Effort) -> anyhow::Result<()> {
-        self.effort = effort;
-        let Some(process) = self.process.as_mut() else {
-            return Ok(());
-        };
-        let request_id = process.apply_effort(effort).await?;
-        self.await_control_response(request_id, "Claude Code rejected effort update")
-            .await?;
-        Ok(())
     }
 
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
