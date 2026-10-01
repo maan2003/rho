@@ -1,6 +1,6 @@
 # Rho Font
 
-Source Sans 3 0.70 of the way to Source Code Pro, set word by word by
+Source Sans 3 0.82 of the way to Source Code Pro, set word by word by
 rho's typesetter (`src/typeset.rs`). Transcripts mix
 prose with paths and identifiers. Full monospace spends width on every
 narrow letter, and plain sans makes code look like prose. Part of the
@@ -16,7 +16,7 @@ families, such as `i`, `l`, `g` and `0`. For those, the mono master
 gets the sans outline centred in the mono advance. The mono outline
 becomes a `.mono` alternate, used only from `MONO` 0.5 up. The `.mono`
 alternates keep the sans advance at `MONO` 0, so every advance
-interpolates. The font keeps the whole `MONO` axis, defaulting to 0.7,
+interpolates. The font keeps the whole `MONO` axis, defaulting to 0.82,
 with `wght` from 400 to 700. Kerning comes
 from the sans, and OpenType features are dropped.
 
@@ -27,8 +27,8 @@ matches Duo's, and existing font-size settings read as they did.
 The OFL reserves "Source", "Plex" and "iA Writer", so the result carries rho's own name.
 
 The typesetter keeps each word's shaped width and redraws its letters
-inside it: each letter picks a `MONO` instance from 0.7 to 1 (`m` and
-`w` from 0 to 0.4) so the optical gaps between letters come out even.
+inside it: each letter picks a slimmer `MONO` instance, from 0.3 to 0.6 (`m`
+and `w` from 0 to 0.4), so the gaps open up and come out optically even.
 Monospaced words would line up but space unevenly; this keeps the
 rhythm of a grid while narrow letters stay narrow.
 

@@ -1,6 +1,6 @@
 //! How Rho Font sets a word: each letter's MONO form and where it sits.
 //!
-//! The shaper sets Rho Font at its default, MONO 0.7, and that fixes every
+//! The shaper sets Rho Font at its default, MONO 0.82, and that fixes every
 //! word's width, so wrapping, cursors and clicks stay as shaped. Inside each
 //! word, letters take equal cells (one and a half for `m` and `w`), the
 //! monospace rhythm. Each letter then picks a MONO form, and moves off its
@@ -14,9 +14,9 @@ use std::sync::Mutex;
 use gpui::{FontId, GlyphId, LineLayout, LineTypesetter, PlatformTextSystem, ShapedRun, px};
 
 const MONO: [u8; 4] = *b"MONO";
-/// Forms a letter may take, as MONO values; the slab form, MONO 1, is
-/// preferred.
-const FORMS: [f32; 4] = [0.7, 0.8, 0.9, 1.0];
+/// Forms a letter may take, as MONO values, preferring the widest. They are
+/// slimmer than the default, so the rest of each cell opens the gaps.
+const FORMS: [f32; 4] = [0.3, 0.4, 0.5, 0.6];
 /// Wide letters are cramped as slabs, so they take the sans form, MONO 0, in a
 /// wider cell.
 const WIDE_FORMS: [f32; 3] = [0.0, 0.2, 0.4];
@@ -81,7 +81,7 @@ impl Cache {
             .entry(font)
             .or_insert_with(|| {
                 let mut at = Vec::new();
-                for mono in FORMS.iter().chain(&WIDE_FORMS) {
+                for mono in FORMS.iter().chain(&WIDE_FORMS).chain(&[1.]) {
                     at.push((*mono, ts.font_with_axis(font, MONO, *mono)?));
                 }
                 Some(Face {
@@ -267,7 +267,7 @@ fn set_word(
                             mono: m,
                         })
                         .collect(),
-                    1.,
+                    FORMS[FORMS.len() - 1],
                 ),
             }
         })
