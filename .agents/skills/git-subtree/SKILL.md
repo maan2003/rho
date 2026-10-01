@@ -1,6 +1,6 @@
 ---
 name: git-subtree
-description: Use when inspecting, updating, adding, or editing an upstream project vendored into rho as a squashed git subtree (vendor/zed, vendor/brush, vendor/iroh, vendor/noq, crates/senax-encoder).
+description: Use when inspecting, updating, adding, or editing an upstream project vendored into rho as a squashed git subtree (vendor/zed, vendor/brush, vendor/moq, vendor/libvpx-rs, vendor/iroh, vendor/noq, crates/senax-encoder).
 ---
 
 # Git subtrees
@@ -11,14 +11,16 @@ behavior belongs there (editor/GPUI behavior belongs in `vendor/zed`, not
 in a Rho-side adapter), keep Rho-specific changes focused so they carry
 across an upstream update, and avoid unrelated cleanup inside a subtree.
 
-| Path | Upstream |
-|---|---|
-| `vendor/zed` | https://github.com/zed-industries/zed.git |
-| `vendor/brush` | https://github.com/reubeno/brush.git |
-| `vendor/iroh` | https://github.com/n0-computer/iroh.git |
-| `vendor/noq` | https://github.com/n0-computer/noq.git |
-| `crates/senax-encoder` | https://github.com/yossyX/senax-encoder.git |
-| `vendor/devenv` | https://github.com/cachix/devenv.git (hard fork, see its README; not updated by `subtree pull`) |
+| Path | Upstream | Branch |
+|---|---|---|
+| `vendor/zed` | https://github.com/zed-industries/zed.git | main |
+| `vendor/brush` | https://github.com/reubeno/brush.git | main |
+| `vendor/iroh` | https://github.com/n0-computer/iroh.git | main |
+| `vendor/noq` | https://github.com/n0-computer/noq.git | main |
+| `crates/senax-encoder` | https://github.com/yossyX/senax-encoder.git | main |
+| `vendor/moq` | https://github.com/moq-dev/moq.git | main |
+| `vendor/libvpx-rs` | https://github.com/shiguredo/libvpx-rs.git | develop |
+| `vendor/devenv` | https://github.com/cachix/devenv.git (hard fork, see its README; not updated by `subtree pull`) | — |
 
 The upstream baseline of a subtree is the newest squash commit reachable
 from `HEAD`, found by its trailers:
