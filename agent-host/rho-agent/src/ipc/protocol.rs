@@ -133,6 +133,8 @@ pub(crate) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
+        // TODO: drop at the next protocol VERSION bump. Every loop keeps its
+        // queue in its rows now, so workers always send `None`.
         queue: Option<Vec<crate::QueuedInput>>,
     },
     HistoryBatch {

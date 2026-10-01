@@ -40,7 +40,6 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<crate::QueuedInput>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
 }
@@ -181,8 +180,8 @@ impl HostClient {
                             let status = published.status.lock().expect("poison").upgrade()
                                 .map(|status| status.read().expect("poison").clone());
                             if let Some(status) = status {
-                                let queue = published.queue.lock().expect("poison").clone();
-                                writer.send(port, encode(&Message::Status { status, queue })?).await?;
+                                // No loop keeps its queue outside its rows any more.
+                                writer.send(port, encode(&Message::Status { status, queue: None })?).await?;
                             }
                         }
                     }

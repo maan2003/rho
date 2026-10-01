@@ -4,16 +4,16 @@
 //! The runtime writes its own events; this is
 //! the one place they become the client's words.
 
+use rho_agent::AgentEvent;
 use rho_agent::entry::{Block, Entry, Notice, Party, Report};
 use rho_agent::inference::Carry;
 use rho_agent::log::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
-use rho_agent::{AgentEvent, InputKind, QueuedInput};
+use rho_agent_types::PresentationField;
 #[cfg(test)]
 use rho_agent_types::UnixMs;
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agent_types::{ContentPart, PresentationField};
 use rho_agents_client::protocol::transcript::{
-    ArgumentsFormat, Item, QueuedItem, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
+    ArgumentsFormat, Item, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
 };
 
 pub fn runtime_kind(runtime: &AgentRuntime) -> RuntimeKind {
@@ -607,25 +607,4 @@ fn join(parts: &[AStr]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// A queued input as the wire tells it.
-pub fn queued_item(input: &QueuedInput) -> QueuedItem {
-    match &input.kind {
-        InputKind::Message { content } => QueuedItem::Message {
-            from: match input.source {
-                rho_agent_types::transcript::MessageSender::User => None,
-                rho_agent_types::transcript::MessageSender::Agent { id } => Some(id),
-            },
-            text: content
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text { text } => text.as_str(),
-                    ContentPart::Image { .. } => "[image]",
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        },
-        InputKind::Compaction => QueuedItem::Compaction,
-    }
 }

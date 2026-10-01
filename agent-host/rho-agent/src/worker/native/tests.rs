@@ -774,7 +774,6 @@ async fn code_fragments_wait_for_a_publication_frame() {
 #[tokio::test]
 async fn live_response_is_replaced_only_after_its_step_is_durable() {
     let harness = Harness::new().await;
-    let mut updates = crate::journal::feed(&harness.db);
     let script = Arc::new(Scripted::new());
     // Enough separate streamed lines to observe several distinct snapshots.
     let code = format!("value = 17\n{}end_turn()", "# still writing\n".repeat(40));
@@ -811,27 +810,6 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    // No GUI focuses this harness. Current state still reaches the host feed,
-    // but the potentially large response body is not broadcast.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut saw_responding = false;
-        loop {
-            if let crate::journal::Feed::Status { status, .. } = updates.recv().await.unwrap() {
-                assert!(
-                    status.response.is_none(),
-                    "unfocused response bodies must stay private to the worker/host cache"
-                );
-                saw_responding |= status.runtime.inference == InferenceState::Responding;
-                if status.runtime.awaiting_human && status.runtime.inference == InferenceState::Idle
-                {
-                    assert!(saw_responding);
-                    break;
-                }
-            }
         }
     })
     .await

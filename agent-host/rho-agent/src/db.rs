@@ -19,7 +19,7 @@ use crate::AgentEvent;
 use crate::inference::PromptCacheKey;
 #[cfg(test)]
 use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use crate::journal::{Feed, Journal, LogAppended};
+use crate::journal::{Journal, LogAppended};
 use crate::log::{
     AgentConfig, AgentEventPos, AgentHead, AgentOrigin, AgentRuntime, AgentSpawnedBy,
     AgentUsageBucket, AgentUsageModel, ClaudeRewind, ContextBoundary, NativeRecovery,
@@ -724,7 +724,7 @@ impl AgentWriteTxnExt for WriteTxn {
                 pos: pos.into(),
             };
             self.after_commit(move || {
-                let _ = appends.send(Feed::Appended(appended));
+                let _ = appends.send(appended);
             });
         }
         pos
