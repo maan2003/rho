@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::log::AgentRuntime;
+use rho_agent_hosts::protocol::DebugReport;
 use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -35,7 +36,7 @@ pub struct DebugArgs {
 
 #[derive(Clone, Debug, clap::Subcommand)]
 enum DebugCommand {
-    /// Snapshot the database and print persisted agent records.
+    /// Print persisted agent records.
     Agents,
     /// Snapshot the database and run pending migrations on the copy.
     Migrate,
@@ -65,9 +66,8 @@ enum DebugCommand {
     /// Print bytes stored per table and pages allocated overall for the
     /// real database. Stop the agent host first.
     Stats,
-    /// Snapshot the database and print the context usage each agent would
-    /// restore on load (event log for Rho agents, session transcript for
-    /// Claude agents).
+    /// Print the context usage each agent would restore on load (event log for
+    /// Rho agents, session transcript for Claude agents).
     Context,
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
@@ -75,8 +75,7 @@ enum DebugCommand {
         /// low-adv, med-adv, or med1-adv.
         role: String,
     },
-    /// Snapshot the database and print one agent's persisted events, each
-    /// cut to `--max-chars`.
+    /// Print one agent's persisted events, each cut to `--max-chars`.
     Transcript {
         /// Full agent id.
         agent: String,
@@ -120,7 +119,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         None => rho_claude::accounts::ClaudePaths::from_env()?,
     };
     match args.command {
-        DebugCommand::Agents => print_agents(args.db_path, &claude).await,
+        DebugCommand::Agents => print_report(args.db_path, &claude, DebugReport::Agents).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
         DebugCommand::Rollback => rollback(args.db_path).await,
         DebugCommand::Savepoints => savepoints(args.db_path).await,
@@ -129,10 +128,14 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
         DebugCommand::DeleteAgents { agents } => delete_agents(args.db_path, &agents).await,
-        DebugCommand::Context => print_context(args.db_path, &claude).await,
+        DebugCommand::Context => print_report(args.db_path, &claude, DebugReport::Context).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
         DebugCommand::Transcript { agent, max_chars } => {
-            print_transcript(args.db_path, &agent, max_chars).await
+            let report = DebugReport::Transcript {
+                agent,
+                max_chars: max_chars as u64,
+            };
+            print_report(args.db_path, &claude, report).await
         }
         DebugCommand::NewAgent {
             role,
@@ -435,21 +438,98 @@ fn copy_snapshot_unlocked(source: &Path) -> anyhow::Result<Snapshot> {
     })
 }
 
-async fn print_agents(
+/// Prints a read-only report. While the agent host runs, it renders the
+/// report from its live database; otherwise it is read from a migrated copy.
+async fn print_report(
     db_path: Option<PathBuf>,
     claude: &rho_claude::accounts::ClaudePaths,
+    report: DebugReport,
 ) -> anyhow::Result<()> {
-    let snapshot = copy_snapshot(db_path).await?;
-
+    let snapshot = match db_path {
+        Some(source) => copy_snapshot_unlocked(&source)?,
+        None => {
+            let source = default_db_path().context("resolve rho db path")?;
+            let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
+            std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
+            match copy_snapshot_from(&source, &paths.host_lock())? {
+                Some(snapshot) => snapshot,
+                None => {
+                    let path = rho_rpc::protocol::client::call(paths.socket(), report)
+                        .await
+                        .context("ask the agent host, which holds the database, for the report")?
+                        .into_std_path_buf();
+                    let _dir =
+                        SnapshotDir(path.parent().context("report has no directory")?.to_owned());
+                    let mut file = std::fs::File::open(&path)
+                        .with_context(|| format!("open report {}", path.display()))?;
+                    io::copy(&mut file, &mut io::stdout().lock())?;
+                    return Ok(());
+                }
+            }
+        }
+    };
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
+    let output = render_report(&db, &snapshot.source, claude, report).await?;
+    io::stdout().lock().write_all(output.as_bytes())?;
+    Ok(())
+}
+
+/// The agent host's half of
+/// [`host::DebugReport`](rho_agent_hosts::protocol::DebugReport): the
+/// report, read from the live `db`, in a file of a directory of its own
+/// beside it.
+pub(crate) async fn host_report(
+    db: &RhoDb,
+    claude: &rho_claude::accounts::ClaudePaths,
+    report: DebugReport,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    // Decoding every agent's log takes seconds of CPU: keep it off the
+    // runtime's workers.
+    let (live, claude) = (db.clone(), claude.clone());
+    let runtime = tokio::runtime::Handle::current();
+    let output = tokio::task::spawn_blocking(move || {
+        runtime.block_on(render_report(&live, live.path(), &claude, report))
+    })
+    .await??;
+    let dir = new_snapshot_dir(db.path())?;
+    let path = dir.0.join("report.txt");
+    std::fs::write(&path, output).with_context(|| format!("write report {}", path.display()))?;
+    let path = camino::Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| anyhow::anyhow!("report path is not UTF-8: {}", path.display()))?;
+    // Handed over: the directory is the caller's to delete now.
+    std::mem::forget(dir);
+    Ok(path)
+}
+
+/// The text of `report`, read from `db`, a copy of `source` or `source`
+/// itself.
+pub(crate) async fn render_report(
+    db: &RhoDb,
+    source: &Path,
+    claude: &rho_claude::accounts::ClaudePaths,
+    report: DebugReport,
+) -> anyhow::Result<String> {
+    match report {
+        DebugReport::Agents => render_agents(db, source, claude).await,
+        DebugReport::Context => render_context(db, source, claude).await,
+        DebugReport::Transcript { agent, max_chars } => {
+            render_transcript(db, &agent, max_chars as usize)
+        }
+    }
+}
+
+async fn render_agents(
+    db: &RhoDb,
+    source: &Path,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<String> {
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
 
     let mut output = String::new();
-    writeln!(output, "source: {}", snapshot.source.display())?;
-    writeln!(output, "snapshot: {}", snapshot.path.display())?;
+    writeln!(output, "source: {}", source.display())?;
     writeln!(output, "agents: {}", agents.len())?;
     for (agent_id, agent) in agents {
         writeln!(output)?;
@@ -486,20 +566,12 @@ async fn print_agents(
             }
         }
     }
-    io::stdout().lock().write_all(output.as_bytes())?;
-    Ok(())
+    Ok(output)
 }
 
-async fn print_transcript(
-    db_path: Option<PathBuf>,
-    agent: &str,
-    max_chars: usize,
-) -> anyhow::Result<()> {
+fn render_transcript(db: &RhoDb, agent: &str, max_chars: usize) -> anyhow::Result<String> {
     let agent_id = rho_agent_types::AgentId::from_encoded(agent)
         .with_context(|| format!("agent id {agent}"))?;
-    let snapshot = copy_snapshot(db_path).await?;
-    let db = RhoDb::open(&snapshot.path);
-    migrate_snapshot(&db).await?;
     let read = db.read();
     let mut output = String::new();
     for (index, event) in read.agent_events(agent_id).1.iter().enumerate() {
@@ -513,23 +585,20 @@ async fn print_transcript(
             writeln!(output, "   … {} more bytes", text.len() - cut)?;
         }
     }
-    io::stdout().lock().write_all(output.as_bytes())?;
-    Ok(())
+    Ok(output)
 }
 
-async fn print_context(
-    db_path: Option<PathBuf>,
+async fn render_context(
+    db: &RhoDb,
+    source: &Path,
     claude: &rho_claude::accounts::ClaudePaths,
-) -> anyhow::Result<()> {
-    let snapshot = copy_snapshot(db_path).await?;
-    let db = RhoDb::open(&snapshot.path);
-    migrate_snapshot(&db).await?;
+) -> anyhow::Result<String> {
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
 
     let mut output = String::new();
-    writeln!(output, "source: {}", snapshot.source.display())?;
+    writeln!(output, "source: {}", source.display())?;
     writeln!(output, "agents: {}", agents.len())?;
     for (agent_id, agent) in agents {
         writeln!(output)?;
@@ -621,8 +690,7 @@ async fn print_context(
             }
         }
     }
-    io::stdout().lock().write_all(output.as_bytes())?;
-    Ok(())
+    Ok(output)
 }
 
 async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {

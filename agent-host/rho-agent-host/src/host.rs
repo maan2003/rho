@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
-    GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
-    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, Snapshot,
+    DebugReport, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
+    IrohApprove, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request,
+    Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -183,6 +184,12 @@ where
         }
         Request::Snapshot(call) => {
             respond(writer, call, |Snapshot| debug::host_snapshot(&services.db)).await
+        }
+        Request::DebugReport(call) => {
+            respond(writer, call, |report: DebugReport| {
+                debug::host_report(&services.db, &services.claude, report)
+            })
+            .await
         }
         Request::IrohApprove(call) => {
             respond(writer, call, |IrohApprove { code }| async move {

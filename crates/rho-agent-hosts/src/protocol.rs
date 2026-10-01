@@ -60,6 +60,10 @@ rho_rpc::calls! {
         /// Answered with where the copy is, in a directory of its own
         /// beside the database; the copy is the caller's to delete.
         Snapshot(Snapshot) -> camino::Utf8PathBuf;
+        /// Answered with a file holding the report, in a directory of its
+        /// own beside the database; it is the caller's to delete. A report
+        /// can outgrow a frame.
+        DebugReport(DebugReport) -> camino::Utf8PathBuf;
     }
 }
 
@@ -125,6 +129,15 @@ pub struct IrohRevoke {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot;
 
+/// A read-only `rho debug` report, rendered from the agent host's live
+/// database: copying a large database costs more than reading it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum DebugReport {
+    Agents,
+    Context,
+    Transcript { agent: String, max_chars: u64 },
+}
+
 /// Maximum encoded GUI performance snapshot accepted by the agent host.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -184,6 +197,11 @@ mod tests {
             }
             .into(),
             Snapshot.into(),
+            DebugReport::Transcript {
+                agent: "00img8eiae3n".to_owned(),
+                max_chars: 200,
+            }
+            .into(),
         ] {
             round_trips(Open::Request(request));
         }
