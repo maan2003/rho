@@ -513,6 +513,81 @@ def set_max_wait(seconds):
         owner.cell.max_wait(seconds)
 
 
+def rust_importer(command):
+    """`rust_import` for a notebook whose shell commands run through `command`."""
+
+    async def rust_import(cargo_toml_path, *, release=False, shell=None):
+        """Build the PyO3 cdylib crate of `cargo_toml_path` and import it as a
+        fresh module.
+
+        The build runs in the dev shell of `shell`'s nearest flake. By default
+        that is the crate's own flake, or the notebook cwd's when the crate has
+        none, so a scratch crate borrows a repo's toolchain without a flake of
+        its own. Cargo still runs in the crate's directory, so its own
+        .cargo/config.toml applies.
+
+        CPython never unloads an extension, so each build loads from a new
+        copy: a new path gets a new dlopen with fresh PyO3 statics. Copies are
+        never overwritten, since this or another process may have one mapped.
+        """
+        import importlib.util
+        import json
+        import shlex
+        import shutil
+        import tempfile
+        import uuid
+
+        manifest = pathlib.Path(cargo_toml_path).absolute()
+        here = manifest.parent
+        if shell is None and any((d / 'flake.nix').exists() for d in (here, *here.parents)):
+            shell = here
+        python = pathlib.Path(sys.base_prefix, 'bin', 'python3')
+        with tempfile.TemporaryDirectory() as logs:
+            out, err = pathlib.Path(logs, 'out'), pathlib.Path(logs, 'err')
+            # Cranelift, which rho's .cargo/config.toml picks for local crates,
+            # emits no usable unwind info: a panic would abort the process
+            # instead of raising PanicException. Choosing a backend is unstable
+            # Cargo, enabled here for crates outside such a config.
+            await command(
+                f'cd {shlex.quote(str(here))} && '
+                f'CARGO_UNSTABLE_CODEGEN_BACKEND=true CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm '
+                f'PYO3_PYTHON={python} '
+                f'cargo build --message-format=json-render-diagnostics '
+                f'--manifest-path {shlex.quote(str(manifest))}'
+                + (' --release' if release else '')
+                + f' > {out} 2> {err}',
+                workdir=None if shell is None else str(shell),
+            )
+            messages = [json.loads(line) for line in out.read_text().splitlines()]
+            diagnostics = err.read_text()
+        built = [
+            (message['target']['name'], path)
+            for message in messages
+            if message.get('reason') == 'compiler-artifact'
+            and pathlib.Path(message['manifest_path']) == manifest
+            for path in message['filenames']
+            if path.endswith('.so')
+        ]
+        if not built:
+            raise RuntimeError(f'cargo build of {manifest} failed:\n{diagnostics[-8000:]}')
+        if 'warning' in diagnostics:
+            print(diagnostics, end='')
+        name, path = built[0]
+        loaded = pathlib.Path(path).parent / 'rust_import'
+        loaded.mkdir(exist_ok=True)
+        # A counter would restart after `cargo clean` and reuse a path this
+        # process already loaded, which CPython answers with the old module.
+        copy = loaded / f'{name}.{uuid.uuid4().hex}.so'
+        shutil.copyfile(path, copy)
+        spec = importlib.util.spec_from_file_location(name, copy)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+        return module
+
+    return rust_import
+
+
 def namespace(exports):
     """A notebook's globals, with the objects its host exports. Those are
     also importable, from the notebook's code only."""
@@ -533,6 +608,7 @@ def namespace(exports):
         'Task': Task,
         'Path': pathlib.Path,
         'pathlib': pathlib,
+        'rust_import': rust_importer(modules['command']),
         **modules,
     }
 

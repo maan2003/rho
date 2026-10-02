@@ -157,6 +157,15 @@ handle.more_output(*, max_tokens: int = 2000) → Awaitable[None]
 Stop the command.
 handle.cancel() → Awaitable[None]
 
+### Rust
+
+When Python is too slow for a job, or a Rust crate already does it, write a small PyO3 cdylib
+crate in /src/scratch/<name> and import it as a module. It may depend on crates of the
+repository you work in by path. Prefer Python otherwise. Each call rebuilds and loads a fresh
+copy. It builds in the dev shell of shell when given, else of the crate's flake, else of the
+notebook's cwd. A panic raises PanicException; a crash in Rust code ends the notebook.
+rust_import(cargo_toml_path: str, *, release: bool = False, shell: str | None = None) → Awaitable[module]
+
 ### Python output
 
 The built-in print, with a cap on how much of one call is kept. Library output on stdout and
