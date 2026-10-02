@@ -24,7 +24,8 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        // The worker installs one at startup; the notebook's web client needs it.
+        // The worker installs one at startup; the notebook's web client needs
+        // it.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));

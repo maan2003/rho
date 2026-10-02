@@ -32,8 +32,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let state_dir = tempfile::tempdir()?;
-    // Keep the agent host's state (redb, sockets) away from the user's real one,
-    // and give its terminals a shell that exists in a view.
+    // Keep the agent host's state (redb, sockets) away from the user's real
+    // one, and give its terminals a shell that exists in a view.
     // SAFETY: top of main; no other threads exist yet.
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.path());

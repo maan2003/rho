@@ -701,7 +701,8 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let read = db.read();
     let agents = read.list_agents();
     let mut events = 0usize;
-    // Check physical rows too: a later rewind must not hide an obsolete decoder.
+    // Check physical rows too: a later rewind must not hide an obsolete
+    // decoder.
     for (agent_id, head) in &agents {
         for pos in 0..head.next.pos {
             anyhow::ensure!(

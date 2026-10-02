@@ -246,7 +246,8 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
         }),
     );
 
-    // A non-image file exercises the desktop opener rather than the image viewer.
+    // A non-image file exercises the desktop opener rather than the image
+    // viewer.
     fake.add_message(
         GROUP,
         json!({

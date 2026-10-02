@@ -277,7 +277,8 @@ pub(crate) async fn run(
                                     .await;
                             }
                             execution.clients.lock().expect("poison").remove(&port);
-                            // Empty logical payload is GUI-port EOF, ordered after its final frame.
+                            // Empty logical payload is GUI-port EOF, ordered
+                            // after its final frame.
                             let _ = sender.send(port, bytes::Bytes::new()).await;
                         });
                     }
@@ -302,8 +303,9 @@ pub(crate) async fn run(
         {
             let agents = agents.lock().expect("poison");
             if let Some(incoming) = agents.get(&agent) {
-                // A retiring agent may have dropped its receiver. Its late replies
-                // are no different from replies after the route is unregistered.
+                // A retiring agent may have dropped its receiver. Its late
+                // replies are no different from replies after
+                // the route is unregistered.
                 let _ = incoming.send(packet);
                 continue;
             }

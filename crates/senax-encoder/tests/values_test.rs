@@ -2907,8 +2907,8 @@ fn test_box_is_default_behavior() {
 
 #[test]
 fn test_box_vs_arc_compatibility() {
-    // Test that Box<T> and Arc<T> encode the same way (since they both encode the
-    // inner value)
+    // Test that Box<T> and Arc<T> encode the same way (since they both encode
+    // the inner value)
     let box_value = Box::new("test".to_string());
     let arc_value = Arc::new("test".to_string());
 

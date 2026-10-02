@@ -315,7 +315,8 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let settings = ThemeSettings::get_global(cx);
-        // The grid needs a monospace face; the bundled buffer font is proportional.
+        // The grid needs a monospace face; the bundled buffer font is
+        // proportional.
         let mut font = settings.buffer_font.clone();
         font.family = ".ZedMono".into();
         let font_size = settings.buffer_font_size(cx);

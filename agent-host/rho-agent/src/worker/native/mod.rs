@@ -1037,7 +1037,8 @@ impl Agent {
         self.writing = None;
         self.publish().await?;
         let step = {
-            // The socket actor emits ordered owned events; the agent alone admits Python.
+            // The socket actor emits ordered owned events; the agent alone
+            // admits Python.
             let mut streaming = None;
             // Full replaceable snapshots copy the accumulated code. Coalesce
             // provider fragments into 50 ms display frames rather than copying

@@ -265,7 +265,8 @@ fn process_char(
         }
         (Value::Number(num), ObjectStatus::ScalarNumber { value_so_far }, c @ '0'..='9') => {
             value_so_far.push(c);
-            // if the number contains a decimal point or an exponent, parse as f64
+            // if the number contains a decimal point or an exponent, parse as
+            // f64
             if value_so_far.contains(&'.')
                 || value_so_far.contains(&'e')
                 || value_so_far.contains(&'E')

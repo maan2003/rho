@@ -171,7 +171,8 @@ pub enum Input {
     )
 )]
 pub struct FrameId {
-    /// Timestamp of the root keyframe, independent of transport stream numbering.
+    /// Timestamp of the root keyframe, independent of transport stream
+    /// numbering.
     pub epoch: u64,
     pub timestamp_us: u64,
 }

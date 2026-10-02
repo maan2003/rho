@@ -281,7 +281,8 @@ impl FakeModel {
         let task = tokio::spawn(async move {
             axum::serve(
                 listener.tap_io(|socket| {
-                    // Immediate chunks must not wait for Nagle/delayed-ACK batching.
+                    // Immediate chunks must not wait for Nagle/delayed-ACK
+                    // batching.
                     socket
                         .set_nodelay(true)
                         .expect("set fake-model TCP_NODELAY");

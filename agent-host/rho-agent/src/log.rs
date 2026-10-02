@@ -161,7 +161,7 @@ impl From<rho_agent_types::AgentPos> for AgentEventPos {
 /// A sidecar-derived title/activity update. `through` is a durable source
 /// position, not the position where this update happens to be recorded. That
 /// distinction makes a late result harmless after rewind.
-
+///
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
 /// first and reaches the head through the fold.

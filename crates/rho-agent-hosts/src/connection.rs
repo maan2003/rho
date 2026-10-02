@@ -903,8 +903,9 @@ async fn connect_iroh(
             events.unbounded_send(ConnEvent::Disconnected(format!(
                 "enroll this rho on the host: rho iroh approve {code}"
             )))?;
-            // The server closes after our auth ack. Keep the per-connection code
-            // visible long enough for approval, without racing a new code.
+            // The server closes after our auth ack. Keep the per-connection
+            // code visible long enough for approval, without racing
+            // a new code.
             let closed = CLOSED.notified();
             let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             if !closing() {

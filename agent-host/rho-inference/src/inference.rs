@@ -462,7 +462,8 @@ mod host_tests {
         )
         .await
         .unwrap();
-        // Disable discovered accounts before the client opens its credential watch.
+        // Disable discovered accounts before the client opens its credential
+        // watch.
         for namespace in host.state().namespaces {
             host.set_account_enabled(&namespace, false).await;
         }

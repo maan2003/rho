@@ -1841,9 +1841,9 @@ fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
         })
         .expect("clear initial wrap edits");
 
-    // Updating two blocks deliberately drops the single-block incremental hint and
-    // exercises transcript suffix reconstruction. The settled user excerpt must
-    // retain its identity.
+    // Updating two blocks deliberately drops the single-block incremental hint
+    // and exercises transcript suffix reconstruction. The settled user
+    // excerpt must retain its identity.
     feed_edit(&workspace, cx, agent(1), |state| {
         stream_text(state, 1, response.len(), "\nappended response");
         replace_block(

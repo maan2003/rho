@@ -483,7 +483,8 @@ fn test_rename_attribute_compatibility() {
     let mut buffer = BytesMut::new();
     new_struct.encode(&mut buffer).unwrap();
 
-    // Decode with the old struct (rename="old_name" helps to generate the same ID)
+    // Decode with the old struct (rename="old_name" helps to generate the same
+    // ID)
     let mut reader = buffer.freeze();
     let legacy = LegacyStruct::decode(&mut reader).unwrap();
 
@@ -495,8 +496,8 @@ fn test_rename_attribute_compatibility() {
 fn test_rename_with_explicit_id() {
     // Test that explicit ID takes precedence over rename-based ID calculation
 
-    // Create a struct that would have a different ID if CRC32("different_name") was
-    // used
+    // Create a struct that would have a different ID if CRC32("different_name")
+    // was used
     #[derive(Encode, Decode, Debug, PartialEq)]
     struct DifferentNameStruct {
         #[senax(id = 1)] // Same explicit ID as CompatibleWithOldName
@@ -639,8 +640,8 @@ fn test_rename_only_behavior() {
         other_field: String,
     }
 
-    // Simulate the original struct that had "original_field" as the actual field
-    // name
+    // Simulate the original struct that had "original_field" as the actual
+    // field name
     #[derive(Encode, Decode, Debug, PartialEq)]
     struct OriginalFieldStruct {
         original_field: i32, // CRC32("original_field") ID - same as rename calculation
@@ -657,8 +658,9 @@ fn test_rename_only_behavior() {
     let mut buffer = BytesMut::new();
     original.encode(&mut buffer).unwrap();
 
-    // Decode with the renamed struct - should work because rename="original_field"
-    // generates the same ID as the actual field name "original_field"
+    // Decode with the renamed struct - should work because
+    // rename="original_field" generates the same ID as the actual field
+    // name "original_field"
     let mut reader = buffer.freeze();
     let decoded = WithRenameOnly::decode(&mut reader).unwrap();
 

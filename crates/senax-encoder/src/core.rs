@@ -2099,8 +2099,9 @@ pub fn skip_value(reader: &mut impl Buf) -> Result<()> {
             Ok(())
         }
         TAG_NONE | TAG_SOME => {
-            // These should have been handled by Option<T> decode or skip_value for T
-            // For TAG_NONE, it's fine. For TAG_SOME, we need to skip the inner value.
+            // These should have been handled by Option<T> decode or skip_value
+            // for T For TAG_NONE, it's fine. For TAG_SOME, we need
+            // to skip the inner value.
             if tag == TAG_SOME {
                 skip_value(reader)?;
             }

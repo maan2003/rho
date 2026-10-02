@@ -1709,7 +1709,8 @@ impl Render for BrowserView {
                 }
                 if let Some(passthrough) = this.passthrough.take() {
                     // The release frame first closes the ordered parent hole;
-                    // only then may dropping the handle unmap/destroy the child.
+                    // only then may dropping the handle unmap/destroy the
+                    // child.
                     window.on_next_frame(move |window, _| {
                         window.on_next_frame(move |_, _| drop(passthrough));
                     });
@@ -2061,9 +2062,11 @@ impl Render for BrowserView {
                             let buffer = buffer.clone();
                             let passthrough = passthrough.clone();
                             let paint_state = passthrough_state.clone();
-                            // place_below, position, and viewport destination are
-                            // parent-latched. Commit the desynchronized child only
-                            // after this GPUI frame has committed those requests.
+                            // place_below, position, and viewport destination
+                            // are parent-latched.
+                            // Commit the desynchronized child only
+                            // after this GPUI frame has committed those
+                            // requests.
                             window.on_next_frame(move |window, cx| {
                                 let mut state = paint_state.get();
                                 if state.positioned != Some(scene_id) {
@@ -2097,8 +2100,9 @@ impl Render for BrowserView {
                     }
                     // Promotion keeps painting the texture until niri confirms
                     // the child commit was presented. Because hole punching is
-                    // an after-content pass, ordinary GPUI overlays remain above
-                    // the child once the hole becomes active.
+                    // an after-content pass, ordinary GPUI overlays remain
+                    // above the child once the hole becomes
+                    // active.
                     if state.presented == Some(*scene_id) {
                         if !state.active {
                             record_handoff_event(0, "pt-hole", *scene_id);
@@ -2122,7 +2126,8 @@ impl Render for BrowserView {
                         && let Some(passthrough) = passthrough.clone()
                     {
                         // The opaque texture is drawn before the asynchronous
-                        // null attach, so demotion cannot expose stale child pixels.
+                        // null attach, so demotion cannot expose stale child
+                        // pixels.
                         window.on_next_frame(move |_, _| passthrough.hide());
                     }
                     state = PassthroughPaintState::default();

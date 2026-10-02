@@ -160,7 +160,8 @@ fn subscribe_with(
                 }
             };
             // spawn_blocking cannot be cancelled. Keep one resolution in flight
-            // and coalesce changes rather than accumulating abandoned refreshes.
+            // and coalesce changes rather than accumulating abandoned
+            // refreshes.
             if invalidated {
                 continue;
             }

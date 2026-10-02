@@ -1445,8 +1445,9 @@ mod tests {
                 read.get_agent(parent_id).place().workset
             );
 
-            // The selected directory supplies the child's guidance, immediately after
-            // workspace context; identity belongs with collaboration, not that guidance.
+            // The selected directory supplies the child's guidance, immediately
+            // after workspace context; identity belongs with
+            // collaboration, not that guidance.
             let team = crate::multi_agent_tools::MultiAgentTools::new(
                 Arc::downgrade(&pool),
                 child_id,
@@ -1827,7 +1828,8 @@ mod tests {
             &pool.execution(first_id).await.unwrap()
         ));
 
-        // A local service failure must not leave its runtime alive after reload.
+        // A local service failure must not leave its runtime alive after
+        // reload.
         process.fail_agent_service(first_id);
         tokio::time::timeout(Duration::from_secs(10), async {
             let _ = process.closed.clone().wait_for(|closed| *closed).await;

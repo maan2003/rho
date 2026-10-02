@@ -9076,31 +9076,31 @@ impl Drop for EditorPrepaintGuard {
     }
 }
 
-/// What each pass of [`EditorElement::prepaint`] cost, timed on the stack and
-/// pushed to the profiler only for a frame whose prepaint already went long.
-///
-/// The frame log times prepaint whole, so a prepaint of 4.2 ms against a
-/// median of 1.4 says a frame missed and names nothing. Timing the passes is
-/// cheap — one clock read each — but recording them is not: a rig run draws
-/// about sixteen hundred frames, and a dozen records apiece would push the
-/// between-frame log out of the ring the two share. The question is only ever
-/// asked about a frame that went long, so the marks are taken always and
-/// recorded almost never.
-///
-/// A mark closes the segment *ending* with the pass it names rather than
-/// timing that call alone, so the segments sum to the whole prepaint exactly
-/// and no time hides between two passes. `prepaint/rest` is everything after
-/// the last mark: the popovers, the gutter menu, the toggles and the minimap.
-///
-/// A prepaint that returns early to re-wrap re-enters this function, and the
-/// abandoned attempt records nothing: the marks are dropped with it and the
-/// call that follows times itself from its own start. Such a frame therefore
-/// under-reports, by the work it did before deciding to start again.
-///
-/// The labels are `prepaint/<pass>`, the same shape a desk sync's passes use,
-/// with the difference that these are *inside* a frame and that one is not —
-/// a reader that adds them to the between-frame total is counting the draw
-/// twice.
+// What each pass of [`EditorElement::prepaint`] cost, timed on the stack and
+// pushed to the profiler only for a frame whose prepaint already went long.
+//
+// The frame log times prepaint whole, so a prepaint of 4.2 ms against a
+// median of 1.4 says a frame missed and names nothing. Timing the passes is
+// cheap — one clock read each — but recording them is not: a rig run draws
+// about sixteen hundred frames, and a dozen records apiece would push the
+// between-frame log out of the ring the two share. The question is only ever
+// asked about a frame that went long, so the marks are taken always and
+// recorded almost never.
+//
+// A mark closes the segment *ending* with the pass it names rather than
+// timing that call alone, so the segments sum to the whole prepaint exactly
+// and no time hides between two passes. `prepaint/rest` is everything after
+// the last mark: the popovers, the gutter menu, the toggles and the minimap.
+//
+// A prepaint that returns early to re-wrap re-enters this function, and the
+// abandoned attempt records nothing: the marks are dropped with it and the
+// call that follows times itself from its own start. Such a frame therefore
+// under-reports, by the work it did before deciding to start again.
+//
+// The labels are `prepaint/<pass>`, the same shape a desk sync's passes use,
+// with the difference that these are *inside* a frame and that one is not —
+// a reader that adds them to the between-frame total is counting the draw
+// twice.
 thread_local! {
     /// Nanoseconds inside the chunk iterator and chunks taken from it, for
     /// the prepaint that is consuming it. Set to zero before the pass and

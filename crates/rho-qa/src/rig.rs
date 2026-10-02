@@ -247,8 +247,9 @@ fn new(args: NewArgs) -> Result<()> {
     }
     // A snapshot taken with `--gui-state` holds a second device's half: the
     // mirror, the inbox, the journal, the desk device. It is laid over the
-    // agent host's state after the clone, because a rig runs one state directory
-    // and the GUI reads its files from the same place the agent host does.
+    // agent host's state after the clone, because a rig runs one state
+    // directory and the GUI reads its files from the same place the agent
+    // host does.
     let gui = snapshot.join("gui-state").join("rho");
     if gui.is_dir() {
         for relative in paths::GUI_SNAPSHOT_CONTENTS {
@@ -403,7 +404,8 @@ fn up(args: UpArgs) -> Result<()> {
         model.openai_base_url, model.pid
     );
 
-    // The rig agent host is its own node: no `--iroh`, no identity of the user's.
+    // The rig agent host is its own node: no `--iroh`, no identity of the
+    // user's.
     let log = fs::File::create(root.join("logs").join("agent-host.log"))?;
     let agent_host = command(bin.agent_host(), &root)
         .arg("--socket-path")
@@ -422,8 +424,8 @@ fn up(args: UpArgs) -> Result<()> {
     let pid = agent_host.id();
     fs::write(root.join("run").join("agent-host.pid"), pid.to_string())?;
     wait_for(&socket, "the agent host's socket")?;
-    // A socket on disk is not an agent host: the last one's may still be there, and
-    // this one may have died opening the store. Ask the process.
+    // A socket on disk is not an agent host: the last one's may still be there,
+    // and this one may have died opening the store. Ask the process.
     if !alive(pid) {
         bail!(
             "the agent host exited at startup; the last lines of {}:\n{}",
@@ -1492,7 +1494,11 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn rig_root(name: &str) -> Result<PathBuf> {
