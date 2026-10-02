@@ -117,6 +117,13 @@ pub(crate) fn command(
     max_tokens: Option<i64>,
 ) -> PyResult<Command> {
     let budget = budget(max_tokens)?;
+    // The notebook thread's own cwd, which `os.chdir` moves.
+    let workdir = std::env::current_dir()
+        .map_err(|e| PyRuntimeError::new_err(format!("notebook cwd: {e}")))?
+        .join(workdir.unwrap_or_default())
+        .into_os_string()
+        .into_string()
+        .map_err(|_| PyValueError::new_err("workdir is not valid UTF-8"))?;
     let (shared, cell) = current(py, "Commands are available")?;
     let shared = &shared;
     let future = crate::runtime::future(py, shared)?;
@@ -147,7 +154,7 @@ pub(crate) fn command(
                 &job,
                 &wake,
                 &cmd,
-                workdir.as_deref(),
+                Some(&workdir),
                 stdin,
                 &mut writes,
                 &shared_for_work,

@@ -115,6 +115,10 @@ Run a shell command. Starts immediately and returns a persistent command handle;
 automatically.
 command(cmd: str, *, workdir: str | None = None, stdin: bool = False, max_tokens: int = 2000) → Command
 
+A command starts in the notebook's cwd, or in workdir relative to it, and runs in that
+directory's flake dev shell, auto-refreshed when the flake changes; there is no need for nix
+develop. To work in another repository, os.chdir there rather than cd in the command.
+
 Run independent inspections in one exec, without gather or await:
 
     command("git diff --stat")

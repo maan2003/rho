@@ -440,6 +440,28 @@ async fn command_handle_and_await_result_use_scrambled_session_id() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn commands_start_in_the_notebook_cwd() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        r#"import os, tempfile
+root = os.path.realpath(tempfile.mkdtemp())
+os.mkdir(root + "/sub")
+os.chdir(root)
+async def pwd(**kw):
+    out = root + "/out"
+    await command("pwd > " + out, **kw)
+    return open(out).read().strip()
+assert await pwd() == root, await pwd()
+assert await pwd(workdir="sub") == root + "/sub"
+assert await pwd(workdir="/") == "/"
+print("cwd ok")"#
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "cwd ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn checkin_remains_configurable_without_tool_suppression() {
     let (notebook, wake) = notebook();
     assert_eq!(notebook.checkin(), Duration::from_secs(120));
