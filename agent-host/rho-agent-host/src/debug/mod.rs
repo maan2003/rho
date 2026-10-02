@@ -51,7 +51,8 @@ enum DebugCommand {
     /// first.
     DropStaleSavepoints,
     /// Drop the savepoints recorded for migrations once they are verified,
-    /// so nothing pins the pages they freed. Stop the agent host first.
+    /// so nothing pins the pages they freed. The running agent host does it;
+    /// a named database is opened directly.
     ForgetSavepoints,
     /// Rewrite the real database file without the pages nothing refers to
     /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
@@ -762,12 +763,22 @@ async fn drop_stale_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let path = db_path
-        .map(Ok)
-        .unwrap_or_else(default_db_path)
-        .context("resolve rho db path")?;
-    let db = RhoDb::open(&path);
-    let dropped = rho_agent::db::forget_savepoints(&db).await;
+    let (path, dropped) = match db_path {
+        Some(path) => {
+            let dropped = rho_agent::db::forget_savepoints(&RhoDb::open(&path)).await;
+            (path, dropped)
+        }
+        None => {
+            let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
+            let dropped = rho_rpc::protocol::client::call(
+                paths.socket(),
+                rho_agent_hosts::protocol::ForgetSavepoints,
+            )
+            .await
+            .context("ask the agent host, which holds the database")?;
+            (default_db_path().context("resolve rho db path")?, dropped)
+        }
+    };
     println!(
         "{}: forgot {} migration savepoint(s) {dropped:?}",
         path.display(),
