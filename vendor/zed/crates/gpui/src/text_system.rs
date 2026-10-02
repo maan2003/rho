@@ -309,10 +309,10 @@ impl TextSystem {
     /// weight. Bold comes as both: themes set Markdown's strong emphasis
     /// to semibold, UI code asks for [`FontWeight::BOLD`].
     ///
-    /// `None` resolves every weight as asked again. Cached font resolution
-    /// and line layouts are invalidated, as in [`Self::add_fonts`].
-    pub fn set_bold_weight(&self, weight: Option<FontWeight>) {
-        *self.bold_weight.write() = weight;
+    /// Cached font resolution and line layouts are invalidated, as in
+    /// [`Self::add_fonts`].
+    pub fn set_bold_weight(&self, weight: FontWeight) {
+        *self.bold_weight.write() = Some(weight);
         self.font_ids_by_font.write().clear();
         self.font_generation.fetch_add(1, Ordering::Release);
     }
