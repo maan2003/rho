@@ -237,6 +237,7 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    bold_weight: RwLock<FontWeight>,
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
@@ -267,6 +268,7 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
+            bold_weight: RwLock::new(FontWeight::BOLD),
             font_generation: Arc::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
                 generation: missing_glyph_generation.clone(),
@@ -302,6 +304,17 @@ impl TextSystem {
         Ok(())
     }
 
+    /// Set the weight that fonts asking for [`FontWeight::BOLD`] get, for a
+    /// font whose bold reads too heavy beside its text weight.
+    ///
+    /// Cached font resolution and line layouts are invalidated, as in
+    /// [`Self::add_fonts`].
+    pub fn set_bold_weight(&self, weight: FontWeight) {
+        *self.bold_weight.write() = weight;
+        self.font_ids_by_font.write().clear();
+        self.font_generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Takes the receiver for missing-glyph reports.
     ///
     /// Only one receiver is available for each text system. Returns `None` when
@@ -329,6 +342,14 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        let bold_weight = *self.bold_weight.read();
+        if font.weight == FontWeight::BOLD && bold_weight != FontWeight::BOLD {
+            return self.font_id(&Font {
+                weight: bold_weight,
+                ..font.clone()
+            });
+        }
+
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),

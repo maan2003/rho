@@ -103,7 +103,8 @@ impl RhoAssets {
     /// Then every `.ttf` and `.otf` in the directory `RHO_GUI_FONTS` names:
     /// fonts licensed to the user rather than to rho, which the deployment
     /// supplies and must never enter the repo or the published build.
-    /// Settings pick them by family like any other font.
+    /// Settings pick them by family like any other font, and
+    /// `RHO_GUI_FONT_BOLD_WEIGHT` sets the weight bold text gets in them.
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
         assets::Assets.load_fonts(cx)?;
         let mut fonts = RhoEmbedded::iter()
@@ -129,7 +130,14 @@ impl RhoAssets {
                 }
             }
         }
-        cx.text_system().add_fonts(fonts)
+        cx.text_system().add_fonts(fonts)?;
+        if let Some(weight) = std::env::var("RHO_GUI_FONT_BOLD_WEIGHT")
+            .ok()
+            .and_then(|weight| weight.parse().ok())
+        {
+            cx.text_system().set_bold_weight(gpui::FontWeight(weight));
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +169,40 @@ mod tests {
         assert!(unscaled.contains(r#""ui_font_weight": 400,"#));
         let unrenamed = settings_with_font(None, Some(1.5), None);
         assert!(unrenamed.contains(r#""ui_font_family": "Rho Font""#));
+    }
+
+    #[test]
+    fn bold_weight_override_resolves_bold_to_that_weight() -> anyhow::Result<()> {
+        use gpui::{FontWeight, TextSystem};
+        use gpui_wgpu::CosmicTextSystem;
+
+        let text_system = TextSystem::new(std::sync::Arc::new(
+            CosmicTextSystem::new_without_system_fonts("sans-serif"),
+        ));
+        let regular = RhoEmbedded::get("fonts/rho-font/RhoFont-Regular.ttf")
+            .context("embedded Rho Font")?
+            .data;
+        text_system.add_fonts(vec![regular])?;
+        let weighted = |weight| gpui::Font {
+            weight,
+            ..gpui::font("Rho Font")
+        };
+
+        let bold = text_system.resolve_font(&weighted(FontWeight::BOLD));
+        let medium = text_system.resolve_font(&weighted(FontWeight(550.0)));
+        assert_ne!(bold, medium, "Rho Font varies its weight");
+
+        text_system.set_bold_weight(FontWeight(550.0));
+        assert_eq!(
+            text_system.resolve_font(&weighted(FontWeight::BOLD)),
+            medium
+        );
+        assert_ne!(
+            text_system.resolve_font(&weighted(FontWeight::NORMAL)),
+            medium,
+            "only bold moves"
+        );
+        Ok(())
     }
 
     fn wcag_relative_luminance(color: gpui::Color) -> f32 {
