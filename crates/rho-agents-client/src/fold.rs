@@ -39,7 +39,6 @@ pub enum Said {
     Stopped,
     /// A send delivering what the user asked for.
     Result,
-    Other,
 }
 
 impl Said {
@@ -49,7 +48,6 @@ impl Said {
         match self {
             Self::Ask | Self::Stopped => 0,
             Self::Result => 1,
-            Self::Other => 2,
         }
     }
 }
@@ -147,11 +145,14 @@ impl Digest {
                 to: None, kind, at, ..
             } => {
                 let said = match kind {
-                    SendKind::Ask => Said::Ask,
-                    SendKind::Result => Said::Result,
-                    SendKind::Status | SendKind::Other => Said::Other,
+                    SendKind::Ask => Some(Said::Ask),
+                    SendKind::Result => Some(Said::Result),
+                    // Kept in the conversation, but nothing the user is owed.
+                    SendKind::Status | SendKind::Fyi => None,
                 };
-                self.unread.push(Unread { pos, at: *at, said });
+                if let Some(said) = said {
+                    self.unread.push(Unread { pos, at: *at, said });
+                }
                 self.status = None;
                 self.last_sent_at = Some(*at);
             }
@@ -1214,7 +1215,7 @@ mod tests {
                 at: UnixMs(3),
             },
         );
-        digest.tell(AgentPos(3), &sent(SendKind::Other, 4));
+        digest.tell(AgentPos(3), &sent(SendKind::Fyi, 4));
         digest.tell(AgentPos(4), &sent(SendKind::Ask, 5));
         let strongest = |seen| {
             digest
@@ -1226,15 +1227,15 @@ mod tests {
         assert_eq!(strongest(5), None);
 
         let mut digest = Digest::default();
-        digest.tell(AgentPos(0), &sent(SendKind::Other, 1));
-        digest.tell(AgentPos(1), &sent(SendKind::Result, 2));
+        digest.tell(AgentPos(0), &sent(SendKind::Status, 1));
+        digest.tell(AgentPos(1), &sent(SendKind::Fyi, 2));
         assert_eq!(
-            digest
-                .strongest_unread(AgentPos::ZERO)
-                .map(|unread| unread.said),
-            Some(Said::Result),
-            "a result outranks an older aside"
+            digest.strongest_unread(AgentPos::ZERO),
+            None,
+            "an fyi is owed nothing"
         );
+        assert_eq!(digest.last_sent_at, Some(UnixMs(2)), "but it is a send");
+        assert_eq!(digest.status, None, "and it ends the status");
     }
 
     /// Only the conversation counts: a status, a retried error and mail to

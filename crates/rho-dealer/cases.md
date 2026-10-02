@@ -14,17 +14,17 @@ user put away, which they open to be dealt from it.
 An agent reaches the user only through their conversation: its sends, the
 user's messages, and the host's notices about it. Its mail with other
 agents is never unread, and whether it is running never ranks. Every send names its kind,
-picked by these questions in order:
+picked by whether the user needs to read it now:
 
 ```
-1. Does this ask the human for something the work needs: a decision,
-   an approval, information, or an action? It counts even while I keep
-   working on other parts. An offer of work beyond what they asked
-   is not one.                                                  → ask
-2. Does this deliver what the human asked for: an answer to their
-   question, or finished work?                                   → result
-3. Is it an acknowledgement or progress: "on it", "86% done"?    → status
-4. None of these.                                                → other
+1. Yes: it asks them for something the work needs: a decision, an
+   approval, information, or an action, even while the agent keeps
+   working. An offer of work beyond what they asked is not one. → ask
+2. Yes: what they asked for is done, or it answers their question.
+   Not while part of it is still pending.                       → result
+3. No, but it is worth keeping: a finding, an assumption, a report
+   while follow-through is pending.                             → fyi
+4. No, and it is passing: "on it", "86% done".                  → status
 ```
 
 The user reads a conversation explicitly: a done, or a message of their
@@ -34,10 +34,10 @@ own, reads it through to its end. Opening it reads nothing.
 |---|---|---|
 | A1 | An unread ask | "asks", rises |
 | A2 | An unread result | "result", below an ask, fades, gone after ~3 days |
-| A3 | An unread other | low, fades within a day |
+| A3 | An fyi | nothing; it stays in the conversation, where the user reads it |
 | A4 | A status | nothing; it is the agent's status line until any later message, from either side, hides it |
 | A5 | Several unread sends | one card, of the strongest kind, counting from its oldest unread send |
-| A6 | Read | nothing until a newer send that is not a status |
+| A6 | Read | nothing until a newer ask or result |
 | A7 | The user wrote within the hour before the send | a bonus, fading over the hour |
 | A8 | Notice: it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask |
 | A9 | Notice: an error the host retries by itself | nothing |

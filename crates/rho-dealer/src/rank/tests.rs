@@ -462,18 +462,14 @@ fn a2_a_result_is_below_an_ask_and_gone_in_three_days() {
 }
 
 #[test]
-fn a3_anything_else_is_below_a_result_and_gone_within_the_day() {
+fn a3_an_fyi_is_no_card() {
     let mut w = world();
     let a = w.agent("a");
-    let b = w.agent("b");
-    w.sends(&a, SendKind::Other);
-    w.finishes(&b);
-    assert_eq!(w.hand(), "b · result · 0m ago\na · message · 0m ago");
-    w.pass(hours(23));
-    assert!(w.priority(&a).is_some());
-    w.pass(hours(1));
-    assert!(w.priority(&a).is_none());
-    assert!(w.priority(&b).is_some());
+    w.sends(&a, SendKind::Fyi);
+    assert_eq!(w.hand(), "");
+    w.finishes(&a);
+    w.sends(&a, SendKind::Fyi);
+    assert_eq!(w.hand(), "a · result · 0m ago", "nor does it hide one");
 }
 
 #[test]
@@ -495,7 +491,7 @@ fn a5_several_unread_sends_are_one_card_of_the_strongest_from_its_oldest() {
     w.pass(hours(1));
     w.asks(&a);
     w.pass(hours(1));
-    w.sends(&a, SendKind::Other);
+    w.sends(&a, SendKind::Fyi);
     w.asks(&a);
     assert_eq!(w.hand(), "a · asks · 1.0h");
 }

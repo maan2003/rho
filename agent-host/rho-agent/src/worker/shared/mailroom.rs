@@ -75,10 +75,10 @@ impl Bridge {
             "ask" => SendKind::Ask,
             "result" => SendKind::Result,
             "status" => SendKind::Status,
-            "other" => SendKind::Other,
+            "fyi" => SendKind::Fyi,
             _ => {
                 return Err(PyValueError::new_err(
-                    "kind is one of \"ask\", \"result\", \"status\" or \"other\"",
+                    "kind is one of \"ask\", \"result\", \"fyi\" or \"status\"",
                 ));
             }
         };
@@ -104,7 +104,7 @@ class Human:
         self._bridge = bridge
 
     def send(self, text, *, kind):
-        """Send the human a message: kind is "ask", "result", "status" or "other"."""
+        """Send the human a message: kind is "ask", "result", "fyi" or "status"."""
         self._bridge.send(str(text), kind)
 
     def __repr__(self):

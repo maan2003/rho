@@ -26,9 +26,6 @@ pub const SLACK_SMALL_THREAD_PEOPLE: usize = 3;
 /// An agent's result: for the user's information, gone in three days.
 pub const AGENT_FINISHED_HEAD_START: f64 = 0.0;
 pub const AGENT_FINISHED_GONE_DAYS: f64 = 3.0;
-/// Anything else an agent sent: below a result, gone within the day.
-pub const AGENT_OTHER_HEAD_START: f64 = -0.5;
-pub const AGENT_OTHER_GONE_DAYS: f64 = 1.0;
 /// Unread traffic in a channel nobody addressed the user in: barely
 /// above nothing, and gone within the day, or half of it once someone else
 /// is answering.

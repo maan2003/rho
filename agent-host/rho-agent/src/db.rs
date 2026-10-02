@@ -26,6 +26,7 @@ use crate::log::{
     SessionBinding, usage_model_of,
 };
 
+mod fyi_migration;
 mod native;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -82,7 +83,9 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "b85e2d07";
+const CURRENT_AGENT_DB_FORMAT: &str = "6967c9bb";
+/// The log before `fyi`: an aside's kind was stored as `Other`.
+const OTHER_AGENT_DB_FORMAT: &str = "b85e2d07";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -1130,7 +1133,18 @@ pub async fn prepare(db: &rho_db::RhoDb) {
              or remove the local rho database if you do not need the saved agents."
         );
     }
+    let from = stored.as_deref().unwrap_or_default();
+    let hop = format!("{from}->{CURRENT_AGENT_DB_FORMAT}");
+    let needs_savepoint = from == OTHER_AGENT_DB_FORMAT
+        && (!read.has_table("recovery_savepoints")
+            || read.open_table(RECOVERY).get(&hop).is_none());
     drop(read);
+    if needs_savepoint {
+        db.persistent_savepoint(|write, id| {
+            write.open_table(RECOVERY).insert(&hop, &id);
+        })
+        .await;
+    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -1293,6 +1307,7 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
+        Some(OTHER_AGENT_DB_FORMAT) => fyi_migration::migrate(write),
         Some(other) => panic!(
             "this rho agent database was written by an older or different rho version \
              (database format {other}, this build expects {CURRENT_AGENT_DB_FORMAT}). \

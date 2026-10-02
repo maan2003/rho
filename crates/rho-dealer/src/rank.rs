@@ -259,14 +259,6 @@ fn rank_into(
                 },
                 "result · {age} ago",
             ),
-            Said::Other => (
-                Curve::Fading {
-                    head_start: curve::AGENT_OTHER_HEAD_START,
-                    since,
-                    gone_days: curve::AGENT_OTHER_GONE_DAYS,
-                },
-                "message · {age} ago",
-            ),
         };
         // The newest unread is where the card's source last moved.
         let cursor = digest.unread.last().map_or(0, |newest| newest.pos.0);

@@ -34,7 +34,7 @@ impl Seq {
 
 /// What a send to the user is for, as the agent classed it: the dealer
 /// ranks the conversation on this alone (`rho-dealer/cases.md`, A1–A6).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum SendKind {
     /// Asks the user for something the work needs.
     Ask,
@@ -45,7 +45,53 @@ pub enum SendKind {
     /// Acknowledgement or progress: the agent's status line until any
     /// later message.
     Status,
+    /// Worth keeping, but the user need not read it now: in the
+    /// conversation, never a card.
+    Fyi,
+}
+
+// Rows from before `fyi` name it `Other`. Read only by the agent host's fyi
+// migration (`rho-agent/src/db/fyi_migration.rs`), which rewrites every
+// one; this goes with it.
+#[derive(Decode)]
+enum StoredSendKind {
+    Ask,
+    Result,
+    Status,
+    Fyi,
     Other,
+}
+
+impl senax_encoder::Decoder for SendKind {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        Ok(match StoredSendKind::decode(reader)? {
+            StoredSendKind::Ask => Self::Ask,
+            StoredSendKind::Result => Self::Result,
+            StoredSendKind::Status => Self::Status,
+            StoredSendKind::Fyi | StoredSendKind::Other => Self::Fyi,
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_stored_other_reads_as_fyi() {
+    #[derive(Encode)]
+    enum Before {
+        Status,
+        Other,
+    }
+    let read = |before| {
+        let bytes = senax_encoder::encode(&before).unwrap();
+        senax_encoder::decode::<SendKind>(&mut bytes.as_ref()).unwrap()
+    };
+    assert_eq!(read(Before::Other), SendKind::Fyi);
+    assert_eq!(read(Before::Status), SendKind::Status);
+    let fyi = senax_encoder::encode(&SendKind::Fyi).unwrap();
+    assert_eq!(
+        senax_encoder::decode::<SendKind>(&mut fyi.as_ref()).unwrap(),
+        SendKind::Fyi
+    );
 }
 
 /// One field of a sidecar proposal. `Clear` stays distinct from

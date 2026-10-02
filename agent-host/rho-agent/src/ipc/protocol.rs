@@ -7,7 +7,7 @@ use senax_encoder::{Decode, Encode};
 use crate::AgentEvent;
 use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(crate) const VERSION: u32 = 23;
+pub(crate) const VERSION: u32 = 24;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host

@@ -579,6 +579,41 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
+async fn fyi_migration_takes_one_savepoint_and_keeps_every_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    let sent = |kind| {
+        AgentEvent::Entry(crate::entry::Entry::Sent {
+            at: UnixMs(2),
+            id: crate::entry::MessageId(1),
+            to: crate::entry::Party::Human,
+            text: "found it".into(),
+            kind,
+        })
+    };
+    write.append_agent_event(agent, &sent(rho_agent_types::SendKind::Fyi));
+    write.append_agent_event(agent, &sent(rho_agent_types::SendKind::Ask));
+    write.open_table(FORMAT).insert((), "b85e2d07".to_owned());
+    write.commit();
+    let before = db.read().agent_events(agent).1;
+
+    prepare(&db).await;
+    assert_eq!(
+        db.read().open_table(FORMAT).get(()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    assert_eq!(db.read().agent_events(agent).1, before);
+    assert_eq!(savepoints(&db).await.len(), 1);
+
+    // A second open does not run the migration or create another savepoint.
+    prepare(&db).await;
+    assert_eq!(savepoints(&db).await.len(), 1);
+}
+
+#[tokio::test]
 async fn current_agent_db_format_is_accepted_on_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -591,7 +626,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format 7f24a9d3, this build expects b85e2d07")]
+#[should_panic(expected = "database format 7f24a9d3, this build expects 6967c9bb")]
 async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -602,7 +637,7 @@ async fn init_agent_tables_rejects_older_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "database format deadbeef, this build expects b85e2d07")]
+#[should_panic(expected = "database format deadbeef, this build expects 6967c9bb")]
 async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
