@@ -104,7 +104,7 @@ impl RhoAssets {
     /// fonts licensed to the user rather than to rho, which the deployment
     /// supplies and must never enter the repo or the published build.
     /// Settings pick them by family like any other font, and
-    /// `RHO_GUI_FONT_BOLD_WEIGHT` sets the weight bold text gets in them.
+    /// `RHO_GUI_FONT_BOLD_WEIGHT` sets the weight bold and semibold text get.
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
         assets::Assets.load_fonts(cx)?;
         let mut fonts = RhoEmbedded::iter()
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn bold_weight_override_resolves_bold_to_that_weight() -> anyhow::Result<()> {
+    fn bold_weight_override_resolves_bold_and_semibold_to_that_weight() -> anyhow::Result<()> {
         use gpui::{FontWeight, TextSystem};
         use gpui_wgpu::CosmicTextSystem;
 
@@ -192,10 +192,18 @@ mod tests {
         let medium = text_system.resolve_font(&weighted(FontWeight(550.0)));
         assert_ne!(bold, medium, "Rho Font varies its weight");
 
+        let semibold = text_system.resolve_font(&weighted(FontWeight::SEMIBOLD));
+        assert_ne!(semibold, medium);
+
         text_system.set_bold_weight(FontWeight(550.0));
         assert_eq!(
             text_system.resolve_font(&weighted(FontWeight::BOLD)),
             medium
+        );
+        assert_eq!(
+            text_system.resolve_font(&weighted(FontWeight::SEMIBOLD)),
+            medium,
+            "Markdown's strong emphasis is semibold"
         );
         assert_ne!(
             text_system.resolve_font(&weighted(FontWeight::NORMAL)),

@@ -237,7 +237,7 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
-    bold_weight: RwLock<FontWeight>,
+    bold_weight: RwLock<Option<FontWeight>>,
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
@@ -268,7 +268,7 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
-            bold_weight: RwLock::new(FontWeight::BOLD),
+            bold_weight: RwLock::default(),
             font_generation: Arc::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
                 generation: missing_glyph_generation.clone(),
@@ -304,13 +304,15 @@ impl TextSystem {
         Ok(())
     }
 
-    /// Set the weight that fonts asking for [`FontWeight::BOLD`] get, for a
-    /// font whose bold reads too heavy beside its text weight.
+    /// Set the weight that fonts asking for [`FontWeight::SEMIBOLD`] or
+    /// heavier get, for a font whose bold reads too heavy beside its text
+    /// weight. Bold comes as both: themes set Markdown's strong emphasis
+    /// to semibold, UI code asks for [`FontWeight::BOLD`].
     ///
     /// Cached font resolution and line layouts are invalidated, as in
     /// [`Self::add_fonts`].
     pub fn set_bold_weight(&self, weight: FontWeight) {
-        *self.bold_weight.write() = weight;
+        *self.bold_weight.write() = Some(weight);
         self.font_ids_by_font.write().clear();
         self.font_generation.fetch_add(1, Ordering::Release);
     }
@@ -343,7 +345,10 @@ impl TextSystem {
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let bold_weight = *self.bold_weight.read();
-        if font.weight == FontWeight::BOLD && bold_weight != FontWeight::BOLD {
+        if let Some(bold_weight) = bold_weight
+            && font.weight >= FontWeight::SEMIBOLD
+            && font.weight != bold_weight
+        {
             return self.font_id(&Font {
                 weight: bold_weight,
                 ..font.clone()
