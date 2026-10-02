@@ -112,7 +112,7 @@ pub fn load(db: &RhoDb) -> Vec<HostSpec> {
         return Vec::new();
     }
     let table = read.open_table(SAVED);
-    let Some(saved) = table.get(&()) else {
+    let Some(saved) = table.get(()) else {
         return Vec::new();
     };
     let saved = saved.value().into_owned();
@@ -145,7 +145,7 @@ pub fn save<'a>(db: &RhoDb, hosts: impl IntoIterator<Item = &'a HostSpec>) {
         let mut write = db.write().await;
         write
             .open_table(SAVED)
-            .insert(&(), SenValue::borrowed(&saved));
+            .insert((), SenValue::borrowed(&saved));
         write.commit();
     });
 }
@@ -244,9 +244,7 @@ mod tests {
         };
         futures::executor::block_on(async {
             let mut write = db.write().await;
-            write
-                .open_table(SAVED)
-                .insert(&(), SenValue::borrowed(&old));
+            write.open_table(SAVED).insert((), SenValue::borrowed(&old));
             write.commit();
         });
         assert_eq!(

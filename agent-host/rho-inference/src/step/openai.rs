@@ -425,7 +425,8 @@ impl Session {
                     #[serde(default)]
                     usage: Value,
                 }
-                // item.done is the source of items; do not parse/copy response.output.
+                // item.done is the source of items; do not parse/copy
+                // response.output.
                 let completed: Completion = serde_json::from_str(&text)?;
                 let count = items.len();
                 let answer = step(items, &completed.response.usage);
@@ -859,7 +860,8 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // Completed output is deliberately different. item.done owns item bytes.
+            // Completed output is deliberately different. item.done owns item
+            // bytes.
             socket.send(WsMessage::Text(r#"{"type":"response.completed","response":{"id":"raw-r1","usage":{},"output":[{"type":"message","content":[{"text":"wrong source","unknown":1e+9999}]}]}}"#.into())).await.unwrap();
             let wire = loop {
                 match socket.next().await.unwrap().unwrap() {
@@ -1029,7 +1031,7 @@ mod tests {
     #[test]
     fn only_first_exec_call_is_replayed_and_returned() {
         let answer = step(
-            vec![
+            [
                 json!({"type":"reasoning","id":"rs","encrypted_content":"secret","summary":[]}),
                 json!({"type":"message","id":"msg","content":[{"text":"prose"}]}),
                 json!({"type":"custom_tool_call","id":"one","call_id":"first","input":"print(1)"}),
@@ -1053,6 +1055,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback error type"
+    )]
     async fn host_auth_quota_and_streaming_share_one_step_without_retry() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1266,6 +1272,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback error type"
+    )]
     async fn warm_socket_uses_suffix_and_compaction_replays_without_reconnecting() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1292,7 +1302,8 @@ mod tests {
                 &*header.lock().unwrap()
             );
             complete(&mut socket, "r1", false).await;
-            // Server ping must be serviced while no step future is being polled.
+            // Server ping must be serviced while no step future is being
+            // polled.
             socket
                 .send(WsMessage::Ping(vec![9, 4].into()))
                 .await
@@ -1486,10 +1497,10 @@ mod tests {
             let mut admitted = Some(admitted);
             running
                 .step(&request(), &mut |event| {
-                    if matches!(event, Event::Code(_)) {
-                        if let Some(tx) = admitted.take() {
-                            let _ = tx.send(());
-                        }
+                    if matches!(event, Event::Code(_))
+                        && let Some(tx) = admitted.take()
+                    {
+                        let _ = tx.send(());
                     }
                 })
                 .await

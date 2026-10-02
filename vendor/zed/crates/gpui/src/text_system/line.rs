@@ -1,6 +1,6 @@
 use crate::{
     App, Bounds, DevicePixels, ElementId, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams,
-    Result, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle,
+    Result, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle,
     Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};

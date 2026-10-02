@@ -188,7 +188,7 @@ impl Importer {
 		if self
 			.backend
 			.imported
-			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+			.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
 				(count < self.backend.capacity).then_some(count + 1)
 			})
 			.is_err()

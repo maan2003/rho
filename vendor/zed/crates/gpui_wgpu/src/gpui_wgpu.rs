@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod cosmic_text_system;
 #[cfg(target_os = "linux")]
 mod linux_dmabuf;

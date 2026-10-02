@@ -152,8 +152,6 @@ impl ClaudeAgent {
         self.status.read().expect("poison").clone()
     }
 
-    /// The record as of the loop's last change to it.
-
     /// A user message carried the pending notice: it is not said again.
     /// The log agrees once the message's row is in it.
     pub fn notice_carried(&self) {
@@ -866,8 +864,9 @@ impl ClaudeLoop {
                             .is_none_or(python_host::PythonHost::retire_settled))
                 {
                     let _ = reply.send(Ok(()));
-                    // Freeze scheduling and admission at this serialized boundary.
-                    // The outer driver cancels this future on agent host disconnect.
+                    // Freeze scheduling and admission at this serialized
+                    // boundary. The outer driver cancels
+                    // this future on agent host disconnect.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));
@@ -950,10 +949,10 @@ impl ClaudeLoop {
                     content = combined;
                 }
                 self.cancelling = false;
-                if matches!(source, InputSource::Human(_)) {
-                    if let Some(host) = &mut self.python {
-                        host.user_spoke();
-                    }
+                if matches!(source, InputSource::Human(_))
+                    && let Some(host) = &mut self.python
+                {
+                    host.user_spoke();
                 }
                 let busy = matches!(self.state.kind, InferenceState::Responding);
                 if !busy {
@@ -1784,8 +1783,9 @@ impl ClaudeLoop {
                     self.fail(anyhow::anyhow!("{}", message.errors.join("\n")))
                         .await?;
                 } else {
-                    // CLI result prose is provider output, not a message to the human.
-                    // Queued sends run next inside the CLI: staying in the
+                    // CLI result prose is provider output, not a message to the
+                    // human. Queued sends run next inside
+                    // the CLI: staying in the
                     // streaming state avoids a false turn end between them.
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
@@ -2018,8 +2018,9 @@ impl ClaudeLoop {
                         )
                         .await?;
                     } else {
-                        // The outbox survives both this process and the notebook. A
-                        // future user send carries its output, never reruns its source.
+                        // The outbox survives both this process and the
+                        // notebook. A future user send
+                        // carries its output, never reruns its source.
                         self.close_process().await?;
                         self.fail(anyhow::anyhow!(
                             "Claude Code output transport failed; notebook output is retained"
@@ -2703,13 +2704,13 @@ enum ClaudeLoopEvent {
 /// not run. Only messages accepted *while archived* could not have reached
 /// Claude: there was no process. An unechoed active send is acknowledged as
 /// uncertain rather than resent, so the UI cannot leave a phantom queue.
-fn recover_receipts(
-    entries: impl IntoIterator<Item = Entry>,
-) -> (
+type RecoveredReceipts = (
     bool,
     Vec<(rho_agent_types::UnixMs, MessageId, AgentId, Vec<Block>)>,
     Vec<MessageId>,
-) {
+);
+
+fn recover_receipts(entries: impl IntoIterator<Item = Entry>) -> RecoveredReceipts {
     let mut archived_since = None;
     let mut received = Vec::new();
     let mut accounted = HashSet::new();

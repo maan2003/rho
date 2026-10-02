@@ -127,15 +127,12 @@ mod tests {
         let db = open(dir.path()).unwrap();
         {
             let mut write = db.write().await;
-            write.open_table(MINE).insert(&1, &11);
-            write.open_table(YOURS).insert(&1, &22);
+            write.open_table(MINE).insert(1, 11);
+            write.open_table(YOURS).insert(1, 22);
             write.commit();
         }
         let read = db.read();
-        assert_eq!(read.open_table(MINE).get(&1).map(|it| it.value()), Some(11));
-        assert_eq!(
-            read.open_table(YOURS).get(&1).map(|it| it.value()),
-            Some(22)
-        );
+        assert_eq!(read.open_table(MINE).get(1).map(|it| it.value()), Some(11));
+        assert_eq!(read.open_table(YOURS).get(1).map(|it| it.value()), Some(22));
     }
 }

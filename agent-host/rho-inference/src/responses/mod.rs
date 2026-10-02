@@ -2,8 +2,8 @@
 pub(crate) mod oauth;
 mod route;
 pub(crate) mod ws;
-pub use rho_agent::inference::PromptCacheKey;
 pub use oauth::{InferenceAuth, ResolvedAuth, ResolvedOAuth};
+pub use rho_agent::inference::PromptCacheKey;
 pub(crate) use route::RouteSelector;
 pub use route::{DialRoute, InferenceRouteProbe, RouteSelection};
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";

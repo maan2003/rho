@@ -143,14 +143,14 @@ fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: 
     };
     let mut table = write.open_table(GLOBAL_AGENT_USAGE);
     let mut merged = table
-        .get(&key)
+        .get(key)
         .map(|value| value.value().into_owned())
         .unwrap_or_else(|| AgentUsageBucket {
             bucket_start_ms: bucket.bucket_start_ms,
             ..AgentUsageBucket::default()
         });
     merged.add(bucket);
-    table.insert(&key, SenValue::borrowed(&merged));
+    table.insert(key, SenValue::borrowed(&merged));
 }
 
 fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservationRecord) -> bool {
@@ -211,9 +211,6 @@ pub trait AgentReadTxnExt {
         before: AgentEventPos,
     ) -> Option<crate::inference::Carry>;
 
-    /// Newest text-bearing visible rows, read backward and bounded before
-    /// decoding/building a Luna request.
-
     /// How far the journal runs; zero when nothing has been appended.
     fn journal_head(&self) -> Seq;
     /// Journal entries after `since`, at most `limit`, with the rows they
@@ -251,10 +248,6 @@ pub trait AgentWriteTxnExt {
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
 
     fn alloc_agent_id(&mut self) -> AgentId;
-    /// Applies an update only when its source is still visible. The
-    /// returned cache is the acknowledged source of truth for a sidecar
-    /// session; `None` means its result was made stale by a rewind.
-
     /// Takes back history from `to` on: told at a new position, so what
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`). Returns where it was told.
@@ -361,14 +354,14 @@ impl AgentProfileWriteTxnExt for WriteTxn {
 impl AgentReadTxnExt for ReadTxn {
     fn machine_seed(&self) -> u64 {
         self.open_table(MACHINE)
-            .get(&MACHINE_SEED_KEY)
+            .get(MACHINE_SEED_KEY)
             .expect("machine seed missing; init_agent_tables must run first")
             .value()
     }
 
     fn last_agent_counter(&self) -> u64 {
         self.open_table(COUNTERS)
-            .get(&CounterKey::LAST_AGENT_ID)
+            .get(CounterKey::LAST_AGENT_ID)
             .map(|counter| counter.value())
             .unwrap_or(0)
     }
@@ -380,12 +373,12 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead> {
         self.open_table(AGENT_HEADS)
-            .get(&agent_id)
+            .get(agent_id)
             .map(|value| value.value().into_owned())
     }
 
     fn agent_exists(&self, agent_id: AgentId) -> bool {
-        self.open_table(AGENT_LOG).get(&(agent_id, 0)).is_some()
+        self.open_table(AGENT_LOG).get((agent_id, 0)).is_some()
     }
 
     fn list_agent_ids(&self) -> Vec<AgentId> {
@@ -432,7 +425,7 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool {
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
-            .get(&AgentResponseSubscription { target, subscriber })
+            .get(AgentResponseSubscription { target, subscriber })
             .is_some()
     }
 
@@ -452,7 +445,7 @@ impl AgentReadTxnExt for ReadTxn {
     fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary {
         let cursor = self
             .open_table(native::NATIVE_CURSORS)
-            .get(&agent_id)
+            .get(agent_id)
             .map(|value| value.value().into_owned())
             .unwrap_or_default();
         ContextBoundary {
@@ -463,7 +456,7 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery {
         self.open_table(native::NATIVE_CURSORS)
-            .get(&agent_id)
+            .get(agent_id)
             .map(|value| value.value().into_owned().recovery)
             .unwrap_or_default()
     }
@@ -535,7 +528,7 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {
         self.open_table(AGENT_LOG)
-            .get(&(agent_id, pos.pos))
+            .get((agent_id, pos.pos))
             .map(|value| value.value().into_owned())
     }
 
@@ -561,7 +554,7 @@ impl AgentReadTxnExt for ReadTxn {
             .map(|(seq, row)| {
                 let (agent_id, pos) = row.value();
                 let event = log
-                    .get(&(agent_id, pos))
+                    .get((agent_id, pos))
                     .expect("journal names a row that exists")
                     .value()
                     .into_owned();
@@ -612,14 +605,14 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket {
         self.open_table(AGENT_USAGE_TOTALS)
-            .get(&agent_id)
+            .get(agent_id)
             .map(|value| value.value().into_owned())
             .unwrap_or_default()
     }
 
     fn claude_account(&self) -> String {
         self.open_table(CLAUDE_ACCOUNT)
-            .get(&())
+            .get(())
             .map(|value| value.value())
             .unwrap_or_else(|| rho_claude::accounts::DEFAULT_ACCOUNT.to_owned())
     }
@@ -656,14 +649,14 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(GLOBAL_AGENT_USAGE);
         self.open_table(CLAUDE_ACCOUNT);
         let mut machine = self.open_table(MACHINE);
-        if machine.get(&MACHINE_SEED_KEY).is_none() {
-            machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
+        if machine.get(MACHINE_SEED_KEY).is_none() {
+            machine.insert(MACHINE_SEED_KEY, rand::random::<u64>());
         }
     }
     fn agent_context_boundary(&mut self, agent_id: AgentId) -> ContextBoundary {
         let from = self
             .open_table(native::NATIVE_CURSORS)
-            .get(&agent_id)
+            .get(agent_id)
             .map(|row| row.value().into_owned().from)
             .unwrap_or_default();
         let through = self
@@ -688,14 +681,14 @@ impl AgentWriteTxnExt for WriteTxn {
             "creation is the first row of a log and nothing else is"
         );
         self.open_table(AGENT_LOG)
-            .insert(&(agent_id, pos.pos), SenValue::borrowed(event));
+            .insert((agent_id, pos.pos), SenValue::borrowed(event));
         native::append(self, agent_id, pos, event);
         let head = if pos == AgentEventPos::ZERO {
             created_head(event, pos)
         } else {
             let mut head = self
                 .open_table(AGENT_HEADS)
-                .get(&agent_id)
+                .get(agent_id)
                 .expect("agent head missing for existing log")
                 .value()
                 .into_owned();
@@ -704,7 +697,7 @@ impl AgentWriteTxnExt for WriteTxn {
             head
         };
         self.open_table(AGENT_HEADS)
-            .insert(&agent_id, SenValue::borrowed(&head));
+            .insert(agent_id, SenValue::borrowed(&head));
         let seq = {
             let mut journal = self.open_table(JOURNAL);
             let seq = journal
@@ -712,7 +705,7 @@ impl AgentWriteTxnExt for WriteTxn {
                 .next_back()
                 .map(|(key, _)| key.value() + 1)
                 .unwrap_or(1);
-            journal.insert(&seq, &(agent_id, pos.pos));
+            journal.insert(seq, (agent_id, pos.pos));
             seq
         };
         // Told after the commit, so a listener woken by it finds the row.
@@ -799,14 +792,14 @@ impl AgentWriteTxnExt for WriteTxn {
         let key = AgentResponseSubscription { target, subscriber };
         let mut subscriptions = self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         if subscribed {
-            subscriptions.insert(&key, &());
+            subscriptions.insert(key, ());
         } else {
-            subscriptions.remove(&key);
+            subscriptions.remove(key);
         }
     }
     fn set_claude_account(&mut self, account: &str) {
         self.open_table(CLAUDE_ACCOUNT)
-            .insert(&(), account.to_owned());
+            .insert((), account.to_owned());
     }
 
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
@@ -853,24 +846,24 @@ impl AgentWriteTxnExt for WriteTxn {
         };
         let mut buckets = self.open_table(AGENT_USAGE_BUCKETS);
         let mut merged = buckets
-            .get(&key)
+            .get(key)
             .map(|value| value.value().into_owned())
             .unwrap_or_else(|| AgentUsageBucket {
                 bucket_start_ms: bucket.bucket_start_ms,
                 ..AgentUsageBucket::default()
             });
         merged.add(&bucket);
-        buckets.insert(&key, SenValue::borrowed(&merged));
+        buckets.insert(key, SenValue::borrowed(&merged));
         drop(buckets);
 
         let mut totals = self.open_table(AGENT_USAGE_TOTALS);
         let mut total = totals
-            .get(&agent_id)
+            .get(agent_id)
             .map(|value| value.value().into_owned())
             .unwrap_or_default();
         total.add(&bucket);
         total.bucket_start_ms = 0;
-        totals.insert(&agent_id, SenValue::borrowed(&total));
+        totals.insert(agent_id, SenValue::borrowed(&total));
         drop(totals);
 
         add_global_agent_usage(self, bucket.model, &bucket);
@@ -886,11 +879,11 @@ impl AgentWriteTxnExt for WriteTxn {
             .map(|(key, _)| key.value())
             .collect::<Vec<_>>();
         for key in old_keys {
-            buckets.remove(&key);
+            buckets.remove(key);
         }
         for ((agent_id, bucket_start_ms), bucket) in replacement {
             buckets.insert(
-                &AgentUsageKey {
+                AgentUsageKey {
                     agent_id: *agent_id,
                     bucket_start_ms: *bucket_start_ms,
                 },
@@ -909,11 +902,11 @@ impl AgentWriteTxnExt for WriteTxn {
             .map(|(key, _)| key.value())
             .collect::<Vec<_>>();
         for agent_id in old_agents {
-            totals.remove(&agent_id);
+            totals.remove(agent_id);
         }
         for (agent_id, mut total) in by_agent {
             total.bucket_start_ms = 0;
-            totals.insert(&agent_id, SenValue::borrowed(&total));
+            totals.insert(agent_id, SenValue::borrowed(&total));
         }
     }
 }
@@ -1013,7 +1006,7 @@ fn created_head(event: &AgentEvent<'_>, pos: AgentEventPos) -> AgentHead {
 pub(crate) fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Option<AgentHead> {
     write
         .open_table(AGENT_HEADS)
-        .get(&agent_id)
+        .get(agent_id)
         .map(|value| value.value().into_owned())
 }
 
@@ -1121,7 +1114,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
 pub async fn prepare(db: &rho_db::RhoDb) {
     let read = db.read();
     let stored = if read.has_table("format") {
-        read.open_table(FORMAT).get(&()).map(|value| value.value())
+        read.open_table(FORMAT).get(()).map(|value| value.value())
     } else {
         None
     };
@@ -1200,8 +1193,8 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
             log.remove(key);
         }
         drop(log);
-        write.open_table(AGENT_HEADS).remove(&agent_id);
-        write.open_table(native::NATIVE_CURSORS).remove(&agent_id);
+        write.open_table(AGENT_HEADS).remove(agent_id);
+        write.open_table(native::NATIVE_CURSORS).remove(agent_id);
         deleted.push((agent_id, keys.len()));
 
         let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
@@ -1221,7 +1214,7 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
             usage.remove(key);
         }
         drop(usage);
-        write.open_table(AGENT_USAGE_TOTALS).remove(&agent_id);
+        write.open_table(AGENT_USAGE_TOTALS).remove(agent_id);
     }
 
     let mut journal = write.open_table(JOURNAL);
@@ -1296,7 +1289,7 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
 }
 
 fn assert_agent_db_format(write: &mut WriteTxn) {
-    let stored = write.open_table(FORMAT).get(&()).map(|value| value.value());
+    let stored = write.open_table(FORMAT).get(()).map(|value| value.value());
     match stored.as_deref() {
         None => {}
         Some(CURRENT_AGENT_DB_FORMAT) => return,
@@ -1309,20 +1302,20 @@ fn assert_agent_db_format(write: &mut WriteTxn) {
     }
     write
         .open_table(FORMAT)
-        .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
+        .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
     let mut counters = write.open_table(COUNTERS);
-    let next = counters.get(&key).map(|value| value.value()).unwrap_or(0) + 1;
-    counters.insert(&key, &next);
+    let next = counters.get(key).map(|value| value.value()).unwrap_or(0) + 1;
+    counters.insert(key, next);
     next
 }
 
 fn machine_seed(write: &mut WriteTxn) -> u64 {
     write
         .open_table(MACHINE)
-        .get(&MACHINE_SEED_KEY)
+        .get(MACHINE_SEED_KEY)
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }

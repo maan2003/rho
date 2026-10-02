@@ -22,7 +22,7 @@ fn mint<T>(state: &Lock<State<T>>, counts: &Arc<Counts>, only_open: bool) -> Opt
 	let waiters = if !only_open
 		&& counts
 			.consumers
-			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+			.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
 				(count > 0).then(|| count + 1)
 			})
 			.is_ok()

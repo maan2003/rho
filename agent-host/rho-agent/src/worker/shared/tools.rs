@@ -28,6 +28,10 @@ use crate::worker::image_tool::{ImageTools, ViewImageArgs};
 /// collaboration, web search, papercuts, and the mailroom's `human`,
 /// `archive` and `end_turn` when there is one). Unavailable services export
 /// nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tool wiring combines agent identity, capabilities, and host services"
+)]
 pub(crate) fn host_tools(
     cwd: &camino::Utf8Path,
     role: AgentRole,

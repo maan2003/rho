@@ -232,12 +232,12 @@ fn env_flag(name: &str) -> bool {
 async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh::SecretKey> {
     let mut write = db.write().await;
     let mut table = write.open_table(IROH_SERVER_SECRET);
-    if let Some(secret) = table.get(&()) {
+    if let Some(secret) = table.get(()) {
         return Ok(iroh::SecretKey::from_bytes(secret.value()));
     }
 
     let secret = iroh::SecretKey::generate().to_bytes();
-    table.insert(&(), &secret);
+    table.insert((), &secret);
     drop(table);
     write.commit();
     Ok(iroh::SecretKey::from_bytes(&secret))
@@ -758,6 +758,33 @@ where
     )
 }
 
+/// Stream-scoped media routing on the existing authenticated connection.
+pub use moq_tokio::shared_iroh as media;
+
+/// Route a media stream or return an ordinary compressed application stream.
+/// Authentication must finish before this function is called.
+pub async fn accept_iroh_stream(
+    media: &media::Mux,
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> anyhow::Result<Option<(Reader, iroh::endpoint::SendStream)>> {
+    tokio::time::timeout(PREFACE_TIMEOUT, async {
+        let mut prefix = [0; 1];
+        recv.read_exact(&mut prefix).await?;
+        if prefix[0] == media::PREFIX {
+            media.route_bi(send, recv).await?;
+            return Ok(None);
+        }
+        anyhow::ensure!(prefix[0] == 0x28, "invalid RPC stream prefix");
+        Ok(Some((
+            Reader::new(std::io::Cursor::new(prefix).chain(recv)),
+            send,
+        )))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("application stream preface timed out"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,31 +975,4 @@ mod tests {
             .unwrap();
         assert_eq!(read, 0);
     }
-}
-
-/// Stream-scoped media routing on the existing authenticated connection.
-pub use moq_tokio::shared_iroh as media;
-
-/// Route a media stream or return an ordinary compressed application stream.
-/// Authentication must finish before this function is called.
-pub async fn accept_iroh_stream(
-    media: &media::Mux,
-    send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-) -> anyhow::Result<Option<(Reader, iroh::endpoint::SendStream)>> {
-    tokio::time::timeout(PREFACE_TIMEOUT, async {
-        let mut prefix = [0; 1];
-        recv.read_exact(&mut prefix).await?;
-        if prefix[0] == media::PREFIX {
-            media.route_bi(send, recv).await?;
-            return Ok(None);
-        }
-        anyhow::ensure!(prefix[0] == 0x28, "invalid RPC stream prefix");
-        Ok(Some((
-            Reader::new(std::io::Cursor::new(prefix).chain(recv)),
-            send,
-        )))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("application stream preface timed out"))?
 }

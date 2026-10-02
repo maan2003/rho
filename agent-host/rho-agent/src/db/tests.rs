@@ -574,7 +574,7 @@ async fn init_agent_tables_stamps_current_db_format() {
     write.init_agent_tables();
     write.commit();
 
-    let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
+    let format = db.read().open_table(FORMAT).get(()).unwrap().value();
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
@@ -585,7 +585,7 @@ async fn current_agent_db_format_is_accepted_on_reopen() {
     prepare(&db).await;
     prepare(&db).await;
     assert_eq!(
-        db.read().open_table(FORMAT).get(&()).unwrap().value(),
+        db.read().open_table(FORMAT).get(()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT
     );
 }
@@ -596,7 +596,7 @@ async fn init_agent_tables_rejects_older_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
-    write.open_table(FORMAT).insert(&(), &"7f24a9d3".to_owned());
+    write.open_table(FORMAT).insert((), "7f24a9d3".to_owned());
     write.commit();
     prepare(&db).await;
 }
@@ -607,7 +607,7 @@ async fn init_agent_tables_rejects_unknown_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
-    write.open_table(FORMAT).insert(&(), &"deadbeef".to_owned());
+    write.open_table(FORMAT).insert((), "deadbeef".to_owned());
     write.commit();
     prepare(&db).await;
 }
@@ -1159,7 +1159,7 @@ async fn native_nested_rewinds_restore_prior_state_and_frozen_branch() {
     assert_eq!(
         write
             .open_table(native::NATIVE_CURSORS)
-            .get(&agent)
+            .get(agent)
             .unwrap()
             .value()
             .into_owned()
@@ -1185,8 +1185,8 @@ async fn native_nested_rewinds_restore_prior_state_and_frozen_branch() {
         read.agent_native_recovery(agent).compaction.context_used,
         None
     );
-    // Original cutoff ignores all later rewinds; the compacted Step still stands
-    // there.
+    // Original cutoff ignores all later rewinds; the compacted Step still
+    // stands there.
     assert_eq!(
         read.agent_context_records(agent, frozen)
             .iter()
@@ -1272,7 +1272,7 @@ async fn native_recovery_notices_follow_visible_branch() {
     write.append_agent_event(agent, &native_step(true, None)); // 5
     let before = write
         .open_table(native::NATIVE_CURSORS)
-        .get(&agent)
+        .get(agent)
         .unwrap()
         .value()
         .into_owned()
@@ -1282,7 +1282,7 @@ async fn native_recovery_notices_follow_visible_branch() {
     write.rewind_agent(UnixMs(6), agent, AgentEventPos::new(2));
     let restored = write
         .open_table(native::NATIVE_CURSORS)
-        .get(&agent)
+        .get(agent)
         .unwrap()
         .value()
         .into_owned()
@@ -1303,11 +1303,11 @@ async fn prepare_accepts_other_subsystems_before_agent_initialization() {
         .open_table(redb::TableDefinition::<(), String>::new(
             "chatgpt_inference_format",
         ))
-        .insert(&(), &"75b4468b".to_owned());
+        .insert((), "75b4468b".to_owned());
     write.commit();
     prepare(&db).await;
     assert_eq!(
-        db.read().open_table(FORMAT).get(&()).unwrap().value(),
+        db.read().open_table(FORMAT).get(()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT
     );
 }

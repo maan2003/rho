@@ -976,9 +976,8 @@ impl Workspace {
                     return Vec::new();
                 }
                 Secret::words_starting(&word.to_lowercase())
-                    .iter()
                     .map(|word| crate::minibuffer::Candidate {
-                        value: (*word).to_owned(),
+                        value: word.to_owned(),
                         description: String::new(),
                     })
                     .collect()

@@ -988,8 +988,8 @@ pub(crate) fn prompt(
     let (agents_md, skills) = {
         let (agents_files, skills) = &place.context;
         (
-            render_agents_md_prompt(&agents_files).unwrap_or_default(),
-            render_skills_prompt(&skills).unwrap_or_default(),
+            render_agents_md_prompt(agents_files).unwrap_or_default(),
+            render_skills_prompt(skills).unwrap_or_default(),
         )
     };
     let team_context = team_context(multi_agent, role);
@@ -1731,7 +1731,8 @@ mod tests {
             let prompt = claude_prompt(None, Some(team), AgentRole::default());
             assert!(prompt.contains(signature));
             assert!(prompt.find("### Engineers\n").unwrap() < prompt.find(signature).unwrap());
-            // Whoever spawned it, an Engineer the user manages talks to the user.
+            // Whoever spawned it, an Engineer the user manages talks to the
+            // user.
             assert!(
                 prompt.contains("human.send(text, *, kind)")
                     && prompt.contains("## Working with the user")

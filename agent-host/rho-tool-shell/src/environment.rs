@@ -81,7 +81,8 @@ struct Snapshot {
 impl Snapshot {
     /// Whether the next command may use this without resolving again.
     fn current(&self) -> bool {
-        !self.failure.as_ref().is_some_and(|failure| failure.retry) && matches!(self.watches.changed(), Ok(false))
+        !self.failure.as_ref().is_some_and(|failure| failure.retry)
+            && matches!(self.watches.changed(), Ok(false))
     }
 }
 
@@ -136,7 +137,10 @@ impl Source {
     fn holds(&self, built: &Built) -> bool {
         built.shell.as_ref() == Some(&self.shell)
             && built.watch.iter().all(|path| self.contents.contains(path))
-            && built.watch_names.iter().all(|path| self.names.contains(path))
+            && built
+                .watch_names
+                .iter()
+                .all(|path| self.names.contains(path))
     }
 }
 
@@ -419,25 +423,39 @@ async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
 }
 
 async fn build(shells: &Shells, flake: &Path) -> Result<(Built, Vec<u8>), ShellFailed> {
-    let (built, diagnostics) = shells(flake.to_owned()).await.map_err(ShellFailed::from_error)?;
-    if !built.watch.iter().chain(&built.watch_names).all(|path| path.is_absolute()) {
-        return Err(ShellFailed::from_error(anyhow!("relative shell watch path")));
+    let (built, diagnostics) = shells(flake.to_owned())
+        .await
+        .map_err(ShellFailed::from_error)?;
+    if !built
+        .watch
+        .iter()
+        .chain(&built.watch_names)
+        .all(|path| path.is_absolute())
+    {
+        return Err(ShellFailed::from_error(anyhow!(
+            "relative shell watch path"
+        )));
     }
     Ok((built, diagnostics))
 }
 
 /// `flake`'s shell applied to `key`'s base environment, with the builder's
 /// and the shell hook's output.
-async fn shell(key: &Key, shells: &Shells, flake: &Path) -> Result<(Environment, Vec<u8>, Built), ShellFailed> {
+async fn shell(
+    key: &Key,
+    shells: &Shells,
+    flake: &Path,
+) -> Result<(Environment, Vec<u8>, Built), ShellFailed> {
     let (built, mut diagnostics) = build(shells, flake).await?;
-    let (environment, hook_output) = activate(key, &built.activation)
-        .await
-        .map_err(|error| ShellFailed {
-            message: format!("{error:#}"),
-            watch: built.watch.clone(),
-            watch_names: built.watch_names.clone(),
-            activating: Some(built.shell.clone()),
-        })?;
+    let (environment, hook_output) =
+        activate(key, &built.activation)
+            .await
+            .map_err(|error| ShellFailed {
+                message: format!("{error:#}"),
+                watch: built.watch.clone(),
+                watch_names: built.watch_names.clone(),
+                activating: Some(built.shell.clone()),
+            })?;
     diagnostics.extend(hook_output);
     Ok((environment, diagnostics, built))
 }
@@ -473,7 +491,11 @@ async fn activate(key: &Key, activation: &str) -> Result<(Environment, Vec<u8>)>
     Ok((environment, diagnostics))
 }
 
-async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Result<(Snapshot, Vec<u8>)> {
+async fn resolve(
+    key: &Key,
+    previous: Option<Snapshot>,
+    shells: &Shells,
+) -> Result<(Snapshot, Vec<u8>)> {
     let good = previous.as_ref().and_then(|previous| previous.good.clone());
     let shown = previous
         .as_ref()
@@ -578,7 +600,11 @@ async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Resu
 /// shell as it was, e.g. git rewriting its index or an editor saving
 /// unchanged contents. Watching the same inputs before asking the builder
 /// makes its answer hold until the next command drains the watches.
-async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<(Snapshot, Vec<u8>)>> {
+async fn reuse(
+    key: &Key,
+    previous: Snapshot,
+    shells: &Shells,
+) -> Result<Option<(Snapshot, Vec<u8>)>> {
     let Some(source) = previous.source else {
         return Ok(None);
     };
@@ -778,7 +804,12 @@ mod tests {
         assert!(fixture.run(command, None).await.ends_with("unset base"));
         fixture.write("flake.nix", "");
         assert!(fixture.run(command, None).await.ends_with("flake base"));
-        assert!(fixture.run(command, Some("repo")).await.ends_with("unset base"));
+        assert!(
+            fixture
+                .run(command, Some("repo"))
+                .await
+                .ends_with("unset base")
+        );
     }
 
     #[tokio::test]
@@ -865,8 +896,13 @@ mod tests {
         fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=old\n");
         fixture.run("true", None).await;
         fixture.write("env.sh", "echo expected-failure >&2\nexit 1\n");
-        let output = fixture.run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None).await;
-        assert!(output.contains("expected-failure") && output.ends_with("old"), "{output}");
+        let output = fixture
+            .run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None)
+            .await;
+        assert!(
+            output.contains("expected-failure") && output.ends_with("old"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
@@ -878,7 +914,9 @@ mod tests {
         fixture.write("env.sh", "BROKEN one\n");
         let output = fixture.run(command, None).await;
         assert!(
-            output.contains("its last environment") && output.contains("broken: BROKEN one") && output.ends_with("good"),
+            output.contains("its last environment")
+                && output.contains("broken: BROKEN one")
+                && output.ends_with("good"),
             "{output}"
         );
         assert_eq!(fixture.run(command, None).await, "good");
@@ -886,7 +924,12 @@ mod tests {
         fixture.write("extra", "x");
         assert_eq!(fixture.run(command, None).await, "good");
         fixture.write("env.sh", "BROKEN two\n");
-        assert!(fixture.run(command, None).await.contains("broken: BROKEN two"));
+        assert!(
+            fixture
+                .run(command, None)
+                .await
+                .contains("broken: BROKEN two")
+        );
         fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=fixed\n");
         assert_eq!(fixture.run(command, None).await, "fixed");
     }
@@ -897,7 +940,10 @@ mod tests {
         fixture.write("env.sh", "BROKEN\n");
         let command = r#"printf '%s %s' "${RHO_CACHE_TEST_VALUE-unset}" "$RHO_CACHE_TEST_BASE""#;
         let output = fixture.run(command, None).await;
-        assert!(output.contains("the base environment") && output.ends_with("unset base"), "{output}");
+        assert!(
+            output.contains("the base environment") && output.ends_with("unset base"),
+            "{output}"
+        );
         fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=fixed\n");
         assert_eq!(fixture.run(command, None).await, "fixed base");
     }
@@ -909,7 +955,10 @@ mod tests {
         fixture.write("down", "");
         let command = r#"printf '%s' "${RHO_CACHE_TEST_VALUE-unset}""#;
         let output = fixture.run(command, None).await;
-        assert!(output.contains("builder down") && output.ends_with("unset"), "{output}");
+        assert!(
+            output.contains("builder down") && output.ends_with("unset"),
+            "{output}"
+        );
         assert_eq!(fixture.run(command, None).await, "unset");
         std::fs::remove_file(fixture.root.path().join("down")).unwrap();
         assert_eq!(fixture.run(command, None).await, "up");
@@ -918,10 +967,18 @@ mod tests {
     #[tokio::test]
     async fn shell_hook_output_and_status_do_not_break_activation() {
         let fixture = Fixture::new();
-        fixture.write("env.sh", "echo noise\nexport RHO_CACHE_TEST_VALUE=ok\nfalse\n");
-        let output = fixture.run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None).await;
+        fixture.write(
+            "env.sh",
+            "echo noise\nexport RHO_CACHE_TEST_VALUE=ok\nfalse\n",
+        );
+        let output = fixture
+            .run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None)
+            .await;
         // The hook's output is a diagnostic, not the environment.
-        assert!(output.contains("noise") && output.ends_with("ok"), "{output}");
+        assert!(
+            output.contains("noise") && output.ends_with("ok"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
@@ -1075,10 +1132,7 @@ mod latency {
                 native.push(start.elapsed().as_secs_f64() * 1e6);
             }
             native.sort_by(f64::total_cmp);
-            eprintln!(
-                "{source:?}: median_us={} p95_us={}",
-                native[25], native[48]
-            );
+            eprintln!("{source:?}: median_us={} p95_us={}", native[25], native[48]);
         }
     }
 
@@ -1105,11 +1159,20 @@ mod latency {
                     }
                 }
                 let text = String::from_utf8_lossy(&text).into_owned();
-                eprintln!("{source:?} {:?}: {}", start.elapsed(), text.lines().last().unwrap_or(""));
+                eprintln!(
+                    "{source:?} {:?}: {}",
+                    start.elapsed(),
+                    text.lines().last().unwrap_or("")
+                );
                 text
             }
         };
-        assert!(run("command -v cargo").await.trim_end().ends_with("/bin/cargo"));
+        assert!(
+            run("command -v cargo")
+                .await
+                .trim_end()
+                .ends_with("/bin/cargo")
+        );
         run("command -v cargo").await;
         // Git rewrites its index after noticing the new mtime; the shell is
         // unchanged, so the environment is kept after one builder check.

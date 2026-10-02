@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::fd::AsRawFd as _;
@@ -375,7 +377,8 @@ fn find_deny_roots() -> OsString {
 /// This must run before the Tokio runtime starts, because mutating the process
 /// environment is not thread-safe.
 pub fn configure_embedded_environment() {
-    // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
+    // SAFETY: called by rho-agent-host's main before it creates the Tokio
+    // runtime.
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
@@ -395,7 +398,8 @@ const HANDOFF_ENV: &str = "RHO_HANDOFF";
 /// reason as [`configure_embedded_environment`].
 pub fn take_handoff() -> Option<String> {
     let handoff = std::env::var(HANDOFF_ENV).ok();
-    // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
+    // SAFETY: called by rho-agent-host's main before it creates the Tokio
+    // runtime.
     unsafe { std::env::remove_var(HANDOFF_ENV) };
     handoff
 }
@@ -1863,8 +1867,9 @@ where
             };
             let desktop = rho_desktop_proto::local::Desktop::open(&socket).await?;
             let mut control = desktop.control;
-            // Desktop-open itself requests a fresh keyframe, including late joins
-            // to a static desktop whose cached keyframe has expired.
+            // Desktop-open itself requests a fresh keyframe, including late
+            // joins to a static desktop whose cached keyframe has
+            // expired.
             anyhow::ensure!(
                 matches!(
                     rho_desktop_proto::local::request(
@@ -1888,9 +1893,12 @@ where
                     if let Input::Feedback(feedback) = &mut input {
                         feedback.rtt_us = transport.rtt().as_micros() as u64;
                         if feedback.delivery_bps > 0 {
-                            // Drain slightly ahead of measured delivery, separately from
-                            // the source's reduced encoding target. New in-flight samples
-                            // can discover a faster path without idle padding traffic.
+                            // Drain slightly ahead of measured delivery,
+                            // separately from
+                            // the source's reduced encoding target. New
+                            // in-flight samples can
+                            // discover a faster path without idle padding
+                            // traffic.
                             let rate = feedback.delivery_bps.saturating_mul(11) / 80;
                             transport.set_send_rate(rate.clamp(16_000, 2_500_000));
                         }

@@ -56,8 +56,8 @@ impl Secret {
     }
 
     /// The phrase words that start with `prefix`, for completing one.
-    pub fn words_starting(prefix: &str) -> &[&'static str] {
-        Language::English.words_by_prefix(prefix)
+    pub fn words_starting(prefix: &str) -> impl Iterator<Item = &'static str> {
+        Language::English.words_by_prefix_iter(prefix)
     }
 
     /// The key for one use, named by `context` in BLAKE3's own form:

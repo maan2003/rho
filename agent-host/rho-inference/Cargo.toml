@@ -24,7 +24,6 @@ notify.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true
-rpassword.workspace = true
 rho-agent-types.workspace = true
 rho-agent.workspace = true
 rho-web-search.workspace = true

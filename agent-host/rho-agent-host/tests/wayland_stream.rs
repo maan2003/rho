@@ -76,9 +76,8 @@ fn main() -> Result<()> {
             if let Some(status)=agent_host.0.try_wait()? { anyhow::bail!("agent host exited: {status}"); }
             let text=std::fs::read_to_string(&log)?;
             let endpoint=text.lines().find_map(|line|line.strip_prefix("rho-agent-host iroh endpoint: ")).map(str::to_owned);
-            if let Some(endpoint)=endpoint {
-                if let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
-            }
+            if let Some(endpoint)=endpoint
+                && let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
             ensure!(tokio::time::Instant::now()<deadline,"agent host startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -116,12 +115,8 @@ layout { background-color "#315b97"; }
         }
         let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(desktop_directory.join(format!("{desktop_name}.json")))?)?;
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                { let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
-                    ensure!(sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
-                    break;
-                }
-            }
+            let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
+            ensure!(sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
             Ok::<_,anyhow::Error>(())
         }).await??;
         let mut status=tokio::io::BufReader::new(rho_desktop_proto::local::connect(descriptor["socket"].as_str().unwrap()).await?);

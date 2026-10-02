@@ -93,13 +93,10 @@ chacha20poly1305 = "0.11"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 clock = { path = "vendor/zed/crates/clock" }
-deno_core = "0.407"
-deno_error = "0.7"
 dirs = { version = "7", default-features = false }
 fnv = "1"
 futures = "0.3"
 futures-util = "0.3"
-imara-diff = "0.2.0"
 iroh = { version = "1.3.0", default-features = false }
 jiff = "0.2"
 json-stream = { path = "crates/json-stream" }
@@ -109,14 +106,12 @@ noq-proto = { version = "=1.3.0", default-features = false }
 notify = "9.0.0-rc.4"
 octo-server = { path = "agent-host/octo-server" }
 octo-types = { path = "crates/octo-types" }
-pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 pyo3 = "0.29"
 pythonize = "0.29"
 rand = "0.10"
 redb = "4.3.0"
 redb-derive = "0.1.0"
-regex = "1"
 reqwest = { version = "0.13", default-features = false, features = [
   "blocking",
   "json",
@@ -130,10 +125,8 @@ rho-agents-client = { path = "crates/rho-agents-client" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }
-rho-ci = { path = "agent-host/rho-ci" }
 rho-claude = { path = "agent-host/rho-claude" }
 rho-claude-usage = { path = "agent-host/rho-claude-usage" }
-rho-cli = { path = "agent-host/rho-cli" }
 rho-context-config = { path = "agent-host/rho-context-config" }
 rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-db = { path = "crates/rho-db" }
@@ -157,8 +150,6 @@ rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }
 rho-desktop-media = { path = "crates/rho-desktop-media" }
 moq-net = { path = "vendor/moq/rs/moq-net" }
 moq-tokio = { path = "vendor/moq/rs/moq-tokio", default-features = false }
-shiguredo_libvpx = { path = "vendor/libvpx-rs" }
-web-transport-iroh = "0.7"
 rho-window = { path = "crates/rho-window" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }
@@ -169,13 +160,11 @@ rho-slack = { path = "crates/rho-slack", default-features = false }
 rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "agent-host/rho-tool-shell" }
 rho-devshell = { path = "agent-host/rho-devshell" }
-rho-devshell-daemon = { path = "agent-host/rho-devshell-daemon" }
 rho-watch = { path = "agent-host/rho-watch" }
 rho-agent-types = { path = "crates/rho-agent-types" }
 rho-visualizations = { path = "agent-host/rho-visualizations" }
 rho-web-search = { path = "agent-host/rho-web-search" }
 rho-fs-view = { path = "agent-host/rho-fs-view" }
-rpassword = "7"
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
@@ -183,7 +172,6 @@ rustls = { version = "0.23", default-features = false, features = [
   "tls12",
 ] }
 senax-encoder = { path = "crates/senax-encoder" }
-senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zbus = "5"
@@ -213,11 +201,6 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
-worktree = { path = "vendor/zed/crates/worktree" }
-zip = { version = "2", default-features = false, features = [
-  "deflate",
-  "time",
-] }
 [profile.ci]
 debug = "line-tables-only"
 incremental = false

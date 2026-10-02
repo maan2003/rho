@@ -328,6 +328,58 @@ pub(crate) fn arguments_format(tool_type: ToolType) -> ArgumentsFormat {
     }
 }
 
+/// The item as a client draws it. Compaction and unknown items have no
+/// face; their index is never told.
+pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
+    Some(match item {
+        StreamingContextItem::AssistantMessage { .. } => return None,
+        StreamingContextItem::RawReasoning {
+            content, summary, ..
+        } => Item::Reasoning {
+            text: reasoning_text(content, summary),
+        },
+        StreamingContextItem::EncryptedReasoning { summary, .. } => {
+            if summary.is_empty() {
+                return None;
+            }
+            Item::Reasoning {
+                text: join(summary),
+            }
+        }
+        StreamingContextItem::ToolCall {
+            id,
+            name,
+            arguments,
+            tool_type,
+            ..
+        } => Item::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.to_string(),
+            format: crate::transcript::arguments_format(*tool_type),
+        },
+        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
+            return None;
+        }
+    })
+}
+
+fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
+    if summary.is_empty() {
+        content.to_string()
+    } else {
+        join(summary)
+    }
+}
+
+fn join(parts: &[AStr]) -> String {
+    parts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use rho_agent::entry::{MessageId, RequestNotice, ResponseUsage};
@@ -555,56 +607,4 @@ mod tests {
             })
         );
     }
-}
-
-/// The item as a client draws it. Compaction and unknown items have no
-/// face; their index is never told.
-pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
-    Some(match item {
-        StreamingContextItem::AssistantMessage { .. } => return None,
-        StreamingContextItem::RawReasoning {
-            content, summary, ..
-        } => Item::Reasoning {
-            text: reasoning_text(content, summary),
-        },
-        StreamingContextItem::EncryptedReasoning { summary, .. } => {
-            if summary.is_empty() {
-                return None;
-            }
-            Item::Reasoning {
-                text: join(summary),
-            }
-        }
-        StreamingContextItem::ToolCall {
-            id,
-            name,
-            arguments,
-            tool_type,
-            ..
-        } => Item::ToolCall {
-            id: id.as_str().to_owned(),
-            name: name.as_str().to_owned(),
-            arguments: arguments.to_string(),
-            format: crate::transcript::arguments_format(*tool_type),
-        },
-        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
-            return None;
-        }
-    })
-}
-
-fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
-    if summary.is_empty() {
-        content.to_string()
-    } else {
-        join(summary)
-    }
-}
-
-fn join(parts: &[AStr]) -> String {
-    parts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
 }

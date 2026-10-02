@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Tokio-based connection helpers for native MoQ applications.
 //!
 //! Establishes MoQ connections over:

@@ -10,8 +10,8 @@
 //! remain usable until Nix collects them, when using one pins it again.
 //! One process owns the entries, so pinning and unpinning never race:
 //! `rho-agent-host` runs this crate's binary, which keeps them in its own
-//! database in the cache directory. Clients reach it over [`protocol::socket_path`]
-//! ([`Store::serve`]).
+//! database in the cache directory. Clients reach it over
+//! [`protocol::socket_path`] ([`Store::serve`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
@@ -22,9 +22,8 @@ use anyhow::Result;
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 pub use rho_devshell::Candidate;
-use rho_devshell::{Event, Record};
 use rho_devshell::protocol::{self, Reply, Request};
-use rho_devshell::{activations_dir, activations_root, gc_root, roots_dir};
+use rho_devshell::{Event, Record, activations_dir, activations_root, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
 
 /// How many environments stay pinned, most recently used first.
@@ -168,7 +167,11 @@ impl Store {
     /// Entry `id`'s environment is gone: drop every entry sharing it.
     pub async fn forget(&self, id: u64) -> Result<()> {
         self.with(|state, changes| {
-            if let Some(env) = state.entries.get(&id).map(|entry| entry.env_store_path.clone()) {
+            if let Some(env) = state
+                .entries
+                .get(&id)
+                .map(|entry| entry.env_store_path.clone())
+            {
                 state.drop_env(&self.dir, &env, changes);
             }
         })
@@ -207,7 +210,10 @@ impl Store {
             return Vec::new();
         }
         let table = read.open_table(RECORDS);
-        table.iter().map(|(_, record)| record.value().into_owned()).collect()
+        table
+            .iter()
+            .map(|(_, record)| record.value().into_owned())
+            .collect()
     }
 
     /// Listen on the socket in the shared cache directory, replacing a
@@ -222,7 +228,9 @@ impl Store {
         let listener = tokio::net::UnixListener::bind(&path)?;
         Ok(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
                 tokio::spawn(self.clone().answer(stream));
             }
         })
@@ -238,9 +246,14 @@ impl Store {
                     key,
                     env_store_path,
                     data,
-                } => self.store(key, env_store_path, data).await.map(Reply::Stored),
+                } => self
+                    .store(key, env_store_path, data)
+                    .await
+                    .map(Reply::Stored),
                 Request::Forget(id) => self.forget(id).await.map(|()| Reply::Done),
-                Request::Record { flake, event } => self.record(flake, event).await.map(|()| Reply::Done),
+                Request::Record { flake, event } => {
+                    self.record(flake, event).await.map(|()| Reply::Done)
+                }
                 Request::Records => Ok(Reply::Records(self.records().await)),
             };
             let reply = result.unwrap_or_else(|error| Reply::Error(format!("{error:#}")));
@@ -293,7 +306,7 @@ async fn load(db: &RhoDb, dir: &Path) -> State {
             let table = read.open_table(RECORDS);
             let mut keys = table.iter().map(|(key, _)| key.value());
             if let Some(first) = keys.next() {
-                state.records = first..keys.last().unwrap_or(first) + 1;
+                state.records = first..keys.next_back().unwrap_or(first) + 1;
             }
         }
     }
@@ -421,7 +434,11 @@ impl State {
 
     /// Remove `env`'s activation scripts once no entry uses it.
     fn forget_activation(&self, dir: &Path, env: &str) {
-        if !self.entries.values().any(|entry| entry.env_store_path == env) {
+        if !self
+            .entries
+            .values()
+            .any(|entry| entry.env_store_path == env)
+        {
             let _ = std::fs::remove_dir_all(activations_dir(dir, env));
         }
     }
@@ -454,7 +471,11 @@ mod tests {
 
         async fn open(temp: &tempfile::TempDir) -> Store {
             std::fs::create_dir_all(temp.path().join("cache/roots")).unwrap();
-            Store::open(RhoDb::open(temp.path().join("db")), temp.path().join("cache")).await
+            Store::open(
+                RhoDb::open(temp.path().join("db")),
+                temp.path().join("cache"),
+            )
+            .await
         }
 
         /// A stand-in store path that exists, pinned as a worker would.
@@ -476,7 +497,13 @@ mod tests {
         }
 
         async fn ids(&self, key: &str) -> Vec<u64> {
-            self.store.lookup(key).await.unwrap().into_iter().map(|c| c.id).collect()
+            self.store
+                .lookup(key)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
         }
     }
 
@@ -484,9 +511,16 @@ mod tests {
     async fn lookup_is_newest_used_first_and_same_data_replaces() {
         let f = Fixture::new().await;
         let (a, b) = (f.env("a"), f.env("b"));
-        let one = f.store.store("k".into(), a.clone(), b"one".to_vec()).await.unwrap();
+        let one = f
+            .store
+            .store("k".into(), a.clone(), b"one".to_vec())
+            .await
+            .unwrap();
         let two = f.store.store("k".into(), b, b"two".to_vec()).await.unwrap();
-        f.store.store("other".into(), a.clone(), b"one".to_vec()).await.unwrap();
+        f.store
+            .store("other".into(), a.clone(), b"one".to_vec())
+            .await
+            .unwrap();
         assert_eq!(f.ids("k").await, [two, one]);
         assert!(f.store.used(one).await.unwrap());
         assert_eq!(f.ids("k").await, [one, two]);
@@ -499,7 +533,10 @@ mod tests {
         let f = Fixture::new().await;
         let a = f.env("a");
         let id = f.store.store("k".into(), a.clone(), vec![]).await.unwrap();
-        f.store.store("other".into(), a.clone(), vec![1]).await.unwrap();
+        f.store
+            .store("other".into(), a.clone(), vec![1])
+            .await
+            .unwrap();
         std::fs::remove_file(&a).unwrap();
         assert!(f.ids("k").await.is_empty());
         assert!(f.ids("other").await.is_empty());
@@ -514,7 +551,12 @@ mod tests {
         let mut envs = Vec::new();
         for n in 0..=PIN_BUDGET {
             let env = f.env(&format!("env{n}"));
-            ids.push(f.store.store(format!("k{n}"), env.clone(), vec![]).await.unwrap());
+            ids.push(
+                f.store
+                    .store(format!("k{n}"), env.clone(), vec![])
+                    .await
+                    .unwrap(),
+            );
             envs.push(env);
         }
         // The oldest lost its root but is still found; using it re-pins it
@@ -549,7 +591,13 @@ mod tests {
         let f = Fixture::new().await;
         for (flake, event) in [
             ("/a", Event::Hit { ms: 50 }),
-            ("/b", Event::Miss { ms: 4000, stale: true }),
+            (
+                "/b",
+                Event::Miss {
+                    ms: 4000,
+                    stale: true,
+                },
+            ),
             ("/a", Event::Kept { uses: 12 }),
         ] {
             f.store.record(flake.into(), event).await.unwrap();
@@ -558,21 +606,41 @@ mod tests {
         drop(store);
         let store = Fixture::open(&temp).await;
         // Keys continue after the reopened log's last.
-        store.record("/c".into(), Event::Failed { ms: 7 }).await.unwrap();
+        store
+            .record("/c".into(), Event::Failed { ms: 7 })
+            .await
+            .unwrap();
         let records = store.records().await;
-        let seen: Vec<_> = records.iter().map(|r| (r.flake.as_str(), r.event)).collect();
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| (r.flake.as_str(), r.event))
+            .collect();
         assert_eq!(
             seen,
             [
                 ("/a", Event::Hit { ms: 50 }),
-                ("/b", Event::Miss { ms: 4000, stale: true }),
+                (
+                    "/b",
+                    Event::Miss {
+                        ms: 4000,
+                        stale: true
+                    }
+                ),
                 ("/a", Event::Kept { uses: 12 }),
                 ("/c", Event::Failed { ms: 7 }),
             ]
         );
         assert!(records.windows(2).all(|w| w[0].at_ms <= w[1].at_ms));
         let stats = rho_devshell::Stats::of(&records);
-        assert_eq!((stats.hit.count, stats.stale.count, stats.failed.count, stats.kept), (1, 1, 1, 12));
+        assert_eq!(
+            (
+                stats.hit.count,
+                stats.stale.count,
+                stats.failed.count,
+                stats.kept
+            ),
+            (1, 1, 1, 12)
+        );
         assert!(stats.to_string().contains("served from cache: 86.7% of 15"));
     }
 
@@ -584,8 +652,16 @@ mod tests {
         let cache = f.temp.path().join("cache");
         // In use by an entry, of an environment still in the store, and of
         // one Nix collected.
-        let store_path = std::fs::read_dir(NIX_STORE).unwrap().flatten().next().unwrap().path();
-        let kept = [activations_dir(&cache, &a), activations_dir(&cache, store_path.to_str().unwrap())];
+        let store_path = std::fs::read_dir(NIX_STORE)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let kept = [
+            activations_dir(&cache, &a),
+            activations_dir(&cache, store_path.to_str().unwrap()),
+        ];
         let collected = activations_dir(&cache, "/nix/store/00000000000000000000000000000000-gone");
         for dir in kept.iter().chain([&collected]) {
             std::fs::create_dir_all(dir).unwrap();

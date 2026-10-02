@@ -149,7 +149,7 @@ impl Budget {
 	/// Take `size` bytes of the budget, or `None` if that is more than remains.
 	pub(crate) fn reserve(&self, size: usize) -> Option<Reservation> {
 		self.0
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(size))
+			.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(size))
 			.ok()?;
 		Some(Reservation {
 			budget: self.clone(),

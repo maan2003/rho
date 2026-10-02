@@ -420,7 +420,8 @@ async fn run_async(args: Args) -> Result<()> {
                             at,
                             ..
                         } => {
-                            // A usage row is a second Replied event, not another model step.
+                            // A usage row is a second Replied event, not
+                            // another model step.
                             if items.is_empty() && !did_compact {
                                 continue;
                             }
@@ -632,6 +633,10 @@ async fn run_async(args: Args) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the completion predicate compares independent observed scenario metrics"
+)]
 fn scenario_complete(
     scenario: Scenario,
     rounds: usize,
@@ -896,7 +901,11 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn tree_commit() -> Result<String> {
@@ -925,35 +934,49 @@ mod tests {
     }
 
     #[test]
-    fn real_rounds_require_all_calls_and_results() {
+    fn real_rounds_require_all_calls_results_and_message() {
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS,
+            REAL_TOOL_ROUNDS + 1,
             0,
             0,
             REAL_TOOL_ROUNDS - 1,
+            1,
             &[1]
         ));
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS - 1,
+            REAL_TOOL_ROUNDS,
             0,
             0,
             REAL_TOOL_ROUNDS,
+            1,
+            &[1]
+        ));
+        assert!(!scenario_complete(
+            Scenario::RealToolRounds,
+            REAL_TOOL_ROUNDS,
+            0,
+            REAL_TOOL_ROUNDS + 1,
+            0,
+            0,
+            REAL_TOOL_ROUNDS,
+            0,
             &[1]
         ));
         assert!(scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS,
+            REAL_TOOL_ROUNDS + 1,
             0,
             0,
             REAL_TOOL_ROUNDS,
+            1,
             &[1]
         ));
     }

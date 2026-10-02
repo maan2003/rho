@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use rho_agent_types::UnixMs;
 use rho_tool_shell::{ProcessEvent, ShellTools};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::notebook::{Shared, current, register};
 use crate::runtime::{Build, Inbox, Message, Reply, resolved};
@@ -152,7 +152,6 @@ pub(crate) fn command(
             let result = run_command(
                 &shell,
                 &job,
-                &wake,
                 &cmd,
                 Some(&workdir),
                 stdin,
@@ -402,7 +401,6 @@ impl Command {
 pub(crate) async fn run_command(
     shell: &ShellTools,
     job: &Source,
-    wake: &Notify,
     cmd: &str,
     workdir: Option<&str>,
     stdin: bool,
@@ -434,7 +432,7 @@ pub(crate) async fn run_command(
             let failed = result.is_err();
             (writing.take().expect("set above")).settle(result, job);
             if failed {
-                wake.notify_one();
+                shared.wake.notify_one();
             }
         }
     };
@@ -467,7 +465,7 @@ pub(crate) async fn run_command(
                 ProcessEvent::Failed(error) => return Err(error),
                 ProcessEvent::Closed => break,
             }
-            wake.notify_one();
+            shared.wake.notify_one();
         }
         Ok(CommandExit {
             id: job.id.session(),

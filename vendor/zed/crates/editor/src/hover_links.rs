@@ -10,7 +10,7 @@ use gpui::{
 use language::{Bias, ToOffset};
 use linkify::{LinkFinder, LinkKind};
 use lsp::LanguageServerId;
-use project::{InlayId, Location, LocationLink, Project, ProjectPath, ResolvedPath};
+use project::{ Location, LocationLink, Project, ProjectPath, ResolvedPath};
 use regex::Regex;
 use settings::{OpenResultsIn, Settings};
 use std::{

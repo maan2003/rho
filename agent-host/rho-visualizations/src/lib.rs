@@ -69,7 +69,7 @@ impl VisualizationStore {
         self.db
             .read()
             .open_table(VISUALIZATIONS)
-            .get(&id.to_owned())
+            .get(id.to_owned())
             .map(|value| value.value().into_owned())
     }
 }

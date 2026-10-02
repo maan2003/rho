@@ -552,18 +552,19 @@ async fn github_request<B: Serialize, Q: Serialize>(
     path: &[&str],
     query: Option<Q>,
     body: Option<B>,
-) -> Result<reqwest::Response, Response> {
-    // Url encodes each item as one segment, including slashes and percent signs.
-    // Reject empty/dot components rather than letting them change the route.
+) -> Result<reqwest::Response, Box<Response>> {
+    // Url encodes each item as one segment, including slashes and percent
+    // signs. Reject empty/dot components rather than letting them change
+    // the route.
     if !path
         .iter()
         .all(|part| part.split('/').all(|part| !matches!(part, "" | "." | "..")))
     {
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
     let token = match state.get_token().await {
         Ok(token) => token,
-        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        Err(_) => return Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response())),
     };
     let mut url = state.github_api_url.clone();
     url.path_segments_mut()
@@ -585,7 +586,7 @@ async fn github_request<B: Serialize, Q: Serialize>(
     }
     let upstream = match request.send().await {
         Ok(response) => response,
-        Err(_) => return Err(StatusCode::BAD_GATEWAY.into_response()),
+        Err(_) => return Err(Box::new(StatusCode::BAD_GATEWAY.into_response())),
     };
     Ok(upstream)
 }
@@ -600,7 +601,7 @@ async fn github<T: DeserializeOwned + Serialize, B: Serialize, Q: Serialize>(
 ) -> Response {
     let upstream = match github_request(state, method, path, query, body).await {
         Ok(response) => response,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     // Following redirects could disclose the host's token to another origin.
     if upstream.status().is_redirection() {
@@ -650,7 +651,7 @@ async fn github_empty_post<B: Serialize>(
 ) -> Response {
     let upstream = match github_request::<B, ()>(state, Method::POST, path, None, body).await {
         Ok(response) => response,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let status = upstream.status();
     if status != StatusCode::CREATED {
@@ -672,7 +673,7 @@ async fn github_logs(state: Arc<AppState>, path: &[&str], content_type: &'static
     let upstream =
         match github_request::<(), ()>(state.clone(), Method::GET, path, None, None).await {
             Ok(response) => response,
-            Err(error) => return error,
+            Err(error) => return *error,
         };
     if upstream.status() != StatusCode::FOUND {
         let status = upstream.status();
@@ -1578,8 +1579,8 @@ mod tests {
 
     #[tokio::test]
     async fn log_download_follows_signed_url_without_token_or_redirecting_again() {
-        // Use an independent signed-download listener: the API's Location cannot depend
-        // on its request URI.
+        // Use an independent signed-download listener: the API's Location
+        // cannot depend on its request URI.
         let download =
             axum::Router::new().fallback(any(|headers: HeaderMap, uri: Uri| async move {
                 assert!(headers.get("authorization").is_none());

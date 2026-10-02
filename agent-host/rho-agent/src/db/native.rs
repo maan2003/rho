@@ -43,12 +43,12 @@ impl NativeCursor {
                 self.recovery.woken = true;
             }
             Entry::Step { carry, .. } => {
-                if carry.has_compaction() {
-                    if let Some(request) = self.request {
-                        // A Received between the request and Step must survive:
-                        // it may not have been delivered in that request.
-                        self.from = request.next();
-                    }
+                if carry.has_compaction()
+                    && let Some(request) = self.request
+                {
+                    // A Received between the request and Step must survive:
+                    // it may not have been delivered in that request.
+                    self.from = request.next();
                 }
                 self.request = None;
             }
@@ -73,7 +73,7 @@ pub(super) fn append(
 ) {
     let mut cursor = write
         .open_table(NATIVE_CURSORS)
-        .get(&agent)
+        .get(agent)
         .map(|row| row.value().into_owned())
         .unwrap_or_default();
     if matches!(event, AgentEvent::Rewound { .. }) {
@@ -83,7 +83,7 @@ pub(super) fn append(
     }
     write
         .open_table(NATIVE_CURSORS)
-        .insert(&agent, SenValue::borrowed(&cursor));
+        .insert(agent, SenValue::borrowed(&cursor));
 }
 
 pub(super) fn rebuild(write: &mut WriteTxn, agent: AgentId) -> NativeCursor {

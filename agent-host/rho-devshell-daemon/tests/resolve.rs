@@ -9,12 +9,18 @@ use rho_devshell::{Client, Flake, Resolver};
 #[tokio::test]
 #[ignore = "manual: needs RHO_DEVSHELL_BUILDER and a flake checkout in RHO_TEST_FLAKE"]
 async fn evaluates_once_then_hits_and_repins() {
-    let flake = Flake::new(PathBuf::from(std::env::var("RHO_TEST_FLAKE").unwrap()).canonicalize().unwrap(), "default");
+    let flake = Flake::new(
+        PathBuf::from(std::env::var("RHO_TEST_FLAKE").unwrap())
+            .canonicalize()
+            .unwrap(),
+        "default",
+    );
     let builder = PathBuf::from(std::env::var("RHO_DEVSHELL_BUILDER").unwrap());
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join("cache");
     let store = Arc::new(
-        rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone()).await,
+        rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone())
+            .await,
     );
     tokio::spawn(store.serve().unwrap());
     let resolver = || {
@@ -30,7 +36,10 @@ async fn evaluates_once_then_hits_and_repins() {
     let (first, _) = resolver().resolve(&flake).await.unwrap();
     eprintln!("miss: {:?}", start.elapsed());
     let root = rho_devshell::gc_root(&rho_devshell::roots_dir(&dir), &first.env_store_path);
-    assert_eq!(std::fs::read_link(&root).unwrap(), PathBuf::from(&first.env_store_path));
+    assert_eq!(
+        std::fs::read_link(&root).unwrap(),
+        PathBuf::from(&first.env_store_path)
+    );
 
     let start = std::time::Instant::now();
     let (hit, _) = resolver().resolve(&flake).await.unwrap();
@@ -41,7 +50,10 @@ async fn evaluates_once_then_hits_and_repins() {
     std::fs::remove_file(&root).unwrap();
     let (repinned, _) = resolver().resolve(&flake).await.unwrap();
     assert_eq!(repinned.id, first.id);
-    assert_eq!(std::fs::read_link(&root).unwrap(), PathBuf::from(&first.env_store_path));
+    assert_eq!(
+        std::fs::read_link(&root).unwrap(),
+        PathBuf::from(&first.env_store_path)
+    );
 
     // A watched resolver keeps the shell until an input changes.
     let watched = resolver().with_watcher(rho_watch::Watcher::global().unwrap());
@@ -64,7 +76,11 @@ async fn evaluates_once_then_hits_and_repins() {
         .await
         .unwrap();
     eprintln!("builder shell: {:?}", start.elapsed());
-    assert!(shell.status.success(), "{}", String::from_utf8_lossy(&shell.stderr));
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
     let shell: serde_json::Value = serde_json::from_slice(&shell.stdout).unwrap();
     assert_eq!(shell["env_store_path"], first.env_store_path.as_str());
 
@@ -72,22 +88,40 @@ async fn evaluates_once_then_hits_and_repins() {
     let activation = watched.activation(&hit.env_store_path).await.unwrap();
     std::fs::remove_dir_all(rho_devshell::activations_dir(&dir, &hit.env_store_path)).unwrap();
     let start = std::time::Instant::now();
-    assert_eq!(watched.activation(&hit.env_store_path).await.unwrap(), activation);
+    assert_eq!(
+        watched.activation(&hit.env_store_path).await.unwrap(),
+        activation
+    );
     eprintln!("activate: {:?}", start.elapsed());
     assert!(activation.exists());
     let output = std::process::Command::new("bash")
-        .args(["--noprofile", "--norc", "-c", rho_devshell::EXEC_SCRIPT, "bash"])
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            rho_devshell::EXEC_SCRIPT,
+            "bash",
+        ])
         .arg(&activation)
         .args(["bash", "-c", "command -v cargo"])
         .current_dir(&flake.dir)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     eprintln!("cargo: {}", String::from_utf8_lossy(&output.stdout));
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .unwrap();
     assert!(status.success(), "git {args:?}");
 }
 
@@ -101,7 +135,8 @@ async fn observations_decide_hits() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join("cache");
     let store = Arc::new(
-        rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone()).await,
+        rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone())
+            .await,
     );
     tokio::spawn(store.clone().serve().unwrap());
     let repo = temp.path().join("repo");
@@ -128,7 +163,12 @@ async fn observations_decide_hits() {
     git(&repo, &["add", "."]);
 
     let resolver = || {
-        Resolver::new(Some(Client::new(&dir)), dir.clone(), builder.clone(), std::env::vars_os().collect())
+        Resolver::new(
+            Some(Client::new(&dir)),
+            dir.clone(),
+            builder.clone(),
+            std::env::vars_os().collect(),
+        )
     };
     let id = |flake: &Flake| {
         let flake = flake.clone();
@@ -161,43 +201,80 @@ async fn observations_decide_hits() {
     assert_eq!(id(&flake).await, first, "back to the first shell's inputs");
 
     let copy = temp.path().join("copy");
-    let status = std::process::Command::new("cp").arg("-a").arg(&repo).arg(&copy).status().unwrap();
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(&repo)
+        .arg(&copy)
+        .status()
+        .unwrap();
     assert!(status.success());
-    assert_eq!(id(&Flake::new(copy.canonicalize().unwrap(), "default")).await, first, "a copy shares entries");
+    assert_eq!(
+        id(&Flake::new(copy.canonicalize().unwrap(), "default")).await,
+        first,
+        "a copy shares entries"
+    );
 
     let watched = resolver().with_watcher(rho_watch::Watcher::global().unwrap());
     assert_eq!(watched.resolve(&flake).await.unwrap().0.id, Some(first));
     let start = std::time::Instant::now();
     assert_eq!(watched.resolve(&flake).await.unwrap().0.id, Some(first));
-    assert!(start.elapsed() < std::time::Duration::from_millis(50), "kept: {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(50),
+        "kept: {:?}",
+        start.elapsed()
+    );
     for _ in 0..2 {
         watched.resolve(&flake).await.unwrap();
     }
     // `maybe` is untracked now: data "two" without it is a new shell.
     std::fs::write(repo.join("data.txt"), "two").unwrap();
     let changed = watched.resolve(&flake).await.unwrap().0.id.unwrap();
-    assert!(![first, tracked, edited].contains(&changed), "a watched read changed");
+    assert!(
+        ![first, tracked, edited].contains(&changed),
+        "a watched read changed"
+    );
     // The dropped shell's uses are logged, within the minute between reports.
     let kept = || async {
         let records = store.records().await;
-        records.iter().map(|r| match r.event {
-            rho_devshell::Event::Kept { uses } if r.flake == flake.dir.display().to_string() => uses,
-            _ => 0,
-        }).sum::<u64>()
+        records
+            .iter()
+            .map(|r| match r.event {
+                rho_devshell::Event::Kept { uses }
+                    if r.flake == flake.dir.display().to_string() =>
+                {
+                    uses
+                }
+                _ => 0,
+            })
+            .sum::<u64>()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while kept().await < 3 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(kept().await, 3, "three kept uses logged when the shell was dropped");
+    assert_eq!(
+        kept().await,
+        3,
+        "three kept uses logged when the shell was dropped"
+    );
 
     // A flake that does not evaluate fails with what to watch.
     let good = std::fs::read_to_string(repo.join("flake.nix")).unwrap();
     std::fs::write(repo.join("flake.nix"), "{ outputs = ").unwrap();
     let error = resolver().resolve(&flake).await.unwrap_err();
-    let failed = error.downcast_ref::<rho_devshell::Failed>().expect("a shell failure");
-    assert!(failed.message.contains("syntax error") && !failed.message.contains('\u{1b}'), "{}", failed.message);
+    let failed = error
+        .downcast_ref::<rho_devshell::Failed>()
+        .expect("a shell failure");
+    assert!(
+        failed.message.contains("syntax error") && !failed.message.contains('\u{1b}'),
+        "{}",
+        failed.message
+    );
     assert!(failed.watch.contents.contains(&flake.dir.join("flake.nix")));
     std::fs::write(repo.join("flake.nix"), good).unwrap();
-    assert_eq!(resolver().resolve(&flake).await.unwrap().0.id, Some(changed), "fixed");
+    assert_eq!(
+        resolver().resolve(&flake).await.unwrap().0.id,
+        Some(changed),
+        "fixed"
+    );
 }

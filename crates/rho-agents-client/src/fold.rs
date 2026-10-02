@@ -563,11 +563,8 @@ impl TranscriptFold {
                 for (queued_at, id, queued) in queue {
                     if id.is_some_and(|id| delivered_ids.contains(&id)) {
                         self.push(pos, delivered(queued));
-                    } else if id.is_some_and(|id| acknowledged.contains(&id)) {
-                        self.touch(self.blocks.len() + self.queue.len());
-                    } else if *compaction
-                        && id.is_none()
-                        && matches!(queued, UiBlock::Notice { .. })
+                    } else if id.is_some_and(|id| acknowledged.contains(&id))
+                        || (*compaction && id.is_none() && matches!(queued, UiBlock::Notice { .. }))
                     {
                         self.touch(self.blocks.len() + self.queue.len());
                     } else {
@@ -699,7 +696,8 @@ impl TranscriptFold {
                         .or_default()
                         .observe(*milestone, *at);
                 }
-                // Earlier tool rows may have been updated by a now-rewound handoff.
+                // Earlier tool rows may have been updated by a now-rewound
+                // handoff.
                 for block in &mut self.blocks {
                     if let UiBlock::Tool(tool) = Arc::make_mut(block) {
                         tool.timing = timings.get(&tool.id).copied().unwrap_or_default();
@@ -1445,7 +1443,8 @@ mod tests {
         tell(&mut fold, 2, ResponseFinished, 30);
         tell(&mut fold, 3, Boundary, 40);
         tell(&mut fold, 4, HandedOff, 50);
-        // Redelivery of one observation is idempotent even at a new log position.
+        // Redelivery of one observation is idempotent even at a new log
+        // position.
         tell(&mut fold, 5, FirstBlock, 99);
         assert_eq!(
             fold.state().exec_timings["exec-1"].first_block_at,

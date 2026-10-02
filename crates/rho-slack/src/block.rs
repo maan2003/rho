@@ -486,14 +486,13 @@ pub(crate) fn render_attachment(
             Flavour::Mrkdwn => header,
             Flavour::Markdown => escape(&header),
         });
-    } else if flavour == Flavour::Markdown {
-        if let Some(site) = attachment
+    } else if flavour == Flavour::Markdown
+        && let Some(site) = attachment
             .service
             .as_deref()
             .filter(|site| !site.is_empty())
-        {
-            lines.push(escape(site));
-        }
+    {
+        lines.push(escape(site));
     }
 
     if let Some(title) = attachment
@@ -845,7 +844,7 @@ fn apply_style(flavour: Flavour, style: Option<&Value>, text: &str) -> String {
     let trailing = &text[text.trim_end().len()..];
     let mut text = text.trim().to_owned();
     if text.is_empty() {
-        return format!("{leading}");
+        return leading.to_string();
     }
     for (enabled, marker) in [
         (flag("strike"), struck),

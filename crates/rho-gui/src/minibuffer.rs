@@ -178,6 +178,10 @@ impl Minibuffer {
         self.secret
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "editor primitives pass their callbacks and GPUI window/context explicitly"
+    )]
     pub fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,

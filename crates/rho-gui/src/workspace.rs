@@ -867,9 +867,10 @@ impl Workspace {
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor
         });
-        // A menu owns its focused keys before GPUI resolves keybindings. In particular,
-        // Vim binds `g` as the prefix of several multi-stroke commands, so an ordinary
-        // `on_key_down` handler would not see a menu's one-stroke `g` until another key
+        // A menu owns its focused keys before GPUI resolves keybindings. In
+        // particular, Vim binds `g` as the prefix of several
+        // multi-stroke commands, so an ordinary `on_key_down` handler
+        // would not see a menu's one-stroke `g` until another key
         // arrived (or the prefix timer expired).
         let transient_keystroke_listener =
             cx.listener(|this, event: &gpui::KeystrokeEvent, window, cx| {
@@ -1407,7 +1408,7 @@ impl Workspace {
                     .map_or_else(|| registry.agent_id_label(agent_id), str::to_owned),
             )
         };
-        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
+        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, name));
         // An agent already shown as a card above is not listed again.
         let dealt = rows
             .next
@@ -1441,7 +1442,7 @@ impl Workspace {
                 Some((sent, agent_id))
             })
             .collect::<Vec<_>>();
-        recent.sort_by(|a, b| b.0.cmp(&a.0));
+        recent.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         rows.recent = recent
             .into_iter()
             .take(crate::home::HOME_CAP)
@@ -1850,7 +1851,8 @@ impl Workspace {
                     self.show_status(*agent_id, cx);
                 }
                 self.invalidate_dealer_signals(cx);
-                // Status is workspace chrome, not part of the transcript editor.
+                // Status is workspace chrome, not part of the transcript
+                // editor.
                 if matches!(
                     self.active_surface().key,
                     SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if changed.contains(&id)
@@ -1915,14 +1917,14 @@ impl Workspace {
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
-            if let TranscriptFrame::Live(
-                rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
-            ) = &frame
+            if let TranscriptFrame::Live(rho_agents_client::protocol::transcript::Live::Snapshot {
+                state,
+                ..
+            }) = &frame
+                && self.registry.set_runtime(agent_id, state.clone())
             {
-                if self.registry.set_runtime(agent_id, state.clone()) {
-                    self.invalidate_dealer_signals(cx);
-                    self.refresh_home(cx);
-                }
+                self.invalidate_dealer_signals(cx);
+                self.refresh_home(cx);
             }
             let Some((summary, old_context, usage_changed, became_live)) =
                 self.apply_frame_state(agent_id, frame)
@@ -1996,8 +1998,9 @@ impl Workspace {
                 self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.selection.active_pane(), ActivePane::Startup) {
-                    // The startup scaffold guessed before agent host data existed;
-                    // refresh it now that workdir names and topics are known.
+                    // The startup scaffold guessed before agent host data
+                    // existed; refresh it now that workdir
+                    // names and topics are known.
                     self.seed_draft(false, window, cx);
                 }
                 // The focus set is this client's to keep; an agent host that
@@ -2044,9 +2047,10 @@ impl Workspace {
             }
             ConnEvent::Disconnected(reason) => {
                 self.desktop_sessions.remove(&host);
-                // An agent host that goes is an agent host that is no longer asking;
-                // the request still has to be answered, or it is left
-                // blocked on a channel nobody will send on.
+                // An agent host that goes is an agent host that is no longer
+                // asking; the request still has to be answered,
+                // or it is left blocked on a channel nobody
+                // will send on.
                 if self.git_approval.answer(GitApprovalDecision::Done) {
                     self.finish_overlay_focus(window, cx);
                 }
@@ -5475,6 +5479,10 @@ impl Workspace {
         self.open_prompt_inner(prompt, complete, on_change, on_submit, None, window, cx);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "prompt callbacks remain explicit alongside the GPUI window/context"
+    )]
     fn open_prompt_inner(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
@@ -7370,7 +7378,8 @@ impl Workspace {
             .gap_3()
             .child(div().flex().flex_row().items_center().gap_1p5().children(
                 quota.into_iter().enumerate().flat_map(|(index, summary)| {
-                    // Colour is the provider's, always; the number says how low.
+                    // Colour is the provider's, always; the number says how
+                    // low.
                     let color = match summary.model.as_str() {
                         "gpt" => colors.terminal_ansi_cyan,
                         "opus" | "fable" => gpui::rgb(0xd97757).into(),
@@ -7963,10 +7972,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_eof))
             .on_action(
                 cx.listener(|this, _: &crate::SlackSidebarFocus, window, cx| {
-                    if this.active_context == ContextId::Slack {
-                        if let Some(list) = this.slack_list_view(window, cx) {
-                            window.focus(&list.read(cx).editor().focus_handle(cx), cx);
-                        }
+                    if this.active_context == ContextId::Slack
+                        && let Some(list) = this.slack_list_view(window, cx)
+                    {
+                        window.focus(&list.read(cx).editor().focus_handle(cx), cx);
                     }
                 }),
             )

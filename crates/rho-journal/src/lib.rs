@@ -825,7 +825,7 @@ impl Event {
 }
 
 enum Message {
-    Entry(Entry),
+    Entry(Box<Entry>),
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -871,7 +871,7 @@ impl Journal {
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             event,
         };
-        if self.sender.send(Message::Entry(entry)).is_err() {
+        if self.sender.send(Message::Entry(Box::new(entry))).is_err() {
             tracing::error!("action journal writer stopped");
         }
     }
@@ -963,7 +963,7 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
         let mut next = Some(first);
         while let Some(message) = next {
             match message {
-                Message::Entry(entry) => entries.push(entry),
+                Message::Entry(entry) => entries.push(*entry),
                 Message::Flush(done) => flushes.push(done),
             }
             next = (entries.len() < BATCH)
@@ -975,7 +975,7 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
                 let mut write = db.write().await;
                 let mut table = write.open_table(EVENTS);
                 for entry in &entries {
-                    table.insert(&sequence, SenValue::borrowed(entry));
+                    table.insert(sequence, SenValue::borrowed(entry));
                     sequence = sequence
                         .checked_add(1)
                         .expect("action journal sequence overflow");
@@ -1100,7 +1100,7 @@ mod tests {
                 .open_table(STORED_EVENTS)
                 // Past the writer's own sequence, so recording the next
                 // event cannot quietly overwrite it.
-                .insert(&999, &b"not an entry this build knows".as_slice());
+                .insert(999, b"not an entry this build knows".as_slice());
             write.commit();
         });
         journal.record(Event::DeskRawModeToggled { enabled: true });
@@ -1413,7 +1413,7 @@ mod tests {
                         timestamp: "2026-09-01T00:00:00Z".into(),
                         event,
                     };
-                    events.insert(&(sequence as u64), SenValue::borrowed(&entry));
+                    events.insert(sequence as u64, SenValue::borrowed(&entry));
                 }
                 drop(events);
                 write.commit();

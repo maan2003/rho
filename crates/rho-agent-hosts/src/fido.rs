@@ -41,7 +41,7 @@ pub async fn endpoint() -> anyhow::Result<iroh::Endpoint> {
                 let read = db.read();
                 if read.has_table(IDENTITY.name()) {
                     read.open_table(IDENTITY)
-                        .get(&())
+                        .get(())
                         .map(|row| row.value().into_owned())
                 } else {
                     None
@@ -59,7 +59,7 @@ pub async fn endpoint() -> anyhow::Result<iroh::Endpoint> {
                     let mut write = db.write().await;
                     write
                         .open_table(IDENTITY)
-                        .insert(&(), SenValue::borrowed(&credential));
+                        .insert((), SenValue::borrowed(&credential));
                     write.commit();
                     credential
                 }

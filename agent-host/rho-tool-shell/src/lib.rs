@@ -174,10 +174,7 @@ impl Drop for ProcessSession {
 
 impl ShellTools {
     /// Tools running in a directory in the current process namespace.
-    pub fn in_directory(
-        working_directory: Utf8PathBuf,
-        path_overrides: PathOverrides,
-    ) -> Self {
+    pub fn in_directory(working_directory: Utf8PathBuf, path_overrides: PathOverrides) -> Self {
         Self {
             working_directory,
             path_overrides,

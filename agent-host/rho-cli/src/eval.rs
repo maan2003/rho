@@ -195,8 +195,8 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         let Some(event) = db.read().agent_event(id, appended.pos.into()) else {
             continue;
         };
-        match event {
-            AgentEvent::Entry(entry) => match entry {
+        if let AgentEvent::Entry(entry) = event {
+            match entry {
                 Entry::RequestSent { report, .. } => {
                     requests += 1;
                     emit(json!({"type":"request", "number":requests}))?;
@@ -218,7 +218,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                     }
                     if let Some(usage) = usage {
                         emit(json!({"type":"usage", "input_tokens":usage.input_tokens,
-                            "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}))?;
+                        "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}))?;
                     }
                 }
                 Entry::Sent {
@@ -233,8 +233,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                     emit(json!({"type":"message", "text":text}))?;
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     };
     agent.cancel();

@@ -103,11 +103,12 @@ fn test_raw_value_long_json() {
 
 #[test]
 fn test_raw_value_is_default() {
-    // RawValue always contains valid JSON, so an empty JSON object is the smallest
-    // valid JSON We don't test for empty string as it's not valid JSON
+    // RawValue always contains valid JSON, so an empty JSON object is the
+    // smallest valid JSON We don't test for empty string as it's not valid
+    // JSON
 
-    // Small JSON should not be default (since is_default checks if the string is
-    // empty)
+    // Small JSON should not be default (since is_default checks if the string
+    // is empty)
     let non_empty_raw = RawValue::from_string("{}".to_string()).unwrap();
     assert!(!non_empty_raw.is_default());
 
@@ -174,7 +175,7 @@ fn test_raw_value_with_option() {
 
 #[test]
 fn test_raw_value_in_vec() {
-    let json_items = vec![r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#];
+    let json_items = [r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#];
 
     let original: Vec<Box<RawValue>> = json_items
         .iter()

@@ -471,7 +471,7 @@ mod tests {
         let mut allocations = std::collections::HashSet::new();
         for i in 0..40 {
             let mut pixels = pixels.clone();
-            for (n, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            for (n, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 pixel.copy_from_slice(&[
                     (n % 251) as u8,
                     (i * 5) as u8,
@@ -491,8 +491,8 @@ mod tests {
                 .remove(0);
             let frame = decoder.decode_planes(&packet.data)?.unwrap();
             allocations.insert(frame.plane(0).as_ptr() as usize);
-            for p in 0..3 {
-                assert_eq!(frozen.plane(p), saved[p]);
+            for (p, saved_plane) in saved.iter().enumerate() {
+                assert_eq!(frozen.plane(p), saved_plane);
             }
         }
         assert!(allocations.len() < 40, "decoder buffers must be reused");
@@ -503,13 +503,13 @@ mod tests {
                 .remove(0);
             let resized = decoder.decode_planes(&packet.data)?.unwrap();
             assert_eq!((resized.width(), resized.height()), (width, height));
-            for p in 0..3 {
-                assert_eq!(frozen.plane(p), saved[p]);
+            for (p, saved_plane) in saved.iter().enumerate() {
+                assert_eq!(frozen.plane(p), saved_plane);
             }
         }
         drop(decoder);
-        for p in 0..3 {
-            assert_eq!(frozen.plane(p), saved[p]);
+        for (p, saved_plane) in saved.iter().enumerate() {
+            assert_eq!(frozen.plane(p), saved_plane);
         }
         Ok(())
     }

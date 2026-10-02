@@ -104,7 +104,7 @@ pub enum SessionEvent {
         result: crate::api::ViewSubmission,
     },
     ExternalOptions {
-        message: Message,
+        message: Box<Message>,
         action: crate::block::Interaction,
         options: Vec<crate::block::InteractionOption>,
     },
@@ -3041,7 +3041,7 @@ impl Session {
             let fetched = task.await;
             let _ = this.update(cx, |_, cx| match fetched {
                 Ok(Ok(options)) => cx.emit(SessionEvent::ExternalOptions {
-                    message,
+                    message: Box::new(message),
                     action,
                     options,
                 }),

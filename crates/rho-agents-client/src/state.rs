@@ -43,6 +43,10 @@ pub struct UiAgentUsage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "blocks are already shared behind Arc; boxing tools adds another allocation"
+)]
 pub enum UiBlock {
     UserMessage {
         text: String,

@@ -770,6 +770,14 @@ async fn run(mut command: tokio::process::Command, action: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// Prevent unrelated inherited descriptors from surviving command exec.
+pub fn command_stdio_only(command: &mut tokio::process::Command) {
+    // Only a close_range syscall runs after fork.
+    unsafe {
+        command.pre_exec(ns::close_inherited_fds_on_exec);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,13 +814,5 @@ mod tests {
         assert!(visible_relative("/src", Utf8Path::new("/src/../x")).is_err());
         assert!(visible_relative("/src", Utf8Path::new("/srcx/a")).is_err());
         assert!(visible_relative("/src", Utf8Path::new("./a")).is_err());
-    }
-}
-
-/// Prevent unrelated inherited descriptors from surviving command exec.
-pub fn command_stdio_only(command: &mut tokio::process::Command) {
-    // Only a close_range syscall runs after fork.
-    unsafe {
-        command.pre_exec(ns::close_inherited_fds_on_exec);
     }
 }

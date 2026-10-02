@@ -2234,7 +2234,6 @@ impl Drop for EditorTimingGuard {
 /// a share of a frame's own time and a reader that adds it to the
 /// between-frame total counts the same milliseconds twice.
 #[derive(Debug, Copy, Clone)]
-#[expect(missing_docs)]
 pub enum MainThreadWorkKind {
     /// Reconciling a model event into the UI.
     ModelEvent,

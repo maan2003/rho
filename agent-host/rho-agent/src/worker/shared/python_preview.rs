@@ -155,9 +155,11 @@ fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usiz
         .count()
         .min(2);
     let preceding = &source[..source.len() - count];
-    (preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0)
-        .then_some(count)
-        .unwrap_or(0)
+    if preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0 {
+        count
+    } else {
+        0
+    }
 }
 
 fn last_send(node: Node<'_>, source: &str) -> Option<usize> {

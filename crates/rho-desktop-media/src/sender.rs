@@ -96,8 +96,9 @@ impl Sender {
         self.prune();
 
         // A production controller, not a second packet congestion controller.
-        // Do not probe during idle periods or turn slow image serialization into
-        // congestion. Backlog pressure reduces encoding, not transport draining.
+        // Do not probe during idle periods or turn slow image serialization
+        // into congestion. Backlog pressure reduces encoding, not
+        // transport draining.
         if progressed
             && self
                 .adjusted
@@ -203,10 +204,10 @@ impl Sender {
             window_bytes = window_bytes.min(window.max(16 * 1024));
             // Receiver CPU pressure is distinct from transport receipt.
             decode_us = decode_us.max(f.decode_us);
-            if let (Some(received), Some(presented)) = (f.received, f.presented) {
-                if received.timestamp_us.saturating_sub(presented.timestamp_us) > 200_000 {
-                    ready = false;
-                }
+            if let (Some(received), Some(presented)) = (f.received, f.presented)
+                && received.timestamp_us.saturating_sub(presented.timestamp_us) > 200_000
+            {
+                ready = false;
             }
             // A stalled feedback channel must pause production, not silently
             // expire the slow viewer and release unbounded work.
@@ -217,9 +218,10 @@ impl Sender {
             }
         }
         // An indivisible frame may exceed the window once. It must finish
-        // before further images are encoded (except the one refinement replacement).
-        // One fresh motion state may replace a slow static refinement. It cannot
-        // abandon a checkpoint, and its own motion debt prevents endless resets.
+        // before further images are encoded (except the one refinement
+        // replacement). One fresh motion state may replace a slow
+        // static refinement. It cannot abandon a checkpoint, and its
+        // own motion debt prevents endless resets.
         let replace_refinement = !self.pending.is_empty()
             && self
                 .pending
