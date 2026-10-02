@@ -5856,6 +5856,17 @@ impl Workspace {
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
             Command::DeleteMade => self.delete_made(window, cx),
             Command::MoveLabel => self.prompt_move_label(window, cx),
+            Command::ToggleFont => match crate::rho_assets::toggle_font(cx) {
+                Ok(family) => {
+                    self.notice_on(None, &format!("font: {family}"), StyleClass::SystemInfo, cx)
+                }
+                Err(error) => self.notice_on(
+                    None,
+                    &format!("font: {error:#}"),
+                    StyleClass::StatusError,
+                    cx,
+                ),
+            },
             Command::Quit => cx.quit(),
             Command::Home => self.toggle_overview(window, cx),
             Command::SlackReact(name) => self.slack_react(&name, window, cx),

@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
-use gpui::{App, AssetSource, Result, SharedString};
+use gpui::{App, AssetSource, BorrowAppContext, Result, SharedString};
 use rust_embed::RustEmbed;
+use settings::SettingsStore;
 
 /// Rho's own assets, embedded the way zed embeds its own: a directory
 /// walked at build time rather than a list of paths kept in sync by hand.
@@ -131,14 +133,44 @@ impl RhoAssets {
             }
         }
         cx.text_system().add_fonts(fonts)?;
-        if let Some(weight) = std::env::var("RHO_GUI_FONT_BOLD_WEIGHT")
-            .ok()
-            .and_then(|weight| weight.parse().ok())
-        {
-            cx.text_system().set_bold_weight(gpui::FontWeight(weight));
-        }
+        cx.text_system().set_bold_weight(bold_weight());
         Ok(())
     }
+}
+
+/// `RHO_GUI_FONT_BOLD_WEIGHT`: the weight the deployment's font is bold at.
+fn bold_weight() -> Option<gpui::FontWeight> {
+    std::env::var("RHO_GUI_FONT_BOLD_WEIGHT")
+        .ok()
+        .and_then(|weight| weight.parse().ok())
+        .map(gpui::FontWeight)
+}
+
+/// The font the deployment makes the default, if any.
+pub fn deployment_font() -> Option<String> {
+    std::env::var("RHO_GUI_FONT_FAMILY").ok()
+}
+
+static USING_RHO_FONT: AtomicBool = AtomicBool::new(false);
+
+/// Swaps between the deployment's font, sized and weighted as configured,
+/// and plain Rho Font, so the two can be compared in place. Returns the
+/// family now in use.
+pub fn toggle_font(cx: &mut App) -> Result<String> {
+    let rho_font = !USING_RHO_FONT.fetch_xor(true, Ordering::Relaxed);
+    let (defaults, bold, family) = if rho_font {
+        (Cow::Borrowed(RHO_DEFAULT_SETTINGS), None, "Rho Font".into())
+    } else {
+        (
+            default_settings(),
+            bold_weight(),
+            deployment_font().unwrap_or_default(),
+        )
+    };
+    cx.text_system().set_bold_weight(bold);
+    cx.update_global::<SettingsStore, _>(|store, cx| store.set_default_settings(&defaults, cx))?;
+    cx.refresh_windows();
+    Ok(family)
 }
 
 #[cfg(test)]
@@ -195,7 +227,7 @@ mod tests {
         let semibold = text_system.resolve_font(&weighted(FontWeight::SEMIBOLD));
         assert_ne!(semibold, medium);
 
-        text_system.set_bold_weight(FontWeight(550.0));
+        text_system.set_bold_weight(Some(FontWeight(550.0)));
         assert_eq!(
             text_system.resolve_font(&weighted(FontWeight::BOLD)),
             medium

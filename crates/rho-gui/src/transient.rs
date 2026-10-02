@@ -72,6 +72,7 @@ pub(crate) enum Command {
     Terminal,
     NewTerminal,
     UndoVerdict,
+    ToggleFont,
     Quit,
     /// Home, from the verdict menu's own `tab` row.
     Home,
@@ -343,6 +344,12 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             MenuAction::Command(Command::UndoVerdict),
         )
         .item("shift-s", "slack…", MenuAction::Open(MenuId::Slack))
+        .when(
+            crate::rho_assets::deployment_font().is_some(),
+            "o",
+            "font · deployment/Rho Font",
+            MenuAction::Command(Command::ToggleFont),
+        )
         .item("q", "quit", MenuAction::Command(Command::Quit))
 }
 
