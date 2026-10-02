@@ -21,39 +21,52 @@ struct RhoEmbedded;
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
 /// [`RHO_DEFAULT_SETTINGS`] with `RHO_GUI_FONT_FAMILY`, when set, as the
-/// buffer and UI font, and their sizes multiplied by `RHO_GUI_FONT_SCALE`:
-/// the deployment that supplies a font through `RHO_GUI_FONTS` makes it the
-/// default, scaled to read as large as Rho Font, and user settings still win.
+/// buffer and UI font, their sizes multiplied by `RHO_GUI_FONT_SCALE` and
+/// their weight set to `RHO_GUI_FONT_WEIGHT`: the deployment that supplies a
+/// font through `RHO_GUI_FONTS` makes it the default, sized and weighted to
+/// read like Rho Font, and user settings still win.
 pub fn default_settings() -> Cow<'static, str> {
     let family = std::env::var("RHO_GUI_FONT_FAMILY").ok();
-    let scale = std::env::var("RHO_GUI_FONT_SCALE")
-        .ok()
-        .and_then(|scale| scale.parse().ok());
-    if family.is_none() && scale.is_none() {
+    let number = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+    };
+    let scale = number("RHO_GUI_FONT_SCALE");
+    let weight = number("RHO_GUI_FONT_WEIGHT");
+    if family.is_none() && scale.is_none() && weight.is_none() {
         return Cow::Borrowed(RHO_DEFAULT_SETTINGS);
     }
-    Cow::Owned(settings_with_font(family.as_deref(), scale))
+    Cow::Owned(settings_with_font(family.as_deref(), scale, weight))
 }
 
-fn settings_with_font(family: Option<&str>, scale: Option<f32>) -> String {
+fn settings_with_font(family: Option<&str>, scale: Option<f32>, weight: Option<f32>) -> String {
     let mut settings = RHO_DEFAULT_SETTINGS.to_string();
+    let mut set_number = |key: String, f: &dyn Fn(f32) -> f32| {
+        let prefix = format!(r#""{key}": "#);
+        let start = settings.find(&prefix).expect("defaults set the key") + prefix.len();
+        let end = start
+            + settings[start..]
+                .find(',')
+                .expect("the number ends at a comma");
+        let value: f32 = settings[start..end].parse().expect("the value is a number");
+        settings.replace_range(start..end, &f(value).to_string());
+    };
     for key in ["buffer_font", "ui_font"] {
-        if let Some(family) = family {
-            let family = serde_json::to_string(family).expect("a string serializes");
-            settings = settings.replace(
-                &format!(r#""{key}_family": "Rho Font""#),
-                &format!(r#""{key}_family": {family}"#),
-            );
-        }
         if let Some(scale) = scale {
-            let prefix = format!(r#""{key}_size": "#);
-            let start = settings.find(&prefix).expect("defaults set the size") + prefix.len();
-            let end = start
-                + settings[start..]
-                    .find(',')
-                    .expect("the size ends at a comma");
-            let size: f32 = settings[start..end].parse().expect("the size is a number");
-            settings.replace_range(start..end, &(size * scale).to_string());
+            set_number(format!("{key}_size"), &|size| size * scale);
+        }
+        if let Some(weight) = weight {
+            set_number(format!("{key}_weight"), &|_| weight);
+        }
+    }
+    if let Some(family) = family {
+        let family = serde_json::to_string(family).expect("a string serializes");
+        for key in ["buffer_font_family", "ui_font_family"] {
+            settings = settings.replace(
+                &format!(r#""{key}": "Rho Font""#),
+                &format!(r#""{key}": {family}"#),
+            );
         }
     }
     settings
@@ -126,7 +139,7 @@ mod tests {
 
     #[test]
     fn font_override_replaces_both_defaults() {
-        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5));
+        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5), Some(300.0));
         for key in ["buffer_font_family", "ui_font_family"] {
             assert!(
                 settings.contains(&format!(r#""{key}": "ABC \"Quoted\" Sans""#)),
@@ -140,10 +153,13 @@ mod tests {
             settings.contains(r#""agent_buffer_font_size": 12,"#),
             "only the two defaults scale"
         );
+        assert!(settings.contains(r#""buffer_font_weight": 300,"#));
+        assert!(settings.contains(r#""ui_font_weight": 300,"#));
 
-        let unscaled = settings_with_font(Some("ABC Sans"), None);
+        let unscaled = settings_with_font(Some("ABC Sans"), None, None);
         assert!(unscaled.contains(r#""buffer_font_size": 15,"#));
-        let unrenamed = settings_with_font(None, Some(1.5));
+        assert!(unscaled.contains(r#""ui_font_weight": 400,"#));
+        let unrenamed = settings_with_font(None, Some(1.5), None);
         assert!(unrenamed.contains(r#""ui_font_family": "Rho Font""#));
     }
 
