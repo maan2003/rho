@@ -97,6 +97,7 @@ async fn anthropic_stream_has_native_sse_events_and_real_error_body() {
 
 #[tokio::test]
 async fn rate_limit_scenario_uses_provider_http_errors_and_retry_after() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::new();
     let mut config = FakeModelConfig::seeded(4);
     config.scenario = Scenario::RateLimit;
@@ -207,6 +208,7 @@ async fn stream_cut_before_python_admission_allows_retry() {
 
 #[tokio::test]
 async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::new();
 
     let mut config = FakeModelConfig::seeded(1);

@@ -145,7 +145,8 @@ layout { background-color "#315b97"; }
         let result=tokio::time::timeout(Duration::from_secs(10),async {
             let mut group=video.next_group().await?.context("no video group")?;
             let packet=group.read_frame().await?.context("no frame")?;
-            let image=rho_desktop_media::codec::Decoder::new()?.decode(&packet.payload)?.context("no decoded image")?;
+            let (_,payload)=rho_desktop_media::Header::unpack(packet.payload)?;
+            let image=rho_desktop_media::codec::Decoder::new()?.decode(&payload)?.context("no decoded image")?;
             ensure!((image.width,image.height)==(640,480),"wrong image size");
             for (got,want) in image.bgra[..4].iter().zip([0x97u8,0x5b,0x31,255]) {
                 ensure!((*got as i16-want as i16).abs()<12,"wrong decoded pixel");
@@ -181,7 +182,8 @@ layout { background-color "#315b97"; }
         tokio::time::timeout(Duration::from_secs(5),async {
             let mut group=video2.next_group().await?.context("late viewer has no keyframe group")?;
             let packet=group.read_frame().await?.context("late viewer has no frame")?;
-            let image=rho_desktop_media::codec::Decoder::new()?.decode(&packet.payload)?.context("late viewer decode")?;
+            let (_,payload)=rho_desktop_media::Header::unpack(packet.payload)?;
+            let image=rho_desktop_media::codec::Decoder::new()?.decode(&payload)?.context("late viewer decode")?;
             ensure!((image.width,image.height)==(640,480),"late viewer wrong dimensions");
             Ok::<_,anyhow::Error>(())
         }).await??;

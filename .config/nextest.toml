@@ -15,3 +15,14 @@ slow-timeout = { period = "20s", terminate-after = 1 }
 # failures back off 1+1+2+3 seconds.
 filter = 'package(rho-agent) & test(/^worker::native::tests::/)'
 slow-timeout = { period = "20s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# An unclaimed task failure is reported after twenty real seconds.
+filter = 'package(rho-notebook) & test(unclaimed_failure_reports_once_after_twenty_seconds)'
+slow-timeout = { period = "30s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# The desktop end-to-end test waits out real encoder idle and late-viewer
+# keyframe windows.
+filter = 'package(rho-agent-host) & binary(wayland_stream)'
+slow-timeout = { period = "20s", terminate-after = 1 }

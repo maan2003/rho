@@ -2499,6 +2499,7 @@ async fn modern_views_open_submit_validate_update_and_close_by_the_desktop_proto
 
 #[tokio::test]
 async fn control_messages_can_carry_fresh_app_blocks() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let fake = Fake::start().await.unwrap();
     fake.add_channel("C1", "design");
     let response: serde_json::Value = reqwest::Client::new()
