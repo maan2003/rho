@@ -56,6 +56,12 @@
           inherit system;
           overlays = [
             flakebox.overlays.default
+            (_final: prev: {
+              # Semgrep's upper bound lags nixpkgs' compatible PyJWT minor release.
+              semgrep = prev.semgrep.overridePythonAttrs (old: {
+                pythonRelaxDeps = (old.pythonRelaxDeps or [ ]) ++ [ "pyjwt" ];
+              });
+            })
           ];
         };
         projectName = "rho";
@@ -300,21 +306,30 @@
         selfciPkg = selfci.packages.${system}.default;
         selfciMq = selfci.packages.${system}.mq;
 
-        flakeboxLib = flakebox.lib.mkLib pkgs {
-          config = {
-            github.ci.buildOutputs = [ ".#ci.workspace" ];
-            just.importPaths = [ "justfile.custom.just" ];
-            just.rules.watch.enable = false;
-            toolchain.components = [
-              "rustc"
-              "cargo"
-              "clippy"
-              "rust-analyzer"
-              "rust-src"
-              "llvm-tools"
-            ];
-          };
-        };
+        flakeboxLib =
+          (flakebox.lib.mkLib pkgs {
+            config = {
+              github.ci.buildOutputs = [ ".#ci.workspace" ];
+              just.importPaths = [ "justfile.custom.just" ];
+              just.rules.watch.enable = false;
+              toolchain.components = [
+                "rustc"
+                "cargo"
+                "clippy"
+                "rust-analyzer"
+                "rust-src"
+                "llvm-tools"
+              ];
+            };
+          }).overrideScope
+            (
+              _final: _prev: {
+                # Clang 18 cannot compile the new GCC 16 libstdc++ headers.
+                defaultClang = pkgs.clang;
+                defaultLibClang = pkgs.libclang.lib;
+                defaultClangUnwrapped = pkgs.llvmPackages.clang-unwrapped;
+              }
+            );
 
         muslToolchains =
           flakeboxLib.mkStdToolchains { }
@@ -442,11 +457,19 @@
         # Evaluation in rho-devshell-builder records what the evaluator
         # read; the agent base's `nix develop` takes local flakes' dev shells
         # from the builder's cache.
-        nixFork = nix.packages.${system}.nix.appendPatches [
-          ./nix/patches/nix-0001-libexpr-record-what-evaluation-observes-of-local-inp.patch
-          ./nix/patches/nix-0002-libstore-BuildEnvironment-toRcScript-C-API.patch
-          ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DE.patch
-        ];
+        nixFork =
+          (nix.packages.${system}.nix.appendPatches [
+            ./nix/patches/nix-0001-libexpr-record-what-evaluation-observes-of-local-inp.patch
+            ./nix/patches/nix-0002-libstore-BuildEnvironment-toRcScript-C-API.patch
+            ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DE.patch
+          ]).overrideAllMesonComponents
+            (
+              _final: prev: {
+                # libstore has a source directory named build; keep Meson's build
+                # directory separate so newer Meson does not treat sources as outputs.
+                mesonBuildDir = "build-meson";
+              }
+            );
 
         guiNativeBuildInputs = [
           pkgs.clang
