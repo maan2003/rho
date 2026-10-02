@@ -10,22 +10,34 @@ pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<Strin
     let diagram_id = format!("merman-{id}");
 
     let config = to_merman_config(theme);
-    let renderer = merman::svg::HeadlessRenderer::new()
-        .with_site_config(config)
-        .with_vendored_text_measurer()
-        .with_diagram_id(&diagram_id);
+    let renderer =
+        merman::Renderer::new().with_engine(merman::Engine::new().with_site_config(config));
+    let mut request = merman::SvgRequest::default();
+    request.options.diagram_id = Some(merman::svg::sanitize_svg_id(&diagram_id));
     // Apply merman's raster-safe pipeline before Zed-specific styling. The
     // pipeline handles generic rasterizer compatibility cleanup: foreignObject
     // fallback text, unsupported CSS removal, and invalid SVG attribute cleanup.
     // Zed also strips merman's existing `!important` declarations before
     // injecting its own theme CSS so host styling wins consistently in usvg/resvg.
-    let pipeline = merman::svg::SvgPipeline::resvg_safe()
-        .with_postprocessor(merman::svg::CssOverridePostprocessor::strip_existing_important());
+    request.pipeline = Some(
+        merman::svg::SvgPipeline::resvg_safe()
+            .with_postprocessor(merman::svg::CssOverridePostprocessor::strip_existing_important()),
+    );
 
-    let svg = renderer
-        .render_svg_with_pipeline_sync(source, &pipeline)
-        .context("merman render failed")?
-        .ok_or_else(|| anyhow!("merman returned no SVG for the given input"))?;
+    let output = renderer
+        .render(merman::RenderRequest::svg(
+            source,
+            merman::OperationControl::new(),
+            request,
+        ))
+        .context("merman render failed")?;
+    let merman::RenderOutput::Svg(svg) = output else {
+        return Err(anyhow!("merman returned a non-SVG output"));
+    };
+    let svg = svg
+        .ok_or_else(|| anyhow!("merman returned no SVG for the given input"))?
+        .into_parts()
+        .0;
 
     Ok(svg)
 }

@@ -260,7 +260,7 @@ pub fn enable_passive_cpu_profile() -> anyhow::Result<()> {
     }
     let directory = tempfile::Builder::new().prefix("rho-gui-cpu-").tempdir()?;
     let profiler = rho_profiling::CpuProfiler::start_rolling(
-        directory.path().join("trace.bin"),
+        directory.path(),
         CPU_ROTATION_PERIOD,
         CPU_TRACE_DISK_BUDGET,
     )?;
