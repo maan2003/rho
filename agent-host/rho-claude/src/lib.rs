@@ -600,6 +600,56 @@ mod tests {
     }
 
     #[test]
+    fn failed_results_preserve_api_and_cli_explanations() {
+        for (wire, expected) in [
+            // Claude reports quota failures as a successful CLI execution.
+            (
+                json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": "You've hit your session limit · resets 5:30pm (UTC)"
+                }),
+                "You've hit your session limit · resets 5:30pm (UTC)",
+            ),
+            (
+                json!({
+                    "subtype": "error_during_execution",
+                    "is_error": true,
+                    "errors": ["first failure", "second failure"],
+                    "result": "less specific result"
+                }),
+                "first failure\nsecond failure",
+            ),
+            (
+                json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "errors": [" ", ""],
+                    "result": "API unavailable"
+                }),
+                "API unavailable",
+            ),
+            (
+                json!({
+                    "subtype": "error_max_turns",
+                    "is_error": true,
+                    "errors": [],
+                    "result": " "
+                }),
+                "Claude Code reached its turn limit",
+            ),
+            (
+                json!({"subtype": "success", "is_error": true}),
+                "Claude Code reported an error without details",
+            ),
+        ] {
+            let message: protocol::ResultMessage = serde_json::from_value(wire).unwrap();
+            assert!(message.is_error);
+            assert_eq!(message.failure_message(), expected);
+        }
+    }
+
+    #[test]
     fn parses_control_response_event() {
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "control_response",

@@ -270,6 +270,38 @@ pub struct ResultMessage {
     pub terminal_reason: Option<String>,
 }
 
+impl ResultMessage {
+    /// API failures can have subtype `success` and put their explanation
+    /// in `result`, rather than the `errors` list used for CLI failures.
+    pub fn failure_message(&self) -> String {
+        let errors = self
+            .errors
+            .iter()
+            .filter(|error| !error.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !errors.is_empty() {
+            return errors;
+        }
+        if let Some(result) = &self.result
+            && !result.trim().is_empty()
+        {
+            return result.clone();
+        }
+        match self.subtype {
+            ResultSubtype::Success => "Claude Code reported an error without details",
+            ResultSubtype::ErrorDuringExecution => "Claude Code failed during execution",
+            ResultSubtype::ErrorMaxTurns => "Claude Code reached its turn limit",
+            ResultSubtype::ErrorMaxBudgetUsd => "Claude Code reached its budget limit",
+            ResultSubtype::ErrorMaxStructuredOutputRetries => {
+                "Claude Code exhausted its structured output retries"
+            }
+        }
+        .to_owned()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultSubtype {

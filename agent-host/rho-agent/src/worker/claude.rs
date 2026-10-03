@@ -1780,7 +1780,7 @@ impl ClaudeLoop {
                     self.response_id = None;
                     self.set_kind(InferenceState::Idle);
                 } else if message.is_error {
-                    self.fail(anyhow::anyhow!("{}", message.errors.join("\n")))
+                    self.fail(anyhow::anyhow!("{}", message.failure_message()))
                         .await?;
                 } else {
                     // CLI result prose is provider output, not a message to the
@@ -2825,6 +2825,78 @@ fn write_generated_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quota_failure_reaches_live_status_and_the_persisted_failure() {
+        use crate::db::{AgentProfileWriteTxnExt as _, AgentWriteTxnExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent_id = write.alloc_agent_id();
+        let role = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium1,
+        };
+        write.create_agent(
+            rho_agent_types::UnixMs(1),
+            agent_id,
+            None,
+            crate::db::tests::test_workspace(),
+            role,
+            role.session_profile(),
+            AgentRuntime::Claude {
+                session_id: Uuid::new_v4(),
+            },
+            crate::log::AgentOrigin::User,
+        );
+        write.commit();
+        let host = crate::testing::services_pair(
+            db.clone(),
+            crate::inference::testing::accounts(),
+            agent_id,
+            std::sync::Weak::new(),
+        );
+        let cwd = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            rho_claude::accounts::ClaudePaths::at(cwd.join("claude")),
+            cwd,
+        )
+        .await
+        .unwrap();
+        let explanation = "You've hit your session limit · resets 5:30pm (UTC)";
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": explanation
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.status().runtime.inference,
+            InferenceState::Failed {
+                error: explanation.to_owned(),
+            }
+        );
+        assert!(
+            host.history()
+                .await
+                .unwrap()
+                .1
+                .into_iter()
+                .any(|(_, event)| matches!(
+                    event,
+                    AgentEvent::Failed { error, .. } if error == explanation
+                ))
+        );
+    }
 
     #[test]
     fn streamed_exec_draft_keeps_its_call_identity_after_source_completes() {
