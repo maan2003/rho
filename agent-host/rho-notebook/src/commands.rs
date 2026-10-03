@@ -232,6 +232,15 @@ impl Exit {
         self.exit.exit_code
     }
 
+    /// Awaiting the result again gives it back, so a name rebound by
+    /// `r = await r` still means the command.
+    fn __await__<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        py.import("asyncio")?
+            .call_method1("sleep", (0, slf))?
+            .call_method0("__await__")
+    }
+
     fn __repr__(&self) -> String {
         let code = self
             .exit

@@ -108,7 +108,8 @@ A raised task does not wait for its commands; cancelling a task kills its comman
 failed task raises the original exception and claims the failure; otherwise the failure is
 reported after 20 seconds. Task results are never reported; await the task to retrieve one.
 
-The handle for a live exec or created task, found by the session ID in its reports.
+The handle for a recent exec or created task, found by the session ID in its reports.
+Awaiting an exec waits for it and its commands.
 Task.from_session_id(session_id: int) → Task
 
 ### Commands

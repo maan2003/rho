@@ -25,6 +25,9 @@ from concurrent.futures import thread as executor_thread
 
 CELL = contextvars.ContextVar('rho_cell', default=None)
 OUTPUT_TOKEN_LIMIT = 10000
+# Ended tasks `Task.from_session_id` still finds: a report can name a task
+# that ends before the model's next cell runs.
+ENDED_TASKS_KEPT = 1000
 FUTURE_FLAGS = 0
 for _name in __future__.all_feature_names:
     FUTURE_FLAGS |= getattr(__future__, _name).compiler_flag
@@ -35,15 +38,40 @@ DIAGNOSTICS = sys.stderr
 class Owner:
     """One task's output, commands and completion; children copy its context only."""
 
-    def __init__(self, cell, notebook):
+    def __init__(self, cell, notebook, created=False):
         self.cell = cell
         self.notebook = notebook
+        self.created = created
         self.commands = set()
         self.task = None
-        self.done = False
+        self.settled = None
+        self._done = False
+        notebook.remember(self)
+
+    @property
+    def done(self):
+        return self._done
+
+    @done.setter
+    def done(self, done):
+        self._done = done
+        if done and self.settled is not None and not self.settled.done():
+            self.settled.set_result(None)
 
     def __await__(self):
-        return self.task.__await__()
+        """A created task gives its result; an exec, which has none, ends
+        with its commands. Either raises the exception it failed with."""
+        if self.created:
+            return self.task.__await__()
+        return self.ended().__await__()
+
+    async def ended(self):
+        if not self.done:
+            if self.settled is None:
+                self.settled = self.notebook.loop.create_future()
+            await self.settled
+        if self.task is not None and self.task.done() and not self.task.cancelled():
+            self.task.result()
 
     def failed(self, exc):
         self.cell.pending_failure()
@@ -103,7 +131,7 @@ class NotebookEventLoop(asyncio.SelectorEventLoop):
             return super().create_task(coro, **kwargs)
         name = getattr(coro, '__name__', type(coro).__name__)
         cell = self.notebook.driver.new_task(creator.cell.id, name)
-        owner = Owner(cell, self.notebook)
+        owner = Owner(cell, self.notebook, created=True)
         context = kwargs.pop('context', None) or contextvars.copy_context()
         context.run(CELL.set, owner)
         task = super().create_task(owner.finish(coro), context=context, **kwargs)
@@ -164,12 +192,14 @@ class Task:
     """A task named in a report; awaiting propagates its original exception."""
     @staticmethod
     def from_session_id(label):
-        notebook = NOTEBOOK
-        matches = [owner for id, owner in notebook.tasks.items()
-                   if session_id(id) == label]
-        if len(matches) != 1:
-            raise RuntimeError(f'No unique live task has session ID {label}')
-        return matches[0]
+        """The newest task wearing `label`, live or recently ended: labels
+        come round again every 9,000 tasks."""
+        notebook = CELL.get().notebook
+        owners = {**notebook.recent, **notebook.tasks}
+        matches = [id for id in owners if session_id(id) == label]
+        if not matches:
+            raise RuntimeError(f'No recent task has session ID {label}')
+        return owners[max(matches)]
 
     def __await__(self):
         return self.task.__await__()
@@ -263,8 +293,7 @@ class Notebook:
         self.namespace = namespace(exports)
         self.loop = None
         self.tasks = {}
-        global NOTEBOOK
-        NOTEBOOK = self
+        self.recent = {}
 
     def run(self):
         self.loop = NotebookEventLoop(self)
@@ -280,6 +309,11 @@ class Notebook:
                 getattr(self, 'on_' + message[0])(*message[1:])
             except BaseException:
                 traceback.print_exc(file=DIAGNOSTICS)
+
+    def remember(self, owner):
+        self.recent[owner.cell.id] = owner
+        if len(self.recent) > ENDED_TASKS_KEPT:
+            del self.recent[next(iter(self.recent))]
 
     def owner(self, cell):
         owner = Owner(cell, self)
