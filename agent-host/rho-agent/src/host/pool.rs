@@ -1600,6 +1600,29 @@ mod tests {
         )
         .await
         .unwrap();
+        // The bare id behind the handle names the same agent; a prefix of
+        // the wrong role does not.
+        let bare = pool.agent_id_prefix(owned);
+        let output = call_agent_tool(
+            tools_of(creator_id, None),
+            AgentCall::Message(SendArgs {
+                agent_id: bare.clone(),
+                message: "by bare id".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(output.contains(&owned_handle), "{output}");
+        let error = call_agent_tool(
+            tools_of(creator_id, None),
+            AgentCall::Message(SendArgs {
+                agent_id: format!("adv-{bare}"),
+                message: "wrong role".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("role prefix differs"), "{error}");
         let error = call_agent_tool(
             tools_of(creator_id, None),
             AgentCall::Cancel(InterruptArgs {
