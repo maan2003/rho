@@ -9,19 +9,15 @@ operations: 57 reads and 19 writes. Writes cover PR collaboration, issue and
 issue-comment creation/editing, and the three existing CI reruns. It also defines Octo-only `pulls.review_decision`
 and `pulls.set_draft` helpers backed by fixed, typed GraphQL operations.
 
-Reads use the selected metadata as an explicit GET/path-template allowlist.
-Octo forwards query parameters and response fields without schema validation;
-GitHub validates its API. The Python client still checks declared argument names.
+REST reads and writes use the selected metadata as an explicit method/path-template
+allowlist. Octo forwards query parameters and request bodies unchanged and relays
+upstream responses without schema validation; GitHub validates its API. The Python
+client still checks declared argument names and missing required parameters.
 
-Writes are explicitly dispatched to handwritten Rust request types in
-`octo-server/src/api/gh_writes.rs`. Unknown fields, wrong types, and missing
-required fields are rejected before Octo acquires credentials. The original
-JSON is forwarded after validation, preserving null versus omission and the
-caller's union representation. Omission or `UNSET` leaves a field out; `None`
-sends JSON null and is accepted only for nullable fields. `False`, `0`, and `""`
-are forwarded as values. Unlike the old host, PR create/edit and CI rerun
-parameters no longer silently drop `None`: omit those nonnullable fields instead.
-There is no schema generator or REST response model.
+Omission or `UNSET` leaves a field out; `None` sends JSON null, and `False`, `0`,
+and `""` remain values. Octo does not drop or interpret nulls: GitHub decides
+whether a field accepts null. There is no schema generator, REST request/response
+model, or write wrapper.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
 and dismissing another review. Generic GraphQL, Git ref writes, repository

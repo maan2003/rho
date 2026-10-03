@@ -1,8 +1,6 @@
 //! GitHub REST operations from the same pinned metadata used by ghapi.
-//! Reads are allowlisted; writes have typed handlers. Credentials and signed
+//! Reads and writes share a method/path allowlist. Credentials and signed
 //! redirects stay on the host; branch-changing APIs are not exposed.
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
@@ -16,21 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
-
-#[path = "gh_writes.rs"]
-mod gh_writes;
-
-type HandlerFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
-type Handler = fn(Request) -> HandlerFuture;
-
-struct Request {
-    state: Arc<AppState>,
-    op: &'static Operation,
-    parts: Vec<String>,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -57,8 +40,6 @@ struct Operation {
     name: String,
     path: String,
     verb: String,
-    #[serde(default)]
-    param_types: std::collections::BTreeMap<String, String>,
 }
 
 fn operations() -> &'static [Operation] {
@@ -183,75 +164,6 @@ async fn rest(
     else {
         return forbidden();
     };
-    let request = Request {
-        state,
-        op,
-        parts,
-        uri,
-        headers,
-        body,
-    };
-    if method == Method::GET {
-        return forward(request).await;
-    }
-    let Some(handler) = gh_writes::handler(&op.group, &op.name) else {
-        return forbidden();
-    };
-    handler(request).await
-}
-
-async fn typed<B>(request: Request, body_required: bool, json_body: bool) -> Response
-where
-    B: DeserializeOwned,
-{
-    let Request {
-        state,
-        op,
-        parts,
-        uri,
-        headers,
-        body,
-    } = request;
-    // Typed schema validation happens before acquiring host credentials.
-
-    for (template, value) in op.path.trim_start_matches('/').split('/').zip(&parts) {
-        let name = template.trim_start_matches('{').trim_end_matches('}');
-        if op.param_types.get(name).is_some_and(|kind| kind == "int")
-            && !value.parse::<i64>().is_ok_and(|id| id > 0)
-        {
-            return forbidden();
-        }
-    }
-    // None of the selected write operations accepts query parameters.
-    if uri.query().is_some_and(|query| !query.is_empty()) {
-        return forbidden();
-    }
-    if body_required && body.is_empty() {
-        return forbidden();
-    }
-    if !body.is_empty() && (!json_body || serde_json::from_slice::<B>(&body).is_err()) {
-        return forbidden();
-    }
-    forward(Request {
-        state,
-        op,
-        parts,
-        uri,
-        headers,
-        body,
-    })
-    .await
-}
-
-async fn forward(request: Request) -> Response {
-    let Request {
-        state,
-        op,
-        parts,
-        uri,
-        headers,
-        body,
-    } = request;
     let token = match state.get_token().await {
         Ok(token) => token,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -669,19 +581,16 @@ mod tests {
         Arc::new(|| Ok("host-token-test".into()))
     }
     #[test]
-    fn reads_are_allowlisted_and_writes_have_manual_handlers() {
+    fn rest_allowlist_contains_only_the_selected_methods_and_paths() {
         let mut reads = 0;
         let mut writes = 0;
         for op in operations() {
             if matches!(op.name.as_str(), "review_decision" | "set_draft") {
                 continue;
             }
-            let handler = gh_writes::handler(&op.group, &op.name);
             if op.verb == "GET" {
-                assert!(handler.is_none(), "{}.{}", op.group, op.name);
                 reads += 1;
             } else {
-                assert!(handler.is_some(), "{}.{}", op.group, op.name);
                 writes += 1;
             }
         }
@@ -752,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pr_issue_and_search_handlers_forward_typed_payloads_and_fields() {
+    async fn pr_issue_and_search_requests_relay_payloads_and_fields() {
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let seen = captured.clone();
         let (upstream, upstream_task) = serve(Router::new().fallback(any(
@@ -1127,7 +1036,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_or_authoritative_requests_never_obtain_credentials() {
+    async fn writes_relay_raw_bodies_queries_and_upstream_validation_errors() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = captured.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "Bearer host-token-test"
+                    );
+                    assert!(!headers.contains_key(header::COOKIE));
+                    assert!(!headers.contains_key("x-forwarded-host"));
+                    assert_eq!(
+                        headers.get(header::CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    seen.lock()
+                        .await
+                        .push((method, uri.to_string(), body.to_vec()));
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({
+                            "message":"Validation Failed",
+                            "errors":[{"field":"body","code":"invalid"}]
+                        })),
+                    )
+                }
+            },
+        )))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        for (method, path, body) in [
+            (
+                Method::PATCH,
+                "/repos/acme/widget/pulls/not-a-number?future_flag=yes&future_flag=no",
+                b"{ \"body\": null, \"future_field\": 9007199254740993, \"draft\": false }"
+                    .as_slice(),
+            ),
+            (
+                Method::POST,
+                "/repos/acme/widget/issues?future_flag=yes",
+                b"not JSON".as_slice(),
+            ),
+            (
+                Method::POST,
+                "/repos/acme/widget/actions/runs/0/rerun",
+                b"{\"enable_debug_logging\":null}".as_slice(),
+            ),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer agent-token")
+                .header(header::COOKIE, "agent=cookie")
+                .header("x-forwarded-host", "evil.example")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({
+                    "message":"Validation Failed",
+                    "errors":[{"field":"body","code":"invalid"}]
+                })
+            );
+            assert_eq!(
+                captured.lock().await.last().unwrap(),
+                &(method, path.to_owned(), body.to_vec())
+            );
+        }
+        assert_eq!(captured.lock().await.len(), 3);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_methods_and_paths_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let provider: crate::TokenProvider = Arc::new(move || {
@@ -1163,81 +1152,6 @@ mod tests {
                 json!({"ref":"refs/heads/main","sha":"a"}),
             ),
             (Method::POST, "graphql", json!({"query":"mutation { ... }"})),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/comments/19",
-                json!({}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/comments/19",
-                json!({"body":19}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/comments/19",
-                json!({"body":"edited","boddy":"typo"}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/comments/19?future_flag=true",
-                json!({"body":"edited"}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/pulls",
-                json!({"head":null,"base":"main","title":"Fix"}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/pulls/7",
-                json!({"base":"main","unexpected":null}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/actions/runs/23/rerun",
-                json!({"enable_debug_logging":"false"}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/pulls",
-                json!({"head":"topic","base":"main","issue":7,"title":null}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/pulls/7",
-                json!({"body":null}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/actions/jobs/19/rerun",
-                json!({"enable_debugger":null}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/actions/runs/23/rerun",
-                json!({"enable_debug_logging":null}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/actions/runs/23/rerun-failed-jobs",
-                json!({"enable_debug_logging":null}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues",
-                json!({"title":true}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues",
-                json!({"title":"Issue","issue_field_values":[{"field_id":"five","value":"x"}]}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/pulls/7/reviews",
-                json!({"event":"COMMENT","comments":[{"path":"foo","line":"five","body":"text"}]}),
-            ),
             (
                 Method::GET,
                 "repos/acme/widget/pulls/7/update-branch",
@@ -1376,21 +1290,6 @@ mod tests {
                 Method::DELETE,
                 "repos/acme/widget/milestones/7",
                 Value::Null,
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/not-a-number",
-                json!({"body":"x"}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/0",
-                json!({"body":"x"}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/pulls/-1",
-                json!({"body":"x"}),
             ),
             (
                 Method::PUT,

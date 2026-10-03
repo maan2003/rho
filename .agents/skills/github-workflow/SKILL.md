@@ -20,8 +20,9 @@ issues = await api.issues.list_for_repo(state="open", per_page=100, page=1)
 ```
 
 The selected client covers PR collaboration, issue/comment creation and editing,
-issue/search reads, and existing CI/check/log/rerun operations. Reads use an explicit GET/path allowlist;
-writes have typed host handlers. PR merges, head-branch updates, review dismissal,
+issue/search reads, and existing CI/check/log/rerun operations. REST reads and
+writes share an explicit method/path allowlist; Octo passes their bodies, queries,
+and responses through without schema validation. PR merges, head-branch updates, review dismissal,
 Git ref writes, repository administration, and credential APIs are not exposed.
 Generic GraphQL is unavailable; `pulls.review_decision` and `pulls.set_draft`
 are fixed Octo-only helpers. Issue writes are limited to `create`, `update`,
@@ -31,11 +32,9 @@ locking, pinning, deletion, and label/milestone administration writes are unavai
 
 Pass declared parameters directly as keywords. Unknown keywords, missing
 required parameters, and undeclared `query_`/`body_` fields raise `TypeError`
-before a request. The host checks write request schemas. Read queries and
-responses pass through to GitHub without schema validation. Omit a parameter
-(or use `UNSET`) to leave it out. `None` sends JSON null and is accepted only
-for nullable write fields; PR create/edit and CI rerun options do not treat
-`None` as omission. List/search operations
+before a request. GitHub validates REST argument types and values. Omit a
+parameter (or use `UNSET`) to leave it out. `None` sends JSON null; GitHub decides
+whether the field accepts it. Octo never treats `None` as omission. List/search operations
 may require pagination; use `result['items']` for search rows (`.items` is a
 dict method).
 
