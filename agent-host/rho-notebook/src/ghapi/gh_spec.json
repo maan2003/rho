@@ -3182,6 +3182,2115 @@
       "docs_url": "https://docs.github.com/rest/issues/issues#list-user-account-issues-assigned-to-the-authenticated-user"
     },
     {
+      "group": "actions",
+      "name": "get_artifact",
+      "path": "/repos/{owner}/{repo}/actions/artifacts/{artifact_id}",
+      "verb": "GET",
+      "summary": "Get an artifact",
+      "route_params": [
+        "owner",
+        "repo",
+        "artifact_id"
+      ],
+      "required_params": [
+        "artifact_id",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "artifact_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "artifact_id": "The unique identifier of the artifact."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/artifacts#get-an-artifact"
+    },
+    {
+      "group": "actions",
+      "name": "get_workflow",
+      "path": "/repos/{owner}/{repo}/actions/workflows/{workflow_id}",
+      "verb": "GET",
+      "summary": "Get a workflow",
+      "route_params": [
+        "owner",
+        "repo",
+        "workflow_id"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "workflow_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "workflow_id": "The ID of the workflow. You can also pass the workflow file name as a string."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/workflows#get-a-workflow"
+    },
+    {
+      "group": "actions",
+      "name": "get_workflow_run_attempt",
+      "path": "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}",
+      "verb": "GET",
+      "summary": "Get a workflow run attempt",
+      "route_params": [
+        "owner",
+        "repo",
+        "run_id",
+        "attempt_number"
+      ],
+      "query_params": [
+        "exclude_pull_requests"
+      ],
+      "required_params": [
+        "attempt_number",
+        "owner",
+        "repo",
+        "run_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "run_id": "int",
+        "attempt_number": "int",
+        "exclude_pull_requests": "bool"
+      },
+      "param_defaults": {
+        "exclude_pull_requests": false
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "run_id": "The unique identifier of the workflow run.",
+        "attempt_number": "The attempt number of the workflow run.",
+        "exclude_pull_requests": "If `true` pull requests are omitted from the response (empty array)."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/workflow-runs#get-a-workflow-run-attempt"
+    },
+    {
+      "group": "actions",
+      "name": "list_artifacts_for_repo",
+      "path": "/repos/{owner}/{repo}/actions/artifacts",
+      "verb": "GET",
+      "summary": "List artifacts for a repository",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "per_page",
+        "page",
+        "name"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "per_page": "int",
+        "page": "int",
+        "name": "str"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "name": "The name field of an artifact. When specified, only artifacts with this name will be returned."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/artifacts#list-artifacts-for-a-repository"
+    },
+    {
+      "group": "actions",
+      "name": "list_jobs_for_workflow_run_attempt",
+      "path": "/repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs",
+      "verb": "GET",
+      "summary": "List jobs for a workflow run attempt",
+      "route_params": [
+        "owner",
+        "repo",
+        "run_id",
+        "attempt_number"
+      ],
+      "query_params": [
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "attempt_number",
+        "owner",
+        "repo",
+        "run_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "run_id": "int",
+        "attempt_number": "int",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "run_id": "The unique identifier of the workflow run.",
+        "attempt_number": "The attempt number of the workflow run.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt"
+    },
+    {
+      "group": "actions",
+      "name": "list_repo_workflows",
+      "path": "/repos/{owner}/{repo}/actions/workflows",
+      "verb": "GET",
+      "summary": "List repository workflows",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/actions/workflows#list-repository-workflows"
+    },
+    {
+      "group": "actions",
+      "name": "list_workflow_run_artifacts",
+      "path": "/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+      "verb": "GET",
+      "summary": "List workflow run artifacts",
+      "route_params": [
+        "owner",
+        "repo",
+        "run_id"
+      ],
+      "query_params": [
+        "per_page",
+        "page",
+        "name",
+        "direction"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "run_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "run_id": "int",
+        "per_page": "int",
+        "page": "int",
+        "name": "str",
+        "direction": "str"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1,
+        "direction": "desc"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "run_id": "The unique identifier of the workflow run.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "name": "The name field of an artifact. When specified, only artifacts with this name will be returned.",
+        "direction": "The direction to sort the results by."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/artifacts#list-workflow-run-artifacts"
+    },
+    {
+      "group": "actions",
+      "name": "list_workflow_runs",
+      "path": "/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
+      "verb": "GET",
+      "summary": "List workflow runs for a workflow",
+      "route_params": [
+        "owner",
+        "repo",
+        "workflow_id"
+      ],
+      "query_params": [
+        "actor",
+        "branch",
+        "event",
+        "status",
+        "per_page",
+        "page",
+        "created",
+        "exclude_pull_requests",
+        "check_suite_id",
+        "head_sha"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "workflow_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "actor": "str",
+        "branch": "str",
+        "event": "str",
+        "status": "str",
+        "per_page": "int",
+        "page": "int",
+        "created": "str",
+        "exclude_pull_requests": "bool",
+        "check_suite_id": "int",
+        "head_sha": "str"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1,
+        "exclude_pull_requests": false
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "workflow_id": "The ID of the workflow. You can also pass the workflow file name as a string.",
+        "actor": "Returns someone's workflow runs. Use the login for the user who created the `push` associated with the check suite or workflow run.",
+        "branch": "Returns workflow runs associated with a branch. Use the name of the branch of the `push`.",
+        "event": "Returns workflow run triggered by the event you specify. For example, `push`, `pull_request` or `issue`. For more information, see \"[Events that trigger workflows](https://docs.github.com/actions/automating-your-workflow-with-github-actions/events-that-trigger-workflows).\"",
+        "status": "Returns workflow runs with the check run `status` or `conclusion` that you specify. For example, a conclusion can be `success` or a status can be `in_progress`. Only GitHub Actions can set a status of `waiting`, `pending`, or `requested`.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "created": "Returns workflow runs created within the given date-time range. For more information on the syntax, see \"[Understanding the search syntax](https://docs.github.com/search-github/getting-started-with-searching-on-github/understanding-the-search-syntax#query-for-dates).\"",
+        "exclude_pull_requests": "If `true` pull requests are omitted from the response (empty array).",
+        "check_suite_id": "Returns workflow runs with the `check_suite_id` that you specify.",
+        "head_sha": "Only returns workflow runs that are associated with the specified `head_sha`."
+      },
+      "docs_url": "https://docs.github.com/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow"
+    },
+    {
+      "group": "git",
+      "name": "get_blob",
+      "path": "/repos/{owner}/{repo}/git/blobs/{file_sha}",
+      "verb": "GET",
+      "summary": "Get a blob",
+      "route_params": [
+        "owner",
+        "repo",
+        "file_sha"
+      ],
+      "required_params": [
+        "file_sha",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "file_sha": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive."
+      },
+      "docs_url": "https://docs.github.com/rest/git/blobs#get-a-blob"
+    },
+    {
+      "group": "git",
+      "name": "get_commit",
+      "path": "/repos/{owner}/{repo}/git/commits/{commit_sha}",
+      "verb": "GET",
+      "summary": "Get a commit object",
+      "route_params": [
+        "owner",
+        "repo",
+        "commit_sha"
+      ],
+      "required_params": [
+        "commit_sha",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "commit_sha": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "commit_sha": "The SHA of the commit."
+      },
+      "docs_url": "https://docs.github.com/rest/git/commits#get-a-commit-object"
+    },
+    {
+      "group": "git",
+      "name": "get_ref",
+      "path": "/repos/{owner}/{repo}/git/ref/{ref}",
+      "verb": "GET",
+      "summary": "Get a reference",
+      "route_params": [
+        "owner",
+        "repo",
+        "ref"
+      ],
+      "required_params": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "ref": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "ref": "The Git reference. For more information, see \"[Git References](https://git-scm.com/book/en/v2/Git-Internals-Git-References)\" in the Git documentation."
+      },
+      "docs_url": "https://docs.github.com/rest/git/refs#get-a-reference"
+    },
+    {
+      "group": "git",
+      "name": "get_tag",
+      "path": "/repos/{owner}/{repo}/git/tags/{tag_sha}",
+      "verb": "GET",
+      "summary": "Get a tag",
+      "route_params": [
+        "owner",
+        "repo",
+        "tag_sha"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "tag_sha"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "tag_sha": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive."
+      },
+      "docs_url": "https://docs.github.com/rest/git/tags#get-a-tag"
+    },
+    {
+      "group": "git",
+      "name": "get_tree",
+      "path": "/repos/{owner}/{repo}/git/trees/{tree_sha}",
+      "verb": "GET",
+      "summary": "Get a tree",
+      "route_params": [
+        "owner",
+        "repo",
+        "tree_sha"
+      ],
+      "query_params": [
+        "recursive"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "tree_sha"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "tree_sha": "str",
+        "recursive": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "tree_sha": "The SHA1 value or ref (branch or tag) name of the tree.",
+        "recursive": "Setting this parameter to any value returns the objects or subtrees referenced by the tree specified in `:tree_sha`. For example, setting `recursive` to any of the following will enable returning objects or subtrees: `0`, `1`, `\"true\"`, and `\"false\"`. Omit this parameter to prevent recursively returning objects or subtrees."
+      },
+      "docs_url": "https://docs.github.com/rest/git/trees#get-a-tree"
+    },
+    {
+      "group": "git",
+      "name": "list_matching_refs",
+      "path": "/repos/{owner}/{repo}/git/matching-refs/{ref}",
+      "verb": "GET",
+      "summary": "List matching references",
+      "route_params": [
+        "owner",
+        "repo",
+        "ref"
+      ],
+      "required_params": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "ref": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "ref": "The Git reference. For more information, see \"[Git References](https://git-scm.com/book/en/v2/Git-Internals-Git-References)\" in the Git documentation."
+      },
+      "docs_url": "https://docs.github.com/rest/git/refs#list-matching-references"
+    },
+    {
+      "group": "issues",
+      "name": "add_assignees",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/assignees",
+      "verb": "POST",
+      "summary": "Add assignees to an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "assignees"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "assignees": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "assignees": "Usernames of people to assign this issue to. _NOTE: Only users with push access can add assignees to an issue. Assignees are silently ignored otherwise._"
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "assignees": [
+              "hubot",
+              "other_user"
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/assignees#add-assignees-to-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "add_blocked_by_dependency",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by",
+      "verb": "POST",
+      "summary": "Add a dependency an issue is blocked by",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "issue_id"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_id",
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "issue_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "issue_id": "The id of the issue that blocks the current issue"
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "issue_id": 1
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/issue-dependencies#add-a-dependency-an-issue-is-blocked-by"
+    },
+    {
+      "group": "issues",
+      "name": "add_issue_field_values",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/issue-field-values",
+      "verb": "POST",
+      "summary": "Add issue field values to an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "issue_field_values"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "issue_field_values": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "issue_field_values": "An array of issue field values to add to this issue. Each field value must include the field ID and the value to set."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "Add multiple field values",
+          "value": {
+            "issue_field_values": [
+              {
+                "field_id": 123,
+                "value": "Critical"
+              },
+              {
+                "field_id": 456,
+                "value": 5
+              },
+              {
+                "field_id": 789,
+                "value": "2024-12-31"
+              }
+            ]
+          }
+        },
+        "single-field": {
+          "summary": "Add a single field value",
+          "value": {
+            "issue_field_values": [
+              {
+                "field_id": 123,
+                "value": "High Priority"
+              }
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/issue-field-values#add-issue-field-values-to-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "add_labels",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/labels",
+      "verb": "POST",
+      "summary": "Add labels to an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "labels"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "labels": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "labels": "The labels to add to the issue's existing labels. You can also pass an `array` of labels directly, but GitHub recommends passing an object with the `labels` key. To replace all of the labels for an issue, use \"[Set labels for an issue](https://docs.github.com/rest/issues/labels#set-labels-for-an-issue).\""
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "labels": [
+              "bug",
+              "enhancement"
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/labels#add-labels-to-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "add_sub_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/sub_issues",
+      "verb": "POST",
+      "summary": "Add sub-issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "sub_issue_id",
+        "replace_parent"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo",
+        "sub_issue_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "sub_issue_id": "int",
+        "replace_parent": "bool"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "sub_issue_id": "The id of the sub-issue to add. The sub-issue must belong to the same repository owner as the parent issue",
+        "replace_parent": "Option that, when true, instructs the operation to replace the sub-issues current parent issue"
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "sub_issue_id": 1
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/sub-issues#add-sub-issue"
+    },
+    {
+      "group": "issues",
+      "name": "delete_comment",
+      "path": "/repos/{owner}/{repo}/issues/comments/{comment_id}",
+      "verb": "DELETE",
+      "summary": "Delete an issue comment",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id"
+      ],
+      "required_params": [
+        "comment_id",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment."
+      },
+      "docs_url": "https://docs.github.com/rest/issues/comments#delete-an-issue-comment"
+    },
+    {
+      "group": "issues",
+      "name": "delete_issue_field_value",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/issue-field-values/{issue_field_id}",
+      "verb": "DELETE",
+      "summary": "Delete an issue field value from an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number",
+        "issue_field_id"
+      ],
+      "required_params": [
+        "issue_field_id",
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "issue_field_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "issue_field_id": "The unique identifier of the issue field."
+      },
+      "docs_url": "https://docs.github.com/rest/issues/issue-field-values#delete-an-issue-field-value-from-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "remove_all_labels",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/labels",
+      "verb": "DELETE",
+      "summary": "Remove all labels from an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue."
+      },
+      "docs_url": "https://docs.github.com/rest/issues/labels#remove-all-labels-from-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "remove_assignees",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/assignees",
+      "verb": "DELETE",
+      "summary": "Remove assignees from an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "assignees"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "assignees": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "assignees": "Usernames of assignees to remove from an issue. _NOTE: Only users with push access can remove assignees from an issue. Assignees are silently ignored otherwise._"
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "assignees": [
+              "hubot",
+              "other_user"
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/assignees#remove-assignees-from-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "remove_dependency_blocked_by",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by/{issue_id}",
+      "verb": "DELETE",
+      "summary": "Remove dependency an issue is blocked by",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number",
+        "issue_id"
+      ],
+      "required_params": [
+        "issue_id",
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "issue_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "issue_id": "The id of the blocking issue to remove as a dependency"
+      },
+      "docs_url": "https://docs.github.com/rest/issues/issue-dependencies#remove-dependency-an-issue-is-blocked-by"
+    },
+    {
+      "group": "issues",
+      "name": "remove_label",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/labels/{name}",
+      "verb": "DELETE",
+      "summary": "Remove a label from an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number",
+        "name"
+      ],
+      "required_params": [
+        "issue_number",
+        "name",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "name": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue."
+      },
+      "docs_url": "https://docs.github.com/rest/issues/labels#remove-a-label-from-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "remove_sub_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/sub_issue",
+      "verb": "DELETE",
+      "summary": "Remove sub-issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "sub_issue_id"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo",
+        "sub_issue_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "sub_issue_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "sub_issue_id": "The id of the sub-issue to remove"
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "sub_issue_id": 6
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/sub-issues#remove-sub-issue"
+    },
+    {
+      "group": "issues",
+      "name": "reprioritize_sub_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/sub_issues/priority",
+      "verb": "PATCH",
+      "summary": "Reprioritize sub-issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "sub_issue_id",
+        "after_id",
+        "before_id"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo",
+        "sub_issue_id"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "sub_issue_id": "int",
+        "after_id": "int",
+        "before_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "sub_issue_id": "The id of the sub-issue to reprioritize",
+        "after_id": "The id of the sub-issue to be prioritized after (either positional argument after OR before should be specified).",
+        "before_id": "The id of the sub-issue to be prioritized before (either positional argument after OR before should be specified)."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "sub_issue_id": 6,
+            "after_id": 5
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/sub-issues#reprioritize-sub-issue"
+    },
+    {
+      "group": "issues",
+      "name": "set_issue_field_values",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/issue-field-values",
+      "verb": "PUT",
+      "summary": "Set issue field values for an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "issue_field_values"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "issue_field_values": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "issue_field_values": "An array of issue field values to set for this issue. Each field value must include the field ID and the value to set. All existing field values will be replaced."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "Set multiple field values",
+          "value": {
+            "issue_field_values": [
+              {
+                "field_id": 123,
+                "value": "Critical"
+              },
+              {
+                "field_id": 456,
+                "value": 5
+              },
+              {
+                "field_id": 789,
+                "value": "2024-12-31"
+              }
+            ]
+          }
+        },
+        "single-field": {
+          "summary": "Set a single field value",
+          "value": {
+            "issue_field_values": [
+              {
+                "field_id": 123,
+                "value": "High Priority"
+              }
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/issue-field-values#set-issue-field-values-for-an-issue"
+    },
+    {
+      "group": "issues",
+      "name": "set_labels",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/labels",
+      "verb": "PUT",
+      "summary": "Set labels for an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "labels"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "labels": "list"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "labels": [
+              "bug",
+              "enhancement"
+            ]
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/issues/labels#set-labels-for-an-issue"
+    },
+    {
+      "group": "reactions",
+      "name": "create_for_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/reactions",
+      "verb": "POST",
+      "summary": "Create reaction for an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "body_params": [
+        "content"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "content",
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "content": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "content": "The [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions) to add to the issue."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "content": "heart"
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#create-reaction-for-an-issue"
+    },
+    {
+      "group": "reactions",
+      "name": "create_for_issue_comment",
+      "path": "/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
+      "verb": "POST",
+      "summary": "Create reaction for an issue comment",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id"
+      ],
+      "body_params": [
+        "content"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "comment_id",
+        "content",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "content": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "content": "The [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions) to add to the issue comment."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "content": "heart"
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#create-reaction-for-an-issue-comment"
+    },
+    {
+      "group": "reactions",
+      "name": "create_for_pull_request_review_comment",
+      "path": "/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+      "verb": "POST",
+      "summary": "Create reaction for a pull request review comment",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id"
+      ],
+      "body_params": [
+        "content"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "comment_id",
+        "content",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "content": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "content": "The [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions) to add to the pull request review comment."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "content": "heart"
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#create-reaction-for-a-pull-request-review-comment"
+    },
+    {
+      "group": "reactions",
+      "name": "delete_for_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/reactions/{reaction_id}",
+      "verb": "DELETE",
+      "summary": "Delete an issue reaction",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number",
+        "reaction_id"
+      ],
+      "required_params": [
+        "issue_number",
+        "owner",
+        "reaction_id",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "reaction_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "reaction_id": "The unique identifier of the reaction."
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#delete-an-issue-reaction"
+    },
+    {
+      "group": "reactions",
+      "name": "delete_for_issue_comment",
+      "path": "/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions/{reaction_id}",
+      "verb": "DELETE",
+      "summary": "Delete an issue comment reaction",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id",
+        "reaction_id"
+      ],
+      "required_params": [
+        "comment_id",
+        "owner",
+        "reaction_id",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "reaction_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "reaction_id": "The unique identifier of the reaction."
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#delete-an-issue-comment-reaction"
+    },
+    {
+      "group": "reactions",
+      "name": "delete_for_pull_request_comment",
+      "path": "/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions/{reaction_id}",
+      "verb": "DELETE",
+      "summary": "Delete a pull request comment reaction",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id",
+        "reaction_id"
+      ],
+      "required_params": [
+        "comment_id",
+        "owner",
+        "reaction_id",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "reaction_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "reaction_id": "The unique identifier of the reaction."
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#delete-a-pull-request-comment-reaction"
+    },
+    {
+      "group": "reactions",
+      "name": "list_for_issue",
+      "path": "/repos/{owner}/{repo}/issues/{issue_number}/reactions",
+      "verb": "GET",
+      "summary": "List reactions for an issue",
+      "route_params": [
+        "owner",
+        "repo",
+        "issue_number"
+      ],
+      "query_params": [
+        "content",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "issue_number",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "issue_number": "int",
+        "content": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "issue_number": "The number that identifies the issue.",
+        "content": "Returns a single [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions). Omit this parameter to list all reactions to an issue.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#list-reactions-for-an-issue"
+    },
+    {
+      "group": "reactions",
+      "name": "list_for_issue_comment",
+      "path": "/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
+      "verb": "GET",
+      "summary": "List reactions for an issue comment",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id"
+      ],
+      "query_params": [
+        "content",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "comment_id",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "content": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "content": "Returns a single [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions). Omit this parameter to list all reactions to an issue comment.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#list-reactions-for-an-issue-comment"
+    },
+    {
+      "group": "reactions",
+      "name": "list_for_pull_request_review_comment",
+      "path": "/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+      "verb": "GET",
+      "summary": "List reactions for a pull request review comment",
+      "route_params": [
+        "owner",
+        "repo",
+        "comment_id"
+      ],
+      "query_params": [
+        "content",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "comment_id",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "comment_id": "int",
+        "content": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "comment_id": "The unique identifier of the comment.",
+        "content": "Returns a single [reaction type](https://docs.github.com/rest/reactions/reactions#about-reactions). Omit this parameter to list all reactions to a pull request review comment.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/reactions/reactions#list-reactions-for-a-pull-request-review-comment"
+    },
+    {
+      "group": "repos",
+      "name": "compare_commits",
+      "path": "/repos/{owner}/{repo}/compare/{basehead}",
+      "verb": "GET",
+      "summary": "Compare two commits",
+      "route_params": [
+        "owner",
+        "repo",
+        "basehead"
+      ],
+      "query_params": [
+        "page",
+        "per_page"
+      ],
+      "required_params": [
+        "basehead",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "page": "int",
+        "per_page": "int",
+        "basehead": "str"
+      },
+      "param_defaults": {
+        "page": 1,
+        "per_page": 30
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "basehead": "The base branch and head branch to compare. This parameter expects the format `BASE...HEAD`. Both must be branch names in `repo`. To compare with a branch that exists in a different repository in the same network as `repo`, the `basehead` parameter expects the format `USERNAME:BASE...USERNAME:HEAD`."
+      },
+      "docs_url": "https://docs.github.com/rest/commits/commits#compare-two-commits"
+    },
+    {
+      "group": "repos",
+      "name": "get",
+      "path": "/repos/{owner}/{repo}",
+      "verb": "GET",
+      "summary": "Get a repository",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive."
+      },
+      "docs_url": "https://docs.github.com/rest/repos/repos#get-a-repository"
+    },
+    {
+      "group": "repos",
+      "name": "get_branch",
+      "path": "/repos/{owner}/{repo}/branches/{branch}",
+      "verb": "GET",
+      "summary": "Get a branch",
+      "route_params": [
+        "owner",
+        "repo",
+        "branch"
+      ],
+      "required_params": [
+        "branch",
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "branch": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "branch": "The name of the branch. Cannot contain wildcard characters. To use wildcard characters in branch names, use [the GraphQL API](https://docs.github.com/graphql)."
+      },
+      "docs_url": "https://docs.github.com/rest/branches/branches#get-a-branch"
+    },
+    {
+      "group": "repos",
+      "name": "get_commit",
+      "path": "/repos/{owner}/{repo}/commits/{ref}",
+      "verb": "GET",
+      "summary": "Get a commit",
+      "route_params": [
+        "owner",
+        "repo",
+        "ref"
+      ],
+      "query_params": [
+        "page",
+        "per_page"
+      ],
+      "required_params": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "page": "int",
+        "per_page": "int",
+        "ref": "str"
+      },
+      "param_defaults": {
+        "page": 1,
+        "per_page": 30
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "ref": "The commit reference. Can be a commit SHA, branch name (`heads/BRANCH_NAME`), or tag name (`tags/TAG_NAME`). For more information, see \"[Git References](https://git-scm.com/book/en/v2/Git-Internals-Git-References)\" in the Git documentation."
+      },
+      "docs_url": "https://docs.github.com/rest/commits/commits#get-a-commit"
+    },
+    {
+      "group": "repos",
+      "name": "get_content",
+      "path": "/repos/{owner}/{repo}/contents/{path}",
+      "verb": "GET",
+      "summary": "Get repository content",
+      "route_params": [
+        "owner",
+        "repo",
+        "path"
+      ],
+      "query_params": [
+        "ref"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "owner",
+        "path",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "path": "str",
+        "ref": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "path": "path parameter",
+        "ref": "The name of the commit/branch/tag. Default: the repository’s default branch."
+      },
+      "docs_url": "https://docs.github.com/rest/repos/contents#get-repository-content"
+    },
+    {
+      "group": "repos",
+      "name": "get_latest_release",
+      "path": "/repos/{owner}/{repo}/releases/latest",
+      "verb": "GET",
+      "summary": "Get the latest release",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive."
+      },
+      "docs_url": "https://docs.github.com/rest/releases/releases#get-the-latest-release"
+    },
+    {
+      "group": "repos",
+      "name": "get_readme",
+      "path": "/repos/{owner}/{repo}/readme",
+      "verb": "GET",
+      "summary": "Get a repository README",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "ref"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "ref": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "ref": "The name of the commit/branch/tag. Default: the repository’s default branch."
+      },
+      "docs_url": "https://docs.github.com/rest/repos/contents#get-a-repository-readme"
+    },
+    {
+      "group": "repos",
+      "name": "get_release",
+      "path": "/repos/{owner}/{repo}/releases/{release_id}",
+      "verb": "GET",
+      "summary": "Get a release",
+      "route_params": [
+        "owner",
+        "repo",
+        "release_id"
+      ],
+      "required_params": [
+        "owner",
+        "release_id",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "release_id": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "release_id": "The unique identifier of the release."
+      },
+      "docs_url": "https://docs.github.com/rest/releases/releases#get-a-release"
+    },
+    {
+      "group": "repos",
+      "name": "get_release_by_tag",
+      "path": "/repos/{owner}/{repo}/releases/tags/{tag}",
+      "verb": "GET",
+      "summary": "Get a release by tag name",
+      "route_params": [
+        "owner",
+        "repo",
+        "tag"
+      ],
+      "required_params": [
+        "owner",
+        "repo",
+        "tag"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "tag": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "tag": "tag parameter"
+      },
+      "docs_url": "https://docs.github.com/rest/releases/releases#get-a-release-by-tag-name"
+    },
+    {
+      "group": "repos",
+      "name": "list_branches",
+      "path": "/repos/{owner}/{repo}/branches",
+      "verb": "GET",
+      "summary": "List branches",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "protected",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "protected": "bool",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "protected": "Setting to `true` returns only branches protected by branch protections or rulesets. When set to `false`, only unprotected branches are returned. Omitting this parameter returns all branches.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/branches/branches#list-branches"
+    },
+    {
+      "group": "repos",
+      "name": "list_commits",
+      "path": "/repos/{owner}/{repo}/commits",
+      "verb": "GET",
+      "summary": "List commits",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "sha",
+        "path",
+        "author",
+        "committer",
+        "since",
+        "until",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "sha": "str",
+        "path": "str",
+        "author": "str",
+        "committer": "str",
+        "since": "str",
+        "until": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "sha": "SHA or branch to start listing commits from. Default: the repository’s default branch (usually `main`).",
+        "path": "Only commits containing this file path will be returned.",
+        "author": "GitHub username or email address to use to filter by commit author.",
+        "committer": "GitHub username or email address to use to filter by commit committer.",
+        "since": "Only show results that were last updated after the given time. This is a timestamp in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format: `YYYY-MM-DDTHH:MM:SSZ`. Due to limitations of Git, timestamps must be between 1970-01-01 and 2099-12-31 (inclusive) or unexpected results may be returned.",
+        "until": "Only commits before this date will be returned. This is a timestamp in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format: `YYYY-MM-DDTHH:MM:SSZ`. Due to limitations of Git, timestamps must be between 1970-01-01 and 2099-12-31 (inclusive) or unexpected results may be returned.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/commits/commits#list-commits"
+    },
+    {
+      "group": "repos",
+      "name": "list_for_authenticated_user",
+      "path": "/user/repos",
+      "verb": "GET",
+      "summary": "List repositories for the authenticated user",
+      "query_params": [
+        "visibility",
+        "affiliation",
+        "type",
+        "sort",
+        "direction",
+        "per_page",
+        "page",
+        "since",
+        "before"
+      ],
+      "param_types": {
+        "visibility": "str",
+        "affiliation": "str",
+        "type": "str",
+        "sort": "str",
+        "direction": "str",
+        "per_page": "int",
+        "page": "int",
+        "since": "str",
+        "before": "str"
+      },
+      "param_defaults": {
+        "visibility": "all",
+        "affiliation": "owner,collaborator,organization_member",
+        "type": "all",
+        "sort": "full_name",
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "visibility": "Limit results to repositories with the specified visibility.",
+        "affiliation": "Comma-separated list of values. Can include: * `owner`: Repositories that are owned by the authenticated user. * `collaborator`: Repositories that the user has been added to as a collaborator. * `organization_member`: Repositories that the user has access to through being a member of an organization. This includes every repository on every team that the user is on.",
+        "type": "Limit results to repositories of the specified type. Will cause a `422` error if used in the same request as **visibility** or **affiliation**.",
+        "sort": "The property to sort the results by.",
+        "direction": "The order to sort by. Default: `asc` when using `full_name`, otherwise `desc`.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "since": "Only show repositories updated after the given time. This is a timestamp in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format: `YYYY-MM-DDTHH:MM:SSZ`.",
+        "before": "Only show repositories updated before the given time. This is a timestamp in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format: `YYYY-MM-DDTHH:MM:SSZ`."
+      },
+      "docs_url": "https://docs.github.com/rest/repos/repos#list-repositories-for-the-authenticated-user"
+    },
+    {
+      "group": "repos",
+      "name": "list_for_org",
+      "path": "/orgs/{org}/repos",
+      "verb": "GET",
+      "summary": "List organization repositories",
+      "route_params": [
+        "org"
+      ],
+      "query_params": [
+        "type",
+        "sort",
+        "direction",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "org"
+      ],
+      "param_types": {
+        "org": "str",
+        "type": "str",
+        "sort": "str",
+        "direction": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "type": "all",
+        "sort": "created",
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "org": "The organization name. The name is not case sensitive.",
+        "type": "Specifies the types of repositories you want returned.",
+        "sort": "The property to sort the results by.",
+        "direction": "The order to sort by. Default: `asc` when using `full_name`, otherwise `desc`.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/repos/repos#list-organization-repositories"
+    },
+    {
+      "group": "repos",
+      "name": "list_for_user",
+      "path": "/users/{username}/repos",
+      "verb": "GET",
+      "summary": "List repositories for a user",
+      "route_params": [
+        "username"
+      ],
+      "query_params": [
+        "type",
+        "sort",
+        "direction",
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "username"
+      ],
+      "param_types": {
+        "username": "str",
+        "type": "str",
+        "sort": "str",
+        "direction": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "type": "owner",
+        "sort": "full_name",
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "username": "The handle for the GitHub user account.",
+        "type": "Limit results to repositories of the specified type.",
+        "sort": "The property to sort the results by.",
+        "direction": "The order to sort by. Default: `asc` when using `full_name`, otherwise `desc`.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/repos/repos#list-repositories-for-a-user"
+    },
+    {
+      "group": "repos",
+      "name": "list_release_assets",
+      "path": "/repos/{owner}/{repo}/releases/{release_id}/assets",
+      "verb": "GET",
+      "summary": "List release assets",
+      "route_params": [
+        "owner",
+        "repo",
+        "release_id"
+      ],
+      "query_params": [
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "release_id",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "release_id": "int",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "release_id": "The unique identifier of the release.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/releases/assets#list-release-assets"
+    },
+    {
+      "group": "repos",
+      "name": "list_releases",
+      "path": "/repos/{owner}/{repo}/releases",
+      "verb": "GET",
+      "summary": "List releases",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/releases/releases#list-releases"
+    },
+    {
+      "group": "repos",
+      "name": "list_tags",
+      "path": "/repos/{owner}/{repo}/tags",
+      "verb": "GET",
+      "summary": "List repository tags",
+      "route_params": [
+        "owner",
+        "repo"
+      ],
+      "query_params": [
+        "per_page",
+        "page"
+      ],
+      "required_params": [
+        "owner",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "per_page": "int",
+        "page": "int"
+      },
+      "param_defaults": {
+        "per_page": 30,
+        "page": 1
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "per_page": "The number of results per page (max 100). For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\"",
+        "page": "The page number of the results to fetch. For more information, see \"[Using pagination in the REST API](https://docs.github.com/rest/using-the-rest-api/using-pagination-in-the-rest-api).\""
+      },
+      "docs_url": "https://docs.github.com/rest/repos/repos#list-repository-tags"
+    },
+    {
       "group": "pulls",
       "name": "review_decision",
       "path": "/repos/{owner}/{repo}/pulls/{pull_number}/review-decision",

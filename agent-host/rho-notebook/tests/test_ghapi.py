@@ -17,27 +17,74 @@ from ghapi.gh_spec import spec
 class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
     def test_selected_spec_matches_complete_pinned_upstream_entries(self):
         # Hash independently selected from upstream 81b28a5325b311e9878a676a57fef801093242f6:
-        # baseline CI, all selected reads/PRs, and issue/comment create/update writes.
+        # selected collaboration, repository/code reads, and CI metadata.
         custom = {("pulls", "review_decision"), ("pulls", "set_draft")}
         upstream = {**spec, "ops": sorted(
             [o for o in spec["ops"] if (o["group"], o["name"]) not in custom],
             key=lambda o: (o["group"], o["name"]),
         )}
-        self.assertEqual(len(spec["ops"]), 78)
-        self.assertEqual(len(upstream["ops"]), 76)
+        self.assertEqual(len(spec["ops"]), 133)
+        self.assertEqual(len(upstream["ops"]), 131)
         writes = {(op["group"], op["name"]) for op in upstream["ops"] if op["verb"] != "GET"}
-        self.assertEqual(len(writes), 19)
+        self.assertEqual(len(writes), 40)
         self.assertEqual({name for group, name in writes if group == "issues"},
-                         {"create", "update", "create_comment", "update_comment"})
-        self.assertEqual(sum(op["verb"] == "GET" for op in upstream["ops"]), 57)
+                         {
+                             "create", "update", "create_comment", "update_comment", "delete_comment",
+                             "add_assignees", "remove_assignees", "add_labels", "set_labels",
+                             "remove_label", "remove_all_labels", "add_blocked_by_dependency",
+                             "remove_dependency_blocked_by", "add_sub_issue", "remove_sub_issue",
+                             "reprioritize_sub_issue", "add_issue_field_values", "set_issue_field_values",
+                             "delete_issue_field_value",
+                         })
+        self.assertEqual(sum(op["verb"] == "GET" for op in upstream["ops"]), 91)
         canonical = json.dumps(upstream, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "bd646d0dca2eda7381da9e17d9baaf199dd2266e95ee33886500439a84d6c4b7")
+        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "adde59131429ceeac4213e46b74a41b52de46af1abfde27358583d81027f4502")
         self.assertEqual({o["group"] for o in spec["ops"]},
-                         {"actions", "checks", "issues", "pulls", "repos", "search"})
+                         {"actions", "checks", "git", "issues", "pulls", "reactions", "repos", "search"})
         draft = next(o for o in spec["ops"] if (o["group"], o["name"]) == ("pulls", "set_draft"))
         self.assertEqual((draft["verb"], draft["path"], draft["body_params"]),
                          ("PUT", "/repos/{owner}/{repo}/pulls/{pull_number}/draft", ["draft"]))
         self.assertIn("draft", draft["required_params"])
+
+
+    async def test_expanded_collaboration_and_code_read_methods(self):
+        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+            for sync in (False, True):
+                with self.subTest(sync=sync):
+                    api = GhApi("acme", "widget", sync=sync)
+                    request = Mock(return_value={"ok": True}) if sync else AsyncMock(return_value={"ok": True})
+                    api.transport.request = request
+                    for op, args, kwargs, method, path, query, body in (
+                        (api.repos.get, (), {}, "GET", "/repos/acme/widget", {}, None),
+                        (api.repos.get_content, ("src/main.rs",), {"ref": "topic/next"},
+                         "GET", "/repos/acme/widget/contents/src/main.rs", {"ref": "topic/next"}, None),
+                        (api.git.get_ref, ("heads/topic",), {},
+                         "GET", "/repos/acme/widget/git/ref/heads/topic", {}, None),
+                        (api.actions.list_workflow_run_artifacts, (23,), {"page": 3},
+                         "GET", "/repos/acme/widget/actions/runs/23/artifacts", {"page": 3}, None),
+                        (api.issues.add_labels, (17,), {"labels": ["bug", "needs review"]},
+                         "POST", "/repos/acme/widget/issues/17/labels", {}, {"labels": ["bug", "needs review"]}),
+                        (api.issues.remove_label, (17, "needs review"), {},
+                         "DELETE", "/repos/acme/widget/issues/17/labels/needs%20review", {}, None),
+                        (api.issues.add_sub_issue, (17,), {"sub_issue_id": 41},
+                         "POST", "/repos/acme/widget/issues/17/sub_issues", {}, {"sub_issue_id": 41}),
+                        (api.issues.add_blocked_by_dependency, (17,), {"issue_id": 43},
+                         "POST", "/repos/acme/widget/issues/17/dependencies/blocked_by", {}, {"issue_id": 43}),
+                        (api.reactions.create_for_pull_request_review_comment, (29,), {"content": "+1"},
+                         "POST", "/repos/acme/widget/pulls/comments/29/reactions", {}, {"content": "+1"}),
+                        (api.reactions.delete_for_issue, (17, 31), {},
+                         "DELETE", "/repos/acme/widget/issues/17/reactions/31", {}, None),
+                        (api.issues.delete_comment, (37,), {},
+                         "DELETE", "/repos/acme/widget/issues/comments/37", {}, None),
+                    ):
+                        with self.subTest(method=method, path=path):
+                            result = op(*args, **kwargs)
+                            if not sync:
+                                result = await result
+                            self.assertTrue(result.ok)
+                            self.assertEqual(request.call_args.args, (method, "http://octo" + path))
+                            self.assertEqual(request.call_args.kwargs["params"], query)
+                            self.assertEqual(request.call_args.kwargs["json"], body)
 
     async def test_required_parameters_are_checked_after_binding_and_mapping_overrides(self):
         from fastcore.all import UNSET
@@ -134,8 +181,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                             with self.assertRaises(TypeError):
                                 await invoke(api.issues.update_comment, 7, **kwargs)
                     request.assert_not_called()
-                    for name in ("add_assignees", "set_labels", "create_label", "delete_comment",
-                                 "create_milestone", "add_sub_issue", "approve_suggestion"):
+                    for name in ("create_label", "create_milestone", "approve_suggestion", "lock", "pin_comment"):
                         self.assertFalse(hasattr(api.issues, name), name)
 
                     self.assertEqual(inspect.signature(api.pulls.list).parameters["sort"].default, "created")

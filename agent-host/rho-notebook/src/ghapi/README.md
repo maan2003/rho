@@ -4,10 +4,17 @@ Based on [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5,
 [`81b28a5`](https://github.com/AnswerDotAI/ghapi/commit/81b28a5325b311e9878a676a57fef801093242f6)
 (Apache-2.0; see `LICENSE`).
 
-`gh_spec.json` contains complete, unmodified upstream metadata for 76 REST
-operations: 57 reads and 19 writes. Writes cover PR collaboration, issue and
-issue-comment creation/editing, and the three existing CI reruns. It also defines Octo-only `pulls.review_decision`
-and `pulls.set_draft` helpers backed by fixed, typed GraphQL operations.
+`gh_spec.json` contains complete, unmodified upstream metadata for 131 REST
+operations: 91 reads and 40 writes. It also defines Octo-only
+`pulls.review_decision` and `pulls.set_draft` helpers backed by fixed,
+typed GraphQL operations.
+
+The selected surface covers PR collaboration, issue/comment workflows,
+issue labels/assignees/field values/dependencies/sub-issues, and reactions
+on issues and issue/review comments. Reads also cover repository discovery,
+metadata, contents, commits/comparisons, branches/tags, Git objects/refs,
+releases/assets metadata, and workflow/run/attempt/artifact metadata.
+Actions writes remain limited to the three existing CI reruns.
 
 REST reads and writes use the selected metadata as an explicit method/path-template
 allowlist. Octo forwards query parameters and request bodies unchanged and relays
@@ -20,14 +27,14 @@ whether a field accepts null. There is no schema generator, REST request/respons
 model, or write wrapper.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
-and dismissing another review. Generic GraphQL, Git ref writes, repository
-administration, and credential operations are not exposed. Issue writes are
-limited to `create`, `update`, `create_comment`, and `update_comment`. Use
-`issues.update` for labels, assignees, and milestone assignment. Dedicated issue
-dependency, sub-issue, suggestion, field-value, locking, pinning, deletion, and
-label/milestone administration writes are unavailable; their selected reads remain.
-API availability
-does not authorize a live write: agents still need the user's specific approval.
+and dismissing another review. Generic GraphQL, Git/ref/content writes,
+repository administration, credential operations, workflow dispatch/deployment,
+issue locking/pinning/suggestion moderation, and label/milestone administration
+are not exposed. `issues.update` still supports milestone assignment.
+Artifact/release/archive downloads requiring additional redirect handling
+are not exposed; existing Actions job/run log downloads remain available.
+API availability does not authorize a live write: agents still need the user's
+specific approval.
 
 `core.py` retains upstream operation generation, response decoding,
 owner/repo overrides, and `pr_status`/`check_status` presentation.

@@ -594,7 +594,7 @@ mod tests {
                 writes += 1;
             }
         }
-        assert_eq!((reads, writes), (57, 19));
+        assert_eq!((reads, writes), (91, 40));
         for name in ["merge", "merge_async", "update_branch", "dismiss_review"] {
             assert!(
                 !operations()
@@ -603,7 +603,7 @@ mod tests {
             );
         }
         for (group, name) in [
-            ("repos", "get"),
+            ("repos", "update"),
             ("git", "create_ref"),
             ("apps", "create_installation_access_token"),
         ] {
@@ -1116,6 +1116,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expanded_operations_relay_to_github_without_new_handlers() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = captured.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "Bearer host-token-test"
+                    );
+                    seen.lock()
+                        .await
+                        .push((method, uri.to_string(), body.to_vec()));
+                    (StatusCode::ACCEPTED, "upstream result")
+                }
+            },
+        )))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        // Concrete fixtures selected independently from pinned upstream metadata.
+        for (method, path) in [
+            (Method::GET, "/repos/acme/widget/actions/artifacts/7"),
+            (Method::GET, "/repos/acme/widget/actions/workflows/7"),
+            (Method::GET, "/repos/acme/widget/actions/runs/7/attempts/7"),
+            (Method::GET, "/repos/acme/widget/actions/artifacts"),
+            (
+                Method::GET,
+                "/repos/acme/widget/actions/runs/7/attempts/7/jobs",
+            ),
+            (Method::GET, "/repos/acme/widget/actions/workflows"),
+            (Method::GET, "/repos/acme/widget/actions/runs/7/artifacts"),
+            (Method::GET, "/repos/acme/widget/actions/workflows/7/runs"),
+            (Method::GET, "/repos/acme/widget/git/blobs/7"),
+            (Method::GET, "/repos/acme/widget/git/commits/7"),
+            (Method::GET, "/repos/acme/widget/git/ref/heads%2Ftopic"),
+            (Method::GET, "/repos/acme/widget/git/tags/7"),
+            (Method::GET, "/repos/acme/widget/git/trees/7"),
+            (
+                Method::GET,
+                "/repos/acme/widget/git/matching-refs/heads%2Ftopic",
+            ),
+            (Method::POST, "/repos/acme/widget/issues/7/assignees"),
+            (
+                Method::POST,
+                "/repos/acme/widget/issues/7/dependencies/blocked_by",
+            ),
+            (
+                Method::POST,
+                "/repos/acme/widget/issues/7/issue-field-values",
+            ),
+            (Method::POST, "/repos/acme/widget/issues/7/labels"),
+            (Method::POST, "/repos/acme/widget/issues/7/sub_issues"),
+            (Method::DELETE, "/repos/acme/widget/issues/comments/7"),
+            (
+                Method::DELETE,
+                "/repos/acme/widget/issues/7/issue-field-values/7",
+            ),
+            (Method::DELETE, "/repos/acme/widget/issues/7/labels"),
+            (Method::DELETE, "/repos/acme/widget/issues/7/assignees"),
+            (
+                Method::DELETE,
+                "/repos/acme/widget/issues/7/dependencies/blocked_by/7",
+            ),
+            (Method::DELETE, "/repos/acme/widget/issues/7/labels/7"),
+            (Method::DELETE, "/repos/acme/widget/issues/7/sub_issue"),
+            (
+                Method::PATCH,
+                "/repos/acme/widget/issues/7/sub_issues/priority",
+            ),
+            (
+                Method::PUT,
+                "/repos/acme/widget/issues/7/issue-field-values",
+            ),
+            (Method::PUT, "/repos/acme/widget/issues/7/labels"),
+            (Method::POST, "/repos/acme/widget/issues/7/reactions"),
+            (
+                Method::POST,
+                "/repos/acme/widget/issues/comments/7/reactions",
+            ),
+            (
+                Method::POST,
+                "/repos/acme/widget/pulls/comments/7/reactions",
+            ),
+            (Method::DELETE, "/repos/acme/widget/issues/7/reactions/7"),
+            (
+                Method::DELETE,
+                "/repos/acme/widget/issues/comments/7/reactions/7",
+            ),
+            (
+                Method::DELETE,
+                "/repos/acme/widget/pulls/comments/7/reactions/7",
+            ),
+            (Method::GET, "/repos/acme/widget/issues/7/reactions"),
+            (
+                Method::GET,
+                "/repos/acme/widget/issues/comments/7/reactions",
+            ),
+            (Method::GET, "/repos/acme/widget/pulls/comments/7/reactions"),
+            (Method::GET, "/repos/acme/widget/compare/main...topic"),
+            (Method::GET, "/repos/acme/widget"),
+            (Method::GET, "/repos/acme/widget/branches/release%2Fnext"),
+            (Method::GET, "/repos/acme/widget/commits/heads%2Ftopic"),
+            (Method::GET, "/repos/acme/widget/contents/src%2Fmain.rs"),
+            (Method::GET, "/repos/acme/widget/releases/latest"),
+            (Method::GET, "/repos/acme/widget/readme"),
+            (Method::GET, "/repos/acme/widget/releases/7"),
+            (Method::GET, "/repos/acme/widget/releases/tags/v1.2"),
+            (Method::GET, "/repos/acme/widget/branches"),
+            (Method::GET, "/repos/acme/widget/commits"),
+            (Method::GET, "/user/repos"),
+            (Method::GET, "/orgs/team/repos"),
+            (Method::GET, "/users/alice/repos"),
+            (Method::GET, "/repos/acme/widget/releases/7/assets"),
+            (Method::GET, "/repos/acme/widget/releases"),
+            (Method::GET, "/repos/acme/widget/tags"),
+        ] {
+            let uri = format!("{path}?page=3&future_flag=one&future_flag=two");
+            let body = b"{ \"future_field\": null, \"enabled\": false }";
+            let response = client
+                .request(method.clone(), format!("{base}{}", uri.replace("%2F", "/")))
+                .body(body.as_slice())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{method} {path}");
+            assert_eq!(response.text().await.unwrap(), "upstream result");
+            assert_eq!(
+                captured.lock().await.last().unwrap(),
+                &(method, uri, body.to_vec())
+            );
+        }
+        assert_eq!(captured.lock().await.len(), 55);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn unavailable_methods_and_paths_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1158,14 +1297,8 @@ mod tests {
                 Value::Null,
             ),
             (Method::GET, "repos/acme/widget/git/refs", Value::Null),
-            (Method::GET, "repos/acme/widget", Value::Null),
             (Method::HEAD, "repos/acme/widget/issues/7", Value::Null),
             (
-                Method::DELETE,
-                "repos/acme/widget/issues/comments/7",
-                Value::Null,
-            ),
-            (
                 Method::PUT,
                 "repos/acme/widget/issues/comments/7/pin",
                 Value::Null,
@@ -1173,61 +1306,6 @@ mod tests {
             (
                 Method::DELETE,
                 "repos/acme/widget/issues/comments/7/pin",
-                Value::Null,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/assignees",
-                json!({"assignees":["alice"]}),
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/assignees",
-                json!({"assignees":["alice"]}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/dependencies/blocked_by",
-                json!({"issue_id":41}),
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/dependencies/blocked_by/7",
-                Value::Null,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/issue-field-values",
-                json!({"issue_field_values":[{"field_id":5,"value":"High"}]}),
-            ),
-            (
-                Method::PUT,
-                "repos/acme/widget/issues/7/issue-field-values",
-                json!({"issue_field_values":[{"field_id":5,"value":"High"}]}),
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/issue-field-values/7",
-                Value::Null,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/labels",
-                json!({"labels":["bug"]}),
-            ),
-            (
-                Method::PUT,
-                "repos/acme/widget/issues/7/labels",
-                json!({"labels":["bug"]}),
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/labels",
-                Value::Null,
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/labels/7",
                 Value::Null,
             ),
             (
@@ -1239,21 +1317,6 @@ mod tests {
                 Method::DELETE,
                 "repos/acme/widget/issues/7/lock",
                 Value::Null,
-            ),
-            (
-                Method::DELETE,
-                "repos/acme/widget/issues/7/sub_issue",
-                json!({"sub_issue_id":41}),
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/sub_issues",
-                json!({"sub_issue_id":41}),
-            ),
-            (
-                Method::PATCH,
-                "repos/acme/widget/issues/7/sub_issues/priority",
-                json!({"sub_issue_id":41,"after_id":19}),
             ),
             (
                 Method::POST,
@@ -1293,14 +1356,43 @@ mod tests {
             ),
             (
                 Method::PUT,
-                "repos/acme/widget/pulls/7/draft",
-                json!({"draft":"false"}),
-            ),
-            (
-                Method::PUT,
                 "repos/acme/widget/pulls/7/draft?extra=true",
                 json!({"draft":false}),
             ),
+            (
+                Method::PUT,
+                "repos/acme/widget/pulls/7/draft",
+                json!({"draft":"false"}),
+            ),
+            (Method::GET, "repos/acme/widget/hooks/7/config", Value::Null),
+            (
+                Method::GET,
+                "repos/acme/widget/actions/secrets",
+                Value::Null,
+            ),
+            (Method::GET, "repos/acme/widget/keys/7", Value::Null),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/runners/registration-token",
+                json!({}),
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/contents/file.txt",
+                json!({"message":"write","content":"YQ=="}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/actions/workflows/7/dispatches",
+                json!({"ref":"main"}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/deployments",
+                json!({"ref":"main"}),
+            ),
+            (Method::PATCH, "repos/acme/widget", json!({"private":false})),
+            (Method::DELETE, "repos/acme/widget", Value::Null),
         ] {
             let mut request = client.request(method.clone(), format!("{base}/{path}"));
             if !body.is_null() {
