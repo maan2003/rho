@@ -47,33 +47,6 @@ pub(super) fn handler(group: &str, name: &str) -> Option<Handler> {
         ("issues", "update") => optional::<UpdateIssue>,
         ("issues", "create_comment") => required::<Comment>,
         ("issues", "update_comment") => required::<Comment>,
-        ("issues", "delete_comment") => no_body,
-        ("issues", "pin_comment") => no_body,
-        ("issues", "unpin_comment") => no_body,
-        ("issues", "add_assignees") => optional::<AddAssignees>,
-        ("issues", "remove_assignees") => optional::<RemoveAssignees>,
-        ("issues", "add_blocked_by_dependency") => required::<Dependency>,
-        ("issues", "remove_dependency_blocked_by") => no_body,
-        ("issues", "add_issue_field_values") => required::<IssueFields<FieldInput>>,
-        ("issues", "set_issue_field_values") => required::<IssueFields<StringOrNumber>>,
-        ("issues", "delete_issue_field_value") => no_body,
-        ("issues", "add_labels") => optional::<AddLabels>,
-        ("issues", "set_labels") => optional::<SetLabels>,
-        ("issues", "remove_label") => no_body,
-        ("issues", "remove_all_labels") => no_body,
-        ("issues", "lock") => optional::<Option<Lock>>,
-        ("issues", "unlock") => no_body,
-        ("issues", "add_sub_issue") => required::<AddSubIssue>,
-        ("issues", "remove_sub_issue") => required::<RemoveSubIssue>,
-        ("issues", "reprioritize_sub_issue") => required::<PrioritizeSubIssue>,
-        ("issues", "approve_suggestion") => no_body,
-        ("issues", "dismiss_suggestion") => no_body,
-        ("issues", "create_label") => required::<CreateLabel>,
-        ("issues", "update_label") => optional::<UpdateLabel>,
-        ("issues", "delete_label") => no_body,
-        ("issues", "create_milestone") => required::<CreateMilestone>,
-        ("issues", "update_milestone") => optional::<UpdateMilestone>,
-        ("issues", "delete_milestone") => no_body,
         ("pulls", "create") => required::<CreatePull>,
         ("pulls", "update") => optional::<UpdatePull>,
         ("pulls", "create_review_comment") => required::<ReviewComment>,
@@ -162,13 +135,6 @@ enum StateReason {
 struct FieldValue<V> {
     field_id: i64,
     value: V,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, bound(deserialize = "V: Deserialize<'de>"))]
-struct IssueFields<V> {
-    #[serde(default)]
-    issue_field_values: Optional<Vec<FieldValue<V>>>,
 }
 
 #[derive(Deserialize)]
@@ -301,25 +267,6 @@ struct TypeSuggestion {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum AddAssignee {
-    Login(String),
-    Suggestion(AssigneeSuggestion),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssigneeSuggestion {
-    login: String,
-    #[serde(default)]
-    suggest: Optional<bool>,
-    #[serde(default)]
-    rationale: Optional<String>,
-    #[serde(default)]
-    confidence: Optional<Confidence>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum UpdateAssignee {
     Login(String),
     Suggestion(UpdateAssigneeSuggestion),
@@ -336,181 +283,6 @@ struct UpdateAssigneeSuggestion {
     rationale: Optional<String>,
     #[serde(default)]
     confidence: Optional<Confidence>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AddAssignees {
-    #[serde(default)]
-    assignees: Optional<Vec<AddAssignee>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoveAssignees {
-    #[serde(default)]
-    assignees: Optional<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Dependency {
-    issue_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AddedLabel {
-    Name(String),
-    Suggestion(LabelSuggestion),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LabelSuggestion {
-    name: String,
-    #[serde(default)]
-    suggest: Optional<bool>,
-    #[serde(default)]
-    rationale: Optional<String>,
-    #[serde(default)]
-    confidence: Optional<Confidence>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AddedLabelsObject {
-    #[serde(default)]
-    labels: Optional<Vec<AddedLabel>>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AddLabels {
-    Object(AddedLabelsObject),
-    Names(Vec<String>),
-    Suggestions(Vec<LabelSuggestion>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LabelName {
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LabelNames {
-    #[serde(default)]
-    labels: Optional<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LabelObjects {
-    #[serde(default)]
-    labels: Optional<Vec<LabelName>>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SetLabels {
-    NamesObject(LabelNames),
-    Names(Vec<String>),
-    LabelsObject(LabelObjects),
-    Labels(Vec<LabelName>),
-    Name(String),
-}
-
-#[derive(Deserialize)]
-enum LockReason {
-    #[serde(rename = "off-topic")]
-    OffTopic,
-    #[serde(rename = "too heated")]
-    TooHeated,
-    #[serde(rename = "resolved")]
-    Resolved,
-    #[serde(rename = "spam")]
-    Spam,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Lock {
-    #[serde(default)]
-    lock_reason: Optional<LockReason>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoveSubIssue {
-    sub_issue_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AddSubIssue {
-    sub_issue_id: i64,
-    #[serde(default)]
-    replace_parent: Optional<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrioritizeSubIssue {
-    sub_issue_id: i64,
-    #[serde(default)]
-    after_id: Optional<i64>,
-    #[serde(default)]
-    before_id: Optional<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateLabel {
-    name: String,
-    #[serde(default)]
-    color: Optional<String>,
-    #[serde(default)]
-    description: Optional<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UpdateLabel {
-    #[serde(default)]
-    new_name: Optional<String>,
-    #[serde(default)]
-    color: Optional<String>,
-    #[serde(default)]
-    description: Optional<String>,
-    #[serde(default)]
-    archived: Optional<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateMilestone {
-    title: String,
-    #[serde(default)]
-    state: Optional<State>,
-    #[serde(default)]
-    description: Optional<String>,
-    #[serde(default)]
-    due_on: Optional<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UpdateMilestone {
-    #[serde(default)]
-    title: Optional<String>,
-    #[serde(default)]
-    state: Optional<State>,
-    #[serde(default)]
-    description: Optional<String>,
-    #[serde(default)]
-    due_on: Optional<String>,
 }
 
 #[derive(Deserialize)]
@@ -689,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_and_assignee_requirements_depend_on_the_write() {
+    fn reviewer_and_issue_assignee_requirements_depend_on_the_write() {
         for value in [
             json!({"reviewers":["alice"]}),
             json!({"team_reviewers":["maintainers"]}),
@@ -701,42 +473,25 @@ mod tests {
         assert!(!valid::<Reviewers>(
             json!({"team_reviewers":["maintainers"]})
         ));
-        assert!(valid::<AddAssignees>(
-            json!({"assignees":[{"login":"alice","confidence":"high"}]})
-        ));
-        assert!(!valid::<AddAssignees>(
-            json!({"assignees":[{"suggest":true}]})
-        ));
         assert!(valid::<UpdateIssue>(
-            json!({"assignees":[{"suggest":true}]})
+            json!({"assignees":["alice",{"suggest":true}]})
         ));
-        assert!(!valid::<RemoveAssignees>(
-            json!({"assignees":[{"login":"alice"}]})
-        ));
+        assert!(!valid::<UpdateIssue>(json!({"assignees":[{"login":73}]})));
     }
 
     #[test]
-    fn label_and_field_value_unions_are_not_interchangeable() {
-        assert!(valid::<AddLabels>(
-            json!({"labels":["UI",{"name":"bug","confidence":"medium"}]})
+    fn issue_label_and_field_value_unions_stay_typed() {
+        assert!(valid::<UpdateIssue>(json!({
+            "labels":["UI",{"name":"bug","confidence":"medium"}],
+            "issue_field_values":[{"field_id":5,"value":["High","UI"]}]
+        })));
+        assert!(!valid::<UpdateIssue>(
+            json!({"labels":[{"name":"bug","color":19}]})
         ));
-        assert!(valid::<AddLabels>(json!([{"name":"bug","suggest":true}])));
-        assert!(!valid::<AddLabels>(json!(["UI",{"name":"bug"}])));
-        assert!(!valid::<SetLabels>(
-            json!({"labels":[{"name":"bug","suggest":true}]})
+        assert!(!valid::<CreateIssue>(
+            json!({"title":"Issue","issue_field_values":[{"value":"High"}]})
         ));
-        assert!(valid::<SetLabels>(json!("bug")));
-        assert!(!valid::<AddLabels>(json!("bug")));
-        assert!(valid::<IssueFields<FieldInput>>(
-            json!({"issue_field_values":[{"field_id":5,"value":["High","UI"]}]})
-        ));
-        assert!(!valid::<IssueFields<StringOrNumber>>(
-            json!({"issue_field_values":[{"field_id":5,"value":["High","UI"]}]})
-        ));
-        assert!(!valid::<IssueFields<FieldInput>>(
-            json!({"issue_field_values":[{"value":"High"}]})
-        ));
-        assert!(!valid::<IssueFields<FieldInput>>(
+        assert!(!valid::<UpdateIssue>(
             json!({"issue_field_values":[{"field_id":5,"value":true}]})
         ));
     }
@@ -758,7 +513,5 @@ mod tests {
         assert!(!valid::<CreateReview>(
             json!({"comments":[{"path":"foo","body":"check","line":"five"}]})
         ));
-        assert!(valid::<Lock>(json!({"lock_reason":"too heated"})));
-        assert!(!valid::<Lock>(json!({"lock_reason":"too_heated"})));
     }
 }

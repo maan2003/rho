@@ -685,7 +685,7 @@ mod tests {
                 writes += 1;
             }
         }
-        assert_eq!((reads, writes), (57, 46));
+        assert_eq!((reads, writes), (57, 19));
         for name in ["merge", "merge_async", "update_branch", "dismiss_review"] {
             assert!(
                 !operations()
@@ -777,14 +777,7 @@ mod tests {
                             match_path(&op.path, uri.path().trim_start_matches('/')).is_some()
                         })
                         .unwrap();
-                    let status = if matches!(
-                        op.name.as_str(),
-                        "create"
-                            | "create_label"
-                            | "create_milestone"
-                            | "add_assignees"
-                            | "request_reviewers"
-                    ) {
+                    let status = if matches!(op.name.as_str(), "create" | "request_reviewers") {
                         StatusCode::CREATED
                     } else {
                         StatusCode::OK
@@ -841,38 +834,8 @@ mod tests {
             (
                 Method::PATCH,
                 "repos/acme/widget/issues/7",
-                json!({"body":"only body"}),
+                json!({"body":"only body","labels":["bug","UI"],"assignees":["alice","bob"],"milestone":41}),
                 StatusCode::OK,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/assignees",
-                json!({"assignees":["alice","bob"]}),
-                StatusCode::CREATED,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/labels",
-                json!({"labels":["bug","UI"]}),
-                StatusCode::OK,
-            ),
-            (
-                Method::PUT,
-                "repos/acme/widget/issues/7/labels",
-                json!(["UI"]),
-                StatusCode::OK,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/labels",
-                json!({"name":"urgent","color":"abcdef"}),
-                StatusCode::CREATED,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/milestones",
-                json!({"title":"v2","due_on":"2026-10-10T12:00:00Z"}),
-                StatusCode::CREATED,
             ),
             (
                 Method::POST,
@@ -899,26 +862,8 @@ mod tests {
                 StatusCode::OK,
             ),
             (
-                Method::POST,
-                "repos/acme/widget/issues/7/dependencies/blocked_by",
-                json!({"issue_id":41}),
-                StatusCode::OK,
-            ),
-            (
-                Method::POST,
-                "repos/acme/widget/issues/7/sub_issues",
-                json!({"sub_issue_id":43,"replace_parent":true}),
-                StatusCode::OK,
-            ),
-            (
                 Method::PATCH,
-                "repos/acme/widget/issues/7/sub_issues/priority",
-                json!({"sub_issue_id":43,"after_id":19,"before_id":73}),
-                StatusCode::OK,
-            ),
-            (
-                Method::PUT,
-                "repos/acme/widget/issues/7/issue-field-values",
+                "repos/acme/widget/issues/7",
                 json!({"issue_field_values":[{"field_id":5,"value":9007199254740993u64}]}),
                 StatusCode::OK,
             ),
@@ -1302,6 +1247,137 @@ mod tests {
             (Method::GET, "repos/acme/widget", Value::Null),
             (Method::HEAD, "repos/acme/widget/issues/7", Value::Null),
             (
+                Method::DELETE,
+                "repos/acme/widget/issues/comments/7",
+                Value::Null,
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/issues/comments/7/pin",
+                Value::Null,
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/comments/7/pin",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/assignees",
+                json!({"assignees":["alice"]}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/assignees",
+                json!({"assignees":["alice"]}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/dependencies/blocked_by",
+                json!({"issue_id":41}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/dependencies/blocked_by/7",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/issue-field-values",
+                json!({"issue_field_values":[{"field_id":5,"value":"High"}]}),
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/issues/7/issue-field-values",
+                json!({"issue_field_values":[{"field_id":5,"value":"High"}]}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/issue-field-values/7",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/labels",
+                json!({"labels":["bug"]}),
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/issues/7/labels",
+                json!({"labels":["bug"]}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/labels",
+                Value::Null,
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/labels/7",
+                Value::Null,
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/issues/7/lock",
+                json!({"lock_reason":"spam"}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/lock",
+                Value::Null,
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/issues/7/sub_issue",
+                json!({"sub_issue_id":41}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/sub_issues",
+                json!({"sub_issue_id":41}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/issues/7/sub_issues/priority",
+                json!({"sub_issue_id":41,"after_id":19}),
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/suggestions/7/approve",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/issues/7/suggestions/7/dismiss",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "repos/acme/widget/labels",
+                json!({"name":"bug","color":"abcdef"}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/labels/7",
+                json!({"new_name":"defect"}),
+            ),
+            (Method::DELETE, "repos/acme/widget/labels/7", Value::Null),
+            (
+                Method::POST,
+                "repos/acme/widget/milestones",
+                json!({"title":"Next"}),
+            ),
+            (
+                Method::PATCH,
+                "repos/acme/widget/milestones/7",
+                json!({"title":"Next"}),
+            ),
+            (
+                Method::DELETE,
+                "repos/acme/widget/milestones/7",
+                Value::Null,
+            ),
+            (
                 Method::PATCH,
                 "repos/acme/widget/issues/not-a-number",
                 json!({"body":"x"}),
@@ -1399,7 +1475,7 @@ mod tests {
                         assert_eq!(headers.get(header::ACCEPT).unwrap(),"application/vnd.github.diff");
                         ([(header::CONTENT_TYPE,"text/plain")],"diff --git a/foo b/foo\n+fixed").into_response()
                     }
-                    ("DELETE","/repos/acme/widget/issues/comments/7")=>StatusCode::NO_CONTENT.into_response(),
+                    ("DELETE","/repos/acme/widget/pulls/comments/7")=>StatusCode::NO_CONTENT.into_response(),
                     ("GET","/repos/acme/widget/issues/7")=>{
                         assert_eq!(headers.get(header::IF_NONE_MATCH).unwrap(),"\"etag\"");
                         StatusCode::NOT_MODIFIED.into_response()
@@ -1426,7 +1502,7 @@ mod tests {
         for (method, path, status) in [
             (
                 Method::DELETE,
-                "repos/acme/widget/issues/comments/7",
+                "repos/acme/widget/pulls/comments/7",
                 StatusCode::NO_CONTENT,
             ),
             (

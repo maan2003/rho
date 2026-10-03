@@ -4,9 +4,9 @@ Based on [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5,
 [`81b28a5`](https://github.com/AnswerDotAI/ghapi/commit/81b28a5325b311e9878a676a57fef801093242f6)
 (Apache-2.0; see `LICENSE`).
 
-`gh_spec.json` contains complete, unmodified upstream metadata for 103 REST
-operations: PR collaboration, all issue and search endpoints, plus the existing
-CI/check/log/rerun operations. It also defines Octo-only `pulls.review_decision`
+`gh_spec.json` contains complete, unmodified upstream metadata for 76 REST
+operations: 57 reads and 19 writes. Writes cover PR collaboration, issue and
+issue-comment creation/editing, and the three existing CI reruns. It also defines Octo-only `pulls.review_decision`
 and `pulls.set_draft` helpers backed by fixed, typed GraphQL operations.
 
 Reads use the selected metadata as an explicit GET/path-template allowlist.
@@ -25,7 +25,12 @@ There is no schema generator or REST response model.
 
 The selected PR surface excludes merging (sync/async), head-branch updates,
 and dismissing another review. Generic GraphQL, Git ref writes, repository
-administration, and credential operations are not exposed. API availability
+administration, and credential operations are not exposed. Issue writes are
+limited to `create`, `update`, `create_comment`, and `update_comment`. Use
+`issues.update` for labels, assignees, and milestone assignment. Dedicated issue
+dependency, sub-issue, suggestion, field-value, locking, pinning, deletion, and
+label/milestone administration writes are unavailable; their selected reads remain.
+API availability
 does not authorize a live write: agents still need the user's specific approval.
 
 `core.py` retains upstream operation generation, response decoding,

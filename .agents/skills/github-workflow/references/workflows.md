@@ -22,7 +22,7 @@ Creating a PR is not proof that CI passed; report its URL before a long wait.
 Set draft/ready state with `api.pulls.set_draft(number, draft=True/False)`.
 Read full diffs with `api.pulls.get(number,
 headers_={"Accept": "application/vnd.github.diff"})` (or `.patch` media).
-Manage PR labels/assignees/milestones through `api.issues` using the PR number;
+Manage PR labels/assignees/milestones through `api.issues.update` using the PR number;
 manage reviewers with `api.pulls.request_reviewers` and
 `api.pulls.remove_requested_reviewers`.
 

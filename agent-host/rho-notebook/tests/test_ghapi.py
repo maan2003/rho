@@ -17,16 +17,21 @@ from ghapi.gh_spec import spec
 class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
     def test_selected_spec_matches_complete_pinned_upstream_entries(self):
         # Hash independently selected from upstream 81b28a5325b311e9878a676a57fef801093242f6:
-        # baseline CI plus all issues/search/PRs, excluding merge/merge_async/update_branch/dismiss_review.
+        # baseline CI, all selected reads/PRs, and issue/comment create/update writes.
         custom = {("pulls", "review_decision"), ("pulls", "set_draft")}
         upstream = {**spec, "ops": sorted(
             [o for o in spec["ops"] if (o["group"], o["name"]) not in custom],
             key=lambda o: (o["group"], o["name"]),
         )}
-        self.assertEqual(len(spec["ops"]), 105)
-        self.assertEqual(len(upstream["ops"]), 103)
+        self.assertEqual(len(spec["ops"]), 78)
+        self.assertEqual(len(upstream["ops"]), 76)
+        writes = {(op["group"], op["name"]) for op in upstream["ops"] if op["verb"] != "GET"}
+        self.assertEqual(len(writes), 19)
+        self.assertEqual({name for group, name in writes if group == "issues"},
+                         {"create", "update", "create_comment", "update_comment"})
+        self.assertEqual(sum(op["verb"] == "GET" for op in upstream["ops"]), 57)
         canonical = json.dumps(upstream, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "d3bdccf5a1bc435e697e4c78aff5e2214e78c56f97d36e34956c609c6fa8b25e")
+        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "bd646d0dca2eda7381da9e17d9baaf199dd2266e95ee33886500439a84d6c4b7")
         self.assertEqual({o["group"] for o in spec["ops"]},
                          {"actions", "checks", "issues", "pulls", "repos", "search"})
         draft = next(o for o in spec["ops"] if (o["group"], o["name"]) == ("pulls", "set_draft"))
@@ -129,6 +134,9 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                             with self.assertRaises(TypeError):
                                 await invoke(api.issues.update_comment, 7, **kwargs)
                     request.assert_not_called()
+                    for name in ("add_assignees", "set_labels", "create_label", "delete_comment",
+                                 "create_milestone", "add_sub_issue", "approve_suggestion"):
+                        self.assertFalse(hasattr(api.issues, name), name)
 
                     self.assertEqual(inspect.signature(api.pulls.list).parameters["sort"].default, "created")
                     self.assertEqual(inspect.signature(api.search.repos).parameters["order"].default, "desc")
@@ -254,12 +262,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                                 })
                                 self.assertEqual(requests[8][0::2], ("GET", None))
                                 self.assertEqual(requests[9][0::2], ("GET", None))
-                                await invoke(api.issues.add_assignees, 7, assignees=["alice", "bob"])
-                                await invoke(api.issues.create_label, name="bug", color="a1b2c3", description="Bug reports")
-                                await invoke(api.issues.create_milestone, title="Next", state="closed",
-                                             due_on="2026-12-01T00:00:00Z", description="Next release")
-                                self.assertEqual(inspect.signature(api.issues.create_milestone)
-                                                 .parameters["state"].default, "open")
+                                await invoke(api.issues.update, 7, assignees=["alice", "bob"],
+                                             labels=["bug", "UI"], milestone=41)
                                 await invoke(api.pulls.request_reviewers, 17,
                                              reviewers=["alice"], team_reviewers=["maintainers"])
                                 self.assertIn("comments", inspect.signature(api.pulls.create_review).parameters)
@@ -270,13 +274,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                                 await invoke(api.pulls.set_draft, 17, draft=True)
                                 await invoke(api.pulls.set_draft, 17, body_={"draft": False})
                                 self.assertEqual(requests[10:], [
-                                    ("POST", "/repos/acme/widget/issues/7/assignees", {"assignees": ["alice", "bob"]}),
-                                    ("POST", "/repos/acme/widget/labels", {
-                                        "name": "bug", "color": "a1b2c3", "description": "Bug reports",
-                                    }),
-                                    ("POST", "/repos/acme/widget/milestones", {
-                                        "title": "Next", "state": "closed", "due_on": "2026-12-01T00:00:00Z",
-                                        "description": "Next release",
+                                    ("PATCH", "/repos/acme/widget/issues/7", {
+                                        "assignees": ["alice", "bob"], "labels": ["bug", "UI"], "milestone": 41,
                                     }),
                                     ("POST", "/repos/acme/widget/pulls/17/requested_reviewers", {
                                         "reviewers": ["alice"], "team_reviewers": ["maintainers"],

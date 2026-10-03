@@ -19,12 +19,15 @@ api = GhApi(owner="OWNER", repo="REPO")
 issues = await api.issues.list_for_repo(state="open", per_page=100, page=1)
 ```
 
-The selected client covers PR collaboration, all issue/search endpoints,
-and existing CI/check/log/rerun operations. Reads use an explicit GET/path allowlist;
+The selected client covers PR collaboration, issue/comment creation and editing,
+issue/search reads, and existing CI/check/log/rerun operations. Reads use an explicit GET/path allowlist;
 writes have typed host handlers. PR merges, head-branch updates, review dismissal,
 Git ref writes, repository administration, and credential APIs are not exposed.
 Generic GraphQL is unavailable; `pulls.review_decision` and `pulls.set_draft`
-are fixed Octo-only helpers.
+are fixed Octo-only helpers. Issue writes are limited to `create`, `update`,
+`create_comment`, and `update_comment`; use `issues.update` for labels, assignees,
+and milestone assignment. Dedicated dependency, sub-issue, suggestion, field-value,
+locking, pinning, deletion, and label/milestone administration writes are unavailable.
 
 Pass declared parameters directly as keywords. Unknown keywords, missing
 required parameters, and undeclared `query_`/`body_` fields raise `TypeError`
