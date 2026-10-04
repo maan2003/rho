@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct EvalArgs {
-    /// Task text. Alternatively use --prompt-file (use - for stdin).
+    /// Task text. Alternatively use --prompt-file (use - for stdin). With
+    /// --rewind-to and no task, the model is asked again as after a restart.
     #[arg(
-        required_unless_present = "prompt_file",
+        required_unless_present_any = ["prompt_file", "rewind_to"],
         conflicts_with = "prompt_file"
     )]
     pub prompt: Option<String>,
@@ -56,6 +57,19 @@ pub(crate) struct EvalArgs {
     /// task text becomes its next user message.
     #[arg(long, requires = "state_dir")]
     pub resume: Option<String>,
+    /// Before resuming, rewind the agent to just after it sent its Nth
+    /// request; the task then asks the model again from there.
+    #[arg(long, requires = "resume")]
+    pub rewind_to: Option<usize>,
+    /// Each time the agent sends its Nth request, snapshot --workdir, which
+    /// must be a bcachefs subvolume, read-only into this directory as
+    /// r<N>: the files that request was asked about, for a later
+    /// --rewind-to N.
+    #[arg(long, requires = "workdir")]
+    pub checkpoints: Option<PathBuf>,
+    /// End the run once the agent has sent this many requests.
+    #[arg(long)]
+    pub max_requests: Option<usize>,
 }
 
 enum KeptOrTemp {
@@ -72,7 +86,11 @@ impl KeptOrTemp {
     }
 }
 
-fn emit(value: Value) -> Result<()> {
+/// Writes one event, stamped with milliseconds since the evaluation began.
+fn emit(mut value: Value) -> Result<()> {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    value["ms"] = json!(start.elapsed().as_millis() as u64);
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;
     writeln!(stdout)?;
@@ -83,14 +101,15 @@ fn emit(value: Value) -> Result<()> {
 pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
     let prompt = match (&args.prompt, &args.prompt_file) {
-        (Some(prompt), _) => prompt.clone(),
+        (None, None) => None,
+        (Some(prompt), _) => Some(prompt.clone()),
         (_, Some(path)) if path.as_os_str() == "-" => {
             let mut prompt = String::new();
             tokio::io::stdin()
                 .take(1024 * 1024 + 1)
                 .read_to_string(&mut prompt)
                 .await?;
-            prompt
+            Some(prompt)
         }
         (_, Some(path)) => {
             let mut prompt = String::new();
@@ -100,12 +119,13 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 .take(1024 * 1024 + 1)
                 .read_to_string(&mut prompt)
                 .await?;
-            prompt
+            Some(prompt)
         }
-        _ => anyhow::bail!("provide a task or --prompt-file"),
     };
     anyhow::ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= 1024 * 1024,
+        prompt
+            .as_ref()
+            .is_none_or(|prompt| !prompt.trim().is_empty() && prompt.len() <= 1024 * 1024),
         "task must contain 1 byte through 1 MiB of text"
     );
     let started = Instant::now();
@@ -152,7 +172,18 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 }
                 prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {handle}"),
             };
-            Some((id, read.get_agent(id).place().workset.clone()))
+            let workset = read.get_agent(id).place().workset.clone();
+            drop(read);
+            if let Some(n) = args.rewind_to {
+                let sent = requests_sent(&db, id);
+                let Some(&at) = sent.get(n.wrapping_sub(1)) else {
+                    anyhow::bail!("agent {handle} sent {} requests, not {n}", sent.len());
+                };
+                let mut write = db.write().await;
+                write.rewind_agent(rho_agent_types::UnixMs::now(), id, at.next());
+                write.commit();
+            }
+            Some((id, workset))
         }
         None => None,
     };
@@ -235,7 +266,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir}))?;
     // Subscribed before the prompt goes, so its work is seen starting.
     let mut statuses = agent.statuses();
-    agent.send_user_message(prompt);
+    match prompt {
+        Some(prompt) => agent.send_user_message(prompt),
+        None => agent.retry(),
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let mut requests = 0;
     let mut calls = BTreeSet::new();
@@ -305,6 +339,23 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             Entry::RequestSent { report, .. } => {
                 requests += 1;
                 emit(json!({"type":"request", "agent":agent, "number":requests}))?;
+                if agent_id == id {
+                    // Numbered by the agent's own history, so a resumed run
+                    // continues the numbers it was rewound to.
+                    let n = requests_sent(&db, id).len();
+                    if let Some(dir) = &args.checkpoints {
+                        let status = std::process::Command::new("bcachefs")
+                            .args(["subvolume", "snapshot", "-r"])
+                            .arg(&workdir)
+                            .arg(dir.join(format!("r{n}")))
+                            .status()
+                            .context("run bcachefs")?;
+                        anyhow::ensure!(status.success(), "snapshot for request {n} failed");
+                    }
+                    if args.max_requests.is_some_and(|max| n > max) {
+                        break Err(format!("Stopped before request {n}"));
+                    }
+                }
                 let prior = db.read().agent_input_carry(agent_id, appended.pos.into());
                 let results = rho_inference::transcript::report_results(&report, prior.as_ref());
                 for result in results {
@@ -379,6 +430,17 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         failures.join("; ")
     );
     Ok(())
+}
+
+/// Where each request the agent's visible history sent was recorded.
+fn requests_sent(db: &rho_db::RhoDb, id: AgentId) -> Vec<rho_agent::log::AgentEventPos> {
+    db.read()
+        .agent_event_records(id)
+        .1
+        .into_iter()
+        .filter(|(_, event)| matches!(event, AgentEvent::Entry(Entry::RequestSent { .. })))
+        .map(|(pos, _)| pos)
+        .collect()
 }
 
 fn checks(
