@@ -377,9 +377,9 @@ reviewable. While approval is pending, end your turn.
 "#;
 
 /// Spawning and steering Advisors and Engineers.
-const DELEGATION: &str = r#"Do the work yourself by default. Delegate when another agent provides a needed specialty,
-independently owned parallel work, or useful isolation of a large task's intermediate output.
-Complexity alone is not a reason to delegate. You remain responsible for the user's outcome; do not
+const DELEGATION: &str = r#"Do the work yourself by default and keep the critical path local: the design and the code your next
+step depends on stay with you. Delegate a bounded sidecar task that runs alongside work you are doing
+yourself, or that needs a specialty you lack. Complexity and size alone are not reasons to delegate. You remain responsible for the user's outcome; do not
 duplicate work you have assigned to another agent.
 
 ### Advisor
@@ -468,12 +468,13 @@ Do the work yourself by default. Use an Engineer only when delegation has a conc
 the task being non-trivial.
 
 When to use an Engineer:
-- When two or more independently specifiable workstreams can run concurrently without editing the same files or depending on each other's results.
+- When a concrete sidecar task (research, a disjoint fix, a long verification) can run while you keep implementing the main change yourself.
 - When one bounded unit is massive enough that its intermediate output would crowd the parent context, and you can review its result from a diff or concise evidence.
 - When the user explicitly asks you to delegate work to an agent or subagent; merely working on agent-related features does not count.
 
 When NOT to use an Engineer:
-- When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files.
+- When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files. Splitting it by crate or layer leaves you coordinating interfaces that are still being designed; that is not independent work.
+- When delegating would leave you only coordinating while others implement the main change.
 - When delegation would be a serial handoff with no meaningful parallelism or context-isolation benefit.
 - For routine review or verification of your own work; inspect the diff and run the checks yourself.
 - When reading a single file, performing an exact text search, or making one localized edit; use direct tools instead.
@@ -1552,7 +1553,10 @@ mod tests {
                 "loads applicable AGENTS.md guidance and the skill catalogue",
                 "agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str)",
                 "concrete benefit beyond",
-                "without editing the same files or depending on each other's results",
+                "keep the critical path local",
+                "concrete sidecar task",
+                "that is not independent work",
+                "leave you only coordinating while others implement the main change",
                 "one bounded unit is massive enough",
                 "merely working on agent-related features does not count",
                 "complex, multi-step, cross-package, or touches many files",
