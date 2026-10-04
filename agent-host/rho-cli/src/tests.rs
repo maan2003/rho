@@ -72,3 +72,28 @@ fn evaluation_defaults_to_astra_and_requires_a_prompt() {
         .is_err()
     );
 }
+
+#[test]
+fn reset_listing_and_redemption_parse() {
+    let parse = |args: &[&str]| Args::try_parse(args.iter().map(|s| s.to_string()));
+    assert!(matches!(
+        parse(&["auth", "resets"]).unwrap().command,
+        Command::Auth(AuthArgs::Resets { name }) if name == "default"
+    ));
+    assert!(matches!(
+        parse(&["auth", "resets", "--name", "second"]).unwrap().command,
+        Command::Auth(AuthArgs::Resets { name }) if name == "second"
+    ));
+    assert!(parse(&["auth", "reset"]).is_err());
+    assert!(matches!(
+        parse(&["auth", "reset", "--name", "second", "--credit-id", "credit-2",
+                "--idempotency-key", "retry-key"]).unwrap().command,
+        Command::Auth(AuthArgs::Reset { name, credit_id: Some(id), idempotency_key: Some(key) })
+            if name == "second" && id == "credit-2" && key == "retry-key"
+    ));
+    assert!(matches!(
+        parse(&["auth", "reset", "--name", "default"]).unwrap().command,
+        Command::Auth(AuthArgs::Reset { name, credit_id: None, idempotency_key: None })
+            if name == "default"
+    ));
+}

@@ -37,6 +37,25 @@ pub enum AuthArgs {
         #[arg(long, default_value = DEFAULT_AUTH_NAME)]
         name: String,
     },
+    /// List earned usage-reset credits, including grant and expiry timestamps.
+    Resets {
+        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+    },
+    /// Redeem one usage-reset credit. This changes the selected account's
+    /// allowance.
+    Reset {
+        /// Select the account explicitly; there is no default for redemption.
+        #[arg(long)]
+        name: String,
+        /// Omit to let ChatGPT select the next available credit.
+        #[arg(long)]
+        credit_id: Option<String>,
+        /// Reuse this key when retrying the same reset after an uncertain
+        /// result.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
     Import {
         #[arg(long, default_value = DEFAULT_AUTH_NAME)]
         name: String,
@@ -73,6 +92,16 @@ pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
             Ok(())
         }
         AuthArgs::RateLimits { name } => print_rate_limits(name.trim()),
+        AuthArgs::Resets { name } => print_reset_credits(name.trim()),
+        AuthArgs::Reset {
+            name,
+            credit_id,
+            idempotency_key,
+        } => redeem_reset_credit(
+            name.trim(),
+            credit_id.as_deref(),
+            idempotency_key.as_deref(),
+        ),
         AuthArgs::Import { name, path } => {
             let credentials_json = read_credentials_json(path)?;
             println!("{}", save_json(name, &credentials_json)?);
@@ -400,23 +429,198 @@ fn fetch_rate_limit_status(
     bearer_token: &str,
     account_id: Option<&str>,
 ) -> io::Result<RateLimitStatus> {
-    let url = format!("{DEFAULT_CHATGPT_BASE_URL}/wham/usage");
-    let authorization = format!("Bearer {bearer_token}");
+    let request = chatgpt_request(
+        DEFAULT_CHATGPT_BASE_URL,
+        bearer_token,
+        account_id,
+        reqwest::Method::GET,
+        "usage",
+    );
+    read_chatgpt_response(request)
+}
+
+// Match Codex's backend-client contract: details are separate from /usage,
+// and redemption sends redeem_request_id (not an Idempotency-Key header).
+fn chatgpt_request(
+    base_url: &str,
+    bearer_token: &str,
+    account_id: Option<&str>,
+    method: reqwest::Method,
+    endpoint: &str,
+) -> reqwest::blocking::RequestBuilder {
+    let url = format!("{base_url}/wham/{endpoint}");
     let mut request = reqwest::blocking::Client::new()
-        .get(&url)
-        .header("Authorization", &authorization)
-        .header("User-Agent", USER_AGENT);
+        .request(method, url)
+        .bearer_auth(bearer_token)
+        .header("User-Agent", USER_AGENT)
+        .timeout(Duration::from_secs(30));
     if let Some(account_id) = account_id {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
-    let json = read_success_json(
-        &url,
-        request
-            .timeout(Duration::from_secs(30))
-            .send()
-            .map_err(|error| io::Error::other(format!("{url}: {error}")))?,
-    )?;
+    request
+}
+
+fn read_chatgpt_response<T: serde::de::DeserializeOwned>(
+    request: reqwest::blocking::RequestBuilder,
+) -> io::Result<T> {
+    let response = request.send().map_err(io::Error::other)?;
+    let url = response.url().to_string();
+    let json = read_success_json(&url, response)?;
     serde_json::from_value(json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn print_reset_credits(name: &str) -> Result<()> {
+    let resolved = InferenceAuth::named(name)?
+        .resolve()
+        .context("resolving OAuth credentials")?;
+    let details: ResetCreditsDetails = read_chatgpt_response(chatgpt_request(
+        DEFAULT_CHATGPT_BASE_URL,
+        &resolved.bearer_token,
+        resolved.account_id.as_deref(),
+        reqwest::Method::GET,
+        "rate-limit-reset-credits",
+    ))
+    .context("fetching ChatGPT reset credit details")?;
+    write_reset_credits(
+        &mut io::stdout().lock(),
+        name,
+        resolved.account_id.as_deref(),
+        &details,
+    )
+}
+
+fn write_reset_credits(
+    out: &mut impl Write,
+    name: &str,
+    account_id: Option<&str>,
+    details: &ResetCreditsDetails,
+) -> Result<()> {
+    writeln!(
+        out,
+        "namespace={name} account={} rate_limit_reset_credits_available={} listed={}",
+        account_id.unwrap_or("unknown"),
+        details.available_count,
+        details.credits.len()
+    )?;
+    // The backend may cap the detail list; its length is not the available
+    // count.
+    for credit in &details.credits {
+        let granted: jiff::Timestamp = credit
+            .granted_at
+            .parse()
+            .with_context(|| format!("invalid granted_at for credit {}", credit.id))?;
+        let expires = credit
+            .expires_at
+            .as_deref()
+            .map(str::parse::<jiff::Timestamp>)
+            .transpose()
+            .with_context(|| format!("invalid expires_at for credit {}", credit.id))?;
+        writeln!(
+            out,
+            "credit_id={} type={} status={} granted_at={granted} granted_at_unix={} expires_at={} expires_at_unix={} title={:?} description={:?}",
+            credit.id,
+            credit.reset_type,
+            credit.status,
+            granted.as_second(),
+            expires
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "never".into()),
+            expires
+                .map(|t| t.as_second().to_string())
+                .unwrap_or_else(|| "none".into()),
+            credit.title.as_deref().unwrap_or(""),
+            credit.description.as_deref().unwrap_or(""),
+        )?;
+    }
+    Ok(())
+}
+
+fn redeem_reset_credit(name: &str, credit_id: Option<&str>, key: Option<&str>) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "name must not be empty");
+    anyhow::ensure!(
+        credit_id.is_none_or(|id| !id.trim().is_empty()),
+        "credit-id must not be empty"
+    );
+    anyhow::ensure!(
+        key.is_none_or(|key| !key.trim().is_empty()),
+        "idempotency-key must not be empty"
+    );
+    let resolved = InferenceAuth::named(name)?
+        .resolve()
+        .context("resolving OAuth credentials")?;
+    let key = key
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Print before sending: a timeout can still mean the backend consumed the
+    // credit. Never automatically retry with a new key.
+    eprintln!("namespace={name} idempotency_key={key}");
+    eprintln!("If the result is uncertain, retry with --idempotency-key {key}");
+    let response = consume_reset_credit(
+        DEFAULT_CHATGPT_BASE_URL,
+        &resolved.bearer_token,
+        resolved.account_id.as_deref(),
+        &key,
+        credit_id,
+    )
+    .context("redeeming ChatGPT reset credit; retry only with the same idempotency key")?;
+    println!(
+        "namespace={name} outcome={} windows_reset={} idempotency_key={key}",
+        response.code, response.windows_reset
+    );
+    Ok(())
+}
+
+fn consume_reset_credit(
+    base_url: &str,
+    bearer_token: &str,
+    account_id: Option<&str>,
+    key: &str,
+    credit_id: Option<&str>,
+) -> io::Result<ResetCreditResponse> {
+    read_chatgpt_response(
+        chatgpt_request(
+            base_url,
+            bearer_token,
+            account_id,
+            reqwest::Method::POST,
+            "rate-limit-reset-credits/consume",
+        )
+        .json(&ResetCreditRequest {
+            redeem_request_id: key,
+            credit_id,
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetCreditsDetails {
+    available_count: i64,
+    credits: Vec<ResetCredit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetCredit {
+    id: String,
+    reset_type: String,
+    status: String,
+    granted_at: String,
+    expires_at: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ResetCreditRequest<'a> {
+    redeem_request_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetCreditResponse {
+    code: String,
+    #[serde(default)]
+    windows_reset: i64,
 }
 
 fn print_window(
@@ -433,11 +637,11 @@ fn print_window(
         .map(|seconds| seconds / 60)
         .map(|mins| mins.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    let resets_at = window.reset_at.or_else(|| {
-        window
-            .reset_after_seconds
-            .map(|seconds| now_secs().saturating_add(seconds))
-    });
+    let resets_at = window_reset_at(window);
+    let resets_at_utc = resets_at
+        .and_then(|timestamp| jiff::Timestamp::from_second(timestamp).ok())
+        .map(|timestamp| timestamp.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
     let resets_at = resets_at
         .map(|timestamp| timestamp.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
@@ -447,7 +651,7 @@ fn print_window(
         .unwrap_or_else(|| "unknown".to_owned());
     let limit_name = limit_name.unwrap_or("-");
     println!(
-        "limit={limit_id} name={limit_name} window={kind} used_percent={} window_mins={window_mins} resets_at_unix={resets_at} resets_in_secs={resets_in}",
+        "limit={limit_id} name={limit_name} window={kind} used_percent={} window_mins={window_mins} resets_at={resets_at_utc} resets_at_unix={resets_at} resets_in_secs={resets_in}",
         window.used_percent
     );
 }
@@ -508,6 +712,191 @@ struct RateLimitResetCredits {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn reset_credit_listing_preserves_precision_and_distinguishes_no_expiry() {
+        let details: ResetCreditsDetails = serde_json::from_value(serde_json::json!({
+            "available_count": 5,
+            "credits": [
+                {
+                    "id": "expiring",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T05:30:01.123456+05:30",
+                    "expires_at": "2026-07-17T02:00:03.654321-04:00",
+                    "title": "Full reset",
+                    "description": "Weekly + 5 hr"
+                },
+                {
+                    "id": "no-expiry",
+                    "reset_type": "future_type",
+                    "status": "redeeming",
+                    "granted_at": "2026-06-18T00:00:00Z",
+                    "expires_at": null
+                }
+            ],
+            "total_earned_count": 8
+        }))
+        .unwrap();
+        let mut out = Vec::new();
+        write_reset_credits(&mut out, "second", Some("account-2"), &details).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "namespace=second account=account-2 rate_limit_reset_credits_available=5 listed=2\n",
+                "credit_id=expiring type=codex_rate_limits status=available ",
+                "granted_at=2026-06-17T00:00:01.123456Z granted_at_unix=1781654401 ",
+                "expires_at=2026-07-17T06:00:03.654321Z expires_at_unix=1784268003 ",
+                "title=\"Full reset\" description=\"Weekly + 5 hr\"\n",
+                "credit_id=no-expiry type=future_type status=redeeming ",
+                "granted_at=2026-06-18T00:00:00Z granted_at_unix=1781740800 ",
+                "expires_at=never expires_at_unix=none title=\"\" description=\"\"\n"
+            )
+        );
+
+        let invalid: ResetCreditsDetails = serde_json::from_value(serde_json::json!({
+            "available_count": 1,
+            "credits": [{
+                "id": "invalid-expiry",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-06-18T00:00:00Z",
+                "expires_at": "bad timestamp"
+            }]
+        }))
+        .unwrap();
+        let error = write_reset_credits(&mut Vec::new(), "default", None, &invalid).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid expires_at for credit invalid-expiry")
+        );
+    }
+
+    #[test]
+    fn redemption_uses_account_headers_selected_credit_and_retry_key() {
+        use std::io::BufRead;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Exercise selected and backend-chosen credits, every known outcome,
+        // and backend failure without touching a real account.
+        for (credit_id, status, response_json) in [
+            (
+                Some("credit-2"),
+                200,
+                r#"{"code":"reset","windows_reset":2}"#,
+            ),
+            (
+                None,
+                200,
+                r#"{"code":"nothing_to_reset","windows_reset":0}"#,
+            ),
+            (None, 200, r#"{"code":"no_credit"}"#),
+            (
+                Some("credit-2"),
+                200,
+                r#"{"code":"already_redeemed","windows_reset":0}"#,
+            ),
+            (None, 500, r#"{"message":"backend failure"}"#),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}/backend-api", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = io::BufReader::new(socket);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(!line.is_empty(), "request ended before headers");
+                    headers.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(headers.starts_with(
+                    "POST /backend-api/wham/rate-limit-reset-credits/consume HTTP/1.1\r\n"
+                ));
+                let headers = headers.to_ascii_lowercase();
+                assert!(headers.contains("\r\nauthorization: bearer test-token\r\n"));
+                assert!(headers.contains("\r\nchatgpt-account-id: account-2\r\n"));
+                assert!(headers.contains("\r\nuser-agent: rho-cli\r\n"));
+                assert!(headers.contains("\r\ncontent-type: application/json\r\n"));
+                let len: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let expected = match credit_id {
+                    Some(id) => serde_json::json!({
+                        "redeem_request_id": "same-attempt-key", "credit_id": id
+                    }),
+                    None => serde_json::json!({"redeem_request_id": "same-attempt-key"}),
+                };
+                assert_eq!(body, expected);
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_json}",
+                    response_json.len(),
+                ).unwrap();
+            });
+            let result = consume_reset_credit(
+                &base_url,
+                "test-token",
+                Some("account-2"),
+                "same-attempt-key",
+                credit_id,
+            );
+            server.join().unwrap();
+            if status == 200 {
+                let response = result.unwrap();
+                let expected: serde_json::Value = serde_json::from_str(response_json).unwrap();
+                assert_eq!(response.code, expected["code"].as_str().unwrap());
+                assert_eq!(
+                    response.windows_reset,
+                    expected["windows_reset"].as_i64().unwrap_or(0)
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("HTTP 500") && error.contains("backend failure"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reset_rejects_empty_selectors_before_resolving_credentials() {
+        for (name, id, key, expected) in [
+            ("", None, None, "name must not be empty"),
+            (
+                "missing-test-account",
+                Some(" "),
+                None,
+                "credit-id must not be empty",
+            ),
+            (
+                "missing-test-account",
+                None,
+                Some(" "),
+                "idempotency-key must not be empty",
+            ),
+        ] {
+            assert_eq!(
+                redeem_reset_credit(name, id, key).unwrap_err().to_string(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn auth_cli_installs_the_tls_provider() {
