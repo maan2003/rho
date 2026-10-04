@@ -70,6 +70,19 @@ impl ClaudePaths {
         }
     }
 
+    /// Rooted at `dir` like [`Self::at`], but logging in through the
+    /// accounts under `accounts_root`. What an evaluation passes to run on a
+    /// real login while its transcripts stay under `dir`.
+    pub fn at_with_accounts(
+        dir: impl Into<Utf8PathBuf>,
+        accounts_root: impl Into<Utf8PathBuf>,
+    ) -> Self {
+        Self {
+            accounts_root: accounts_root.into(),
+            ..Self::at(dir)
+        }
+    }
+
     pub(crate) fn with_sources(
         &self,
         config_home: Utf8PathBuf,

@@ -25,7 +25,7 @@ pub use transcript::*;
 const DEFAULT_COMMAND: &str = "claude";
 #[allow(dead_code)]
 const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "320000";
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "390000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
