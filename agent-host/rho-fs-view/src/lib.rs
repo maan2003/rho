@@ -337,9 +337,17 @@ impl Worksets {
     /// this process: for evaluations, renderings and tests that work on a
     /// directory the user already has. Nothing is written to the state root.
     pub fn adopt(self: &Arc<Self>, directory: impl AsRef<Path>) -> anyhow::Result<Workset> {
+        self.adopt_as(format!("adopted-{}", random_workset_id()?), directory)
+    }
+
+    /// Adopt under an id recorded earlier, so agents placed in it resume.
+    pub fn adopt_as(
+        self: &Arc<Self>,
+        id: String,
+        directory: impl AsRef<Path>,
+    ) -> anyhow::Result<Workset> {
         let root = absolute_utf8(directory.as_ref())?;
         anyhow::ensure!(root.is_dir(), "not a directory: {root}");
-        let id = format!("adopted-{}", random_workset_id()?);
         self.adopted
             .lock()
             .unwrap()
