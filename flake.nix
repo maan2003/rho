@@ -622,6 +622,7 @@
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
+                cp -r ${./.agents/skills/slack} $out/share/rho/skills/slack
                 chmod -R u+w $out/share/rho/skills
               ''
               + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
