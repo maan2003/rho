@@ -651,9 +651,15 @@ async fn a_send_outside_simplified_technical_english_raises_and_is_not_logged() 
     let (handle, _task) = harness.start(&script).await;
 
     say(&handle, "hi").await;
-    let second = requests(&script, 2).await;
+    // The raised cell returns at once, not after a failure's 20 seconds.
+    let second = tokio::time::timeout(Duration::from_secs(10), requests(&script, 2))
+        .await
+        .unwrap();
     let told = told(&second[1]);
-    assert!(told.contains("- contraction: \"It's\""), "{told}");
+    assert!(
+        told.contains("line 1, contraction: `It's` is a contraction."),
+        "{told}"
+    );
     let entries = harness
         .until("the rewritten result", |entries| {
             entries.iter().any(|entry| {
