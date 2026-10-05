@@ -45,6 +45,8 @@ class FakeSlackServer:
         reply = self.replies[api]
         if isinstance(reply, list):
             reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        if callable(reply):
+            reply = await reply()
         payload = json.dumps(reply).encode()
         writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                      f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
@@ -221,9 +223,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
             threads.subscribe("C2", "5.0", on_b)
             while len(self.fake.requests) < 3:
                 await asyncio.sleep(0.01)
-            threads.unsubscribe("D1", "1.0")
-            threads.unsubscribe("C2", "5.0")
-            self.assertIsNone(threads._poller)
+            threads.close()
 
         requests = await self.run_with({"rho.events": polls}, body)
 
@@ -231,6 +231,55 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a, [reply_a, root_a, reaction_a, truncated])
         self.assertEqual(b, [edit_b, truncated])
         self.assertEqual([r["query"].get("cursor") for r in requests[:3]], [None, ["7:5"], ["8:0"]])
+
+    async def test_thread_subscriptions_count_events_from_creation(self):
+        reply = {"type": "message", "channel": "D1", "ts": "2.0", "thread_ts": "1.0"}
+        subscribed = asyncio.Event()
+
+        async def after_subscribe():
+            await subscribed.wait()
+            return {"ok": True, "events": [{"payload": {"event": reply}}], "cursor": "7:1", "truncated": False}
+
+        polls = [after_subscribe, {"ok": True, "events": [], "cursor": "7:1", "truncated": False}]
+        got = []
+
+        async def body():
+            threads = ThreadSubscriptions()
+            # The first poll is out before the agent posts and subscribes.
+            while not self.fake.requests:
+                await asyncio.sleep(0.01)
+            threads.subscribe("D1", "1.0", got.append)
+            subscribed.set()
+            while not got:
+                await asyncio.sleep(0.01)
+            threads.close()
+
+        await self.run_with({"rho.events": polls}, body)
+
+        self.assertEqual(got, [reply])
+        self.assertNotIn("cursor", self.fake.requests[0]["query"])
+
+    async def test_thread_subscriptions_stop_on_a_host_refusal_and_resume_on_subscribe(self):
+        error = "rho_no_slack_app_token: run `rho slack init` on the agent host"
+        polls = [
+            {"ok": False, "error": error},
+            {"ok": True, "events": [], "cursor": "7:0", "truncated": False},
+        ]
+        got = []
+
+        async def body():
+            threads = ThreadSubscriptions()
+            threads.subscribe("D1", "1.0", got.append)
+            await asyncio.wait_for(asyncio.shield(threads._poller), 5)
+            self.assertEqual(len(self.fake.requests), 1)
+            threads.subscribe("D1", "1.0", got.append)
+            while len(self.fake.requests) < 2:
+                await asyncio.sleep(0.01)
+            threads.close()
+
+        await self.run_with({"rho.events": polls}, body)
+
+        self.assertEqual(got, [{"type": "rho_error", "error": error}])
 
 
 if __name__ == "__main__":

@@ -7,10 +7,20 @@ use crate::{SlackArgs, SlackCommand, host_call};
 pub(crate) async fn run(args: SlackArgs) -> anyhow::Result<()> {
     match args.command {
         SlackCommand::Init => init(args.socket_path).await,
+        SlackCommand::Manifest => {
+            print!("{MANIFEST}");
+            Ok(())
+        }
     }
 }
 
+/// The Slack app manifest, with the steps to install it in its comments.
+const MANIFEST: &str = include_str!("../../slack-server/manifest.yaml");
+
 async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    eprintln!(
+        "This host needs its own Slack app: `rho slack manifest` prints it, with the steps to install it."
+    );
     let bot = prompt_token("Slack bot token (xoxb-...): ")?;
     anyhow::ensure!(
         bot.starts_with("xoxb-"),

@@ -1,0 +1,50 @@
+# The Slack app for one agent host. Slack sends each event to only one
+# Socket Mode connection, so every host needs its own app.
+#
+# Create it at https://api.slack.com/apps ("Create New App", "From a
+# manifest"), install it to the workspace, and make an app-level token with
+# `connections:write` under "Basic Information". Then run `rho slack init`.
+#
+# The scopes cover the methods in methods.json and nothing more.
+display_information:
+  name: rho agents
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: rho
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:write
+      - im:read
+      - im:history
+      - mpim:read
+      - mpim:history
+      - channels:read
+      - channels:history
+      - groups:read
+      - groups:history
+      - users:read
+      - users:read.email
+      - reactions:read
+      - reactions:write
+      - files:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - message.mpim
+      - message.channels
+      - message.groups
+      - reaction_added
+      - reaction_removed
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

@@ -55,30 +55,36 @@ method does not declare with `rho_invalid_arguments: <names>`; both raise
 `SlackApiError`. Fix the call instead of working around either. What
 succeeds also depends on the scopes the user gave the app: report
 `missing_scope` to the user. `rho_no_slack_token` or
-`rho_no_slack_app_token` means the host has no tokens yet: ask the user to
-run `rho slack init`.
+`rho_no_slack_app_token` means the host has no Slack app yet: ask the user
+to create one from `rho slack manifest` and run `rho slack init`.
 
 ## Waiting for replies
 
-Subscribe to the threads you wait on. One long poll serves all of them,
-and each callback gets the raw Slack events of its thread: replies, edits,
-deletions, and reactions to the root message. The callback decides what
-matters and calls `notify()`; then end your turn instead of polling.
+Subscribe to the threads you wait on. One `ThreadSubscriptions` per
+notebook serves all of them with one long poll, and each callback gets the
+raw Slack events of its thread: replies, edits, deletions, and reactions to
+the root message. The callback decides what matters and calls `notify()`;
+then end your turn instead of polling. Events count from when the object
+is created, so create it before you post.
 
 ```python
 from slack_sdk.rho import ThreadSubscriptions
 threads = ThreadSubscriptions(slack)
+sent = await slack.chat_postMessage(channel=dm, text="Could you review #42? <url>")
 
 def on_event(event):
-    if event["type"] == "rho_truncated" or event.get("user") == user:
+    if event["type"] in ("rho_truncated", "rho_error") or event.get("user") == user:
         notify(event)
 
 threads.subscribe(sent["channel"], sent["ts"], on_event)
-# when done with the thread:
+# when done with the thread, and with all threads:
 threads.unsubscribe(sent["channel"], sent["ts"])
+threads.close()
 ```
 
 `{"type": "rho_truncated"}` means the host lost events, for example after
 it restarted: read the thread again with `conversations_replies`.
+`{"type": "rho_error", "error": ...}` means the host refused the poll, for
+example without an app token; polling stops until the next `subscribe`.
 Subscriptions live in the notebook only; after a notebook restart,
 subscribe again. The bot's own messages never arrive.

@@ -290,6 +290,8 @@ pub(crate) enum SlackCommand {
     /// Install the host-held Slack tokens: the bot token agents call Slack
     /// with, and the app token its Socket Mode connection uses.
     Init,
+    /// Print the manifest of the Slack app each host needs.
+    Manifest,
 }
 
 #[derive(Clone, clap::Args)]
