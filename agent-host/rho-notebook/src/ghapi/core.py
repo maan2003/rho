@@ -1,11 +1,13 @@
-"""Selected ghapi 2.1.5 client and CI helpers, adapted for Octo transport.
+"""ghapi 2.1.5 client and CI helpers, adapted for Octo transport.
 
 Copyright (c) the ghapi contributors. Apache-2.0; see LICENSE.
 Upstream: https://github.com/AnswerDotAI/ghapi (81b28a5325b311e9878a676a57fef801093242f6).
 """
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime
 import os
+import stat
 from pathlib import Path
 from urllib.parse import quote
 
@@ -90,8 +92,43 @@ def gh_patch(fn):
     return patch(splice_sig(_f, fn, 'self'))
 
 # %% ../nbs/00_core.ipynb #83e8a9ce
+class GhOpFunc(OpFunc):
+    "Generated operation with strict schema keywords and query/body mapping fields."
+    def _split(self, kwargs):
+        for p in self.required_params:
+            if p in self.op_spec.param_defaults:
+                kwargs.setdefault(self.sparams[p], self.op_spec.param_defaults[p])
+        parts = super()._split(kwargs)
+        _, _, route, query, body, files = parts
+        values = {**route, **query, **(body or {}), **files}
+        missing = [p for p in self.required_params
+                   if values.get(p, UNSET) is UNSET or p in self.route_params and values[p] is None]
+        if missing:
+            raise TypeError(f"{self.name}: missing required parameter(s): {', '.join(missing)}")
+        return parts
+
+    def _prep(self, args, kwargs):
+        controls = {'headers_', 'query_', 'body_', 'raw_', 'stream'}
+        if self.media_url: controls.update(('media', 'media_type'))
+        unknown = kwargs.keys() - (self.sparams.keys() | set(self.sparams.values()) | controls)
+        if unknown:
+            raise TypeError(f"{self.name}: unexpected keyword argument(s): {', '.join(sorted(unknown))}")
+        for option, fields in (('query_', self.query_params), ('body_', self.body_params)):
+            extra = kwargs.get(option, {})
+            if not isinstance(extra, Mapping):
+                raise TypeError(f"{self.name}: {option} must be a mapping")
+            unknown = extra.keys() - set(fields)
+            if unknown:
+                raise TypeError(f"{self.name}: unsupported {option} field(s): {', '.join(sorted(unknown))}")
+        return super()._prep(args, kwargs)
+
+
+class GhSyncOpFunc(SyncOpFunc, GhOpFunc):
+    "Sync twin using the same operation validation before blocking requests."
+
+
 class GhApi(OpenAPIClient):
-    "Octo-backed client generated from the selected ghapi endpoint metadata."
+    "Octo-backed client generated from the selected pinned ghapi REST metadata."
     def __init__(self, owner=None, repo=None, *, debug=None, limit_cb=None,
                  timeout=60.0, sync=False):
         kwargs = {}
@@ -99,7 +136,7 @@ class GhApi(OpenAPIClient):
         if repo: kwargs['repo'] = repo
         self.headers = {'Accept': 'application/vnd.github+json'}
         self.token, self.gh_host = None, GH_HOST
-        tcls, fcls = (GhSyncTransport, SyncOpFunc) if sync else (GhTransport, OpFunc)
+        tcls, fcls = (GhSyncTransport, GhSyncOpFunc) if sync else (GhTransport, GhOpFunc)
         socket = Path(os.environ['RHO_SOCKET_PATH']).with_name('octo.sock')
         transport = (httpx2.HTTPTransport if sync else httpx2.AsyncHTTPTransport)(uds=str(socket))
         client = (httpx2.Client if sync else httpx2.AsyncClient)(transport=transport, follow_redirects=False, timeout=timeout)
@@ -190,3 +227,43 @@ def __call__(self:GhApi, path:str, verb:str=None, headers:dict=None, route:dict=
 def __getitem__(self:GhApi, k):
     a,b = k if isinstance(k,tuple) else (k,'GET')
     return self.func_dict[f'{a}:{b.upper()}']
+
+
+_attachment_types = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+}
+
+@patch
+def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
+    """Upload one local image/video through Octo and return its asset response (`.url`).
+
+    Uses this client's repository defaults or explicit owner/repo overrides.
+    Does not post a comment or edit a body. Requires repository write access.
+    Async clients must await the result; sync clients return it directly.
+    """
+    path = Path(path)
+    content_type = _attachment_types.get(path.suffix.lower())
+    if content_type is None:
+        raise ValueError(f"Unsupported attachment type: {path.suffix}")
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Attachments must be regular files")
+    limit = (100 if content_type.startswith("video/") else 10) * 1024 * 1024
+    if not 0 < info.st_size <= limit:
+        raise ValueError(f"Attachment must be nonempty and at most {limit} bytes")
+    body = path.read_bytes()
+
+    def upload(repository):
+        return self("/user-attachments/assets", verb="POST",
+                    query={"name": path.name, "content_type": content_type,
+                           "repository_id": repository.id},
+                    headers={"Content-Type": "application/octet-stream"}, data=body)
+
+    if isinstance(self.transport, GhSyncTransport):
+        return upload(self.repos.get(owner=owner, repo=repo))
+
+    async def run():
+        return await upload(await self.repos.get(owner=owner, repo=repo))
+    return run()

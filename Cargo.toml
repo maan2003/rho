@@ -110,6 +110,7 @@ notify = "9.0.0-rc.4"
 octo-server = { path = "agent-host/octo-server" }
 octo-types = { path = "crates/octo-types" }
 prefix-id = { path = "crates/prefix-id", default-features = false }
+percent-encoding = "2"
 pyo3 = "0.29"
 pythonize = "0.29"
 rand = "0.10"
