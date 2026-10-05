@@ -1,0 +1,79 @@
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  RUSTUP_MAX_RETRIES: '10'
+jobs:
+  build:
+    if: needs.gate.outputs.run == 'true'
+    needs:
+    - gate
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v4
+    - name: Fetch tags
+      run: git fetch --tags --force --no-recurse-submodules
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        targets: aarch64-unknown-linux-gnu
+    - name: Install mold
+      uses: rui314/setup-mold@v1
+    - name: Remove .cargo/config.toml
+      run: rm -f .cargo/config.toml .cargo/config
+    - name: Build release binary
+      run: cargo build --release --target aarch64-unknown-linux-gnu
+    - name: Package binary
+      run: 'cd target/aarch64-unknown-linux-gnu/release
+
+        PNAME="${GITHUB_REPOSITORY##*/}"
+
+        tar -czvf ../../../${PNAME}-aarch64-unknown-linux-gnu.tar.gz $PNAME
+
+        '
+    - id: version
+      name: Resolve version tag
+      run: "if [[ \"${{ github.ref_type }}\" == \"tag\" ]]; then\n  echo \"tag=${{\
+        \ github.ref_name }}\" >> \"$GITHUB_OUTPUT\"\nelse\n  LATEST=$(git tag -l\
+        \ 'v[0-9]*' --sort=-v:refname | head -1)\n  if [[ -n \"$LATEST\" ]]; then\n\
+        \    echo \"tag=$LATEST\" >> \"$GITHUB_OUTPUT\"\n  else\n    echo \"::notice::No\
+        \ existing v* tags found, skipping versioned release\"\n    echo \"tag=\"\
+        \ >> \"$GITHUB_OUTPUT\"\n  fi\nfi\n"
+      shell: bash
+    - env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      name: Release (latest)
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ github.event.repository.name }}-aarch64-unknown-linux-gnu.tar.gz
+        make_latest: false
+        name: Latest linux-aarch64
+        prerelease: true
+        tag_name: latest-linux-aarch64
+    - env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      if: steps.version.outputs.tag != ''
+      name: Release (versioned)
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ github.event.repository.name }}-aarch64-unknown-linux-gnu.tar.gz
+        tag_name: ${{ steps.version.outputs.tag }}
+  gate:
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+    - id: check
+      run: "if [ \"$(git show HEAD~1:ste_checker/Cargo.toml | grep '^version' | head\
+        \ -1)\" != \"$(grep '^version' ste_checker/Cargo.toml | head -1)\" ]; then\n\
+        \  echo \"run=true\" >> \"$GITHUB_OUTPUT\"\nelse\n  echo \"run=false\" >>\
+        \ \"$GITHUB_OUTPUT\"\nfi\n"
+name: Release linux-aarch64
+'on':
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: write
