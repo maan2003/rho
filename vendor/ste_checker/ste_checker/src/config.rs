@@ -1,17 +1,15 @@
 #[derive(Clone, Debug, Default)]
 pub struct AppConfig {
 	pub text_type: TextType,
-	/// Rule names to switch off entirely; `--help` lists them.
+	/// Rule names to switch off entirely; [`crate::rule_names`] lists them.
 	pub disable: Vec<String>,
 }
 
 /// ASD-STE100 allows longer sentences in descriptive text than in procedures.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TextType {
 	#[default]
-	#[value(alias = "procedural")]
 	Procedure,
-	#[value(alias = "descriptive")]
 	Description,
 }
 

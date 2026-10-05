@@ -26,6 +26,7 @@ fn corpus_calibration() {
 			("compound-tense", 3),
 			("ing-verb", 58),
 			("contraction", 10),
+			("semicolon", 68),
 		]
 	);
 }
@@ -47,6 +48,7 @@ fn glossary_absorbs_technical_vocabulary() {
 			("compound-tense", 3),
 			("ing-verb", 58),
 			("contraction", 10),
+			("semicolon", 68),
 		]
 	);
 }
@@ -194,18 +196,6 @@ fn contractions_are_reported_once() {
 	assert_eq!(rules, vec!["contraction"]);
 }
 
-/// Harper counts characters; miette and editors count bytes.
-#[test]
-fn reported_offsets_index_bytes() {
-	let ctx = Ctx::new(AppConfig::default(), Glossary::default());
-	let text = "Ünicode — do not work the lever.\n";
-	let findings = ste_checker::check(text, &ctx);
-	let reported = ste_checker::report::json("t.md", text, &findings);
-	let word = reported.iter().find(|f| f.rule == "unapproved-word").expect("`work` as a verb is unapproved");
-	assert_eq!(&text[word.start..word.end], "work");
-	assert!(ste_checker::report::human("t.md", text, &findings).is_some());
-}
-
 /// STE allows -ing inside a Technical Name, and a gerund after a noun is one. Silently eating
 /// `ing-verb` hits is what the progressive guard on the noun-run rule exists to prevent, so the
 /// three findings this rule takes off the corpus are named here.
@@ -235,16 +225,19 @@ fn precision_and_recall() {
 		})
 		.collect();
 
-	let ctx = Ctx::new(AppConfig::default(), Glossary::read(Path::new(GLOSSARY)).unwrap());
+	// The truth rows predate the semicolon rule.
+	let config = AppConfig {
+		disable: vec!["semicolon".into()],
+		..Default::default()
+	};
+	let ctx = Ctx::new(config, Glossary::read(Path::new(GLOSSARY)).unwrap());
 	let mut found = HashSet::new();
 	for file in truth.iter().map(|(f, ..)| f.clone()).collect::<HashSet<_>>() {
 		let text = std::fs::read_to_string(format!("{CORPUS}/{file}")).unwrap();
 		let findings = ste_checker::check(&text, &ctx);
-		found.extend(
-			ste_checker::report::json(&file, &text, &findings)
-				.into_iter()
-				.map(|f| (file.clone(), f.start, f.end, f.rule.to_string())),
-		);
+		// Harper spans count chars; the truth rows count bytes.
+		let byte = |char: usize| text.char_indices().nth(char).map_or(text.len(), |(i, _)| i);
+		found.extend(findings.iter().map(|f| (file.clone(), byte(f.lint.span.start), byte(f.lint.span.end), f.rule.to_string())));
 	}
 	// `tedi__usage.md` is entirely a code fence: it carries no rows, so it is invisible above and
 	// has to be checked for silence by name.
@@ -288,38 +281,6 @@ fn glossary_nix_round_trips() {
 	}
 }
 
-/// The bootstrap loop: the first run in a repo with no glossary has to produce a file the next
-/// run can read.
-#[test]
-fn suggest_glossary_emits_parseable_nix() {
-	let out = std::process::Command::new(env!("CARGO_BIN_EXE_ste_checker"))
-		.arg("--suggest-glossary")
-		.args(corpus_paths())
-		.output()
-		.unwrap();
-	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-	let skeleton = Glossary::parse(std::str::from_utf8(&out.stdout).unwrap()).unwrap();
-	assert!(skeleton.names.contains_key("browser") && skeleton.verbs.contains_key("forbid"));
-	assert_eq!(skeleton.names.get("browser"), Some(&Some(String::new())), "every entry leaves `desc` for the human");
-}
-
-/// `--suggest-glossary > docs/glossary.nix` is the documented bootstrap, and the shell truncates
-/// the file before the process starts: the default glossary must not be read on that path.
-#[test]
-fn suggest_glossary_ignores_the_file_it_writes() {
-	let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("redirected");
-	std::fs::create_dir_all(dir.join("docs")).unwrap();
-	std::fs::write(dir.join("docs/glossary.nix"), "").unwrap();
-	std::fs::write(dir.join("in.md"), "Restart the browser.\n").unwrap();
-	let out = std::process::Command::new(env!("CARGO_BIN_EXE_ste_checker"))
-		.current_dir(&dir)
-		.args(["--suggest-glossary", "in.md"])
-		.output()
-		.unwrap();
-	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-	assert!(Glossary::parse(std::str::from_utf8(&out.stdout).unwrap()).unwrap().names.contains_key("browser"));
-}
-
 /// A glossary of Technical Names only, for the tests that need one.
 fn names(words: &[&str]) -> Glossary {
 	Glossary {
@@ -347,7 +308,11 @@ fn flagged(text: &str, rule: &str, ctx: &Ctx) -> Vec<String> {
 }
 
 fn corpus_paths() -> Vec<std::path::PathBuf> {
-	let mut paths: Vec<_> = std::fs::read_dir(CORPUS).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name() != Some("README.md".as_ref())).collect();
+	let mut paths: Vec<_> = std::fs::read_dir(CORPUS)
+		.unwrap()
+		.map(|e| e.unwrap().path())
+		.filter(|p| p.file_name() != Some("README.md".as_ref()))
+		.collect();
 	paths.sort();
 	paths
 }

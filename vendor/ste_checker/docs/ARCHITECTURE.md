@@ -13,7 +13,6 @@ flowchart TD
     DICT["dictionary rules<br/>unapproved-word · wrong-pos<br/>unknown-word"]
     STRUCT["structural rules<br/>sentence-length · noun-cluster<br/>passive · compound-tense · ing-verb · contraction"]
     OUT["Vec&lt;Finding&gt;  (rule + harper Lint)"]
-    REP["report: miette (human) | serde_json (json)"]
 
     MD --> DOC
     DOC --> UNL
@@ -28,7 +27,6 @@ flowchart TD
     CTX --> STRUCT
     DICT --> OUT
     STRUCT --> OUT
-    OUT --> REP
 ```
 
 Where this is going, and the measured gaps that decide the order: [ROADMAP.md](./ROADMAP.md).

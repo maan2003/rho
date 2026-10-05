@@ -7,10 +7,17 @@
 //! ~200 ms against a 100 µs lint, and would not exist on a `cargo binstall` machine.
 use std::{collections::HashMap, path::Path};
 
-use color_eyre::eyre::{Result, WrapErr, bail};
 use harper_brill::UPOS;
 
 use crate::wordset::equivalent;
+
+type Result<T> = std::result::Result<T, String>;
+
+macro_rules! bail {
+	($($arg:tt)*) => {
+		return Err(format!($($arg)*))
+	};
+}
 
 /// Words to their definitions. Nothing reads a definition yet; it is documentation for the human
 /// and the slot `--suggest-glossary` leaves empty.
@@ -22,8 +29,8 @@ pub struct Glossary {
 
 impl Glossary {
 	pub fn read(path: &Path) -> Result<Self> {
-		let src = std::fs::read_to_string(path).wrap_err_with(|| format!("failed to read glossary {}", path.display()))?;
-		Self::parse(&src).wrap_err_with(|| format!("failed to parse glossary {}", path.display()))
+		let src = std::fs::read_to_string(path).map_err(|e| format!("failed to read glossary {}: {e}", path.display()))?;
+		Self::parse(&src).map_err(|e| format!("failed to parse glossary {}: {e}", path.display()))
 	}
 
 	/// A Technical Name is approved as a noun and a Technical Verb as a verb; declaring one does

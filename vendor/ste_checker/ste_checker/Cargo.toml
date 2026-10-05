@@ -6,35 +6,13 @@ description = "Procedural ASD-STE100 (Simplified Technical English) checker for 
 license = "BlueOak-1.0.0"
 repository = "https://github.com/valeratrades/ste_checker"
 readme = "../README.md"
-keywords = ["ste", "asd-ste100", "linter", "markdown", "documentation"]
-categories = ["command-line-utilities", "text-processing"]
-
-[package.metadata]
-
-# cargo-release defaults to `{crate}-v{version}` for a workspace member, and the release
-# workflow resolves `v[0-9]*` — a mismatch publishes the tarballs under the previous tag.
-[package.metadata.release]
-tag-name = "v{{version}}"
-
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
-bin-dir = "{ bin }{ binary-ext }"
-pkg-fmt = "tgz"
+publish = false
 
 [dependencies]
-clap.workspace = true
-color-eyre.workspace = true
 harper-brill.workspace = true
 harper-core.workspace = true
-miette.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-# The FRNG/minimizer/corpus kernel the fuzz binary is a target table over — the same one
-# `trading_data` and `dockviewers_core` sit on. Dev-only, and `default-features = false` because the
-# fuzz feature is the whole of what is wanted here.
-[dev-dependencies]
-v_utils = { workspace = true, features = ["fuzz"] }
 
 [lints]
 workspace = true

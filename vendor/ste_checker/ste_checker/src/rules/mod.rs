@@ -5,6 +5,7 @@ use crate::{ctx::Ctx, tags::Tags};
 pub mod contraction;
 pub mod dictionary;
 pub mod noun_cluster;
+pub mod semicolon;
 pub mod sentence;
 pub mod verb_form;
 
@@ -20,6 +21,7 @@ pub const RULES: &[(&str, Rule)] = &[
 	("compound-tense", verb_form::compound_tense),
 	("ing-verb", verb_form::ing_as_verb),
 	("contraction", contraction::contraction),
+	("semicolon", semicolon::semicolon),
 ];
 
 /// Word tokens outside headings, with their index into `doc.get_tokens()` — which is what
