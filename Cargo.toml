@@ -1,0 +1,31 @@
+cargo-features = ["codegen-backend"]
+
+[workspace]
+members = ["ste_checker"]
+default-members = ["ste_checker"]
+resolver = "3"
+
+[workspace.lints.clippy]
+float_cmp = "allow"
+len_zero = "allow"
+undocumented_unsafe_blocks = "warn"
+tabs_in_doc_comments = "allow"
+doc_lazy_continuation = "allow"
+get_first = "allow"
+get_last_with_len = "allow"
+manual_is_multiple_of = "allow"
+
+[workspace.lints.rust]
+unused_features = "allow"
+
+[workspace.dependencies]
+clap = { version = "^4.5.4", features = ["derive"] }
+color-eyre = "^0.6.5"
+# exact: the corpus counts in tests/integration are a snapshot of this dictionary and tagger,
+# and CI runs `cargo update` — a floating minor moves them out from under the calibration.
+harper-brill = "=2.8.0"
+harper-core = "=2.8.0"
+miette = { version = "^7.6.0", features = ["fancy", "serde", "syntect-highlighter"] }
+serde = { version = "^1.0.229", features = ["derive"] }
+serde_json = "^1.0.151"
+v_utils = { version = "^2.17.8", default-features = false }
