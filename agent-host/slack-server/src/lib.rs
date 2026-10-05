@@ -9,7 +9,7 @@
 //! One method is the server's own: `rho.events` long-polls the events the
 //! app's Socket Mode connection receives (see [`events`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -42,22 +42,46 @@ struct AppState {
 const DEFAULT_WAIT: Duration = Duration::from_secs(20);
 const MAX_WAIT: Duration = Duration::from_secs(300);
 
-/// The Web API methods agents may call, shared with the notebook's
-/// `slack_sdk`, which also checks their argument names.
-fn methods() -> &'static HashSet<String> {
-    static METHODS: OnceLock<HashSet<String>> = OnceLock::new();
+/// The Web API methods agents may call, each with the argument names it
+/// takes. The names are upstream `slack_sdk`'s method signatures.
+fn methods() -> &'static HashMap<String, HashSet<String>> {
+    static METHODS: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
     METHODS.get_or_init(|| {
-        let list: Value = serde_json::from_str(include_str!(
-            "../../rho-notebook/src/slack_sdk/rho_methods.json"
-        ))
-        .expect("bundled Slack method list is valid");
-        list["methods"]
-            .as_object()
-            .expect("the Slack method list has methods")
-            .keys()
-            .cloned()
-            .collect()
+        #[derive(serde::Deserialize)]
+        struct List {
+            methods: HashMap<String, HashSet<String>>,
+        }
+        serde_json::from_str::<List>(include_str!("../methods.json"))
+            .expect("bundled Slack method list is valid")
+            .methods
     })
+}
+
+/// The argument names a call sends, from its query and its form or JSON
+/// body. Slack ignores names it does not know, so a misspelt `thread_ts`
+/// would post outside the thread instead of failing.
+fn argument_names(query: &str, headers: &HeaderMap, body: &[u8]) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    if body.is_empty() {
+        return Ok(names);
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match content_type.split(';').next().unwrap_or_default().trim() {
+        "application/x-www-form-urlencoded" => {
+            names.extend(url::form_urlencoded::parse(body).map(|(name, _)| name.into_owned()))
+        }
+        "application/json" => match serde_json::from_slice::<Value>(body) {
+            Ok(Value::Object(object)) => names.extend(object.into_iter().map(|(name, _)| name)),
+            _ => return Err("the JSON body is not an object".to_owned()),
+        },
+        other => return Err(format!("unsupported content type {other:?}")),
+    }
+    Ok(names)
 }
 
 pub fn router(
@@ -96,8 +120,22 @@ async fn call(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !methods().contains(&method) {
+    let Some(arguments) = methods().get(&method) else {
         return slack_error("rho_method_unavailable");
+    };
+    match argument_names(query.as_deref().unwrap_or_default(), &headers, &body) {
+        Ok(names) => {
+            let unknown: BTreeSet<&str> = names
+                .iter()
+                .filter(|name| !arguments.contains(*name))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                let unknown = unknown.into_iter().collect::<Vec<_>>().join(", ");
+                return slack_error(&format!("rho_invalid_arguments: {unknown}"));
+            }
+        }
+        Err(error) => return slack_error(&format!("rho_invalid_arguments: {error}")),
     }
     if method == "rho.events" {
         return wait_for_events(&state, query.as_deref().unwrap_or_default()).await;
@@ -349,6 +387,59 @@ mod tests {
             events.push(json!({"payload": {"event": {"channel": "D1", "ts": "2.0"}}}));
         });
         poll.await
+    }
+
+    #[tokio::test]
+    async fn refuses_argument_names_the_method_does_not_take() {
+        let (slack, seen) = fake_slack().await;
+        let server = server("xoxb-host", slack).await;
+        let client = reqwest::Client::new();
+        let call = |query: &str, content_type: &str, body: &str| {
+            client
+                .post(format!("{server}/api/chat.postMessage{query}"))
+                .header(header::CONTENT_TYPE, content_type)
+                .body(body.to_owned())
+                .send()
+        };
+        let json = "application/json;charset=utf-8";
+        let form = "application/x-www-form-urlencoded";
+
+        for (request, error) in [
+            (
+                call(
+                    "",
+                    json,
+                    r#"{"channel":"D1","thread_tss":"1.0","text":"hi"}"#,
+                ),
+                "thread_tss",
+            ),
+            (
+                call("?thread_tss=1.0&zz=1", json, r#"{"channel":"D1"}"#),
+                "thread_tss, zz",
+            ),
+            (call("", form, "channel=D1&token=xoxp-1"), "token"),
+            (
+                call("", json, r#"[{"channel":"D1"}]"#),
+                "the JSON body is not an object",
+            ),
+            (
+                call("", "multipart/form-data; boundary=x", "--x--"),
+                r#"unsupported content type "multipart/form-data""#,
+            ),
+        ] {
+            let body = request.await.unwrap().json::<Value>().await.unwrap();
+            assert_eq!(
+                body,
+                json!({"ok": false, "error": format!("rho_invalid_arguments: {error}")})
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Declared names in the query and the form body go through.
+        call("?thread_ts=1.0", form, "channel=D1&text=hi")
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -16101,6 +16101,7 @@ dependencies = [
  "rand 0.10.3",
  "reqwest 0.13.5",
  "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

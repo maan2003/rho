@@ -4,13 +4,9 @@ Copyright (c) the slack_sdk contributors. MIT License.
 Upstream: https://github.com/slackapi/python-slack-sdk (dd615799e83ff20cd6b6acd2909ea19604679ef1).
 
 Requests go over httpx to the host's Slack server, which adds the bot
-token. Only the methods in `rho_methods.json` work, with the arguments
-listed there, which are upstream's method signatures. The server enforces
-the same method list; this client checks it first so that a mistake fails
-before any request.
+token and refuses methods and argument names outside its list.
 """
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -18,8 +14,6 @@ from ssl import SSLContext
 from typing import Any, Dict, Optional
 
 import httpx
-
-from slack_sdk.errors import SlackRequestError
 
 from .async_slack_response import AsyncSlackResponse
 from .deprecation import show_deprecation_warning_if_any
@@ -31,9 +25,6 @@ from .internal_utils import (
     convert_bool_to_0_or_1,
     get_user_agent,
 )
-
-# Method name to the argument names it takes.
-METHODS: Dict[str, list] = json.loads((Path(__file__).parent.parent / "rho_methods.json").read_text())["methods"]
 
 
 class AsyncBaseClient:
@@ -92,14 +83,6 @@ class AsyncBaseClient:
         auth: Optional[dict] = None,
     ) -> AsyncSlackResponse:
         """Calls a Slack Web API method, e.g. `'chat.postMessage'`, through the host."""
-        if api_method not in METHODS:
-            raise SlackRequestError(f"rho does not expose the Slack method {api_method}")
-        if files:
-            raise SlackRequestError("rho does not send multipart files: use files_upload_v2")
-        # Upstream passes `token` itself; the host replaces it.
-        unknown = {k for args in (params, data, json) for k in args or {}} - {"token", *METHODS[api_method]}
-        if unknown:
-            raise TypeError(f"{api_method} got unexpected arguments: {', '.join(sorted(unknown))}")
         api_url = _get_url(self.base_url, api_method)
         headers = headers or {}
         headers.update(self.headers)

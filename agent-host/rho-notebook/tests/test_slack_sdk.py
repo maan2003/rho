@@ -3,20 +3,21 @@ import asyncio
 import collections
 import json
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError, SlackRequestError
+from slack_sdk.errors import SlackApiError
 from slack_sdk.rho import ThreadSubscriptions
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
-from slack_sdk.web.async_base_client import METHODS
 from slack_sdk.web.async_client import AsyncWebClient
 
+METHODS_FILE = Path(__file__).parents[2] / "slack-server" / "methods.json"
 ENVELOPE = {"envelope_id": "e1", "type": "events_api",
             "payload": {"event": {"type": "message", "channel": "D1", "text": "LGTM"}}}
 EVENTS = [
@@ -102,39 +103,39 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["a", "b"])
         self.assertEqual([r["query"].get("cursor") for r in requests], [None, ["c2"]])
 
-    async def test_unlisted_methods_and_arguments_fail_before_a_request(self):
+    async def test_host_refusals_raise_and_sync_clients_refuse(self):
         async def body():
-            with self.assertRaisesRegex(SlackRequestError, "does not expose the Slack method auth.revoke"):
-                await AsyncWebClient().auth_revoke()
-            with self.assertRaisesRegex(TypeError, "chat.postMessage got unexpected arguments: txt"):
-                await AsyncWebClient().chat_postMessage(channel="D1", txt="typo")
             with self.assertRaises(SlackApiError) as raised:
-                await AsyncWebClient().chat_postMessage(channel="D1", text="hi")
-            self.assertEqual(raised.exception.response["error"], "channel_not_found")
+                await AsyncWebClient().chat_postMessage(channel="D1", thread_tss="1.0")
+            self.assertEqual(raised.exception.response["error"], "rho_invalid_arguments: thread_tss")
             for sync in (WebClient, SocketModeClient):
                 with self.assertRaisesRegex(TypeError, "only the async"):
                     sync(token="xoxb-agent-guess")
 
-        requests = await self.run_with({"chat.postMessage": {"ok": False, "error": "channel_not_found"}}, body)
+        await self.run_with({"chat.postMessage": {"ok": False, "error": "rho_invalid_arguments: thread_tss"}}, body)
 
-        self.assertEqual([r["api"] for r in requests], ["chat.postMessage"])
-
-    async def test_every_listed_method_accepts_all_its_listed_arguments(self):
-        """The list must name what upstream's methods send, or real calls fail."""
-        sent = {}
+    async def test_every_listed_method_sends_only_its_listed_arguments(self):
+        """The host's list must cover what upstream's methods send, or it refuses real calls."""
+        methods = json.loads(METHODS_FILE.read_text())["methods"]
+        del methods["rho.events"]
 
         async def body():
             client = AsyncWebClient()
-            for method, args in METHODS.items():
-                if method == "rho.events":
-                    continue
+            for method, args in methods.items():
                 values = {name: ("U1" if name != "files" else [{"id": "F1"}]) for name in args}
                 await getattr(client, method.replace(".", "_"))(**values)
-                sent[method] = self.fake.requests[-1]["api"]
 
-        await self.run_with(collections.defaultdict(lambda: {"ok": True}), body)
+        requests = await self.run_with(collections.defaultdict(lambda: {"ok": True}), body)
 
-        self.assertEqual(sent, {m: m for m in METHODS if m != "rho.events"})
+        self.assertEqual([r["api"] for r in requests], list(methods))
+        for request in requests:
+            sent = set(request["query"])
+            if request["body"]:
+                if request["headers"]["content-type"].startswith("application/json"):
+                    sent |= set(json.loads(request["body"]))
+                else:
+                    sent |= set(parse_qs(request["body"].decode()))
+            self.assertLessEqual(sent, set(methods[request["api"]]), request["api"])
 
     async def test_files_upload_v2_sends_the_bytes_straight_to_the_issued_url(self):
         uploads = []

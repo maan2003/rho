@@ -49,9 +49,10 @@ cursor pagination:
   `files_upload_v2` (through `files_getUploadURLExternal` and
   `files_completeUploadExternal`).
 
-Writes need no approval: post when the task calls for it. Any other method
-raises `SlackRequestError` before a request, and an argument the method
-does not declare raises `TypeError`. Do not work around either. What
+Writes need no approval: post when the task calls for it. The host refuses
+any other method with `rho_method_unavailable`, and an argument name the
+method does not declare with `rho_invalid_arguments: <names>`; both raise
+`SlackApiError`. Fix the call instead of working around either. What
 succeeds also depends on the scopes the user gave the app: report
 `missing_scope` to the user. `rho_no_slack_token` or
 `rho_no_slack_app_token` means the host has no tokens yet: ask the user to
