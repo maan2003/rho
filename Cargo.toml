@@ -217,6 +217,37 @@ lto = "off"
 debug-assertions = false
 opt-level = 3
 
+# human.send's STE check loads Harper's tagger, which takes seconds unoptimized.
+[profile.dev.package.harper-core]
+opt-level = 3
+
+[profile.dev.package.harper-brill]
+opt-level = 3
+
+[profile.dev.package.harper-pos-utils]
+opt-level = 3
+
+[profile.dev.package.burn-core]
+opt-level = 3
+
+[profile.dev.package.burn-nn]
+opt-level = 3
+
+[profile.dev.package.burn-tensor]
+opt-level = 3
+
+[profile.dev.package.burn-ndarray]
+opt-level = 3
+
+[profile.dev.package.ndarray]
+opt-level = 3
+
+[profile.dev.package.matrixmultiply]
+opt-level = 3
+
+[profile.dev.package.ste_checker]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"
