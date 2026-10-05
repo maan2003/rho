@@ -1,5 +1,6 @@
 """Exercise the adapted slack_sdk clients against a Slack-server-shaped Unix socket."""
 import asyncio
+import collections
 import json
 import os
 import tempfile
@@ -8,11 +9,12 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
+from slack_sdk.errors import SlackApiError, SlackRequestError
 from slack_sdk.rho import ThreadSubscriptions
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.web.async_base_client import METHODS
 from slack_sdk.web.async_client import AsyncWebClient
 
 ENVELOPE = {"envelope_id": "e1", "type": "events_api",
@@ -100,27 +102,67 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["a", "b"])
         self.assertEqual([r["query"].get("cursor") for r in requests], [None, ["c2"]])
 
-    async def test_api_errors_raise_and_sync_clients_refuse(self):
+    async def test_unlisted_methods_and_arguments_fail_before_a_request(self):
         async def body():
-            with self.assertRaises(SlackApiError) as raised:
+            with self.assertRaisesRegex(SlackRequestError, "does not expose the Slack method auth.revoke"):
                 await AsyncWebClient().auth_revoke()
-            self.assertEqual(raised.exception.response["error"], "rho_method_refused")
+            with self.assertRaisesRegex(TypeError, "chat.postMessage got unexpected arguments: txt"):
+                await AsyncWebClient().chat_postMessage(channel="D1", txt="typo")
+            with self.assertRaises(SlackApiError) as raised:
+                await AsyncWebClient().chat_postMessage(channel="D1", text="hi")
+            self.assertEqual(raised.exception.response["error"], "channel_not_found")
             for sync in (WebClient, SocketModeClient):
                 with self.assertRaisesRegex(TypeError, "only the async"):
                     sync(token="xoxb-agent-guess")
 
-        await self.run_with({"auth.revoke": {"ok": False, "error": "rho_method_refused"}}, body)
+        requests = await self.run_with({"chat.postMessage": {"ok": False, "error": "channel_not_found"}}, body)
 
-    async def test_files_go_multipart_with_their_fields(self):
+        self.assertEqual([r["api"] for r in requests], ["chat.postMessage"])
+
+    async def test_every_listed_method_accepts_all_its_listed_arguments(self):
+        """The list must name what upstream's methods send, or real calls fail."""
+        sent = {}
+
         async def body():
-            await AsyncWebClient().api_call("files.upload", files={"file": b"log line"},
-                                            data={"channels": "C1", "filename": "ci.log"})
+            client = AsyncWebClient()
+            for method, args in METHODS.items():
+                if method == "rho.events":
+                    continue
+                values = {name: ("U1" if name != "files" else [{"id": "F1"}]) for name in args}
+                await getattr(client, method.replace(".", "_"))(**values)
+                sent[method] = self.fake.requests[-1]["api"]
 
-        (request,) = await self.run_with({"files.upload": {"ok": True}}, body)
+        await self.run_with(collections.defaultdict(lambda: {"ok": True}), body)
 
-        self.assertTrue(request["headers"]["content-type"].startswith("multipart/form-data; boundary="))
-        self.assertIn(b'name="channels"\r\n\r\nC1', request["body"])
-        self.assertIn(b"log line", request["body"])
+        self.assertEqual(sent, {m: m for m in METHODS if m != "rho.events"})
+
+    async def test_files_upload_v2_sends_the_bytes_straight_to_the_issued_url(self):
+        uploads = []
+
+        async def upload(reader, writer):
+            head = (await reader.readuntil(b"\r\n\r\n")).decode()
+            length = int(next(l for l in head.split("\r\n") if l.lower().startswith("content-length")).split(":")[1])
+            uploads.append((head.split()[1], await reader.readexactly(length)))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK")
+            await writer.drain()
+            writer.close()
+
+        upload_server = await asyncio.start_server(upload, "127.0.0.1", 0)
+        port = upload_server.sockets[0].getsockname()[1]
+
+        async def body():
+            async with upload_server:
+                await AsyncWebClient().files_upload_v2(channel="C1", content=b"log line", filename="ci.log")
+
+        requests = await self.run_with({
+            "files.getUploadURLExternal": {"ok": True, "upload_url": f"http://127.0.0.1:{port}/up/F1", "file_id": "F1"},
+            "files.completeUploadExternal": {"ok": True, "files": [{"id": "F1"}]},
+        }, body)
+
+        self.assertEqual(uploads, [("/up/F1", b"log line")])
+        get_url, complete = requests
+        self.assertEqual(get_url["query"], {"filename": ["ci.log"], "length": ["8"]})
+        self.assertEqual(json.loads(complete["query"]["files"][0]), [{"id": "F1", "title": "ci.log"}])
 
     async def test_async_socket_mode_client_runs_listeners_from_rho_events(self):
         async def body():

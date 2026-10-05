@@ -2,14 +2,15 @@
 //!
 //! Agents call the Slack Web API over this Unix socket, through the
 //! `slack_sdk` the notebook ships (`agent-host/rho-notebook/src/slack_sdk`).
-//! The server adds the bot token, so no agent holds it. The scopes the user
-//! grants the Slack app decide what the bot may do; the server refuses only
-//! the methods that would revoke, uninstall or reconfigure the app itself.
+//! The server adds the bot token, so no agent holds it, and forwards only
+//! the methods in a fixed list: reads and the writes agents need to work
+//! with people. Slack validates the arguments.
 //!
 //! One method is the server's own: `rho.events` long-polls the events the
 //! app's Socket Mode connection receives (see [`events`]).
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,6 +21,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use reqwest::{Client, Url};
+use serde_json::Value;
 use tokio::net::UnixListener;
 
 mod events;
@@ -40,15 +42,23 @@ struct AppState {
 const DEFAULT_WAIT: Duration = Duration::from_secs(20);
 const MAX_WAIT: Duration = Duration::from_secs(300);
 
-/// Methods an agent may not call, by exact name or by `prefix.`.
-const REFUSED: &[&str] = &[
-    "auth.revoke",
-    "apps.uninstall",
-    "apps.manifest.",
-    "oauth.",
-    "openid.",
-    "tooling.",
-];
+/// The Web API methods agents may call, shared with the notebook's
+/// `slack_sdk`, which also checks their argument names.
+fn methods() -> &'static HashSet<String> {
+    static METHODS: OnceLock<HashSet<String>> = OnceLock::new();
+    METHODS.get_or_init(|| {
+        let list: Value = serde_json::from_str(include_str!(
+            "../../rho-notebook/src/slack_sdk/rho_methods.json"
+        ))
+        .expect("bundled Slack method list is valid");
+        list["methods"]
+            .as_object()
+            .expect("the Slack method list has methods")
+            .keys()
+            .cloned()
+            .collect()
+    })
+}
 
 pub fn router(
     token_provider: TokenProvider,
@@ -86,20 +96,11 @@ async fn call(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if method.is_empty()
-        || !method
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.')
-    {
-        return slack_error("rho_invalid_method");
+    if !methods().contains(&method) {
+        return slack_error("rho_method_unavailable");
     }
     if method == "rho.events" {
         return wait_for_events(&state, query.as_deref().unwrap_or_default()).await;
-    }
-    if REFUSED.iter().any(|refused| {
-        method == *refused || (refused.ends_with('.') && method.starts_with(refused))
-    }) {
-        return slack_error("rho_method_refused");
     }
     let token = match (state.token_provider)() {
         Ok(token) if !token.trim().is_empty() => token.trim().to_owned(),
@@ -179,7 +180,7 @@ mod tests {
     use std::sync::Mutex;
 
     use axum::extract::Request;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::*;
 
@@ -269,17 +270,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_methods_that_reconfigure_the_app_and_malformed_names() {
+    async fn forwards_only_listed_methods() {
         let (slack, seen) = fake_slack().await;
         let server = server("xoxb-host", slack).await;
 
-        for (method, error) in [
-            ("auth.revoke", "rho_method_refused"),
-            ("apps.uninstall", "rho_method_refused"),
-            ("apps.manifest.update", "rho_method_refused"),
-            ("oauth.v2.access", "rho_method_refused"),
-            ("chat.post_message", "rho_invalid_method"),
-            ("..%2Fauth.revoke", "rho_invalid_method"),
+        for method in [
+            "auth.revoke",
+            "conversations.kick",
+            "chat.postMessageX",
+            "chat.postmessage",
+            "..%2Fchat.postMessage",
         ] {
             let body = reqwest::get(format!("{server}/api/{method}"))
                 .await
@@ -287,12 +287,15 @@ mod tests {
                 .json::<Value>()
                 .await
                 .unwrap();
-            assert_eq!(body, json!({"ok": false, "error": error}), "{method}");
+            assert_eq!(
+                body,
+                json!({"ok": false, "error": "rho_method_unavailable"}),
+                "{method}"
+            );
         }
         assert!(seen.lock().unwrap().is_empty());
 
-        // A name that only starts like a refused one is not refused.
-        reqwest::get(format!("{server}/api/auth.revokeX"))
+        reqwest::get(format!("{server}/api/conversations.replies"))
             .await
             .unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1);

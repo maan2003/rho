@@ -1,0 +1,138 @@
+{
+  "methods": {
+    "auth.test": [],
+    "users.info": [
+      "user",
+      "include_locale"
+    ],
+    "users.lookupByEmail": [
+      "email"
+    ],
+    "users.list": [
+      "cursor",
+      "include_locale",
+      "limit",
+      "team_id"
+    ],
+    "conversations.info": [
+      "channel",
+      "include_locale",
+      "include_num_members"
+    ],
+    "conversations.history": [
+      "channel",
+      "cursor",
+      "inclusive",
+      "include_all_metadata",
+      "latest",
+      "limit",
+      "oldest"
+    ],
+    "conversations.replies": [
+      "channel",
+      "ts",
+      "cursor",
+      "inclusive",
+      "include_all_metadata",
+      "latest",
+      "limit",
+      "oldest"
+    ],
+    "conversations.list": [
+      "cursor",
+      "exclude_archived",
+      "limit",
+      "team_id",
+      "types"
+    ],
+    "conversations.members": [
+      "channel",
+      "cursor",
+      "limit"
+    ],
+    "reactions.get": [
+      "channel",
+      "file",
+      "file_comment",
+      "full",
+      "timestamp"
+    ],
+    "chat.getPermalink": [
+      "channel",
+      "message_ts"
+    ],
+    "conversations.open": [
+      "channel",
+      "return_im",
+      "users"
+    ],
+    "chat.postMessage": [
+      "channel",
+      "text",
+      "as_user",
+      "attachments",
+      "blocks",
+      "thread_ts",
+      "reply_broadcast",
+      "unfurl_links",
+      "unfurl_media",
+      "container_id",
+      "icon_emoji",
+      "icon_url",
+      "mrkdwn",
+      "link_names",
+      "username",
+      "parse",
+      "metadata",
+      "markdown_text"
+    ],
+    "chat.update": [
+      "channel",
+      "ts",
+      "text",
+      "attachments",
+      "blocks",
+      "as_user",
+      "file_ids",
+      "link_names",
+      "parse",
+      "reply_broadcast",
+      "metadata",
+      "markdown_text"
+    ],
+    "chat.delete": [
+      "channel",
+      "ts",
+      "as_user"
+    ],
+    "reactions.add": [
+      "channel",
+      "name",
+      "timestamp"
+    ],
+    "reactions.remove": [
+      "name",
+      "channel",
+      "file",
+      "file_comment",
+      "timestamp"
+    ],
+    "files.getUploadURLExternal": [
+      "filename",
+      "length",
+      "alt_txt",
+      "snippet_type"
+    ],
+    "files.completeUploadExternal": [
+      "files",
+      "channel_id",
+      "channels",
+      "initial_comment",
+      "thread_ts"
+    ],
+    "rho.events": [
+      "cursor",
+      "timeout"
+    ]
+  }
+}

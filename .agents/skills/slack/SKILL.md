@@ -37,13 +37,25 @@ dm = (await slack.conversations_open(users=[user]))["channel"]["id"]
 sent = await slack.chat_postMessage(channel=dm, text="Could you review #42? <url>")
 ```
 
-Every Web API method of `slack_sdk` is available, with its usual
-arguments and cursor pagination. What succeeds depends on the scopes the
-user gave the app: report `missing_scope` to the user rather than working
-around it. `rho_no_slack_token` or `rho_no_slack_app_token` means the
-host has no tokens yet: ask the user to run `rho slack init`. Methods that
-would revoke, uninstall or reconfigure the app fail with
-`rho_method_refused`.
+The host exposes a fixed list of methods, with upstream's arguments and
+cursor pagination:
+
+- Reads: `auth_test`, `users_info`, `users_lookupByEmail`, `users_list`,
+  `conversations_info`, `conversations_history`, `conversations_replies`,
+  `conversations_list`, `conversations_members`, `reactions_get`,
+  `chat_getPermalink`.
+- Writes: `conversations_open`, `chat_postMessage`, `chat_update`,
+  `chat_delete`, `reactions_add`, `reactions_remove`, and
+  `files_upload_v2` (through `files_getUploadURLExternal` and
+  `files_completeUploadExternal`).
+
+Writes need no approval: post when the task calls for it. Any other method
+raises `SlackRequestError` before a request, and an argument the method
+does not declare raises `TypeError`. Do not work around either. What
+succeeds also depends on the scopes the user gave the app: report
+`missing_scope` to the user. `rho_no_slack_token` or
+`rho_no_slack_app_token` means the host has no tokens yet: ask the user to
+run `rho slack init`.
 
 ## Waiting for replies
 

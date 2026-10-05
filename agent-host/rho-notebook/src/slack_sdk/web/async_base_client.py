@@ -3,21 +3,37 @@
 Copyright (c) the slack_sdk contributors. MIT License.
 Upstream: https://github.com/slackapi/python-slack-sdk (dd615799e83ff20cd6b6acd2909ea19604679ef1).
 
-It sends requests with the transport in `base_client.py`, on httpx instead
-of aiohttp.
+Requests go over httpx to the host's Slack server, which adds the bot
+token. Only the methods in `rho_methods.json` work, with the arguments
+listed there, which are upstream's method signatures. The server enforces
+the same method list; this client checks it first so that a mistake fails
+before any request.
 """
 
+import json
 import logging
+import os
+from pathlib import Path
 from ssl import SSLContext
 from typing import Any, Dict, Optional
 
 import httpx
 
+from slack_sdk.errors import SlackRequestError
+
 from .async_slack_response import AsyncSlackResponse
-from .base_client import _request_kwargs, _response, _socket
 from .deprecation import show_deprecation_warning_if_any
 from .file_upload_v2_result import FileUploadV2Result
-from .internal_utils import _build_req_args, _get_url, get_user_agent
+from .internal_utils import (
+    _build_req_args,
+    _build_unexpected_body_error_message,
+    _get_url,
+    convert_bool_to_0_or_1,
+    get_user_agent,
+)
+
+# Method name to the argument names it takes.
+METHODS: Dict[str, list] = json.loads((Path(__file__).parent.parent / "rho_methods.json").read_text())["methods"]
 
 
 class AsyncBaseClient:
@@ -76,6 +92,14 @@ class AsyncBaseClient:
         auth: Optional[dict] = None,
     ) -> AsyncSlackResponse:
         """Calls a Slack Web API method, e.g. `'chat.postMessage'`, through the host."""
+        if api_method not in METHODS:
+            raise SlackRequestError(f"rho does not expose the Slack method {api_method}")
+        if files:
+            raise SlackRequestError("rho does not send multipart files: use files_upload_v2")
+        # Upstream passes `token` itself; the host replaces it.
+        unknown = {k for args in (params, data, json) for k in args or {}} - {"token", *METHODS[api_method]}
+        if unknown:
+            raise TypeError(f"{api_method} got unexpected arguments: {', '.join(sorted(unknown))}")
         api_url = _get_url(self.base_url, api_method)
         headers = headers or {}
         headers.update(self.headers)
@@ -100,14 +124,25 @@ class AsyncBaseClient:
 
     async def _request(self, *, http_verb, api_url, req_args) -> Dict[str, Any]:
         """Sends one request. `AsyncSlackResponse` pagination calls this for each page."""
-        opened, kwargs = _request_kwargs(http_verb, api_url, req_args)
+        socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+        # httpx sets the content type; the host sets the token.
+        headers = {
+            k: v for k, v in (req_args.get("headers") or {}).items() if k.lower() not in ("content-type", "authorization")
+        }
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=self.timeout) as client:
+            resp = await client.request(
+                http_verb,
+                api_url,
+                headers=headers,
+                params=convert_bool_to_0_or_1(req_args.get("params")),
+                data=convert_bool_to_0_or_1(req_args.get("data")),
+                json=req_args.get("json"),
+            )
         try:
-            transport = httpx.AsyncHTTPTransport(uds=_socket())
-            async with httpx.AsyncClient(transport=transport, timeout=self.timeout) as client:
-                return _response(await client.request(**kwargs))
-        finally:
-            for f in opened:
-                f.close()
+            data = resp.json()
+        except ValueError:
+            data = {"ok": False, "error": _build_unexpected_body_error_message(resp.text)}
+        return {"status_code": resp.status_code, "headers": dict(resp.headers), "data": data}
 
     async def _upload_file(
         self,
