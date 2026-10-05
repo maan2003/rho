@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime
 import os
+import stat
 from pathlib import Path
 from urllib.parse import quote
 
@@ -226,3 +227,43 @@ def __call__(self:GhApi, path:str, verb:str=None, headers:dict=None, route:dict=
 def __getitem__(self:GhApi, k):
     a,b = k if isinstance(k,tuple) else (k,'GET')
     return self.func_dict[f'{a}:{b.upper()}']
+
+
+_attachment_types = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+}
+
+@patch
+def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
+    """Upload one local image/video through Octo and return its asset response (`.url`).
+
+    Uses this client's repository defaults or explicit owner/repo overrides.
+    Does not post a comment or edit a body. Requires repository write access.
+    Async clients must await the result; sync clients return it directly.
+    """
+    path = Path(path)
+    content_type = _attachment_types.get(path.suffix.lower())
+    if content_type is None:
+        raise ValueError(f"Unsupported attachment type: {path.suffix}")
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Attachments must be regular files")
+    limit = (100 if content_type.startswith("video/") else 10) * 1024 * 1024
+    if not 0 < info.st_size <= limit:
+        raise ValueError(f"Attachment must be nonempty and at most {limit} bytes")
+    body = path.read_bytes()
+
+    def upload(repository):
+        return self("/user-attachments/assets", verb="POST",
+                    query={"name": path.name, "content_type": content_type,
+                           "repository_id": repository.id},
+                    headers={"Content-Type": "application/octet-stream"}, data=body)
+
+    if isinstance(self.transport, GhSyncTransport):
+        return upload(self.repos.get(owner=owner, repo=repo))
+
+    async def run():
+        return await upload(await self.repos.get(owner=owner, repo=repo))
+    return run()

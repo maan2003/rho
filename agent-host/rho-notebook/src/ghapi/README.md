@@ -49,6 +49,27 @@ search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
 `application/vnd.github.patch`. Draft/ready transitions use
 `await api.pulls.set_draft(number, draft=True/False)`.
 
+`await api.upload_attachment(path, owner=..., repo=...)` uploads a local
+image/video and returns the asset response (`.url`). Owner/repo overrides are
+optional; client defaults apply. A sync client uses the same method without
+`await`. The helper resolves the numeric repository ID with `repos.get` and
+sends raw bytes through the host's fixed `POST /user-attachments/assets` route.
+Only that operation targets `uploads.github.com`; ordinary REST requests still
+target `api.github.com`. The pinned REST metadata is unchanged.
+
+The helper accepts PNG, JPG/JPEG, GIF, WebP, SVG, MP4, MOV, and WebM, checks for
+a nonempty regular file, and applies the CLI's 10 MiB image/100 MiB video limits.
+GitHub validates media and may enforce a lower plan-dependent video limit.
+Repository write access is required; GitHub App installation tokens are not
+supported. The host targets GitHub.com, not GitHub Enterprise Server.
+
+Uploads do not create comments or edit bodies. Embed images as
+`![Description](asset.url)` and put video URLs alone in a paragraph.
+Uploads require specific approval for the file and repository, including any
+private-data disclosure. If publication fails after upload, reuse the URL
+rather than upload again. Octo does not deduplicate uploads or follow upload
+redirects. See the GitHub workflow skill for complete examples and retry rules.
+
 Octo preserves selected pagination/cache/rate-limit headers, empty responses,
 and text/binary response media. Existing job/run log download redirects
 are fetched once on the host without credentials; signed URLs never reach the

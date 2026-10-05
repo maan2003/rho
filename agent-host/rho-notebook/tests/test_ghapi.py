@@ -86,6 +86,125 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(request.call_args.kwargs["params"], query)
                             self.assertEqual(request.call_args.kwargs["json"], body)
 
+
+    async def test_attachment_upload_uses_repository_id_and_raw_bytes_in_both_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requests = []
+            headers_seen = []
+
+            async def serve(reader, writer):
+                method, path, _ = (await reader.readline()).decode().split()
+                headers = {}
+                while line := (await reader.readline()).decode().strip():
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+                body = await reader.readexactly(int(headers.get("content-length", 0)))
+                requests.append((method, path, body))
+                headers_seen.append(headers)
+                status, payload = "200 OK", b'{"id": 913, "node_id": "R_acme"}'
+                if path == "/repos/other/project":
+                    payload = b'{"id": 1701, "node_id": "R_other"}'
+                if method == "POST":
+                    status, payload = "201 Created", b'{"url":"https://github.com/user-attachments/assets/new"}'
+                writer.write(
+                    f"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\n".encode()
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                )
+                await writer.drain()
+                writer.close()
+
+            image = Path(directory) / "screen & shot.PNG"
+            video = Path(directory) / "clip.mov"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n\x00\xffbinary\x00")
+            video.write_bytes(b"\x00\x00\x00\x18ftypqt  \x00\xff")
+            server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
+            try:
+                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                    async with server:
+                        for sync in (False, True):
+                            with self.subTest(sync=sync):
+                                requests.clear()
+                                headers_seen.clear()
+                                api = GhApi("acme", "widget", sync=sync)
+                                for path, overrides in (
+                                    (image, {}),
+                                    (video, {"owner": "other", "repo": "project"}),
+                                ):
+                                    if sync:
+                                        result = await asyncio.to_thread(api.upload_attachment, path, **overrides)
+                                    else:
+                                        result = await api.upload_attachment(path, **overrides)
+                                    self.assertEqual(result.url, "https://github.com/user-attachments/assets/new")
+                                self.assertEqual(len(requests), 4)  # No comment creation/body update.
+                                self.assertEqual(requests[0], ("GET", "/repos/acme/widget", b""))
+                                self.assertEqual(requests[2], ("GET", "/repos/other/project", b""))
+                                for index, name, mime, repository_id, expected in (
+                                    (1, "screen & shot.PNG", "image/png", "913", b"\x89PNG\r\n\x1a\n\x00\xffbinary\x00"),
+                                    (3, "clip.mov", "video/quicktime", "1701", b"\x00\x00\x00\x18ftypqt  \x00\xff"),
+                                ):
+                                    method, path, body = requests[index]
+                                    url = urlsplit(path)
+                                    self.assertEqual((method, url.path), ("POST", "/user-attachments/assets"))
+                                    self.assertEqual(parse_qs(url.query), {
+                                        "name": [name], "content_type": [mime], "repository_id": [repository_id],
+                                    })
+                                    self.assertEqual(body, expected)
+                                    self.assertEqual(headers_seen[index]["content-type"], "application/octet-stream")
+                                    self.assertEqual(headers_seen[index]["host"], "octo")
+                                    self.assertNotIn("authorization", headers_seen[index])
+                                    self.assertNotIn("cookie", headers_seen[index])
+            finally:
+                server.close()
+                await server.wait_closed()
+
+    async def test_attachment_file_validation_and_upstream_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsupported = root / "log.txt"
+            unsupported.write_text("log")
+            empty = root / "empty.png"
+            empty.touch()
+            folder = root / "folder.png"
+            folder.mkdir()
+            fifo = root / "pipe.png"
+            os.mkfifo(fifo)
+            with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                for sync in (False, True):
+                    with self.subTest(sync=sync):
+                        api = GhApi("acme", "widget", sync=sync)
+                        request = Mock() if sync else AsyncMock()
+                        api.transport.request = request
+                        for path in (unsupported, empty, folder, fifo):
+                            with self.subTest(path=path.name):
+                                with self.assertRaises(ValueError):
+                                    api.upload_attachment(path)
+                        with self.assertRaises(FileNotFoundError):
+                            api.upload_attachment(root / "missing.png")
+                        # Inclusive size limits: a plausible >= implementation must fail.
+                        for name, limit in (("large.svg", 10 * 1024 * 1024),
+                                            ("large.webm", 100 * 1024 * 1024)):
+                            path = root / name
+                            with path.open("wb") as file:
+                                file.truncate(limit + 1)
+                            with self.assertRaises(ValueError):
+                                api.upload_attachment(path)
+                            with path.open("wb") as file:
+                                file.truncate(limit)
+                            # Avoid allocating the large test payload; the real binary path is tested above.
+                            with patch.object(Path, "read_bytes", return_value=b"boundary bytes") as read:
+                                if sync:
+                                    request.side_effect = [dict(id=913), RuntimeError("upstream rejected upload")]
+                                    with self.assertRaisesRegex(RuntimeError, "upstream rejected upload"):
+                                        api.upload_attachment(path)
+                                else:
+                                    request.side_effect = [dict(id=913), RuntimeError("upstream rejected upload")]
+                                    with self.assertRaisesRegex(RuntimeError, "upstream rejected upload"):
+                                        await api.upload_attachment(path)
+                                read.assert_called_once()
+                            self.assertEqual(request.call_count, 2)
+                            request.reset_mock()
+                        request.assert_not_called()
+
     async def test_required_parameters_are_checked_after_binding_and_mapping_overrides(self):
         from fastcore.all import UNSET
         from ghapi.core import _gh_override

@@ -29,6 +29,15 @@ impl AppState {
         Ok(url)
     }
 
+    pub(crate) fn github_upload_url(&self) -> Url {
+        let mut url = self.github_api_url.clone();
+        if url.host_str() == Some("api.github.com") {
+            url.set_host(Some("uploads.github.com"))
+                .expect("fixed GitHub upload host is valid");
+        }
+        url
+    }
+
     pub(crate) async fn get_token(&self) -> Result<String> {
         (self.token_provider)()
             .map(|token| token.trim().to_owned())
@@ -65,5 +74,19 @@ mod tests {
                 .as_str(),
             "https://github.com/fedimint/fedimint.git/info/refs"
         );
+    }
+    #[test]
+    fn github_upload_url_uses_the_fixed_upload_origin() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let state = AppState {
+            client: reqwest::Client::new(),
+            token_provider: Arc::new(|| Ok("token".to_owned())),
+            github_api_url: Url::parse("https://api.github.com").unwrap(),
+        };
+        assert_eq!(
+            state.github_upload_url().as_str(),
+            "https://uploads.github.com/"
+        );
+        assert_eq!(state.github_api_url.as_str(), "https://api.github.com/");
     }
 }

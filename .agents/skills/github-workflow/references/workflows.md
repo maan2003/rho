@@ -55,6 +55,11 @@ Explicit `None` clears nullable fields; omission leaves them unchanged.
 Review submission and new inline comments are available through upstream
 methods, but require authorization for that specific live write.
 
+For screenshots/videos, use `api.upload_attachment(path)` and reference its
+`.url` in the approved comment or body update. Uploads and posts are separate:
+reuse the URL if the post fails. See the skill's attachment section for file
+limits, permissions, Markdown examples, and approval requirements.
+
 ## Track CI for the current head
 
 Poll `api.pr_status(number)` until checks finish. It reads the PR head and

@@ -50,6 +50,14 @@ fn operations() -> &'static [Operation] {
         ))
         .expect("bundled ghapi metadata is valid")
         .ops;
+        // Attachment bytes go to GitHub's upload origin, not its REST API.
+        // Keep this fixed operation beside the shared method/path allowlist.
+        ops.push(Operation {
+            group: "attachments".into(),
+            name: "upload".into(),
+            path: "/user-attachments/assets".into(),
+            verb: "POST".into(),
+        });
         // Prefer literal routes (e.g. releases/latest) over parameter routes.
         ops.sort_by_key(|op| {
             std::cmp::Reverse(
@@ -168,7 +176,11 @@ async fn rest(
         Ok(token) => token,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let mut url = state.github_api_url.clone();
+    let mut url = if op.group == "attachments" {
+        state.github_upload_url()
+    } else {
+        state.github_api_url.clone()
+    };
     url.path_segments_mut()
         .expect("GitHub base is hierarchical")
         .clear()
@@ -585,7 +597,9 @@ mod tests {
         let mut reads = 0;
         let mut writes = 0;
         for op in operations() {
-            if matches!(op.name.as_str(), "review_decision" | "set_draft") {
+            if op.group == "attachments"
+                || matches!(op.name.as_str(), "review_decision" | "set_draft")
+            {
                 continue;
             }
             if op.verb == "GET" {
@@ -595,6 +609,15 @@ mod tests {
             }
         }
         assert_eq!((reads, writes), (91, 40));
+        let uploads: Vec<_> = operations()
+            .iter()
+            .filter(|op| op.group == "attachments")
+            .collect();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(
+            (uploads[0].verb.as_str(), uploads[0].path.as_str()),
+            ("POST", "/user-attachments/assets")
+        );
         for name in ["merge", "merge_async", "update_branch", "dismiss_review"] {
             assert!(
                 !operations()
@@ -1255,6 +1278,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachments_relay_binary_uploads_without_credentials_or_redirects_to_agents() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = captured.clone();
+        let (upstream, upstream_task) = serve(Router::new().route(
+            "/user-attachments/assets",
+            axum::routing::post(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(headers.get(header::AUTHORIZATION).unwrap(), "Bearer host-token-test");
+                    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/octet-stream");
+                    assert!(!headers.contains_key(header::COOKIE));
+                    assert!(!headers.contains_key("x-forwarded-host"));
+                    assert_eq!(headers.get(header::USER_AGENT).unwrap(), "octo-gh");
+                    seen.lock().await.push((uri.to_string(), body.to_vec()));
+                    match uri.query().unwrap() {
+                        "name=screen%20%26%20shot.png&content_type=image%2Fpng&repository_id=913" => (
+                            StatusCode::CREATED,
+                            Json(json!({"url":"https://github.com/user-attachments/assets/image",
+                                        "message":"host-token-test",
+                                        "repository":{"full_name":"acme/widget","temp_clone_token":"ephemeral"}}))
+                        ).into_response(),
+                        "name=clip.webm&content_type=video%2Fwebm&repository_id=913" => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({"message":"Video exceeds plan limit","errors":[{"code":"too_large"}]}))
+                        ).into_response(),
+                        _ => (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, "https://untrusted.invalid/host-token-test")],
+                        ).into_response(),
+                    }
+                }
+            }),
+        )).await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        let body = b"\x89PNG\r\n\x1a\n\x00\xffbinary\x00";
+        for (query, status, expected) in [
+            (
+                "name=screen%20%26%20shot.png&content_type=image%2Fpng&repository_id=913",
+                StatusCode::CREATED,
+                Some(
+                    json!({"url":"https://github.com/user-attachments/assets/image",
+                         "message":"[redacted]","repository":{"full_name":"acme/widget"}}),
+                ),
+            ),
+            (
+                "name=clip.webm&content_type=video%2Fwebm&repository_id=913",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(json!({"message":"Video exceeds plan limit","errors":[{"code":"too_large"}]})),
+            ),
+            (
+                "name=redirect.png&content_type=image%2Fpng&repository_id=913",
+                StatusCode::BAD_GATEWAY,
+                None,
+            ),
+        ] {
+            let path = format!("/user-attachments/assets?{query}");
+            let response = client
+                .post(format!("{base}{path}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::AUTHORIZATION, "Bearer agent-token")
+                .header(header::COOKIE, "session=agent")
+                .header("x-forwarded-host", "untrusted.invalid")
+                .body(body.as_slice())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            if let Some(expected) = expected {
+                assert_eq!(response.json::<Value>().await.unwrap(), expected);
+            } else {
+                assert!(response.bytes().await.unwrap().is_empty());
+            }
+            assert_eq!(
+                captured.lock().await.last().unwrap(),
+                &(path, body.to_vec())
+            );
+        }
+        assert_eq!(captured.lock().await.len(), 3);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn unavailable_methods_and_paths_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1269,6 +1377,11 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
         for (method, path, body) in [
+            (Method::GET, "user-attachments/assets", Value::Null),
+            (Method::DELETE, "user-attachments/assets", Value::Null),
+            (Method::POST, "user-attachments/assets/7", json!({})),
+            (Method::POST, "user-attachments/assets/../other", json!({})),
+            (Method::POST, "user-attachments/%2e%2e/assets", json!({})),
             (Method::PUT, "repos/acme/widget/pulls/7/merge", json!({})),
             (
                 Method::PUT,
