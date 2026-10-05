@@ -23,7 +23,7 @@ pub fn length(doc: &Document, tags: &Tags, ctx: &Ctx) -> Vec<Lint> {
 			Some(Lint {
 				span,
 				lint_kind: LintKind::Readability,
-				message: format!("{words} words; ASD-STE100 allows at most {max} here. Split the sentence."),
+				message: format!("This sentence has {words} words. The limit is {max}. Split it into shorter sentences."),
 				..Default::default()
 			})
 		})

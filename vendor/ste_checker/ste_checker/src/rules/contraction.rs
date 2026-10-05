@@ -23,7 +23,7 @@ pub fn contraction(doc: &Document, tags: &Tags, _ctx: &Ctx) -> Vec<Lint> {
 			contracted.then(|| Lint {
 				span: t.span,
 				lint_kind: LintKind::Style,
-				message: format!("`{word}` is a contraction. ASD-STE100 wants the words written out in full."),
+				message: format!("`{word}` is a contraction. Write the full words, for example `it's` -> `it is`."),
 				..Default::default()
 			})
 		})

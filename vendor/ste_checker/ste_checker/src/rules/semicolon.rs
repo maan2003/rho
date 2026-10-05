@@ -13,7 +13,7 @@ pub fn semicolon(doc: &Document, tags: &Tags, _ctx: &Ctx) -> Vec<Lint> {
 		.map(|t| Lint {
 			span: t.span,
 			lint_kind: LintKind::Style,
-			message: "ASD-STE100 allows no semicolons. Write two sentences.".to_owned(),
+			message: "A semicolon is not allowed. Write two sentences.".to_owned(),
 			..Default::default()
 		})
 		.collect()

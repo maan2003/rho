@@ -54,7 +54,10 @@ pub fn ing_as_verb(doc: &Document, tags: &Tags, _ctx: &Ctx) -> Vec<Lint> {
 		.map(|(_, t)| Lint {
 			span: t.span,
 			lint_kind: LintKind::Style,
-			message: format!("`{}` is an -ing form used as a verb. ASD-STE100 allows -ing words only inside a Technical Name.", t.get_str(src)),
+			message: format!(
+				"`{}` is an -ing verb form. Use a simple tense, for example `is running` -> `runs`. Put a quoted word in a code span.",
+				t.get_str(src)
+			),
 			..Default::default()
 		})
 		.collect()
