@@ -3,13 +3,13 @@ import asyncio
 import json
 import os
 import tempfile
-import threading
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.rho import ThreadSubscriptions
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -100,31 +100,16 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(texts, ["a", "b"])
         self.assertEqual([r["query"].get("cursor") for r in requests], [None, ["c2"]])
 
-    async def test_sync_client_pagination_and_errors(self):
-        texts, errors = [], []
-
+    async def test_api_errors_raise_and_sync_clients_refuse(self):
         async def body():
-            def sync():
-                client = WebClient()
-                for page in client.users_list(limit=1):
-                    texts.extend(m["name"] for m in page["members"])
-                try:
-                    client.auth_revoke()
-                except SlackApiError as error:
-                    errors.append(error.response["error"])
-            await asyncio.to_thread(sync)
+            with self.assertRaises(SlackApiError) as raised:
+                await AsyncWebClient().auth_revoke()
+            self.assertEqual(raised.exception.response["error"], "rho_method_refused")
+            for sync in (WebClient, SocketModeClient):
+                with self.assertRaisesRegex(TypeError, "only the async"):
+                    sync(token="xoxb-agent-guess")
 
-        requests = await self.run_with({
-            "users.list": [
-                {"ok": True, "members": [{"name": "ann"}], "response_metadata": {"next_cursor": "c2"}},
-                {"ok": True, "members": [{"name": "bo"}]},
-            ],
-            "auth.revoke": {"ok": False, "error": "rho_method_refused"},
-        }, body)
-
-        self.assertEqual(texts, ["ann", "bo"])
-        self.assertEqual(errors, ["rho_method_refused"])
-        self.assertEqual([r["query"].get("cursor") for r in requests[:2]], [None, ["c2"]])
+        await self.run_with({"auth.revoke": {"ok": False, "error": "rho_method_refused"}}, body)
 
     async def test_files_go_multipart_with_their_fields(self):
         async def body():
@@ -161,19 +146,48 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
         self.assertEqual(requests[1]["query"], {"cursor": ["7:1"], "timeout": ["20"]})
 
-    async def test_sync_socket_mode_client_runs_listeners_from_rho_events(self):
+    async def test_thread_subscriptions_route_events_to_their_threads(self):
+        def envelope(event):
+            return {"envelope_id": "e", "type": "events_api", "payload": {"event": event}}
+
+        reply_a = {"type": "message", "channel": "D1", "ts": "2.0", "thread_ts": "1.0", "text": "LGTM"}
+        root_a = {"type": "message", "channel": "D1", "ts": "1.0"}
+        same_ts_elsewhere = {"type": "message", "channel": "C9", "ts": "3.0", "thread_ts": "1.0"}
+        edit_b = {"type": "message", "subtype": "message_changed", "channel": "C2",
+                  "message": {"ts": "6.0", "thread_ts": "5.0", "text": "edited"}}
+        reaction_a = {"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}
+        polls = [
+            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a]],
+             "cursor": "7:5", "truncated": False},
+            {"ok": True, "events": [], "cursor": "8:0", "truncated": True},
+            {"ok": True, "events": [], "cursor": "8:0", "truncated": False},
+        ]
+        a, b = [], []
+
         async def body():
-            client = SocketModeClient(app_token="xapp-agent-guess")
-            seen = threading.Event()
-            client.socket_mode_request_listeners.append(
-                lambda client, request: seen.set() if request.envelope_id == "e1" else None)
-            client.connect()
-            self.assertTrue(await asyncio.to_thread(seen.wait, 5))
-            client.close()
+            threads = ThreadSubscriptions()
 
-        requests = await self.run_with({"rho.events": list(EVENTS)}, body)
+            def on_a(event):
+                a.append(event)
+                raise RuntimeError("a failing callback does not stop the others")
 
-        self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
+            async def on_b(event):
+                b.append(event)
+
+            threads.subscribe("D1", "1.0", on_a)
+            threads.subscribe("C2", "5.0", on_b)
+            while len(self.fake.requests) < 3:
+                await asyncio.sleep(0.01)
+            threads.unsubscribe("D1", "1.0")
+            threads.unsubscribe("C2", "5.0")
+            self.assertIsNone(threads._poller)
+
+        requests = await self.run_with({"rho.events": polls}, body)
+
+        truncated = {"type": "rho_truncated"}
+        self.assertEqual(a, [reply_a, root_a, reaction_a, truncated])
+        self.assertEqual(b, [edit_b, truncated])
+        self.assertEqual([r["query"].get("cursor") for r in requests[:3]], [None, ["7:5"], ["8:0"]])
 
 
 if __name__ == "__main__":

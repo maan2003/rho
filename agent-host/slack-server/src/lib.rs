@@ -136,20 +136,16 @@ async fn call(
     }
 }
 
-/// `rho.events`: `cursor`, `channel`, `thread_ts` and `timeout` (seconds)
-/// arrive as query parameters.
+/// `rho.events`: `cursor` and `timeout` (seconds) arrive as query parameters.
 async fn wait_for_events(state: &AppState, query: &str) -> Response {
     if events::present(&state.app_token).is_none() {
         return slack_error("rho_no_slack_app_token: run `rho slack init` on the agent host");
     }
     let mut cursor = None;
-    let mut filter = events::Filter::default();
     let mut timeout = DEFAULT_WAIT;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match &*key {
             "cursor" => cursor = Some(value.into_owned()),
-            "channel" => filter.channel = Some(value.into_owned()),
-            "thread_ts" => filter.thread_ts = Some(value.into_owned()),
             "timeout" => match value.parse::<f64>() {
                 Ok(seconds) if seconds >= 0.0 => {
                     timeout = Duration::from_secs_f64(seconds).min(MAX_WAIT)
@@ -159,7 +155,7 @@ async fn wait_for_events(state: &AppState, query: &str) -> Response {
             _ => {}
         }
     }
-    let reply = state.events.wait(cursor.as_deref(), &filter, timeout).await;
+    let reply = state.events.wait(cursor.as_deref(), timeout).await;
     axum::Json(reply).into_response()
 }
 
@@ -330,10 +326,7 @@ mod tests {
         let start = poll("timeout=0".into()).await;
         assert_eq!(start["events"], json!([]));
         let cursor = start["cursor"].as_str().unwrap().to_owned();
-        let reply = message_after(
-            &events,
-            poll(format!("cursor={cursor}&channel=D1&timeout=5")),
-        );
+        let reply = message_after(&events, poll(format!("cursor={cursor}&timeout=5")));
         assert_eq!(
             reply.await["events"],
             json!([{"payload": {"event": {"channel": "D1", "ts": "2.0"}}}])
@@ -345,13 +338,11 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
-    /// Runs `poll`, and pushes an event for another channel and then one for
-    /// `D1` while it waits.
+    /// Runs `poll`, and pushes an event while it waits.
     async fn message_after(events: &Arc<Events>, poll: impl Future<Output = Value>) -> Value {
         let events = events.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            events.push(json!({"payload": {"event": {"channel": "C9", "ts": "1.0"}}}));
             events.push(json!({"payload": {"event": {"channel": "D1", "ts": "2.0"}}}));
         });
         poll.await

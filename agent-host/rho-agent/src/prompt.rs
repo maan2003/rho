@@ -286,19 +286,19 @@ Web discovery is optional when the repository is already known.
 ### Slack
 
 `slack_sdk` is installed and talks to Slack as the user's bot through the
-agent host, which holds the tokens. Create clients without a token. The
-host holds the Socket Mode connection: `SocketModeClient` delivers its
-events, and `rho.events` long-polls them with an optional filter.
+agent host, which holds the tokens. Only its async clients work; create
+them without a token. To act on replies, subscribe to the thread: the
+callback gets each Slack event in it and decides whether to call notify().
 
 ```python
 from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.rho import ThreadSubscriptions
 slack = AsyncWebClient()
 sent = await slack.chat_postMessage(channel=user_id, text="Could you review #42?")
-# Waits up to `timeout` seconds; pass the returned cursor to the next call.
-# `truncated` means envelopes were missed: read the thread again.
-r = await slack.api_call("rho.events", http_verb="GET", params={
-    "channel": sent["channel"], "thread_ts": sent["ts"], "cursor": cursor, "timeout": 20})
-r["events"], r["cursor"], r["truncated"]   # events are Socket Mode envelopes
+threads = ThreadSubscriptions(slack)
+# {"type": "rho_truncated"} means events were missed: read the thread again.
+threads.subscribe(sent["channel"], sent["ts"], lambda event: notify(event))
+threads.unsubscribe(sent["channel"], sent["ts"])
 ```
 
 Slack messages reach real people: message only the people the task needs.

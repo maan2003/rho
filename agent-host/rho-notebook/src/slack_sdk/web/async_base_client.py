@@ -3,7 +3,8 @@
 Copyright (c) the slack_sdk contributors. MIT License.
 Upstream: https://github.com/slackapi/python-slack-sdk (dd615799e83ff20cd6b6acd2909ea19604679ef1).
 
-The async twin of `base_client.py`, on httpx instead of aiohttp.
+It sends requests with the transport in `base_client.py`, on httpx instead
+of aiohttp.
 """
 
 import logging

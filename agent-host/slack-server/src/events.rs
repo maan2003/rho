@@ -36,13 +36,6 @@ struct Buffer {
     events: VecDeque<(u64, Value)>,
 }
 
-/// Which events a poll wants.
-#[derive(Default)]
-pub(crate) struct Filter {
-    pub channel: Option<String>,
-    pub thread_ts: Option<String>,
-}
-
 impl Default for Events {
     fn default() -> Self {
         Self {
@@ -69,14 +62,9 @@ impl Events {
         self.arrived.notify_waiters();
     }
 
-    /// The matching events after `cursor`, waiting up to `timeout` for the
-    /// first. No cursor means "from now".
-    pub(crate) async fn wait(
-        &self,
-        cursor: Option<&str>,
-        filter: &Filter,
-        timeout: Duration,
-    ) -> Value {
+    /// The envelopes after `cursor`, waiting up to `timeout` for the first.
+    /// No cursor means "from now".
+    pub(crate) async fn wait(&self, cursor: Option<&str>, timeout: Duration) -> Value {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut after = None;
         let mut truncated = false;
@@ -104,7 +92,7 @@ impl Events {
                 let events: Vec<&Value> = buffer
                     .events
                     .iter()
-                    .filter(|(seq, event)| *seq > after && filter.matches(event))
+                    .filter(|(seq, _)| *seq > after)
                     .map(|(_, event)| event)
                     .collect();
                 if !events.is_empty() || truncated || tokio::time::Instant::now() >= deadline {
@@ -125,36 +113,6 @@ impl Events {
         (epoch.parse::<u64>().ok()? == self.epoch)
             .then(|| seq.parse().ok())
             .flatten()
-    }
-}
-
-impl Filter {
-    fn matches(&self, envelope: &Value) -> bool {
-        if self.channel.is_none() && self.thread_ts.is_none() {
-            return true;
-        }
-        let Some(event) = envelope.pointer("/payload/event") else {
-            return false;
-        };
-        // Edits and deletions carry the message one level down; reactions
-        // name theirs as an item.
-        let message = event.get("message").unwrap_or(event);
-        let channel = event
-            .get("channel")
-            .or_else(|| event.pointer("/item/channel"))
-            .and_then(Value::as_str);
-        let in_thread = |ts: &str| {
-            [
-                message.get("thread_ts"),
-                message.get("ts"),
-                event.pointer("/item/ts"),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|value| value.as_str() == Some(ts))
-        };
-        self.channel.as_deref().is_none_or(|c| channel == Some(c))
-            && self.thread_ts.as_deref().is_none_or(in_thread)
     }
 }
 
@@ -277,38 +235,26 @@ mod tests {
         )
     }
 
-    fn thread(ts: &str) -> Filter {
-        Filter {
-            channel: Some("D1".into()),
-            thread_ts: Some(ts.into()),
-        }
-    }
-
     #[tokio::test]
-    async fn a_poll_from_now_waits_for_the_next_matching_event() {
+    async fn a_poll_from_now_waits_for_the_next_event() {
         let events = Arc::new(Events::default());
         events.push(message("D1", "1.0", None));
         let pusher = events.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            pusher.push(message("C9", "2.0", Some("1.0")));
-            pusher.push(message("D1", "3.0", Some("1.0")));
+            pusher.push(message("D1", "2.0", Some("1.0")));
         });
 
-        let reply = events
-            .wait(None, &thread("1.0"), Duration::from_secs(5))
-            .await;
+        let reply = events.wait(None, Duration::from_secs(5)).await;
 
-        // The event from before the poll and the other channel's are not news.
-        assert_eq!(reply["events"], json!([message("D1", "3.0", Some("1.0"))]));
+        // The event from before the poll is not news.
+        assert_eq!(reply["events"], json!([message("D1", "2.0", Some("1.0"))]));
         assert_eq!(reply["truncated"], false);
         let cursor = reply["cursor"].as_str().unwrap();
-        assert!(cursor.ends_with(":3"), "{cursor}");
+        assert!(cursor.ends_with(":2"), "{cursor}");
 
         // From that cursor, nothing new: the poll times out empty.
-        let reply = events
-            .wait(Some(cursor), &thread("1.0"), Duration::from_millis(20))
-            .await;
+        let reply = events.wait(Some(cursor), Duration::from_millis(20)).await;
         assert_eq!(reply["events"], json!([]));
         assert_eq!(reply["cursor"], cursor);
     }
@@ -316,32 +262,27 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_returns_what_arrived_since_without_waiting() {
         let events = Events::default();
-        let start = events.wait(None, &Filter::default(), Duration::ZERO).await;
-        let edit = envelope(
-            json!({"type": "message", "subtype": "message_changed", "channel": "D1",
-                                   "message": {"ts": "5.0", "thread_ts": "1.0", "text": "edited"}}),
-        );
-        let reaction =
-            envelope(json!({"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}));
-        events.push(edit.clone());
-        events.push(message("D1", "6.0", Some("4.0")));
-        events.push(reaction.clone());
+        let start = events.wait(None, Duration::ZERO).await;
+        events.push(message("D1", "5.0", None));
+        events.push(message("C2", "6.0", Some("4.0")));
 
         let reply = events
-            .wait(
-                start["cursor"].as_str(),
-                &thread("1.0"),
-                Duration::from_secs(60),
-            )
+            .wait(start["cursor"].as_str(), Duration::from_secs(60))
             .await;
 
-        assert_eq!(reply["events"], json!([edit, reaction]));
+        assert_eq!(
+            reply["events"],
+            json!([
+                message("D1", "5.0", None),
+                message("C2", "6.0", Some("4.0"))
+            ])
+        );
     }
 
     #[tokio::test]
     async fn cursors_the_buffer_lost_or_another_process_made_are_truncated() {
         let events = Events::default();
-        let start = events.wait(None, &Filter::default(), Duration::ZERO).await;
+        let start = events.wait(None, Duration::ZERO).await;
         let start = start["cursor"].as_str().unwrap().to_owned();
         let epoch = start.split_once(':').unwrap().0.to_owned();
 
@@ -349,9 +290,7 @@ mod tests {
         for i in 0..CAPACITY {
             events.push(message("D1", &format!("{i}.0"), None));
         }
-        let reply = events
-            .wait(Some(&start), &Filter::default(), Duration::ZERO)
-            .await;
+        let reply = events.wait(Some(&start), Duration::ZERO).await;
         assert_eq!(reply["truncated"], false);
         assert_eq!(reply["events"].as_array().unwrap().len(), CAPACITY);
 
@@ -362,9 +301,7 @@ mod tests {
             format!("{epoch}:999999"),
             "junk".to_owned(),
         ] {
-            let reply = events
-                .wait(Some(&cursor), &Filter::default(), Duration::from_secs(60))
-                .await;
+            let reply = events.wait(Some(&cursor), Duration::from_secs(60)).await;
             assert_eq!(reply["truncated"], true, "{cursor}");
             assert_eq!(reply["events"], json!([]), "{cursor}");
             assert_eq!(reply["cursor"], format!("{epoch}:{}", CAPACITY + 1));
