@@ -902,7 +902,7 @@ fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest)
         Scenario::ClarifyingQuestion => {
             "Could you clarify which behavior you want me to implement?".to_owned()
         }
-        Scenario::SlowTrickle => (0..200).map(|index| format!("token-{index} ")).collect(),
+        Scenario::SlowTrickle => (0..200).map(|index| format!("token-{index}. ")).collect(),
         _ => persona_text(state.config.seed, request_number, request),
     }
 }
@@ -915,7 +915,7 @@ fn persona_text(seed: u64, request_number: u64, request: &OpenAiRequest) -> Stri
         request.model,
         request.input.len()
     );
-    let line = "Observed state is consistent; continuing through the real agent host, tools, journal, story, and GUI wire.\n";
+    let line = "Observed state is consistent. The turn goes through the real agent host, tools, journal, story, and GUI wire.\n";
     let mut text = prefix;
     while text.len() < length {
         text.push_str(line);

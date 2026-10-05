@@ -7,16 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-tikv-jemalloc-ctl = "0.7"
-rho-desktop-client.workspace = true
-rustls.workspace = true
-rho-rpc.workspace = true
 alacritty_terminal.workspace = true
-rustix-openpty.workspace = true
-json-stream.workspace = true
-libc.workspace = true
-rho-agent-types.workspace = true
-rho-agents-client.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
@@ -24,27 +15,37 @@ camino.workspace = true
 chrono = "0.4"
 dirs.workspace = true
 futures.workspace = true
+json-stream.workspace = true
+libc.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 pyo3.workspace = true
 pythonize.workspace = true
 rand.workspace = true
 redb.workspace = true
-rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 redb-derive = "0.1"
+rho-agent-types.workspace = true
+rho-agents-client.workspace = true
 rho-claude.workspace = true
 rho-context-config.workspace = true
 rho-db.workspace = true
+rho-desktop-client.workspace = true
 rho-devshell.workspace = true
-rho-notebook.workspace = true
+rho-fs-view.workspace = true
 rho-image.workspace = true
+rho-notebook.workspace = true
+rho-rpc.workspace = true
 rho-tool-shell.workspace = true
 rho-watch.workspace = true
-rho-fs-view.workspace = true
 rho-web-search.workspace = true
-senax-encoder = { workspace = true, features = ["uuid", "raw_value"] }
+rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
+rustix-openpty.workspace = true
+rustls.workspace = true
+senax-encoder = { workspace = true, features = ["raw_value", "uuid"] }
 serde.workspace = true
 serde_json.workspace = true
+ste_checker = { path = "../../vendor/ste_checker/ste_checker" }
 tempfile.workspace = true
+tikv-jemalloc-ctl = "0.7"
 tokio = { workspace = true, features = ["signal"] }
 tree-sitter = "0.27"
 tree-sitter-python = "0.25"

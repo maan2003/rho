@@ -640,6 +640,43 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
 }
 
 #[tokio::test]
+async fn a_send_outside_simplified_technical_english_raises_and_is_not_logged() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then(
+            "human.send(\"I'm reading\", kind='status')\nhuman.send(\"It's done.\", kind='result')",
+        )
+        .then("human.send('It is done.', kind='result')\nend_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    say(&handle, "hi").await;
+    let second = requests(&script, 2).await;
+    let told = told(&second[1]);
+    assert!(told.contains("- contraction: \"It's\""), "{told}");
+    let entries = harness
+        .until("the rewritten result", |entries| {
+            entries.iter().any(|entry| {
+                matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "It is done.")
+            })
+        })
+        .await;
+    let sent: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Sent {
+                to: Party::Human,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, ["I'm reading", "It is done."]);
+    drop(handle);
+}
+
+#[tokio::test]
 async fn exhausted_retry_window_stops_without_another_request() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
