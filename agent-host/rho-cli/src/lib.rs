@@ -17,6 +17,7 @@ use rho_rpc::protocol::{Answer, Call, client};
 
 mod eval;
 mod github;
+mod slack;
 mod visualization;
 mod wayland;
 
@@ -62,6 +63,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Github(args) => github::run(args).await,
+        Command::Slack(args) => slack::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
@@ -163,6 +165,7 @@ enum Command {
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Github(GithubArgs),
+    Slack(SlackArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Wayland(wayland::WaylandArgs),
@@ -189,6 +192,7 @@ enum CliCommand {
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Github(GithubArgs),
+    Slack(SlackArgs),
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
@@ -274,6 +278,20 @@ pub(crate) struct GithubArgs {
 }
 
 #[derive(Clone, clap::Args)]
+pub(crate) struct SlackArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: SlackCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum SlackCommand {
+    /// Install the host-held Slack bot token that agents call Slack with.
+    Init,
+}
+
+#[derive(Clone, clap::Args)]
 pub(crate) struct RecordVisualizationArgs {
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
@@ -304,6 +322,7 @@ impl Args {
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Github(args) => Command::Github(args),
+            CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Wayland(args) => Command::Wayland(args),

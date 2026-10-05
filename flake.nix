@@ -449,8 +449,27 @@
               dependencies = [ fastcore fastspec fasttransport ];
               doCheck = false;
             };
+            # Upstream slack_sdk, with its request transport replaced by the
+            # host's Slack server; see agent-host/rho-notebook/src/slack_sdk.
+            slackSdk = ps.buildPythonPackage {
+              pname = "slack-sdk";
+              version = "3.45.0";
+              pyproject = true;
+              src = ps.fetchPypi {
+                pname = "slack_sdk";
+                version = "3.45.0";
+                hash = "sha256-GreURS8ji1nbDYpNNGJj1lGQKIrdU+xnoFdR2OdAJIY=";
+              };
+              build-system = [ ps.setuptools ];
+              dependencies = [ ps.httpx ];
+              postInstall = ''
+                cp ${./agent-host/rho-notebook/src/slack_sdk/web}/*.py \
+                  "$out/${pkgs.python3.sitePackages}/slack_sdk/web/"
+              '';
+              doCheck = false;
+            };
           in
-          [ ps.pyyaml ps.httpx ghapi pythonLs ]
+          [ ps.pyyaml ps.httpx ghapi pythonLs slackSdk ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 

@@ -52,6 +52,23 @@ print("ghapi import ready")"#
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn adapted_slack_sdk_is_importable_in_the_notebook() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        r#"from slack_sdk import WebClient
+from slack_sdk.web.async_client import AsyncWebClient
+assert AsyncWebClient().base_url == WebClient().base_url == "http://slack/api/"
+print("slack_sdk import ready")"#
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    assert_eq!(
+        notebook.report().unwrap().render().text,
+        "slack_sdk import ready"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_ls_xdir_is_available_in_the_notebook() {
     let (notebook, wake) = notebook();
     let cell = notebook.run(

@@ -31,7 +31,7 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     }
 }
 
-fn prompt_token(prompt: &str) -> anyhow::Result<String> {
+pub(crate) fn prompt_token(prompt: &str) -> anyhow::Result<String> {
     eprint!("{prompt}");
     std::io::stderr().flush().ok();
     let mut token = String::new();

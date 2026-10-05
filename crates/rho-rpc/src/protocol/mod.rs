@@ -139,6 +139,10 @@ impl RuntimePaths {
         self.directory.join("octo.sock")
     }
 
+    pub fn slack_socket(&self) -> std::path::PathBuf {
+        self.directory.join("slack.sock")
+    }
+
     pub fn browser_socket(&self) -> std::path::PathBuf {
         self.directory.join("rho-browser.sock")
     }

@@ -342,6 +342,25 @@ fn spawn_octo_server(
     Ok(())
 }
 
+fn spawn_slack_server(
+    listener: tokio::net::UnixListener,
+    secrets: PlatformSecrets,
+) -> anyhow::Result<()> {
+    let slack_api_url = url::Url::parse("https://slack.com/api/")?;
+    let token_provider: slack_server::TokenProvider = Arc::new(move || {
+        secrets
+            .get("SLACK_BOT_TOKEN")
+            .context("reading SLACK_BOT_TOKEN")
+    });
+    let router = slack_server::router(token_provider, slack_api_url);
+    tokio::spawn(async move {
+        if let Err(error) = slack_server::serve(listener, router).await {
+            tracing::error!(%error, "slack server stopped");
+        }
+    });
+    Ok(())
+}
+
 fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
@@ -350,13 +369,18 @@ fn start_runtime_sockets(
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
+    let slack_socket = paths.slack_socket();
     prepare_socket_path(paths.socket(), "rho-agent-host")?;
     prepare_socket_path(&octo_socket, "octo")?;
+    prepare_socket_path(&slack_socket, "slack")?;
     let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
         .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
+    let slack_listener = tokio::net::UnixListener::bind(&slack_socket)
+        .with_context(|| format!("bind slack socket {}", slack_socket.display()))?;
     let listener = tokio::net::UnixListener::bind(paths.socket())
         .with_context(|| format!("bind rho-agent-host socket {}", paths.socket().display()))?;
-    spawn_octo_server(octo_listener, secrets)?;
+    spawn_octo_server(octo_listener, secrets.clone())?;
+    spawn_slack_server(slack_listener, secrets)?;
     Ok(RuntimeSockets {
         paths,
         server: Server::from_listener(listener),
@@ -1514,6 +1538,7 @@ mod tests {
 
         assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
+        assert!(paths.slack_socket().exists());
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert_eq!(
