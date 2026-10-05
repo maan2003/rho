@@ -241,14 +241,6 @@ where
         self.index.contains_key(key)
     }
 
-    pub fn first_key(&self) -> Option<&K> {
-        self.items.first().map(|item| &item.key)
-    }
-
-    pub fn last_key(&self) -> Option<&K> {
-        self.items.last().map(|item| &item.key)
-    }
-
     /// Double-ended, so a caller looking for the last key of a kind walks
     /// back from the end rather than over everything drawn.
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> {

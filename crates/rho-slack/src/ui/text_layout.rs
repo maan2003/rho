@@ -67,7 +67,8 @@ impl TextLayout {
                             ) {
                                 layout.bullets.push(marker.start_byte()..marker_end);
                             }
-                            // Markdown permits lazy list continuation, but a Slack
+                            // Markdown permits lazy list continuation, but a
+                            // Slack
                             // message boundary always ends the preceding list.
                             let message = messages
                                 .partition_point(|range| range.start <= marker.start_byte());
@@ -76,8 +77,10 @@ impl TextLayout {
                             });
                             let mut offset = row_start;
                             for line in source[row_start..end].split_inclusive('\n') {
-                                // Slack source newlines are author-entered, not soft
-                                // wraps. An unindented following paragraph is not a
+                                // Slack source newlines are author-entered, not
+                                // soft
+                                // wraps. An unindented following paragraph is
+                                // not a
                                 // lazy Markdown continuation of this list item.
                                 if offset != row_start
                                     && !line.trim().is_empty()

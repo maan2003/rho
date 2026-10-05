@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6](https://github.com/moq-dev/moq/compare/moq-json-v0.5.5...moq-json-v0.5.6) - 2026-09-30
+
+### Fixed
+
+- *(net)* keep an aborted track's finished groups, expire ended tracks ([#4378](https://github.com/moq-dev/moq/pull/4378))
+
+### Other
+
+- *(json)* prove the Rust snapshot gate measures the encoded delta ([#4462](https://github.com/moq-dev/moq/pull/4462))
+
+## [0.5.5](https://github.com/moq-dev/moq/compare/moq-json-v0.5.4...moq-json-v0.5.5) - 2026-09-27
+
+### Added
+
+- *(mux)* detect delay and jitter on JSON and binary tracks ([#4270](https://github.com/moq-dev/moq/pull/4270))
+
+## [0.5.4](https://github.com/moq-dev/moq/compare/moq-json-v0.5.3...moq-json-v0.5.4) - 2026-09-26
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.5.3](https://github.com/moq-dev/moq/compare/moq-json-v0.5.2...moq-json-v0.5.3) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.5.2](https://github.com/moq-dev/moq/compare/moq-json-v0.5.1...moq-json-v0.5.2) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.5.1](https://github.com/moq-dev/moq/compare/moq-json-v0.5.0...moq-json-v0.5.1) - 2026-09-25
+
+### Other
+
+- *(json)* skip unchanged root entries in the snapshot diff ([#4020](https://github.com/moq-dev/moq/pull/4020))
+
+## [0.5.0](https://github.com/moq-dev/moq/compare/moq-json-v0.4.2...moq-json-v0.5.0) - 2026-09-25
+
+### Fixed
+
+- *(moq-json)* reject trailing data after a window frame ([#4029](https://github.com/moq-dev/moq/pull/4029))
+
+### Other
+
+- *(json)* track the error path only when a snapshot decode fails ([#4019](https://github.com/moq-dev/moq/pull/4019))
+- *(moq-json)* track the window decode path only to explain a failure ([#4028](https://github.com/moq-dev/moq/pull/4028))
+
+## [0.4.2](https://github.com/moq-dev/moq/compare/moq-json-v0.4.1...moq-json-v0.4.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.4.1](https://github.com/moq-dev/moq/compare/moq-json-v0.4.0...moq-json-v0.4.1) - 2026-09-23
+
+### Added
+
+- *(ffi)* add a TrackDemand handle and expose demand() on JSON producers ([#3949](https://github.com/moq-dev/moq/pull/3949))
+
+## [0.4.0](https://github.com/moq-dev/moq/compare/moq-json-v0.3.12...moq-json-v0.4.0) - 2026-09-23
+
+### Added
+
+- *(json)* edit a snapshot value through a closure ([#3889](https://github.com/moq-dev/moq/pull/3889))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(json)* [**breaking**] Config means the same thing in json and binary ([#3718](https://github.com/moq-dev/moq/pull/3718))
+
+### Fixed
+
+- *(moq-json)* a lost snapshot group is not fatal ([#3907](https://github.com/moq-dev/moq/pull/3907))
+- *(moq-json)* a snapshot edit fails on a shape mismatch instead of seeding a default ([#3874](https://github.com/moq-dev/moq/pull/3874))
+
+### Other
+
+- *(json)* bound snapshot update allocations ([#3929](https://github.com/moq-dev/moq/pull/3929))
+- *(json)* skip the snapshot baseline parse when deltas are disabled ([#3916](https://github.com/moq-dev/moq/pull/3916))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
 ### Changed
 
 - [**breaking**] Codec options are `Config` in snapshot and stream. Track-owning options are

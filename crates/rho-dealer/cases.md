@@ -6,37 +6,45 @@ for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
 Home shows three sections: **next**, every card by priority until it fades
-below the floor, **running**, the agents at work, and **piles**, what the
+below the floor, **recent**, the user's agents by their latest send, folded, and **piles**, what the
 user put away, which they open to be dealt from it.
 
 ## Agents
 
+An agent reaches the user only through their conversation: its sends, the
+user's messages, and the host's notices about it. Its mail with other
+agents is never unread, and whether it is running never ranks. Every send names its kind,
+picked by whether the user needs to read it now:
+
+```
+1. Yes: it asks them for something the work needs: a decision, an
+   approval, information, or an action, even while the agent keeps
+   working. An offer of work beyond what they asked is not one. → ask
+2. Yes: what they asked for is done, or it answers their question.
+   Not while part of it is still pending.                       → result
+3. No, but it is worth keeping: a finding, an assumption, a report
+   while follow-through is pending.                             → fyi
+4. No, and it is passing: "on it", "86% done".                  → status
+```
+
+The user reads a conversation explicitly: a done, or a message of their
+own, reads it through to its end. Opening it reads nothing.
+
 | # | History and facts | Card |
 |---|---|---|
-| A1 | Turn ended, finished | low, "finished · 0m ago", fades, gone after ~3 days |
-| A2 | Turn ended asking for the user | "waiting on reply", rises |
-| A3 | Turn errored | "errored", rises |
-| A4 | Turn running, or the user's message is queued | no card; under running |
-| A5 | The user wrote to it, and it finished within ~5 min | at the top, chimes |
-| A6 | Done | nothing until a newer turn ends; then counts from that turn |
-| A7 | Made by another agent | no card of its own |
-| A8 | Muted, or its host is gone | nothing |
-| A9 | Opened, not replied | priority unchanged |
-
-## Notebook agents
-
-A Rho agent speaks only through its notebook: `human.send()` is what it
-tells the user, and `end_turn()` parks it on them. A1–A9 are
-agents that speak by ending a turn.
-
-| # | History and facts | Card |
-|---|---|---|
-| R1 | Sent a message, still working | nothing until it stops; then "message", fades, new from when it stopped |
-| R2 | Sent a message and waits on the user | "waiting on you", rises from when the wait began, even beside other running work; never under running |
-| R3 | Waits, nothing sent since the user wrote | nothing |
-| R4 | Errored | "errored", rises |
-| R5 | Archived | as stopped: its last message is the card |
-| R6 | Done, or the user wrote | nothing until a newer message; waiting again is not one |
+| A1 | An unread ask | "asks", rises |
+| A2 | An unread result | "result", below an ask, fades, gone after ~3 days |
+| A3 | An fyi | nothing; it stays in the conversation, where the user reads it |
+| A4 | A status | nothing; it is the agent's status line until any later message, from either side, hides it |
+| A5 | Several unread sends | one card, of the strongest kind, counting from its oldest unread send |
+| A6 | Read | nothing until a newer ask or result |
+| A7 | The user wrote within the hour before the send | a bonus, fading over the hour |
+| A8 | Notice: it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask |
+| A9 | Notice: an error the host retries by itself | nothing |
+| A10 | An engineer another agent started for the user | its brief opens the conversation as context, never unread; it deals by its own sends |
+| A11 | Made by another agent for its own work | nothing; it belongs to that agent |
+| A12 | Running, waiting, or idle | changes nothing |
+| A13 | Muted, or its host is gone | nothing |
 
 ## Snoozes
 
@@ -64,7 +72,7 @@ agents that speak by ending a turn.
 | T1 | Todo | low, never fades, rises slowly, stays until done |
 | T2 | Todo with a start date | nothing until then, then as T1 |
 | T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
-| T4 | Todo on an agent at work | hidden while it works; back when its turn ends |
+| T4 | Todo on an agent | as T1, whatever the agent is doing |
 | T5 | Todo on an agent, then the user writes to it | the todo stays; only done clears it |
 | T6 | Done or muted | takes back the todo, the deadline and the snooze |
 

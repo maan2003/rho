@@ -4,7 +4,7 @@ use crate::runtime::Timers;
 use crate::time::{Clock, Instant};
 use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_20, ALPN_21, ALPN_22, ALPN_LITE, ALPN_LITE_03,
-	ALPN_LITE_04, ALPN_LITE_05, ALPN_LITE_06_WIP, Consume, Error, NEGOTIATED, Session, Version, Versions,
+	ALPN_LITE_04, ALPN_LITE_05, ALPN_LITE_06, ALPN_LITE_07_WIP, Consume, Error, NEGOTIATED, Session, Version, Versions,
 	coding::{self, Decode, Encode, Stream},
 	ietf, lite, setup, stats,
 };
@@ -17,6 +17,7 @@ pub struct Client {
 	stats: stats::Session,
 	versions: Versions,
 	setup_path: Option<String>,
+	setup_authority: Option<String>,
 	cost: Option<u64>,
 	peer_hop: Option<crate::Hop>,
 }
@@ -66,8 +67,8 @@ impl Client {
 		self
 	}
 
-	/// Set the request path to advertise in the SETUP (moq-lite-05 and every
-	/// moq-transport draft we speak).
+	/// Set the request path to advertise in SETUP (moq-lite-05 and newer, and
+	/// every moq-transport draft we speak).
 	///
 	/// Only for transports that carry no request URI of their own (native QUIC, qmux
 	/// over TCP/TLS, unix sockets), so the server learns which path the client wants.
@@ -79,6 +80,12 @@ impl Client {
 	/// versions with no in-band request path (lite 01-04).
 	pub fn with_path(mut self, path: impl Into<String>) -> Self {
 		self.setup_path = Some(path.into());
+		self
+	}
+
+	/// Set the URI authority to advertise in SETUP (moq-transport only)
+	pub fn with_authority(mut self, authority: impl Into<String>) -> Self {
+		self.setup_authority = Some(authority.into());
 		self
 	}
 
@@ -144,10 +151,7 @@ impl Client {
 			.subscribe
 			.clone()
 			.map(|origin| origin.with_stats(self.stats.clone()));
-		let publish = match self.peer_hop {
-			Some(peer) => publish.map(|origin| origin.excluding(peer)),
-			None => publish,
-		};
+		let publish = publish.map(|origin| origin.excluding(self.peer_hop.unwrap_or(crate::Hop::UNKNOWN)));
 		(publish, subscribe)
 	}
 
@@ -219,7 +223,8 @@ impl Client {
 	{
 		let runtime = Clock::new(now);
 		let version = match session.protocol() {
-			Some(ALPN_LITE_06_WIP) => lite::Version::Lite06Wip,
+			Some(ALPN_LITE_07_WIP) => lite::Version::Lite07,
+			Some(ALPN_LITE_06) => lite::Version::Lite06,
 			Some(ALPN_LITE_05) => lite::Version::Lite05,
 			Some(ALPN_LITE_04) => lite::Version::Lite04,
 			Some(ALPN_LITE_03) => lite::Version::Lite03,
@@ -268,6 +273,7 @@ impl Client {
 					cost: self.cost,
 					version: draft,
 					path: self.setup_path.clone(),
+					authority: self.setup_authority.clone(),
 					peer_setup_stream: None,
 					peer_declared: None,
 				})?;
@@ -303,9 +309,10 @@ impl Client {
 					.ok_or(Error::Version)?;
 				(v, v.into())
 			}
-			Some(alpn @ (ALPN_LITE_05 | ALPN_LITE_06_WIP)) => {
+			Some(alpn @ (ALPN_LITE_05 | ALPN_LITE_06 | ALPN_LITE_07_WIP)) => {
 				let version = match alpn {
-					ALPN_LITE_06_WIP => lite::Version::Lite06Wip,
+					ALPN_LITE_07_WIP => lite::Version::Lite07,
+					ALPN_LITE_06 => lite::Version::Lite06,
 					_ => lite::Version::Lite05,
 				};
 				self.versions.select(Version::Lite(version)).ok_or(Error::Version)?;
@@ -342,7 +349,11 @@ impl Client {
 		if let Some(path) = &self.setup_path {
 			parameters.set_bytes(ietf::ParameterBytes::Path, path.clone().into_bytes());
 		}
+		if let Some(authority) = &self.setup_authority {
+			parameters.set_bytes(ietf::ParameterBytes::Authority, authority.clone().into_bytes());
+		}
 		ietf::solicit::into_setup(&mut parameters, ietf_encoding);
+		ietf::hidden::into_setup(&mut parameters, ietf_encoding);
 		let parameters = parameters.encode_bytes(ietf_encoding)?;
 
 		let client = setup::Client {
@@ -392,6 +403,7 @@ impl Client {
 					.map(ietf::RequestId);
 				let peer_declared = ietf::peer::Peer {
 					solicit: ietf::solicit::from_setup(&parameters, v)?,
+					hidden: ietf::hidden::from_setup(&parameters, v),
 					..Default::default()
 				};
 
@@ -409,6 +421,7 @@ impl Client {
 					cost: self.cost,
 					version: v,
 					path: None,
+					authority: None,
 					peer_setup_stream: None,
 					peer_declared: Some(peer_declared),
 				})?;
@@ -736,6 +749,42 @@ mod tests {
 		.await
 		.expect("connect waited on a peer that never announced")
 		.expect("connect failed");
+	}
+
+	/// The client SETUP on the bidi control stream (the pre-draft-17 framing) carries the
+	/// AUTHORITY next to the PATH.
+	#[tokio::test(start_paused = true)]
+	async fn draft14_setup_carries_the_authority() {
+		let fake = FakeSession::new(Some(ALPN_LITE), mock_server_setup(Version::Lite(lite::Version::Lite01)));
+		let client = Client::new()
+			.with_versions(
+				[
+					Version::Lite(lite::Version::Lite01),
+					Version::Ietf(ietf::Version::Draft14),
+				]
+				.into(),
+			)
+			.with_path("/anon")
+			.with_authority("relay.example.com:4443");
+
+		let (_session, driver) = client
+			.connect(tokio::time::Instant::now().into_std(), fake.clone())
+			.await
+			.unwrap();
+		tokio::spawn(crate::time::run(driver));
+
+		let mut setup_bytes = Bytes::from(fake.control_writes());
+		let setup = setup::Client::decode(&mut setup_bytes, Version::Ietf(ietf::Version::Draft14)).unwrap();
+		let mut parameters = setup.parameters;
+		let parameters = ietf::Parameters::decode(&mut parameters, ietf::Version::Draft14).unwrap();
+		assert_eq!(
+			parameters.get_bytes(ietf::ParameterBytes::Authority),
+			Some(b"relay.example.com:4443".as_ref())
+		);
+		assert_eq!(
+			parameters.get_bytes(ietf::ParameterBytes::Path),
+			Some(b"/anon".as_ref())
+		);
 	}
 
 	#[tokio::test(start_paused = true)]

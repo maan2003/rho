@@ -8,10 +8,10 @@
 //! title twice and never changes an answer. The cases it must meet are in
 //! `cases.md`, and each has a test under its name.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use jiff::{Timestamp, Zoned};
-use rho_agents_client::AgentMap;
+use rho_agents_client::{AgentMap, Said};
 use rho_slack::model::{Attention, Model, Unit};
 
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
@@ -212,10 +212,9 @@ fn rank_into(
     let at = now.timestamp();
     let marks = sources.marks;
     let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
-    let mut running = BTreeSet::new();
 
-    // Agents (A1–A9, R1–R6): something it put to the user that they have
-    // not dealt with and have not answered.
+    // Agents (A1–A13): the strongest thing an agent put to the user that
+    // they have not read. Only the conversation counts.
     let agents = sources.agents;
     for agent_id in agents.known_agents().copied() {
         let node = NodeId::Agent(agent_id);
@@ -225,101 +224,49 @@ fn rank_into(
         let Some(digest) = agents.agent_digest(agent_id) else {
             continue;
         };
-        let facts = agents.agent_facts(agent_id);
-        // A task waiting on the user is not work (R2).
-        let busy = facts
-            .runtime
-            .as_ref()
-            .map_or(facts.turn_running, |runtime| runtime.is_busy());
-        if busy {
-            running.insert(node.clone());
-        }
         let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
         if let Some(trace) = trace.as_deref_mut() {
-            trace.input(&node, "agent facts", format!("{facts:?}"));
-            trace.input(&node, "digest newest", digest.newest.0.to_string());
+            trace.input(&node, "unread", format!("{:?}", digest.unread));
             trace.input(&node, "seen through", seen.to_string());
         }
-        let code_first = facts.runtime.is_some()
-            || digest.awaiting_human.is_some()
-            || digest.message_sent.is_some();
-        // What the agent last put to the user: since when, whether it
-        // blocks on them, how the card says it, and whether a done has
-        // already seen it. A notebook agent speaks through `human`
-        // (R1–R6); an older one through how its turn ended (A1–A9).
-        let asked: Result<(rho_agent_types::UnixMs, bool, &str, bool), &str> = if code_first {
-            let errored = digest
-                .errored
-                .filter(|_| facts.errored)
-                .zip(facts.last_turn_ended);
-            // What it told the user since they last wrote: the message is
-            // the card, and done's cursor is its place in the story.
-            let sent = digest.message_sent;
-            if let Some((pos, ended)) = errored {
-                Ok((ended, true, "errored · {age} ago", pos.0 < seen))
-            } else if let Some((pos, at)) = sent {
-                if let Some((_, since)) = digest.awaiting_human {
-                    Ok((since, true, "waiting on you · {age}", pos.0 < seen))
-                } else if busy {
-                    Err("working; what it sent waits until it stops")
-                } else {
-                    // It stopped after sending: the message is new from then.
-                    let at = facts.last_turn_ended.map_or(at, |ended| ended.max(at));
-                    Ok((at, false, "message · {age} ago", pos.0 < seen))
-                }
-            } else {
-                Err("nothing sent since the user wrote")
+        let Some(unread) = digest.strongest_unread(rho_agent_types::AgentPos(seen)) else {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.outcome(&node, "no card: nothing unread".to_owned());
             }
-        } else if facts.turn_running {
-            Err("running")
-        } else if let Some(ended) = facts.last_turn_ended {
-            let (blocks, reason) = if facts.errored {
-                (true, "errored · {age} ago")
-            } else if facts.needs_you_hint {
-                (true, "waiting on reply · {age}")
-            } else {
-                (false, "finished · {age} ago")
-            };
-            Ok((ended, blocks, reason, digest.newest.0 <= seen))
-        } else {
-            Err("no turn has ended")
+            continue;
         };
-        let asked = asked.and_then(|(at, blocks, reason, seen)| {
-            if at <= facts.last_user_message_at {
-                Err("the user wrote after it")
-            } else if seen {
-                Err("seen through its newest")
-            } else {
-                Ok((at, blocks, reason))
-            }
-        });
-        let (ended, blocks, reason) = match asked {
-            Ok(asked) => asked,
-            Err(quiet) => {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.outcome(&node, format!("no card: {quiet}"));
-                }
-                continue;
-            }
+        let since = unix(unread.at.0 as i64);
+        let (curve, reason) = match unread.said {
+            Said::Ask => (
+                Curve::Waiting {
+                    head_start: curve::AGENT_BLOCKED_HEAD_START,
+                    since,
+                },
+                "asks · {age}",
+            ),
+            Said::Stopped => (
+                Curve::Waiting {
+                    head_start: curve::AGENT_BLOCKED_HEAD_START,
+                    since,
+                },
+                "stopped · {age} ago",
+            ),
+            Said::Result => (
+                Curve::Fading {
+                    head_start: curve::AGENT_FINISHED_HEAD_START,
+                    since,
+                    gone_days: curve::AGENT_FINISHED_GONE_DAYS,
+                },
+                "result · {age} ago",
+            ),
         };
-        let ended = unix(ended.0 as i64);
-        let curve = if blocks {
-            Curve::Waiting {
-                head_start: curve::AGENT_BLOCKED_HEAD_START,
-                since: ended,
-            }
-        } else {
-            Curve::Fading {
-                head_start: curve::AGENT_FINISHED_HEAD_START,
-                since: ended,
-                gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-            }
-        };
-        let mut part = Part::source(curve, reason.to_owned(), digest.newest.0.to_string());
-        let spoke = unix(facts.last_user_message_at.0 as i64);
-        if facts.last_user_message_at.0 > 0 {
+        // The newest unread is where the card's source last moved.
+        let cursor = digest.unread.last().map_or(0, |newest| newest.pos.0);
+        let mut part = Part::source(curve, reason.to_owned(), cursor.to_string());
+        let spoke = unix(digest.last_user_message_at.0 as i64);
+        if digest.last_user_message_at.0 > 0 {
             part.bonus = curve::recency_bonus(spoke, at);
-            if ended.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
+            if since.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
                 part.breaks_snooze_set_by = Some(spoke);
             }
         }
@@ -413,9 +360,7 @@ fn rank_into(
     // The user's own dates (T1–T6, N2), on any node.
     for (node, held) in marks.nodes() {
         let facts = held.facts();
-        if let Some(todo) = facts.todo()
-            && !running.contains(node)
-        {
+        if let Some(todo) = facts.todo() {
             parts.entry(node.clone()).or_default().push(Part::dated(
                 Curve::Plate { since: todo.start },
                 format!("todo {}", todo.set.timestamp().as_millisecond()),

@@ -99,13 +99,15 @@ fn request_input(request: agent::Request) -> Request {
         .into_iter()
         .flat_map(|item| match item {
             agent::Item::Step { carry, exec } => {
-                // Interrupted execution records only the code actually admitted.
-                // The provider-start payload still owns the original call identity.
+                // Interrupted execution records only the code actually
+                // admitted. The provider-start payload still
+                // owns the original call identity.
                 let mut carry = carry;
                 if let Some(code) = exec
                     && super::replay(&carry).pending_exec
                 {
-                    // A stream-start carry contains exactly its one unfinished call.
+                    // A stream-start carry contains exactly its one unfinished
+                    // call.
                     let mut data: serde_json::Value =
                         serde_json::from_str(carry.data().get()).expect("stream-start carry");
                     data["items"][0]["input"] = code.into();
@@ -171,7 +173,8 @@ mod tests {
             ],
             true,
         );
-        // Historical Entry.exec is the first display call, not the last retained call.
+        // Historical Entry.exec is the first display call, not the last
+        // retained call.
         let request = request_input(agent::Request::new(
             "system".into(),
             vec![

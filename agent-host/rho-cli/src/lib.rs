@@ -39,8 +39,10 @@ pub fn main() -> Result<()> {
             },
         );
     }
-    if let Command::Wayland(args) = args.command {
-        return wayland::run(args);
+    match args.command {
+        Command::Auth(auth) => return run_auth_cli(auth),
+        Command::Wayland(args) => return wayland::run(args),
+        _ => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -51,10 +53,7 @@ pub fn main() -> Result<()> {
 
 async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Auth(auth) => {
-            run_auth_cli(auth)?;
-            Ok(())
-        }
+        Command::Auth(_) => unreachable!("auth runs before the shared async runtime"),
         Command::ClaudeAccount(args) => run_claude_account(args).await,
         Command::Debug(args) => {
             rho_agent_host::debug::run(args).await?;

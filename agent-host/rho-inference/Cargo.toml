@@ -9,18 +9,22 @@ rust-version.workspace = true
 [dependencies]
 # unprefixed_malloc routes CPython and other C allocations through jemalloc
 # too; glibc keeps freed memory in per-thread arenas instead of returning it.
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+# Profiling samples allocations from the start, so SIGUSR1 can dump the heap.
+tikv-jemallocator = { version = "0.7", features = [
+  "profiling",
+  "unprefixed_malloc_on_supported_platforms",
+] }
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
 clap.workspace = true
 dirs.workspace = true
 fnv.workspace = true
+jiff.workspace = true
 notify.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true
-rpassword.workspace = true
 rho-agent-types.workspace = true
 rho-agent.workspace = true
 rho-web-search.workspace = true

@@ -45,6 +45,11 @@ impl Import {
 		self.track.track().demand()
 	}
 
+	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> crate::Result<()> {
+		self.track.flush(timestamp, now)
+	}
+
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.track.finish()?;
@@ -63,6 +68,11 @@ impl Import {
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
 		Ok(())
+	}
+
+	/// Mark a timeline break and restart measurement without lowering advertised values.
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()
 	}
 
 	/// Close the current group and open the next one at `sequence`.

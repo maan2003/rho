@@ -76,9 +76,8 @@ fn main() -> Result<()> {
             if let Some(status)=agent_host.0.try_wait()? { anyhow::bail!("agent host exited: {status}"); }
             let text=std::fs::read_to_string(&log)?;
             let endpoint=text.lines().find_map(|line|line.strip_prefix("rho-agent-host iroh endpoint: ")).map(str::to_owned);
-            if let Some(endpoint)=endpoint {
-                if let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
-            }
+            if let Some(endpoint)=endpoint
+                && let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
             ensure!(tokio::time::Instant::now()<deadline,"agent host startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -92,7 +91,8 @@ fn main() -> Result<()> {
             content:None,
         }).await.context("agent creation failed")?;
         let desktop_name = "preview".to_owned();
-        let desktop_directory = runtime.join("rho-desktop/agents").join(agent.encoded());
+        let handle = rho_agent_types::AgentRole::default().full_handle(agent);
+        let desktop_directory = runtime.join("rho-desktop/agents").join(&handle);
         let desktop_program=std::env::var_os("RHO_AGENT_DESKTOP_BIN").map(PathBuf::from)
             .unwrap_or_else(||PathBuf::from("rho-agent-desktop"));
         let config=temp.path().join("desktop.kdl");
@@ -104,7 +104,7 @@ layout { background-color "#315b97"; }
 
         let desktop_log=temp.path().join("desktop.log");
         let mut desktop=Child(Command::new(&desktop_program)
-            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1").env("RHO_AGENT_ID",agent.encoded())
+            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1").env("RHO_AGENT_ID",&handle)
             .args(["--headless","--name",&desktop_name,"--width","640","--height","480","--scale","1","--config"])
             .arg(&config).stdout(Stdio::null()).stderr(std::fs::File::create(&desktop_log)?).spawn()?);
         let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
@@ -115,12 +115,8 @@ layout { background-color "#315b97"; }
         }
         let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(desktop_directory.join(format!("{desktop_name}.json")))?)?;
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                { let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
-                    ensure!(sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
-                    break;
-                }
-            }
+            let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
+            ensure!(sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
             Ok::<_,anyhow::Error>(())
         }).await??;
         let mut status=tokio::io::BufReader::new(rho_desktop_proto::local::connect(descriptor["socket"].as_str().unwrap()).await?);
@@ -149,7 +145,8 @@ layout { background-color "#315b97"; }
         let result=tokio::time::timeout(Duration::from_secs(10),async {
             let mut group=video.next_group().await?.context("no video group")?;
             let packet=group.read_frame().await?.context("no frame")?;
-            let image=rho_desktop_media::codec::Decoder::new()?.decode(&packet.payload)?.context("no decoded image")?;
+            let (_,payload)=rho_desktop_media::Header::unpack(packet.payload)?;
+            let image=rho_desktop_media::codec::Decoder::new()?.decode(&payload)?.context("no decoded image")?;
             ensure!((image.width,image.height)==(640,480),"wrong image size");
             for (got,want) in image.bgra[..4].iter().zip([0x97u8,0x5b,0x31,255]) {
                 ensure!((*got as i16-want as i16).abs()<12,"wrong decoded pixel");
@@ -185,7 +182,8 @@ layout { background-color "#315b97"; }
         tokio::time::timeout(Duration::from_secs(5),async {
             let mut group=video2.next_group().await?.context("late viewer has no keyframe group")?;
             let packet=group.read_frame().await?.context("late viewer has no frame")?;
-            let image=rho_desktop_media::codec::Decoder::new()?.decode(&packet.payload)?.context("late viewer decode")?;
+            let (_,payload)=rho_desktop_media::Header::unpack(packet.payload)?;
+            let image=rho_desktop_media::codec::Decoder::new()?.decode(&payload)?.context("late viewer decode")?;
             ensure!((image.width,image.height)==(640,480),"late viewer wrong dimensions");
             Ok::<_,anyhow::Error>(())
         }).await??;
@@ -212,7 +210,7 @@ layout { background-color "#315b97"; }
         // A second named desktop is advertised, then excluded after a crash
         // even though SIGKILL leaves its manifest behind.
         let mut second = Child(Command::new(&desktop_program)
-            .env("XDG_RUNTIME_DIR", &runtime).env("RHO_AGENT_ID", agent.encoded())
+            .env("XDG_RUNTIME_DIR", &runtime).env("RHO_AGENT_ID", &handle)
             .args(["--headless", "--name", "browser", "--width", "128", "--height", "96", "--scale", "1", "--config"])
             .arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         tokio::time::timeout(Duration::from_secs(5), async {

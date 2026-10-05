@@ -25,7 +25,6 @@ native = [
     "dep:fs",
     "dep:fuzzy",
     "dep:git",
-    "dep:lsp",
     "dep:markdown",
     "dep:menu",
     "dep:project",
@@ -80,9 +79,10 @@ indoc.workspace = true
 edit_prediction_types = { workspace = true, optional = true }
 itertools.workspace = true
 language.workspace = true
+language_detection.workspace = true
 linkify.workspace = true
 log.workspace = true
-lsp = { workspace = true, optional = true }
+lsp.workspace = true
 markdown = { workspace = true, optional = true }
 menu = { workspace = true, optional = true }
 multi_buffer.workspace = true
@@ -106,7 +106,6 @@ sum_tree.workspace = true
 task = { workspace = true, optional = true }
 telemetry = { workspace = true, optional = true }
 text.workspace = true
-time.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 tree-sitter-c = { workspace = true, optional = true }
@@ -115,7 +114,6 @@ tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
 ztracing.workspace = true
-tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-script.workspace = true
 unindent = { workspace = true, optional = true }

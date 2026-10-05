@@ -65,8 +65,6 @@ impl Services {
     }
 
     pub(crate) async fn worker_failed(&self, error: String) {
-        use rho_agent_types::{TurnEdge, TurnOutcome};
-
         use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             runtime: crate::RuntimeState {
@@ -80,22 +78,19 @@ impl Services {
         // The supervisor knows the process ended, not which unrecorded Python
         // statements ran. Record only that coarse lifecycle fact.
         let mut write = self.db.write().await;
-        write.tell_turn(
-            rho_agent_types::UnixMs::now(),
+        write.append_agent_event(
             self.agent,
-            TurnEdge::Ended(TurnOutcome::Errored { message: error }),
+            &crate::AgentEvent::Entry(crate::entry::Entry::Notice {
+                at: rho_agent_types::UnixMs::now(),
+                notice: crate::entry::Notice::Stopped(error),
+            }),
         );
         write.commit();
+        self.status.send_replace(status);
         if let Some(pool) = self.pool.upgrade() {
             pool.settle_turn(self.agent).await;
-            crate::journal::tell_status(
-                &self.db,
-                self.agent,
-                Arc::new(status.clone()),
-                Some(Arc::from([])),
-            );
+            pool.status_changed(self.agent, &self.status);
         }
-        self.status.send_replace(status);
     }
 
     pub(crate) async fn publish_failure(&self, error: String) {
@@ -177,24 +172,15 @@ impl Services {
                                 }
                                 continue;
                             }
-                            Message::Status { mut status, queue } => {
+                            // The worker sends a status only once the rows it
+                            // reflects are committed, so a client that sends
+                            // rows before statuses never shows one ahead of them.
+                            Message::Status { mut status, queue: _ } => {
                                 status.runtime.stale = self.stale;
-                                // Only focused clients receive the response body. Avoid
-                                // cloning its growing text for an unfocused publication.
-                                let snapshot = if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    status.clone()
-                                } else {
-                                    crate::AgentStatus {
-                                        runtime: status.runtime.clone(),
-                                        response: None,
-                                        draft: None,
-                                        queued: status.queued,
-                                    }
-                                };
-                                crate::journal::tell_status(
-                                    &self.db, self.agent, Arc::new(snapshot), queue.map(Arc::from),
-                                );
                                 self.status.send_replace(status);
+                                if let Some(pool) = self.pool.upgrade() {
+                                    pool.status_changed(self.agent, &self.status);
+                                }
                                 continue;
                             }
                             Message::Request { id, body } => (id, body),
@@ -470,12 +456,6 @@ impl Services {
             }
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
             Request::UsageTotal => Reply::Usage(self.db.read().agent_usage_total(self.agent)),
-            Request::Turn { at, edge } => {
-                let mut write = self.db.write().await;
-                write.tell_turn(at, self.agent, edge);
-                write.commit();
-                Reply::Done
-            }
         };
         Ok(reply)
     }
@@ -512,9 +492,12 @@ mod tests {
         for _ in 0..3 {
             write.append_agent_event(
                 agent,
-                &AgentEvent::Entry(crate::entry::Entry::Status {
-                    text: "x".repeat(700_000),
+                &AgentEvent::Entry(crate::entry::Entry::Sent {
                     at: UnixMs(2),
+                    id: crate::entry::MessageId::new(),
+                    to: crate::entry::Party::Human,
+                    text: "x".repeat(700_000),
+                    kind: rho_agent_types::SendKind::Status,
                 }),
             );
         }
@@ -562,7 +545,7 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert!(
             entries.iter().all(|entry| matches!(
-                entry, crate::entry::Entry::Status { text, .. } if text.len() == 700_000
+                entry, crate::entry::Entry::Sent { text, .. } if text.len() == 700_000
             )),
             "all native history frames must reach the caller"
         );

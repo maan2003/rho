@@ -1,13 +1,15 @@
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
-    Capslock, DispatchEventResult, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, point, px,
+    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
+    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+    point, px,
 };
 use wasm_bindgen::prelude::*;
 
+use crate::ime_mirror::ImeMirror;
 use crate::window::WebWindowInner;
 
 pub struct WebEventListeners {
@@ -89,46 +91,28 @@ pub(crate) struct ClickState {
     current_count: usize,
 }
 
-/// An in-progress touch gesture. Touch pointers must not drive the mouse-drag
-/// path: a finger drag means scrolling, not text selection. The gesture stays
-/// undecided until the finger moves past a slop radius; a release before that
-/// is a tap and synthesizes a click.
-pub(crate) struct TouchDrag {
-    start: Point<Pixels>,
-    last: Point<Pixels>,
-    /// Smoothed finger velocity in px/ms, used to seed a fling on release.
-    velocity: (f32, f32),
-    last_time: f64,
-    scrolling: bool,
+#[derive(Default)]
+pub(crate) struct TouchIds {
+    next: u64,
+    active: HashMap<i32, TouchId>,
 }
 
-/// Momentum scrolling after a touch scroll release, decayed and dispatched
-/// once per animation frame by [`WebWindowInner::process_fling`].
-pub(crate) struct Fling {
-    position: Point<Pixels>,
-    /// px/ms
-    velocity: (f32, f32),
-    last_time: f64,
-}
+impl TouchIds {
+    fn start(&mut self, pointer_id: i32) -> Option<TouchId> {
+        let next = self.next.checked_add(1)?;
+        let touch_id = TouchId(self.next);
+        self.next = next;
+        self.active.insert(pointer_id, touch_id);
+        Some(touch_id)
+    }
 
-/// Movement under this many pixels is still a tap; past it the gesture
-/// becomes a scroll. Matches typical browser/platform touch slop.
-const TOUCH_SLOP: f32 = 8.0;
+    fn active(&self, pointer_id: i32) -> Option<TouchId> {
+        self.active.get(&pointer_id).copied()
+    }
 
-/// Exponential fling decay time constant in ms; roughly matches platform
-/// scroll-view momentum feel.
-const FLING_DECAY_MS: f64 = 325.0;
-
-/// Flings slower than this (px/ms) stop; releases slower than this don't
-/// start one.
-const FLING_MIN_VELOCITY: f32 = 0.05;
-
-fn is_touch(event: &web_sys::PointerEvent) -> bool {
-    event.pointer_type() == "touch"
-}
-
-fn distance(a: Point<Pixels>, b: Point<Pixels>) -> f32 {
-    (f32::from(a.x) - f32::from(b.x)).hypot(f32::from(a.y) - f32::from(b.y))
+    fn end(&mut self, pointer_id: i32) -> Option<TouchId> {
+        self.active.remove(&pointer_id)
+    }
 }
 
 impl Default for ClickState {
@@ -165,6 +149,7 @@ impl WebWindowInner {
             self.register_pointer_down(),
             self.register_pointer_up(),
             self.register_pointer_cancel(),
+            self.register_touch_end(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -173,6 +158,8 @@ impl WebWindowInner {
             self.register_drop(),
             self.register_key_down(),
             self.register_key_up(),
+            self.register_before_input(),
+            self.register_input(),
             self.register_paste(),
             self.register_composition_start(),
             self.register_composition_update(),
@@ -181,11 +168,31 @@ impl WebWindowInner {
             self.register_blur(),
             self.register_pointer_enter(),
         ];
+        handles.extend(self.register_selection_change());
         handles.extend(self.register_visibility_change());
         handles.extend(self.register_appearance_change());
         handles.extend(self.register_fullscreen_change());
+        handles.extend(self.register_viewport_changes());
 
         WebEventListeners { _handles: handles }
+    }
+
+    fn register_viewport_changes(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+        let mut targets: Vec<web_sys::EventTarget> = vec![self.browser_window.clone().into()];
+        if let Some(viewport) = self.browser_window.visual_viewport() {
+            targets.push(viewport.into());
+        }
+        targets
+            .into_iter()
+            .flat_map(|target| {
+                ["resize", "scroll"].map(|event_name| {
+                    let this = Rc::clone(self);
+                    EventListenerHandle::add(&target, event_name, move |_| {
+                        this.notify_viewport_changed()
+                    })
+                })
+            })
+            .collect()
     }
 
     fn listen(
@@ -196,15 +203,12 @@ impl WebWindowInner {
         EventListenerHandle::add(self.canvas.as_ref(), event_name, handler)
     }
 
-    /// Listens on the container of the two hidden inputs, so the handler
-    /// fires no matter which of them holds focus. Only bubbling events work
-    /// here (`focus`/`blur` do not; use `focusin`/`focusout`).
     fn listen_input(
         self: &Rc<Self>,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
-        EventListenerHandle::add(self.input_container.as_ref(), event_name, handler)
+        EventListenerHandle::add(self.ime_mirror.event_target(), event_name, handler)
     }
 
     fn listen_non_passive(
@@ -235,13 +239,11 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
-            // Keep DOM focus on the hidden inputs so hardware keys and IME
-            // reach us, but don't yank it off the keyboard-bearing input:
-            // that would dismiss the touch keyboard on every tap. pointerup
-            // re-decides which input should hold focus.
-            if !this.keyboard_input_focused() {
-                this.input_element.focus().ok();
-            }
+
+            let pointer_type = event.pointer_type();
+            let position = pointer_position_in_element(&event);
+            this.gesture_start_visual_viewport_height
+                .set(this.visual_viewport_height());
 
             // Capture the pointer so drags that leave the canvas keep
             // delivering pointermove/pointerup here; otherwise a release
@@ -249,117 +251,14 @@ impl WebWindowInner {
             // stuck. The capture is released implicitly on pointerup.
             this.canvas.set_pointer_capture(event.pointer_id()).ok();
 
-            let button = dom_mouse_button_to_gpui(event.button());
-            let position = pointer_position_in_element(&event);
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
-            let time = js_sys::Date::now();
-
-            {
-                let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
-                current_state.modifiers = modifiers;
-            }
-
-            // Any new pointer contact stops an in-flight momentum scroll,
-            // like catching a scrolling list with a finger.
-            this.fling.borrow_mut().take();
-
-            if is_touch(&event)
+            if pointer_type == "touch"
                 && this
                     .direct_touch_region
                     .get()
                     .is_some_and(|bounds| bounds.contains(&position))
             {
                 this.direct_touches.borrow_mut().insert(event.pointer_id());
-                let click_count = this.click_state.borrow_mut().register_click(position, time);
-                this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Left,
-                    position,
-                    modifiers,
-                    click_count,
-                    first_mouse: false,
-                }));
-                return;
-            }
-
-            // A touch gesture is undecided at this point: it may become a
-            // scroll or a tap. Dispatching MouseDown now would start a text
-            // selection drag, so the decision is deferred to pointermove
-            // (scroll) or pointerup (tap click).
-            if is_touch(&event) {
-                *this.touch_drag.borrow_mut() = Some(TouchDrag {
-                    start: position,
-                    last: position,
-                    velocity: (0.0, 0.0),
-                    last_time: time,
-                    scrolling: false,
-                });
-                return;
-            }
-
-            this.pressed_button.set(Some(button));
-            let click_count = this.click_state.borrow_mut().register_click(position, time);
-
-            this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
-                button,
-                position,
-                modifiers,
-                click_count,
-                first_mouse: false,
-            }));
-        })
-    }
-
-    fn register_pointer_up(self: &Rc<Self>) -> EventListenerHandle {
-        let this = Rc::clone(self);
-        self.listen("pointerup", move |event: JsValue| {
-            let event: web_sys::PointerEvent = event.unchecked_into();
-            event.prevent_default();
-
-            let button = dom_mouse_button_to_gpui(event.button());
-            let position = pointer_position_in_element(&event);
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
-
-            {
-                let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
-                current_state.modifiers = modifiers;
-            }
-
-            if is_touch(&event) {
-                if this.direct_touches.borrow_mut().remove(&event.pointer_id()) {
-                    let click_count = this.click_state.borrow().current_count;
-                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers,
-                        click_count,
-                    }));
-                    return;
-                }
-                let Some(drag) = this.touch_drag.borrow_mut().take() else {
-                    return;
-                };
-                if drag.scrolling {
-                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
-                        modifiers,
-                        touch_phase: TouchPhase::Ended,
-                    }));
-                    if drag.velocity.0.hypot(drag.velocity.1) > FLING_MIN_VELOCITY {
-                        *this.fling.borrow_mut() = Some(Fling {
-                            position,
-                            velocity: drag.velocity,
-                            last_time: js_sys::Date::now(),
-                        });
-                    }
-                    // A scroll is not a click; also skip the keyboard raise
-                    // below so scrolling a transcript never pops the
-                    // keyboard.
-                    return;
-                }
-                // Tap: deliver the deferred press and release as one click.
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 let click_count = this
                     .click_state
                     .borrow_mut()
@@ -371,41 +270,336 @@ impl WebWindowInner {
                     click_count,
                     first_mouse: false,
                 }));
-                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position,
-                    modifiers,
-                    click_count,
-                }));
-            } else {
-                this.pressed_button.set(None);
-                let click_count = this.click_state.borrow().current_count;
-
-                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                    button,
-                    position,
-                    modifiers,
-                    click_count,
-                }));
+                return;
             }
+
+            if pointer_type == "touch" {
+                // Android can reopen a manually dismissed keyboard on the
+                // next touch even without another focus() call. Disarm the
+                // still-focused mirror before the browser handles that
+                // gesture; only an editable tap may enable its keyboard again.
+                if this.keyboard_likely_dismissed() {
+                    this.ime_mirror.set_virtual_keyboard_enabled(false);
+                }
+                let Some(touch_id) = this.touch_ids.borrow_mut().start(event.pointer_id()) else {
+                    log::error!("exhausted touch identifiers");
+                    return;
+                };
+                this.state.borrow_mut().mouse_position = position;
+                if this.touch_tap_candidate.get().is_none() {
+                    this.touch_tap_candidate
+                        .set(Some((event.pointer_id(), position)));
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Started,
+                    position,
+                    predicted_position: None,
+                    force: None,
+                    serial: None,
+                    timestamp: std::time::Duration::from_secs_f64(event.time_stamp() / 1000.0),
+                }));
+                // Keyboard and IME focus intentionally do not change here:
+                // whether this touch is a tap or a pan is only known at
+                // release, and only a tap may affect them (see
+                // `touch_tap_candidate`). The release handler still runs
+                // within a user gesture, as keyboard summoning requires.
+                return;
+            }
+
+            let button = dom_mouse_button_to_gpui(event.button());
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            let time = js_sys::Date::now();
+
+            this.pressed_button.set(Some(button));
+            let click_count = this.click_state.borrow_mut().register_click(position, time);
+
+            {
+                let mut current_state = this.state.borrow_mut();
+                current_state.mouse_position = position;
+                current_state.modifiers = modifiers;
+            }
+
+            this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count,
+                first_mouse: false,
+            }));
+
+            this.ime_mirror.focus();
         })
     }
 
+    fn pointer_targets_text_input(&self, position: Point<Pixels>) -> bool {
+        self.with_input_handler(|handler| {
+            handler.query_accepts_text_input()
+                && handler
+                    .element_bounds()
+                    .is_some_and(|bounds| bounds.contains(&position))
+        })
+        .unwrap_or(false)
+    }
+
+    fn register_pointer_up(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("pointerup", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            event.prevent_default();
+
+            let position = pointer_position_in_element(&event);
+
+            if this.direct_touches.borrow_mut().remove(&event.pointer_id()) {
+                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: pointer_position_in_element(&event),
+                    modifiers: modifiers_from_mouse_event(&event, this.is_mac),
+                    click_count: this.click_state.borrow().current_count,
+                }));
+                return;
+            }
+            if event.pointer_type() == "touch" {
+                let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
+                    return;
+                };
+                this.state.borrow_mut().mouse_position = position;
+                let completes_tap = match this.touch_tap_candidate.get() {
+                    Some((pointer_id, _)) if pointer_id == event.pointer_id() => {
+                        this.touch_tap_candidate.set(None);
+                        true
+                    }
+                    _ => false,
+                };
+                // A recognized tap is dispatched synchronously inside this
+                // call, so the text-input check below sees the state the tap
+                // produced.
+                let dispatch_result = this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Ended,
+                    position,
+                    predicted_position: None,
+                    force: None,
+                    serial: None,
+                    timestamp: std::time::Duration::from_secs_f64(event.time_stamp() / 1000.0),
+                }));
+
+                // A keyboard opening or closing mid-gesture reflows the
+                // layout, so the release position no longer refers to the
+                // content the user aimed at. Do not summon the keyboard
+                // from that stale position, or from pans and flings.
+                let viewport_stable = this.gesture_start_visual_viewport_height.get()
+                    == this.visual_viewport_height();
+                // A consumed tap may navigate to an editor under this same
+                // coordinate. Do not reinterpret that navigation as editing.
+                // Controls that intend typing can explicitly request a keyboard.
+                if completes_tap
+                    && viewport_stable
+                    && dispatch_result.is_some_and(|result| !result.default_prevented)
+                    && this.pointer_targets_text_input(position)
+                {
+                    this.show_virtual_keyboard();
+                }
+                this.schedule_ime_mirror_sync();
+                return;
+            }
+
+            let button = dom_mouse_button_to_gpui(event.button());
+            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+
+            this.pressed_button.set(None);
+            let click_count = this.click_state.borrow().current_count;
+
+            {
+                let mut current_state = this.state.borrow_mut();
+                current_state.mouse_position = position;
+                current_state.modifiers = modifiers;
+            }
+
+            this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count,
+            }));
+
+            this.schedule_ime_mirror_sync();
+        })
+    }
+
+    /// The visual viewport's current height in layout pixels, or zero when
+    /// the API is unavailable.
+    fn visual_viewport_height(&self) -> f64 {
+        self.browser_window
+            .visual_viewport()
+            .map_or(0.0, |viewport| viewport.height() * viewport.scale())
+    }
+
+    /// Infers dismissal only when the visual viewport fills the layout viewport.
+    ///
+    /// This fallback requires `interactive-widget=resizes-visual` (the modern
+    /// browser default). It deliberately makes no inference while zoomed, or
+    /// when the host opts into another resize policy. Floating keyboards can
+    /// still overlay both viewports; this is not authoritative keyboard state.
+    fn keyboard_likely_dismissed(&self) -> bool {
+        if !self.touch_input {
+            return false;
+        }
+        let Some(viewport) = self.browser_window.visual_viewport() else {
+            return false;
+        };
+        let Some(document) = self.browser_window.document() else {
+            return false;
+        };
+        if let Ok(Some(meta)) = document.query_selector("meta[name=viewport]")
+            && let Some(content) = meta.get_attribute("content")
+            && content.split(',').any(|directive| {
+                directive.split_once('=').is_some_and(|(key, value)| {
+                    key.trim().eq_ignore_ascii_case("interactive-widget")
+                        && !value.trim().eq_ignore_ascii_case("resizes-visual")
+                })
+            })
+        {
+            return false;
+        }
+        let Some(root) = document.document_element() else {
+            return false;
+        };
+        (viewport.scale() - 1.).abs() < 0.001
+            && viewport.offset_top().abs() < 1.
+            && viewport.offset_left().abs() < 1.
+            && (viewport.height() - root.client_height() as f64).abs() < 1.
+            && (viewport.width() - root.client_width() as f64).abs() < 1.
+    }
+
+    /// The browser or OS took over the pointer (native scrolling, a system
+    /// gesture, the pointer being removed): no pointerup will follow, so the
+    /// gesture must unwind rather than complete.
     fn register_pointer_cancel(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             if this.direct_touches.borrow_mut().remove(&event.pointer_id()) {
-                let position = pointer_position_in_element(&event);
-                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                     button: MouseButton::Left,
-                    position,
-                    modifiers,
+                    position: pointer_position_in_element(&event),
+                    modifiers: modifiers_from_mouse_event(&event, this.is_mac),
                     click_count: this.click_state.borrow().current_count,
                 }));
+                return;
+            }
+            if event.pointer_type() == "touch" {
+                let Some(touch_id) = this.touch_ids.borrow_mut().end(event.pointer_id()) else {
+                    return;
+                };
+                if let Some((pointer_id, _)) = this.touch_tap_candidate.get()
+                    && pointer_id == event.pointer_id()
+                {
+                    this.touch_tap_candidate.set(None);
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Cancelled,
+                    position: pointer_position_in_element(&event),
+                    predicted_position: None,
+                    force: None,
+                    serial: None,
+                    timestamp: std::time::Duration::from_secs_f64(event.time_stamp() / 1000.0),
+                }));
+            } else {
+                this.pressed_button.set(None);
             }
         })
+    }
+
+    /// Cancels touch default handling separately because iOS does not consistently
+    /// transfer pointer-event cancellation to the corresponding touch event.
+    /// During native scrolling, touchend may be non-cancelable.
+    fn register_touch_end(self: &Rc<Self>) -> EventListenerHandle {
+        self.listen_non_passive("touchend", move |event: JsValue| {
+            let event: web_sys::Event = event.unchecked_into();
+            if event.cancelable() {
+                event.prevent_default();
+            }
+        })
+    }
+
+    /// See [`ImeMirror::schedule_sync`].
+    fn schedule_ime_mirror_sync(self: &Rc<Self>) {
+        ImeMirror::schedule_sync(self);
+    }
+
+    /// Aligns the software keyboard with the text input targeted by a touch tap.
+    ///
+    /// Mobile browsers show the keyboard only when an editable element is
+    /// focused from within a user gesture, so this runs while the tap's
+    /// `pointerup` is still on the stack (by which point GPUI has usually
+    /// painted a frame since the `MouseDown`, so the input handler reflects
+    /// the tap's focus change). This also handles an editable tap after manual
+    /// dismissal, when editability stayed true and no focus transition fires.
+    ///
+    /// We don't use `navigator.virtualKeyboard` here because it's
+    /// Chromium-only.
+    pub(crate) fn show_virtual_keyboard(self: &Rc<Self>) {
+        if !self.touch_input {
+            return;
+        }
+        let was_enabled = self.ime_mirror.virtual_keyboard_enabled();
+        self.ime_mirror.set_virtual_keyboard_enabled(true);
+        // Trigger a focus event only when the keyboard actually needs
+        // summoning. Cycling focus on every tap would restart the IME
+        // connection right as the keyboard reads the tapped caret's context,
+        // racing its word segmentation. But `focus()` on an already-focused
+        // element is a no-op, so a dismissed keyboard would otherwise never
+        // return for taps that stay within editable content: detect that
+        // through the visual viewport and force a fresh focus event.
+        if was_enabled && (!self.ime_mirror.is_focused() || self.keyboard_likely_dismissed()) {
+            // A same-task blur/focus cycle may be coalesced by iOS, but
+            // this branch only runs when the keyboard is already gone,
+            // so a coalesced cycle loses nothing.
+            self.focus_ime_mirror();
+        }
+    }
+
+    /// Restarts DOM input without synchronously re-entering GPUI activation.
+    pub(crate) fn focus_ime_mirror(self: &Rc<Self>) {
+        self.suppress_focus_status_events.set(true);
+        if self.ime_mirror.is_focused() {
+            self.ime_mirror.blur();
+        }
+        self.ime_mirror.focus();
+        self.suppress_focus_status_events.set(false);
+
+        let callback = wasm_bindgen::closure::Closure::once_into_js({
+            let this = Rc::clone(self);
+            move || {
+                this.refresh_active_status();
+            }
+        });
+        if let Err(error) = self
+            .browser_window
+            .set_timeout_with_callback(callback.unchecked_ref())
+        {
+            log::warn!("failed to defer web window activation: {error:?}");
+        }
+    }
+
+    /// Dispatches a full key press for editing intents that arrive without a
+    /// usable key event (Android IMEs send `key: "Unidentified"` placeholders
+    /// and express backspace/enter through `beforeinput` instead), so they
+    /// run through the same keybinding path as hardware keys.
+    fn dispatch_synthetic_keystroke(&self, key: &str, modifiers: Modifiers) {
+        let keystroke = Keystroke {
+            modifiers,
+            key: key.to_string(),
+            key_char: None,
+        };
+        self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        }));
+        self.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
     }
 
     fn register_pointer_move(self: &Rc<Self>) -> EventListenerHandle {
@@ -415,6 +609,40 @@ impl WebWindowInner {
             event.prevent_default();
 
             let position = pointer_position_in_element(&event);
+
+            if this.direct_touches.borrow().contains(&event.pointer_id()) {
+                return;
+            }
+            if event.pointer_type() == "touch" {
+                let Some(touch_id) = this.touch_ids.borrow().active(event.pointer_id()) else {
+                    return;
+                };
+                this.state.borrow_mut().mouse_position = position;
+                // Mirror the slop rule of gpui's tap recognizer: once the
+                // touch travels beyond it, its release must not affect the
+                // keyboard. Only gpui knows what the gesture truly resolved
+                // to; this platform-side shadow exists because the keyboard
+                // decision must be made synchronously inside the browser's
+                // pointerup handler.
+                if let Some((pointer_id, start_position)) = this.touch_tap_candidate.get()
+                    && pointer_id == event.pointer_id()
+                    && (position - start_position).magnitude()
+                        > f64::from(GestureTuning::default().touch_slop)
+                {
+                    this.touch_tap_candidate.set(None);
+                }
+                this.dispatch_input(PlatformInput::Touch(TouchEvent {
+                    id: touch_id,
+                    phase: TouchPhase::Moved,
+                    position,
+                    predicted_position: predicted_pointer_position(&event, position),
+                    force: None,
+                    serial: None,
+                    timestamp: std::time::Duration::from_secs_f64(event.time_stamp() / 1000.0),
+                }));
+                return;
+            }
+
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
             let current_pressed = this.pressed_button.get();
 
@@ -422,50 +650,6 @@ impl WebWindowInner {
                 let mut current_state = this.state.borrow_mut();
                 current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
-            }
-
-            // Touch movement scrolls instead of hovering/dragging. MouseMove
-            // is suppressed entirely: a finger has no hover state, and
-            // synthetic hover would flash hover styles mid-scroll.
-            if is_touch(&event) {
-                if this.direct_touches.borrow().contains(&event.pointer_id()) {
-                    return;
-                }
-                let scroll = {
-                    let mut drag_slot = this.touch_drag.borrow_mut();
-                    let Some(drag) = drag_slot.as_mut() else {
-                        return;
-                    };
-                    let time = js_sys::Date::now();
-                    let delta = point(position.x - drag.last.x, position.y - drag.last.y);
-                    let elapsed = (time - drag.last_time).max(1.0) as f32;
-                    let instant = (f32::from(delta.x) / elapsed, f32::from(delta.y) / elapsed);
-                    // Weighted toward the newest sample so the fling picks up
-                    // the release-time velocity, not the whole gesture's mean.
-                    drag.velocity = (
-                        0.7 * instant.0 + 0.3 * drag.velocity.0,
-                        0.7 * instant.1 + 0.3 * drag.velocity.1,
-                    );
-                    drag.last = position;
-                    drag.last_time = time;
-                    if !drag.scrolling && distance(position, drag.start) > TOUCH_SLOP {
-                        drag.scrolling = true;
-                        Some((delta, TouchPhase::Started))
-                    } else if drag.scrolling {
-                        Some((delta, TouchPhase::Moved))
-                    } else {
-                        None
-                    }
-                };
-                if let Some((delta, touch_phase)) = scroll {
-                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(delta),
-                        modifiers,
-                        touch_phase,
-                    }));
-                }
-                return;
             }
 
             this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
@@ -476,43 +660,10 @@ impl WebWindowInner {
         })
     }
 
-    /// Applies one animation-frame step of touch momentum scrolling, if any.
-    /// Called from the RAF tick so decay follows real frame timing.
-    pub(crate) fn process_fling(&self) {
-        let step = {
-            let mut fling_slot = self.fling.borrow_mut();
-            let Some(fling) = fling_slot.as_mut() else {
-                return;
-            };
-            let now = js_sys::Date::now();
-            let elapsed = (now - fling.last_time).clamp(0.0, 100.0);
-            fling.last_time = now;
-            let delta = point(
-                px(fling.velocity.0 * elapsed as f32),
-                px(fling.velocity.1 * elapsed as f32),
-            );
-            let decay = (-elapsed / FLING_DECAY_MS).exp() as f32;
-            fling.velocity = (fling.velocity.0 * decay, fling.velocity.1 * decay);
-            let position = fling.position;
-            if fling.velocity.0.hypot(fling.velocity.1) < FLING_MIN_VELOCITY {
-                *fling_slot = None;
-            }
-            (position, delta)
-        };
-        let modifiers = self.state.borrow().modifiers;
-        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: step.0,
-            delta: ScrollDelta::Pixels(step.1),
-            modifiers,
-            touch_phase: TouchPhase::Moved,
-        }));
-    }
-
     fn register_pointer_leave(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerleave", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            this.touch_drag.borrow_mut().take();
 
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
@@ -623,6 +774,20 @@ impl WebWindowInner {
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
 
+            // The software keyboard must edit the mirror itself: cancelling
+            // keydown prevents iOS from updating its autocorrect context and
+            // from delivering the corresponding beforeinput/input events.
+            if this.touch_input
+                && this.ime_mirror.virtual_keyboard_enabled()
+                && this.state.borrow().input_handler.is_some()
+                && !modifiers.platform
+                && !modifiers.control
+                && !modifiers.alt
+                && (key_char.is_some() || matches!(key.as_str(), "backspace" | "delete" | "enter"))
+            {
+                return;
+            }
+
             let keystroke = Keystroke {
                 modifiers,
                 key,
@@ -638,6 +803,7 @@ impl WebWindowInner {
             if let Some(result) = result {
                 if !result.propagate {
                     event.prevent_default();
+                    this.schedule_ime_mirror_sync();
                     return;
                 }
             }
@@ -659,6 +825,7 @@ impl WebWindowInner {
                 // through so browser shortcuts keep their defaults.
                 event.prevent_default();
             }
+            this.schedule_ime_mirror_sync();
         })
     }
 
@@ -700,11 +867,241 @@ impl WebWindowInner {
         })
     }
 
+    /// Imports IME edits from the hidden input into the app.
+    ///
+    /// Text-editing `beforeinput` events are deliberately left uncancelled,
+    /// so the browser applies them to the mirror element exactly as the IME
+    /// expects (cancelling them and echoing the edit back programmatically
+    /// restarts the IME connection on every keystroke, which desynchronizes
+    /// the keyboard's internal state — e.g. Gboard then swallows backspaces
+    /// against a stale private buffer). The resulting `input` event is
+    /// diffed against the last known mirror text; IME edits are contiguous,
+    /// so a common prefix/suffix diff recovers them exactly.
+    ///
+    /// The diff supplies only the *shape* of the edit — how many UTF-16
+    /// units were removed before/after the element's pre-edit selection and
+    /// what text replaced them. It never supplies document coordinates:
+    /// mirror offsets captured at sync time go stale whenever the document
+    /// changes underneath (this is a live collaborative document). The
+    /// position comes from `selected_text_range()` queried in this same
+    /// synchronous callback — the editor resolves its selection through
+    /// anchors, so the freshly-fetched offsets are exact, and nothing can
+    /// run between the query and the edit below.
+    fn register_input(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("input", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+
+            // Composition text is delivered through the composition events;
+            // the mirror is reconciled once on compositionend.
+            if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            let new_value = this.ime_mirror.value();
+            let old_value = this.ime_mirror.stored_text();
+            if new_value == old_value {
+                return;
+            }
+
+            let old_units: Vec<u16> = old_value.encode_utf16().collect();
+            let new_units: Vec<u16> = new_value.encode_utf16().collect();
+
+            // A prefix/suffix diff is ambiguous when the inserted text
+            // shares characters with what follows it (inserting "pactor "
+            // before "pact" also reads as inserting "or pact" four units
+            // later). The edit's true position is not ambiguous: the browser
+            // leaves the caret at the end of an IME edit, so the suffix is
+            // anchored as "everything after the post-edit caret", and the
+            // prefix is capped to fit. Greedy matching is only a fallback
+            // for edits where the anchored suffix doesn't verify.
+            let post_edit_caret = this
+                .ime_mirror
+                .selection_start()
+                .map(|caret| caret as usize);
+            let anchored_suffix_length = post_edit_caret
+                .map(|caret| new_units.len().saturating_sub(caret))
+                .filter(|&suffix_length| {
+                    suffix_length <= old_units.len()
+                        && old_units[old_units.len() - suffix_length..]
+                            == new_units[new_units.len() - suffix_length..]
+                });
+            let suffix_length = anchored_suffix_length.unwrap_or_else(|| {
+                old_units
+                    .iter()
+                    .rev()
+                    .zip(new_units.iter().rev())
+                    .take_while(|(old_unit, new_unit)| old_unit == new_unit)
+                    .count()
+            });
+            let prefix_length = old_units
+                .iter()
+                .zip(&new_units)
+                .take_while(|(old_unit, new_unit)| old_unit == new_unit)
+                .count()
+                .min(old_units.len() - suffix_length)
+                .min(new_units.len() - suffix_length);
+
+            let inserted_text = String::from_utf16_lossy(
+                &new_units[prefix_length..new_units.len() - suffix_length],
+            );
+            let replaced_old_end = old_units.len() - suffix_length;
+
+            // The edit's shape relative to the element's pre-edit selection.
+            // The element is private to the IME and these syncs, so the
+            // stored selection is exact.
+            let (element_selection_start, element_selection_end) =
+                this.ime_mirror.stored_selection();
+            let removed_before_selection =
+                (element_selection_start as usize).saturating_sub(prefix_length);
+            let removed_after_selection =
+                replaced_old_end.saturating_sub(element_selection_end as usize);
+
+            let applied = this.with_input_handler(|handler| {
+                let Some(selection) = handler.selected_text_range(false) else {
+                    return false;
+                };
+                let range = selection
+                    .range
+                    .start
+                    .saturating_sub(removed_before_selection)
+                    ..selection.range.end + removed_after_selection;
+                handler.replace_text_in_range(Some(range), &inserted_text);
+                true
+            });
+            if applied != Some(true) {
+                return;
+            }
+
+            this.ime_mirror.adopt_element_state();
+        })
+    }
+
+    /// Imports IME-driven selection moves on the mirror element into the app.
+    ///
+    /// Some IME gestures preview their effect by moving the field's
+    /// selection before committing an edit — Android's slide-on-backspace
+    /// grows a selection over the text it will delete. A native field
+    /// renders that selection itself; this import gives the app the same
+    /// chance. Like edit imports, the move is expressed relative to the
+    /// element's stored selection and applied to the app selection queried
+    /// in the same synchronous callback, never through document coordinates,
+    /// which go stale in a collaborative document.
+    ///
+    /// Self-inflicted events are filtered by state, not by suppression
+    /// flags: `selectionchange` dispatches asynchronously, after the sync or
+    /// import that caused it has already adopted the element's selection, so
+    /// a stored-state match means there is nothing to import.
+    ///
+    /// Registered on the document: Chrome dispatches text-control selection
+    /// changes there, not on the element.
+    fn register_selection_change(self: &Rc<Self>) -> Option<EventListenerHandle> {
+        let document = self.browser_window.document()?;
+        let this = Rc::clone(self);
+        Some(EventListenerHandle::add(
+            document.as_ref(),
+            "selectionchange",
+            move |_event: JsValue| {
+                if this.is_composing.get() || !this.ime_mirror.is_focused() {
+                    return;
+                }
+                // An in-flight edit owns the selection; its import adopts it.
+                if this.ime_mirror.value() != this.ime_mirror.stored_text() {
+                    return;
+                }
+                let Some(element_start) = this.ime_mirror.selection_start() else {
+                    return;
+                };
+                let element_end = this
+                    .ime_mirror
+                    .element_selection_end()
+                    .unwrap_or(element_start);
+                let (stored_start, stored_end) = this.ime_mirror.stored_selection();
+                if (element_start, element_end) == (stored_start, stored_end) {
+                    return;
+                }
+                let applied = this.with_input_handler(|handler| {
+                    let Some(selection) = handler.selected_text_range(false) else {
+                        return false;
+                    };
+                    // The app range corresponding to the stored element
+                    // selection is exactly `selection`; a single consistent
+                    // alignment between the two maps the moved endpoints.
+                    // Disagreeing alignments mean the app selection changed
+                    // underneath and the pending resync owns the element.
+                    let alignment = selection.range.start.checked_sub(stored_start as usize);
+                    if alignment.is_none()
+                        || alignment != selection.range.end.checked_sub(stored_end as usize)
+                    {
+                        return false;
+                    }
+                    let alignment = alignment.unwrap();
+                    handler.set_selected_text_range(
+                        alignment + element_start as usize..alignment + element_end as usize,
+                    );
+                    true
+                });
+                if applied == Some(true) {
+                    this.ime_mirror.adopt_element_state();
+                } else {
+                    // No import is coming for this move; without a forced
+                    // sync the mirror would keep deferring to it and show
+                    // the IME a selection the app never adopted.
+                    this.ime_mirror.reject_selection_import();
+                    this.schedule_ime_mirror_sync();
+                }
+            },
+        ))
+    }
+
+    /// Software keyboards (IMEs) express editing through `beforeinput`
+    /// rather than key events: Android IMEs emit only a placeholder key
+    /// event (`key: "Unidentified"`, `keyCode` 229). This handler only
+    /// intercepts the intents that must not mutate the mirror element;
+    /// ordinary edits deliberately proceed to the element and are imported
+    /// by `register_input`. Desktop keystrokes never reach this handler,
+    /// because `register_key_down` calls `preventDefault()` for every
+    /// keystroke it inserts, which cancels the corresponding `beforeinput`.
+    fn register_before_input(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen_input("beforeinput", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+
+            // During composition the composition{update,end} handlers own
+            // the text.
+            if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            match event.input_type().as_str() {
+                // Enter means "submit", not "insert a newline into the
+                // mirror": run it through the keybinding path instead of
+                // letting it mutate the element.
+                "insertLineBreak" | "insertParagraph" => {
+                    event.prevent_default();
+                    this.dispatch_synthetic_keystroke("enter", Modifiers::default());
+                    this.schedule_ime_mirror_sync();
+                }
+                // Everything else (insertText, deleteContent*, autocorrect's
+                // insertReplacementText, ...) is left to the browser's
+                // default action on the mirror element; `register_input`
+                // imports the resulting element diff into the editor.
+                _ => {}
+            }
+        })
+    }
+
     /// Paste is delivered through the DOM `paste` event rather than
     /// `Platform::read_from_clipboard`: the browser's asynchronous clipboard
     /// read API cannot fit that synchronous signature, while `ClipboardEvent`
     /// exposes `clipboardData` synchronously inside the event. It fires for
     /// any browser-initiated paste (keyboard, menu bar, context menu).
+    ///
+    /// Text-only pastes reach the input handler synchronously. Pasted image
+    /// files only expose their bytes through asynchronous blob reads, so
+    /// pastes containing images are delivered once those reads resolve — to
+    /// whichever input handler is focused at that point, matching how an
+    /// application-level paste action would behave.
     fn register_paste(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen_input("paste", move |event: JsValue| {
@@ -712,16 +1109,70 @@ impl WebWindowInner {
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
-            let Ok(text) = clipboard_data.get_data("text/plain") else {
+            let text = clipboard_data
+                .get_data("text/plain")
+                .ok()
+                .filter(|text| !text.is_empty());
+
+            // File handles must be collected synchronously: the browser
+            // clears `clipboardData`'s item list once this handler returns,
+            // while the `File`s themselves stay readable afterwards.
+            let mut image_files = Vec::new();
+            let items = clipboard_data.items();
+            for index in 0..items.length() {
+                let Some(item) = items.get(index) else {
+                    continue;
+                };
+                if item.kind() != "file" {
+                    continue;
+                }
+                let Some(format) = ImageFormat::from_mime_type(&item.type_()) else {
+                    continue;
+                };
+                if let Ok(Some(file)) = item.get_as_file() {
+                    image_files.push((format, file));
+                }
+            }
+
+            if text.is_none() && image_files.is_empty() {
                 return;
-            };
-            if text.is_empty() {
+            }
+            event.prevent_default();
+
+            if image_files.is_empty() {
+                if let Some(text) = text {
+                    this.with_input_handler(|handler| {
+                        handler.paste(ClipboardItem::new_string(text));
+                    });
+                }
                 return;
             }
 
-            event.prevent_default();
-            this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &text);
+            let this = Rc::clone(&this);
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut entries = Vec::new();
+                if let Some(text) = text {
+                    entries.push(ClipboardEntry::String(ClipboardString::new(text)));
+                }
+                for (format, file) in image_files {
+                    match crate::platform::read_blob_bytes(&file).await {
+                        Ok(bytes) => {
+                            entries.push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "failed to read pasted image: {}",
+                                crate::platform::js_error_message(&error)
+                            );
+                        }
+                    }
+                }
+                if entries.is_empty() {
+                    return;
+                }
+                this.with_input_handler(|handler| {
+                    handler.paste(ClipboardItem { entries });
+                });
             });
         })
     }
@@ -752,57 +1203,52 @@ impl WebWindowInner {
             let data = event.data().unwrap_or_default();
             this.is_composing.set(false);
             this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &data);
+                // Only commit the final text when a marked range still
+                // exists. When a caret move ended the composition, the
+                // editor has already unmarked (keeping the composed text as
+                // committed content); inserting `data` at the selection
+                // would duplicate the word at the new caret position.
+                if handler.marked_text_range().is_some() {
+                    handler.replace_text_in_range(None, &data);
+                }
                 handler.unmark_text();
             });
-            this.input_element.set_value("");
-            this.keyboard_input_element.set_value("");
+            // Adopt the element's post-composition state as the mirror
+            // baseline without writing anything: the browser applied the
+            // commit to the element itself, and a write here would restart
+            // the IME mid-commit. The deferred sync reconciles any
+            // app-side divergence afterwards.
+            this.ime_mirror.adopt_element_state();
+            this.schedule_ime_mirror_sync();
         })
     }
 
     fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        // `focusin`, because plain `focus` does not bubble to the container.
-        self.listen_input("focusin", move |_event: JsValue| {
-            {
-                let mut state = this.state.borrow_mut();
-                if state.is_active {
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "focus",
+            move |_event: JsValue| {
+                if this.suppress_focus_status_events.get() {
                     return;
                 }
-                state.is_active = true;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(true),
-            );
-        })
+                this.refresh_active_status();
+            },
+        )
     }
 
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("focusout", move |event: JsValue| {
-            // A focus transfer between the two hidden inputs (raising or
-            // dismissing the touch keyboard) is not a window deactivation.
-            let event: web_sys::FocusEvent = event.unchecked_into();
-            let stays_within_inputs = event
-                .related_target()
-                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
-                .is_some_and(|node| this.input_container.contains(Some(&node)));
-            if stays_within_inputs {
-                return;
-            }
-            {
-                let mut state = this.state.borrow_mut();
-                if !state.is_active {
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "blur",
+            move |_event: JsValue| {
+                if this.suppress_focus_status_events.get() {
                     return;
                 }
-                state.is_active = false;
-            }
-            this.with_callback(
-                |callbacks| &mut callbacks.active_status_change,
-                |callback| callback(false),
-            );
-        })
+                this.refresh_active_status();
+            },
+        )
     }
 
     fn register_pointer_enter(self: &Rc<Self>) -> EventListenerHandle {
@@ -976,6 +1422,63 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
     mouse_position_in_element(mouse_event)
 }
 
+/// How far ahead of the raw pointer position predictions may reach.
+///
+/// Browsers predict much further (Chrome offers samples out to 25ms), but
+/// prediction error grows with the horizon and surfaces as jitter: the
+/// emitted pan deltas gain a term proportional to lead x change in velocity,
+/// which at long leads visibly reverses direction mid-drag. Measurements
+/// show leads up to ~10ms track at or below the raw stream's frame-to-frame
+/// variation; AOSP similarly caps touch resampling extrapolation at 8ms
+/// (`RESAMPLE_MAX_PREDICTION` in `InputTransport.cpp`).
+const MAX_PREDICTION_LEAD_MS: f64 = 10.;
+
+/// The predicted pointer position closest to [`MAX_PREDICTION_LEAD_MS`]
+/// ahead of `event`, from `getPredictedEvents()`, or `None` when the browser
+/// offers no prediction (Safari lacks the method, Firefox returns an empty
+/// array). A prediction further out than the cap is linearly scaled back to
+/// it.
+///
+/// Accessed through `Reflect` because calling a missing method through the
+/// web-sys binding would throw, and predicted events' `offsetX`/`offsetY`
+/// are unreliable across browsers (their target may be detached), so the
+/// position is derived from the client-coordinate delta against the parent
+/// event, anchored to the parent's element-relative `position`.
+fn predicted_pointer_position(
+    event: &web_sys::PointerEvent,
+    position: Point<Pixels>,
+) -> Option<Point<Pixels>> {
+    let method = js_sys::Reflect::get(event, &JsValue::from_str("getPredictedEvents")).ok()?;
+    let method = method.dyn_ref::<js_sys::Function>()?;
+    let predicted_events: js_sys::Array = method.call0(event).ok()?.dyn_into().ok()?;
+    let mut best: Option<(f64, web_sys::PointerEvent)> = None;
+    for predicted in predicted_events.iter() {
+        let Ok(predicted) = predicted.dyn_into::<web_sys::PointerEvent>() else {
+            continue;
+        };
+        let lead = predicted.time_stamp() - event.time_stamp();
+        if lead <= 0. {
+            continue;
+        }
+        let distance_to_cap = (lead - MAX_PREDICTION_LEAD_MS).abs();
+        if best
+            .as_ref()
+            .is_none_or(|(best_distance, _)| distance_to_cap < *best_distance)
+        {
+            best = Some((distance_to_cap, predicted));
+        }
+    }
+    let (_, predicted) = best?;
+    let lead = predicted.time_stamp() - event.time_stamp();
+    let scale = (MAX_PREDICTION_LEAD_MS / lead).min(1.) as f32;
+    let event: &web_sys::MouseEvent = event.as_ref();
+    let predicted: &web_sys::MouseEvent = predicted.as_ref();
+    Some(point(
+        position.x + px((predicted.client_x() - event.client_x()) as f32 * scale),
+        position.y + px((predicted.client_y() - event.client_y()) as f32 * scale),
+    ))
+}
+
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
     // Derive the position from client coordinates and the target's rect instead
     // of offset_x/offset_y: Chromium erroneously divides offset coordinates of
@@ -992,5 +1495,26 @@ fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
         )
     } else {
         point(px(event.offset_x() as f32), px(event.offset_y() as f32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_pointer_id_reuse_gets_a_new_touch_id() {
+        let mut touch_ids = TouchIds::default();
+        let first = touch_ids.start(7).expect("first touch id");
+        let concurrent = touch_ids.start(8).expect("concurrent touch id");
+
+        assert_ne!(first, concurrent);
+        assert_eq!(touch_ids.active(7), Some(first));
+        assert_eq!(touch_ids.end(7), Some(first));
+        assert_eq!(touch_ids.active(7), None);
+
+        let reused = touch_ids.start(7).expect("reused pointer touch id");
+        assert_ne!(reused, first);
+        assert_ne!(reused, concurrent);
     }
 }

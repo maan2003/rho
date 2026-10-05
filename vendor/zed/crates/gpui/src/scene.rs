@@ -59,6 +59,7 @@ pub struct Scene {
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
+    pub vector_sprites: Vec<VectorSprite>,
     pub surfaces: Vec<PaintSurface>,
     #[cfg(any(test, feature = "test-support"))]
     recorded_primitives: Vec<RecordedPrimitive>,
@@ -118,6 +119,7 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
+        self.vector_sprites.clear();
         self.surfaces.clear();
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -201,6 +203,10 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
+            Primitive::VectorSprite(sprite) => {
+                sprite.order = order;
+                self.vector_sprites.push(*sprite);
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -267,6 +273,10 @@ impl Scene {
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
+            }
+            Primitive::VectorSprite(sprite) => {
+                sprite.order = order;
+                self.vector_sprites.push(*sprite);
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
@@ -337,6 +347,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.vector_sprites.sort_by_key(|sprite| sprite.order);
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
@@ -365,6 +376,8 @@ impl Scene {
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            vector_sprites_start: 0,
+            vector_sprites_iter: self.vector_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -435,6 +448,11 @@ impl Scene {
                 let mut value = *value;
                 value.order = 0;
                 write!(&mut fingerprint, "polychrome:{value:?}")
+            }
+            Primitive::VectorSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "vector:{value:?}")
             }
             Primitive::Surface(value) => {
                 let mut value = value.clone();
@@ -549,6 +567,7 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
+    VectorSprite,
     Surface,
 }
 
@@ -569,6 +588,7 @@ pub enum Primitive {
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
+    VectorSprite(VectorSprite),
     Surface(PaintSurface),
 }
 
@@ -584,6 +604,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::VectorSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
     }
@@ -598,6 +619,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+            Primitive::VectorSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
@@ -627,6 +649,8 @@ struct BatchIterator<'a> {
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    vector_sprites_start: usize,
+    vector_sprites_iter: Peekable<slice::Iter<'a, VectorSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -658,6 +682,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.polychrome_sprites_iter.peek().map(|s| s.order),
                 PrimitiveKind::PolychromeSprite,
+            ),
+            (
+                self.vector_sprites_iter.peek().map(|s| s.order),
+                PrimitiveKind::VectorSprite,
             ),
             (
                 self.surfaces_iter.peek().map(|s| s.order),
@@ -808,6 +836,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            PrimitiveKind::VectorSprite => {
+                let sprites_start = self.vector_sprites_start;
+                let mut sprites_end = sprites_start + 1;
+                self.vector_sprites_iter.next();
+                while self
+                    .vector_sprites_iter
+                    .next_if(|sprite| (sprite.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    sprites_end += 1;
+                }
+                self.vector_sprites_start = sprites_end;
+                Some(PrimitiveBatch::VectorSprites(sprites_start..sprites_end))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -854,6 +896,7 @@ pub enum PrimitiveBatch {
         texture_id: AtlasTextureId,
         range: Range<usize>,
     },
+    VectorSprites(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -887,6 +930,7 @@ impl PrimitiveBatch {
                     texture_id.index
                 )
             }
+            Self::VectorSprites(range) => format!("vector sprites ({})", range.len()),
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
     }
@@ -1126,13 +1170,36 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// A glyph drawn straight from its outline curves; see [`VectorGlyph`](crate::VectorGlyph).
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct VectorSprite {
+    pub order: DrawOrder,
+    /// Word offset of the glyph's encoding in the atlas glyph buffer.
+    pub glyph: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: Color,
+    /// The glyph's origin on the baseline.
+    pub origin: Point<ScaledPixels>,
+    pub font_size: ScaledPixels,
+    pub pad: u32,
+}
+
+impl From<VectorSprite> for Primitive {
+    fn from(sprite: VectorSprite) -> Self {
+        Primitive::VectorSprite(sprite)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(target_os = "linux")]
     pub source: crate::SurfaceSource,

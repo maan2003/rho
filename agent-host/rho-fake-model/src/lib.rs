@@ -281,7 +281,8 @@ impl FakeModel {
         let task = tokio::spawn(async move {
             axum::serve(
                 listener.tap_io(|socket| {
-                    // Immediate chunks must not wait for Nagle/delayed-ACK batching.
+                    // Immediate chunks must not wait for Nagle/delayed-ACK
+                    // batching.
                     socket
                         .set_nodelay(true)
                         .expect("set fake-model TCP_NODELAY");
@@ -764,7 +765,7 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source = format!("human.send({text:?})\nend_turn()");
+        let source = format!("human.send({text:?}, kind=\"result\")\nend_turn()");
         append_tool_call(
             events,
             state,
@@ -901,7 +902,7 @@ fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest)
         Scenario::ClarifyingQuestion => {
             "Could you clarify which behavior you want me to implement?".to_owned()
         }
-        Scenario::SlowTrickle => (0..200).map(|index| format!("token-{index} ")).collect(),
+        Scenario::SlowTrickle => (0..200).map(|index| format!("token-{index}. ")).collect(),
         _ => persona_text(state.config.seed, request_number, request),
     }
 }
@@ -914,7 +915,7 @@ fn persona_text(seed: u64, request_number: u64, request: &OpenAiRequest) -> Stri
         request.model,
         request.input.len()
     );
-    let line = "Observed state is consistent; continuing through the real agent host, tools, journal, story, and GUI wire.\n";
+    let line = "Observed state is consistent. The turn goes through the real agent host, tools, journal, story, and GUI wire.\n";
     let mut text = prefix;
     while text.len() < length {
         text.push_str(line);

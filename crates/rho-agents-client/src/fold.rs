@@ -7,29 +7,16 @@
 
 use std::sync::Arc;
 
-use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, TurnEdge, TurnOutcome,
-    UnixMs,
-};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, UnixMs};
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{
-    RuntimeKind, RuntimeState, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
+    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
 };
 use crate::state::{
     UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiNotebookActivity, UiToolStatus,
 };
-
-/// How much an agent wants the user, as the view decided.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Attention {
-    #[default]
-    Quiet,
-    Working,
-    Pending,
-    NeedsInput,
-}
 
 /// What the user last said about an agent: how far they have dealt with
 /// its rows, and whether they muted it. The only facts attention needs
@@ -43,66 +30,34 @@ pub struct Verdict {
     pub muted: bool,
 }
 
-/// What of a digest attention is decided from.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AttentionFacts {
-    pub turn_running: bool,
-    /// Where the last turn died, if nothing has happened since.
-    pub errored: Option<AgentPos>,
-    /// Where the last finished turn said what it wants.
-    pub wants_at: Option<AgentPos>,
-    pub awaiting_at: Option<AgentPos>,
-    pub sent_at: Option<AgentPos>,
-    pub runtime: Option<RuntimeState>,
+/// What a row put to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub enum Said {
+    /// A send asking for something the work needs.
+    Ask,
+    /// The agent stopped on an error: as much an ask as a question.
+    Stopped,
+    /// A send delivering what the user asked for.
+    Result,
 }
 
-/// How badly an agent wants the user: the join of what its rows say and
-/// the user's verdict. The one place attention is decided; every rail
-/// reads the answer through the registry.
-pub fn attention(facts: AttentionFacts, verdict: Verdict) -> Attention {
-    let past = |pos: AgentPos| pos >= verdict.handled_through;
-    // A mute is not a cursor: the user said "not this agent", so nothing
-    // the agent does takes it back — not a turn starting, not a turn
-    // ending with a question. Working used to be read first, on the
-    // reasoning that a running turn is the agent's court; that is true of
-    // how loudly an agent may ask and not of whether it may ask at all.
-    if verdict.muted {
-        Attention::Quiet
-    } else if facts.awaiting_at.map_or_else(
-        || {
-            facts
-                .runtime
-                .as_ref()
-                .is_some_and(|state| state.awaiting_human)
-        },
-        past,
-    ) {
-        Attention::NeedsInput
-    } else if facts.sent_at.is_some_and(past) {
-        Attention::Pending
-    } else if facts.errored.is_some_and(past) {
-        Attention::NeedsInput
-    } else if let Some(runtime) = facts.runtime.as_ref() {
-        if runtime.is_working() {
-            Attention::Working
-        } else {
-            Attention::Quiet
+impl Said {
+    /// How hard it pulls on the user: lower is stronger. A stop pulls as
+    /// hard as a question.
+    pub fn strength(self) -> u8 {
+        match self {
+            Self::Ask | Self::Stopped => 0,
+            Self::Result => 1,
         }
-    } else if facts.turn_running {
-        Attention::Working
-    } else if facts.wants_at.is_some_and(past) {
-        Attention::Pending
-    } else {
-        Attention::Quiet
     }
 }
 
-/// What the last finished turn asks of the user, and where it said so.
-#[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-pub struct Wants {
-    pub want: AgentWant,
-    pub summary: Option<String>,
-    pub at: AgentPos,
+/// One thing the agent put to the user since they last wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct Unread {
+    pub pos: AgentPos,
+    pub at: UnixMs,
+    pub said: Said,
 }
 
 /// What an agent is: its `Created` row, kept current by the rows that
@@ -124,33 +79,28 @@ pub struct AgentIdentity {
 /// Which fold made a stored digest. Bump when `Digest::tell` changes
 /// what it makes of a row; a client finding another version on disk
 /// folds that agent's rows again, once.
-pub const DIGEST_VERSION: u32 = 2;
+pub const DIGEST_VERSION: u32 = 3;
 
 /// What the rails read of an agent, folded from its mirror. Incremental,
 /// and kept on disk by the client, so a restart reads it back instead of
-/// folding every event again.
+/// folding every event again. Only the conversation with the user counts:
+/// what the agent says to other agents, and whether it is running, do not.
 #[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Digest {
     /// One past the newest position folded.
     pub newest: AgentPos,
     /// The sidecar's title. A spawn name always beats it.
     pub title: Option<String>,
-    pub activity: Option<String>,
-    pub turn_running: bool,
-    /// When the running turn began, so a reader is told how long it has
-    /// been working. `None` between turns, and while a turn the client
-    /// never saw start is running.
-    pub turn_started_at: Option<UnixMs>,
+    /// The agent's newest status and where it said it, until any later
+    /// message from either side hides it.
+    pub status: Option<(AgentPos, String)>,
     pub last_active: UnixMs,
     pub last_user_message_at: UnixMs,
     pub last_user_message_text: String,
-    pub last_turn_ended: Option<UnixMs>,
-    /// Where the last turn died, if nothing has happened since.
-    pub errored: Option<AgentPos>,
-    pub wants: Option<Wants>,
-    /// Explicit code-first wait and latest human delivery positions.
-    pub awaiting_human: Option<(AgentPos, UnixMs)>,
-    pub message_sent: Option<(AgentPos, UnixMs)>,
+    /// When it last sent the user anything but a status.
+    pub last_sent_at: Option<UnixMs>,
+    /// What it put to the user since they last wrote, oldest first.
+    pub unread: Vec<Unread>,
     pub notebook: Option<UiNotebookActivity>,
     /// Every reply's usage, summed.
     pub usage: AgentUsageBucket,
@@ -159,17 +109,6 @@ pub struct Digest {
 }
 
 impl Digest {
-    pub fn attention_facts(&self) -> AttentionFacts {
-        AttentionFacts {
-            turn_running: self.turn_running,
-            errored: self.errored,
-            wants_at: self.wants.as_ref().map(|wants| wants.at),
-            awaiting_at: self.awaiting_human.map(|(pos, _)| pos),
-            sent_at: self.message_sent.map(|(pos, _)| pos),
-            runtime: None,
-        }
-    }
-
     /// Folds one event. Positions already held are skipped, so a repeated
     /// run is harmless; returns whether anything was new.
     pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
@@ -196,30 +135,32 @@ impl Digest {
                 text,
                 at,
             } => self.user_spoke(*at, text),
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at,
+            TranscriptEvent::MessageSent {
+                to: None,
+                text,
+                kind: SendKind::Status,
+                ..
+            } => self.status = Some((pos, text.clone())),
+            TranscriptEvent::MessageSent {
+                to: None, kind, at, ..
             } => {
-                self.turn_running = true;
-                self.turn_started_at = Some(*at);
-                self.errored = None;
-                self.wants = None;
+                let said = match kind {
+                    SendKind::Ask => Some(Said::Ask),
+                    SendKind::Result => Some(Said::Result),
+                    // Kept in the conversation, but nothing the user is owed.
+                    SendKind::Status | SendKind::Fyi => None,
+                };
+                if let Some(said) = said {
+                    self.unread.push(Unread { pos, at: *at, said });
+                }
+                self.status = None;
+                self.last_sent_at = Some(*at);
             }
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(outcome),
-                at,
-            } => {
-                self.turn_running = false;
-                self.turn_started_at = None;
-                self.last_turn_ended = Some(*at);
-                self.errored = matches!(outcome, TurnOutcome::Errored { .. }).then_some(pos);
-            }
-            TranscriptEvent::MessageSent { to: None, at, .. } => {
-                self.message_sent = Some((pos, *at));
-            }
-            TranscriptEvent::AwaitingHuman { since, .. } => {
-                self.awaiting_human = since.map(|since| (pos, since));
-            }
+            TranscriptEvent::Stopped { at, .. } => self.unread.push(Unread {
+                pos,
+                at: *at,
+                said: Said::Stopped,
+            }),
             TranscriptEvent::NotebookActivity {
                 responding,
                 running_tasks,
@@ -234,19 +175,7 @@ impl Digest {
                     archived: *archived,
                 });
             }
-            TranscriptEvent::Presented {
-                title, activity, ..
-            } => {
-                apply(&mut self.title, title);
-                apply(&mut self.activity, activity);
-            }
-            TranscriptEvent::Wants { want, summary, .. } => {
-                self.wants = Some(Wants {
-                    want: *want,
-                    summary: summary.clone(),
-                    at: pos,
-                });
-            }
+            TranscriptEvent::Presented { title, .. } => apply(&mut self.title, title),
             TranscriptEvent::Replied {
                 usage: Some(usage), ..
             } => {
@@ -260,17 +189,9 @@ impl Digest {
             }
             // History from `to` on is gone, and with it anything it said.
             TranscriptEvent::Rewound { to, .. } => {
-                if self.wants.as_ref().is_some_and(|wants| wants.at >= *to) {
-                    self.wants = None;
-                }
-                if self.errored.is_some_and(|errored| errored >= *to) {
-                    self.errored = None;
-                }
-                if self.awaiting_human.is_some_and(|(at, _)| at >= *to) {
-                    self.awaiting_human = None;
-                }
-                if self.message_sent.is_some_and(|(at, _)| at >= *to) {
-                    self.message_sent = None;
+                self.unread.retain(|unread| unread.pos < *to);
+                if self.status.as_ref().is_some_and(|(at, _)| at >= to) {
+                    self.status = None;
                 }
             }
             TranscriptEvent::Message { .. }
@@ -292,14 +213,22 @@ impl Digest {
         true
     }
 
+    /// The strongest thing the agent put to the user past `seen`, counted
+    /// from the oldest of that kind (`rho-dealer/cases.md`, A5).
+    pub fn strongest_unread(&self, seen: AgentPos) -> Option<Unread> {
+        self.unread
+            .iter()
+            .filter(|unread| unread.pos >= seen)
+            .min_by_key(|unread| (unread.said.strength(), unread.pos))
+            .copied()
+    }
+
+    /// Writing reads everything before it.
     fn user_spoke(&mut self, at: UnixMs, text: &str) {
         self.last_user_message_at = at;
         self.last_user_message_text = one_line(text);
-        // The ball is the agent's again.
-        self.wants = None;
-        self.errored = None;
-        self.awaiting_human = None;
-        self.message_sent = None;
+        self.status = None;
+        self.unread.clear();
     }
 }
 
@@ -416,7 +345,7 @@ pub struct TranscriptFold {
     told_at: Vec<AgentPos>,
     /// Messages no request has carried yet; drawn after the blocks.
     queue: Vec<(AgentPos, Option<u64>, UiBlock)>,
-    turn_running: bool,
+    /// The agent stopped on an error and nobody has written since.
     errored: bool,
     /// What the last reply said the context holds, and where it said it.
     context_used: Option<(AgentPos, u64)>,
@@ -437,7 +366,6 @@ pub struct FoldDelta {
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
-    pub awaiting_human: Option<UnixMs>,
     pub context_used: Option<u64>,
     pub usage: UiAgentUsage,
 }
@@ -493,7 +421,6 @@ impl TranscriptFold {
             from,
             blocks: self.composed_from(from),
             status: state.status,
-            awaiting_human: state.awaiting_human,
             context_used: state.context_used,
             usage: state.usage,
         })
@@ -637,11 +564,8 @@ impl TranscriptFold {
                 for (queued_at, id, queued) in queue {
                     if id.is_some_and(|id| delivered_ids.contains(&id)) {
                         self.push(pos, delivered(queued));
-                    } else if id.is_some_and(|id| acknowledged.contains(&id)) {
-                        self.touch(self.blocks.len() + self.queue.len());
-                    } else if *compaction
-                        && id.is_none()
-                        && matches!(queued, UiBlock::Notice { .. })
+                    } else if id.is_some_and(|id| acknowledged.contains(&id))
+                        || (*compaction && id.is_none() && matches!(queued, UiBlock::Notice { .. }))
                     {
                         self.touch(self.blocks.len() + self.queue.len());
                     } else {
@@ -658,6 +582,11 @@ impl TranscriptFold {
                 }
                 self.report_calls(calls);
             }
+            // A status is the status line, not a message.
+            TranscriptEvent::MessageSent {
+                kind: SendKind::Status,
+                ..
+            } => {}
             TranscriptEvent::MessageSent { to, text, .. } => {
                 self.push(
                     pos,
@@ -711,20 +640,9 @@ impl TranscriptFold {
                     },
                 );
             }
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                ..
-            } => {
-                self.turn_running = true;
-                self.errored = false;
-            }
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(outcome),
-                ..
-            } => {
-                self.turn_running = false;
-                self.errored = matches!(outcome, TurnOutcome::Errored { .. });
-                // A call the turn never answered is over too. Only a
+            TranscriptEvent::Stopped { error, .. } => {
+                self.errored = true;
+                // A call the agent never answered is over too. Only a
                 // running one is copied out of its sharing.
                 for block in &mut self.blocks {
                     if matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
@@ -733,18 +651,16 @@ impl TranscriptFold {
                         tool.status = UiToolStatus::Cancelled;
                     }
                 }
-                if let TurnOutcome::Errored { message } = outcome {
-                    self.push(
-                        pos,
-                        UiBlock::Notice {
-                            text: message.clone(),
-                        },
-                    );
-                }
+                self.push(
+                    pos,
+                    UiBlock::Notice {
+                        text: error.clone(),
+                    },
+                );
             }
             // What the model said before its request failed stays
-            // readable; a retry says so, a final failure is the turn's
-            // ending right after.
+            // readable; a retry says so, a final failure is `Stopped`
+            // right after.
             TranscriptEvent::Failed {
                 text,
                 error,
@@ -781,7 +697,8 @@ impl TranscriptFold {
                         .or_default()
                         .observe(*milestone, *at);
                 }
-                // Earlier tool rows may have been updated by a now-rewound handoff.
+                // Earlier tool rows may have been updated by a now-rewound
+                // handoff.
                 for block in &mut self.blocks {
                     if let UiBlock::Tool(tool) = Arc::make_mut(block) {
                         tool.timing = timings.get(&tool.id).copied().unwrap_or_default();
@@ -801,9 +718,8 @@ impl TranscriptFold {
             TranscriptEvent::Created { .. }
             | TranscriptEvent::RoleChanged { .. }
             | TranscriptEvent::Notice { .. }
-            | TranscriptEvent::Presented { .. }
-            | TranscriptEvent::Wants { .. } => {}
-            TranscriptEvent::AwaitingHuman { .. } | TranscriptEvent::NotebookActivity { .. } => {
+            | TranscriptEvent::Presented { .. } => {}
+            TranscriptEvent::NotebookActivity { .. } => {
                 self.touch(self.blocks.len() + self.queue.len());
             }
         }
@@ -822,14 +738,10 @@ impl TranscriptFold {
             exec_timings: self.exec_timings.clone(),
             blocks,
             runtime: None,
-            awaiting_human: self.digest.awaiting_human.map(|(_, since)| since),
-            // Never `Streaming`: this is the mirror, not the live tail. A
-            // turn that was running when the client last heard is the
-            // agent host's to report again.
+            // Never `Streaming`: this is the mirror, not the live tail.
+            // Whether the agent is working is the agent host's to report.
             status: if self.errored {
                 UiAgentStatus::Error
-            } else if self.turn_running {
-                UiAgentStatus::Unloaded
             } else {
                 UiAgentStatus::Idle
             },
@@ -1016,45 +928,6 @@ mod tests {
         );
     }
 
-    /// A mirror does not claim to stream, but an unloaded running turn
-    /// must still be treated as open when a surface composes its tail.
-    #[test]
-    fn a_running_turn_read_back_from_the_mirror_stays_open() {
-        let mut events = vec![
-            user("go", 1),
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(2),
-            },
-        ];
-        for nth in 0..3 {
-            events.push(TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(3 + nth),
-            });
-            events.push(TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: format!("call-{nth}"),
-                    name: "shell".to_owned(),
-                    arguments: format!("{{\"cmd\":\"echo {nth}\"}}"),
-                    format: ArgumentsFormat::Json,
-                }],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(3 + nth),
-            });
-        }
-        // No `TurnEdge::Finished`: this turn is still running, which is the
-        // state a reader opens a working agent in.
-        let state = told(events);
-        assert!(
-            crate::store::turn_open(state.status),
-            "a turn the mirror saw running is a turn in progress"
-        );
-    }
-
     fn only_tool(state: &UiAgentState) -> &UiTool {
         state
             .blocks
@@ -1075,10 +948,6 @@ mod tests {
         let code = "const files = await tools.exec_command({ cmd: 'ls' });\nconsole.log(files);\n";
         let state = told(vec![
             user("what is in there", 1),
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(2),
-            },
             TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
@@ -1108,10 +977,6 @@ mod tests {
     fn a_shell_call_still_carries_its_command() {
         let state = told(vec![
             user("build it", 1),
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(2),
-            },
             TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
@@ -1139,10 +1004,6 @@ mod tests {
     fn a_told_turn_reads_as_a_transcript() {
         let state = told(vec![
             user("have a look", 1),
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(2),
-            },
             TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
@@ -1187,10 +1048,6 @@ mod tests {
                 }),
                 context_used: Some(12),
                 at: UnixMs(5),
-            },
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Completed),
-                at: UnixMs(6),
             },
         ]);
         assert_eq!(state.status, UiAgentStatus::Idle);
@@ -1278,19 +1135,11 @@ mod tests {
     /// The error text is the trailing notice, which is what `Error` status
     /// means to every reader of a live frame.
     #[test]
-    fn an_errored_turn_ends_in_a_notice() {
-        let state = told(vec![
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(1),
-            },
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Errored {
-                    message: "the deploy script exited 1".to_owned(),
-                }),
-                at: UnixMs(2),
-            },
-        ]);
+    fn a_stopped_agent_ends_in_a_notice() {
+        let state = told(vec![TranscriptEvent::Stopped {
+            error: "the deploy script exited 1".to_owned(),
+            at: UnixMs(2),
+        }]);
         assert_eq!(state.status, UiAgentStatus::Error);
         assert_eq!(
             state.blocks,
@@ -1299,16 +1148,11 @@ mod tests {
             })]
         );
     }
-
     /// What the model said before its request failed stays on screen:
-    /// a retry says so after it, a final failure is the turn's notice.
+    /// a retry says so after it, a final failure is the stop's notice.
     #[test]
     fn a_failed_request_keeps_what_was_said() {
         let state = told(vec![
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(1),
-            },
             TranscriptEvent::Failed {
                 text: "half an answer".to_owned(),
                 error: "overloaded".to_owned(),
@@ -1321,10 +1165,8 @@ mod tests {
                 retrying: false,
                 at: UnixMs(3),
             },
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Errored {
-                    message: "quota".to_owned(),
-                }),
+            TranscriptEvent::Stopped {
+                error: "quota".to_owned(),
                 at: UnixMs(3),
             },
         ]);
@@ -1350,127 +1192,96 @@ mod tests {
         );
     }
 
-    /// A mute is not a cursor: an agent the user muted stays quiet whatever
-    /// it does next. A turn starting used to be read first — a running turn
-    /// is the agent's court — which made the mute last exactly until the
-    /// agent moved.
-    #[test]
-    fn code_first_wait_and_activity_are_independent() {
-        let mut digest = Digest::default();
-        let activity =
-            |responding, running_tasks, archived, at| TranscriptEvent::NotebookActivity {
-                responding,
-                running_tasks,
-                archived,
-                checkin_at: Some(UnixMs(44)),
-                at: UnixMs(at),
-            };
-        digest.tell(AgentPos(0), &activity(true, 3, false, 10));
-        digest.tell(
-            AgentPos(1),
-            &TranscriptEvent::MessageSent {
-                to: None,
-                text: "progress, not done".into(),
-                at: UnixMs(11),
-            },
-        );
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::Pending
-        );
-        digest.tell(
-            AgentPos(2),
-            &TranscriptEvent::AwaitingHuman {
-                since: Some(UnixMs(12)),
-                at: UnixMs(12),
-            },
-        );
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::NeedsInput
-        );
-        digest.tell(AgentPos(3), &activity(false, 2, false, 13));
-        assert_eq!(digest.awaiting_human, Some((AgentPos(2), UnixMs(12))));
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::NeedsInput
-        );
-        digest.tell(AgentPos(4), &user("continue", 14));
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::Quiet // historical activity is not current runtime state
-        );
-        digest.tell(AgentPos(5), &activity(false, 0, true, 15));
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::Quiet
-        );
-        digest.tell(AgentPos(6), &activity(true, 1, false, 16));
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::Quiet
-        );
+    fn sent(kind: SendKind, at: u64) -> TranscriptEvent {
+        TranscriptEvent::MessageSent {
+            to: None,
+            text: format!("sent at {at}"),
+            kind,
+            at: UnixMs(at),
+        }
     }
 
+    /// The card counts from the oldest unread of the strongest kind, and a
+    /// stop is as strong as a question (`rho-dealer/cases.md`, A5, A8).
     #[test]
-    fn permanent_error_after_idle_snapshot_still_needs_input() {
+    fn the_strongest_unread_counts_from_its_oldest() {
         let mut digest = Digest::default();
-        digest.tell(
-            AgentPos(0),
-            &TranscriptEvent::NotebookActivity {
-                responding: false,
-                running_tasks: 0,
-                checkin_at: None,
-                archived: false,
-                at: UnixMs(1),
-            },
-        );
-        digest.tell(
-            AgentPos(1),
-            &TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Errored {
-                    message: "failed".into(),
-                }),
-                at: UnixMs(2),
-            },
-        );
-        assert_eq!(
-            attention(digest.attention_facts(), Verdict::default()),
-            Attention::NeedsInput
-        );
-    }
-
-    #[test]
-    fn checkin_turn_end_preserves_explicit_activity_label() {
-        let mut digest = Digest::default();
-        digest.tell(
-            AgentPos(0),
-            &TranscriptEvent::NotebookActivity {
-                responding: false,
-                running_tasks: 1,
-                checkin_at: Some(UnixMs(10)),
-                archived: false,
-                at: UnixMs(1),
-            },
-        );
-        digest.tell(
-            AgentPos(1),
-            &TranscriptEvent::Presented {
-                title: PresentationField::Unchanged,
-                activity: PresentationField::Set("Checking build logs".into()),
-                at: UnixMs(2),
-            },
-        );
+        digest.tell(AgentPos(0), &user("go", 1));
+        digest.tell(AgentPos(1), &sent(SendKind::Result, 2));
         digest.tell(
             AgentPos(2),
-            &TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Completed),
+            &TranscriptEvent::Stopped {
+                error: "quota".to_owned(),
                 at: UnixMs(3),
             },
         );
-        assert_eq!(digest.activity.as_deref(), Some("Checking build logs"));
+        digest.tell(AgentPos(3), &sent(SendKind::Fyi, 4));
+        digest.tell(AgentPos(4), &sent(SendKind::Ask, 5));
+        let strongest = |seen| {
+            digest
+                .strongest_unread(AgentPos(seen))
+                .map(|unread| (unread.said, unread.pos.0))
+        };
+        assert_eq!(strongest(0), Some((Said::Stopped, 2)));
+        assert_eq!(strongest(3), Some((Said::Ask, 4)));
+        assert_eq!(strongest(5), None);
+
+        let mut digest = Digest::default();
+        digest.tell(AgentPos(0), &sent(SendKind::Status, 1));
+        digest.tell(AgentPos(1), &sent(SendKind::Fyi, 2));
+        assert_eq!(
+            digest.strongest_unread(AgentPos::ZERO),
+            None,
+            "an fyi is owed nothing"
+        );
+        assert_eq!(digest.last_sent_at, Some(UnixMs(2)), "but it is a send");
+        assert_eq!(digest.status, None, "and it ends the status");
     }
 
+    /// Only the conversation counts: a status, a retried error and mail to
+    /// another agent put nothing to the user, and writing reads it all.
+    #[test]
+    fn unread_is_what_the_agent_put_to_the_user_since_they_wrote() {
+        let mut digest = Digest::default();
+        digest.tell(AgentPos(0), &sent(SendKind::Status, 1));
+        digest.tell(
+            AgentPos(1),
+            &TranscriptEvent::Failed {
+                text: String::new(),
+                error: "overloaded".to_owned(),
+                retrying: true,
+                at: UnixMs(2),
+            },
+        );
+        digest.tell(
+            AgentPos(2),
+            &TranscriptEvent::MessageSent {
+                to: Some(AgentId::from_counter(9, &rho_agent_types::AgentIdDomain(0)).unwrap()),
+                text: "mail".to_owned(),
+                kind: SendKind::Ask,
+                at: UnixMs(3),
+            },
+        );
+        assert!(digest.unread.is_empty());
+        assert_eq!(
+            digest.status,
+            Some((AgentPos(0), "sent at 1".to_owned())),
+            "mail to an agent is not the conversation and leaves the status"
+        );
+        assert_eq!(digest.last_sent_at, None);
+
+        digest.tell(AgentPos(3), &sent(SendKind::Result, 4));
+        assert_eq!(digest.status, None, "a later send hides the status");
+        assert_eq!(digest.last_sent_at, Some(UnixMs(4)));
+        digest.tell(AgentPos(4), &sent(SendKind::Status, 5));
+        assert_eq!(digest.unread.len(), 1);
+        digest.tell(AgentPos(5), &user("thanks", 6));
+        assert!(
+            digest.unread.is_empty(),
+            "writing reads everything before it"
+        );
+        assert_eq!(digest.status, None, "and hides the status");
+    }
     #[test]
     fn report_delivers_exact_messages_and_reports_call_while_task_runs() {
         let mut fold = TranscriptFold::default();
@@ -1547,53 +1358,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_wait_respects_a_handled_durable_wait() {
-        let mut facts = AttentionFacts {
-            runtime: Some(RuntimeState {
-                awaiting_human: true,
-                ..RuntimeState::default()
-            }),
-            ..AttentionFacts::default()
-        };
-        let verdict = Verdict {
-            handled_through: AgentPos(8),
-            muted: false,
-        };
-        assert_eq!(attention(facts.clone(), verdict), Attention::NeedsInput);
-        facts.awaiting_at = Some(AgentPos(7));
-        assert_eq!(attention(facts.clone(), verdict), Attention::Quiet);
-        facts.awaiting_at = Some(AgentPos(8));
-        assert_eq!(attention(facts, verdict), Attention::NeedsInput);
-    }
-
-    #[test]
-    fn a_muted_agent_stays_quiet_through_a_turn() {
-        let muted = Verdict {
-            handled_through: AgentPos(0),
-            muted: true,
-        };
-        let running = AttentionFacts {
-            turn_running: true,
-            errored: None,
-            wants_at: None,
-            ..AttentionFacts::default()
-        };
-        assert_eq!(attention(running.clone(), muted), Attention::Quiet);
-        assert_eq!(
-            attention(running, Verdict::default()),
-            Attention::Working,
-            "and an agent nobody muted still says it is working"
-        );
-        let asking = AttentionFacts {
-            turn_running: false,
-            errored: None,
-            wants_at: Some(AgentPos(1)),
-            ..AttentionFacts::default()
-        };
-        assert_eq!(attention(asking, muted), Attention::Quiet);
-    }
-
     /// A rewind hides what it undid and keeps what came before it.
     #[test]
     fn a_rewind_hides_what_it_undid() {
@@ -1638,45 +1402,23 @@ mod tests {
         assert!(MirroredAgent::new(host, agent_id, &user("x", 1)).is_none());
         let mut mirrored = MirroredAgent::new(host, agent_id, &created).unwrap();
         assert!(mirrored.tell(AgentPos(1), &user("do the thing\nand then some", 10)));
-        assert!(mirrored.tell(
-            AgentPos(2),
-            &TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: UnixMs(11),
-            }
-        ));
-        assert!(mirrored.digest.turn_running);
         assert_eq!(mirrored.digest.last_user_message_text, "do the thing");
-        assert!(mirrored.tell(
-            AgentPos(3),
-            &TranscriptEvent::Wants {
-                want: AgentWant::Ask,
-                summary: Some("needs a decision".to_owned()),
-                at: UnixMs(12),
-            }
-        ));
-        assert!(mirrored.tell(
-            AgentPos(4),
-            &TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Completed),
-                at: UnixMs(13),
-            }
-        ));
-        assert!(!mirrored.digest.turn_running);
-        assert_eq!(mirrored.digest.last_turn_ended, Some(UnixMs(13)));
-        assert_eq!(mirrored.digest.wants.as_ref().unwrap().at, AgentPos(3));
+        assert!(mirrored.tell(AgentPos(2), &sent(SendKind::Status, 11)));
+        assert!(mirrored.tell(AgentPos(3), &sent(SendKind::Ask, 12)));
+        assert_eq!(mirrored.digest.unread.len(), 1);
         // Replaying a position the fold already holds changes nothing.
         assert!(!mirrored.tell(AgentPos(3), &user("again", 99)));
-        assert_eq!(mirrored.digest.newest, AgentPos(5));
-        assert_eq!(mirrored.digest.last_active, UnixMs(13));
+        assert_eq!(mirrored.digest.newest, AgentPos(4));
+        assert_eq!(mirrored.digest.last_active, UnixMs(12));
         assert!(mirrored.tell(
-            AgentPos(5),
+            AgentPos(4),
             &TranscriptEvent::Rewound {
-                to: AgentPos(3),
+                to: AgentPos(2),
                 at: UnixMs(14),
             }
         ));
-        assert_eq!(mirrored.digest.wants, None);
+        assert!(mirrored.digest.unread.is_empty());
+        assert_eq!(mirrored.digest.status, None);
     }
     #[test]
     fn exec_observations_survive_commit_and_rewind_without_retiming() {
@@ -1702,7 +1444,8 @@ mod tests {
         tell(&mut fold, 2, ResponseFinished, 30);
         tell(&mut fold, 3, Boundary, 40);
         tell(&mut fold, 4, HandedOff, 50);
-        // Redelivery of one observation is idempotent even at a new log position.
+        // Redelivery of one observation is idempotent even at a new log
+        // position.
         tell(&mut fold, 5, FirstBlock, 99);
         assert_eq!(
             fold.state().exec_timings["exec-1"].first_block_at,

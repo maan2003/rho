@@ -56,7 +56,7 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 #[cfg(test)]
 mod tests {
     use rho_agent_hosts::HostId;
-    use rho_agent_types::{AgentIdDomain, AgentPos, TurnEdge, TurnOutcome, UnixMs};
+    use rho_agent_types::{AgentIdDomain, AgentPos, UnixMs};
 
     use super::*;
     use crate::MirroredAgent;
@@ -116,8 +116,10 @@ mod tests {
             vec![
                 created(1),
                 said("fix the flaky mirror test", 2),
-                TranscriptEvent::Turn {
-                    edge: TurnEdge::Ended(TurnOutcome::Completed),
+                TranscriptEvent::MessageSent {
+                    to: None,
+                    text: "fixed".to_owned(),
+                    kind: rho_agent_types::SendKind::Result,
                     at: UnixMs(3),
                 },
             ],

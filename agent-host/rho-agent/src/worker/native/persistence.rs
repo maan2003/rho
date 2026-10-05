@@ -29,7 +29,8 @@ impl Writer {
                             Ok(committed) => boundary = committed,
                             Err(error) => {
                                 eprintln!("native event replication failed: {error}");
-                                // Dropping the receiver wakes the loop and all barriers.
+                                // Dropping the receiver wakes the loop and all
+                                // barriers.
                                 return;
                             }
                         }

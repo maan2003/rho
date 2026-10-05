@@ -1818,7 +1818,8 @@ fn handle(
         "search.files" => {
             let query = search_query(&field("query"));
             // Standalone and message-attached files share Slack's file index.
-            // A shared file may appear in several messages; return it only once.
+            // A shared file may appear in several messages; return it only
+            // once.
             let files = state
                 .files
                 .iter()

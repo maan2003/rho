@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig;
-use dial9_tokio_telemetry::telemetry::{
-    RotatingWriter, TelemetryCore, TelemetryGuard, TelemetryHandle, clock_monotonic_ns,
-    record_event,
-};
+use dial9_core::buffer::DiskBuffer;
+use dial9_core::clock::clock_monotonic_ns;
+use dial9_core::recorder::recorder;
+use dial9_core::recording::Recorder;
+use dial9_perf_self_profile::{CpuProfilingConfig, RecorderPerfExt as _};
 use dial9_trace_format::TraceEvent;
 
 pub struct CpuProfiler {
@@ -18,8 +18,7 @@ pub struct CpuProfiler {
     output_path: PathBuf,
     start_instant: Instant,
     start_monotonic_ns: u64,
-    guard: TelemetryGuard,
-    handle: TelemetryHandle,
+    recorder: Recorder,
 }
 
 /// A GPUI frame span to place on the same monotonic timeline as CPU samples.
@@ -128,58 +127,59 @@ impl CpuProfiler {
         let output_path = dial9_output_path(&path);
         remove_if_exists(&output_path)?;
         remove_if_exists(&dial9_raw_output_path(&path))?;
-        let writer = RotatingWriter::single_file(&path)
+        let writer = DiskBuffer::single_file(&path)
             .with_context(|| format!("create Dial9 trace {}", path.display()))?;
         Self::start_with_writer(path, output_path, writer)
     }
 
-    /// Starts a bounded profiler whose self-contained segments rotate by time.
+    /// Starts a bounded profiler whose self-contained segments rotate by time,
+    /// as `trace.N.bin` files in `directory`.
     pub fn start_rolling(
-        path: impl Into<PathBuf>,
+        directory: impl Into<PathBuf>,
         rotation_period: Duration,
         max_total_size: u64,
     ) -> anyhow::Result<Self> {
-        let path = absolute_path(path.into())?;
-        let output_path = dial9_output_path(&path);
-        let writer = RotatingWriter::builder()
-            .base_path(&path)
+        let directory = absolute_path(directory.into())?;
+        let writer = DiskBuffer::builder()
+            .base_path(&directory)
             .max_file_size(max_total_size)
             .max_total_size(max_total_size)
             .rotation_period(rotation_period)
             .build()
-            .with_context(|| format!("create rolling Dial9 trace {}", path.display()))?;
+            .with_context(|| format!("create rolling Dial9 trace in {}", directory.display()))?;
+        let path = writer
+            .trace_dir()
+            .join(format!("{}.bin", writer.trace_stem()));
+        let output_path = dial9_output_path(&path);
         Self::start_with_writer(path, output_path, writer)
     }
 
     fn start_with_writer(
         path: PathBuf,
         output_path: PathBuf,
-        writer: RotatingWriter,
+        writer: DiskBuffer,
     ) -> anyhow::Result<Self> {
-        let guard = TelemetryCore::builder()
-            .writer(writer)
-            .trace_path(path.clone())
-            .cpu_profiling(CpuProfilingConfig::default().frequency_hz(100))
-            .build()
-            .context("start Dial9 profiler")?;
-        let handle = guard.handle();
-        guard.enable();
+        let recorder = recorder(writer)
+            .with_cpu_profiling(CpuProfilingConfig::default().frequency_hz(100))
+            .build();
+        // Dial9 allows one recorder per process and hands any later one back
+        // disabled rather than failing.
+        anyhow::ensure!(
+            recorder.handle().is_enabled(),
+            "start Dial9 profiler: this process already has one"
+        );
         let start_instant = Instant::now();
         let start_monotonic_ns = clock_monotonic_ns();
-        record_event(
-            RhoProfileSession {
-                timestamp_ns: start_monotonic_ns,
-                frequency_hz: 100,
-            },
-            &handle,
-        );
+        recorder.handle().record_event(RhoProfileSession {
+            timestamp_ns: start_monotonic_ns,
+            frequency_hz: 100,
+        });
         Ok(Self {
             path,
             output_path,
             start_instant,
             start_monotonic_ns,
-            guard,
-            handle,
+            recorder,
         })
     }
 
@@ -264,9 +264,8 @@ impl CpuProfiler {
 
     /// Stops a rolling profiler and flushes its current segment.
     pub fn shutdown(self) -> anyhow::Result<()> {
-        self.guard
-            .graceful_shutdown(Duration::from_secs(30))
-            .context("finish Dial9 trace")
+        self.recorder.graceful_shutdown(Duration::from_secs(30));
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -293,58 +292,45 @@ impl CpuProfiler {
             let timestamp_ns = instant_ns(span.start, self.start_instant, self.start_monotonic_ns);
             let duration_ns = duration_ns(span.end.saturating_duration_since(span.start));
             match span.kind {
-                GpuiFrameSpanKind::Latency => record_event(
-                    RhoGpuiLatencyV1 {
+                GpuiFrameSpanKind::Latency => {
+                    self.recorder.handle().record_event(RhoGpuiLatencyV1 {
                         timestamp_ns,
                         duration_ns,
                         tid: span.tid,
                         frame: span.frame,
                         window: span.window,
                         invalidations: span.invalidations,
-                    },
-                    &self.handle,
-                ),
-                GpuiFrameSpanKind::Draw => record_event(
-                    RhoGpuiDrawV1 {
-                        timestamp_ns,
-                        duration_ns,
-                        tid: span.tid,
-                        frame: span.frame,
-                        window: span.window,
-                        invalidations: span.invalidations,
-                    },
-                    &self.handle,
-                ),
+                    })
+                }
+                GpuiFrameSpanKind::Draw => self.recorder.handle().record_event(RhoGpuiDrawV1 {
+                    timestamp_ns,
+                    duration_ns,
+                    tid: span.tid,
+                    frame: span.frame,
+                    window: span.window,
+                    invalidations: span.invalidations,
+                }),
             }
         }
         for span in editor_spans {
-            record_event(
-                RhoEditorStageV1 {
-                    timestamp_ns: instant_ns(
-                        span.start,
-                        self.start_instant,
-                        self.start_monotonic_ns,
-                    ),
-                    duration_ns: duration_ns(span.end.saturating_duration_since(span.start)),
-                    tid: span.tid,
-                    kind: span.kind,
-                    input_edits: span.input_edits,
-                    input_start: span.input_start,
-                    input_rows: span.input_rows,
-                    output_edits: span.output_edits,
-                    output_start: span.output_start,
-                    output_rows: span.output_rows,
-                    old_rows: span.old_rows,
-                    new_rows: span.new_rows,
-                    pending_batches: span.pending_batches,
-                    flags: span.flags,
-                },
-                &self.handle,
-            );
+            self.recorder.handle().record_event(RhoEditorStageV1 {
+                timestamp_ns: instant_ns(span.start, self.start_instant, self.start_monotonic_ns),
+                duration_ns: duration_ns(span.end.saturating_duration_since(span.start)),
+                tid: span.tid,
+                kind: span.kind,
+                input_edits: span.input_edits,
+                input_start: span.input_start,
+                input_rows: span.input_rows,
+                output_edits: span.output_edits,
+                output_start: span.output_start,
+                output_rows: span.output_rows,
+                old_rows: span.old_rows,
+                new_rows: span.new_rows,
+                pending_batches: span.pending_batches,
+                flags: span.flags,
+            });
         }
-        self.guard
-            .graceful_shutdown(Duration::from_secs(30))
-            .context("finish Dial9 trace")?;
+        self.recorder.graceful_shutdown(Duration::from_secs(30));
         let raw_output = dial9_raw_output_path(&self.path);
         if raw_output.exists() {
             return Ok(raw_output);
@@ -453,8 +439,15 @@ fn absolute_path(path: PathBuf) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// Dial9 runs one recorder per process, so the tests that start one take
+    /// turns.
+    static RECORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn writes_a_dial9_profile() {
+        let _recorder = RECORDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cpu.bin");
         std::fs::write(directory.path().join("cpu.0.bin.gz"), b"stale").unwrap();
@@ -502,10 +495,12 @@ mod tests {
     /// snapshots dropped exactly that, so the tail comes back marked.
     #[test]
     fn a_rolling_snapshot_keeps_the_unsealed_tail() {
+        let _recorder = RECORDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("cpu.bin");
         let profiler = super::CpuProfiler::start_rolling(
-            &path,
+            directory.path(),
             std::time::Duration::from_millis(100),
             1024 * 1024,
         )

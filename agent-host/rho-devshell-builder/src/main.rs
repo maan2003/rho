@@ -6,13 +6,13 @@
 //! so rho runs it as a separate process rather than loading Nix into its
 //! own.
 //!
-//!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR] [--no-cache]
-//!     rho-devshell-builder activate <env-store-path> --dir DIR
+//!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR]
+//! [--no-cache]     rho-devshell-builder activate <env-store-path> --dir DIR
 //!     rho-devshell-builder pin <store-path> <gc-root>
 //!
 //! `shell` finds the shell in the daemon's cache in `DIR` (by default
-//! `rho_devshell::devshell_dir`) unless `--no-cache`, pinning it, or evaluates and
-//! caches it; writes its activation script into `DIR`; and prints it as
+//! `rho_devshell::devshell_dir`) unless `--no-cache`, pinning it, or evaluates
+//! and caches it; writes its activation script into `DIR`; and prints it as
 //! JSON (`rho_devshell::Shell`). The agent base's patched `nix develop`
 //! runs it too, and reads `env_store_path`. A flake without a shell exits
 //! with `rho_devshell::SHELL_FAILED`, the error on stderr and what to watch
@@ -29,23 +29,40 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use devenv_nix_backend::logger::strip_ansi;
 use devenv_nix_backend::{DevShellRequest, LocalInput, NIX_STACK_SIZE, NixRuntime};
-use rho_devshell::{Client, Evaluated, Event, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch};
+use rho_devshell::{
+    Client, Evaluated, Event, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch,
+};
 
-const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR] [--no-cache]
+const USAGE: &str =
+    "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR] [--no-cache]
        rho-devshell-builder activate <env-store-path> --dir DIR
        rho-devshell-builder pin <store-path> <gc-root>";
 
 enum Mode {
-    Shell { flake: Flake, dir: Option<PathBuf>, cache: bool },
-    Activate { env_store_path: String, dir: PathBuf },
-    Pin { store_path: String, gc_root: PathBuf },
+    Shell {
+        flake: Flake,
+        dir: Option<PathBuf>,
+        cache: bool,
+    },
+    Activate {
+        env_store_path: String,
+        dir: PathBuf,
+    },
+    Pin {
+        store_path: String,
+        gc_root: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<Mode> {
-    let mut args = std::env::args_os()
-        .skip(1)
-        .map(|arg| arg.into_string().map_err(|arg| anyhow::anyhow!("non-UTF-8 argument {arg:?}")));
-    let mut next = |what: &str| -> Result<String> { args.next().with_context(|| format!("missing {what}\n{USAGE}"))? };
+    let mut args = std::env::args_os().skip(1).map(|arg| {
+        arg.into_string()
+            .map_err(|arg| anyhow::anyhow!("non-UTF-8 argument {arg:?}"))
+    });
+    let mut next = |what: &str| -> Result<String> {
+        args.next()
+            .with_context(|| format!("missing {what}\n{USAGE}"))?
+    };
     match next("mode")?.as_str() {
         "shell" => {
             let dir = next("flake directory")?;
@@ -105,18 +122,29 @@ fn main() -> Result<()> {
         .spawn(move || {
             let mut nix = NixRuntime::new().map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
             match mode {
-                Mode::Shell { flake, dir, cache } => match shell(&mut nix, &flake, dir.as_deref(), cache)? {
-                    Ok(shell) => println!("{}", serde_json::to_string(&shell)?),
-                    Err(failure) => {
-                        eprintln!("{}", failure.error);
-                        println!("{}", serde_json::to_string(&failure.watch)?);
-                        std::process::exit(SHELL_FAILED);
+                Mode::Shell { flake, dir, cache } => {
+                    match shell(&mut nix, &flake, dir.as_deref(), cache)? {
+                        Ok(shell) => println!("{}", serde_json::to_string(&shell)?),
+                        Err(failure) => {
+                            eprintln!("{}", failure.error);
+                            println!("{}", serde_json::to_string(&failure.watch)?);
+                            std::process::exit(SHELL_FAILED);
+                        }
                     }
-                },
-                Mode::Activate { env_store_path, dir } => {
-                    println!("{}", write_activation(&nix, &dir, &env_store_path)?.display());
                 }
-                Mode::Pin { store_path, gc_root } => {
+                Mode::Activate {
+                    env_store_path,
+                    dir,
+                } => {
+                    println!(
+                        "{}",
+                        write_activation(&nix, &dir, &env_store_path)?.display()
+                    );
+                }
+                Mode::Pin {
+                    store_path,
+                    gc_root,
+                } => {
                     if !pin(&mut nix, &gc_root, &store_path)? {
                         std::process::exit(rho_devshell::PIN_GONE);
                     }
@@ -130,13 +158,21 @@ fn main() -> Result<()> {
 
 /// `flake`'s shell: a valid cached one, pinned, or a new evaluation, cached
 /// if it can be. Cache failures are reported and otherwise ignored.
-fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -> Result<Result<Shell, Failure>> {
+fn shell(
+    nix: &mut NixRuntime,
+    flake: &Flake,
+    dir: Option<&Path>,
+    cache: bool,
+) -> Result<Result<Shell, Failure>> {
     let started = std::time::Instant::now();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let client = dir.filter(|_| cache).map(Client::new);
     let record = |event: fn(u64) -> Event| {
         if let Some(client) = &client {
-            let _ = runtime.block_on(client.record(&flake.dir, event(started.elapsed().as_millis() as u64)));
+            let _ = runtime
+                .block_on(client.record(&flake.dir, event(started.elapsed().as_millis() as u64)));
         }
     };
     let mut key = flake.key()?;
@@ -174,7 +210,9 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
                 key = locked;
             }
             let mut id = None;
-            if let (Some(client), Some(dir), Some(evaluated), true) = (&client, dir, evaluation.cacheable(), stable) {
+            if let (Some(client), Some(dir), Some(evaluated), true) =
+                (&client, dir, evaluation.cacheable(), stable)
+            {
                 match runtime.block_on(store(nix, client, &key, dir, &evaluated)) {
                     Ok(stored) => id = Some(stored),
                     Err(e) => eprintln!("rho: failed to cache dev shell: {e:#}"),
@@ -208,10 +246,11 @@ struct Failure {
 /// An error from Nix as plain text: each context, then what it wraps, a
 /// line each.
 fn plain<'a>(chain: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>) -> String {
-    let lines: Vec<String> = chain.map(|error| error.to_string().trim_matches('\n').to_owned()).collect();
+    let lines: Vec<String> = chain
+        .map(|error| error.to_string().trim_matches('\n').to_owned())
+        .collect();
     strip_ansi(&lines.join("\n"))
 }
-
 
 /// The newest cached shell whose observations all hold now and whose
 /// environment could be pinned, and whether the key had entries at all.
@@ -232,7 +271,8 @@ async fn cached(
         if !now.holds(nix, &evaluated.observations) {
             continue;
         }
-        let gc_root = rho_devshell::gc_root(&rho_devshell::roots_dir(dir), &candidate.env_store_path);
+        let gc_root =
+            rho_devshell::gc_root(&rho_devshell::roots_dir(dir), &candidate.env_store_path);
         if !client.used(candidate.id).await? && !pin(nix, &gc_root, &candidate.env_store_path)? {
             client.forget(candidate.id).await?;
             continue;
@@ -267,7 +307,11 @@ impl<'a> Now<'a> {
 
     fn observe(&mut self, nix: &NixRuntime, observation: &Observation) -> Option<String> {
         let url = observation.input.url(self.root);
-        let seen = (url.clone(), observation.kind.clone(), observation.path.clone());
+        let seen = (
+            url.clone(),
+            observation.kind.clone(),
+            observation.path.clone(),
+        );
         if let Some(value) = self.seen.get(&seen) {
             return value.clone();
         }
@@ -332,7 +376,9 @@ fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation, Failure> 
             watch: Watch::failed(flake, &observations),
         }
     };
-    let eval = nix.eval_dev_shell(&request).map_err(|error| failed(plain(error.chain()), &[]))?;
+    let eval = nix
+        .eval_dev_shell(&request)
+        .map_err(|error| failed(plain(error.chain()), &[]))?;
     let shell = match eval.shell {
         Ok(shell) => shell,
         Err(error) => return Err(failed(plain(error.chain()), &eval.observations)),
@@ -354,13 +400,20 @@ fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation, Failure> 
 /// Evaluation's observations as every checkout of the flake at `root` can
 /// check them, if they can be: the flake's source was observed, and
 /// nothing changed while evaluation read it.
-fn record(root: &Path, observed: Vec<devenv_nix_backend::Observation>) -> Result<Vec<Observation>, String> {
+fn record(
+    root: &Path,
+    observed: Vec<devenv_nix_backend::Observation>,
+) -> Result<Vec<Observation>, String> {
     let mut values: HashMap<(String, InputUrl, String), String> = HashMap::new();
     let mut observations = Vec::new();
     for observation in observed {
         let input = InputUrl::parse(&observation.input, root)
             .ok_or_else(|| format!("cannot name the local input {}", observation.input))?;
-        let identity = (observation.kind.clone(), input.clone(), observation.path.clone());
+        let identity = (
+            observation.kind.clone(),
+            input.clone(),
+            observation.path.clone(),
+        );
         if let Some(previous) = values.insert(identity, observation.value.clone())
             && previous != observation.value
         {
@@ -376,7 +429,10 @@ fn record(root: &Path, observed: Vec<devenv_nix_backend::Observation>) -> Result
             value: observation.value,
         });
     }
-    if !observations.iter().any(|o| o.input.dir.as_os_str().is_empty()) {
+    if !observations
+        .iter()
+        .any(|o| o.input.dir.as_os_str().is_empty())
+    {
         return Err(format!("evaluation observed nothing of {}", root.display()));
     }
     observations.sort();
@@ -386,14 +442,27 @@ fn record(root: &Path, observed: Vec<devenv_nix_backend::Observation>) -> Result
 
 /// Pin a new cacheable shell, before this process and with it Nix's
 /// temporary root go away, then store it; returns its entry.
-async fn store(nix: &mut NixRuntime, client: &Client, key: &str, dir: &Path, evaluated: &Evaluated) -> Result<u64> {
+async fn store(
+    nix: &mut NixRuntime,
+    client: &Client,
+    key: &str,
+    dir: &Path,
+    evaluated: &Evaluated,
+) -> Result<u64> {
     let env_store_path = &evaluated.env_store_path;
     let roots = rho_devshell::roots_dir(dir);
     std::fs::create_dir_all(&roots)?;
-    nix.add_gc_root(&rho_devshell::gc_root(&roots, env_store_path), env_store_path)
-        .map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
+    nix.add_gc_root(
+        &rho_devshell::gc_root(&roots, env_store_path),
+        env_store_path,
+    )
+    .map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
     client
-        .store(key.to_owned(), env_store_path.clone(), serde_json::to_vec(evaluated)?)
+        .store(
+            key.to_owned(),
+            env_store_path.clone(),
+            serde_json::to_vec(evaluated)?,
+        )
         .await
 }
 
@@ -402,7 +471,8 @@ fn pin(nix: &mut NixRuntime, gc_root: &Path, store_path: &str) -> Result<bool> {
     if let Some(dir) = gc_root.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    nix.pin(gc_root, store_path).map_err(|e| anyhow::anyhow!(plain(e.chain())))
+    nix.pin(gc_root, store_path)
+        .map_err(|e| anyhow::anyhow!(plain(e.chain())))
 }
 
 /// Write `env_store_path`'s activation script into the cache directory
@@ -412,7 +482,8 @@ fn write_activation(nix: &NixRuntime, dir: &Path, env_store_path: &str) -> Resul
     if path.exists() {
         return Ok(path);
     }
-    let json = std::fs::read_to_string(env_store_path).with_context(|| format!("read {env_store_path}"))?;
+    let json = std::fs::read_to_string(env_store_path)
+        .with_context(|| format!("read {env_store_path}"))?;
     let data = path.with_extension("d");
     std::fs::create_dir_all(&data)?;
     let script = nix

@@ -23,6 +23,9 @@ pub(super) fn decode_size<B: Buf>(buf: &mut B, version: Version) -> Result<usize
 ///
 /// Lite messages use a varint size prefix.
 pub trait Message: Sized + std::fmt::Debug {
+	/// The largest body this receiver accepts for this message.
+	const MAX_SIZE: usize = MAX_MESSAGE_SIZE;
+
 	/// Encode this message body (without size prefix).
 	fn encode_msg<W: BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError>;
 
@@ -35,6 +38,10 @@ impl<T: Message> Encode<Version> for T {
 		tracing::trace!(?self, "encoding");
 		let mut sizer = Sizer::default();
 		self.encode_msg(&mut sizer, version)?;
+		// Never emit a body our own receiver would refuse.
+		if sizer.size > Self::MAX_SIZE {
+			return Err(EncodeError::TooLarge);
+		}
 		sizer.size.encode(w, version)?;
 		self.encode_msg(w, version)
 	}
@@ -43,6 +50,12 @@ impl<T: Message> Encode<Version> for T {
 impl<T: Message> Decode<Version> for T {
 	fn decode<B: Buf>(buf: &mut B, version: Version) -> Result<Self, DecodeError> {
 		let size = decode_size(buf, version)?;
+		if size > Self::MAX_SIZE {
+			return Err(DecodeError::MessageTooLarge {
+				size,
+				max: Self::MAX_SIZE,
+			});
+		}
 
 		if tracing::enabled!(tracing::Level::TRACE) {
 			if buf.remaining() < size {
@@ -50,7 +63,7 @@ impl<T: Message> Decode<Version> for T {
 			}
 			let raw = buf.copy_to_bytes(size);
 			let mut slice = &raw[..];
-			match Self::decode_msg(&mut slice, version) {
+			match Self::decode_msg(&mut slice, version).map_err(DecodeError::complete) {
 				Ok(result) => {
 					if slice.remaining() > 0 {
 						return Err(DecodeError::Long);
@@ -68,7 +81,7 @@ impl<T: Message> Decode<Version> for T {
 				return Err(DecodeError::Short);
 			}
 			let mut limited = buf.take(size);
-			match Self::decode_msg(&mut limited, version) {
+			match Self::decode_msg(&mut limited, version).map_err(DecodeError::complete) {
 				Ok(result) => {
 					if limited.remaining() > 0 {
 						return Err(DecodeError::Long);
@@ -105,10 +118,10 @@ mod tests {
 	fn rejects_oversized_message_before_reading_the_body() {
 		let mut wire = Vec::new();
 		((MAX_MESSAGE_SIZE + 1) as u64)
-			.encode(&mut wire, Version::Lite06Wip)
+			.encode(&mut wire, Version::Lite06)
 			.unwrap();
 
-		let err = Empty::decode(&mut wire.as_slice(), Version::Lite06Wip).unwrap_err();
+		let err = Empty::decode(&mut wire.as_slice(), Version::Lite06).unwrap_err();
 		assert!(matches!(
 			err,
 			DecodeError::MessageTooLarge {
@@ -121,9 +134,9 @@ mod tests {
 	#[test]
 	fn accepts_message_at_the_limit() {
 		let mut wire = Vec::new();
-		(MAX_MESSAGE_SIZE as u64).encode(&mut wire, Version::Lite06Wip).unwrap();
+		(MAX_MESSAGE_SIZE as u64).encode(&mut wire, Version::Lite06).unwrap();
 
-		let err = Empty::decode(&mut wire.as_slice(), Version::Lite06Wip).unwrap_err();
+		let err = Empty::decode(&mut wire.as_slice(), Version::Lite06).unwrap_err();
 		assert!(matches!(err, DecodeError::Short));
 	}
 }

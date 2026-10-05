@@ -64,7 +64,8 @@ fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin 
     Ok(fixed_session(async move {
         use moq_net::web_transport_trait::{RecvStream as _, SendStream as _};
         let _close = CloseTransport(transport.clone());
-        // The reverse stream carries asynchronous group floors, never a startup gate.
+        // The reverse stream carries asynchronous group floors, never a startup
+        // gate.
         let (mut send, mut recv) = transport.open_bi().await?;
         let video = async {
             let broadcast = origin.consume().request_broadcast("app").await?;
@@ -96,7 +97,8 @@ fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin 
             }
         };
         // QMux opens bidirectional streams lazily: write a one-byte preface to
-        // make the reverse floor stream visible without waiting for its receiver.
+        // make the reverse floor stream visible without waiting for its
+        // receiver.
         let lifetime = async {
             send.write_chunk(Bytes::from_static(&[0])).await?;
             let _ = send.closed().await;
@@ -433,7 +435,8 @@ mod tests {
                 local_client(down_b, viewer.clone()),
             )?;
             let mut upstream_prefs = video.track.clone();
-            // Consume the original viewer demand before looking for the changed floor.
+            // Consume the original viewer demand before looking for the changed
+            // floor.
             let _ = upstream_prefs.subscription_changed().await?;
             let remote = viewer.consume().request_broadcast("app").await?;
             let mut subscribed = remote.track("video")?.subscribe(None).await?.ordered();
@@ -451,7 +454,8 @@ mod tests {
                     .with_start(track::Position::group(1)),
             )?;
             // A spliced cursor forwards changed preferences to its active
-            // segment when polled, independently of the previously handed group.
+            // segment when polled, independently of the previously handed
+            // group.
             let mut next = Box::pin(subscribed.next_group());
             loop {
                 tokio::select! {
@@ -583,7 +587,8 @@ mod tests {
             let mut video = Video::new(&broadcast)?;
             let sending = publish(send_transport, &producer).await?;
             // The receiver has sent nothing and has not even started. Opening
-            // desktop video must demand encoding without a negotiation round trip.
+            // desktop video must demand encoding without a negotiation round
+            // trip.
             tokio::time::timeout(Duration::from_secs(2), video.track.used()).await??;
             let receiving = subscribe(recv_transport, consumer.clone()).await?;
             let mut announced = consumer.consume().announced();

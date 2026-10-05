@@ -35,6 +35,17 @@ pub(crate) fn invalid_input(message: &str) -> Error {
     }
 }
 
+pub(crate) fn unsupported(message: &str) -> Error {
+    #[cfg(not(redb_no_std))]
+    {
+        Error::new(std::io::ErrorKind::Unsupported, message)
+    }
+    #[cfg(redb_no_std)]
+    {
+        Error::other(message)
+    }
+}
+
 // Compiled for test builds as well, so that the tests below run as part of the normal test suite
 // rather than only in the no_std configuration.
 #[cfg(any(redb_no_std, test))]

@@ -3,7 +3,7 @@
 //! the transcript are both projections of these, and they are only ever
 //! appended.
 
-use rho_agent_types::{AgentId, UnixMs};
+use rho_agent_types::{AgentId, SendKind, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 use crate::inference::{Carry, Image, Usage};
@@ -63,8 +63,10 @@ pub enum Wake {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Notice {
-    /// A model request failed.
+    /// A model request failed, and the agent retries it by itself.
     Error(String),
+    /// The agent stopped on an error and will not go on without the user.
+    Stopped(String),
     Restarted,
     Archived,
     FreshNotebook,
@@ -189,27 +191,9 @@ pub enum Entry {
         id: MessageId,
         to: Party,
         text: String,
-    },
-    Status {
-        at: UnixMs,
-        text: String,
-    },
-    /// The model ended its turn with `end_turn()`: from here the agent is
-    /// parked on the human until they write or it is archived. A restart
-    /// does not end it; a restarted agent still waits for fresh input.
-    AwaitingHuman {
-        at: UnixMs,
-    },
-    /// The wait ended without the human writing: the agent was archived.
-    StoppedAwaitingHuman {
-        at: UnixMs,
-    },
-    /// The wait before it had a start and a stop: `since` set began it,
-    /// unset ended it. Only the store migration reads it.
-    #[senax(rename = "Awaiting")]
-    LegacyAwaiting {
-        at: UnixMs,
-        since: Option<UnixMs>,
+        /// What it is for. Only a send to the user ranks on it.
+        #[senax(default)]
+        kind: SendKind,
     },
     Notice {
         at: UnixMs,
@@ -307,10 +291,6 @@ impl Entry {
             | Entry::RequestSent { at, .. }
             | Entry::Received { at, .. }
             | Entry::Sent { at, .. }
-            | Entry::Status { at, .. }
-            | Entry::AwaitingHuman { at }
-            | Entry::StoppedAwaitingHuman { at }
-            | Entry::LegacyAwaiting { at, .. }
             | Entry::Notice { at, .. }
             | Entry::CompactionTrigger { at, .. } => *at,
         }

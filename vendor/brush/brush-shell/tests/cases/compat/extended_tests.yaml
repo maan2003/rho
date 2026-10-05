@@ -234,6 +234,61 @@ cases:
       [[ a =~ ^(a|b)$ ]] && echo "4. Pass"
       [[ a =~ c ]]       && echo "5. Pass"
 
+  # A ']' in the first member position (after any '^') is a member of the bracket
+  # expression, not its terminator.
+  - name: "Regex with leading ] in bracket expression"
+    stdin: |
+      [[ "]" =~ ^[]]$   ]] && echo "1. Matched"
+      [[ "a" =~ ^[]a]$  ]] && echo "2. Matched"
+      [[ "[" =~ ^[][]$  ]] && echo "3. Matched"
+      [[ "]" =~ ^[][]$  ]] && echo "4. Matched"
+      [[ "a" =~ ^[][]$  ]] || echo "5. Not matched"
+      [[ "[" =~ ^[^][]$ ]] || echo "6. Not matched"
+      [[ "a" =~ ^[^][]$ ]] && echo "7. Matched"
+      [[ "[" =~ ^[]a[]$ ]] && echo "8. Matched"
+      # Only the first '^' negates; the second is an ordinary member, so the ']'
+      # that follows it does terminate the expression.
+      [[ "xa" =~ ^[^^][ab]$ ]] && echo "9. Matched"
+      [[ "x[" =~ ^[^^][ab]$ ]] || echo "10. Not matched"
+      [[ "x]" =~ ^[^^]]$    ]] && echo "11. Matched"
+      # That leading ']' can also be the low end of a range.
+      [[ "^" =~ ^[]-a]$ ]] && echo "12. Matched"
+      [[ "]" =~ ^[]-a]$ ]] && echo "13. Matched"
+      [[ "-" =~ ^[]-a]$ ]] || echo "14. Not matched"
+      [[ "b" =~ ^[]-a]$ ]] || echo "15. Not matched"
+      echo "done"
+
+  # `fancy_regex` and POSIX ERE disagree on how a '-' range endpoint binds, and
+  # brush passes the user's bracket expression through without normalizing it.
+  - name: "Regex with '-' as a range endpoint"
+    known_failure: true
+    stdin: |
+      for s in '+' ',' '-' '.' '/' 'a'; do
+        [[ "$s" =~ ^[+--]$ ]] && echo "1. matched: $s"
+      done
+      for s in '+' ',' '-' '.' '/' 'a'; do
+        [[ "$s" =~ ^[--/]$ ]] && echo "2. matched: $s"
+      done
+      echo "done"
+
+  # A reversed range is rejected by both shells, but bash reports a bad regex as
+  # a usage error (status 2) while brush treats it as a failed match (status 1).
+  - name: "Regex with a reversed range"
+    known_failure: true
+    ignore_stderr: true
+    stdin: |
+      [[ x =~ ^[9-0]$ ]]
+      echo "status=$?"
+
+  # POSIX ERE reads '?*' as two stacked quantifiers; `fancy_regex` rejects the
+  # second as having no valid target.
+  - name: "Regex with stacked quantifiers"
+    known_failure: true
+    ignore_stderr: true
+    stdin: |
+      [[ "]" =~ ^[a]?*]$ ]]
+      echo "status=$?"
+
   - name: "Regex with case insensitivity"
     stdin: |
       shopt -u nocasematch
@@ -432,3 +487,129 @@ cases:
       arr=(a b c)
       declare -n ref='arr[5]'
       [[ -v ref ]] && echo "set" || echo "unset"
+
+  #
+  # Newlines within [[ ]] conditional expressions.
+  #
+  # bash allows newlines (1) at the start of a term (after `[[`, `(`, `&&`,
+  # `||`, `!`) and (2) trailing after a complete binary/unary/parenthesized
+  # term -- but NOT after a bare-word string test. These cases pin down both
+  # the accepted and rejected forms. See issue #1176.
+  #
+
+  - name: "Newline after ( in [[ ]]"
+    stdin: |
+      [[ (
+      a = a ) ]] && echo ok
+
+  - name: "Newline after ( before bare word in [[ ]]"
+    stdin: |
+      [[ (
+      a ) ]] && echo ok
+
+  - name: "Newline before ) after binary test in [[ ]]"
+    stdin: |
+      [[ ( a = a
+      ) ]] && echo ok
+
+  - name: "Newline before ) after unary test in [[ ]]"
+    stdin: |
+      [[ ( -n a
+      ) ]] && echo ok
+
+  - name: "Newline before ) after nested parens in [[ ]]"
+    stdin: |
+      [[ ( ( a = a )
+      ) ]] && echo ok
+
+  - name: "Multiple newlines before ) in [[ ]]"
+    stdin: |
+      [[ ( a = a
+
+
+
+      ) ]] && echo ok
+
+  - name: "Newline after && in [[ ]]"
+    stdin: |
+      [[ ( a = a &&
+      b = b ) ]] && echo ok
+
+  - name: "Newline before && after binary test in [[ ]]"
+    stdin: |
+      [[ a = a
+      && b = b ]] && echo ok
+
+  - name: "Newline before || after binary test in [[ ]]"
+    stdin: |
+      [[ a = b
+      || b = b ]] && echo ok
+
+  - name: "Leading newline after [[ "
+    stdin: |
+      [[
+      a = a ]] && echo ok
+
+  - name: "Newline after ! in [[ ]]"
+    stdin: |
+      [[ !
+      a = b ]] && echo ok
+
+  - name: "Newline before ]] after binary test"
+    stdin: |
+      [[ a = a
+      ]] && echo ok
+
+  - name: "Newline before ]] after unary test"
+    stdin: |
+      [[ -n a
+      ]] && echo ok
+
+  - name: "Newline before ]] after parenthesized expression"
+    stdin: |
+      [[ ( a = a )
+      ]] && echo ok
+
+  - name: "Newline before ]] after not of parenthesized expression"
+    stdin: |
+      [[ ! ( a = b )
+      ]] && echo ok
+
+  # Cases bash rejects as syntax errors: a newline may not follow a bare-word
+  # string test (whether before `]]`, `)`, or a binary/logical operator).
+
+  - name: "Error: newline before ]] after bare word"
+    ignore_stderr: true
+    stdin: |
+      [[ a
+      ]] && echo should-not-print
+
+  - name: "Error: newline before ) after bare word"
+    ignore_stderr: true
+    stdin: |
+      [[ ( a
+      ) ]] && echo should-not-print
+
+  - name: "Error: newline before && after bare word"
+    ignore_stderr: true
+    stdin: |
+      [[ a
+      && b ]] && echo should-not-print
+
+  - name: "Error: newline before ) after not of bare word"
+    ignore_stderr: true
+    stdin: |
+      [[ ( ! a
+      ) ]] && echo should-not-print
+
+  # POSIX regexes have no line anchors: ^ and $ match only at the ends of the
+  # whole string, while . matches any character including newline.
+  - name: "Regex anchors match the whole string, not lines"
+    stdin: |
+      s=$'a\nb'
+      [[ $s =~ ^b ]] && echo "wrong 1" || echo "ok 1"
+      [[ $s =~ a$ ]] && echo "wrong 2" || echo "ok 2"
+      [[ $s =~ ^a.b$ ]] && echo "ok 3"
+      t=$' \t\nabc \t\n'
+      re=$'[ \t\n]+$'
+      [[ $t =~ $re ]] && printf '[%s]\n' "${t::${#t}-${#BASH_REMATCH}}"

@@ -1,6 +1,10 @@
 use crate::display::WebDisplay;
-use crate::events::{ClickState, EventListenerHandle, WebEventListeners, is_mac_platform};
+use crate::events::{
+    ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
+};
+use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
+use crate::viewport::WebViewport;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -9,8 +13,9 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
     Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowInsets, WindowParams, WindowVisibility, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -20,8 +25,10 @@ pub(crate) struct WebWindowCallbacks {
     pub(crate) request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     pub(crate) input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     pub(crate) active_status_change: Option<Box<dyn FnMut(bool)>>,
+    pub(crate) visibility_change: Option<Box<dyn FnMut(WindowVisibility)>>,
     pub(crate) hover_status_change: Option<Box<dyn FnMut(bool)>>,
     pub(crate) resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    pub(crate) visual_viewport_changed: Option<Box<dyn FnMut()>>,
     pub(crate) moved: Option<Box<dyn FnMut()>>,
     pub(crate) should_close: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) close: Option<Box<dyn FnOnce()>>,
@@ -38,6 +45,7 @@ pub(crate) struct WebWindowMutableState {
     pub(crate) input_handler: Option<PlatformInputHandler>,
     pub(crate) is_fullscreen: bool,
     pub(crate) is_active: bool,
+    pub(crate) visibility: WindowVisibility,
     pub(crate) is_hovered: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
@@ -47,22 +55,38 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
-    pub(crate) input_container: web_sys::HtmlElement,
-    pub(crate) input_element: web_sys::HtmlInputElement,
-    pub(crate) keyboard_input_element: web_sys::HtmlInputElement,
+    pub(crate) ime_mirror: ImeMirror,
+    pub(crate) viewport: RefCell<WebViewport>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
+    pub(crate) touch_input: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
-    pub(crate) pressed_button: Cell<Option<MouseButton>>,
-    pub(crate) touch_drag: RefCell<Option<crate::events::TouchDrag>>,
     pub(crate) direct_touch_region: Cell<Option<Bounds<Pixels>>>,
     pub(crate) direct_touches: RefCell<HashSet<i32>>,
-    pub(crate) fling: RefCell<Option<crate::events::Fling>>,
+    pub(crate) touch_ids: RefCell<TouchIds>,
+    pub(crate) pressed_button: Cell<Option<MouseButton>>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    /// Set while `show_virtual_keyboard` blur/focus-cycles the hidden input.
+    /// The cycle is a keyboard-visibility hint, not a real activity change;
+    /// letting the focus/blur listeners report it would re-enter GPUI
+    /// synchronously from inside an input dispatch, and a `RefCell`
+    /// double-borrow panic on wasm never unwinds, wedging the app.
+    pub(crate) suppress_focus_status_events: Cell<bool>,
+    /// The visual viewport height when the current pointer gesture began.
+    /// A mid-gesture change means the software keyboard opened or closed and
+    /// reflowed the layout, so the release position no longer refers to what
+    /// the user aimed at.
+    pub(crate) gesture_start_visual_viewport_height: Cell<f64>,
+    /// A touch that may still resolve into a tap: its pointer id and starting
+    /// position, cleared once it travels beyond touch slop. Virtual keyboard
+    /// and IME focus may only change when a touch release completes a tap;
+    /// pans must leave them untouched, or scrolling over editable content
+    /// flickers the keyboard and drags the caret around.
+    pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -77,6 +101,8 @@ pub struct WebWindow {
     _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
+    _safe_area_observer: Option<web_sys::ResizeObserver>,
+    _safe_area_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
     _event_listeners: WebEventListeners,
 }
 
@@ -101,6 +127,9 @@ impl WebWindow {
             ("display", "block"),
             ("outline", "none"),
             ("touch-action", "none"),
+            ("-webkit-touch-callout", "none"),
+            ("user-select", "none"),
+            ("-webkit-user-select", "none"),
         ] {
             style.set_property(property, value).map_err(|error| {
                 anyhow::anyhow!("Failed to set canvas {property} style: {error:?}")
@@ -146,54 +175,14 @@ impl WebWindow {
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
-        // Text input reaches the window through two hidden inputs, and the
-        // touch keyboard is controlled purely by which one holds DOM focus:
-        // Safari ignores dynamic `inputmode` edits until the element is
-        // refocused, so toggling one input's attributes cannot work, while a
-        // focus transfer between two inputs applies each one's mode reliably.
-        // `input_element` (inputmode=none) is the resting focus holder that
-        // relays hardware keys without raising a keyboard; focusing
-        // `keyboard_input_element` raises it. The keyboard listeners attach
-        // to this shared container so both inputs feed the same handlers.
-        let input_container: web_sys::HtmlElement = document
-            .create_element("div")
-            .map_err(|e| anyhow::anyhow!("Failed to create input container: {e:?}"))?
-            .dyn_into()
-            .map_err(|e| anyhow::anyhow!("Created element is not an html element: {e:?}"))?;
-        let make_input = |keyboard: bool| -> anyhow::Result<web_sys::HtmlInputElement> {
-            let input_element: web_sys::HtmlInputElement = document
-                .create_element("input")
-                .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
-                .dyn_into()
-                .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
-            if keyboard {
-                // The raised keyboard types into the editor; predictive text
-                // and autocapitalization would corrupt it through composition
-                // events.
-                input_element.set_attribute("autocapitalize", "off").ok();
-                input_element.set_attribute("autocorrect", "off").ok();
-                input_element.set_attribute("autocomplete", "off").ok();
-                input_element.set_attribute("spellcheck", "false").ok();
-            } else {
-                input_element.set_attribute("inputmode", "none").ok();
-            }
-            let input_style = input_element.style();
-            input_style.set_property("position", "fixed").ok();
-            input_style.set_property("top", "0").ok();
-            input_style.set_property("left", "0").ok();
-            input_style.set_property("width", "1px").ok();
-            input_style.set_property("height", "1px").ok();
-            input_style.set_property("opacity", "0").ok();
-            input_container
-                .append_child(&input_element)
-                .map_err(|e| anyhow::anyhow!("Failed to append input to container: {e:?}"))?;
-            Ok(input_element)
-        };
-        let input_element = make_input(false)?;
-        let keyboard_input_element = make_input(true)?;
-        body.append_child(&input_container)
-            .map_err(|e| anyhow::anyhow!("Failed to append input container to body: {e:?}"))?;
-        input_element.focus().ok();
+        let touch_input = browser_window
+            .match_media("(pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|query| query.matches());
+        let ime_mirror = ImeMirror::new(&document, &body, touch_input)?;
+        let mut viewport = WebViewport::new(&document)?;
+        viewport.update(&browser_window, &canvas)?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -210,7 +199,8 @@ impl WebWindow {
             title: String::new(),
             input_handler: None,
             is_fullscreen: false,
-            is_active: true,
+            is_active: document_is_active(&browser_window),
+            visibility: document_visibility(&browser_window),
             is_hovered: false,
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
@@ -222,22 +212,24 @@ impl WebWindow {
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
-            input_container,
-            input_element,
-            keyboard_input_element,
+            ime_mirror,
+            viewport: RefCell::new(viewport),
             has_device_pixel_support,
             is_mac,
+            touch_input,
             state: RefCell::new(mutable_state),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
-            pressed_button: Cell::new(None),
-            touch_drag: RefCell::new(None),
             direct_touch_region: Cell::new(None),
             direct_touches: RefCell::new(HashSet::new()),
-            fling: RefCell::new(None),
+            touch_ids: RefCell::new(TouchIds::default()),
+            pressed_button: Cell::new(None),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            suppress_focus_status_events: Cell::new(false),
+            gesture_start_visual_viewport_height: Cell::new(0.0),
+            touch_tap_candidate: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -257,6 +249,26 @@ impl WebWindow {
         }
 
         let event_listeners = inner.register_event_listeners();
+        let safe_area_observer_closure = Closure::wrap(Box::new({
+            let inner = Rc::downgrade(&inner);
+            move |_: js_sys::Array| {
+                if let Some(inner) = inner.upgrade() {
+                    inner.notify_viewport_changed();
+                }
+            }
+        }) as Box<dyn FnMut(js_sys::Array)>);
+        let safe_area_observer =
+            match web_sys::ResizeObserver::new(safe_area_observer_closure.as_ref().unchecked_ref())
+            {
+                Ok(observer) => {
+                    inner.viewport.borrow().observe_safe_area(&observer);
+                    Some(observer)
+                }
+                Err(error) => {
+                    log::warn!("Failed to observe safe area: {error:?}");
+                    None
+                }
+            };
 
         Ok(Self {
             inner,
@@ -267,6 +279,8 @@ impl WebWindow {
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
             _event_listeners: event_listeners,
+            _safe_area_observer: safe_area_observer,
+            _safe_area_observer_closure: safe_area_observer_closure,
         })
     }
 
@@ -369,11 +383,57 @@ impl WebWindow {
                 |callbacks| &mut callbacks.resize,
                 |callback| callback(new_size, dpr_f32),
             );
+
+            // ResizeObserver runs after layout but before the browser paints.
+            // Render synchronously here so the newly resized CSS canvas is
+            // never presented with its previous backing image stretched into
+            // the new viewport dimensions.
+            inner.with_callback(
+                |callbacks| &mut callbacks.request_frame,
+                |callback| {
+                    callback(RequestFrameOptions {
+                        require_presentation: true,
+                        force_render: true,
+                        host_vsync: None,
+                    })
+                },
+            );
         })
     }
 }
 
 impl WebWindowInner {
+    fn sample_viewport(&self) -> bool {
+        match self
+            .viewport
+            .borrow_mut()
+            .update(&self.browser_window, &self.canvas)
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::warn!("Failed to update browser viewport: {error:#}");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn notify_viewport_changed(&self) {
+        self.with_callback(
+            |callbacks| &mut callbacks.visual_viewport_changed,
+            |callback| callback(),
+        );
+    }
+
+    pub(crate) fn refresh_active_status(&self) {
+        let active = document_is_active(&self.browser_window);
+        if std::mem::replace(&mut self.state.borrow_mut().is_active, active) != active {
+            self.with_callback(
+                |callbacks| &mut callbacks.active_status_change,
+                |callback| callback(active),
+            );
+        }
+    }
+
     /// Invokes a registered callback with take/call/restore semantics.
     ///
     /// The callback is removed from the slot for the duration of the call, so
@@ -392,17 +452,6 @@ impl WebWindowInner {
         Some(result)
     }
 
-    /// Whether the keyboard-raising hidden input holds DOM focus, i.e.
-    /// whether the touch keyboard is (being) shown.
-    pub(crate) fn keyboard_input_focused(&self) -> bool {
-        self.browser_window
-            .document()
-            .and_then(|document| document.active_element())
-            .is_some_and(|active| {
-                js_sys::Object::is(active.as_ref(), self.keyboard_input_element.as_ref())
-            })
-    }
-
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let this = Rc::clone(self);
         let closure = Closure::new(move || {
@@ -411,9 +460,6 @@ impl WebWindowInner {
             // (e.g. views invalidated during draw) schedule the next request
             // instead of being swallowed.
             this.raf_id.set(None);
-            // Momentum scroll before drawing so the frame reflects it. Its
-            // input event wakes the demand-driven loop for the next step.
-            this.process_fling();
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -424,17 +470,6 @@ impl WebWindowInner {
                     })
                 },
             );
-            // Dismissal counterpart to the pointerup keyboard raise in
-            // events.rs: the draw above has settled which view holds the
-            // input handler, so a frame that ends without one parks focus
-            // back on the inputmode=none holder, dropping the touch
-            // keyboard. Unlike raising, dismissal is allowed outside a user
-            // gesture. take_input_handler cannot make this call — GPUI takes
-            // and re-installs the handler transiently during every draw, and
-            // reacting there made the keyboard flicker.
-            if this.state.borrow().input_handler.is_none() && this.keyboard_input_focused() {
-                this.input_element.focus().ok();
-            }
         });
 
         let js_func: js_sys::Function =
@@ -500,27 +535,18 @@ impl WebWindowInner {
             document.as_ref(),
             "visibilitychange",
             move |_event: JsValue| {
-                let is_visible = this
-                    .browser_window
-                    .document()
-                    .map(|doc| {
-                        let state_str: String =
-                            js_sys::Reflect::get(&doc, &"visibilityState".into())
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .unwrap_or_default();
-                        state_str == "visible"
-                    })
-                    .unwrap_or(true);
-
-                {
+                let visibility = document_visibility(&this.browser_window);
+                let visibility_changed = {
                     let mut state = this.state.borrow_mut();
-                    state.is_active = is_visible;
+                    std::mem::replace(&mut state.visibility, visibility) != visibility
+                };
+                this.refresh_active_status();
+                if visibility_changed {
+                    this.with_callback(
+                        |callbacks| &mut callbacks.visibility_change,
+                        |callback| callback(visibility),
+                    );
                 }
-                this.with_callback(
-                    |callbacks| &mut callbacks.active_status_change,
-                    |callback| callback(is_visible),
-                );
             },
         ))
     }
@@ -593,6 +619,9 @@ impl Drop for WebWindow {
         if let Some(ref observer) = self._resize_observer {
             observer.disconnect();
         }
+        if let Some(observer) = &self._safe_area_observer {
+            observer.disconnect();
+        }
 
         // The DPR media-query closure captures an `Rc<WebWindowInner>` and is
         // stored inside the inner itself, forming a reference cycle; take it
@@ -601,8 +630,7 @@ impl Drop for WebWindow {
 
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
-        let input_container: &web_sys::Element = self.inner.input_container.as_ref();
-        input_container.remove();
+        self.inner.ime_mirror.remove();
         self.active_window.borrow_mut().take();
         self.lifecycle.set(WebWindowLifecycle::Closed);
     }
@@ -621,6 +649,30 @@ fn current_appearance(browser_window: &web_sys::Window) -> WindowAppearance {
     } else {
         WindowAppearance::Light
     }
+}
+
+/// The Page Visibility API: `hidden` when the tab is in the background or the
+/// browser window is minimized. A missing document reads as visible.
+fn document_visibility(browser_window: &web_sys::Window) -> WindowVisibility {
+    let is_visible = browser_window
+        .document()
+        .and_then(|document| js_sys::Reflect::get(&document, &"visibilityState".into()).ok())
+        .and_then(|value| value.as_string())
+        .is_none_or(|state| state == "visible");
+
+    if is_visible {
+        WindowVisibility::Visible
+    } else {
+        WindowVisibility::Hidden
+    }
+}
+
+fn document_is_active(browser_window: &web_sys::Window) -> bool {
+    document_visibility(browser_window).is_visible()
+        && browser_window
+            .document()
+            .and_then(|document| document.has_focus().ok())
+            .unwrap_or(true)
 }
 
 struct MqlHandle {
@@ -727,16 +779,72 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        // Deliberately DOM-neutral. Text input on touch devices is provided
-        // by the in-canvas keyboard; physical keyboard events still arrive
-        // through the inputmode=none holder.
         self.inner.state.borrow_mut().input_handler = Some(input_handler);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
-        // Also DOM-neutral: GPUI takes the handler transiently during every
-        // draw, and reacting here made the keyboard flicker.
         self.inner.state.borrow_mut().input_handler.take()
+    }
+
+    fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+        self.inner.ime_mirror.apply_configuration(&configuration);
+    }
+
+    fn show_soft_keyboard(&self) {
+        self.inner.show_virtual_keyboard();
+    }
+
+    fn hide_soft_keyboard(&self) {
+        if !self.inner.touch_input {
+            return;
+        }
+        self.inner.suppress_focus_status_events.set(true);
+        self.inner.ime_mirror.set_virtual_keyboard_enabled(false);
+        self.inner.suppress_focus_status_events.set(false);
+    }
+
+    fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
+        self.inner.viewport.borrow().visible_bounds
+    }
+
+    fn prepare_frame(&self) -> bool {
+        self.inner.sample_viewport()
+    }
+
+    fn on_visual_viewport_changed(&self, callback: Box<dyn FnMut()>) {
+        self.inner.callbacks.borrow_mut().visual_viewport_changed = Some(callback);
+    }
+
+    fn insets(&self) -> WindowInsets {
+        self.inner.viewport.borrow().insets.clone()
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        // React to editability transitions, not each frame: manually dismissing
+        // the keyboard must remain effective until another editing gesture.
+        // On desktop, the DOM input remains the keyboard event receiver even
+        // when GPUI focuses a read-only surface. Blurring it would also disable
+        // hardware shortcuts, unlike a native window.
+        if self.inner.touch_input {
+            match change {
+                TextInputStateChange::FocusGained => self.inner.show_virtual_keyboard(),
+                TextInputStateChange::FocusLost => self.hide_soft_keyboard(),
+                TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
+            }
+            return;
+        }
+        match change {
+            TextInputStateChange::FocusGained => {
+                self.inner.ime_mirror.set_read_only(false);
+                if !self.inner.ime_mirror.is_focused() {
+                    self.inner.focus_ime_mirror();
+                }
+            }
+            TextInputStateChange::FocusLost => {
+                self.inner.ime_mirror.set_read_only(true);
+            }
+            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
+        }
     }
 
     fn prompt(
@@ -755,6 +863,10 @@ impl PlatformWindow for WebWindow {
 
     fn is_active(&self) -> bool {
         self.inner.state.borrow().is_active
+    }
+
+    fn visibility(&self) -> WindowVisibility {
+        self.inner.state.borrow().visibility
     }
 
     fn is_hovered(&self) -> bool {
@@ -826,6 +938,10 @@ impl PlatformWindow for WebWindow {
         self.inner.callbacks.borrow_mut().active_status_change = Some(callback);
     }
 
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        self.inner.callbacks.borrow_mut().visibility_change = Some(callback);
+    }
+
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.inner.callbacks.borrow_mut().hover_status_change = Some(callback);
     }
@@ -872,10 +988,6 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
-    fn completed_frame(&self) {
-        // On web, presentation happens automatically via wgpu surface present
-    }
-
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }
@@ -889,7 +1001,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        Some(self.inner.state.borrow().renderer.gpu_specs())
+        self.inner.state.borrow().renderer.gpu_specs()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

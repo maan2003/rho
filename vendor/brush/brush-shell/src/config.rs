@@ -7,7 +7,10 @@
 
 use brush_interactive::UIOptions;
 use etcetera::BaseStrategy;
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use crate::args::CommandLineArgs;
 
@@ -153,10 +156,9 @@ impl ConfigLoadResult {
             return Ok(self.config);
         };
 
-        let path_display = self
-            .path
-            .as_ref()
-            .map_or_else(|| String::from("<unknown>"), |p| p.display().to_string());
+        let path_display = self.path.as_ref().map_or(Cow::Borrowed("<unknown>"), |p| {
+            Cow::Owned(p.display().to_string())
+        });
 
         if self.explicit_path {
             // User explicitly provided --config; treat errors as fatal.
@@ -281,7 +283,6 @@ pub fn load_config(disabled: bool, explicit_path: Option<&Path>) -> ConfigLoadRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     #[test]
     fn empty_config() {
@@ -412,11 +413,9 @@ mod tests {
 
         // Simulate CLI explicitly setting values different from defaults
         // by parsing with the flags enabled
-        let args = CommandLineArgs::try_parse_from([
-            "brush",
-            "--enable-highlighting",
-            "--enable-zsh-hooks",
-        ])
+        let args = CommandLineArgs::try_parse_from(
+            ["brush", "--enable-highlighting", "--enable-zsh-hooks"].map(String::from),
+        )
         .unwrap();
 
         // CLI explicitly enables highlighting and zsh-hooks (differs from default)
@@ -429,11 +428,9 @@ mod tests {
     #[test]
     fn to_ui_options_cli_only_settings() {
         let config = Config::default();
-        let args = CommandLineArgs::try_parse_from([
-            "brush",
-            "--disable-bracketed-paste",
-            "--disable-color",
-        ])
+        let args = CommandLineArgs::try_parse_from(
+            ["brush", "--disable-bracketed-paste", "--disable-color"].map(String::from),
+        )
         .unwrap();
 
         let ui = config.to_ui_options(&args);

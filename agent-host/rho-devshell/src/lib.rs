@@ -122,7 +122,10 @@ impl Source {
                 return Self {
                     scheme: Scheme::Git,
                     root: dir.to_path_buf(),
-                    subdir: flake_dir.strip_prefix(dir).unwrap_or(Path::new("")).to_path_buf(),
+                    subdir: flake_dir
+                        .strip_prefix(dir)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
                 };
             }
         }
@@ -153,7 +156,12 @@ impl Flake {
     }
 
     pub fn attr_path(&self) -> String {
-        format!("devShells.{}-{}.{}", std::env::consts::ARCH, std::env::consts::OS, self.shell)
+        format!(
+            "devShells.{}-{}.{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            self.shell
+        )
     }
 
     /// What every valid cached shell of this flake has in common: the
@@ -225,8 +233,12 @@ impl InputUrl {
         let after = &url[colon + 1..];
         let slashes = if after.starts_with("//") { 2 } else { 0 };
         let path_start = colon + 1 + slashes;
-        let path_end = url[path_start..].find(['?', '#']).map_or(url.len(), |i| path_start + i);
-        let dir = PathBuf::from(OsString::from_vec(percent_decode(&url[path_start..path_end])?));
+        let path_end = url[path_start..]
+            .find(['?', '#'])
+            .map_or(url.len(), |i| path_start + i);
+        let dir = PathBuf::from(OsString::from_vec(percent_decode(
+            &url[path_start..path_end],
+        )?));
         if !dir.is_absolute() {
             return None;
         }
@@ -248,7 +260,12 @@ impl InputUrl {
 
     /// The input's URL in the checkout at `root`.
     pub fn url(&self, root: &Path) -> String {
-        format!("{}{}{}", self.prefix, percent_encode(self.dir(root).as_os_str().as_encoded_bytes()), self.rest)
+        format!(
+            "{}{}{}",
+            self.prefix,
+            percent_encode(self.dir(root).as_os_str().as_encoded_bytes()),
+            self.rest
+        )
     }
 
     fn is_git(&self) -> bool {
@@ -259,7 +276,11 @@ impl InputUrl {
 /// `base` joined with `rel`, without a trailing slash for an empty `rel`;
 /// an absolute `rel` replaces `base`.
 fn join(base: &Path, rel: &Path) -> PathBuf {
-    if rel.as_os_str().is_empty() { base.to_path_buf() } else { base.join(rel) }
+    if rel.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rel)
+    }
 }
 
 fn percent_decode(s: &str) -> Option<Vec<u8>> {
@@ -400,8 +421,15 @@ impl Stats {
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        writeln!(f, "over the last {:.1} hours", now.saturating_sub(self.since) as f64 / 3600.0)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        writeln!(
+            f,
+            "over the last {:.1} hours",
+            now.saturating_sub(self.since) as f64 / 3600.0
+        )?;
         writeln!(f, "{:<34}{:>8}", "kept (no builder)", self.kept)?;
         for (name, timing) in [
             ("hit", self.hit),
@@ -411,12 +439,21 @@ impl std::fmt::Display for Stats {
             ("failed", self.failed),
         ] {
             let mean = timing.total_ms.checked_div(timing.count).unwrap_or(0);
-            writeln!(f, "{name:<34}{:>8}   mean {mean:>6} ms   max {:>6} ms", timing.count, timing.max_ms)?;
+            writeln!(
+                f,
+                "{name:<34}{:>8}   mean {mean:>6} ms   max {:>6} ms",
+                timing.count, timing.max_ms
+            )?;
         }
         let served = self.kept + self.hit.count;
-        let all = served + self.miss.count + self.stale.count + self.uncached.count + self.failed.count;
+        let all =
+            served + self.miss.count + self.stale.count + self.uncached.count + self.failed.count;
         if all > 0 {
-            write!(f, "served from cache: {:.1}% of {all}", 100.0 * served as f64 / all as f64)?;
+            write!(
+                f,
+                "served from cache: {:.1}% of {all}",
+                100.0 * served as f64 / all as f64
+            )?;
         }
         Ok(())
     }
@@ -504,14 +541,18 @@ impl Watch {
                         watch.contents.insert(git.common.join("packed-refs"));
                         if let Some(head) = std::fs::read_to_string(git.dir.join("HEAD"))
                             .ok()
-                            .and_then(|head| head.strip_prefix("ref: ").map(|r| r.trim().to_owned()))
+                            .and_then(|head| {
+                                head.strip_prefix("ref: ").map(|r| r.trim().to_owned())
+                            })
                         {
                             watch.contents.insert(git.common.join(head));
                         }
                     }
                 }
                 _ => {
-                    watch.contents.insert(join(&dir, Path::new(&observation.path)));
+                    watch
+                        .contents
+                        .insert(join(&dir, Path::new(&observation.path)));
                 }
             }
         }
@@ -549,7 +590,10 @@ impl Watch {
     /// Whether a subscription to `other` sees every change this watch would.
     fn within(&self, other: &Watch) -> bool {
         self.contents.is_subset(&other.contents)
-            && self.names.iter().all(|name| other.names.contains(name) || other.contents.contains(name))
+            && self
+                .names
+                .iter()
+                .all(|name| other.names.contains(name) || other.contents.contains(name))
     }
 }
 
@@ -646,7 +690,10 @@ pub fn resolver() -> Arc<Resolver> {
 pub async fn command(cwd: &Path, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
     let flake = {
         let cwd = cwd.to_owned();
-        tokio::task::spawn_blocking(move || find_flake(&cwd)).await.ok().flatten()
+        tokio::task::spawn_blocking(move || find_flake(&cwd))
+            .await
+            .ok()
+            .flatten()
     };
     let activation = match flake {
         None => None,
@@ -681,7 +728,12 @@ pub async fn command(cwd: &Path, program: impl AsRef<std::ffi::OsStr>) -> tokio:
 impl Resolver {
     /// Without `cache`, every shell is evaluated, and `dir` is only where
     /// activation scripts go.
-    pub fn new(cache: Option<Client>, dir: PathBuf, builder: PathBuf, environment: Vec<(OsString, OsString)>) -> Self {
+    pub fn new(
+        cache: Option<Client>,
+        dir: PathBuf,
+        builder: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Self {
         Self {
             cache: cache.map(Arc::new),
             dir,
@@ -714,7 +766,13 @@ impl Resolver {
             let flake = flake.clone();
             tokio::task::spawn_blocking(move || flake.key()).await??
         };
-        let lock = self.keys.lock().unwrap().entry(key.clone()).or_default().clone();
+        let lock = self
+            .keys
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .clone();
         let result = {
             let _guard = lock.lock().await;
             match self.hot(flake).await {
@@ -724,7 +782,10 @@ impl Resolver {
         };
         drop(lock);
         let mut keys = self.keys.lock().unwrap();
-        if keys.get(&key).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+        if keys
+            .get(&key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
             keys.remove(&key);
         }
         result
@@ -805,14 +866,22 @@ impl Resolver {
     /// Keep `resolved` for [`Self::hot`] if nothing it was built from can
     /// have changed since the builder checked it unseen: watched from
     /// before, or watched now and confirmed by checking again.
-    async fn keep(&self, flake: &Flake, mut resolved: Resolved, before: Option<(Watch, rho_watch::Subscription)>) {
+    async fn keep(
+        &self,
+        flake: &Flake,
+        mut resolved: Resolved,
+        before: Option<(Watch, rho_watch::Subscription)>,
+    ) {
         let Some(hot) = &self.hot else {
             return;
         };
         if resolved.id.is_none() {
             return;
         }
-        hot.watches.lock().unwrap().insert(slot(flake), resolved.watch.clone());
+        hot.watches
+            .lock()
+            .unwrap()
+            .insert(slot(flake), resolved.watch.clone());
         let subscription = match before {
             Some((watch, subscription))
                 if resolved.watch.within(&watch) && matches!(subscription.changed(), Ok(false)) =>
@@ -820,10 +889,13 @@ impl Resolver {
                 subscription
             }
             _ => {
-                let Some((_, subscription)) = self.subscribe(hot, resolved.watch.clone()).await else {
+                let Some((_, subscription)) = self.subscribe(hot, resolved.watch.clone()).await
+                else {
                     return;
                 };
-                let Ok((again, _)) = self.build(flake).await else { return };
+                let Ok((again, _)) = self.build(flake).await else {
+                    return;
+                };
                 if again.id.is_none()
                     || again.env_store_path != resolved.env_store_path
                     || !again.watch.within(&resolved.watch)
@@ -870,7 +942,11 @@ impl Resolver {
             return Ok(path);
         }
         let mut command = self.builder_command();
-        command.arg("activate").arg(env_store_path).arg("--dir").arg(&self.dir);
+        command
+            .arg("activate")
+            .arg(env_store_path)
+            .arg("--dir")
+            .arg(&self.dir);
         let output = run(command).await?;
         ensure!(
             output.status.success(),
@@ -883,7 +959,10 @@ impl Resolver {
     /// The builder pinning `env_store_path` with a GC root, for [`pinned`].
     fn pin_command(&self, env_store_path: &str) -> tokio::process::Command {
         let mut command = self.builder_command();
-        command.arg("pin").arg(env_store_path).arg(gc_root(&roots_dir(&self.dir), env_store_path));
+        command
+            .arg("pin")
+            .arg(env_store_path)
+            .arg(gc_root(&roots_dir(&self.dir), env_store_path));
         command
     }
 
@@ -903,8 +982,11 @@ impl Resolver {
         command.current_dir(&flake.dir);
         let output = run(command).await?;
         if output.status.code() == Some(SHELL_FAILED) {
-            let watch = serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
-            let message = String::from_utf8_lossy(&output.stderr).trim_end().to_owned();
+            let watch = serde_json::from_slice(&output.stdout)
+                .context("parse rho-devshell-builder output")?;
+            let message = String::from_utf8_lossy(&output.stderr)
+                .trim_end()
+                .to_owned();
             return Err(Failed { message, watch }.into());
         }
         ensure!(
@@ -912,13 +994,16 @@ impl Resolver {
             "rho-devshell-builder failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let shell = serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
+        let shell =
+            serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
         Ok((shell, output.stderr))
     }
 
     fn builder_command(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.builder);
-        command.env_clear().envs(self.environment.iter().map(|(k, v)| (k, v)));
+        command
+            .env_clear()
+            .envs(self.environment.iter().map(|(k, v)| (k, v)));
         command
     }
 }
@@ -957,7 +1042,10 @@ async fn pinned(command: tokio::process::Command) -> Result<bool> {
     match output.status.code() {
         Some(0) => Ok(true),
         Some(PIN_GONE) => Ok(false),
-        _ => bail!("pinning failed: {}", String::from_utf8_lossy(&output.stderr)),
+        _ => bail!(
+            "pinning failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
     }
 }
 
@@ -980,12 +1068,23 @@ async fn run(mut command: tokio::process::Command) -> Result<Output> {
         .stderr(std::process::Stdio::piped());
     rho_fs_view::command_stdio_only(&mut command);
     let mut child = command.spawn().context("start rho-devshell-builder")?;
-    let _group = Group(child.id().and_then(|id| rustix::process::Pid::from_raw(id as i32)));
+    let _group = Group(
+        child
+            .id()
+            .and_then(|id| rustix::process::Pid::from_raw(id as i32)),
+    );
     let mut stdout = child.stdout.take().unwrap().take(MAX_OUTPUT + 1);
     let mut stderr = child.stderr.take().unwrap().take(64 * 1024);
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let (status, _, _) = tokio::try_join!(child.wait(), stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))?;
-    ensure!(out.len() as u64 <= MAX_OUTPUT, "rho-devshell-builder output too large");
+    let (status, _, _) = tokio::try_join!(
+        child.wait(),
+        stdout.read_to_end(&mut out),
+        stderr.read_to_end(&mut err)
+    )?;
+    ensure!(
+        out.len() as u64 <= MAX_OUTPUT,
+        "rho-devshell-builder output too large"
+    );
     Ok(Output {
         status,
         stdout: out,
@@ -1051,7 +1150,10 @@ mod tests {
         let root = Path::new("/work/a b");
         let url = InputUrl::parse("git+file:///work/a%20b?dir=sub", root).unwrap();
         assert_eq!(url.dir, Path::new(""));
-        assert_eq!(url.url(Path::new("/other/ch%eckout")), "git+file:///other/ch%25eckout?dir=sub");
+        assert_eq!(
+            url.url(Path::new("/other/ch%eckout")),
+            "git+file:///other/ch%25eckout?dir=sub"
+        );
         let nested = InputUrl::parse("path:/work/a%20b/vendored", root).unwrap();
         assert_eq!(nested.dir, Path::new("vendored"));
         assert_eq!(nested.url(root), "path:/work/a%20b/vendored");

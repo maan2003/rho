@@ -284,8 +284,8 @@ fn get_field_attributes(attrs: &[Attribute], field_name: &str) -> FieldAttribute
         }
     }
 
-    // ID calculation: Use explicit ID if provided, otherwise calculate CRC64 from
-    // rename or field name
+    // ID calculation: Use explicit ID if provided, otherwise calculate CRC64
+    // from rename or field name
     let calculated_id = id.unwrap_or_else(|| {
         let name_for_id = if let Some(ref rename_val) = rename {
             rename_val.as_str()
@@ -433,7 +433,8 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
                             }
                         });
                     } else if field_attrs.skip_default {
-                        // For skip_default fields, check if the value is default before encoding
+                        // For skip_default fields, check if the value is
+                        // default before encoding
                         field_encode.push(quote! {
                             if senax_encoder::Encoder::is_default(&self.#field_ident) == false {
                                 senax_encoder::core::write_field_id_optimized(writer, #field_id)?;
@@ -491,7 +492,8 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
 
                 let variant_ident = &v.ident;
 
-                // Generate is_default check for this variant if it has #[default] attribute
+                // Generate is_default check for this variant if it has
+                // #[default] attribute
                 if is_default_variant {
                     match &v.fields {
                         Fields::Named(fields) => {
@@ -587,7 +589,8 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
                                     }
                                 });
                             } else if field_attrs.skip_default {
-                                // For skip_default fields, check if the value is default before
+                                // For skip_default fields, check if the value
+                                // is default before
                                 // encoding
                                 field_encode.push(quote! {
                                     if senax_encoder::Encoder::is_default(#field_ident) == false {
@@ -841,7 +844,8 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
                                 #ident: field_values.#ident,
                             }
                         } else if attrs.default || attrs.skip_default {
-                            // Fields marked with default or skip_default use default value if
+                            // Fields marked with default or skip_default use
+                            // default value if
                             // missing
                             quote! {
                                 #ident: field_values.#ident.unwrap_or_default(),
@@ -1025,14 +1029,16 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
                             }
 
                             if attrs.skip_decode {
-                                // Fields marked with skip_decode use default values
+                                // Fields marked with skip_decode use default
+                                // values
                                 struct_assignments_enum_named
                                     .push(quote! { #ident: Default::default(), });
                             } else if is_option_type(ty) {
                                 struct_assignments_enum_named
                                     .push(quote! { #ident: field_values.#ident, });
                             } else if attrs.default || attrs.skip_default {
-                                // Fields marked with default or skip_default use default value if
+                                // Fields marked with default or skip_default
+                                // use default value if
                                 // missing
                                 struct_assignments_enum_named.push(quote! {
                                     #ident: field_values.#ident.unwrap_or_default(),
@@ -1229,8 +1235,8 @@ pub fn derive_pack(input: TokenStream) -> TokenStream {
         });
     }
 
-    // Generate pack implementation for structs and enums (no field IDs for struct
-    // fields)
+    // Generate pack implementation for structs and enums (no field IDs for
+    // struct fields)
     let pack_fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(fields) => {
@@ -1383,8 +1389,8 @@ pub fn derive_unpack(input: TokenStream) -> TokenStream {
         });
     }
 
-    // Generate unpack implementation for structs and enums (no field IDs for struct
-    // fields)
+    // Generate unpack implementation for structs and enums (no field IDs for
+    // struct fields)
     let unpack_fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(fields) => {
@@ -1435,7 +1441,8 @@ pub fn derive_unpack(input: TokenStream) -> TokenStream {
                         let field_types: Vec<_> =
                             fields.named.iter().map(|f| f.ty.clone()).collect();
 
-                        // For unpack, decode fields in order without expecting field IDs
+                        // For unpack, decode fields in order without expecting
+                        // field IDs
                         let field_assignments =
                             field_idents
                                 .iter()

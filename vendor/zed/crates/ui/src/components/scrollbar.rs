@@ -2,7 +2,7 @@ use std::{any::Any, fmt::Debug, ops::Not, time::Duration};
 use web_time::Instant;
 
 use gpui::{
-    Along, Anchor, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle, Bounds,
+    Along, Anchor, AnyElement, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle, Bounds,
     Color as GpuiColor, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Div, Edges,
     Element, ElementId, Entity, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     InteractiveElement, IntoElement, IsZero, LayoutId, ListState, MouseButton, MouseDownEvent,
@@ -237,7 +237,7 @@ impl<T: ScrollableHandle> UniformListDecoration for ScrollbarStateWrapper<T> {
             origin: -scroll_offset,
             state: self.0.clone(),
         }
-        .into_any()
+        .into_any_element()
     }
 }
 
@@ -942,7 +942,7 @@ impl<T: ScrollableHandle> Render for ScrollbarState<T> {
     }
 }
 
-struct ScrollbarElement<T: ScrollableHandle> {
+pub struct ScrollbarElement<T: ScrollableHandle> {
     origin: Point<Pixels>,
     state: Entity<ScrollbarState<T>>,
 }
@@ -962,6 +962,11 @@ impl ThumbState {
 }
 
 impl ScrollableHandle for UniformListScrollHandle {
+    #[inline(never)]
+    fn into_scrollbar_element(element: ScrollbarElement<Self>) -> AnyElement {
+        element.into_any()
+    }
+
     fn max_offset(&self) -> Point<Pixels> {
         self.0.borrow().base_handle.max_offset()
     }
@@ -980,6 +985,11 @@ impl ScrollableHandle for UniformListScrollHandle {
 }
 
 impl ScrollableHandle for ListState {
+    #[inline(never)]
+    fn into_scrollbar_element(element: ScrollbarElement<Self>) -> AnyElement {
+        element.into_any()
+    }
+
     fn max_offset(&self) -> Point<Pixels> {
         self.max_offset_for_scrollbar()
     }
@@ -1006,6 +1016,11 @@ impl ScrollableHandle for ListState {
 }
 
 impl ScrollableHandle for ScrollHandle {
+    #[inline(never)]
+    fn into_scrollbar_element(element: ScrollbarElement<Self>) -> AnyElement {
+        element.into_any()
+    }
+
     fn max_offset(&self) -> Point<Pixels> {
         self.max_offset()
     }
@@ -1024,6 +1039,10 @@ impl ScrollableHandle for ScrollHandle {
 }
 
 pub trait ScrollableHandle: 'static + Any + Sized + Clone {
+    fn into_scrollbar_element(element: ScrollbarElement<Self>) -> AnyElement {
+        element.into_any()
+    }
+
     fn max_offset(&self) -> Point<Pixels>;
     fn set_offset(&self, point: Point<Pixels>);
     fn offset(&self) -> Point<Pixels>;
@@ -1649,6 +1668,10 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+
+    fn into_any_element(self) -> AnyElement {
+        T::into_scrollbar_element(self)
     }
 }
 

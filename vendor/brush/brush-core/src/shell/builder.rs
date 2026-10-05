@@ -23,7 +23,8 @@ impl<SE: extensions::ShellExtensions, S: shell_builder::IsComplete> ShellBuilder
         // Construct the shell.
         let mut shell = Shell::new(options)?;
 
-        // Load profiles/configuration, unless skipped.
+        // Load profiles/configuration (and then history), unless skipped. Callers that skip
+        // both are expected to call `load_config` themselves before needing history.
         if !profile.skip() || !rc.skip() {
             shell.load_config(&profile, &rc).await?;
         }
@@ -182,6 +183,12 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
     /// Whether to launch external commands as session leaders.
     #[builder(default)]
     pub external_cmd_leads_session: bool,
+    /// Whether externally spawned commands should be killed when their spawning
+    /// shell is dropped. Defaults to `false` (children outlive the shell, as a
+    /// real shell requires); enable for embedded shells, where a surviving child
+    /// leaks and can hold the shell's output pipe open past teardown.
+    #[builder(default)]
+    pub kill_external_commands_on_drop: bool,
     /// Initial working dir for the shell. If left unspecified, will be populated from
     /// the host environment.
     pub working_dir: Option<PathBuf>,

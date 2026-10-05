@@ -4,7 +4,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
+use rho_agent_types::{AgentRole, UnixMs};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
@@ -40,7 +40,6 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<crate::QueuedInput>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
 }
@@ -181,8 +180,8 @@ impl HostClient {
                             let status = published.status.lock().expect("poison").upgrade()
                                 .map(|status| status.read().expect("poison").clone());
                             if let Some(status) = status {
-                                let queue = published.queue.lock().expect("poison").clone();
-                                writer.send(port, encode(&Message::Status { status, queue })?).await?;
+                                // No loop keeps its queue outside its rows any more.
+                                writer.send(port, encode(&Message::Status { status, queue: None })?).await?;
                             }
                         }
                     }
@@ -483,9 +482,6 @@ impl HostClient {
     }
     pub(crate) async fn rewind(&self, at: UnixMs, to: AgentEventPos) -> Result<(), StoreError> {
         self.change(Request::Rewind { at, to }).await
-    }
-    pub(crate) async fn turn(&self, at: UnixMs, edge: TurnEdge) -> Result<(), StoreError> {
-        self.change(Request::Turn { at, edge }).await
     }
     async fn change(&self, request: Request<'_>) -> Result<(), StoreError> {
         match self.request(request).await.map_err(StoreError)? {

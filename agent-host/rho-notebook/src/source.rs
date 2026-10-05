@@ -92,6 +92,9 @@ pub(crate) struct Process {
     pub(crate) queued: Mutex<Option<mpsc::UnboundedReceiver<StdinWrite>>>,
     /// Flipped when the command ends.
     pub(crate) done: watch::Sender<bool>,
+    /// Whether it was started with a stdin pipe; otherwise it reads
+    /// `/dev/null` and refuses writes.
+    pub(crate) stdin: bool,
 }
 
 pub(crate) struct State {

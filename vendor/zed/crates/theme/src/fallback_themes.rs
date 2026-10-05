@@ -260,6 +260,7 @@ pub(crate) fn zed_default_dark() -> Theme {
                     .into(),
                 minimap_thumb_border: hsla(228. / 360., 8. / 100., 25. / 100., 1.).into(),
                 editor_foreground: hsla(218. / 360., 14. / 100., 71. / 100., 1.).into(),
+                editor_code_lens_foreground: None,
                 link_text_hover: blue.into(),
                 version_control_added: ADDED_COLOR.into(),
                 version_control_deleted: REMOVED_COLOR.into(),

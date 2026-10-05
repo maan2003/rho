@@ -26,8 +26,8 @@ use brush_core::{
     ExecutionControlFlow, ExecutionParameters, ProcessGroupPolicy, Shell, ShellValue,
     ShellVariable, SourceInfo,
 };
-use rand::RngCore as _;
-use rand::rngs::OsRng;
+use rand::TryRng as _;
+use rand::rngs::SysRng;
 
 use crate::kernel::{
     MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
@@ -354,7 +354,7 @@ fn set_exported(shell: &mut Shell, name: &str, value: impl Into<ShellValue>) -> 
 
 fn random_token() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let mut token = String::with_capacity(bytes.len() * 2);

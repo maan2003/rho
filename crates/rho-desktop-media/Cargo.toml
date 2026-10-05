@@ -17,7 +17,7 @@ bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "net", "time", "macros"] }
 moq-net = { path = "../../vendor/moq/rs/moq-net" }
 moq-tokio = { path = "../../vendor/moq/rs/moq-tokio", default-features = false }
-qmux = { version = "0.5.1", default-features = false, features = ["tcp"] }
+qmux = { version = "0.5.2", default-features = false, features = ["tcp"] }
 shiguredo_libvpx = { path = "../../vendor/libvpx-rs", optional = true }
 yuv = { version = "0.8.19", optional = true }
 

@@ -27,15 +27,35 @@ impl Execution {
                 );
                 let runtime =
                     std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required")?;
+                const NO_DESKTOP: &str =
+                    "No desktop is running for this agent; ask the agent to open an application";
+                // The directory is named by the handle the agent had when it
+                // started the desktop, so find it by id.
+                let mut agents = tokio::fs::read_dir(
+                    std::path::PathBuf::from(runtime).join("rho-desktop/agents"),
+                )
+                .await
+                .context(NO_DESKTOP)?;
+                let mut directory = None;
+                while let Some(entry) = agents.next_entry().await? {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .and_then(rho_agent_types::parse_full_handle)
+                        == Some(agent)
+                    {
+                        directory = Some(entry.path());
+                        break;
+                    }
+                }
                 let descriptor: serde_json::Value = serde_json::from_slice(
                     &tokio::fs::read(
-                        std::path::PathBuf::from(runtime)
-                            .join("rho-desktop/agents")
-                            .join(agent.encoded())
+                        directory
+                            .context(NO_DESKTOP)?
                             .join(format!("{session}.json")),
                     )
                     .await
-                    .context("No desktop is running for this agent; ask the agent to open an application")?,
+                    .context(NO_DESKTOP)?,
                 )?;
                 Reply::Desktop {
                     socket: descriptor["socket"]
@@ -354,6 +374,11 @@ async fn desktop_sessions() -> anyhow::Result<Vec<rho_desktop_client::protocol::
                 {
                     continue;
                 }
+                // The directory is named by the agent's `$RHO_AGENT_ID`, a
+                // handle; the protocol names agents by their bare id.
+                let Some(owner) = rho_agent_types::parse_full_handle(owner) else {
+                    continue;
+                };
                 // The compositor holds this lock from before publishing until
                 // shutdown. Checking it cannot block on a full socket backlog.
                 use std::os::fd::AsRawFd;
@@ -365,7 +390,7 @@ async fn desktop_sessions() -> anyhow::Result<Vec<rho_desktop_client::protocol::
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
                 {
                     sessions.push(rho_desktop_client::protocol::DesktopSession {
-                        agent: owner.to_owned(),
+                        agent: owner.encoded(),
                         name: name.to_owned(),
                     });
                 }

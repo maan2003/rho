@@ -4,9 +4,9 @@
 //! segment-aware prefix operations. [`Pattern`] describes a set of paths with
 //! wildcards, and [`Patterns`] is a union of them reduced by containment. The
 //! grammar and algebra live in [`moq-pattern`](moq_pattern); this module
-//! re-exports them beside [`Path`] so grants, origin scopes, announce interests,
-//! and wildcard advertisements can share one dialect. Literal path construction
-//! and wire decoding retain their existing behavior.
+//! re-exports them beside [`Path`] so grants, origin scopes, and announce
+//! interests can share one dialect. Literal path construction and wire
+//! decoding retain their existing behavior.
 
 pub use moq_pattern::{InvalidPattern, Pattern, Patterns, Segment, Specificity};
 
@@ -150,7 +150,7 @@ impl<'a> Path<'a> {
 	}
 
 	// A copy of this path skipping the first `n` bytes, reusing the shared buffer when possible.
-	fn slice_from(&'a self, n: usize) -> Path<'a> {
+	pub(crate) fn slice_from(&'a self, n: usize) -> Path<'a> {
 		match &self.0 {
 			Repr::Borrowed(s) => Path(Repr::Borrowed(&s[n..])),
 			Repr::Shared { buf, start } => Path(Repr::Shared {
@@ -261,6 +261,12 @@ impl<'a> Path<'a> {
 		} else {
 			Some((s, Path::empty()))
 		}
+	}
+
+	/// Whether a segment starts with `.`, which hides the path from announce
+	/// discovery below the requested prefix.
+	pub(crate) fn is_hidden(&self) -> bool {
+		self.parts().any(|part| part.starts_with('.'))
 	}
 
 	/// The normalized path as a string, with no leading or trailing slash.

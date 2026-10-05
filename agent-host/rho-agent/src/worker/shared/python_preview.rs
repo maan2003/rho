@@ -139,6 +139,7 @@ fn preview_from_start(
         known_sum(
             original.root_node(),
             &source[..completed.map_or(source.len(), |end| end - 1)],
+            completed.is_some(),
             string_end?.end_byte(),
             first,
         )
@@ -154,9 +155,11 @@ fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usiz
         .count()
         .min(2);
     let preceding = &source[..source.len() - count];
-    (preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0)
-        .then_some(count)
-        .unwrap_or(0)
+    if preceding.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 0 {
+        count
+    } else {
+        0
+    }
 }
 
 fn last_send(node: Node<'_>, source: &str) -> Option<usize> {
@@ -205,13 +208,21 @@ fn start_at(node: Node<'_>, offset: usize) -> Option<Node<'_>> {
     None
 }
 
-fn known_sum(tree: Node<'_>, source: &str, mut i: usize, mut text: String) -> Option<String> {
+fn known_sum(
+    tree: Node<'_>,
+    source: &str,
+    call_ended: bool,
+    mut i: usize,
+    mut text: String,
+) -> Option<String> {
     let bytes = source.as_bytes();
     loop {
         while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n')) {
             i += 1;
         }
-        if i == bytes.len() {
+        // The text argument ends at the call's end, or at the keywords of a
+        // call known to be a send.
+        if i == bytes.len() || (call_ended && bytes[i] == b',') {
             return Some(text);
         }
         let plus = bytes[i] == b'+';
@@ -296,7 +307,13 @@ fn send_string<'a>(
             .is_some_and(|callee| &source[callee.byte_range()] == "human.send")
     {
         let args = node.child_by_field_name("arguments")?;
-        if args.named_child_count() == 1 {
+        // The text, then only keywords (`kind=`).
+        let mut cursor = args.walk();
+        let keywords_only = args
+            .named_children(&mut cursor)
+            .skip(1)
+            .all(|child| child.kind() == "keyword_argument");
+        if args.named_child_count() >= 1 && keywords_only {
             let arg = args.named_child(0)?;
             if !arg.has_error() {
                 if synthetic_boundary.is_some()
@@ -426,6 +443,7 @@ mod tests {
                 Some("real"),
             ),
             ("human.send('old')\nhuman.send('new", Some("new")),
+            ("human.send('done', kind='result')", Some("done")),
             (
                 "end_turn()\nfor item in items:\n    print(item)\nhuman.send(\"After work",
                 Some("After work"),
@@ -447,6 +465,7 @@ mod tests {
             .unwrap();
         for source in [
             "human.send(value)",
+            "human.send('text', value)",
             "human.send('old')\nhuman.send(name + 'suffix",
             "# human.send('comment",
             "print('human.send(\\\"string')",

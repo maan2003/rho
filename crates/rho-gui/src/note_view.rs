@@ -166,12 +166,13 @@ impl NoteView {
                 .map(|(_, buffer)| buffer.clone())
             {
                 Some(buffer) => buffer,
-                None => cx.new(|_| {
+                None => cx.new(|cx| {
                     Buffer::remote(
                         next_row_buffer_id(),
                         ReplicaId::new(0),
                         Capability::ReadOnly,
                         "",
+                        cx,
                     )
                 }),
             };

@@ -100,7 +100,8 @@ async fn agents_terminal_and_shell_share_workset_process() {
     // cargo build -p rho-inference -p rho-shell --bins
     use rho_shell_view::protocol::{ShellClientFrame, ShellServerFrame};
     // /src is replaced by the workset even in exposed mode. Stage the
-    // companion inside that workset rather than assuming the checkout is visible.
+    // companion inside that workset rather than assuming the checkout is
+    // visible.
     let shell =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/rho-shell");
     assert!(

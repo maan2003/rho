@@ -1261,7 +1261,7 @@ impl<K: Key, V: Value> Btree<K, V> {
                                 let child = accessor.child_page(i).unwrap();
                                 next_children.push(self.mem.get_page(child, self.hint)?);
                             }
-                            accessor.print_node::<K>();
+                            accessor.print_node();
                         }
                         _ => unreachable!(),
                     }
@@ -1433,13 +1433,14 @@ mod tests {
             AllocationPolicy, InMemoryBackend, PAGE_SIZE, TransactionalMemory,
         };
 
-        let mem = TransactionalMemory::new(
+        let (mem, _writer_lock) = TransactionalMemory::new(
             Box::new(InMemoryBackend::new()),
             true,
             PAGE_SIZE,
             None,
             0,
             false,
+            crate::db::ConcurrencyMode::ExclusiveWriter,
         )
         .unwrap();
         mem.reset_allocator_state().unwrap();

@@ -141,7 +141,7 @@ pub struct ConfirmCodeAction {
 }
 
 /// Toggles comment markers for the selected lines.
-#[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
 pub struct ToggleComments {
@@ -149,6 +149,22 @@ pub struct ToggleComments {
     pub advance_downwards: bool,
     #[serde(default)]
     pub ignore_indent: bool,
+    /// Whether to add comment markers to blank lines inside a multi-line
+    /// selection. A line of only whitespace counts as blank. Defaults to true.
+    #[serde(default = "default_true")]
+    pub comment_empty_lines: bool,
+}
+
+// `Default` is written out rather than derived because `comment_empty_lines`
+// defaults to true.
+impl Default for ToggleComments {
+    fn default() -> Self {
+        Self {
+            advance_downwards: false,
+            ignore_indent: false,
+            comment_empty_lines: true,
+        }
+    }
 }
 
 /// Toggles block comment markers for the selected text.
@@ -491,7 +507,7 @@ actions!(
         CopyFileName,
         /// Copies the file name without extension to the clipboard.
         CopyFileNameWithoutExtension,
-        /// Copies a permalink to the current line.
+        /// Copies a permalink to the current line or selection.
         CopyPermalinkToLine,
         /// Cuts selected text to the clipboard.
         Cut,
@@ -582,8 +598,6 @@ actions!(
         /// edits outside the selected ranges are discarded. External command formatters do not
         /// support range formatting and are skipped.
         FormatSelections,
-        /// Goes to the declaration of the symbol at cursor.
-        GoToDeclaration,
         /// Goes to declaration in a split pane.
         GoToDeclarationSplit,
         /// Goes to definition in a split pane.
@@ -612,8 +626,6 @@ actions!(
         GoToNextReference,
         /// Goes to the previous reference to the symbol under the cursor.
         GoToPreviousReference,
-        /// Goes to the type definition of the symbol at cursor.
-        GoToTypeDefinition,
         /// Goes to type definition in a split pane.
         GoToTypeDefinitionSplit,
         /// Goes to the next document highlight.
@@ -719,7 +731,7 @@ actions!(
         OpenProposedChangesEditor,
         /// Opens documentation for the symbol at cursor.
         OpenDocs,
-        /// Opens a permalink to the current line.
+        /// Opens a permalink to the current line or selection.
         OpenPermalinkToLine,
         /// Opens the file whose name is selected in the editor.
         #[action(deprecated_aliases = ["editor::OpenFile"])]
@@ -880,6 +892,10 @@ actions!(
         ToggleGitBlameInline,
         /// Opens the git commit for the blame at cursor.
         OpenGitBlameCommit,
+        /// Opens a blame of the file at the revision of the blame entry at cursor.
+        BlameRevision,
+        /// Opens a blame of the file at the revision preceding the blame entry at cursor.
+        BlamePreviousRevision,
         /// Toggles the diagnostics panel.
         ToggleDiagnostics,
         /// Toggles indent guides display.
@@ -942,6 +958,8 @@ actions!(
         UnwrapSyntaxNode,
         /// Wraps selections in tag specified by language.
         WrapSelectionsInTag,
+        /// Wraps selections in an expanded Emmet abbreviation.
+        WrapWithAbbreviation,
         /// Aligns selections from different rows into the same column
         AlignSelections,
         /// Saves the current location to navigation history.
@@ -962,12 +980,34 @@ pub struct GoToDefinition {
     pub open_results_in: Option<OpenResultsIn>,
 }
 
+/// Goes to the declaration of the symbol at cursor.
+#[derive(PartialEq, Clone, Default, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct GoToDeclaration {
+    /// Where to show the declarations. Falls back to the `lsp_results_location`
+    /// setting when omitted. A single result is always opened directly.
+    #[serde(default)]
+    pub open_results_in: Option<OpenResultsIn>,
+}
+
 /// Goes to the implementation of the symbol at cursor.
 #[derive(PartialEq, Clone, Default, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
 pub struct GoToImplementation {
     /// Where to show the implementations. Falls back to the `lsp_results_location`
+    /// setting when omitted. A single result is always opened directly.
+    #[serde(default)]
+    pub open_results_in: Option<OpenResultsIn>,
+}
+
+/// Goes to the type definition of the symbol at cursor.
+#[derive(PartialEq, Clone, Default, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct GoToTypeDefinition {
+    /// Where to show the definitions. Falls back to the `lsp_results_location`
     /// setting when omitted. A single result is always opened directly.
     #[serde(default)]
     pub open_results_in: Option<OpenResultsIn>,

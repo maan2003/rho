@@ -16,7 +16,7 @@ chrono = { version = "0.4", default-features = false, features = [
 clap.workspace = true
 base64.workspace = true
 camino.workspace = true
-dial9-trace-format = "0.4.1"
+dial9-trace-format = "0.5.1"
 dirs.workspace = true
 flate2 = "1"
 redb.workspace = true

@@ -82,9 +82,11 @@ public final class BroadcastConsumer: Sendable {
         AudioConsumer(try await ffi.decodeAudio(name: name, catalogAudio: catalogAudio, output: output))
     }
 
-    /// Subscribe to a video track and decode it inside the bindings, yielding
-    /// packed I420. `catalogVideo` is the matching rendition from the catalog.
+    /// Subscribe to a video track and decode it inside the bindings.
+    /// `catalogVideo` is the matching rendition from the catalog.
     ///
+    /// `output.format` picks the packed CPU layout every frame arrives in and
+    /// defaults to I420; each frame repeats the layout it was decoded to.
     /// `output.resize` is best effort, so read each frame's own dimensions.
     public func decodeVideo(
         name: String,
@@ -150,13 +152,13 @@ public final class BroadcastProducer: Sendable {
 
     /// Advertise this broadcast's exact path as a route.
     ///
-    /// Announcing again re-prices the route in place. An unannounced broadcast
-    /// stays reachable by exact path; announcing only makes the path discoverable.
+    /// Announcing again re-prices the route in place. Until announced, the
+    /// broadcast is invisible and unroutable for local consumers and peers alike.
     public func announce(route: Route = Route()) throws {
         try ffi.announce(route: route)
     }
 
-    /// Retract this broadcast's exact-path advertisement, if any.
+    /// Retract this broadcast's advertisement, if any, from local consumers and peers alike.
     public func unannounce() throws {
         try ffi.unannounce()
     }
@@ -170,25 +172,33 @@ public final class BroadcastProducer: Sendable {
     /// are interpreted (e.g. `"opus"`, `"avc3"`). `video` seeds catalog fields
     /// that the stream cannot reveal before its first keyframe.
     /// Publish one audio codec as a new track. `initData` is required: audio resolves its whole
-    /// rendition from those bytes.
+    /// rendition from those bytes. `track` names the track; otherwise a unique name is derived from
+    /// the format.
     public func publishAudio(
         format: AudioFormat,
         initData: Data,
-        label: String? = nil
+        label: String? = nil,
+        track: String? = nil
     ) throws -> MediaProducer {
-        MediaProducer(try ffi.publishAudio(init: MoqAudioInit(format: format, data: initData, label: label)))
+        MediaProducer(
+            try ffi.publishAudio(init: MoqAudioInit(format: format, data: initData, label: label, track: track))
+        )
     }
 
     /// Publish one video codec as a new track. `initData` may be empty for a format that resolves
-    /// in band; `hint` seeds catalog fields the stream can't reveal.
+    /// in band; `hint` seeds catalog fields the stream can't reveal. `track` names the track;
+    /// otherwise a unique name is derived from the format.
     public func publishVideo(
         format: VideoFormat,
         initData: Data = Data(),
         label: String? = nil,
-        hint: VideoHint? = nil
+        hint: VideoHint? = nil,
+        track: String? = nil
     ) throws -> MediaProducer {
         MediaProducer(
-            try ffi.publishVideo(init: MoqVideoInit(format: format, data: initData, label: label, hint: hint))
+            try ffi.publishVideo(
+                init: MoqVideoInit(format: format, data: initData, label: label, hint: hint, track: track)
+            )
         )
     }
 
@@ -238,10 +248,13 @@ public final class BroadcastProducer: Sendable {
     public func publishVideoStream(
         format: VideoFormat,
         label: String? = nil,
-        hint: VideoHint? = nil
+        hint: VideoHint? = nil,
+        track: String? = nil
     ) throws -> MediaStreamProducer {
         MediaStreamProducer(
-            try ffi.publishVideoStream(init: MoqVideoInit(format: format, data: Data(), label: label, hint: hint))
+            try ffi.publishVideoStream(
+                init: MoqVideoInit(format: format, data: Data(), label: label, hint: hint, track: track)
+            )
         )
     }
 
@@ -260,7 +273,7 @@ public final class BroadcastProducer: Sendable {
 
     /// Open a raw-audio track. PCM written via `AudioProducer.write` is encoded
     /// inside the FFI boundary per `input`/`output`. Select the codec with
-    /// `AudioCodec.opus()` (currently the only constructor), placed in `output`.
+    /// `AudioCodec.opus()` or `AudioCodec.aac()`, placed in `output`.
     ///
     /// Pass `bandwidth` to reserve this track's bitrate against the session's
     /// allocator so a co-resident video encoder sizes itself against what is left.
@@ -331,8 +344,15 @@ public final class BroadcastProducer: Sendable {
         try ffi.removeCatalogSection(name: name)
     }
 
-    /// Finish the broadcast, finalizing the catalog stream.
+    /// End the broadcast for good: retract it and serve no new tracks.
+    ///
+    /// Tracks already subscribed carry on to their own end. Closing again is a no-op.
+    public func close() throws {
+        try ffi.close()
+    }
+
+    @available(*, deprecated, renamed: "close", message: "A broadcast end carries no cause.")
     public func finish() throws {
-        try ffi.finish()
+        try ffi.close()
     }
 }

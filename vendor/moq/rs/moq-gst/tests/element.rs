@@ -552,11 +552,11 @@ fn a_pipeline_description_names_the_track() {
 fn a_pipeline_description_configures_quic_timeouts() {
 	init();
 	let sink = gst::parse::launch(
-		"moqsink url=https://127.0.0.1:1 broadcast=test quic-idle-timeout=15000 quic-keep-alive=3000",
+		"moqsink url=https://127.0.0.1:1 broadcast=test quic-idle-timeout=15000 quic-keep-alive=2000",
 	)
 	.expect("parse the description");
 	assert_eq!(sink.property::<u64>("quic-idle-timeout"), 15_000);
-	assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
+	assert_eq!(sink.property::<u64>("quic-keep-alive"), 2_000);
 }
 
 #[test]
@@ -569,6 +569,20 @@ fn a_pipeline_description_selects_loc() {
 	assert_eq!(
 		child_of(&sink, "sink_0").property::<gstmoq::MediaContainer>("container"),
 		gstmoq::MediaContainer::Loc
+	);
+}
+
+#[test]
+fn a_pipeline_description_marks_an_encoder_pad() {
+	init();
+	let sink = gst::parse::launch("moqsink name=publisher url=https://127.0.0.1:1 broadcast=test sink_0::encoder=true")
+		.expect("parse the description");
+	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	assert!(child_of(&sink, "sink_0").property::<bool>("encoder"));
+	let _other = sink.request_pad_simple("sink_1").expect("request sink_1");
+	assert!(
+		!child_of(&sink, "sink_1").property::<bool>("encoder"),
+		"a pad is an import unless it says otherwise"
 	);
 }
 

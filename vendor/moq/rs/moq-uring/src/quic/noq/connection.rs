@@ -1,12 +1,13 @@
 //! The connection: shared state, the driver task, and the session handle.
 
 use std::cell::RefCell;
+use std::net::SocketAddr;
 use std::rc::{Rc, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use noq_proto::{ConnectionHandle, Dir, StreamId, VarInt};
+use moq_noq_proto::{ConnectionHandle, Dir, StreamId, VarInt};
 use rustc_hash::FxHashMap;
 
 use super::super::{Error, SEGMENT};
@@ -27,7 +28,7 @@ const TRAIN_SEGMENTS: usize = 63;
 /// operation can mutate the connection, drop that borrow, and then register a
 /// waiter without ever holding both.
 pub(crate) struct Inner {
-	pub(crate) conn: RefCell<noq_proto::Connection>,
+	pub(crate) conn: RefCell<moq_noq_proto::Connection>,
 	pub(crate) state: RefCell<State>,
 	/// The worker driving this connection, which anything layered on it
 	/// (the WebTransport handshake, say) runs on too.
@@ -277,6 +278,10 @@ pub struct Connection {
 	/// The negotiated ALPN, cached at establishment so `protocol()` can
 	/// borrow from the handle.
 	alpn: Option<String>,
+	/// The SNI the client presented, cached likewise.
+	server_name: Option<String>,
+	/// The peer's address when the handshake completed.
+	remote: SocketAddr,
 }
 
 impl Connection {
@@ -310,6 +315,18 @@ impl Connection {
 			.ok()?;
 		Some(chain.iter().map(|cert| cert.to_vec()).collect())
 	}
+
+	/// The peer's address as of the handshake; a peer that migrates later
+	/// keeps its connection but not this value.
+	pub fn remote_addr(&self) -> SocketAddr {
+		self.remote
+	}
+
+	/// The SNI the client presented, or `None` if it sent none. Always `None`
+	/// on a dialed connection.
+	pub fn server_name(&self) -> Option<&str> {
+		self.server_name.as_deref()
+	}
 }
 
 impl Clone for Connection {
@@ -318,6 +335,8 @@ impl Clone for Connection {
 			shared: self.shared.clone(),
 			park: kio::Park::default(),
 			alpn: self.alpn.clone(),
+			server_name: self.server_name.clone(),
+			remote: self.remote,
 		}
 	}
 }
@@ -333,7 +352,7 @@ pub(crate) fn launch(
 	socket: Rc<udp::Socket>,
 	endpoint: Weak<endpoint::Inner>,
 	key: ConnectionHandle,
-	conn: noq_proto::Connection,
+	conn: moq_noq_proto::Connection,
 ) -> (Shared, impl Future<Output = ()> + use<>) {
 	let shared = Rc::new(Inner {
 		conn: RefCell::new(conn),
@@ -348,15 +367,34 @@ pub(crate) fn launch(
 		key,
 		deadline: owner.timer(),
 		scratch: Vec::with_capacity(TRAIN_SEGMENTS * SEGMENT),
-		blocked: false,
+		close_staged: false,
 	};
 	let future = async move { kio::wait(|waiter| driver.poll(waiter)).await };
 	(shared, future)
 }
 
+/// Own a connection until its handshake is handed to a public handle.
+///
+/// The driver and endpoint keep their own references, so dropping a pending
+/// establishment future without closing it leaves both alive until timeout.
+struct EstablishGuard {
+	shared: Option<Shared>,
+}
+
+impl Drop for EstablishGuard {
+	fn drop(&mut self) {
+		if let Some(shared) = self.shared.take() {
+			shared.close_code(0, "QUIC handshake abandoned");
+		}
+	}
+}
+
 /// Wait out the handshake, yielding the connection's public handle.
 pub(crate) async fn establish(shared: Shared) -> Result<Connection, Error> {
-	kio::wait(|waiter| {
+	let mut guard = EstablishGuard {
+		shared: Some(shared.clone()),
+	};
+	let result = kio::wait(|waiter| {
 		let mut state = shared.state.borrow_mut();
 		if state.established {
 			return Poll::Ready(Ok(()));
@@ -367,22 +405,43 @@ pub(crate) async fn establish(shared: Shared) -> Result<Connection, Error> {
 		waiter.register(&mut state.establish_waiters);
 		Poll::Pending
 	})
-	.await?;
+	.await;
+	if result.is_err() {
+		// The driver already reached a terminal state.
+		guard.shared = None;
+	}
+	result?;
 
-	let alpn = {
+	let (alpn, server_name, remote) = {
 		let conn = shared.conn.borrow();
-		conn.crypto_session()
+		let handshake = conn
+			.crypto_session()
 			.handshake_data()
-			.and_then(|data| data.downcast::<noq_proto::crypto::rustls::HandshakeData>().ok())
-			.and_then(|data| data.protocol)
-			.map(|proto| String::from_utf8_lossy(&proto).into_owned())
+			.and_then(|data| data.downcast::<moq_noq_proto::crypto::rustls::HandshakeData>().ok());
+		let (alpn, server_name) = match handshake {
+			Some(data) => (
+				data.protocol.map(|proto| String::from_utf8_lossy(&proto).into_owned()),
+				data.server_name,
+			),
+			None => (None, None),
+		};
+		// Multipath is never negotiated here, so the first path is the only one.
+		let remote = conn
+			.network_path(moq_noq_proto::PathId::ZERO)
+			.expect("an established connection has its first path")
+			.remote();
+		(alpn, server_name, remote)
 	};
 
-	Ok(Connection {
+	let conn = Connection {
 		shared,
 		park: kio::Park::default(),
 		alpn,
-	})
+		server_name,
+		remote,
+	};
+	guard.shared = None;
+	Ok(conn)
 }
 
 impl web_transport_trait::poll::Session for Connection {
@@ -477,7 +536,7 @@ impl web_transport_trait::poll::Session for Connection {
 				Poll::Ready(Ok(()))
 			}
 			// The send queue is full; a flush frees space.
-			Err(noq_proto::SendDatagramError::Blocked(_)) => {
+			Err(moq_noq_proto::SendDatagramError::Blocked(_)) => {
 				let mut state = self.shared.state.borrow_mut();
 				waiter.register(&mut state.datagram_send_waiters);
 				Poll::Pending
@@ -525,7 +584,7 @@ impl web_transport_trait::poll::Session for Connection {
 		let (stats, path) = {
 			let mut conn = self.shared.conn.borrow_mut();
 			let stats = conn.stats();
-			let path = conn.path_stats(noq_proto::PathId::ZERO).unwrap_or_default();
+			let path = conn.path_stats(moq_noq_proto::PathId::ZERO).unwrap_or_default();
 			(stats, path)
 		};
 		Stats {
@@ -617,9 +676,10 @@ struct Driver {
 	/// Egress staging: noq-proto writes into a `Vec`, so a train is built
 	/// here and copied into the socket's registered buffer.
 	scratch: Vec<u8>,
-	/// The last flush found the transmit pool drained, so nothing it owed the
-	/// peer has reached the wire yet.
-	blocked: bool,
+	/// A CONNECTION_CLOSE has been handed to the socket. Not implied by a
+	/// flush that came back empty: noq paces the close like any other packet,
+	/// so it can sit behind a pacing timer after the application asked for it.
+	close_staged: bool,
 }
 
 impl Driver {
@@ -647,6 +707,9 @@ impl Driver {
 			// (and a retransmit for each packet that arrives after), so the
 			// driver runs until noq says the drain is over.
 			if self.shared.conn.borrow().is_drained() {
+				// A close noq never managed to send (the server's
+				// anti-amplification limit can withhold it) ends here too.
+				self.publish_close();
 				return Poll::Ready(());
 			}
 
@@ -654,7 +717,9 @@ impl Driver {
 				self.shared.state.borrow_mut().fail(err);
 				return Poll::Ready(());
 			}
-			self.publish_close();
+			if self.close_staged {
+				self.publish_close();
+			}
 
 			// Arm, *then* poll: the poll is what registers the waiter, so
 			// polling before the set would leave the firing to wake nobody
@@ -699,18 +764,18 @@ impl Driver {
 
 			let mut state = self.shared.state.borrow_mut();
 			match event {
-				noq_proto::Event::Connected => {
+				moq_noq_proto::Event::Connected => {
 					state.established = true;
 					state.establish_waiters.wake();
 				}
-				noq_proto::Event::ConnectionLost { reason } => state.fail(reason.into()),
-				noq_proto::Event::DatagramReceived => state.datagram_recv_waiters.wake(),
-				noq_proto::Event::DatagramsUnblocked => state.datagram_send_waiters.wake(),
-				noq_proto::Event::HandshakeDataReady => {}
-				noq_proto::Event::Stream(event) => sweep_stream(&mut state, event),
-				noq_proto::Event::HandshakeConfirmed
-				| noq_proto::Event::Path(_)
-				| noq_proto::Event::NatTraversal(_) => {}
+				moq_noq_proto::Event::ConnectionLost { reason } => state.fail(reason.into()),
+				moq_noq_proto::Event::DatagramReceived => state.datagram_recv_waiters.wake(),
+				moq_noq_proto::Event::DatagramsUnblocked => state.datagram_send_waiters.wake(),
+				moq_noq_proto::Event::HandshakeDataReady => {}
+				moq_noq_proto::Event::Stream(event) => sweep_stream(&mut state, event),
+				moq_noq_proto::Event::HandshakeConfirmed
+				| moq_noq_proto::Event::Path(_)
+				| moq_noq_proto::Event::NatTraversal(_) => {}
 			}
 		}
 	}
@@ -718,15 +783,12 @@ impl Driver {
 	/// Publish the terminal error for a close this side asked for.
 	///
 	/// noq raises no event for it, so the driver is what reports it, and
-	/// only once the flush above has staged the CONNECTION_CLOSE, since an
-	/// application is free to stop driving the worker the moment
+	/// only once the CONNECTION_CLOSE is staged (or the drain is over), since
+	/// an application is free to stop driving the worker the moment
 	/// `poll_closed` resolves. Staged is not delivered: the send is
 	/// fire-and-forget, so a worker torn down in the same breath can still
 	/// take the packet with it and leave the peer to idle out.
 	fn publish_close(&mut self) {
-		if self.blocked || !self.shared.conn.borrow().is_closed() {
-			return;
-		}
 		let mut state = self.shared.state.borrow_mut();
 		let Some((code, reason)) = state.local_close.take() else {
 			return;
@@ -749,19 +811,18 @@ impl Driver {
 		Poll::Pending
 	}
 
-	/// Fill one transmit buffer and stage it. Ignores noq's pacing hint;
-	/// the congestion controller still bounds each train.
+	/// Fill one transmit buffer and stage it.
+	///
+	/// Pacing happens inside `poll_transmit`: a paced path returns nothing
+	/// and arms a timer that `poll_timeout` reports, and the driver loop
+	/// flushes again once it fires.
 	fn flush_one(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		let mut tx = match self.socket.poll_acquire(waiter) {
 			Poll::Ready(Ok(tx)) => tx,
 			Poll::Ready(Err(err)) => return Poll::Ready(Err(Error::Io(err.to_string()))),
 			// Backpressure: a completed send re-polls us.
-			Poll::Pending => {
-				self.blocked = true;
-				return Poll::Pending;
-			}
+			Poll::Pending => return Poll::Pending,
 		};
-		self.blocked = false;
 
 		let segments = (tx.len() / SEGMENT).min(TRAIN_SEGMENTS);
 		if segments == 0 {
@@ -773,15 +834,14 @@ impl Driver {
 		let segments = std::num::NonZeroUsize::new(segments).expect("segments was checked above");
 
 		self.scratch.clear();
-		let transmit = match self
-			.shared
-			.conn
-			.borrow_mut()
-			.poll_transmit(Instant::now(), segments, &mut self.scratch)
-		{
-			Some(transmit) => transmit,
-			// Nothing to send; the buffer returns to the pool on drop.
-			None => return Poll::Pending,
+		let (transmit, closing) = {
+			let mut conn = self.shared.conn.borrow_mut();
+			// Nothing to send, or paced; the buffer returns to the pool on drop.
+			let Some(transmit) = conn.poll_transmit(Instant::now(), segments, &mut self.scratch) else {
+				return Poll::Pending;
+			};
+			// Once closed, noq transmits nothing but the CONNECTION_CLOSE.
+			(transmit, conn.is_closed())
 		};
 
 		tx[..transmit.size].copy_from_slice(&self.scratch[..transmit.size]);
@@ -796,6 +856,7 @@ impl Driver {
 		if let Err(err) = tx.send(transmit) {
 			return Poll::Ready(Err(Error::Io(err.to_string())));
 		}
+		self.close_staged |= closing;
 		// A flush frees datagram-send queue space.
 		self.shared.state.borrow_mut().datagram_send_waiters.wake();
 		Poll::Ready(Ok(()))
@@ -825,25 +886,25 @@ fn end(state: &mut State, id: StreamId, end: End) {
 }
 
 /// Apply one stream event to the parking tables.
-fn sweep_stream(state: &mut State, event: noq_proto::StreamEvent) {
+fn sweep_stream(state: &mut State, event: moq_noq_proto::StreamEvent) {
 	// Waking removes the entry: a still-interested poller re-registers on its
 	// next poll, so the maps only hold streams somebody is parked on.
 	match event {
-		noq_proto::StreamEvent::Opened { dir: Dir::Bi } => state.accept_bi_waiters.wake(),
-		noq_proto::StreamEvent::Opened { dir: Dir::Uni } => state.accept_uni_waiters.wake(),
-		noq_proto::StreamEvent::Available { .. } => state.open_waiters.wake(),
-		noq_proto::StreamEvent::Readable { id } => {
+		moq_noq_proto::StreamEvent::Opened { dir: Dir::Bi } => state.accept_bi_waiters.wake(),
+		moq_noq_proto::StreamEvent::Opened { dir: Dir::Uni } => state.accept_uni_waiters.wake(),
+		moq_noq_proto::StreamEvent::Available { .. } => state.open_waiters.wake(),
+		moq_noq_proto::StreamEvent::Readable { id } => {
 			if let Some(mut waiters) = state.readable.remove(&id) {
 				waiters.wake();
 			}
 		}
-		noq_proto::StreamEvent::Writable { id } => {
+		moq_noq_proto::StreamEvent::Writable { id } => {
 			if let Some(mut waiters) = state.writable.remove(&id) {
 				waiters.wake();
 			}
 		}
-		noq_proto::StreamEvent::Finished { id } => end(state, id, End::Delivered),
-		noq_proto::StreamEvent::Stopped { id, error_code } => {
+		moq_noq_proto::StreamEvent::Finished { id } => end(state, id, End::Delivered),
+		moq_noq_proto::StreamEvent::Stopped { id, error_code } => {
 			end(state, id, End::Stopped(error_code.into_inner()));
 			// A writer blocked on capacity has to learn it will never come.
 			if let Some(mut waiters) = state.writable.remove(&id) {
@@ -855,7 +916,7 @@ fn sweep_stream(state: &mut State, event: noq_proto::StreamEvent) {
 
 #[cfg(test)]
 mod tests {
-	use noq_proto::Side;
+	use moq_noq_proto::Side;
 
 	use super::*;
 

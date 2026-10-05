@@ -30,7 +30,10 @@ pub enum Request {
         data: Vec<u8>,
     },
     Forget(u64),
-    Record { flake: String, event: Event },
+    Record {
+        flake: String,
+        event: Event,
+    },
     Records,
 }
 
@@ -45,7 +48,9 @@ pub enum Reply {
 }
 
 /// Read one message; `None` at a clean end of stream.
-pub async fn read<T: senax_encoder::Decoder>(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Option<T>> {
+pub async fn read<T: senax_encoder::Decoder>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Option<T>> {
     let mut length = [0; 4];
     match stream.read_exact(&mut length).await {
         Ok(_) => {}
@@ -57,14 +62,25 @@ pub async fn read<T: senax_encoder::Decoder>(stream: &mut (impl tokio::io::Async
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await?;
     let mut remaining = bytes.as_slice();
-    let value = senax_encoder::decode(&mut remaining).map_err(|_| anyhow::anyhow!("invalid dev shell cache message"))?;
-    ensure!(remaining.is_empty(), "trailing dev shell cache message data");
+    let value = senax_encoder::decode(&mut remaining)
+        .map_err(|_| anyhow::anyhow!("invalid dev shell cache message"))?;
+    ensure!(
+        remaining.is_empty(),
+        "trailing dev shell cache message data"
+    );
     Ok(Some(value))
 }
 
-pub async fn write<T: senax_encoder::Encoder>(stream: &mut (impl tokio::io::AsyncWrite + Unpin), value: &T) -> Result<()> {
-    let bytes = senax_encoder::encode(value).map_err(|_| anyhow::anyhow!("encode dev shell cache message"))?;
-    ensure!(bytes.len() <= MAX_FRAME, "dev shell cache message too large");
+pub async fn write<T: senax_encoder::Encoder>(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    value: &T,
+) -> Result<()> {
+    let bytes = senax_encoder::encode(value)
+        .map_err(|_| anyhow::anyhow!("encode dev shell cache message"))?;
+    ensure!(
+        bytes.len() <= MAX_FRAME,
+        "dev shell cache message too large"
+    );
     let mut frame = Vec::with_capacity(4 + bytes.len());
     frame.extend((bytes.len() as u32).to_le_bytes());
     frame.extend(&bytes[..]);
@@ -119,7 +135,9 @@ impl Client {
 
 async fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Reply> {
     write(stream, request).await?;
-    read(stream).await?.context("dev shell cache closed the connection")
+    read(stream)
+        .await?
+        .context("dev shell cache closed the connection")
 }
 
 fn unexpected() -> anyhow::Error {

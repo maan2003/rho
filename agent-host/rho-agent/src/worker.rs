@@ -44,8 +44,8 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
     // only now: unsharing the user namespace needs a single thread.
     tikv_jemalloc_ctl::background_thread::write(true)
         .map_err(|error| anyhow::anyhow!("start jemalloc background thread: {error}"))?;
-    // This process owns provider transports, but does not start the agent host's
-    // RPC listener (which installs its own TLS provider).
+    // This process owns provider transports, but does not start the agent
+    // host's RPC listener (which installs its own TLS provider).
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("workset TLS provider already initialized"))?;
@@ -56,6 +56,7 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         .enable_all()
         .build()?
         .block_on(async {
+            tokio::spawn(crate::heap::dump_on_sigusr1());
             runtime::run(
                 tokio::net::UnixStream::from_std(socket)?,
                 tokio::net::UnixStream::from_std(requests)?,

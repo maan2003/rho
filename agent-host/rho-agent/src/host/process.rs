@@ -431,6 +431,10 @@ impl Process {
         Ok(process)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent worker channels and startup identity are passed together once"
+    )]
     async fn connect(
         inference: &crate::inference::Accounts,
         server: std::os::unix::net::UnixStream,
@@ -844,7 +848,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(runs_program(child.id(), &sleep).unwrap());
-        // A prefix of the path, or the path with its argument, is another program.
+        // A prefix of the path, or the path with its argument, is another
+        // program.
         assert!(!runs_program(child.id(), sleep.parent().unwrap()).unwrap());
         assert!(!runs_program(child.id(), &sleep.with_file_name("sleep60")).unwrap());
         child.kill().unwrap();

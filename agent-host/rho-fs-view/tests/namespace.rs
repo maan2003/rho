@@ -234,7 +234,8 @@ test ! -e /src/.stores
     assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
     assert_eq!(only_store(temp.path()), store);
 
-    // Commands inherit the workset environment and can start in a requested cwd.
+    // Commands inherit the workset environment and can start in a requested
+    // cwd.
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg("pwd");
     prepare(&layout_path, &mut command, "/src/second").unwrap();

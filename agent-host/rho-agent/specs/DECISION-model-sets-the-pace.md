@@ -19,7 +19,8 @@ nothing foreground running, everything goes at once. While it is:
 
 - a foreground success waits up to 60 seconds for its siblings, so a round of
   parallel commands arrives as one request;
-- a failure waits 20 seconds wherever it is: it is news the model can act on;
+- a failure waits 20 seconds wherever it is: it is news the model can act on.
+  The newest cell raising is not such a failure: it has returned, and goes at once;
 - a background success waits for the next wake, whatever causes it;
 - a `notify()` waits a second, to coalesce with the ones behind it.
 

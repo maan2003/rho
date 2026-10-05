@@ -4,16 +4,16 @@
 //! The runtime writes its own events; this is
 //! the one place they become the client's words.
 
+use rho_agent::AgentEvent;
 use rho_agent::entry::{Block, Entry, Notice, Party, Report};
 use rho_agent::inference::Carry;
 use rho_agent::log::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
-use rho_agent::{AgentEvent, InputKind, QueuedInput};
+use rho_agent_types::PresentationField;
 #[cfg(test)]
 use rho_agent_types::UnixMs;
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agent_types::{ContentPart, PresentationField};
 use rho_agents_client::protocol::transcript::{
-    ArgumentsFormat, Item, QueuedItem, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
+    ArgumentsFormat, Item, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
 };
 
 pub fn runtime_kind(runtime: &AgentRuntime) -> RuntimeKind {
@@ -54,7 +54,6 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             title: title
                 .clone()
                 .map_or(PresentationField::Clear, PresentationField::Set),
-            activity: PresentationField::Unchanged,
             at: *at,
         },
         AgentEvent::ExecObserved { id, milestone, at } => TranscriptEvent::ExecObserved {
@@ -162,15 +161,7 @@ pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<Tran
             text: text.to_string(),
             at: *at,
         },
-        AgentEvent::Turn { edge, at } => TranscriptEvent::Turn {
-            edge: edge.clone(),
-            at: *at,
-        },
-        AgentEvent::Wants { want, summary, at } => TranscriptEvent::Wants {
-            want: *want,
-            summary: summary.clone(),
-            at: *at,
-        },
+        AgentEvent::Retired { .. } => return None,
         AgentEvent::Rewound { to, at } => TranscriptEvent::Rewound {
             to: (*to).into(),
             at: *at,
@@ -243,29 +234,15 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             }),
             at: *at,
         },
-        Entry::Sent { to, text, at, .. } => TranscriptEvent::MessageSent {
+        Entry::Sent {
+            to, text, kind, at, ..
+        } => TranscriptEvent::MessageSent {
             to: match to {
                 Party::Human => None,
                 Party::Agent(id) => Some(*id),
             },
             text: text.clone(),
-            at: *at,
-        },
-        Entry::Status { text, at } => TranscriptEvent::Presented {
-            title: PresentationField::Unchanged,
-            activity: PresentationField::Set(text.clone()),
-            at: *at,
-        },
-        Entry::AwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
-            since: Some(*at),
-            at: *at,
-        },
-        Entry::StoppedAwaitingHuman { at } => TranscriptEvent::AwaitingHuman {
-            since: None,
-            at: *at,
-        },
-        Entry::LegacyAwaiting { since, at } => TranscriptEvent::AwaitingHuman {
-            since: *since,
+            kind: *kind,
             at: *at,
         },
         Entry::Notice {
@@ -277,12 +254,19 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
             retrying: true,
             at: *at,
         },
+        Entry::Notice {
+            notice: Notice::Stopped(error),
+            at,
+        } => TranscriptEvent::Stopped {
+            error: error.clone(),
+            at: *at,
+        },
         Entry::Notice { notice, at } => TranscriptEvent::Notice {
             text: match notice {
                 Notice::Restarted => "rho restarted; the notebook was lost",
                 Notice::Archived => "archived",
                 Notice::FreshNotebook => "started a fresh notebook",
-                Notice::Error(_) => unreachable!("matched above"),
+                Notice::Error(_) | Notice::Stopped(_) => unreachable!("matched above"),
             }
             .to_owned(),
             at: *at,
@@ -342,6 +326,58 @@ pub(crate) fn arguments_format(tool_type: ToolType) -> ArgumentsFormat {
         ToolType::Function => ArgumentsFormat::Json,
         ToolType::Custom => ArgumentsFormat::Text,
     }
+}
+
+/// The item as a client draws it. Compaction and unknown items have no
+/// face; their index is never told.
+pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
+    Some(match item {
+        StreamingContextItem::AssistantMessage { .. } => return None,
+        StreamingContextItem::RawReasoning {
+            content, summary, ..
+        } => Item::Reasoning {
+            text: reasoning_text(content, summary),
+        },
+        StreamingContextItem::EncryptedReasoning { summary, .. } => {
+            if summary.is_empty() {
+                return None;
+            }
+            Item::Reasoning {
+                text: join(summary),
+            }
+        }
+        StreamingContextItem::ToolCall {
+            id,
+            name,
+            arguments,
+            tool_type,
+            ..
+        } => Item::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.to_string(),
+            format: crate::transcript::arguments_format(*tool_type),
+        },
+        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
+            return None;
+        }
+    })
+}
+
+fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
+    if summary.is_empty() {
+        content.to_string()
+    } else {
+        join(summary)
+    }
+}
+
+fn join(parts: &[AStr]) -> String {
+    parts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -524,12 +560,14 @@ mod tests {
                     id: MessageId(7),
                     to: Party::Human,
                     text: "hello".into(),
+                    kind: rho_agent_types::SendKind::Ask,
                 }),
                 None
             ),
             Some(TranscriptEvent::MessageSent {
                 to: None,
                 text: "hello".into(),
+                kind: rho_agent_types::SendKind::Ask,
                 at: UnixMs(5)
             })
         );
@@ -546,30 +584,6 @@ mod tests {
                 None
             ),
             None
-        );
-    }
-
-    #[test]
-    fn wait_is_projected() {
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::AwaitingHuman { at: UnixMs(10) }),
-                None
-            ),
-            Some(TranscriptEvent::AwaitingHuman {
-                at: UnixMs(10),
-                since: Some(UnixMs(10))
-            })
-        );
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::StoppedAwaitingHuman { at: UnixMs(14) }),
-                None
-            ),
-            Some(TranscriptEvent::AwaitingHuman {
-                at: UnixMs(14),
-                since: None
-            })
         );
     }
 
@@ -592,78 +606,5 @@ mod tests {
                 at: UnixMs(17),
             })
         );
-    }
-}
-
-/// The item as a client draws it. Compaction and unknown items have no
-/// face; their index is never told.
-pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
-    Some(match item {
-        StreamingContextItem::AssistantMessage { .. } => return None,
-        StreamingContextItem::RawReasoning {
-            content, summary, ..
-        } => Item::Reasoning {
-            text: reasoning_text(content, summary),
-        },
-        StreamingContextItem::EncryptedReasoning { summary, .. } => {
-            if summary.is_empty() {
-                return None;
-            }
-            Item::Reasoning {
-                text: join(summary),
-            }
-        }
-        StreamingContextItem::ToolCall {
-            id,
-            name,
-            arguments,
-            tool_type,
-            ..
-        } => Item::ToolCall {
-            id: id.as_str().to_owned(),
-            name: name.as_str().to_owned(),
-            arguments: arguments.to_string(),
-            format: crate::transcript::arguments_format(*tool_type),
-        },
-        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
-            return None;
-        }
-    })
-}
-
-fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
-    if summary.is_empty() {
-        content.to_string()
-    } else {
-        join(summary)
-    }
-}
-
-fn join(parts: &[AStr]) -> String {
-    parts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A queued input as the wire tells it.
-pub fn queued_item(input: &QueuedInput) -> QueuedItem {
-    match &input.kind {
-        InputKind::Message { content } => QueuedItem::Message {
-            from: match input.source {
-                rho_agent_types::transcript::MessageSender::User => None,
-                rho_agent_types::transcript::MessageSender::Agent { id } => Some(id),
-            },
-            text: content
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text { text } => text.as_str(),
-                    ContentPart::Image { .. } => "[image]",
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        },
-        InputKind::Compaction => QueuedItem::Compaction,
     }
 }

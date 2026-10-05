@@ -1624,8 +1624,8 @@ async fn run_session(
     };
 
     drop(requests_tx);
-    // The kernel can exit while background descendants retain workspace authority.
-    // Terminate the whole owned session before draining.
+    // The kernel can exit while background descendants retain workspace
+    // authority. Terminate the whole owned session before draining.
     process_session.terminate().await;
     let status = match status {
         Some(status) => Some(status),

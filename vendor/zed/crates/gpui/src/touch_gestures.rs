@@ -4,7 +4,6 @@ use crate::GestureTuning;
 
 const VELOCITY_WINDOW: Duration = Duration::from_millis(100);
 const MOMENTUM_INTERVAL: Duration = Duration::from_millis(16);
-const MOMENTUM_STOP_VELOCITY: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Position {
@@ -85,7 +84,8 @@ struct Sample {
 struct Momentum {
     position: Position,
     velocity: Position,
-    last_at: Duration,
+    started_at: Duration,
+    emitted_distance: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -269,7 +269,8 @@ impl TouchGestureRecognizer {
                     self.momentum = Some(Momentum {
                         position: contact.position,
                         velocity,
-                        last_at: at,
+                        started_at: at,
+                        emitted_distance: 0.,
                     });
                 } else {
                     actions.push(GestureAction::Scroll {
@@ -306,25 +307,19 @@ impl TouchGestureRecognizer {
 
     pub fn advance(&mut self, at: Duration) -> Vec<GestureAction> {
         if let Some(momentum) = self.momentum.as_mut() {
-            let elapsed = at.saturating_sub(momentum.last_at);
-            if elapsed.is_zero() {
-                return Vec::new();
-            }
-            let elapsed_ms = elapsed.as_secs_f32() * 1000.0;
-            let decay = self.tuning.momentum_decay_per_ms.powf(elapsed_ms);
-            let delta = momentum.velocity.scale(elapsed.as_secs_f32());
-            momentum.velocity = momentum.velocity.scale(decay);
-            momentum.position = Position {
-                x: momentum.position.x + delta.x,
-                y: momentum.position.y + delta.y,
-            };
-            momentum.last_at = at;
-            if momentum.velocity.magnitude() < MOMENTUM_STOP_VELOCITY {
+            let elapsed = at.saturating_sub(momentum.started_at);
+            let speed = momentum.velocity.magnitude();
+            let distance = self.tuning.scroll_physics.fling_distance(speed, elapsed);
+            let delta = momentum
+                .velocity
+                .scale((distance - momentum.emitted_distance) / speed);
+            momentum.emitted_distance = distance;
+            if elapsed >= self.tuning.scroll_physics.fling_duration(speed) {
                 let position = momentum.position;
                 self.momentum = None;
                 return vec![GestureAction::Scroll {
                     position,
-                    delta: Position::default(),
+                    delta,
                     phase: Phase::Ended,
                 }];
             }
@@ -503,8 +498,60 @@ mod tests {
             panic!("expected momentum scroll")
         };
         // The 100 ms velocity window retains the samples at 100 and 150 ms:
-        // (50 - 20) / 0.05 s = 600 px/s, hence 9.6 px over a 16 ms tick.
-        assert!((delta.x - 9.6).abs() < 0.01);
+        // (50 - 20) / 0.05 s = 600 px/s. Integrate the default exponential
+        // decay over 16 ms, rather than applying velocity once per tick.
+        let expected = 0.6 * (0.998_f64.powi(16) - 1.0) / 0.998_f64.ln();
+        assert!((f64::from(delta.x) - expected).abs() < 0.01);
+        assert_eq!(delta.y, 0.0);
+    }
+
+    #[test]
+    fn fling_distance_is_independent_of_tick_cadence() {
+        fn fling() -> TouchGestureRecognizer {
+            let mut gesture = TouchGestureRecognizer::new(GestureTuning {
+                scroll_physics: crate::ScrollPhysics::Exponential { decay_per_ms: 0.99 },
+                ..GestureTuning::default()
+            });
+            gesture.down(1, pos(0.0, 0.0), at(0));
+            gesture.motion(1, pos(30.0, 40.0), at(100));
+            gesture.up(1, at(100));
+            gesture
+        }
+        let mut coarse = fling();
+        let mut fine = fling();
+        let mut total = Position::default();
+        for time in [103, 117, 140] {
+            let actions = fine.advance(at(time));
+            let [
+                GestureAction::Scroll {
+                    delta,
+                    phase: Phase::Moved,
+                    ..
+                },
+            ] = actions.as_slice()
+            else {
+                panic!("expected momentum")
+            };
+            total.x += delta.x;
+            total.y += delta.y;
+        }
+        let actions = coarse.advance(at(140));
+        let [
+            GestureAction::Scroll {
+                delta,
+                phase: Phase::Moved,
+                ..
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("expected momentum")
+        };
+        // The release velocity is (300, 400) px/s. Integrate independently.
+        let time_factor = (0.99_f64.powi(40) - 1.0) / 0.99_f64.ln() / 1000.0;
+        assert!((f64::from(total.x) - 300.0 * time_factor).abs() < 0.01);
+        assert!((f64::from(total.y) - 400.0 * time_factor).abs() < 0.01);
+        assert!((total.x - delta.x).abs() < 0.01);
+        assert!((total.y - delta.y).abs() < 0.01);
     }
 
     #[test]

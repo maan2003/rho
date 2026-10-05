@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use rho_agent_types::UnixMs;
 use rho_tool_shell::{ProcessEvent, ShellTools};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::notebook::{Shared, current, register};
 use crate::runtime::{Build, Inbox, Message, Reply, resolved};
@@ -34,6 +34,7 @@ fn new_job(
     shared: &Shared,
     cell: &Source,
     cmd: &str,
+    stdin: bool,
     budget: usize,
 ) -> Result<Arc<Source>, String> {
     let mut jobs = shared.sources.lock().unwrap();
@@ -49,6 +50,7 @@ fn new_job(
             writes,
             queued: Mutex::new(Some(queued)),
             done: watch::channel(false).0,
+            stdin,
         }),
         Some(Log {
             file: {
@@ -103,22 +105,31 @@ fn budget(max_tokens: Option<i64>) -> PyResult<usize> {
 }
 
 /// Start a shell command. The handle is usable at once; awaiting it waits
-/// for the command to end.
+/// for the command to end. Its stdin is `/dev/null` unless `stdin` asks for
+/// a pipe that `write_stdin` feeds.
 #[pyfunction]
-#[pyo3(signature = (cmd, *, workdir = None, max_tokens = None))]
+#[pyo3(signature = (cmd, *, workdir = None, stdin = false, max_tokens = None))]
 pub(crate) fn command(
     py: Python<'_>,
     cmd: String,
     workdir: Option<String>,
+    stdin: bool,
     max_tokens: Option<i64>,
 ) -> PyResult<Command> {
     let budget = budget(max_tokens)?;
+    // The notebook thread's own cwd, which `os.chdir` moves.
+    let workdir = std::env::current_dir()
+        .map_err(|e| PyRuntimeError::new_err(format!("notebook cwd: {e}")))?
+        .join(workdir.unwrap_or_default())
+        .into_os_string()
+        .into_string()
+        .map_err(|_| PyValueError::new_err("workdir is not valid UTF-8"))?;
     let (shared, cell) = current(py, "Commands are available")?;
     let shared = &shared;
     let future = crate::runtime::future(py, shared)?;
     // Published synchronously: write_stdin in the same cell can refer to
     // a command whose process has not started yet.
-    let job = new_job(shared, &cell, &cmd, budget).map_err(PyRuntimeError::new_err)?;
+    let job = new_job(shared, &cell, &cmd, stdin, budget).map_err(PyRuntimeError::new_err)?;
     crate::interpreter::kernel(py)?
         .getattr("CELL")?
         .call_method0("get")?
@@ -141,9 +152,9 @@ pub(crate) fn command(
             let result = run_command(
                 &shell,
                 &job,
-                &wake,
                 &cmd,
-                workdir.as_deref(),
+                Some(&workdir),
+                stdin,
                 &mut writes,
                 &shared_for_work,
             )
@@ -221,6 +232,15 @@ impl Exit {
         self.exit.exit_code
     }
 
+    /// Awaiting the result again gives it back, so a name rebound by
+    /// `r = await r` still means the command.
+    fn __await__<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        py.import("asyncio")?
+            .call_method1("sleep", (0, slf))?
+            .call_method0("__await__")
+    }
+
     fn __repr__(&self) -> String {
         let code = self
             .exit
@@ -242,6 +262,11 @@ pub(crate) fn write_stdin(
 ) -> PyResult<Py<PyAny>> {
     let (shared, job) = touch(py, handle.id)?;
     let shared = &shared;
+    if !job.process().stdin {
+        return Err(PyRuntimeError::new_err(
+            "Command has no stdin; start it with command(..., stdin=True) to write to it",
+        ));
+    }
     if chars.is_empty() {
         return resolved(py, shared);
     }
@@ -385,16 +410,16 @@ impl Command {
 pub(crate) async fn run_command(
     shell: &ShellTools,
     job: &Source,
-    wake: &Notify,
     cmd: &str,
     workdir: Option<&str>,
+    stdin: bool,
     writes: &mut tokio::sync::mpsc::UnboundedReceiver<StdinWrite>,
     shared: &Shared,
 ) -> Result<CommandExit, String> {
     let mut process = tokio::select! {
         biased;
         () = job.cancel.notified() => return Err("Command cancelled".into()),
-        process = shell.spawn(cmd, workdir) => process.map_err(|e| e.to_string())?,
+        process = shell.spawn(cmd, workdir, stdin) => process.map_err(|e| e.to_string())?,
     };
     let mut stdin = process.take_stdin();
     // The write in flight, so one the command's end cuts short is still
@@ -416,7 +441,7 @@ pub(crate) async fn run_command(
             let failed = result.is_err();
             (writing.take().expect("set above")).settle(result, job);
             if failed {
-                wake.notify_one();
+                shared.wake.notify_one();
             }
         }
     };
@@ -449,7 +474,7 @@ pub(crate) async fn run_command(
                 ProcessEvent::Failed(error) => return Err(error),
                 ProcessEvent::Closed => break,
             }
-            wake.notify_one();
+            shared.wake.notify_one();
         }
         Ok(CommandExit {
             id: job.id.session(),

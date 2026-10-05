@@ -8,11 +8,7 @@ use tokio::sync::Notify;
 use crate::{CellHandle, Notebook};
 
 fn notebook() -> (Notebook, Arc<Notify>) {
-    let shell = ShellTools::in_directory(
-        Duration::from_secs(5),
-        "/tmp".into(),
-        PathOverrides::default(),
-    );
+    let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
     let wake = Arc::new(Notify::new());
     (
         Notebook::new(shell, Vec::new(), Arc::clone(&wake)).unwrap(),
@@ -136,7 +132,7 @@ async fn an_interrupted_stream_keeps_what_ran() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     let (notebook, wake) = notebook();
-    let cell = notebook.run("job = command('read line; echo got $line')".into());
+    let cell = notebook.run("job = command('read line; echo got $line', stdin=True)".into());
     until(&wake, || cell.facts().returned.is_some()).await;
     assert!(cell.facts().finished.is_none());
     let first = notebook.report().unwrap().render().text;
@@ -165,6 +161,24 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     finished(&wake, &page).await;
     let text = notebook.report().unwrap().render().text;
     assert!(text.contains("No more output."), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_reads_dev_null_unless_it_asks_for_stdin() {
+    let (notebook, wake) = notebook();
+    // An open pipe would leave cat waiting until timeout kills it (124).
+    let cell = notebook.run(
+        "job = command('timeout 5 cat; echo cat=$?; readlink /proc/self/fd/0')\n\
+         try:\n    write_stdin(job, 'x')\nexcept RuntimeError as e:\n    print(e)"
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(
+        text.contains("Command has no stdin; start it with command(..., stdin=True)"),
+        "{text}"
+    );
+    assert!(text.contains("cat=0\n/dev/null"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -327,12 +341,73 @@ async fn unclaimed_failure_reports_once_after_twenty_seconds() {
     })
     .await
     .unwrap();
+    let label = task_label(&notebook);
     let text = notebook.report().unwrap().render().text;
     assert!(
         text.contains("Task failed\nValueError: unclaimed"),
         "{text}"
     );
     assert!(notebook.report().is_none());
+
+    // Reported and gone from the live tasks, it still re-raises when awaited.
+    let cell = notebook.run(format!(
+        "try:\n    await Task.from_session_id({label})\nexcept ValueError as e:\n    print('raised', e)"
+    ));
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "raised unclaimed");
+}
+
+fn task_label(notebook: &Notebook) -> crate::SessionId {
+    notebook
+        .facts()
+        .iter()
+        .find(|f| f.kind == crate::Kind::Task)
+        .unwrap()
+        .session_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_that_ended_before_the_lookup_still_answers() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        "import asyncio\nasync def work():\n    return 42\nt = asyncio.create_task(work())".into(),
+    );
+    finished(&wake, &cell).await;
+    let label = task_label(&notebook);
+    let _ = notebook.report();
+    let cell = notebook.run(format!("print(await Task.from_session_id({label}))"));
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "42");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn awaiting_an_exec_waits_for_its_commands() {
+    let (notebook, wake) = notebook();
+    // Synchronous code: the exec has no asyncio task, only its command.
+    let first = notebook.run("command('sleep 0.5; echo slept')".into());
+    let label = first.session_id();
+    let second = notebook.run(format!(
+        "await Task.from_session_id({label})\nprint('after')"
+    ));
+    finished(&wake, &second).await;
+    assert!(
+        first.facts().finished.is_some(),
+        "awaited before the exec ended"
+    );
+    let _ = notebook.report();
+    // Once it has ended, awaiting it again returns at once.
+    let third = notebook.run(format!("print(await Task.from_session_id({label}))"));
+    finished(&wake, &third).await;
+    assert_eq!(notebook.report().unwrap().render().text, "None");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_result_awaits_to_itself() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("r = await command('exit 3')\nr = await r\nprint(r.exit_code)".into());
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(text.starts_with("3\n"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -423,6 +498,28 @@ async fn command_handle_and_await_result_use_scrambled_session_id() {
     let text = notebook.report().unwrap().render().text;
     assert!(text.contains(&format!("{command} {command}")), "{text}");
     assert!(!text.contains("2 2"), "raw internal ID leaked: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_start_in_the_notebook_cwd() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        r#"import os, tempfile
+root = os.path.realpath(tempfile.mkdtemp())
+os.mkdir(root + "/sub")
+os.chdir(root)
+async def pwd(**kw):
+    out = root + "/out"
+    await command("pwd > " + out, **kw)
+    return open(out).read().strip()
+assert await pwd() == root, await pwd()
+assert await pwd(workdir="sub") == root + "/sub"
+assert await pwd(workdir="/") == "/"
+print("cwd ok")"#
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "cwd ok");
 }
 
 #[tokio::test(flavor = "multi_thread")]

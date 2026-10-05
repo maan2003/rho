@@ -15,6 +15,7 @@ pub use worker::native::{AgentHandle, render_agent_surface};
 
 pub mod db;
 pub mod entry;
+pub mod heap;
 pub mod journal;
 pub mod log;
 pub mod multi_agent_tools;

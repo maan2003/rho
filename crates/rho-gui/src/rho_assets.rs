@@ -20,6 +20,58 @@ struct RhoEmbedded;
 /// surface viewport is the chrome.
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
+/// [`RHO_DEFAULT_SETTINGS`] with `RHO_GUI_FONT_FAMILY`, when set, as the
+/// buffer and UI font, their sizes multiplied by `RHO_GUI_FONT_SCALE` and
+/// their weight set to `RHO_GUI_FONT_WEIGHT`: the deployment that supplies a
+/// font through `RHO_GUI_FONTS` makes it the default, sized and weighted to
+/// read like Rho Font, and user settings still win.
+pub fn default_settings() -> Cow<'static, str> {
+    let family = std::env::var("RHO_GUI_FONT_FAMILY").ok();
+    let number = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+    };
+    let scale = number("RHO_GUI_FONT_SCALE");
+    let weight = number("RHO_GUI_FONT_WEIGHT");
+    if family.is_none() && scale.is_none() && weight.is_none() {
+        return Cow::Borrowed(RHO_DEFAULT_SETTINGS);
+    }
+    Cow::Owned(settings_with_font(family.as_deref(), scale, weight))
+}
+
+fn settings_with_font(family: Option<&str>, scale: Option<f32>, weight: Option<f32>) -> String {
+    let mut settings = RHO_DEFAULT_SETTINGS.to_string();
+    let mut set_number = |key: String, f: &dyn Fn(f32) -> f32| {
+        let prefix = format!(r#""{key}": "#);
+        let start = settings.find(&prefix).expect("defaults set the key") + prefix.len();
+        let end = start
+            + settings[start..]
+                .find(',')
+                .expect("the number ends at a comma");
+        let value: f32 = settings[start..end].parse().expect("the value is a number");
+        settings.replace_range(start..end, &f(value).to_string());
+    };
+    for key in ["buffer_font", "ui_font"] {
+        if let Some(scale) = scale {
+            set_number(format!("{key}_size"), &|size| size * scale);
+        }
+        if let Some(weight) = weight {
+            set_number(format!("{key}_weight"), &|_| weight);
+        }
+    }
+    if let Some(family) = family {
+        let family = serde_json::to_string(family).expect("a string serializes");
+        for key in ["buffer_font_family", "ui_font_family"] {
+            settings = settings.replace(
+                &format!(r#""{key}": "Rho Font""#),
+                &format!(r#""{key}": {family}"#),
+            );
+        }
+    }
+    settings
+}
+
 pub struct RhoAssets;
 
 impl AssetSource for RhoAssets {
@@ -47,9 +99,15 @@ impl RhoAssets {
     /// Loads the fork's bundled fonts and then rho's, so a transcript reads
     /// the same on a machine with nothing installed. See
     /// `assets/fonts/rho-font/README.md` for what rho ships and why.
+    ///
+    /// Then every `.ttf` and `.otf` in the directory `RHO_GUI_FONTS` names:
+    /// fonts licensed to the user rather than to rho, which the deployment
+    /// supplies and must never enter the repo or the published build.
+    /// Settings pick them by family like any other font, and
+    /// `RHO_GUI_FONT_BOLD_WEIGHT` sets the weight bold and semibold text get.
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
         assets::Assets.load_fonts(cx)?;
-        let fonts = RhoEmbedded::iter()
+        let mut fonts = RhoEmbedded::iter()
             .filter(|asset| asset.ends_with(".ttf"))
             .map(|asset| {
                 RhoEmbedded::get(&asset)
@@ -57,13 +115,103 @@ impl RhoAssets {
                     .with_context(|| format!("loading font at path {asset:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        cx.text_system().add_fonts(fonts)
+        if let Some(dir) = std::env::var_os("RHO_GUI_FONTS") {
+            let entries = std::fs::read_dir(&dir)
+                .with_context(|| format!("reading RHO_GUI_FONTS {dir:?}"))?;
+            for entry in entries {
+                let path = entry?.path();
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "ttf" || ext == "otf")
+                {
+                    let data = std::fs::read(&path)
+                        .with_context(|| format!("loading font at path {path:?}"))?;
+                    fonts.push(Cow::Owned(data));
+                }
+            }
+        }
+        cx.text_system().add_fonts(fonts)?;
+        if let Some(weight) = std::env::var("RHO_GUI_FONT_BOLD_WEIGHT")
+            .ok()
+            .and_then(|weight| weight.parse().ok())
+        {
+            cx.text_system().set_bold_weight(gpui::FontWeight(weight));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_override_replaces_both_defaults() {
+        let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5), Some(300.0));
+        for key in ["buffer_font_family", "ui_font_family"] {
+            assert!(
+                settings.contains(&format!(r#""{key}": "ABC \"Quoted\" Sans""#)),
+                "{key} must name the override"
+            );
+            assert!(!settings.contains(&format!(r#""{key}": "Rho Font""#)));
+        }
+        assert!(settings.contains(r#""buffer_font_size": 22.5,"#));
+        assert!(settings.contains(r#""ui_font_size": 21,"#));
+        assert!(
+            settings.contains(r#""agent_buffer_font_size": 12,"#),
+            "only the two defaults scale"
+        );
+        assert!(settings.contains(r#""buffer_font_weight": 300,"#));
+        assert!(settings.contains(r#""ui_font_weight": 300,"#));
+
+        let unscaled = settings_with_font(Some("ABC Sans"), None, None);
+        assert!(unscaled.contains(r#""buffer_font_size": 15,"#));
+        assert!(unscaled.contains(r#""ui_font_weight": 400,"#));
+        let unrenamed = settings_with_font(None, Some(1.5), None);
+        assert!(unrenamed.contains(r#""ui_font_family": "Rho Font""#));
+    }
+
+    #[test]
+    fn bold_weight_override_resolves_bold_and_semibold_to_that_weight() -> anyhow::Result<()> {
+        use gpui::{FontWeight, TextSystem};
+        use gpui_wgpu::CosmicTextSystem;
+
+        let text_system = TextSystem::new(std::sync::Arc::new(
+            CosmicTextSystem::new_without_system_fonts("sans-serif"),
+        ));
+        let regular = RhoEmbedded::get("fonts/rho-font/RhoFont-Regular.ttf")
+            .context("embedded Rho Font")?
+            .data;
+        text_system.add_fonts(vec![regular])?;
+        let weighted = |weight| gpui::Font {
+            weight,
+            ..gpui::font("Rho Font")
+        };
+
+        let bold = text_system.resolve_font(&weighted(FontWeight::BOLD));
+        let medium = text_system.resolve_font(&weighted(FontWeight(550.0)));
+        assert_ne!(bold, medium, "Rho Font varies its weight");
+
+        let semibold = text_system.resolve_font(&weighted(FontWeight::SEMIBOLD));
+        assert_ne!(semibold, medium);
+
+        text_system.set_bold_weight(FontWeight(550.0));
+        assert_eq!(
+            text_system.resolve_font(&weighted(FontWeight::BOLD)),
+            medium
+        );
+        assert_eq!(
+            text_system.resolve_font(&weighted(FontWeight::SEMIBOLD)),
+            medium,
+            "Markdown's strong emphasis is semibold"
+        );
+        assert_ne!(
+            text_system.resolve_font(&weighted(FontWeight::NORMAL)),
+            medium,
+            "only bold moves"
+        );
+        Ok(())
+    }
 
     fn wcag_relative_luminance(color: gpui::Color) -> f32 {
         let color = gpui::Rgba::from(color);

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! # moq-net: Media over QUIC networking layer
 //!
 //! `moq-net` is the networking layer for Media over QUIC: real-time pub/sub with built-in
@@ -85,7 +87,10 @@ mod lite;
 mod model;
 pub mod path;
 mod recv;
-mod setup;
+pub mod setup;
+mod tail;
+#[cfg(test)]
+mod test_interop;
 mod util;
 mod version;
 

@@ -184,7 +184,7 @@ impl WaylandView {
                 draw_line(&mut pixels, self.size, pair[0], pair[1]);
             }
         }
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         let mut png = std::io::Cursor::new(Vec::new());
@@ -218,7 +218,8 @@ impl WaylandView {
         }
     }
     fn position(&self, p: Point<Pixels>) -> Option<(u32, u32)> {
-        // Before the first frame, the placeholder dimensions are not coordinates.
+        // Before the first frame, the placeholder dimensions are not
+        // coordinates.
         self.image.as_ref()?;
         let bounds = self.bounds.get();
         if !bounds.contains(&p) || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
@@ -271,8 +272,9 @@ impl Render for WaylandView {
                             elapsed_ms = started.elapsed().as_millis(),
                             "desktop first frame paint queued"
                         );
-                        // A paint callback only queues primitives. This next-frame
-                        // marker also exposes stalls in rendering/presentation.
+                        // A paint callback only queues primitives. This
+                        // next-frame marker also
+                        // exposes stalls in rendering/presentation.
                         window.on_next_frame(move |_, _| {
                             tracing::info!(
                                 desktop_id,
@@ -324,13 +326,12 @@ impl Render for WaylandView {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if let Some(position) = this.position(event.position) {
                     if this.frozen.is_some() {
-                        if this.drawing {
-                            if let Some(stroke) = this.strokes.last_mut() {
-                                if stroke.last() != Some(&position) {
-                                    stroke.push(position);
-                                    cx.notify();
-                                }
-                            }
+                        if this.drawing
+                            && let Some(stroke) = this.strokes.last_mut()
+                            && stroke.last() != Some(&position)
+                        {
+                            stroke.push(position);
+                            cx.notify();
                         }
                     } else {
                         this.viewer.motion.send_replace(Some(position));
@@ -392,12 +393,14 @@ impl Render for WaylandView {
                     return;
                 }
                 let key = &event.keystroke;
-                if !key.modifiers.control && !key.modifiers.platform && !key.modifiers.alt {
-                    if let Some(text) = &key.key_char {
-                        this.send(Input::Text(text.clone()), cx);
-                        cx.stop_propagation();
-                        return;
-                    }
+                if !key.modifiers.control
+                    && !key.modifiers.platform
+                    && !key.modifiers.alt
+                    && let Some(text) = &key.key_char
+                {
+                    this.send(Input::Text(text.clone()), cx);
+                    cx.stop_propagation();
+                    return;
                 }
                 let mut chord = String::new();
                 if key.modifiers.control {

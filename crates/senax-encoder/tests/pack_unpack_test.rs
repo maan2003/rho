@@ -230,8 +230,8 @@ fn test_enum_pack_vs_encode_size_difference() {
 
 #[test]
 fn test_enum_field_order_dependency() {
-    // This test demonstrates that pack/unpack is order-dependent for enum fields
-    // too
+    // This test demonstrates that pack/unpack is order-dependent for enum
+    // fields too
     #[derive(Encode, Decode, Pack, Unpack, PartialEq, Debug)]
     enum EnumA {
         Named { first: u32, second: String },

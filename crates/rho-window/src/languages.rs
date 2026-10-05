@@ -20,8 +20,7 @@ pub fn registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
         ));
         languages.set_theme(cx.theme().clone());
         {
-            let fs: Arc<dyn fs::Fs> =
-                Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+            let fs: Arc<dyn fs::Fs> = fs::RealFs::new(None, cx.background_executor().clone());
             languages::init(
                 languages.clone(),
                 fs,

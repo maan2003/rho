@@ -498,7 +498,7 @@ pub(crate) async fn init(db: &RhoDb) -> anyhow::Result<()> {
     let current = {
         let read = db.read();
         read.has_table(FORMAT.name())
-            .then(|| read.open_table(FORMAT).get(&()).map(|value| value.value()))
+            .then(|| read.open_table(FORMAT).get(()).map(|value| value.value()))
             .flatten()
     };
     match current.as_deref() {
@@ -513,7 +513,7 @@ pub(crate) async fn init(db: &RhoDb) -> anyhow::Result<()> {
     write.open_table(QUOTAS);
     write
         .open_table(FORMAT)
-        .insert(&(), CURRENT_FORMAT.to_owned());
+        .insert((), CURRENT_FORMAT.to_owned());
     write.commit();
     Ok(())
 }
@@ -524,7 +524,7 @@ fn load_settings(db: &RhoDb) -> SettingsRecord {
         return SettingsRecord::default();
     }
     read.open_table(SETTINGS)
-        .get(&())
+        .get(())
         .map(|record| record.value().into_owned())
         .unwrap_or_default()
 }
@@ -536,7 +536,7 @@ fn store_settings(write: &mut rho_db::WriteTxn, state: &AccountState) {
     };
     write
         .open_table(SETTINGS)
-        .insert(&(), SenValue::borrowed(&record));
+        .insert((), SenValue::borrowed(&record));
 }
 
 #[cfg(test)]

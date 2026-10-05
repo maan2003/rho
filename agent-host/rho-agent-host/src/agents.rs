@@ -3,7 +3,7 @@
 //! the journal, the live tails, new agents and the quota; requests,
 //! terminals, shells and workspace channels are streams of their own.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -268,7 +268,7 @@ where
                 }
                 // Focus is what this client is looking at, nothing more: it
                 // never loads an agent. The pool unions it across streams
-                // into the live set; a loaded agent in it tells its tail.
+                // into the live set; a loaded agent in it shows its response.
                 services
                     .pool
                     .set_live_wants(stream_id, agent_ids.into_iter().collect())
@@ -306,72 +306,54 @@ where
     result
 }
 
+/// One pipe per connection: rows and live statuses go out in one order.
 /// Rows are read from the journal, never from the feed: an append only
 /// says a row landed, and the connection pages the journal from the last
 /// seq it sent. A lagged subscription does the same. Rows the transcript
 /// leaves behind (`strip` says nothing) advance the seq without a message.
 ///
-/// Catch-up is followed by full live snapshots. No connection-local delta
-/// encoder is needed: repeated snapshots replace the same ephemeral state.
+/// Statuses are full snapshots, the latest per agent: an unsent one is
+/// replaced rather than queued, so a slow connection never falls behind.
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     since: Seq,
 ) -> tokio::task::JoinHandle<()> {
-    use rho_agent::journal::Feed;
     tokio::spawn(async move {
-        // Subscribed before the catch-up read, so a row appended during it
-        // is queued rather than lost; the seq drops the duplicates.
+        // Both subscribed before the first read, so nothing that lands
+        // during it is lost; the seq drops duplicate rows.
+        let statuses = services.pool.watch_statuses().await;
         let mut feed = rho_agent::journal::feed(&services.db);
         let mut sent = since;
-        if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
-            return;
-        }
-        services.pool.tell_tails().await;
         loop {
-            match feed.recv().await {
-                Ok(Feed::Status {
-                    agent_id,
-                    status,
-                    queue,
-                }) => {
-                    if let Some(queue) = queue {
-                        let live = rho_agents_client::protocol::transcript::Live::Queued {
-                            items: queue.iter().map(crate::transcript::queued_item).collect(),
-                        };
-                        if outgoing_tx
-                            .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    let live = rho_agents_client::protocol::transcript::Live::Snapshot {
-                        state: status.runtime.clone(),
-                        response: status.response.clone(),
-                        draft: status.draft.clone(),
-                    };
-                    if outgoing_tx
-                        .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
-                        .is_err()
-                    {
-                        return;
-                    }
+            // Taken before the rows are read: an agent's status arrives
+            // after the rows it reflects commit, so they go out first.
+            let changed = statuses.take();
+            if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
+                return;
+            }
+            for (agent_id, status) in changed {
+                let live = rho_agents_client::protocol::transcript::Live::Snapshot {
+                    state: status.runtime.clone(),
+                    response: status.response.clone(),
+                    draft: status.draft.clone(),
+                };
+                if outgoing_tx
+                    .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
+                    .is_err()
+                {
+                    return;
                 }
-                Ok(Feed::Appended(appended)) => {
-                    if appended.seq > sent
-                        && !send_journal_from(&services.db, &outgoing_tx, &mut sent).await
-                    {
-                        return;
-                    }
+            }
+            loop {
+                tokio::select! {
+                    appended = feed.recv() => match appended {
+                        Ok(appended) if appended.seq <= sent => continue,
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    },
+                    () = statuses.changed() => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
-                        return;
-                    }
-                    services.pool.tell_tails().await;
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     })
@@ -384,6 +366,10 @@ async fn send_journal_from(
     outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
 ) -> bool {
+    // Each agent's newest visible step as of the rows already paged, so a
+    // request reads its carry back from the log once per agent, not once
+    // per request: that walk is as long as the gap since the last step.
+    let mut carries = HashMap::<AgentId, Option<rho_agent::inference::Carry>>::new();
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
         let Some((last, _, _, _)) = page.last() else {
@@ -393,17 +379,31 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                let prior_carry = matches!(
-                    event,
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent { .. })
-                )
-                .then(|| db.read().agent_input_carry(agent_id, pos))
-                .flatten();
+                let mut prior_carry = None;
+                match &event {
+                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
+                        carry, ..
+                    }) => {
+                        carries.insert(agent_id, Some(carry.clone()));
+                    }
+                    rho_agent::AgentEvent::Rewound { .. } => {
+                        carries.remove(&agent_id);
+                    }
+                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
+                        ..
+                    }) => {
+                        prior_carry = carries
+                            .entry(agent_id)
+                            .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
+                            .as_ref();
+                    }
+                    _ => {}
+                }
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: crate::transcript::strip(&event, prior_carry.as_ref())?,
+                    event: crate::transcript::strip(&event, prior_carry)?,
                 })
             })
             .collect::<Vec<_>>();
@@ -1120,7 +1120,90 @@ fn detail_result(
 mod tests {
     use std::sync::Arc;
 
-    use super::detail_result;
+    use rho_agent::AgentEvent;
+    use rho_agent::db::AgentWriteTxnExt as _;
+    use rho_agent::entry::{Entry, Report, RequestNotice};
+    use rho_agent_types::{Seq, UnixMs};
+    use rho_agents_client::protocol::ServerFrame;
+    use rho_agents_client::protocol::transcript::TranscriptEvent;
+
+    use super::{detail_result, send_journal_from};
+
+    #[tokio::test]
+    async fn a_request_after_a_rewind_reports_the_step_still_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let step = |id: &str| {
+            AgentEvent::Entry(Entry::Step {
+                at: UnixMs(1),
+                exec: None,
+                prose: String::new(),
+                carry: rho_agent::inference::Carry::new(
+                    serde_json::json!({"items": [{
+                        "type": "custom_tool_call", "name": "exec", "call_id": id, "input": "cell"
+                    }]}),
+                    vec![rho_agent::inference::Call::new(id, "cell".into())],
+                    false,
+                ),
+                usage: None,
+            })
+        };
+        let request = AgentEvent::Entry(Entry::RequestSent {
+            at: UnixMs(2),
+            why: rho_agent::entry::Wake::Notify,
+            report: Report {
+                notices: vec![RequestNotice::Restarted],
+                ..Default::default()
+            },
+            compact: false,
+        });
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent = write.alloc_agent_id();
+        write.append_agent_event(
+            agent,
+            &AgentEvent::Created {
+                role: Default::default(),
+                binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
+                runtime: rho_agent::log::AgentRuntime::Rho {
+                    prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                },
+                place: rho_agent_types::Place {
+                    workset: "0123456789ab".into(),
+                    cwd: "/src/rho".into(),
+                    origin: None,
+                },
+                spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
+                spawn_name: None,
+                created_at: UnixMs(0),
+                parent: None,
+            },
+        );
+        write.append_agent_event(agent, &step("exec-1"));
+        write.append_agent_event(agent, &request);
+        let taken_back = write.append_agent_event(agent, &step("exec-2"));
+        write.append_agent_event(
+            agent,
+            &AgentEvent::Rewound {
+                to: taken_back,
+                at: UnixMs(3),
+            },
+        );
+        write.append_agent_event(agent, &request);
+        write.commit();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
+        let mut reported = Vec::new();
+        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
+            for entry in entries {
+                if let TranscriptEvent::NotebookReport { calls, .. } = entry.event {
+                    reported.push(calls);
+                }
+            }
+        }
+        assert_eq!(reported, [["exec-1"], ["exec-1"]]);
+    }
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
@@ -1135,7 +1218,6 @@ mod tests {
             },
             started_at: rho_agent_types::UnixMs(1),
             finished_at: rho_agent_types::UnixMs(2),
-            metadata: None,
         };
 
         assert_eq!(detail_result(&result).output, "complete host record");

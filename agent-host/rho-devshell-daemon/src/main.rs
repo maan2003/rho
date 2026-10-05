@@ -19,24 +19,36 @@ const USAGE: &str = "usage: rho-devshell-daemon [stats [HOURS] | events]";
 fn main() -> Result<()> {
     let dir = rho_devshell::devshell_dir()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async {
         let records = || async { rho_devshell::Client::new(&dir).records().await };
         match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
             [] => {
-                let store = Arc::new(Store::open(RhoDb::open(dir.join("shells.redb")), dir.clone()).await);
+                let store =
+                    Arc::new(Store::open(RhoDb::open(dir.join("shells.redb")), dir.clone()).await);
                 store.serve().context("serve the dev shell cache")?.await;
             }
             ["stats", ref hours @ ..] if hours.len() <= 1 => {
-                let hours: Option<f64> = hours.first().map(|h| h.parse()).transpose().context(USAGE)?;
+                let hours: Option<f64> = hours
+                    .first()
+                    .map(|h| h.parse())
+                    .transpose()
+                    .context(USAGE)?;
                 let now = chrono::Utc::now().timestamp_millis() as u64;
                 let records: Vec<Record> = records()
                     .await?
                     .into_iter()
-                    .filter(|r| hours.is_none_or(|h| now.saturating_sub(r.at_ms) as f64 <= h * 3_600_000.0))
+                    .filter(|r| {
+                        hours.is_none_or(|h| now.saturating_sub(r.at_ms) as f64 <= h * 3_600_000.0)
+                    })
                     .collect();
                 println!("{}\n", Stats::of(&records));
-                for record in records.iter().filter(|r| !matches!(r.event, Event::Hit { .. } | Event::Kept { .. })) {
+                for record in records
+                    .iter()
+                    .filter(|r| !matches!(r.event, Event::Hit { .. } | Event::Kept { .. }))
+                {
                     println!("{}", line(record));
                 }
             }

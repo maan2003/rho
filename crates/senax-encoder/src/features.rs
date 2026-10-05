@@ -462,7 +462,8 @@ impl Packer for NaiveTime {
 impl Encoder for NaiveDateTime {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         writer.put_u8(TAG_CHRONO_NAIVE_DATETIME);
-        // Store as seconds and nanoseconds since Unix epoch (1970-01-01 00:00:00)
+        // Store as seconds and nanoseconds since Unix epoch (1970-01-01
+        // 00:00:00)
         let timestamp_seconds = self.and_utc().timestamp();
         let timestamp_nanos = self.and_utc().timestamp_subsec_nanos();
         timestamp_seconds.encode(writer)?;

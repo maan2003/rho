@@ -1905,7 +1905,8 @@ impl ConversationView {
             }
         }
         self.revision = revision;
-        // Resolving authors rewrites rows too; restore the reader's point after it.
+        // Resolving authors rewrites rows too; restore the reader's point after
+        // it.
         self.settle_names(cx);
         // Back on the message it was on, if the redraw moved it off. The
         // reader chose that message; everything below is the surface's own
@@ -2483,7 +2484,7 @@ impl ConversationView {
     ) -> Option<Arc<gpui::RenderImage>> {
         const MAX_DECODED_EMOJI_BYTES: usize = 16 * 1024 * 1024;
         if !self.emoji_images.contains_key(path) {
-            let decoded = std::fs::read(&path)
+            let decoded = std::fs::read(path)
                 .ok()
                 .and_then(|bytes| {
                     let format = emoji_image_format(&bytes)?;
@@ -2722,8 +2723,9 @@ impl ConversationView {
                     .map(std::path::Path::to_path_buf);
                 let image = path.as_ref().and_then(|path| self.decoded_image(path, cx));
                 pending |= self.session.read(cx).avatar_loading(&user);
-                // Author identity and row geometry never depend on the download.
-                // The source still retains the name for copy/search.
+                // Author identity and row geometry never depend on the
+                // download. The source still retains the name
+                // for copy/search.
                 let header = text.lines().next().unwrap_or_default();
                 let initials = header
                     .split_whitespace()
@@ -3965,7 +3967,8 @@ fn message_item_with_header(
     let body_start = lines.len();
     lines.extend(said.split('\n').map(&meta));
     if message.edited {
-        // Keep the marker outside the source Markdown, including closing fences.
+        // Keep the marker outside the source Markdown, including closing
+        // fences.
         let row = said
             .split('\n')
             .enumerate()
@@ -4113,11 +4116,10 @@ fn message_item_with_header(
 /// its own words, because a reply landing in the channel instead is the
 /// mistake this line exists to prevent.
 fn compose_placeholder(label: &str, thread: bool) -> String {
-    let target = match thread {
+    match thread {
         false => format!("Message {label}…"),
         true => format!("Reply in {label}…"),
-    };
-    target
+    }
 }
 
 /// Waits for the outcome of a write that is already on its way. The write

@@ -158,11 +158,6 @@ pub(crate) struct SpawnArgs {
     pub(crate) workdir: Option<String>,
 }
 
-pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
-    anyhow::ensure!(role == "med-eng", "only med-eng spawning is supported");
-    Ok(AgentRole::default())
-}
-
 async fn spawn_engineer(tools: &MultiAgentTools, args: SpawnArgs) -> anyhow::Result<String> {
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
@@ -242,6 +237,39 @@ fn ensure_may_interrupt(pool: &AgentPool, sender: AgentId, target: AgentId) -> a
     Ok(())
 }
 
+/// The agent a handle names: "eng-…" or "adv-…", or the bare id behind
+/// the prefix, which agents also see and pass. A prefix must match the
+/// agent's role.
+fn resolve_handle(pool: &AgentPool, handle: &str) -> anyhow::Result<AgentId> {
+    let handle = handle.trim();
+    let (prefix, raw) = match handle.split_once('-') {
+        Some((prefix @ ("eng" | "adv"), raw)) => (Some(prefix), raw),
+        _ => (None, handle),
+    };
+    let agent = match pool.resolve_agent_id(raw)? {
+        prefix_id::PrefixResolution::Unique(agent) => agent,
+        prefix_id::PrefixResolution::Ambiguous { .. } => {
+            anyhow::bail!("ambiguous agent id {handle}")
+        }
+        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {handle}"),
+    };
+    anyhow::ensure!(pool.agent_exists(agent), "no agent with id {handle}");
+    if let Some(prefix) = prefix {
+        anyhow::ensure!(
+            pool.db()
+                .read()
+                .get_agent(agent)
+                .config
+                .role
+                .handle_prefix()
+                == prefix,
+            "{handle} names {}, whose role prefix differs",
+            pool.agent_handle(agent)
+        );
+    }
+    Ok(agent)
+}
+
 #[derive(Debug, Encode, Decode)]
 pub(crate) struct SendArgs {
     pub(crate) agent_id: String,
@@ -253,33 +281,7 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
         anyhow::bail!("message must not be empty");
     }
     let pool = tools.pool()?;
-    let handle = args.agent_id.trim();
-    let (_, raw_agent_id) = handle
-        .split_once('-')
-        .filter(|(prefix, _)| matches!(*prefix, "eng" | "pm" | "adv"))
-        .ok_or_else(|| anyhow::anyhow!("agent_id must use an eng-, pm-, or adv- handle"))?;
-    let recipient = match pool.resolve_agent_id(raw_agent_id)? {
-        prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
-        prefix_id::PrefixResolution::Ambiguous { .. } => {
-            anyhow::bail!("ambiguous agent id {handle}")
-        }
-        prefix_id::PrefixResolution::NotFound => {
-            anyhow::bail!("no agent with id {handle}")
-        }
-    };
-    if !pool.agent_exists(recipient) {
-        anyhow::bail!("no agent with id {handle}");
-    }
-    anyhow::ensure!(
-        pool.db()
-            .read()
-            .get_agent(recipient)
-            .config
-            .role
-            .handle_prefix()
-            == handle.split('-').next().unwrap(),
-        "agent handle role prefix does not match target"
-    );
+    let recipient = resolve_handle(&pool, &args.agent_id)?;
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
     }
@@ -298,23 +300,7 @@ async fn interrupt_engineer(
     args: InterruptArgs,
 ) -> anyhow::Result<String> {
     let pool = tools.pool()?;
-    let raw_agent_id = args
-        .agent_id
-        .trim()
-        .strip_prefix("eng-")
-        .ok_or_else(|| anyhow::anyhow!("agent_id must start with eng-"))?;
-    let target = match pool.resolve_agent_id(raw_agent_id)? {
-        prefix_id::PrefixResolution::Unique(agent_id)
-        | prefix_id::PrefixResolution::Ambiguous {
-            first: agent_id, ..
-        } => agent_id,
-        prefix_id::PrefixResolution::NotFound => {
-            anyhow::bail!("no agent with id {}", args.agent_id)
-        }
-    };
-    if !pool.agent_exists(target) {
-        anyhow::bail!("no agent with id {}", args.agent_id);
-    }
+    let target = resolve_handle(&pool, &args.agent_id)?;
     anyhow::ensure!(
         pool.db().read().get_agent(target).config.role.is_engineer(),
         "target is not an Engineer"
@@ -334,12 +320,6 @@ async fn interrupt_engineer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_spawn_role() {
-        assert_eq!(parse_spawn_role("med-eng").unwrap(), AgentRole::default());
-        assert!(parse_spawn_role("terra").is_err());
-    }
 
     #[test]
     fn engineer_modes_choose_the_requested_advisor_tiers() {

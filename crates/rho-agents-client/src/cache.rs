@@ -31,7 +31,7 @@ use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; an agent host with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v8");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v10");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v5");
 /// One agent's mirror, ordered by position, agent first: a range read
@@ -55,12 +55,15 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v7: code-first explicit messages and notebook reports replace old
 /// projections.
 /// v8: typed report migration remaps log positions and journal sequence.
+/// v9: sends carry their kind, and turn edges, waits and wants are gone.
+/// Positions are unchanged, so verdicts keep their cursors.
+/// v10: the aside kind `Other` is `Fyi`, under its own name.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
-    TableDefinition::new("gui_mirror_events_v8");
+    TableDefinition::new("gui_mirror_events_v10");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-    TableDefinition::new("gui_agent_digest_v5");
+    TableDefinition::new("gui_agent_digest_v7");
 /// What the user last said about an agent, so Home ranks the same way on
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
@@ -80,7 +83,13 @@ const DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_d
 
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 25] = [
+const RETIRED_TABLES: [&str; 31] = [
+    "gui_mirror_host_v9",
+    "gui_mirror_events_v9",
+    "gui_agent_digest_v6",
+    "gui_mirror_host_v8",
+    "gui_mirror_events_v8",
+    "gui_agent_digest_v5",
     "gui_mirror_host_v7",
     "gui_mirror_events_v7",
     // Code-first projection and host migration remap historical row positions.
@@ -267,7 +276,7 @@ impl Mirror {
                     .collect::<Vec<(AgentId, Verdict)>>();
                 for (agent, mut verdict) in existing {
                     verdict.handled_through = AgentPos::ZERO;
-                    verdicts.insert(&agent, SenValue::borrowed(&verdict));
+                    verdicts.insert(agent, SenValue::borrowed(&verdict));
                 }
             } else {
                 write.open_table(VERDICTS);
@@ -349,14 +358,14 @@ impl Mirror {
                 let agent_id = key.value();
                 // A digest without a host is a partial reset; the host's
                 // copy starts over the next time it is doubted.
-                let host = agent_hosts.get(&agent_id)?.value().to_owned();
+                let host = agent_hosts.get(agent_id)?.value().to_owned();
                 Some((
                     agent_id,
                     MirroredAgent {
                         host,
                         snapshot: value.value().into_owned(),
                         verdict: verdicts
-                            .get(&agent_id)
+                            .get(agent_id)
                             .map(|value| value.value().into_owned()),
                     },
                 ))
@@ -505,7 +514,7 @@ fn apply(
                 let mut events = transaction.open_table(EVENTS);
                 for entry in &entries {
                     events.insert(
-                        &(entry.agent_id, entry.pos.0),
+                        (entry.agent_id, entry.pos.0),
                         SenValue::borrowed(&entry.event),
                     );
                 }
@@ -513,7 +522,7 @@ fn apply(
             {
                 let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
                 for entry in entries.iter().filter(|e| e.pos == AgentPos::ZERO) {
-                    agent_hosts.insert(&entry.agent_id, &host.as_str());
+                    agent_hosts.insert(entry.agent_id, host.as_str());
                 }
             }
             {
@@ -523,30 +532,30 @@ fn apply(
                 }
             }
             transaction.open_table(HOSTS).insert(
-                &host.as_str(),
+                host.as_str(),
                 SenValue::borrowed(&StoredHost { machine_seed, seq }),
             );
         }
         Write::Verdict(agent_id, verdict) => {
             transaction
                 .open_table(VERDICTS)
-                .insert(&agent_id, SenValue::borrowed(&verdict));
+                .insert(agent_id, SenValue::borrowed(&verdict));
         }
         Write::Outgoing(agent_id, id, Some(outgoing)) => {
             transaction
                 .open_table(OUTBOX)
-                .insert(&(agent_id, id), SenValue::borrowed(&outgoing));
-            transaction.open_table(DRAFTS).remove(&agent_id);
+                .insert((agent_id, id), SenValue::borrowed(&outgoing));
+            transaction.open_table(DRAFTS).remove(agent_id);
         }
         Write::Outgoing(agent_id, id, None) => {
-            transaction.open_table(OUTBOX).remove(&(agent_id, id));
+            transaction.open_table(OUTBOX).remove((agent_id, id));
         }
         Write::Draft(agent_id, text) => {
             let mut table = transaction.open_table(DRAFTS);
             if text.is_empty() {
-                table.remove(&agent_id);
+                table.remove(agent_id);
             } else {
-                table.insert(&agent_id, &text.as_str());
+                table.insert(agent_id, text.as_str());
             }
         }
         Write::Digests(digests) => {
@@ -556,7 +565,7 @@ fn apply(
             }
         }
         Write::Reset(host) => {
-            transaction.open_table(HOSTS).remove(&host.as_str());
+            transaction.open_table(HOSTS).remove(host.as_str());
             let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
             let departed = agent_hosts
                 .iter()
@@ -584,7 +593,7 @@ fn apply(
                     .map(|(key, _)| key.value())
                     .collect::<Vec<_>>();
                 for key in held {
-                    events.remove(&key);
+                    events.remove(key);
                 }
             }
         }
@@ -726,7 +735,6 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{TurnEdge, TurnOutcome};
 
     use super::*;
     use crate::protocol::transcript::{RuntimeKind, SpawnedBy};
@@ -756,8 +764,10 @@ mod tests {
                 text: "have a look".to_owned(),
                 at: rho_agent_types::UnixMs(1_000),
             },
-            TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Completed),
+            TranscriptEvent::MessageSent {
+                to: None,
+                text: "looked".to_owned(),
+                kind: rho_agent_types::SendKind::Result,
                 at: rho_agent_types::UnixMs(2_000),
             },
         ]
@@ -936,7 +946,7 @@ mod tests {
                     }),
                 );
                 write.open_table(VERDICTS).insert(
-                    &id,
+                    id,
                     SenValue::borrowed(&Verdict {
                         handled_through: AgentPos(999),
                         muted: true,
@@ -952,7 +962,7 @@ mod tests {
         let verdict = db
             .read()
             .open_table(VERDICTS)
-            .get(&id)
+            .get(id)
             .unwrap()
             .value()
             .into_owned();
@@ -968,7 +978,7 @@ mod tests {
         let verdict = db
             .read()
             .open_table(VERDICTS)
-            .get(&id)
+            .get(id)
             .unwrap()
             .value()
             .into_owned();
@@ -1024,19 +1034,19 @@ mod tests {
                         seq: Seq(3),
                     }),
                 );
-                write.open_table(OLD_AGENT_HOSTS).insert(&id, "local");
+                write.open_table(OLD_AGENT_HOSTS).insert(id, "local");
                 write
                     .open_table(OLD_DIGESTS)
-                    .insert(&id, SenValue::borrowed(&snapshot(&entries)));
+                    .insert(id, SenValue::borrowed(&snapshot(&entries)));
                 for entry in &entries {
                     write
                         .open_table(OLD_EVENTS)
-                        .insert(&(id, entry.pos.0), SenValue::borrowed(&entry.event));
+                        .insert((id, entry.pos.0), SenValue::borrowed(&entry.event));
                 }
                 write
                     .open_table(VERDICTS)
-                    .insert(&id, SenValue::borrowed(&verdict));
-                write.open_table(UNRELATED).insert(&1, "keep me");
+                    .insert(id, SenValue::borrowed(&verdict));
+                write.open_table(UNRELATED).insert(1, "keep me");
                 write.commit();
             });
         let mirror = Mirror::open_on(db.clone()).unwrap();
@@ -1050,18 +1060,18 @@ mod tests {
         assert_eq!(
             db.read()
                 .open_table(VERDICTS)
-                .get(&id)
+                .get(id)
                 .unwrap()
                 .value()
                 .into_owned(),
             verdict
         );
         assert_eq!(
-            db.read().open_table(UNRELATED).get(&1).unwrap().value(),
+            db.read().open_table(UNRELATED).get(1).unwrap().value(),
             "keep me"
         );
-        // Refill from the migrated agent host as on Follow{since:0}; preserve user
-        // disposition when the rebuilt agent first appears again.
+        // Refill from the migrated agent host as on Follow{since:0}; preserve
+        // user disposition when the rebuilt agent first appears again.
         write(&mirror, "local", 7, entries);
         mirror.flush();
         let loaded = mirror.load();

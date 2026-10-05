@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, Place, PresentationField, Seq, TurnEdge, UnixMs,
+    AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, Seq, UnixMs,
 };
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
@@ -16,8 +16,6 @@ use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agents_client::protocol::transcript::RuntimeKind;
 pub type UiSpawnedBy = rho_agents_client::protocol::transcript::SpawnedBy;
-pub type UiAgentWant = rho_agent_types::AgentWant;
-pub type UiTurnOutcome = rho_agent_types::TurnOutcome;
 
 /// A position in an agent's story, as the old `Ready` named it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,8 +34,8 @@ pub struct UiAgentHead {
     pub parent: Option<AgentId>,
     pub spawn_name: Option<String>,
     pub generated_title: Option<String>,
-    pub activity: Option<String>,
-    pub turn_running: bool,
+    /// What the agent last told the user it is doing, as a status send.
+    pub status: Option<String>,
     pub created_at: UnixMs,
 }
 
@@ -48,16 +46,10 @@ pub enum UiStoryEvent {
         text: String,
         at: UnixMs,
     },
-    TurnStarted {
-        at: UnixMs,
-    },
-    TurnEnded {
-        outcome: UiTurnOutcome,
-        at: UnixMs,
-    },
-    Wants {
-        want: UiAgentWant,
-        summary: Option<String>,
+    /// The agent sent the user something of this kind.
+    Sent {
+        text: String,
+        kind: SendKind,
         at: UnixMs,
     },
 }
@@ -70,15 +62,12 @@ impl UiStoryEvent {
                 text,
                 at,
             },
-            Self::TurnStarted { at } => TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
+            Self::Sent { text, kind, at } => TranscriptEvent::MessageSent {
+                to: None,
+                text,
+                kind,
                 at,
             },
-            Self::TurnEnded { outcome, at } => TranscriptEvent::Turn {
-                edge: TurnEdge::Ended(outcome),
-                at,
-            },
-            Self::Wants { want, summary, at } => TranscriptEvent::Wants { want, summary, at },
         }
     }
 }
@@ -120,30 +109,14 @@ fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
 }
 
 /// The rows that say what a head said: creation at row zero, then the
-/// title and the running turn, the last of them at the head's position.
+/// title and the status, the last of them at the head's position.
 /// A head told again for an agent already known is what it says now, as
 /// rows past the last.
 pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     let agent_id = head.agent_id;
     if known(agent_id) {
         let mut events = Vec::new();
-        if head.generated_title.is_some() || head.activity.is_some() {
-            events.push(TranscriptEvent::Presented {
-                title: head
-                    .generated_title
-                    .map_or(PresentationField::Unchanged, PresentationField::Set),
-                activity: head
-                    .activity
-                    .map_or(PresentationField::Unchanged, PresentationField::Set),
-                at: head.created_at,
-            });
-        }
-        if head.turn_running {
-            events.push(TranscriptEvent::Turn {
-                edge: TurnEdge::Started,
-                at: head.created_at,
-            });
-        }
+        events.extend(presented(&head));
         return events
             .into_iter()
             .map(|event| {
@@ -152,6 +125,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             })
             .collect();
     }
+    let shown = presented(&head);
     let mut events = vec![TranscriptEvent::Created {
         role: head.role,
         runtime: head.runtime_kind,
@@ -162,31 +136,15 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         model: "test-model".to_owned(),
         at: head.created_at,
     }];
-    if head.generated_title.is_some() || head.activity.is_some() {
-        events.push(TranscriptEvent::Presented {
-            title: head
-                .generated_title
-                .map_or(PresentationField::Unchanged, PresentationField::Set),
-            activity: head
-                .activity
-                .map_or(PresentationField::Unchanged, PresentationField::Set),
-            at: head.created_at,
-        });
-    }
-    if head.turn_running {
-        events.push(TranscriptEvent::Turn {
-            edge: TurnEdge::Started,
-            at: head.created_at,
-        });
-    }
+    let created_at = head.created_at;
+    events.extend(shown);
     let told = events.len() as u64;
     if head.story_pos.0 >= told {
         // The head stood past what these rows say; a row that changes
         // nothing carries the position.
         events.push(TranscriptEvent::Presented {
             title: PresentationField::Unchanged,
-            activity: PresentationField::Unchanged,
-            at: head.created_at,
+            at: created_at,
         });
     }
     let last = events.len() - 1;
@@ -202,6 +160,26 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             entry(agent_id, pos, event)
         })
         .collect()
+}
+
+/// The title and the status a head carries, as rows.
+fn presented(head: &UiAgentHead) -> Vec<TranscriptEvent> {
+    let mut events = Vec::new();
+    if let Some(title) = &head.generated_title {
+        events.push(TranscriptEvent::Presented {
+            title: PresentationField::Set(title.clone()),
+            at: head.created_at,
+        });
+    }
+    if let Some(status) = &head.status {
+        events.push(TranscriptEvent::MessageSent {
+            to: None,
+            text: status.clone(),
+            kind: SendKind::Status,
+            at: head.created_at,
+        });
+    }
+    events
 }
 
 /// `Ready`, then an agents stream opening on the log rows these heads stand

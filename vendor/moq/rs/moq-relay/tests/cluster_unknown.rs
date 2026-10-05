@@ -1,8 +1,8 @@
 //! Regression for an external publisher whose protocol does not declare a Hop ID.
-//! The relay records that publisher as `Hop::UNKNOWN`; reflected cluster paths
-//! must not replace it while gossiping around a redundant mesh.
+//! The relay stamps that publisher with a random Hop ID of the connection's own;
+//! reflected cluster paths must not replace it while propagating around a redundant mesh.
 
-use std::{net::TcpListener, time::Duration};
+use std::time::Duration;
 
 use moq_relay::{Config, Relay};
 use url::Url;
@@ -10,24 +10,15 @@ use url::Url;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PATH: &str = "opalin/cell-clumsy-octopus/cameras/left.hang";
 
-fn free_tcp_port() -> u16 {
-	TcpListener::bind("127.0.0.1:0")
-		.expect("bind probe")
-		.local_addr()
-		.expect("local addr")
-		.port()
-}
-
 async fn spawn_relay(
 	id: u64,
 	connect: Vec<String>,
 	cluster_version: Option<moq_net::Version>,
 ) -> (u16, tokio::task::JoinHandle<()>) {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-	let port = free_tcp_port();
 
 	let mut config = Config::default();
-	config.listen.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse bind"));
+	config.listen.tcp.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
 	config.connect.bind = Some("127.0.0.1:0".parse().expect("parse client bind"));
 	config.connect.tls.insecure = Some(true);
 	config.connect.version.extend(cluster_version);
@@ -38,19 +29,12 @@ async fn spawn_relay(
 	config.cluster.id = Some(id);
 	config.cluster.connect = connect.into_iter().map(moq_relay::cluster::Peer::new).collect();
 
+	// `load` binds the TCP listener, so the port is ours before anyone dials it.
 	let relay = Relay::load(config).await.expect("relay load");
+	let port = relay.tcp_addr().expect("TCP listener is configured").port();
 	let handle = tokio::spawn(async move {
 		let _ = relay.run().await;
 	});
-
-	let deadline = std::time::Instant::now() + Duration::from_secs(5);
-	loop {
-		if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-			break;
-		}
-		assert!(std::time::Instant::now() < deadline, "relay {id} never became ready");
-		tokio::time::sleep(Duration::from_millis(25)).await;
-	}
 
 	(port, handle)
 }
@@ -121,8 +105,8 @@ async fn publish_version(port: u16, version: &str) -> Publisher {
 }
 
 async fn publish_unknown(port: u16) -> Publisher {
-	// Draft-14 has no Cluster extension, so the accepting relay must represent
-	// this external publisher with the wire-defined UNKNOWN Hop ID.
+	// Draft-14 has no Cluster extension, so the accepting relay must name this
+	// external publisher with a stamp of its own.
 	publish_version(port, "moq-transport-14").await
 }
 
@@ -242,7 +226,7 @@ async fn assert_unknown_publisher_stays_announced(cluster_version: Option<moq_ne
 /// Every ingest version that can carry a broadcast must survive the same
 /// redundant mesh. The pre-fix failure set was exactly the versions that
 /// declare no origin identity (lite <= 03, moq-transport <= 16): their
-/// broadcasts enter with an UNKNOWN first hop, and the reflected copy replaced
+/// broadcasts entered with an UNKNOWN first hop, and the reflected copy replaced
 /// the live source instead of parking. The identity-carrying versions held
 /// even before the fix, so this pins both halves of the boundary.
 #[tokio::test]

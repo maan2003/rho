@@ -265,7 +265,8 @@ fn process_char(
         }
         (Value::Number(num), ObjectStatus::ScalarNumber { value_so_far }, c @ '0'..='9') => {
             value_so_far.push(c);
-            // if the number contains a decimal point or an exponent, parse as f64
+            // if the number contains a decimal point or an exponent, parse as
+            // f64
             if value_so_far.contains(&'.')
                 || value_so_far.contains(&'e')
                 || value_so_far.contains(&'E')
@@ -642,18 +643,6 @@ pub fn parse_stream(json_string: &str) -> Result<Value, String> {
         add_char_into_object(&mut stack, current_char)?;
     }
     Ok(stack.pop().unwrap().0)
-}
-
-pub fn parse_stream_with_limits(
-    json_string: &str,
-    max_depth: Option<usize>,
-    max_length: Option<usize>,
-) -> Result<Value, String> {
-    let mut parser = JsonStreamParser::with_limits(max_depth, max_length);
-    for c in json_string.chars() {
-        parser.add_char(c)?;
-    }
-    Ok(parser.stack.pop().unwrap().0)
 }
 
 pub struct JsonStreamParser {

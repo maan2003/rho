@@ -10,6 +10,9 @@ struct Args {
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: &[u8; 27] = rho_agent::heap::MALLOC_CONF;
+
 fn main() {
     // Return freed memory to the system while the host is idle.
     tikv_jemalloc_ctl::background_thread::write(true).expect("start jemalloc background thread");
@@ -21,6 +24,7 @@ fn main() {
     let result = (|| {
         let profiler = rho_agent_host::HostProfiler::start(&mut host_args)?;
         let runtime = tokio::runtime::Runtime::new()?;
+        runtime.spawn(rho_agent::heap::dump_on_sigusr1());
         let result = runtime.block_on(rho_agent_host::run(host_args));
         drop(runtime);
         profiler.finish(result)

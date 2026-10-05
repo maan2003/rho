@@ -204,6 +204,10 @@ pub struct ThemeColors {
     // Editor
     // ===
     pub editor_foreground: Color,
+    /// Text color used for CodeLens items in the editor.
+    ///
+    /// Falls back to `text_muted` when not explicitly set.
+    pub editor_code_lens_foreground: Option<Color>,
     pub editor_background: Color,
     pub editor_gutter_background: Color,
     pub editor_subheader_background: Color,
@@ -404,6 +408,7 @@ pub enum ThemeColorField {
     MinimapThumbActiveBackground,
     MinimapThumbBorder,
     EditorForeground,
+    EditorCodeLensForeground,
     EditorBackground,
     EditorGutterBackground,
     EditorSubheaderBackground,
@@ -458,6 +463,16 @@ pub enum ThemeColorField {
 }
 
 impl ThemeColors {
+    pub fn surface_overlay_background(&self) -> Color {
+        if self.surface_background.is_opaque() {
+            self.surface_background
+        } else if self.background.is_opaque() {
+            self.background.blend(self.surface_background)
+        } else {
+            self.panel_overlay_background
+        }
+    }
+
     pub fn color(&self, field: ThemeColorField) -> Color {
         match field {
             ThemeColorField::Border => self.border,
@@ -522,6 +537,9 @@ impl ThemeColors {
             ThemeColorField::MinimapThumbActiveBackground => self.minimap_thumb_active_background,
             ThemeColorField::MinimapThumbBorder => self.minimap_thumb_border,
             ThemeColorField::EditorForeground => self.editor_foreground,
+            ThemeColorField::EditorCodeLensForeground => {
+                self.editor_code_lens_foreground.unwrap_or(self.text_muted)
+            }
             ThemeColorField::EditorBackground => self.editor_background,
             ThemeColorField::EditorGutterBackground => self.editor_gutter_background,
             ThemeColorField::EditorSubheaderBackground => self.editor_subheader_background,
@@ -627,9 +645,33 @@ pub struct ThemeStyles {
 
 #[cfg(test)]
 mod tests {
+    use gpui::Rgba;
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn surface_overlay_background() {
+        let mut colors = ThemeColors::light();
+        colors.panel_overlay_background = gpui::rgb(0xff0000).into();
+
+        for (surface, background, expected) in [
+            (0x58585a00, 0xdcdcddff, 0xdcdcddff),
+            (0x00000080, 0xdcdcddff, 0xa1a1a2ff),
+            (0xebebecff, 0x24252900, 0xebebecff),
+            (0xebebec00, 0x24252900, 0xff0000ff),
+            (0xebebec00, 0x24252980, 0xff0000ff),
+            (0x24252980, 0x24252980, 0xff0000ff),
+        ] {
+            colors.surface_background = gpui::rgba(surface).into();
+            colors.background = gpui::rgba(background).into();
+            assert_eq!(
+                u32::from(Rgba::from(colors.surface_overlay_background())),
+                expected,
+                "surface {surface:#010x}, background {background:#010x}"
+            );
+        }
+    }
 
     #[test]
     fn override_a_single_theme_color() {

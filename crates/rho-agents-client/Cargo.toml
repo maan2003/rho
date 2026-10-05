@@ -12,7 +12,6 @@ version.workspace = true
 [features]
 client = [
   "dep:anyhow",
-  "dep:collections",
   "dep:futures",
   "dep:prefix-id",
   "dep:rand",
@@ -31,7 +30,6 @@ rho-agent-types.workspace = true
 senax-encoder.workspace = true
 
 anyhow = { workspace = true, optional = true }
-collections = { path = "../../vendor/zed/crates/collections", optional = true }
 futures = { workspace = true, optional = true }
 prefix-id = { workspace = true, default-features = false, features = ["redb"], optional = true }
 rand = { workspace = true, optional = true }

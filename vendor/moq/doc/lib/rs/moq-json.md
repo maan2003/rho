@@ -28,5 +28,15 @@ let mut producer = moq_json::snapshot::Producer::new(track, config);
 producer.update(&value)?;
 ```
 
+A value is stamped when written, unless it carries its capture time:
+`moq_net::Timed::from(&value).at(captured)`. Writes return the encoded frame
+size, and an unchanged snapshot `update` returns `None`.
+
+A snapshot producer also edits in place, so independent owners each touch only
+their own keys instead of clobbering one another. `mutate(|value| ...)` runs a
+closure and publishes the result, matching `Producer.mutate` in TypeScript;
+`modify()` returns a guard that holds the lock across several edits and
+publishes on drop.
+
 The TypeScript twin is [`@moq/json`](/lib/js/json). API:
 [docs.rs/moq-json](https://docs.rs/moq-json).

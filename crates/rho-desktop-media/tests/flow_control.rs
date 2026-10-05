@@ -274,7 +274,8 @@ async fn actively_consumed_group_outlives_ten_seconds_of_cache_age() -> Result<(
 
         // MoQ's production driver advances a std::time::Instant clock; paused
         // Tokio time alone does not test its cache age. Keep reading the same
-        // open group in real time, well inside its 750ms active-consumer budget.
+        // open group in real time, well inside its 750ms active-consumer
+        // budget.
         let started = Instant::now();
         for index in 1u64..=44 {
             tokio::time::sleep(Duration::from_millis(250)).await;

@@ -583,7 +583,6 @@ mod tests {
             pos: AgentPos(pos),
             event: TranscriptEvent::Presented {
                 title: PresentationField::Set(title.to_owned()),
-                activity: PresentationField::Unchanged,
                 at: rho_agent_types::UnixMs(0),
             },
         }

@@ -207,24 +207,6 @@ pub struct ToolResult {
     /// Historical first-result timestamp, not proof that Python or its jobs
     /// finished.
     pub finished_at: UnixMs,
-    /// Tool-specific UI/runtime metadata. Not sent to providers.
-    pub metadata: Option<ToolResultMetadata>,
-}
-
-/// Complete notebook contributions, independent of provider wire tool types.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum ExecOutput {
-    Reply {
-        id: ExecId,
-        body: ToolOutput,
-        first_block_at: UnixMs,
-        at: UnixMs,
-    },
-    Report {
-        id: ExecId,
-        body: ToolOutput,
-        at: UnixMs,
-    },
 }
 
 /// An extra output item for a tool call that has (or will have) its own
@@ -276,30 +258,6 @@ pub enum ToolFormat {
         syntax: ToolGrammarSyntax,
         definition: String,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub enum ToolResultMetadata {
-    ApplyPatch(ApplyPatchMetadata),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct ApplyPatchMetadata {
-    pub changes: Vec<ToolFileChange>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct ToolFileChange {
-    pub path: String,
-    pub status: ToolFileStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub enum ToolFileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Moved,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

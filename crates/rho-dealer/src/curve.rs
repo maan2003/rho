@@ -12,7 +12,7 @@ use jiff::{SignedDuration, Timestamp};
 pub const DEAL_QUEUE_FLOOR: f64 = -1.0;
 /// Someone waiting on the user rises this much a day.
 pub const WAITING_SLOPE_PER_DAY: f64 = 12.0;
-/// An agent that asked for the user, or died.
+/// An agent that asked the user for something, or stopped.
 pub const AGENT_BLOCKED_HEAD_START: f64 = 1.0;
 /// A direct message: the most personal ask, just above a mention.
 pub const SLACK_DM_HEAD_START: f64 = 1.2;
@@ -23,8 +23,7 @@ pub const SLACK_THREAD_HEAD_START: f64 = 0.6;
 /// A thread this small is a conversation with the user, and asks like a
 /// direct message.
 pub const SLACK_SMALL_THREAD_PEOPLE: usize = 3;
-/// An agent that finished: for the user's information, gone in three
-/// days.
+/// An agent's result: for the user's information, gone in three days.
 pub const AGENT_FINISHED_HEAD_START: f64 = 0.0;
 pub const AGENT_FINISHED_GONE_DAYS: f64 = 3.0;
 /// Unread traffic in a channel nobody addressed the user in: barely

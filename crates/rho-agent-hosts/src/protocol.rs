@@ -60,6 +60,8 @@ rho_rpc::calls! {
         /// Answered with where the copy is, in a directory of its own
         /// beside the database; the copy is the caller's to delete.
         Snapshot(Snapshot) -> camino::Utf8PathBuf;
+        /// Answered with the ids of the savepoints dropped.
+        ForgetSavepoints(ForgetSavepoints) -> Vec<u64>;
         /// Answered with a file holding the report, in a directory of its
         /// own beside the database; it is the caller's to delete. A report
         /// can outgrow a frame.
@@ -129,6 +131,11 @@ pub struct IrohRevoke {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot;
 
+/// Drops the savepoints the agent host's migrations recorded, once they are
+/// verified: in its own write, so the agent host keeps running.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ForgetSavepoints;
+
 /// A read-only `rho debug` report, rendered from the agent host's live
 /// database: copying a large database costs more than reading it.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -197,6 +204,7 @@ mod tests {
             }
             .into(),
             Snapshot.into(),
+            ForgetSavepoints.into(),
             DebugReport::Transcript {
                 agent: "00img8eiae3n".to_owned(),
                 max_chars: 200,

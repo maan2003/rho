@@ -8,11 +8,11 @@
 //!
 //! The runtimes write their own events; the agent host's `strip` is the one
 //! place they become these. The log's positions and the facts every reader
-//! takes as the runtime wrote them (turn edges, wants) are in
+//! takes as the runtime wrote them (what a send is for) are in
 //! `rho-agent-types`.
 
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, Seq, TurnEdge, UnixMs,
+    AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, Seq, UnixMs,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -138,11 +138,8 @@ pub enum TranscriptEvent {
     MessageSent {
         to: Option<AgentId>,
         text: String,
-        at: UnixMs,
-    },
-    /// The agent explicitly waits for the person; None clears the wait.
-    AwaitingHuman {
-        since: Option<UnixMs>,
+        /// What it is for, as the agent classed it.
+        kind: SendKind,
         at: UnixMs,
     },
     /// Durable notebook state, independent of whether it awaits the person.
@@ -180,20 +177,9 @@ pub enum TranscriptEvent {
         context_used: Option<u64>,
         at: UnixMs,
     },
-    Turn {
-        edge: TurnEdge,
-        at: UnixMs,
-    },
-    /// The sidecar's title and activity for this agent.
+    /// The sidecar's title for this agent.
     Presented {
         title: PresentationField,
-        activity: PresentationField,
-        at: UnixMs,
-    },
-    /// What the last turn asks of the person.
-    Wants {
-        want: AgentWant,
-        summary: Option<String>,
         at: UnixMs,
     },
     /// Everything from `to` up to here is no longer the agent's history.
@@ -202,11 +188,16 @@ pub enum TranscriptEvent {
         at: UnixMs,
     },
     /// A request failed with this much said. `retrying` when the runtime
-    /// asks again by itself; otherwise the turn ends in error next.
+    /// asks again by itself; otherwise `Stopped` comes next.
     Failed {
         text: String,
         error: String,
         retrying: bool,
+        at: UnixMs,
+    },
+    /// The agent stopped on an error and will not go on without the user.
+    Stopped {
+        error: String,
         at: UnixMs,
     },
     /// One message of a Claude transcript, mirrored as Claude confirmed
@@ -235,16 +226,14 @@ impl TranscriptEvent {
             | Self::QueueCleared { at }
             | Self::Sent { at, .. }
             | Self::MessageSent { at, .. }
-            | Self::AwaitingHuman { at, .. }
             | Self::NotebookActivity { at, .. }
             | Self::NotebookReport { at, .. }
             | Self::Results { at, .. }
             | Self::Replied { at, .. }
-            | Self::Turn { at, .. }
             | Self::Presented { at, .. }
-            | Self::Wants { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
+            | Self::Stopped { at, .. }
             | Self::ClaudeMessage { at, .. }
             | Self::ExecObserved { at, .. } => *at,
         }
@@ -278,6 +267,8 @@ pub enum Live {
         draft: Option<String>,
     },
     /// Claude Code holds its queue in its process, outside the mirror.
+    // TODO: drop at the next GUI protocol bump. No agent host sends it any
+    // more: every loop keeps its queue in its rows.
     Queued { items: Vec<QueuedItem> },
 }
 
@@ -300,12 +291,6 @@ impl RuntimeState {
             self.inference,
             InferenceState::Responding | InferenceState::Retrying { .. }
         ) || (!self.archived && self.running_tasks > 0)
-    }
-
-    /// Working on its own: a task waiting on the human is not work, even
-    /// beside others.
-    pub fn is_busy(&self) -> bool {
-        self.is_working() && !self.awaiting_human
     }
 }
 

@@ -1,4 +1,5 @@
-use nu_ansi_term::Color;
+use brush_core::trace_categories;
+use nu_ansi_term::Style;
 use reedline::MenuBuilder;
 
 use super::{completer, edit_mode, highlighter, history, validator};
@@ -11,6 +12,31 @@ pub struct ReedlineInputBackend {
 }
 
 const COMPLETION_MENU_NAME: &str = "completion_menu";
+
+/// How many times `reedline.read_line()` is attempted before its error is
+/// propagated: the initial call plus this many minus one retries. See
+/// `read_line` below.
+const MAX_READ_LINE_ATTEMPTS: u32 = 3;
+
+fn completion_menu_text_style() -> Style {
+    Style::new()
+}
+
+fn completion_menu_selected_text_style() -> Style {
+    Style::new().bold().reverse()
+}
+
+fn completion_menu_match_text_style() -> Style {
+    Style::new().underline()
+}
+
+fn completion_menu_selected_match_text_style() -> Style {
+    completion_menu_selected_text_style().underline()
+}
+
+fn history_hint_style() -> Style {
+    Style::new().italic().dimmed()
+}
 
 impl ReedlineInputBackend {
     /// Returns a new interactive shell instance, created with the provided options.
@@ -38,7 +64,7 @@ impl ReedlineInputBackend {
         let validator = validator::ReedlineValidator {
             shell: shell_ref.clone(),
         };
-        let highlighter = highlighter::ReedlineHighlighter {
+        let syntax_highlighter = highlighter::ReedlineHighlighter {
             shell: shell_ref.clone(),
         };
         let history = history::ReedlineHistory {
@@ -57,14 +83,16 @@ impl ReedlineInputBackend {
                 .with_name(COMPLETION_MENU_NAME)
                 .with_marker("")
                 .with_columns(10)
-                .with_selected_text_style(Color::Blue.bold().reverse())
-                .with_selected_match_text_style(Color::Blue.bold().reverse()),
+                .with_text_style(completion_menu_text_style())
+                .with_match_text_style(completion_menu_match_text_style())
+                .with_selected_text_style(completion_menu_selected_text_style())
+                .with_selected_match_text_style(completion_menu_selected_match_text_style()),
         );
 
         // Set up default history-based hinter.
         let mut hinter = reedline::DefaultHinter::default();
         if !options.disable_color {
-            hinter = hinter.with_style(nu_ansi_term::Style::new().italic().fg(Color::DarkGray));
+            hinter = hinter.with_style(history_hint_style());
         }
 
         // Instantiate reedline with some defaults and hand it ownership of
@@ -80,9 +108,15 @@ impl ReedlineInputBackend {
             .with_edit_mode(Box::new(mutable_edit_mode))
             .with_history(Box::new(history));
 
-        // If requested, apply some additional niceties.
-        if !options.disable_highlighting && !options.disable_color {
-            reedline = reedline.with_highlighter(Box::new(highlighter));
+        // Override Reedline's default example highlighter, which hard-codes white as the
+        // neutral input color. When syntax highlighting is disabled we still install a plain
+        // highlighter so typed text follows the terminal's default foreground color.
+        if !options.disable_color {
+            reedline = if options.disable_highlighting {
+                reedline.with_highlighter(Box::new(highlighter::PlainTextHighlighter))
+            } else {
+                reedline.with_highlighter(Box::new(syntax_highlighter))
+            };
         }
 
         let mut shell = tokio::task::block_in_place(|| {
@@ -126,23 +160,49 @@ impl InputBackend for ReedlineInputBackend {
         _shell: &crate::ShellRef<impl brush_core::ShellExtensions>,
         prompt: InteractivePrompt,
     ) -> Result<ReadResult, ShellError> {
-        if let Some(reedline) = &mut self.reedline {
+        let Some(reedline) = &mut self.reedline else {
+            return Ok(ReadResult::Eof);
+        };
+
+        let mut attempt: u32 = 1;
+        loop {
             match reedline.read_line(&prompt) {
-                Ok(reedline::Signal::Success(s)) => {
-                    if edit_mode::is_reedline_host_command(s.as_str()) {
-                        Ok(ReadResult::BoundCommand(s))
-                    } else {
-                        Ok(ReadResult::Input(s))
-                    }
+                Ok(reedline::Signal::Success(s)) => return Ok(ReadResult::Input(s)),
+                Ok(reedline::Signal::CtrlC) => return Ok(ReadResult::Interrupted),
+                Ok(reedline::Signal::CtrlD) => return Ok(ReadResult::Eof),
+                Ok(reedline::Signal::ExternalBreak(_)) => {
+                    return Err(ShellError::UnexpectedInputFailure);
                 }
-                Ok(reedline::Signal::CtrlC) => Ok(ReadResult::Interrupted),
-                Ok(reedline::Signal::CtrlD) => Ok(ReadResult::Eof),
-                Ok(reedline::Signal::ExternalBreak(_)) => Err(ShellError::UnexpectedInputFailure),
-                Ok(_) => Err(ShellError::UnexpectedInputFailure),
-                Err(err) => Err(ShellError::InputError(err)),
+                Ok(reedline::Signal::HostCommand(cmd)) => return Ok(ReadResult::BoundCommand(cmd)),
+                Ok(_) => return Err(ShellError::UnexpectedInputFailure),
+                // An error here is almost always transient. The prevalent case:
+                // reedline asks the terminal for the cursor position (DSR,
+                // `ESC [ 6 n`) before painting a prompt, and again after an
+                // external program (a `bind -x` command such as atuin's search
+                // UI, fzf, ...) hands the terminal back. crossterm waits a fixed
+                // 2s for the reply and then fails; a terminal busy repainting or
+                // a multiplexer briefly holding the reply is enough to trip it,
+                // and giving up would end the whole interactive session. That
+                // failure happens before any input is read, so re-issuing the
+                // read is safe; retry a bounded number of times before treating
+                // the failure as real. A terminal that never answers therefore
+                // fails after MAX_READ_LINE_ATTEMPTS x 2s rather than 2s.
+                //
+                // The one known exception: reedline restores the terminal mode
+                // *after* computing its result, so if `disable_raw_mode` itself
+                // fails, a line that was already submitted is lost and the retry
+                // prompts afresh. That is a tcsetattr failure on a tty that just
+                // worked; the alternative -- exiting the shell -- loses the same
+                // line and everything else with it.
+                Err(err) if attempt < MAX_READ_LINE_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        target: trace_categories::INPUT,
+                        "reedline read_line failed; retrying (attempt {attempt}/{MAX_READ_LINE_ATTEMPTS}): {err}"
+                    );
+                }
+                Err(err) => return Err(ShellError::InputError(err)),
             }
-        } else {
-            Ok(ReadResult::Eof)
         }
     }
 
@@ -224,4 +284,45 @@ fn compose_key_bindings(completion_menu_name: &str) -> reedline::Keybindings {
     );
 
     key_bindings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_hint_style_is_theme_adaptive() {
+        let style = history_hint_style();
+
+        assert_eq!(style.foreground, None);
+        assert_eq!(style.background, None);
+        assert!(style.is_italic);
+        assert!(style.is_dimmed);
+    }
+
+    #[test]
+    fn completion_menu_styles_are_theme_adaptive() {
+        let text_style = completion_menu_text_style();
+        let match_style = completion_menu_match_text_style();
+        let selected_text_style = completion_menu_selected_text_style();
+        let selected_match_text_style = completion_menu_selected_match_text_style();
+
+        assert_eq!(text_style.foreground, None);
+        assert_eq!(text_style.background, None);
+
+        assert_eq!(match_style.foreground, None);
+        assert_eq!(match_style.background, None);
+        assert!(match_style.is_underline);
+
+        assert_eq!(selected_text_style.foreground, None);
+        assert_eq!(selected_text_style.background, None);
+        assert!(selected_text_style.is_bold);
+        assert!(selected_text_style.is_reverse);
+
+        assert_eq!(selected_match_text_style.foreground, None);
+        assert_eq!(selected_match_text_style.background, None);
+        assert!(selected_match_text_style.is_bold);
+        assert!(selected_match_text_style.is_reverse);
+        assert!(selected_match_text_style.is_underline);
+    }
 }

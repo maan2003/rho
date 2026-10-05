@@ -907,9 +907,11 @@ impl Client {
 
     /// A fresh opaque correlation token for one interactive action.
     pub fn interaction_token() -> String {
-        use rand::RngCore as _;
+        use rand::TryRng as _;
         let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("system entropy");
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
@@ -1284,7 +1286,8 @@ impl Client {
         let body = self
             .post_form("users.info", &[("user", user.0.clone())])
             .await?;
-        // 48px thumbnails blur when a gutter avatar is scaled on a HiDPI display.
+        // 48px thumbnails blur when a gutter avatar is scaled on a HiDPI
+        // display.
         Ok(["image_192", "image_96", "image_72", "image_48"]
             .into_iter()
             .find_map(|size| string(&body["user"]["profile"][size]).filter(|url| !url.is_empty())))

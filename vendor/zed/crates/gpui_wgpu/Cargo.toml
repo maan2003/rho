@@ -10,10 +10,12 @@ workspace = true
 
 [lib]
 path = "src/gpui_wgpu.rs"
+doctest = false
 
 [features]
 default = []
-test-support = []
+test-support = ["gpui/test-support", "dep:image"]
+bench-support = ["gpui/bench-support", "dep:image"]
 font-kit = ["dep:font-kit"]
 
 [dependencies]
@@ -24,6 +26,7 @@ collections.workspace = true
 cosmic-text = "0.19.0"
 etagere.workspace = true
 itertools.workspace = true
+image = { workspace = true, optional = true }
 log.workspace = true
 parking_lot.workspace = true
 profiling.workspace = true
@@ -48,14 +51,13 @@ libc = "0.2"
 wgpu-hal = { version = "30.0.0", features = ["vulkan"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
 web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
-js-sys.workspace = true
 wgpu = { workspace = true, features = ["webgl"] }
 
 [dev-dependencies]
 criterion.workspace = true
+gpui = { workspace = true, features = ["bench-support"] }
+image.workspace = true
 naga = { version = "29.0.4", features = ["wgsl-in"] }
 
 [[bench]]

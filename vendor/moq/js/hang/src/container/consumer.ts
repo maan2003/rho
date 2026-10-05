@@ -140,8 +140,8 @@ export class Consumer {
 
 				// Arriving below the delivery cursor is not a reason to drop a group. Groups are
 				// sent newest-first, so the head of a subscription arrives after the live edge it
-				// was served alongside, and both consumers can still place one: audio writes into
-				// a timestamp-indexed ring, video drops a late frame at render. How far back one
+				// was served alongside. Audio can place older groups in its timestamp-indexed ring;
+				// video must reject older groups before decode to preserve codec references. How far back one
 				// may be is the subscription's own max age, applied before it ever reaches here.
 				const group: Group = {
 					consumer,
@@ -304,7 +304,8 @@ export class Consumer {
 	#checkMaxAge() {
 		if (this.#active === undefined) return;
 
-		let skipped = false;
+		let skipped = 0;
+		const start = this.#groups[0]?.consumer.sequence;
 		let hole = false;
 
 		// Keep skipping the oldest group while the buffered span exceeds the max age.
@@ -333,9 +334,6 @@ export class Consumer {
 
 			this.#groups.shift();
 			this.#active = this.#groups[0]?.consumer.sequence;
-			console.warn(
-				`skipping slow group: track=${this.#track.name} ${first.consumer.sequence} -> ${this.#active}`,
-			);
 
 			const nextStart = this.#groups[0]?.frames.at(0)?.timestamp ?? this.#groups[0]?.end;
 			const marker = !first.empty && !first.media;
@@ -344,13 +342,16 @@ export class Consumer {
 			}
 			first.consumer.close();
 			first.frames.length = 0;
-			skipped = true;
+			skipped++;
 			this.#gap = true;
 		}
 
 		if (hole) this.#markPlayhead();
 
 		if (skipped) {
+			console.warn(
+				`skipping slow groups: track=${this.#track.name} ${start} -> ${this.#active} count=${skipped}`,
+			);
 			this.#updateBuffered();
 
 			// Wake up any consumers waiting for a new frame.
@@ -465,16 +466,25 @@ export class Consumer {
 			// non-sequential) next group has since arrived -- promote #active to the first real
 			// group so delivery resumes instead of stalling on a nonexistent sequence.
 			// Promote #active to the first buffered group when it continues the timeline we left off at,
-			// when a completed empty group can be walked (empty groups mean nothing), or when a
-			// zero-budget hole is already proven. After track termination no missing group can arrive,
-			// so drain across any remaining gap. Otherwise wait: #checkMaxAge skips once the budget
-			// is spent, and #tryDurationSkip once the duration covers it.
+			// when a completed empty group can be walked (empty groups mean nothing), or when the hole
+			// is proven: the head already reaches past where presentation left off by more than the
+			// max age, so anything still missing in between would arrive too old to play. Proving it
+			// here matters: #checkMaxAge would instead drop the head, the very group to play next.
+			// After track termination no missing group can arrive, so drain across any remaining gap.
+			// Otherwise wait: #checkMaxAge skips once the budget is spent, and #tryDurationSkip once
+			// the duration covers it.
 			if (this.#active !== undefined && this.#groups.length > 0) {
 				const head = this.#groups[0];
 				if (head.consumer.sequence > this.#active) {
 					const contiguous = ptsContiguous(this.#presentedEnd, head.frames.at(0)?.timestamp);
 					const empty = head.empty && head.consumer.done;
-					const skipHole = this.#maxAge.peek() === 0 && head.frames.length > 0;
+					const maxAge = Moq.Time.Micro.fromMilli(this.#maxAge.peek());
+					const skipHole =
+						head.frames.length > 0 &&
+						(maxAge === 0 ||
+							(this.#presentedEnd !== undefined &&
+								head.latest !== undefined &&
+								head.latest - this.#presentedEnd > maxAge));
 					if (empty || contiguous || skipHole || ended !== undefined) {
 						if ((skipHole || ended !== undefined) && !contiguous && !empty) this.#markPlayhead();
 						if (!contiguous) this.#gap = true;

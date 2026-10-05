@@ -150,7 +150,11 @@ fn first_task_text(history: &[AgentEvent<'_>], current: &str) -> Option<String> 
     if input.is_empty() {
         return None;
     }
-    Some(input[..input.floor_char_boundary(MAX_INPUT_BYTES.min(input.len()))].to_owned())
+    let mut end = MAX_INPUT_BYTES.min(input.len());
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(input[..end].to_owned())
 }
 
 #[cfg(test)]

@@ -262,10 +262,10 @@ async fn relay(
         "x-ratelimit-used",
         "x-ratelimit-resource",
     ] {
-        if let Some(value) = upstream.headers().get(name) {
-            if value.to_str().is_ok_and(|text| !text.contains(token)) {
-                headers.insert(name, value.clone());
-            }
+        if let Some(value) = upstream.headers().get(name)
+            && value.to_str().is_ok_and(|text| !text.contains(token))
+        {
+            headers.insert(name, value.clone());
         }
     }
     if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
@@ -293,8 +293,9 @@ async fn relay(
         {
             return StatusCode::BAD_GATEWAY.into_response();
         }
-        // A known GitHub download operation may return a signed URL. Fetch once,
-        // without credentials, and never expose Location or follow another redirect.
+        // A known GitHub download operation may return a signed URL. Fetch
+        // once, without credentials, and never expose Location or
+        // follow another redirect.
         let downloaded = match state.client.get(url).send().await {
             Ok(response) if response.status().is_success() => response,
             _ => return StatusCode::BAD_GATEWAY.into_response(),
@@ -490,7 +491,7 @@ async fn graphql<T: DeserializeOwned>(
     token: &str,
     query: &'static str,
     variables: Value,
-) -> Result<T, Response> {
+) -> Result<T, Box<Response>> {
     let mut url = state.github_api_url.clone();
     url.set_path("/graphql");
     let upstream = state
@@ -501,27 +502,27 @@ async fn graphql<T: DeserializeOwned>(
         .json(&json!({"query":query,"variables":variables}))
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY.into_response())?;
+        .map_err(|_| Box::new(StatusCode::BAD_GATEWAY.into_response()))?;
     let status = upstream.status();
     if status.is_redirection() {
-        return Err(StatusCode::BAD_GATEWAY.into_response());
+        return Err(Box::new(StatusCode::BAD_GATEWAY.into_response()));
     }
     let bytes = upstream
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY.into_response())?;
+        .map_err(|_| Box::new(StatusCode::BAD_GATEWAY.into_response()))?;
     if !status.is_success() {
         let clean = String::from_utf8_lossy(&bytes).replace(token, "[redacted]");
-        return Err(github_error(status, clean.as_bytes()));
+        return Err(Box::new(github_error(status, clean.as_bytes())));
     }
-    let result: GraphQlEnvelope<T> =
-        serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_GATEWAY.into_response())?;
+    let result: GraphQlEnvelope<T> = serde_json::from_slice(&bytes)
+        .map_err(|_| Box::new(StatusCode::BAD_GATEWAY.into_response()))?;
     if result.errors.is_some_and(|errors| !errors.is_empty()) {
-        return Err(StatusCode::BAD_GATEWAY.into_response());
+        return Err(Box::new(StatusCode::BAD_GATEWAY.into_response()));
     }
     result
         .data
-        .ok_or_else(|| StatusCode::BAD_GATEWAY.into_response())
+        .ok_or_else(|| Box::new(StatusCode::BAD_GATEWAY.into_response()))
 }
 
 async fn set_draft(
@@ -548,7 +549,7 @@ async fn set_draft(
         json!({"owner":owner,"repo":repo,"number":number})).await;
     let data = match lookup {
         Ok(data) => data,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Some(pull) = data.repository.and_then(|repo| repo.pull_request) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -561,7 +562,7 @@ async fn set_draft(
     let data = match graphql::<DraftMutation>(&state, &token, mutation, json!({"id":pull.id})).await
     {
         Ok(data) => data,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Some(actual) = data.draft.and_then(|payload| payload.pull_request) else {
         return StatusCode::BAD_GATEWAY.into_response();
@@ -1160,7 +1161,8 @@ mod tests {
         .await;
         let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
         let client = reqwest::Client::new();
-        // Concrete fixtures selected independently from pinned upstream metadata.
+        // Concrete fixtures selected independently from pinned upstream
+        // metadata.
         for (method, path) in [
             (Method::GET, "/repos/acme/widget/actions/artifacts/7"),
             (Method::GET, "/repos/acme/widget/actions/workflows/7"),

@@ -985,8 +985,8 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
 fn the_agents_status_line_sits_above_the_draft(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
-    let say = |activity: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        let activity = activity.to_owned();
+    let say = |status: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        let status = status.to_owned();
         workspace
             .update(cx, |workspace, window, cx| {
                 story::feed(
@@ -994,7 +994,7 @@ fn the_agents_status_line_sits_above_the_draft(cx: &mut TestAppContext) {
                     HostId::default(),
                     ready_with(
                         vec![story::UiAgentHead {
-                            activity: Some(activity),
+                            status: Some(status),
                             ..ui_head(agent_id)
                         }],
                         2,
@@ -1442,7 +1442,6 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     error: None,
                     started_at: None,
                     finished_at: None,
-                    metadata: None,
                 }),
             )
         });
@@ -1842,9 +1841,9 @@ fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
         })
         .expect("clear initial wrap edits");
 
-    // Updating two blocks deliberately drops the single-block incremental hint and
-    // exercises transcript suffix reconstruction. The settled user excerpt must
-    // retain its identity.
+    // Updating two blocks deliberately drops the single-block incremental hint
+    // and exercises transcript suffix reconstruction. The settled user
+    // excerpt must retain its identity.
     feed_edit(&workspace, cx, agent(1), |state| {
         stream_text(state, 1, response.len(), "\nappended response");
         replace_block(
@@ -2331,7 +2330,6 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 error: None,
                 started_at: None,
                 finished_at: None,
-                metadata: None,
             })],
         ),
     );
@@ -2413,7 +2411,6 @@ fn burst_of_pending_tools_keeps_every_code_row_visible(cx: &mut TestAppContext) 
                 error: None,
                 started_at: None,
                 finished_at: None,
-                metadata: None,
             })
         })
         .collect();
@@ -3029,7 +3026,6 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
             ],
             status: UiAgentStatus::Idle,
             runtime: None,
-            awaiting_human: None,
             context_used: Some(194_816),
             usage: Default::default(),
         },
@@ -3061,7 +3057,6 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             runtime: None,
-            awaiting_human: None,
             context_used: Some(62_300),
             usage: Default::default(),
         },
@@ -3128,7 +3123,6 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             runtime: None,
-            awaiting_human: None,
             context_used: Some(62_300),
             usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
@@ -4105,7 +4099,6 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         error: None,
         started_at: Some(rho_agent_types::UnixMs(10)),
         finished_at: Some(rho_agent_types::UnixMs(20)),
-        metadata: None,
     });
     feed_frame(
         &workspace,
@@ -4953,14 +4946,13 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
         parent: None,
         spawn_name: None,
         generated_title: None,
-        activity: None,
-        turn_running: false,
+        status: None,
         created_at: UnixMs(1),
     }
 }
 
-/// The whole story of an agent that has finished a turn and asked for the
-/// user: the least a card needs to rank as waiting on a reply.
+/// The whole story of an agent that asked the user something: the least a
+/// card needs to rank as waiting on a reply.
 fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::AgentFrame {
     use story::UiStoryEvent;
     story::story(
@@ -4970,14 +4962,9 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::Ag
                 text: "go".to_owned(),
                 at: UnixMs(0),
             },
-            UiStoryEvent::TurnStarted { at: UnixMs(0) },
-            UiStoryEvent::Wants {
-                want: story::UiAgentWant::Ask,
-                summary: None,
-                at,
-            },
-            UiStoryEvent::TurnEnded {
-                outcome: story::UiTurnOutcome::Completed,
+            UiStoryEvent::Sent {
+                text: "which one?".to_owned(),
+                kind: rho_agent_types::SendKind::Ask,
                 at,
             },
         ],
@@ -5599,36 +5586,32 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn running_home_row_is_the_name_alone(cx: &mut TestAppContext) {
+fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(777);
+    let old = agent(779);
+    let now = jiff::Timestamp::now().as_millisecond() as u64;
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(
                 workspace,
                 HostId::default(),
                 ready_with(
-                    vec![story::UiAgentHead {
-                        generated_title: Some("flaky-ci".to_owned()),
-                        activity: Some("reading tests".to_owned()),
-                        turn_running: true,
-                        ..ui_head(agent_id)
-                    }],
-                    778,
+                    vec![
+                        story::UiAgentHead {
+                            generated_title: Some("flaky-ci".to_owned()),
+                            // A status is not a send the reader is owed, so it
+                            // does not make the agent recent.
+                            status: Some("reading tests".to_owned()),
+                            ..ui_head(agent_id)
+                        },
+                        story::UiAgentHead {
+                            generated_title: Some("old-docs".to_owned()),
+                            ..ui_head(old)
+                        },
+                    ],
+                    780,
                 ),
-                window,
-                cx,
-            );
-            workspace.handle_model_event(
-                HostId::default(),
-                rho_agents_client::model::ModelMsg::Runtime {
-                    agent_id,
-                    state: rho_agents_client::protocol::transcript::RuntimeState {
-                        inference:
-                            rho_agents_client::protocol::transcript::InferenceState::Responding,
-                        ..Default::default()
-                    },
-                },
                 window,
                 cx,
             );
@@ -5636,10 +5619,53 @@ fn running_home_row_is_the_name_alone(cx: &mut TestAppContext) {
         })
         .unwrap();
     cx.run_until_parked();
+    assert_eq!(
+        home_text(&workspace, cx).trim_end(),
+        "nothing needs attention"
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            for (agent_id, hours) in [(agent_id, 2), (old, 5 * 24)] {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story::story(
+                        agent_id,
+                        vec![story::UiStoryEvent::Sent {
+                            text: "done".to_owned(),
+                            kind: rho_agent_types::SendKind::Result,
+                            at: UnixMs(now - hours * 3_600_000),
+                        }],
+                    ),
+                    window,
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // The fresh result is a card in `next`, so only the faded one is
+    // recent: an agent is not listed twice.
     let text = home_text(&workspace, cx);
-    // The status and the handle are the transcript's to say; Home only
-    // says that it runs.
-    assert_eq!(text.lines().collect::<Vec<_>>(), ["running", "  flaky-ci"]);
+    let (next, recent) = text.split_once("recent ").expect("a recent heading");
+    assert!(next.contains("flaky-ci"), "{text:?}");
+    assert!(!next.contains("old-docs"), "{text:?}");
+    assert_eq!(recent.lines().next(), Some("▸ 1"), "{text:?}");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let home = workspace.home_view().expect("home is in view");
+            home.update(cx, |home, cx| home.toggle_recent(cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = home_text(&workspace, cx);
+    assert_eq!(
+        text.lines()
+            .skip_while(|line| *line != "recent ▾ 1")
+            .collect::<Vec<_>>(),
+        ["recent ▾ 1", "  old-docs  5.0d ago"],
+        "{text:?}"
+    );
 }
 
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
@@ -5854,7 +5880,6 @@ fn tool(
         error: None,
         started_at: started_at.map(UnixMs),
         finished_at: finished_at.map(UnixMs),
-        metadata: None,
     }
 }
 
@@ -5865,7 +5890,6 @@ fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
         runtime: None,
-        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }

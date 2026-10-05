@@ -1,6 +1,6 @@
-//! A stable client identity sealed to the user's security key by WebAuthn's hmac-secret
-//! extension (`hmacCreateSecret`/`hmacGetSecret`, touch only; PRF would make the platform
-//! ask the key's PIN each time).
+//! A stable client identity sealed to the user's security key by WebAuthn's
+//! hmac-secret extension (`hmacCreateSecret`/`hmacGetSecret`, touch only; PRF
+//! would make the platform ask the key's PIN each time).
 //! Only the credential id, never the derived secret, is stored on disk.
 
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use anyhow::{Context as _, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore as _;
+use rand::TryRng as _;
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
@@ -41,7 +41,7 @@ pub async fn endpoint() -> anyhow::Result<iroh::Endpoint> {
                 let read = db.read();
                 if read.has_table(IDENTITY.name()) {
                     read.open_table(IDENTITY)
-                        .get(&())
+                        .get(())
                         .map(|row| row.value().into_owned())
                 } else {
                     None
@@ -59,7 +59,7 @@ pub async fn endpoint() -> anyhow::Result<iroh::Endpoint> {
                     let mut write = db.write().await;
                     write
                         .open_table(IDENTITY)
-                        .insert(&(), SenValue::borrowed(&credential));
+                        .insert((), SenValue::borrowed(&credential));
                     write.commit();
                     credential
                 }
@@ -78,13 +78,17 @@ pub async fn endpoint() -> anyhow::Result<iroh::Endpoint> {
 
 fn random_challenge() -> String {
     let mut bytes = [0; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system entropy");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn creation_request() -> Value {
     let mut user_id = [0; 16];
-    rand::rngs::OsRng.fill_bytes(&mut user_id);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut user_id)
+        .expect("system entropy");
     json!({
         "rp": {"id": RP_ID, "name": "rho"},
         "user": {"id": URL_SAFE_NO_PAD.encode(user_id), "name": "rho", "displayName": "rho"},

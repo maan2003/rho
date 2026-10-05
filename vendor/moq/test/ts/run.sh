@@ -7,7 +7,8 @@
 # TSDuck + custom analyzer in compliance.py against the capture. The point is to
 # tell whether what the subscriber emits is something an Integrated
 # Receiver/Decoder would accept, and to quantify where it diverges (the exporter
-# is VBR, emits no null packets, and paces PCR per frame).
+# pads to the recorded multiplex rate but never delays media to fit it, and puts a
+# PCR every 25 ms of media time).
 #
 # Modes:
 #   ./run.sh                       # generate a clip, round-trip it, analyze
@@ -16,6 +17,8 @@
 #   ./run.sh --strict              # fail on broadcast-shape warnings too
 #   ./run.sh --with-eit            # add a synthetic EPG first, report which SI survived
 #   ./run.sh --live                # grade PCR release timing off the live pipe
+#   ./run.sh --pair                # two exporters of one broadcast, grade table anchoring
+#   ./run.sh --open-gop            # open-GOP clip; its leading pictures must survive
 
 # `--live` swaps the analyzer, not the rig. compliance.py grades a captured file
 # on the stream's own PCR clock, which is the right basis for the IRD model it
@@ -25,6 +28,13 @@
 # release timing and byte position alongside the values. Nightly runs this arm
 # (.github/workflows/nightly.yml); it is not a per-PR gate, because it needs a
 # real-time window to measure at all.
+#
+# `--pair` changes the rig rather than the analyzer: it subscribes twice to one
+# broadcast, the second joining late, and grades the two captures against each
+# other with table-anchor.py. One exporter cannot show whether a table's emission
+# points belong to the broadcast or to the process that happened to be running,
+# because there is nothing to disagree with -- so this is the only arm that can
+# see a cadence regression at all.
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -50,7 +60,17 @@ PROFILE="${TSC_PROFILE:-debug}"
 STRICT=""
 WITH_EIT="" # add a synthetic EPG to the source and report which SI survived
 LIVE=""     # grade the exporter's stdout as it arrives, rather than a capture
-PASSTHRU=() # forwarded to compliance.py (thresholds, --report-json, ...)
+PAIR=""     # subscribe twice and grade the two captures against each other
+OPEN_GOP="" # publish open GOP with leading pictures, and grade them through the round-trip
+# How far into the run the second subscriber joins. A late join is the point: two
+# exporters started together can share a cadence by starting together, which is
+# exactly the thing under test.
+PAIR_JOIN="${TSC_PAIR_JOIN:-5}"
+# Shortest overlap worth a verdict, in seconds. Below this the slower tables fall under
+# the analyzer's emission floor and go report-only, which reads as a pass.
+PAIR_MIN_OVERLAP="${TSC_PAIR_MIN_OVERLAP:-25}"
+DURATION_SET="" # so pair mode can raise the default without overriding an explicit --duration
+PASSTHRU=()     # forwarded to compliance.py (thresholds, --report-json, ...)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -64,6 +84,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --duration)
             DURATION="$2"
+            DURATION_SET=1
             shift 2
             ;;
         --bitrate)
@@ -90,12 +111,49 @@ while [[ $# -gt 0 ]]; do
             LIVE=1
             shift
             ;;
+        --pair)
+            PAIR=1
+            shift
+            ;;
+        --pair-join)
+            PAIR_JOIN="$2"
+            shift 2
+            ;;
+        --open-gop)
+            OPEN_GOP=1
+            shift
+            ;;
         *)
             PASSTHRU+=("$1")
             shift
             ;;
     esac
 done
+
+if [[ -n "$PAIR" ]]; then
+    if [[ -n "$LIVE" ]]; then
+        echo "error: --live and --pair grade different things and cannot be combined" >&2
+        echo "  --live grades one exporter's release timing; --pair grades two exporters against each other" >&2
+        exit 1
+    fi
+    # The overlap, not the run, is what gets graded, and the default run is too short to
+    # produce one worth grading: at 20s with a 5s join the legs share 15s, which is about
+    # seven SDT emissions against a floor of eight, so the table this mode exists to check
+    # would quietly drop to report-only. Give pair mode its own default and check the
+    # arithmetic rather than letting a short window pass as a clean one.
+    [[ -n "$DURATION_SET" ]] || DURATION=45
+    if ((DURATION - PAIR_JOIN < PAIR_MIN_OVERLAP)); then
+        echo "error: --pair needs at least ${PAIR_MIN_OVERLAP}s of overlap; this run has $((DURATION - PAIR_JOIN))s" >&2
+        echo "  raise --duration above $((PAIR_JOIN + PAIR_MIN_OVERLAP)), or lower --pair-join" >&2
+        exit 1
+    fi
+fi
+
+# open-gop.py grades a capture against its source, which only the plain round-trip keeps.
+if [[ -n "$OPEN_GOP" && -n "$ANALYZE_ONLY$LIVE$PAIR" ]]; then
+    echo "error: --open-gop cannot be combined with --analyze-only, --live, or --pair" >&2
+    exit 1
+fi
 
 URL="" # set once a port is reserved, below
 
@@ -165,6 +223,7 @@ MOQ="$TARGET_BASE/$PROFILE/moq"
 BROADCAST="tscompliance-$$-${RANDOM}.hang"
 SRC_TS="$HARNESS_RUN/source.ts"
 SUB_TS="$HARNESS_RUN/sub.ts"
+SUB_B_TS="$HARNESS_RUN/sub-b.ts"
 
 # Source TS: a real capture (preserves all PIDs/PSI) or a generated broadcast-like
 # clip (H.264 + AAC, one-second GOP, per-frame PES so audio interleaves evenly).
@@ -180,17 +239,22 @@ if [[ -n "$SOURCE" ]]; then
         exit 1
     }
 else
-    echo "### generating ~${DURATION}s broadcast-like clip with ffmpeg"
+    echo "### generating ~${DURATION}s broadcast-like ${OPEN_GOP:+open-GOP }clip with ffmpeg"
     # CBR with a 20 ms PCR, like a contribution feed. Not cosmetic: `regulate`
     # paces on the source PCR, so a clip whose clock is coarse and whose rate is
     # unconstrained is released unevenly and finishes early (measured: a 20 s clip
     # in 17 s, and release jitter of its own). The harness then grades ffmpeg.
+    X264="keyint=25:min-keyint=25:scenecut=0"
+    # Open GOP: after the first IDR, every keyframe is a non-IDR I picture with a
+    # recovery-point SEI. Fixed B placement in a 24-frame GOP puts three B pictures
+    # right after each one in decode order, presented before it: leading pictures.
+    [[ -n "$OPEN_GOP" ]] && X264="keyint=24:min-keyint=24:scenecut=0:open-gop=1:bframes=3:b-adapt=0"
     ffmpeg -y -hide_banner -loglevel error \
         -f lavfi -i "testsrc=size=1280x720:rate=25" \
         -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
         -t "$DURATION" \
         -c:v libx264 -profile:v high -preset veryfast -pix_fmt yuv420p \
-        -x264-params "keyint=25:min-keyint=25:scenecut=0" -b:v 8M \
+        -x264-params "$X264" -b:v 8M \
         -c:a aac -b:a 128k \
         -f mpegts -muxrate "$BITRATE" -pcr_period 20 -pes_payload_size 0 "$SRC_TS"
 fi
@@ -218,7 +282,7 @@ if harness_probe "$URL/certificate.sha256"; then
 fi
 
 echo "### starting relay on 127.0.0.1:${PORT}"
-sed "s/4443/${PORT}/g" "$DIR/../smoke/smoke.toml" >"$HARNESS_RUN/relay.toml"
+sed "s/4443/${PORT}/g" "$DIR/../interop/interop.toml" >"$HARNESS_RUN/relay.toml"
 harness_spawn relay "$HARNESS_RUN/relay.log" "$RELAY" "$HARNESS_RUN/relay.toml"
 if ! harness_ready "$URL/certificate.sha256" 30 "$HARNESS_PID"; then
     echo "error: relay never became ready" >&2
@@ -236,6 +300,16 @@ harness_endpoint relay "$URL"
 # (a file has none left in it). It stops itself after its own window, so the
 # round-trip below still bounds the run.
 
+# SCHEDULE carries the rate pcr-timing.py's schedule check grades against. The
+# generated clip is muxed at $BITRATE, which is the rate the catalog records and the
+# exporter pads to. Left to estimate, the grader divides total bytes by the PCR span,
+# and any transient drags that off the true rate: an unpadded first half-second put it
+# ~3 % low over a 20 s window, which then read every correctly padded interval as off
+# schedule. A --source capture's rate is not known here, so for that the grader
+# estimates it and says so.
+SCHEDULE=()
+[[ -z "$SOURCE" ]] && SCHEDULE=(--mux-rate "$BITRATE")
+
 # Both halves matter and `wait` can only report one, so record each. The
 # exporter's own status is not incidental here: it decides whether the grader saw
 # the whole window or graded a stream that ended under it.
@@ -247,7 +321,7 @@ grade_live() {
     timeout -k 3 $((DURATION + 20)) \
         "$MOQ" --connect "$URL" --broadcast "$BROADCAST" export ts 2>"$HARNESS_RUN/sub.log" |
         python3 "$DIR/pcr-timing.py" --live --seconds "$DURATION" --release-pct-max 1 $STRICT \
-            ${PASSTHRU[@]+"${PASSTHRU[@]}"} >"$HARNESS_RUN/timing.out" 2>&1
+            ${SCHEDULE[@]+"${SCHEDULE[@]}"} ${PASSTHRU[@]+"${PASSTHRU[@]}"} >"$HARNESS_RUN/timing.out" 2>&1
     printf '%s\n' "${PIPESTATUS[0]} ${PIPESTATUS[1]}" >"$HARNESS_RUN/timing.rc"
 }
 
@@ -255,6 +329,17 @@ grade_live() {
 capture() {
     timeout -k 3 $((DURATION + 20)) \
         "$MOQ" --connect "$URL" --broadcast "$BROADCAST" export ts >"$SUB_TS" 2>"$HARNESS_RUN/sub.log"
+}
+
+# shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
+capture_b() {
+    # Joining late is the point. Two exporters started together can agree on a
+    # cadence by having started together, which is the confound this arm exists to
+    # remove: a leg that joins mid-broadcast has to derive its emission points from
+    # the media, because it has no shared history to derive them from.
+    sleep "$PAIR_JOIN"
+    timeout -k 3 $((DURATION + 20)) \
+        "$MOQ" --connect "$URL" --broadcast "$BROADCAST" export ts >"$SUB_B_TS" 2>"$HARNESS_RUN/sub-b.log"
 }
 
 if [[ -n "$LIVE" ]]; then
@@ -265,6 +350,11 @@ else
     harness_spawn sub - capture
 fi
 SUB_PID="$HARNESS_PID"
+if [[ -n "$PAIR" ]]; then
+    echo "### capturing a second subscriber, joining ${PAIR_JOIN}s late"
+    harness_spawn sub-b - capture_b
+    SUB_B_PID="$HARNESS_PID"
+fi
 sleep 1
 
 # Pace on the source PCR (real media time), not a fixed bitrate: a synthetic clip
@@ -353,6 +443,36 @@ if [[ ! -s "$SUB_TS" ]]; then
     exit 1
 fi
 
+# ── pair: the two captures are the measurement ──────────────────────────────
+if [[ -n "$PAIR" ]]; then
+    harness_reap "$SUB_B_PID"
+    if [[ ! -s "$SUB_B_TS" ]]; then
+        echo "error: the second subscriber captured no data" >&2
+        sed 's/^/  sub-b: /' "$HARNESS_RUN/sub-b.log" >&2 || true
+        dump_logs
+        exit 1
+    fi
+    echo "### captured $(wc -c <"$SUB_TS" | tr -d ' ') + $(wc -c <"$SUB_B_TS" | tr -d ' ') bytes -> comparing table anchors"
+    echo
+    if ! python3 "$DIR/table-anchor.py" "$SUB_TS" "$SUB_B_TS" $STRICT \
+        ${PASSTHRU[@]+"${PASSTHRU[@]}"}; then
+        echo >&2
+        echo "error: table anchor analysis failed (see round-trip logs below)" >&2
+        sed 's/^/  sub-b: /' "$HARNESS_RUN/sub-b.log" >&2 || true
+        dump_logs
+        exit 1
+    fi
+    # As in --live: a grader can only speak for what reached it, so a publisher that
+    # died mid-run must not be reported as a clean pair.
+    if [[ "$PUB_RC" -ne 0 ]]; then
+        echo >&2
+        echo "error: the publisher exited $PUB_RC; the graded pair is not a whole round-trip" >&2
+        dump_logs
+        exit 1
+    fi
+    exit 0
+fi
+
 if [[ -n "$CAPTURE_OUT" ]]; then
     cp "$SUB_TS" "$CAPTURE_OUT"
 fi
@@ -376,6 +496,18 @@ if [[ -n "$WITH_EIT" ]]; then
             "$(count_pid "$SRC_TS" "${spec##*:}")" "$(count_pid "$SUB_TS" "${spec##*:}")"
     done
 fi
+
+# Leading pictures are only decodable in continuous playback, which is the case this
+# subscriber is in, so the round-trip owes every one of them, in decode order.
+if [[ -n "$OPEN_GOP" ]]; then
+    echo
+    if ! python3 "$DIR/open-gop.py" "$SRC_TS" "$SUB_TS" $STRICT; then
+        echo >&2
+        echo "error: open-GOP analysis failed (see round-trip logs below)" >&2
+        dump_logs
+        exit 1
+    fi
+fi
 echo
 # Pass the source so duration-fidelity can pin the exported stream's rate. A tiny
 # capture still parses, so the round-trip can fail here with a non-empty file;
@@ -383,6 +515,18 @@ echo
 if ! analyze "$SUB_TS" "$SRC_TS"; then
     echo >&2
     echo "error: compliance analysis failed (see round-trip logs below)" >&2
+    dump_logs
+    exit 1
+fi
+
+# compliance.py grades rate in aggregate and over fixed windows, neither of which says
+# whether the bytes between consecutive PCRs are the ones the mux rate implies, so the
+# capture goes through pcr-timing.py as well. Its hard checks gate here as they do under
+# --live; pcr-schedule is a shape check, so it reports without gating unless --strict.
+echo
+if ! python3 "$DIR/pcr-timing.py" "$SUB_TS" ${SCHEDULE[@]+"${SCHEDULE[@]}"} $STRICT; then
+    echo >&2
+    echo "error: PCR timing analysis failed (see round-trip logs below)" >&2
     dump_logs
     exit 1
 fi

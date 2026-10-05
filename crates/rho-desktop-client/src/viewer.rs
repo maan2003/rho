@@ -105,16 +105,16 @@ impl Progress {
         let safe = packet.header.kind != FrameKind::State
             || receipt.reference == Some((packet.header.epoch, packet.header.base));
         let mut received = safe.then_some(packet.id);
-        if let Some((state, base)) = receipt.state {
-            if receipt.reference == Some((state.epoch, base)) {
-                received = received.map(|id| id.max(state)).or(Some(state));
-            }
+        if let Some((state, base)) = receipt.state
+            && receipt.reference == Some((state.epoch, base))
+        {
+            received = received.map(|id| id.max(state)).or(Some(state));
         }
-        if let Some(id) = received {
-            if feedback.received.is_none_or(|previous| id > previous) {
-                feedback.received = Some(id);
-                feedback.lag_us = packet.lag_us;
-            }
+        if let Some(id) = received
+            && feedback.received.is_none_or(|previous| id > previous)
+        {
+            feedback.received = Some(id);
+            feedback.lag_us = packet.lag_us;
         }
     }
     fn presented(&self, id: FrameId, lag_us: u64) {
@@ -175,7 +175,8 @@ fn decode_packets(
     loop {
         let packet = {
             // Keep future-base bytes only in the watch slot, not in a second
-            // queue while checkpoints decode. Re-read its newest value each turn.
+            // queue while checkpoints decode. Re-read its newest value each
+            // turn.
             let candidate = states.borrow_and_update().clone().filter(|packet| {
                 handled_state != Some(packet.id)
                     && progress.accepts(packet.id)
@@ -496,7 +497,8 @@ async fn receive_packets(
                         base = packet.id.timestamp_us;
                         progress.received(&packet);
                         // Backpressure decoding rather than dropping needed
-                        // checkpoints. A fresh root still preempts a full queue.
+                        // checkpoints. A fresh root still preempts a full
+                        // queue.
                         tokio::select! {
                             biased;
                             newer = reliable.next_group(), if !ended => {
@@ -523,7 +525,8 @@ async fn receive_packets(
                         ) =>
                     {
                         // Explicit supersession already has a new root on its
-                        // way. Requesting another while it serializes is a storm.
+                        // way. Requesting another while it serializes is a
+                        // storm.
                         break;
                     }
                     Err(error) => {
@@ -586,16 +589,15 @@ async fn receive_packets(
                 }
                 packet = &mut read => packet,
             };
-            if let Ok(Some(packet)) = packet {
-                if progress.accepts(packet.id)
-                    && states
-                        .borrow()
-                        .as_ref()
-                        .is_none_or(|old| packet.id > old.id)
-                {
-                    progress.received(&packet);
-                    states.send_replace(Some(Arc::new(packet)));
-                }
+            if let Ok(Some(packet)) = packet
+                && progress.accepts(packet.id)
+                && states
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|old| packet.id > old.id)
+            {
+                progress.received(&packet);
+                states.send_replace(Some(Arc::new(packet)));
             }
             // Cancellation/expiry of an optional state is normal. It never
             // invalidates the reliable reference or requests another root key.
@@ -819,6 +821,10 @@ mod tests {
         )?;
         Ok(())
     }
+    #[expect(
+        clippy::type_complexity,
+        reason = "the test harness returns the worker and both distinct output channels"
+    )]
     fn receive(
         origin: moq_net::origin::Producer,
         progress: Arc<Progress>,
@@ -852,10 +858,10 @@ mod tests {
     ) -> Result<Arc<Image>> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(image) = images.borrow_and_update().clone() {
-                    if image.id.timestamp_us == timestamp {
-                        return Ok(image);
-                    }
+                if let Some(image) = images.borrow_and_update().clone()
+                    && image.id.timestamp_us == timestamp
+                {
+                    return Ok(image);
                 }
                 images.changed().await?;
             }

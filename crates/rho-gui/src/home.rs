@@ -45,11 +45,12 @@ pub(crate) struct HomeRow {
     pub skipped: bool,
 }
 
-/// One live agent, by name.
+/// One agent that said something lately, by name and how long ago.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RunningRow {
+pub(crate) struct RecentRow {
     pub agent_id: AgentId,
     pub name: String,
+    pub label: String,
 }
 
 /// One pile the user put cards on: Enter deals from it.
@@ -67,14 +68,16 @@ pub(crate) struct PileRow {
 pub(crate) struct HomeRows {
     /// The top of the queue above the cutoff: a preview, not the queue.
     pub next: Vec<HomeRow>,
-    pub running: Vec<RunningRow>,
+    /// The agents that sent lately, newest first, but for those already in
+    /// `next`. Folded until opened: what wants the reader is a card above.
+    pub recent: Vec<RecentRow>,
     /// Every pile, all of them: a pile nobody sees is where cards go to die.
     pub piles: Vec<PileRow>,
 }
 
 impl HomeRows {
     pub fn is_empty(&self) -> bool {
-        self.next.is_empty() && self.running.is_empty() && self.piles.is_empty()
+        self.next.is_empty() && self.recent.is_empty() && self.piles.is_empty()
     }
 }
 
@@ -88,7 +91,7 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
     };
     HomeRows {
         next: cards.iter().take(HOME_CAP).map(row).collect(),
-        running: Vec::new(),
+        recent: Vec::new(),
         piles: Vec::new(),
     }
 }
@@ -106,7 +109,7 @@ pub(crate) fn card_title(card: &Card, agent_tag: impl Fn(AgentId) -> String) -> 
     }
 }
 
-/// How long a running turn has been running, in the deal bar's own units.
+/// How long ago something happened, in the deal bar's own units.
 pub(crate) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
     age_label(((now_ms - since_ms).max(0)) as f64 / 86_400_000.0)
 }
@@ -117,6 +120,8 @@ pub(crate) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
 pub(crate) enum HomeTarget {
     Card(NodeId),
     Agent(AgentId),
+    /// The recent heading: Enter folds or unfolds it.
+    Recent,
     /// A pile, dealt from on Enter; `None` is everything snoozed.
     Pile(Option<String>),
     /// A section heading or the empty line: nothing to open.
@@ -183,6 +188,7 @@ pub struct HomeView {
     transcript: Transcript<HomeKey, HomeClass, HomeTarget>,
     editor: Entity<Editor>,
     rows: HomeRows,
+    recent_open: bool,
 }
 
 impl HomeView {
@@ -223,6 +229,7 @@ impl HomeView {
             transcript: Transcript::new(buffer),
             editor,
             rows: HomeRows::default(),
+            recent_open: false,
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // A Home nobody has told anything yet still answers the question.
@@ -264,6 +271,13 @@ impl HomeView {
         if self.cursor_target(cx) == HomeTarget::None {
             self.focus_first_row(cx);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_recent(&mut self, cx: &mut Context<Self>) {
+        self.recent_open = !self.recent_open;
+        let items = self.items();
+        self.reconcile(items, cx);
         cx.notify();
     }
 
@@ -309,10 +323,18 @@ impl HomeView {
                 items.push(card_line(row, column, HomeClass::Title));
             }
         }
-        if !self.rows.running.is_empty() {
-            items.push(section("running"));
-            for row in &self.rows.running {
-                items.push(running_line(row));
+        if !self.rows.recent.is_empty() {
+            let fold = if self.recent_open { "▾" } else { "▸" };
+            let heading = format!("recent {fold} {}", self.rows.recent.len());
+            items.push(
+                line(HomeKey::Section("recent"), &heading, HomeClass::Section)
+                    .with_lines(vec![HomeTarget::Recent]),
+            );
+            if self.recent_open {
+                let column = column_of(self.rows.recent.iter().map(|row| row.name.as_str()));
+                for row in &self.rows.recent {
+                    items.push(recent_line(row, column));
+                }
             }
         }
         if !self.rows.piles.is_empty() {
@@ -412,8 +434,11 @@ fn card_line(
         .with_lines(vec![HomeTarget::Card(row.card.clone())])
 }
 
-fn running_line(row: &RunningRow) -> Item<HomeKey, HomeClass, HomeTarget> {
-    let (text, styles) = columns(&[(row.name.as_str(), HomeClass::Title, 0)]);
+fn recent_line(row: &RecentRow, column: usize) -> Item<HomeKey, HomeClass, HomeTarget> {
+    let (text, styles) = columns(&[
+        (row.name.as_str(), HomeClass::Title, column),
+        (row.label.as_str(), HomeClass::Muted, 0),
+    ]);
     Item::new(HomeKey::Agent(row.agent_id), text)
         .with_styles(styles)
         .with_lines(vec![HomeTarget::Agent(row.agent_id)])

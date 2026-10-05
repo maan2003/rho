@@ -310,6 +310,24 @@ async fn run_async(args: Args) -> Result<()> {
                 } else {
                     responding.remove(&agent_id);
                 }
+                // Each time an agent comes to wait on the user, the baseline
+                // writes to it again.
+                if !state.awaiting_human {
+                    awaiting.remove(&agent_id);
+                } else if awaiting.insert(agent_id)
+                    && args.scenario == Scenario::Baseline
+                    && Instant::now() < deadline
+                {
+                    let cycle = cycles.entry(agent_id).or_default();
+                    *cycle += 1;
+                    client.send(AgentCommand::Send {
+                        agent_id,
+                        messages: vec![UserMessage {
+                            id: *cycle,
+                            content: prompt(0, *cycle),
+                        }],
+                    });
+                }
             }
             Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
@@ -390,25 +408,6 @@ async fn run_async(args: Args) -> Result<()> {
                             }
                             report_at.insert(entry.agent_id, at);
                         }
-                        TranscriptEvent::AwaitingHuman { since, .. } => {
-                            if since.is_some() {
-                                awaiting.insert(entry.agent_id);
-                                if args.scenario == Scenario::Baseline && Instant::now() < deadline
-                                {
-                                    let cycle = cycles.entry(entry.agent_id).or_default();
-                                    *cycle += 1;
-                                    client.send(AgentCommand::Send {
-                                        agent_id: entry.agent_id,
-                                        messages: vec![UserMessage {
-                                            id: *cycle,
-                                            content: prompt(0, *cycle),
-                                        }],
-                                    });
-                                }
-                            } else {
-                                awaiting.remove(&entry.agent_id);
-                            }
-                        }
                         TranscriptEvent::MessageSent { to, text, .. } => {
                             ensure!(to.is_none(), "fake agent sent mail to another agent");
                             ensure!(!text.trim().is_empty(), "empty user-facing message");
@@ -421,7 +420,8 @@ async fn run_async(args: Args) -> Result<()> {
                             at,
                             ..
                         } => {
-                            // A usage row is a second Replied event, not another model step.
+                            // A usage row is a second Replied event, not
+                            // another model step.
                             if items.is_empty() && !did_compact {
                                 continue;
                             }
@@ -633,6 +633,10 @@ async fn run_async(args: Args) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the completion predicate compares independent observed scenario metrics"
+)]
 fn scenario_complete(
     scenario: Scenario,
     rounds: usize,
@@ -897,7 +901,11 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn tree_commit() -> Result<String> {
@@ -926,35 +934,49 @@ mod tests {
     }
 
     #[test]
-    fn real_rounds_require_all_calls_and_results() {
+    fn real_rounds_require_all_calls_results_and_message() {
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS,
+            REAL_TOOL_ROUNDS + 1,
             0,
             0,
             REAL_TOOL_ROUNDS - 1,
+            1,
             &[1]
         ));
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS - 1,
+            REAL_TOOL_ROUNDS,
             0,
             0,
             REAL_TOOL_ROUNDS,
+            1,
+            &[1]
+        ));
+        assert!(!scenario_complete(
+            Scenario::RealToolRounds,
+            REAL_TOOL_ROUNDS,
+            0,
+            REAL_TOOL_ROUNDS + 1,
+            0,
+            0,
+            REAL_TOOL_ROUNDS,
+            0,
             &[1]
         ));
         assert!(scenario_complete(
             Scenario::RealToolRounds,
             REAL_TOOL_ROUNDS,
             0,
-            REAL_TOOL_ROUNDS,
+            REAL_TOOL_ROUNDS + 1,
             0,
             0,
             REAL_TOOL_ROUNDS,
+            1,
             &[1]
         ));
     }

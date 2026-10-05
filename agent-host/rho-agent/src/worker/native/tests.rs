@@ -24,7 +24,8 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        // The worker installs one at startup; the notebook's web client needs it.
+        // The worker installs one at startup; the notebook's web client needs
+        // it.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
@@ -161,7 +162,9 @@ fn received(entries: &[Entry], text: &str) -> bool {
 async fn draft_waits_for_the_originating_cells_actual_send() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
-    script.then("import asyncio\nawait asyncio.sleep(0.6)\nhuman.send('hello from cell')");
+    script.then(
+        "import asyncio\nawait asyncio.sleep(0.6)\nhuman.send('hello from cell', kind='result')",
+    );
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "start").await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -200,8 +203,8 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script
-        .then("human.send('hello there')\nend_turn()")
-        .then("human.status('reading')\nend_turn()");
+        .then("human.send('hello there', kind='result')\nend_turn()")
+        .then("human.send('reading', kind='status')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
 
     say(&handle, "hi").await;
@@ -209,9 +212,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
         .until("the reply and the wait", |entries| {
             entries.iter().any(|entry| {
                 matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "hello there")
-            }) && entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
+            }) && handle.status().runtime.awaiting_human
         })
         .await;
     assert!(received(&entries, "hi"));
@@ -234,19 +235,13 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
             .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
-    let entries = harness
+    harness
         .until("the status", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Status { text, .. } if text == "reading"))
+            entries.iter().any(|entry| {
+                matches!(entry, Entry::Sent { text, kind: SendKind::Status, .. } if text == "reading")
+            })
         })
         .await;
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| matches!(entry, Entry::StoppedAwaitingHuman { .. })),
-        "the answer ends the wait; nothing else says so"
-    );
 }
 
 #[tokio::test]
@@ -328,11 +323,7 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     let (handle, task) = harness.start(&script).await;
     say(&handle, "first").await;
     harness
-        .until("the wait", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
-        })
+        .until("the wait", |_| handle.status().runtime.awaiting_human)
         .await;
     drop(handle);
     task.await.unwrap();
@@ -344,12 +335,6 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     assert!(script.requests().is_empty(), "a reload is not a wake");
     // What awaited the human went with the old notebook, but the agent
     // still waits on them: nothing moves until they write.
-    assert!(
-        !harness
-            .entries()
-            .iter()
-            .any(|entry| matches!(entry, Entry::StoppedAwaitingHuman { .. }))
-    );
     assert!(!harness.entries().iter().any(|entry| matches!(
         entry,
         Entry::Notice {
@@ -419,11 +404,7 @@ async fn rewind_branches_before_the_last_human_message() {
     say(&handle, "one").await;
     requests(&script, 1).await;
     harness
-        .until("the first wait", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
-        })
+        .until("the first wait", |_| handle.status().runtime.awaiting_human)
         .await;
     say(&handle, "two").await;
     requests(&script, 2).await;
@@ -498,22 +479,17 @@ async fn waiting_never_checks_in_and_archive_revival_has_a_fresh_notebook() {
     let script = Arc::new(Scripted::new());
     script
         .then("remembered = 41\nset_max_wait(1)\nend_turn()")
-        .then("human.send('archiving')\narchive()")
-        .then("human.send(str('remembered' in globals()))\nend_turn()");
+        .then("human.send('archiving', kind='result')\narchive()")
+        .then("human.send(str('remembered' in globals()), kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "start").await;
     harness
-        .until("the model waiting for the human", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
-                && {
-                    let state = handle.status().runtime;
-                    state.inference == InferenceState::Idle
-                        && state.checkin_at.is_none()
-                        && !state.archived
-                        && state.awaiting_human
-                }
+        .until("the model waiting for the human", |_| {
+            let state = handle.status().runtime;
+            state.inference == InferenceState::Idle
+                && state.checkin_at.is_none()
+                && !state.archived
+                && state.awaiting_human
         })
         .await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -547,7 +523,7 @@ async fn transient_failures_recover_beyond_three_attempts() {
     for _ in 0..4 {
         script.then_transient();
     }
-    script.then("human.send('recovered')\nend_turn()");
+    script.then("human.send('recovered', kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "original task").await;
     harness
@@ -625,7 +601,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
     for cancel in [false, true] {
         let harness = Harness::new().await;
         let script = Arc::new(Scripted::new());
-        script.then("human.send('fresh input seen')\nend_turn()");
+        script.then("human.send('fresh input seen', kind='result')\nend_turn()");
         let (handle, mut agent) = Agent::load(
             harness.agent,
             harness.host.clone(),
@@ -664,10 +640,53 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
 }
 
 #[tokio::test]
+async fn a_send_outside_simplified_technical_english_raises_and_is_not_logged() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then(
+            "human.send(\"I'm reading\", kind='status')\nhuman.send(\"It's done.\", kind='result')",
+        )
+        .then("human.send('It is done.', kind='result')\nend_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    say(&handle, "hi").await;
+    // The raised cell returns at once, not after a failure's 20 seconds.
+    let second = tokio::time::timeout(Duration::from_secs(10), requests(&script, 2))
+        .await
+        .unwrap();
+    let told = told(&second[1]);
+    assert!(
+        told.contains("line 1, contraction: `It's` is a contraction."),
+        "{told}"
+    );
+    let entries = harness
+        .until("the rewritten result", |entries| {
+            entries.iter().any(|entry| {
+                matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "It is done.")
+            })
+        })
+        .await;
+    let sent: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Sent {
+                to: Party::Human,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, ["I'm reading", "It is done."]);
+    drop(handle);
+}
+
+#[tokio::test]
 async fn exhausted_retry_window_stops_without_another_request() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
-    script.then("human.send('must not run')");
+    script.then("human.send('must not run', kind='result')");
     let (handle, mut agent) = Agent::load(
         harness.agent,
         harness.host.clone(),
@@ -700,10 +719,10 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
     let script = Arc::new(Scripted::new());
     let (admit, cut) = tokio::sync::oneshot::channel();
     script.then_cut_after(
-        "counter = globals().get('counter', 0) + 1\nhuman.send('admitted')\n",
+        "counter = globals().get('counter', 0) + 1\nhuman.send('admitted', kind='result')\n",
         cut,
     );
-    script.then("human.send(str(counter))\nend_turn()");
+    script.then("human.send(str(counter), kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "count once").await;
     harness
@@ -799,7 +818,6 @@ async fn code_fragments_wait_for_a_publication_frame() {
 #[tokio::test]
 async fn live_response_is_replaced_only_after_its_step_is_durable() {
     let harness = Harness::new().await;
-    let mut updates = crate::journal::feed(&harness.db);
     let script = Arc::new(Scripted::new());
     // Enough separate streamed lines to observe several distinct snapshots.
     let code = format!("value = 17\n{}end_turn()", "# still writing\n".repeat(40));
@@ -836,27 +854,6 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    // No GUI focuses this harness. Current state still reaches the host feed,
-    // but the potentially large response body is not broadcast.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut saw_responding = false;
-        loop {
-            if let crate::journal::Feed::Status { status, .. } = updates.recv().await.unwrap() {
-                assert!(
-                    status.response.is_none(),
-                    "unfocused response bodies must stay private to the worker/host cache"
-                );
-                saw_responding |= status.runtime.inference == InferenceState::Responding;
-                if status.runtime.awaiting_human && status.runtime.inference == InferenceState::Idle
-                {
-                    assert!(saw_responding);
-                    break;
-                }
-            }
         }
     })
     .await
@@ -1120,10 +1117,6 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .await
         .unwrap();
     agent
-        .append(Entry::AwaitingHuman { at: UnixMs(2) })
-        .await
-        .unwrap();
-    agent
         .receive(
             MessageId::new(),
             Party::Human,
@@ -1188,7 +1181,6 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
     .await
     .unwrap();
     assert!(agent.restarted);
-    assert!(!agent.awaiting, "the live wait went with the old notebook");
     assert!(
         agent.compaction.reply,
         "automatic compaction still owes a reply"
@@ -1273,11 +1265,7 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
 
     say(&handle, "hi").await;
     harness
-        .until("the wait", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::AwaitingHuman { .. }))
-        })
+        .until("the wait", |_| handle.status().runtime.awaiting_human)
         .await;
     assert!(handle.retire().await.is_err(), "its task is still running");
     harness

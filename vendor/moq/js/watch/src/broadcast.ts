@@ -7,39 +7,6 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
 
 import { toHang } from "./msf";
 
-/**
- * The name of the first rendition whose `broadcast` reference walks above the root, if any.
- *
- * The root is the consumer's authorized subtree, so such a reference names content this
- * consumer cannot reach. It rejects the whole catalog rather than the one rendition: a
- * publisher that emits one has a bug, and quietly serving the rest hides that while the
- * missing rendition resurfaces later as a track that never fills.
- */
-function findEscaping(base: Moq.Path.Valid, catalog: Catalog.Root): string | undefined {
-	// Every section carrying renditions must be listed here; one left out silently exempts
-	// its renditions from the containment check.
-	const renditions = [
-		...Object.entries(catalog.video?.renditions ?? {}),
-		...Object.entries(catalog.audio?.renditions ?? {}),
-		...Object.entries(catalog.text?.renditions ?? {}),
-	];
-
-	for (const [name, config] of renditions) {
-		if (config.broadcast && Path.tryResolve(base, config.broadcast) === undefined) return name;
-	}
-
-	return undefined;
-}
-
-/** Throw if any rendition's `broadcast` reference escapes the root. */
-function assertResolvable(base: Moq.Path.Valid, catalog: Catalog.Root): Catalog.Root {
-	const escaping = findEscaping(base, catalog);
-	if (escaping !== undefined) {
-		throw new Error(`rendition ${JSON.stringify(escaping)}: broadcast reference escapes the root ${base}`);
-	}
-	return catalog;
-}
-
 type ReferencedRendition = {
 	broadcast?: Path.Relative;
 };
@@ -54,8 +21,8 @@ function filterRenditions<T extends ReferencedRendition>(
 	return Object.fromEntries(Object.entries(renditions).filter(([, config]) => usable(config.broadcast)));
 }
 
-// Every section carrying renditions must be listed here, same as `findEscaping`; one left
-// out silently exempts its renditions from the reachability filter.
+// Every section carrying a `broadcast` reference must be listed here, same as `Catalog.checkResolvable`;
+// one left out silently exempts its tracks from the reachability filter.
 function filterCatalog(catalog: Catalog.Root, usable: (rel: Path.Relative | undefined) => boolean): Catalog.Root {
 	return {
 		...catalog,
@@ -67,6 +34,10 @@ function filterCatalog(catalog: Catalog.Root, usable: (rel: Path.Relative | unde
 			: undefined,
 		text: catalog.text
 			? { ...catalog.text, renditions: filterRenditions(catalog.text.renditions, usable) }
+			: undefined,
+		json: catalog.json ? { ...catalog.json, tracks: filterRenditions(catalog.json.tracks, usable) } : undefined,
+		binary: catalog.binary
+			? { ...catalog.binary, tracks: filterRenditions(catalog.binary.tracks, usable) }
 			: undefined,
 	};
 }
@@ -187,7 +158,7 @@ export class Broadcast {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const entry = await Promise.race([effect.cancel, announced.next()]);
+				const entry = await effect.race(announced.next());
 				if (!entry) break;
 				this.#announced.mutate((active) => {
 					if (!active) return;
@@ -279,12 +250,12 @@ export class Broadcast {
 			// catalog is rejected the same way a fetched one is, minus the throw: this runs in
 			// the effect body, where an exception would surface as an unhandled error.
 			const catalog = effect.get(this.in.catalog);
-			const escaping = catalog && findEscaping(name, catalog);
-			if (escaping !== undefined) {
-				console.error("rejecting catalog: broadcast reference escapes the root", name, escaping);
+			let accepted: Catalog.Root | undefined;
+			try {
+				accepted = catalog && Catalog.checkResolvable(Catalog.checkRenditions(catalog), name);
+			} catch (err) {
+				console.error("rejecting catalog", name, err);
 			}
-
-			const accepted = escaping === undefined ? catalog : undefined;
 			this.#raw.set(accepted, true);
 			effect.cleanup(() => this.#raw.set(undefined, true));
 			this.#out.status.set(accepted ? "live" : "loading");
@@ -322,12 +293,12 @@ export class Broadcast {
 		effect.spawn(async () => {
 			try {
 				for (;;) {
-					const update = await Promise.race([effect.cancel, fetchNext()]);
+					const update = await effect.race(fetchNext());
 					if (!update) break;
 
 					console.debug("received catalog", format, this.in.name.peek(), update);
 
-					this.#raw.set(assertResolvable(name, update), true);
+					this.#raw.set(Catalog.checkResolvable(Catalog.checkRenditions(update), name), true);
 					this.#out.status.set("live");
 				}
 			} catch (err) {

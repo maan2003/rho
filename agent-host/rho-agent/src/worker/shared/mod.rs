@@ -29,9 +29,11 @@ impl Progress {
             .map(Notebook::checkin)
             .unwrap_or(wake::DEFAULT_CHECKIN);
         wake::Facts {
+            // A cell that raised has returned too: its failure is not news
+            // to wait for.
             finished: latest
                 .and_then(|cell| cell.facts().finished)
-                .filter(|end| !end.failed && !self.told_returned)
+                .filter(|_| !self.told_returned)
                 .map(|end| end.at),
             notified: sources
                 .iter()

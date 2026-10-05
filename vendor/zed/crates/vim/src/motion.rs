@@ -11,7 +11,7 @@ use language::{CharKind, Point, Selection, SelectionGoal, TextObject, TreeSitter
 use multi_buffer::MultiBufferRow;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::{f64, ops::Range};
+use std::ops::Range;
 
 use crate::Direction;
 
@@ -1489,13 +1489,8 @@ impl Motion {
         text_layout_details: &TextLayoutDetails,
         forced_motion: bool,
     ) -> Option<MotionKind> {
-        let (range, kind) = self.range(
-            map,
-            selection.clone(),
-            times,
-            text_layout_details,
-            forced_motion,
-        )?;
+        let (range, kind) =
+            self.range(map, *selection, times, text_layout_details, forced_motion)?;
         selection.start = range.start;
         selection.end = range.end;
         Some(kind)

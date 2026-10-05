@@ -70,12 +70,12 @@ pub mod client;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/40";
+pub const IROH_ALPN: &[u8] = b"rho/ui/42";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP36";
 
@@ -385,49 +385,6 @@ where
     T: Packer,
 {
     crate::write_frame(writer, value, max_len).await.map(|_| ())
-}
-
-/// Write one length-prefixed raw frame (no senax encoding).
-pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    if payload.len() > MAX_FRAME_LEN {
-        bail!("raw frame length {} exceeds {MAX_FRAME_LEN}", payload.len());
-    }
-    let len: u32 = payload.len().try_into().context("raw frame too large")?;
-    writer
-        .write_u32_le(len)
-        .await
-        .context("write raw frame length")?;
-    writer
-        .write_all(payload)
-        .await
-        .context("write raw frame payload")?;
-    writer.flush().await.context("flush raw frame")?;
-    Ok(())
-}
-
-/// Read one length-prefixed raw frame; `Ok(None)` on clean EOF at a frame
-/// boundary.
-pub async fn read_raw_frame<R>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>>
-where
-    R: AsyncRead + Unpin,
-{
-    let len = match reader.read_u32_le().await {
-        Ok(len) => len as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error).context("read raw frame length"),
-    };
-    if len > MAX_FRAME_LEN {
-        bail!("raw frame length {len} exceeds {MAX_FRAME_LEN}");
-    }
-    let mut payload = vec![0; len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("read raw frame payload")?;
-    Ok(Some(payload))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

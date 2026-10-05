@@ -1,13 +1,13 @@
 //! Private agent messages shared by the host and worker.
 use std::io;
 
-use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
+use rho_agent_types::{AgentRole, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 use crate::AgentEvent;
 use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(crate) const VERSION: u32 = 22;
+pub(crate) const VERSION: u32 = 24;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host
@@ -36,7 +36,6 @@ pub(crate) enum Control {
     Compact,
     Cancel,
     Retry,
-    Effort(rho_claude::Effort),
     Role(rho_agent_types::AgentRole),
     CacheKey,
     Rewind(u32),
@@ -88,10 +87,6 @@ pub(crate) enum Request<'a> {
     ClaudeAccount,
     ClaudePendingOutput,
     UsageTotal,
-    Turn {
-        at: UnixMs,
-        edge: TurnEdge,
-    },
 }
 
 #[derive(Encode, Decode)]
@@ -138,6 +133,8 @@ pub(crate) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
+        // TODO: drop at the next protocol VERSION bump. Every loop keeps its
+        // queue in its rows now, so workers always send `None`.
         queue: Option<Vec<crate::QueuedInput>>,
     },
     HistoryBatch {

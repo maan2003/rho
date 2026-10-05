@@ -337,9 +337,17 @@ impl Worksets {
     /// this process: for evaluations, renderings and tests that work on a
     /// directory the user already has. Nothing is written to the state root.
     pub fn adopt(self: &Arc<Self>, directory: impl AsRef<Path>) -> anyhow::Result<Workset> {
+        self.adopt_as(format!("adopted-{}", random_workset_id()?), directory)
+    }
+
+    /// Adopt under an id recorded earlier, so agents placed in it resume.
+    pub fn adopt_as(
+        self: &Arc<Self>,
+        id: String,
+        directory: impl AsRef<Path>,
+    ) -> anyhow::Result<Workset> {
         let root = absolute_utf8(directory.as_ref())?;
         anyhow::ensure!(root.is_dir(), "not a directory: {root}");
-        let id = format!("adopted-{}", random_workset_id()?);
         self.adopted
             .lock()
             .unwrap()
@@ -370,19 +378,6 @@ impl Worksets {
             }
         }
         anyhow::bail!("could not allocate a unique workset id")
-    }
-
-    /// Makes the directory of a workset named by id, if it is missing:
-    /// for a record that named a workset before anything made one.
-    /// Returns whether it was made.
-    pub async fn ensure_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<bool> {
-        validate_name(workset_id)?;
-        let src = self.root.join("worksets").join(workset_id).join("src");
-        if src.is_dir() {
-            return Ok(false);
-        }
-        std::fs::create_dir_all(&src).with_context(|| format!("create workset {workset_id}"))?;
-        Ok(true)
     }
 
     pub async fn open_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<Workset> {
@@ -421,28 +416,6 @@ impl Worksets {
         }
         ids.sort();
         Ok(ids)
-    }
-
-    /// Removes a workset directory and everything the agent put in it.
-    /// Mirrors are untouched: clones only borrow from them. Idempotent.
-    pub async fn discard_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<()> {
-        validate_name(workset_id)?;
-        let live = self
-            .worksets
-            .lock()
-            .await
-            .remove(workset_id)
-            .and_then(|workset| workset.upgrade());
-        let _guard = match &live {
-            Some(workset) => Some(workset.operation_lock.lock().await),
-            None => None,
-        };
-        let base = self.root.join("worksets").join(workset_id);
-        match std::fs::remove_dir_all(&base) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("remove workset {base}")),
-        }
     }
 
     /// A host-side command with the user's environment and the store
@@ -805,6 +778,14 @@ async fn run(mut command: tokio::process::Command, action: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// Prevent unrelated inherited descriptors from surviving command exec.
+pub fn command_stdio_only(command: &mut tokio::process::Command) {
+    // Only a close_range syscall runs after fork.
+    unsafe {
+        command.pre_exec(ns::close_inherited_fds_on_exec);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,13 +822,5 @@ mod tests {
         assert!(visible_relative("/src", Utf8Path::new("/src/../x")).is_err());
         assert!(visible_relative("/src", Utf8Path::new("/srcx/a")).is_err());
         assert!(visible_relative("/src", Utf8Path::new("./a")).is_err());
-    }
-}
-
-/// Prevent unrelated inherited descriptors from surviving command exec.
-pub fn command_stdio_only(command: &mut tokio::process::Command) {
-    // Only a close_range syscall runs after fork.
-    unsafe {
-        command.pre_exec(ns::close_inherited_fds_on_exec);
     }
 }

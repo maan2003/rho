@@ -376,6 +376,143 @@ async fn broadcast_moq_lite_05_fetch_webtransport() {
 	lite05_fetch_roundtrip("https").await;
 }
 
+/// A cache miss over moq-transport is a standalone FETCH of the one group, served from
+/// the publisher's cache, and a group the publisher lacks comes back as the publisher's
+/// own refusal. Without `served`, the version has no FETCH and the miss is refused.
+async fn transport_fetch_roundtrip(version: &str, served: bool) {
+	let pub_origin = moq_tokio::origin::spawn();
+	let broadcast = pub_origin.create_broadcast("test").expect("failed to create broadcast");
+	broadcast
+		.announce(Default::default())
+		.expect("failed to announce broadcast");
+	let track = broadcast.create_track("video", None).expect("failed to create track");
+	for sequence in 0..3u64 {
+		let mut group = track.append_group().expect("failed to append group");
+		for frame in 0..2 {
+			group
+				.write_frame(
+					moq_net::Timestamp::ZERO,
+					bytes::Bytes::from(format!("{sequence}-{frame}")),
+				)
+				.expect("failed to write frame");
+		}
+		group.finish().expect("failed to finish group");
+	}
+
+	let mut server_config = moq_tokio::listen::Config::default();
+	server_config.bind = Some("[::]:0".parse().unwrap());
+	server_config.tls.generate = vec!["localhost".into()];
+	server_config.version = vec![version.parse().unwrap()];
+	let server = server_config.init(Default::default()).expect("failed to init server");
+	let mut server = server.listen().await.expect("failed to listen");
+	let addr = server.local_addr().expect("failed to get local addr");
+
+	let sub_origin = moq_tokio::origin::spawn();
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
+
+	let mut client_config = moq_tokio::connect::Config::default();
+	client_config.tls.insecure = Some(true);
+	client_config.version = vec![version.parse().unwrap()];
+	let client = client_config.init(Default::default()).expect("failed to init client");
+	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
+
+	let server_handle = tokio::spawn(async move {
+		let request = server.accept().await.expect("no incoming connection");
+		let session = request.with_publisher(&pub_origin).ok().await?;
+		let _broadcast = broadcast;
+		let _track = track;
+		let _ = session.closed().await;
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let client = client.with_subscriber(sub_origin);
+	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
+		.await
+		.expect("client connect timed out")
+		.expect("client connect failed");
+
+	tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("announce timed out")
+		.expect("origin closed");
+	let bc = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timed out")
+		.expect("announced broadcast resolves");
+
+	let fetched = tokio::time::timeout(TIMEOUT, async { bc.track("video").unwrap().fetch_group(1, None).await })
+		.await
+		.expect("fetch timed out");
+	if !served {
+		assert!(
+			matches!(fetched, Err(moq_net::Error::Unsupported)),
+			"expected an unsupported FETCH, got {:?}",
+			fetched.err()
+		);
+		drop(connection);
+		server_handle
+			.await
+			.expect("server task panicked")
+			.expect("server task failed");
+		return;
+	}
+	let mut group = fetched.expect("fetch failed");
+	assert_eq!(group.sequence, 1);
+	for frame in 0..2 {
+		let payload = tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.expect("read timed out")
+			.expect("read failed")
+			.expect("group ended early");
+		assert_eq!(payload.payload, bytes::Bytes::from(format!("1-{frame}")));
+	}
+	let end = tokio::time::timeout(TIMEOUT, group.read_frame())
+		.await
+		.expect("read timed out")
+		.expect("read failed");
+	assert!(end.is_none(), "the group ends after its frames");
+
+	let refused = tokio::time::timeout(TIMEOUT, async { bc.track("video").unwrap().fetch_group(7, None).await })
+		.await
+		.expect("fetch timed out");
+	assert!(
+		matches!(refused, Err(moq_net::Error::NotFound)),
+		"expected the publisher's refusal, got {:?}",
+		refused.err()
+	);
+
+	drop(connection);
+	server_handle
+		.await
+		.expect("server task panicked")
+		.expect("server task failed");
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn fetch_moq_transport_14() {
+	transport_fetch_roundtrip("moq-transport-14", true).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn fetch_moq_transport_16() {
+	transport_fetch_roundtrip("moq-transport-16", true).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn fetch_moq_transport_18() {
+	transport_fetch_roundtrip("moq-transport-18", true).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn fetch_moq_transport_20() {
+	transport_fetch_roundtrip("moq-transport-20", false).await;
+}
+
 /// A fetch must be served while a live subscription is active on the same track.
 /// The relay subscribes starting at the latest group, so an older group isn't
 /// cached and the fetch has to issue a wire FETCH concurrently with the
@@ -724,16 +861,29 @@ async fn next_announce(announcements: &mut moq_net::announce::Consumer) -> moq_n
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_moq_lite_06_announce_lifecycle() {
+	announce_lifecycle_test("moq-lite-06").await;
+}
+
+/// The same lifecycle on lite-07, where every path shares its head with a live one,
+/// so the announcements after the first copy it from a base that the retractions
+/// keep moving.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_lite_07_announce_lifecycle() {
+	announce_lifecycle_test("moq-lite-07-wip").await;
+}
+
+async fn announce_lifecycle_test(version: &str) {
 	let pub_origin = moq_tokio::origin::spawn();
 
 	// Announced before the client connects, so it rides the initial set.
-	let first = pub_origin.create_broadcast("first").expect("create broadcast");
+	let first = pub_origin.create_broadcast("room/first").expect("create broadcast");
 	first.announce(Default::default()).expect("create broadcast");
 
 	let mut server_config = moq_tokio::listen::Config::default();
 	server_config.bind = Some("[::]:0".parse().unwrap());
 	server_config.tls.generate = vec!["localhost".into()];
-	server_config.version = vec!["moq-lite-06-wip".parse().unwrap()];
+	server_config.version = vec![version.parse().unwrap()];
 	let server = server_config.init(Default::default()).expect("init server");
 	let mut server = server.listen().await.expect("failed to listen");
 	let addr = server.local_addr().expect("local addr");
@@ -744,7 +894,7 @@ async fn broadcast_moq_lite_06_announce_lifecycle() {
 
 	let mut client_config = moq_tokio::connect::Config::default();
 	client_config.tls.insecure = Some(true);
-	client_config.version = vec!["moq-lite-06-wip".parse().unwrap()];
+	client_config.version = vec![version.parse().unwrap()];
 	let client = client_config.init(Default::default()).expect("init client");
 	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
 
@@ -764,48 +914,48 @@ async fn broadcast_moq_lite_06_announce_lifecycle() {
 
 	// The initial set: "first" was announced before the session existed.
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "first");
+	assert_eq!(update.prefix.as_str(), "room/first");
 	assert!(update.kind.is_active(), "expected initial announce");
 
 	// A live announce after the initial set.
-	let second = pub_origin.create_broadcast("second").expect("create broadcast");
+	let second = pub_origin.create_broadcast("room/second").expect("create broadcast");
 	second.announce(Default::default()).expect("create broadcast");
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "second");
+	assert_eq!(update.prefix.as_str(), "room/second");
 	assert!(update.kind.is_active(), "expected live announce");
 
 	// Unannounce: retracted by announce id on the wire. Dropping the announcement
 	// retracts the route; the broadcast's own end is independent.
-	second.finish();
+	second.close();
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "second");
+	assert_eq!(update.prefix.as_str(), "room/second");
 	assert!(!update.kind.is_active(), "expected retraction");
 
 	// Re-announce the same path: a fresh announce assigning a fresh id.
-	let _second = pub_origin.create_broadcast("second").expect("create broadcast");
+	let _second = pub_origin.create_broadcast("room/second").expect("create broadcast");
 	_second.announce(Default::default()).expect("create broadcast");
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "second");
+	assert_eq!(update.prefix.as_str(), "room/second");
 	assert!(update.kind.is_active(), "expected re-announce");
 
 	// Replace the route at "first": retract the original (retiring its announce
 	// id on the wire), then announce the same path again (assigning a fresh id).
 	// Await the retraction first so the events cannot coalesce away.
-	first.finish();
+	first.close();
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "first");
+	assert_eq!(update.prefix.as_str(), "room/first");
 	assert!(!update.kind.is_active(), "expected the replaced retraction");
-	let _replacement = pub_origin.create_broadcast("first").expect("create replacement");
+	let _replacement = pub_origin.create_broadcast("room/first").expect("create replacement");
 	_replacement.announce(Default::default()).expect("create replacement");
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "first");
+	assert_eq!(update.prefix.as_str(), "room/first");
 	assert!(update.kind.is_active(), "expected the replacement announce");
 
 	// A sentinel proves no stray event for "first" snuck in behind the replacement.
-	let _sentinel = pub_origin.create_broadcast("sentinel").expect("create broadcast");
+	let _sentinel = pub_origin.create_broadcast("room/sentinel").expect("create broadcast");
 	_sentinel.announce(Default::default()).expect("create broadcast");
 	let update = next_announce(&mut announcements).await;
-	assert_eq!(update.prefix.as_str(), "sentinel");
+	assert_eq!(update.prefix.as_str(), "room/sentinel");
 	assert!(update.kind.is_active(), "expected sentinel announce");
 
 	drop(connection);
@@ -994,6 +1144,267 @@ async fn broadcast_route_migration() {
 	handle_b.await.expect("server b panicked").expect("server b failed");
 }
 
+/// A subscriber returning to a parked track is not handed the parked cache when the
+/// upstream resolves its start past it: lite-06+ resolves the start from the budget, and
+/// an IETF live join starts at the group SUBSCRIBE_OK names as Largest.
+///
+/// The front keeps what an unread track delivered as a warm cache. While parked, the
+/// publisher moved on, so the resumed upstream subscription starts well past that cache.
+/// The cache was only fresh against its own frozen edge; serving it first put a
+/// rejoining player seconds behind live.
+///
+/// Pre-06 lite is skipped: nothing on those wires says where a subscription starts.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_rejoin_skips_a_stale_warm_cache() {
+	let pre06 = [
+		"moq-lite-01",
+		"moq-lite-02",
+		"moq-lite-03",
+		"moq-lite-04",
+		"moq-lite-05",
+	];
+	for version in moq_net::Version::names().filter(|version| !pre06.contains(version)) {
+		rejoin_skips_a_stale_warm_cache(version).await;
+	}
+}
+
+async fn rejoin_skips_a_stale_warm_cache(version: &str) {
+	use moq_net::Timestamp;
+
+	let ms = |ms: u64| Timestamp::from_millis(ms).unwrap();
+	let write = |track: &moq_net::track::Producer, sequence: u64, at: u64| {
+		let mut group = track
+			.create_group(moq_net::group::Info { sequence })
+			.expect("create group");
+		group.write_frame(ms(at), b"frame".as_ref()).expect("write frame");
+		group.finish().expect("finish group");
+	};
+
+	let pub_origin = moq_tokio::origin::spawn();
+	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
+	broadcast.announce(Default::default()).expect("announce");
+	let track = broadcast.create_track("audio", None).expect("create track");
+	let live = track.clone();
+	for sequence in 0..4u64 {
+		write(&track, sequence, sequence * 20);
+	}
+
+	let mut config = moq_tokio::listen::Config::default();
+	config.bind = Some("[::]:0".parse().unwrap());
+	config.tls.generate = vec!["localhost".into()];
+	config.version = vec![version.parse().unwrap()];
+	let mut server = config
+		.init(Default::default())
+		.expect("init server")
+		.listen()
+		.await
+		.expect("listen");
+	let addr = server.local_addr().expect("local addr");
+	let server = tokio::spawn(async move {
+		let request = server.accept().await.expect("accept");
+		let session = request.with_publisher(&pub_origin).ok().await?;
+		let _broadcast = broadcast;
+		let _track = track;
+		let _ = session.closed().await;
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let sub_origin = moq_tokio::origin::spawn();
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(true);
+	config.version = vec![version.parse().unwrap()];
+	let client = config.init(Default::default()).expect("init client");
+	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
+	let (_client, session) = tokio::time::timeout(TIMEOUT, connect_once(client.with_subscriber(sub_origin), url))
+		.await
+		.expect("connect timeout")
+		.expect("connect failed");
+
+	assert!(next_announce(&mut announcements).await.kind.is_active());
+	let remote = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timeout")
+		.expect("broadcast resolves");
+	let budget = moq_net::track::Subscription::default().with_max_age(Duration::from_millis(100));
+	async fn recv(sub: &mut moq_net::track::Subscriber) -> u64 {
+		tokio::time::timeout(TIMEOUT, sub.recv_group())
+			.await
+			.expect("recv timeout")
+			.expect("recv failed")
+			.expect("track ended")
+			.sequence
+	}
+
+	let mut sub = remote
+		.track("audio")
+		.unwrap()
+		.subscribe(budget.clone())
+		.await
+		.expect("subscribe");
+	recv(&mut sub).await;
+	drop(sub);
+
+	// The front parks the track and cancels upstream, while the publisher moves on.
+	tokio::time::timeout(TIMEOUT, live.unused())
+		.await
+		.expect("upstream never canceled")
+		.expect("track open");
+	for sequence in 4..=20u64 {
+		write(&live, sequence, 10_000 + (sequence - 4) * 20);
+	}
+
+	let mut sub = remote
+		.track("audio")
+		.unwrap()
+		.subscribe(budget)
+		.await
+		.expect("resubscribe");
+	let first = recv(&mut sub).await;
+	assert!(
+		first > 4,
+		"{version}: a rejoining reader was served the stale cache first: group {first}"
+	);
+	let mut sequence = first;
+	while sequence < 20 {
+		sequence = recv(&mut sub).await;
+		assert!(
+			sequence >= 4,
+			"{version}: a rejoining reader was served stale group {sequence}"
+		);
+	}
+
+	drop(sub);
+	drop(session);
+	server.await.expect("server panicked").expect("server failed");
+}
+
+/// A subscriber returning to a parked track whose newest group is still current gets it
+/// back, then the live feed resumes: the re-splice asks for that group's tail, which the
+/// publisher answers at once. Asking past it would wait for a group that a quiet track (a
+/// catalog) may never send. Covers a finished newest group (a catalog) and one that stays
+/// open (a JSON log appending frames to group 0), on every version.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_rejoin_replays_a_current_warm_cache() {
+	for version in moq_net::Version::names() {
+		for open in [false, true] {
+			rejoin_replays_a_current_warm_cache(version, open).await;
+		}
+	}
+}
+
+async fn rejoin_replays_a_current_warm_cache(version: &str, open: bool) {
+	let pub_origin = moq_tokio::origin::spawn();
+	let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
+	broadcast.announce(Default::default()).expect("announce");
+	let track = broadcast.create_track("catalog.json", None).expect("create track");
+	let live = track.clone();
+	let mut group = live.append_group().expect("append group");
+	group
+		.write_frame(moq_net::Timestamp::ZERO, b"v0".as_ref())
+		.expect("write frame");
+	if !open {
+		group.finish().expect("finish group");
+	}
+
+	let mut config = moq_tokio::listen::Config::default();
+	config.bind = Some("[::]:0".parse().unwrap());
+	config.tls.generate = vec!["localhost".into()];
+	config.version = vec![version.parse().unwrap()];
+	let mut server = config
+		.init(Default::default())
+		.expect("init server")
+		.listen()
+		.await
+		.expect("listen");
+	let addr = server.local_addr().expect("local addr");
+	let server = tokio::spawn(async move {
+		let request = server.accept().await.expect("accept");
+		let session = request.with_publisher(&pub_origin).ok().await?;
+		let _broadcast = broadcast;
+		let _track = track;
+		let _ = session.closed().await;
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let sub_origin = moq_tokio::origin::spawn();
+	let sub_consumer = sub_origin.consume();
+	let mut announcements = sub_consumer.announced();
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(true);
+	config.version = vec![version.parse().unwrap()];
+	let client = config.init(Default::default()).expect("init client");
+	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
+	let (_client, session) = tokio::time::timeout(TIMEOUT, connect_once(client.with_subscriber(sub_origin), url))
+		.await
+		.expect("connect timeout")
+		.expect("connect failed");
+
+	assert!(next_announce(&mut announcements).await.kind.is_active());
+	let remote = tokio::time::timeout(TIMEOUT, sub_consumer.request_broadcast("test"))
+		.await
+		.expect("request timeout")
+		.expect("broadcast resolves");
+
+	async fn recv(sub: &mut moq_net::track::Subscriber, ctx: &str) -> moq_net::group::Consumer {
+		tokio::time::timeout(TIMEOUT, sub.recv_group())
+			.await
+			.unwrap_or_else(|_| panic!("{ctx}: recv_group timeout"))
+			.expect("recv_group failed")
+			.expect("track closed")
+	}
+	async fn read(group: &mut moq_net::group::Consumer, ctx: &str) -> String {
+		let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.unwrap_or_else(|_| panic!("{ctx}: read_frame timeout"))
+			.expect("read_frame failed")
+			.expect("group ended");
+		String::from_utf8(frame.payload.to_vec()).unwrap()
+	}
+
+	for round in 1..=3 {
+		let ctx = format!("{version} open={open} round {round}");
+		let update = format!("v{round}");
+		let mut sub = remote
+			.track("catalog.json")
+			.unwrap()
+			.subscribe(None)
+			.await
+			.expect("subscribe");
+		let mut reading = recv(&mut sub, &ctx).await;
+		if open {
+			for frame in 0..round {
+				assert_eq!(read(&mut reading, &ctx).await, format!("v{frame}"), "{ctx}");
+			}
+			group
+				.write_frame(moq_net::Timestamp::ZERO, update.as_bytes())
+				.expect("write frame");
+		} else {
+			assert_eq!(read(&mut reading, &ctx).await, format!("v{}", round - 1), "{ctx}");
+			let mut next = live.append_group().expect("append group");
+			next.write_frame(moq_net::Timestamp::ZERO, update.as_bytes())
+				.expect("write frame");
+			next.finish().expect("finish group");
+			reading = recv(&mut sub, &ctx).await;
+		}
+		// The live feed resumed behind the replayed cache.
+		assert_eq!(read(&mut reading, &ctx).await, update, "{ctx}");
+		drop(reading);
+		drop(sub);
+		// The front parks the track and cancels upstream before the next round rejoins.
+		tokio::time::timeout(TIMEOUT, live.unused())
+			.await
+			.unwrap_or_else(|_| panic!("{ctx}: upstream never canceled"))
+			.expect("track open");
+	}
+
+	drop(session);
+	server.await.expect("server panicked").expect("server failed");
+}
+
 /// A publisher-side route update re-advertises downstream as a restart.
 ///
 /// The publisher re-prices its announced route with a longer chain; the
@@ -1110,18 +1521,18 @@ async fn route_reannounce_test(version: Option<&str>) {
 	handle.await.expect("server panicked").expect("server failed");
 }
 
-/// Route re-advertisement on the default version (lite-05: a duplicate ANNOUNCE).
+/// Route re-advertisement on the default version (lite-06: ANNOUNCE_RESTART by id).
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_route_reannounce() {
 	route_reannounce_test(None).await;
 }
 
-/// Route re-advertisement on lite-06 (an explicit ANNOUNCE_RESTART by id).
+/// Route re-advertisement on the opt-in lite-07-wip (an explicit ANNOUNCE_RESTART by id).
 #[tracing_test::traced_test]
 #[tokio::test]
-async fn broadcast_route_reannounce_lite_06() {
-	route_reannounce_test(Some("moq-lite-06-wip")).await;
+async fn broadcast_route_reannounce_lite_07() {
+	route_reannounce_test(Some("moq-lite-07-wip")).await;
 }
 
 // ── Raw QUIC (moqt://) – same version on both sides ─────────────────
@@ -1147,7 +1558,13 @@ async fn broadcast_moq_lite_03() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_moq_lite_06() {
-	broadcast_test("moqt", Some("moq-lite-06-wip"), Some("moq-lite-06-wip")).await;
+	broadcast_test("moqt", Some("moq-lite-06"), Some("moq-lite-06")).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn broadcast_moq_lite_07() {
+	broadcast_test("moqt", Some("moq-lite-07-wip"), Some("moq-lite-07-wip")).await;
 }
 
 #[tracing_test::traced_test]
@@ -1871,13 +2288,13 @@ async fn broadcast_websocket_fallback() {
 ///
 /// Bump this whenever [`moq_net::Versions::all`] gains a newer Lite variant
 /// so the regression tests below keep tracking "the newest", not a frozen value.
-/// Work-in-progress versions (e.g. `moq-lite-06-wip`) are excluded from the default
+/// Work-in-progress versions (e.g. `moq-lite-07-wip`) are excluded from the default
 /// set, so they don't count as "the newest" here until promoted.
-const NEWEST_LITE: &str = "moq-lite-05";
+const NEWEST_LITE: &str = "moq-lite-06";
 
 /// Regression guard for the WebSocket ALPN path. Lite02 over WebSocket means
 /// the qmux subprotocol negotiation produced a bare `moql` (or no match)
-/// instead of `moq-lite-04`, which falls through to legacy SETUP negotiation
+/// instead of the newest lite ALPN, which falls through to legacy SETUP negotiation
 /// and picks Lite02. This test fails immediately if that happens.
 #[tracing_test::traced_test]
 #[tokio::test]
@@ -2476,61 +2893,6 @@ async fn reconnect_stops_on_websocket_unauthorized() {
 		.expect("server task failed");
 }
 
-/// A WebTransport-only endpoint answers the WebSocket fallback with 403 while the
-/// QUIC dial is still in flight. One transport being refused is not the connect's
-/// verdict: QUIC finishes the race and the session comes up.
-#[tracing_test::traced_test]
-#[tokio::test]
-async fn websocket_forbidden_does_not_end_a_quic_connect() {
-	use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-	let (mut server, addr) = test_server().await;
-
-	// The same port over TCP, where the fallback dials.
-	let listener = tokio::net::TcpListener::bind(("::", addr.port()))
-		.await
-		.expect("failed to bind TCP listener");
-	let forbid = tokio::spawn(async move {
-		let (mut stream, _) = listener.accept().await?;
-		let mut buf = [0; 1024];
-		let _ = stream.read(&mut buf).await?;
-		stream
-			.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			.await?;
-		Ok::<_, anyhow::Error>(())
-	});
-
-	let pub_origin = moq_tokio::origin::spawn();
-	let server_handle = tokio::spawn(async move {
-		let request = server.accept().await.expect("no incoming connection");
-		let session = request.with_publisher(&pub_origin).ok().await?;
-		session.closed().await;
-		Ok::<_, anyhow::Error>(())
-	});
-
-	let mut client_config = moq_tokio::connect::Config::default();
-	client_config.tls.insecure = Some(true);
-	// No head start, so the 403 lands before the QUIC handshake completes.
-	client_config.websocket.delay = Duration::ZERO;
-	let client = client_config.init(Default::default()).expect("failed to init client");
-	// http:// dials QUIC as https:// and the fallback as plain ws://, which the listener
-	// above can answer without TLS.
-	let url: url::Url = format!("http://localhost:{}", addr.port()).parse().unwrap();
-
-	let (_client, connection) = tokio::time::timeout(TIMEOUT, connect_once(client, url))
-		.await
-		.expect("client connect timed out")
-		.expect("a fallback refused on auth must not end a connect whose QUIC arm succeeds");
-
-	drop(connection);
-	server_handle
-		.await
-		.expect("server task panicked")
-		.expect("server task failed");
-	// QUIC may win before the fallback ever dials, leaving the listener waiting.
-	forbid.abort();
-}
-
 /// A GOAWAY ends a one-shot connection instead of being ignored.
 ///
 /// The peer here sends a GOAWAY naming no deadline and then waits, which is the
@@ -2911,14 +3273,14 @@ async fn broadcast_wildcard_scopes_lite_05() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_wildcard_scopes_lite_06() {
-	wildcard_scope_test("moq-lite-06-wip", "room/alice/**").await;
+	wildcard_scope_test("moq-lite-06", "room/alice/**").await;
 }
 
 /// A leading-wildcard server grant still filters literal prefix announcements.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn broadcast_wildcard_server_scope_lite_06() {
-	wildcard_scope_test("moq-lite-06-wip", "*/alice/chat").await;
+	wildcard_scope_test("moq-lite-06", "*/alice/chat").await;
 }
 
 /// Older wires use the same literal-head interest and local filtering.
@@ -3184,16 +3546,16 @@ async fn goaway_test(scheme: &str, version: &str, expect_wire_timeout: bool) {
 		.await
 		.expect("goaway timed out")
 		.expect("session closed before GOAWAY");
-	assert_eq!(&*goaway.uri, "https://elsewhere.example/");
+	assert_eq!(goaway.uri(), "https://elsewhere.example/");
 	assert!(draining.peek().is_some());
 	if expect_wire_timeout {
 		assert_eq!(
-			goaway.timeout,
+			goaway.timeout(),
 			Some(Duration::from_secs(5)),
 			"draft-17+ carries the deadline"
 		);
 	} else {
-		assert_eq!(goaway.timeout, None, "no wire timeout on this version");
+		assert_eq!(goaway.timeout(), None, "no wire timeout on this version");
 	}
 
 	// Honor the GOAWAY: leave, letting the server's drain complete cleanly.
@@ -3277,7 +3639,7 @@ async fn goaway_timeout_force_close_moq_transport_19_quic() {
 		.await
 		.expect("goaway timed out")
 		.expect("session closed before GOAWAY");
-	assert_eq!(goaway.timeout, Some(Duration::from_millis(200)));
+	assert_eq!(goaway.timeout(), Some(Duration::from_millis(200)));
 
 	// The server force-closes after the 200ms deadline. Assert the enforcement:
 	// the session ends promptly despite the client overstaying. The close

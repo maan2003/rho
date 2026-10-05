@@ -17,7 +17,6 @@ pub struct UiAgentState {
     pub status: UiAgentStatus,
     /// Latest ephemeral runtime snapshot; absent when disconnected.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
-    pub awaiting_human: Option<UnixMs>,
     /// Tokens occupying the model's context window after the latest
     /// response; `None` until the agent's first response.
     pub context_used: Option<u64>,
@@ -44,6 +43,10 @@ pub struct UiAgentUsage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "blocks are already shared behind Arc; boxing tools adds another allocation"
+)]
 pub enum UiBlock {
     UserMessage {
         text: String,
@@ -110,39 +113,6 @@ pub enum UiAgentStatus {
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
-    /// The agent host is not streaming to this client, and a turn was running
-    /// when it last heard. Retained transcript content is still displayed
-    /// and is no longer being updated.
-    ///
-    /// Only the mirror produces this, and only for a turn it saw running, so
-    /// [`crate::store::turn_open`] treats it as an open turn. A settled agent
-    /// read back from the story is `Idle`; do not widen this variant to cover
-    /// one without moving that decision with it.
-    Unloaded,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiToolMetadata {
-    ApplyPatch(UiApplyPatchMetadata),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiApplyPatchMetadata {
-    pub changes: Vec<UiToolFileChange>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiToolFileChange {
-    pub path: String,
-    pub status: UiToolFileStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiToolFileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Moved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -156,7 +126,6 @@ pub struct UiTool {
     pub error: Option<String>,
     pub started_at: Option<UnixMs>,
     pub finished_at: Option<UnixMs>,
-    pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
     pub timing: rho_agent_types::ExecTiming,
     /// Whether `arguments` is JSON or the raw text the model wrote. A text

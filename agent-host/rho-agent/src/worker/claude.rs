@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_agent_types::transcript::{ContextBlock, ContextItemEvent, PendingInferenceResponse};
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, SendKind};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -152,8 +152,6 @@ impl ClaudeAgent {
         self.status.read().expect("poison").clone()
     }
 
-    /// The record as of the loop's last change to it.
-
     /// A user message carried the pending notice: it is not said again.
     /// The log agrees once the message's row is in it.
     pub fn notice_carried(&self) {
@@ -235,16 +233,6 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("agent loop is closed"))?
     }
 
-    pub async fn set_effort(&self, effort: Effort) -> anyhow::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control
-            .send(ClaudeControl::SetEffort { effort, reply })
-            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
-    }
-
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -295,10 +283,6 @@ enum ClaudeControl {
         uuid: String,
         accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
         source: InputSource,
-    },
-    SetEffort {
-        effort: Effort,
-        reply: oneshot::Sender<anyhow::Result<()>>,
     },
     ChangeRole {
         role: AgentRole,
@@ -852,30 +836,15 @@ impl ClaudeLoop {
                 self.published();
                 stream_dirty = false;
             }
-            let started = !initial_runtime.is_working() && current.is_working();
             let settled = (initial_runtime.is_working() && !current.is_working())
                 || (self.execution_generation != initial_execution_generation
                     && !current.is_working());
-            if started {
-                self.host
-                    .turn(
-                        rho_agent_types::UnixMs::now(),
-                        rho_agent_types::TurnEdge::Started,
-                    )
-                    .await?;
-            } else if settled {
-                let outcome = match &current.inference {
-                    InferenceState::Failed { error } => rho_agent_types::TurnOutcome::Errored {
-                        message: error.clone(),
-                    },
-                    _ => rho_agent_types::TurnOutcome::Completed,
-                };
-                self.host
-                    .turn(
-                        rho_agent_types::UnixMs::now(),
-                        rho_agent_types::TurnEdge::Ended(outcome),
-                    )
-                    .await?;
+            if settled && let InferenceState::Failed { error } = &current.inference {
+                self.entry(Entry::Notice {
+                    at: rho_agent_types::UnixMs::now(),
+                    notice: Notice::Stopped(error.clone()),
+                })
+                .await?;
             }
             if settled {
                 self.host.settled().await?;
@@ -895,8 +864,9 @@ impl ClaudeLoop {
                             .is_none_or(python_host::PythonHost::retire_settled))
                 {
                     let _ = reply.send(Ok(()));
-                    // Freeze scheduling and admission at this serialized boundary.
-                    // The outer driver cancels this future on agent host disconnect.
+                    // Freeze scheduling and admission at this serialized
+                    // boundary. The outer driver cancels
+                    // this future on agent host disconnect.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));
@@ -979,10 +949,10 @@ impl ClaudeLoop {
                     content = combined;
                 }
                 self.cancelling = false;
-                if matches!(source, InputSource::Human(_)) {
-                    if let Some(host) = &mut self.python {
-                        host.user_spoke();
-                    }
+                if matches!(source, InputSource::Human(_))
+                    && let Some(host) = &mut self.python
+                {
+                    host.user_spoke();
                 }
                 let busy = matches!(self.state.kind, InferenceState::Responding);
                 if !busy {
@@ -1082,13 +1052,6 @@ impl ClaudeLoop {
                     }
                 }
             }
-            ClaudeControl::SetEffort { effort, reply } => {
-                let result = self.set_effort(effort).await;
-                if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
-                    return result;
-                }
-                let _ = reply.send(result);
-            }
             ClaudeControl::ChangeRole { role, reply } => {
                 let result = self.change_role(role).await;
                 if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
@@ -1156,7 +1119,7 @@ impl ClaudeLoop {
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
         let at = rho_agent_types::UnixMs::now();
         match outbound {
-            Outbound::Send { cell, text } => {
+            Outbound::Send { cell, text, kind } => {
                 if self.python.as_mut().is_some_and(|python| python.sent(cell)) {
                     self.draft = None;
                 }
@@ -1171,19 +1134,19 @@ impl ClaudeLoop {
                     id: MessageId::new(),
                     to,
                     text: text.clone(),
+                    kind,
                 })
                 .await?;
-                self.host.message_sent(text).await?;
+                // A status is the agent's line, not mail for a subscriber.
+                if kind != SendKind::Status {
+                    self.host.message_sent(text).await?;
+                }
             }
-            Outbound::Status(text) => self.entry(Entry::Status { at, text }).await?,
             Outbound::EndTurn if !self.archived => {
                 if let Some(python) = self.python.as_mut() {
                     python.end_turn();
                 }
-                if !self.awaiting {
-                    self.awaiting = true;
-                    self.entry(Entry::AwaitingHuman { at }).await?;
-                }
+                self.awaiting = true;
             }
             Outbound::EndTurn => {}
             Outbound::Archive => {
@@ -1231,10 +1194,7 @@ impl ClaudeLoop {
                         compact: false,
                     }).await?;
                 }
-                if self.awaiting {
-                    self.awaiting = false;
-                    self.entry(Entry::StoppedAwaitingHuman { at }).await?;
-                }
+                self.awaiting = false;
                 self.python_recheck = None;
                 self.queued_turns.clear();
                 self.state.queued_inputs.clear();
@@ -1371,17 +1331,6 @@ impl ClaudeLoop {
                 return Ok(());
             }
         }
-    }
-
-    async fn set_effort(&mut self, effort: Effort) -> anyhow::Result<()> {
-        self.effort = effort;
-        let Some(process) = self.process.as_mut() else {
-            return Ok(());
-        };
-        let request_id = process.apply_effort(effort).await?;
-        self.await_control_response(request_id, "Claude Code rejected effort update")
-            .await?;
-        Ok(())
     }
 
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
@@ -1619,7 +1568,7 @@ impl ClaudeLoop {
         let mut options =
             ClaudeCodeOptions::new(cwd.clone(), self.model, self.effort, self.session_id);
         options.session = session;
-        options.set_env("RHO_AGENT_ID", self.agent_id.encoded());
+        options.set_env("RHO_AGENT_ID", self.role.full_handle(self.agent_id));
         self.ensure_python().await?;
         // Tool search would defer the one tool behind a lookup; the deny
         // list in the generated settings removes ToolSearch too. The
@@ -1831,11 +1780,12 @@ impl ClaudeLoop {
                     self.response_id = None;
                     self.set_kind(InferenceState::Idle);
                 } else if message.is_error {
-                    self.fail(anyhow::anyhow!("{}", message.errors.join("\n")))
+                    self.fail(anyhow::anyhow!("{}", message.failure_message()))
                         .await?;
                 } else {
-                    // CLI result prose is provider output, not a message to the human.
-                    // Queued sends run next inside the CLI: staying in the
+                    // CLI result prose is provider output, not a message to the
+                    // human. Queued sends run next inside
+                    // the CLI: staying in the
                     // streaming state avoids a false turn end between them.
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
@@ -2068,8 +2018,9 @@ impl ClaudeLoop {
                         )
                         .await?;
                     } else {
-                        // The outbox survives both this process and the notebook. A
-                        // future user send carries its output, never reruns its source.
+                        // The outbox survives both this process and the
+                        // notebook. A future user send
+                        // carries its output, never reruns its source.
                         self.close_process().await?;
                         self.fail(anyhow::anyhow!(
                             "Claude Code output transport failed; notebook output is retained"
@@ -2753,13 +2704,13 @@ enum ClaudeLoopEvent {
 /// not run. Only messages accepted *while archived* could not have reached
 /// Claude: there was no process. An unechoed active send is acknowledged as
 /// uncertain rather than resent, so the UI cannot leave a phantom queue.
-fn recover_receipts(
-    entries: impl IntoIterator<Item = Entry>,
-) -> (
+type RecoveredReceipts = (
     bool,
     Vec<(rho_agent_types::UnixMs, MessageId, AgentId, Vec<Block>)>,
     Vec<MessageId>,
-) {
+);
+
+fn recover_receipts(entries: impl IntoIterator<Item = Entry>) -> RecoveredReceipts {
     let mut archived_since = None;
     let mut received = Vec::new();
     let mut accounted = HashSet::new();
@@ -2875,6 +2826,78 @@ fn write_generated_source(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn quota_failure_reaches_live_status_and_the_persisted_failure() {
+        use crate::db::{AgentProfileWriteTxnExt as _, AgentWriteTxnExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent_id = write.alloc_agent_id();
+        let role = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium1,
+        };
+        write.create_agent(
+            rho_agent_types::UnixMs(1),
+            agent_id,
+            None,
+            crate::db::tests::test_workspace(),
+            role,
+            role.session_profile(),
+            AgentRuntime::Claude {
+                session_id: Uuid::new_v4(),
+            },
+            crate::log::AgentOrigin::User,
+        );
+        write.commit();
+        let host = crate::testing::services_pair(
+            db.clone(),
+            crate::inference::testing::accounts(),
+            agent_id,
+            std::sync::Weak::new(),
+        );
+        let cwd = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            rho_claude::accounts::ClaudePaths::at(cwd.join("claude")),
+            cwd,
+        )
+        .await
+        .unwrap();
+        let explanation = "You've hit your session limit · resets 5:30pm (UTC)";
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": explanation
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.status().runtime.inference,
+            InferenceState::Failed {
+                error: explanation.to_owned(),
+            }
+        );
+        assert!(
+            host.history()
+                .await
+                .unwrap()
+                .1
+                .into_iter()
+                .any(|(_, event)| matches!(
+                    event,
+                    AgentEvent::Failed { error, .. } if error == explanation
+                ))
+        );
+    }
+
     #[test]
     fn streamed_exec_draft_keeps_its_call_identity_after_source_completes() {
         let mut items = BTreeMap::new();
@@ -2969,7 +2992,6 @@ mod tests {
         let notify = Arc::new(tokio::sync::Notify::new());
         let notebook = rho_notebook::Notebook::new(
             rho_tool_shell::ShellTools::in_directory(
-                Duration::from_secs(5),
                 temp.path().to_str().unwrap().into(),
                 Default::default(),
             ),

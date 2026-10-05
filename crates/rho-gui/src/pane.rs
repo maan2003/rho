@@ -72,10 +72,3 @@ pub enum SurfaceKey {
         title: String,
     },
 }
-
-impl SurfaceKey {
-    /// Conversation content, as opposed to an explicitly opened artifact.
-    pub fn is_conversation(&self) -> bool {
-        matches!(self, SurfaceKey::Draft | SurfaceKey::Transcript(_))
-    }
-}

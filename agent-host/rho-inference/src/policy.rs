@@ -40,7 +40,8 @@ struct Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         // Once published, even an abandoned request owns its credit until the
-        // agent host replies. Caller cancellation must not let bursts bypass admission.
+        // agent host replies. Caller cancellation must not let bursts bypass
+        // admission.
         if !self.published {
             self.replies.lock().expect("poison").calls.remove(&self.id);
         }
@@ -365,7 +366,8 @@ mod tests {
                 .is_err()
         );
 
-        // A late reply, not caller cancellation, allows exactly one new request.
+        // A late reply, not caller cancellation, allows exactly one new
+        // request.
         server
             .write_policy(&Message::Reply {
                 id: ids[0],

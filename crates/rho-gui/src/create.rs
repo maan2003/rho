@@ -69,7 +69,9 @@ impl Workspace {
             match view.update(cx, |view, cx| view.cursor_target(cx)) {
                 crate::home::HomeTarget::Card(node) => return Some(node),
                 crate::home::HomeTarget::Agent(agent_id) => return Some(NodeId::Agent(agent_id)),
-                crate::home::HomeTarget::Pile(_) | crate::home::HomeTarget::None => {}
+                crate::home::HomeTarget::Recent
+                | crate::home::HomeTarget::Pile(_)
+                | crate::home::HomeTarget::None => {}
             }
         }
         self.surface_node(cx)

@@ -1028,7 +1028,7 @@ impl Workspace {
     ) {
         let confirm = confirmation.confirm.clone();
         let deny = confirmation.deny.clone();
-        let choices = vec![
+        let choices = [
             Candidate {
                 value: confirm.clone(),
                 description: "confirm".to_owned(),
@@ -2621,7 +2621,7 @@ impl Workspace {
             .as_str()
             .unwrap_or("app modal")
             .to_owned();
-        let choices = vec![
+        let choices = [
             Candidate {
                 value: submit.clone(),
                 description: "send to app".to_owned(),
@@ -2728,6 +2728,10 @@ impl Workspace {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the dialog continuation carries its state alongside the GPUI window/context"
+    )]
     fn prompt_slack_dialog(
         &mut self,
         dialog_id: String,
@@ -2882,7 +2886,7 @@ impl Workspace {
             .as_str()
             .unwrap_or("Submit")
             .to_owned();
-        let choices = vec![
+        let choices = [
             Candidate {
                 value: submit.clone(),
                 description: "send to app".to_owned(),
@@ -2968,7 +2972,7 @@ impl Workspace {
                     self.prompt_slack_select(
                         view.clone(),
                         rho_slack::ui::conversation::MessageInteraction {
-                            message: message.clone(),
+                            message: (**message).clone(),
                             action,
                         },
                         window,

@@ -232,12 +232,12 @@ fn env_flag(name: &str) -> bool {
 async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh::SecretKey> {
     let mut write = db.write().await;
     let mut table = write.open_table(IROH_SERVER_SECRET);
-    if let Some(secret) = table.get(&()) {
+    if let Some(secret) = table.get(()) {
         return Ok(iroh::SecretKey::from_bytes(secret.value()));
     }
 
     let secret = iroh::SecretKey::generate().to_bytes();
-    table.insert(&(), &secret);
+    table.insert((), &secret);
     drop(table);
     write.commit();
     Ok(iroh::SecretKey::from_bytes(&secret))
@@ -717,49 +717,6 @@ where
     Ok(Some((payload, allocation)))
 }
 
-/// Reads and decodes one bounded frame while retaining a caller-provided
-/// allocation reservation for the decoded value's lifetime.
-pub async fn read_frame_allocated<R, T, F, Fut, A>(
-    reader: &mut R,
-    max_len: usize,
-    reserve: F,
-) -> anyhow::Result<(T, A, usize)>
-where
-    R: AsyncRead + Unpin,
-    T: Unpacker,
-    F: FnOnce(usize) -> Fut,
-    Fut: Future<Output = A>,
-{
-    let (payload, allocation) = read_frame_with(reader, max_len, reserve).await?;
-    let len = payload.len();
-    let mut payload = payload.as_slice();
-    let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
-    anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok((value, allocation, len))
-}
-
-pub async fn read_frame_allocated_optional<R, T, F, Fut, A>(
-    reader: &mut R,
-    max_len: usize,
-    reserve: F,
-) -> anyhow::Result<Option<(T, A, usize)>>
-where
-    R: AsyncRead + Unpin,
-    T: Unpacker,
-    F: FnOnce(usize) -> Fut,
-    Fut: Future<Output = A>,
-{
-    let Some((payload, allocation)) = read_frame_with_optional(reader, max_len, reserve).await?
-    else {
-        return Ok(None);
-    };
-    let len = payload.len();
-    let mut payload = payload.as_slice();
-    let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
-    anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok(Some((value, allocation, len)))
-}
-
 /// Copies raw stream bytes while flushing every chunk and half-closing the
 /// destination at EOF. This is required when the destination is a streaming
 /// compressor and the byte protocol has request/response boundaries unknown
@@ -799,6 +756,33 @@ where
         copy_flush(&mut a_read, &mut b_write),
         copy_flush(&mut b_read, &mut a_write),
     )
+}
+
+/// Stream-scoped media routing on the existing authenticated connection.
+pub use moq_tokio::shared_iroh as media;
+
+/// Route a media stream or return an ordinary compressed application stream.
+/// Authentication must finish before this function is called.
+pub async fn accept_iroh_stream(
+    media: &media::Mux,
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> anyhow::Result<Option<(Reader, iroh::endpoint::SendStream)>> {
+    tokio::time::timeout(PREFACE_TIMEOUT, async {
+        let mut prefix = [0; 1];
+        recv.read_exact(&mut prefix).await?;
+        if prefix[0] == media::PREFIX {
+            media.route_bi(send, recv).await?;
+            return Ok(None);
+        }
+        anyhow::ensure!(prefix[0] == 0x28, "invalid RPC stream prefix");
+        Ok(Some((
+            Reader::new(std::io::Cursor::new(prefix).chain(recv)),
+            send,
+        )))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("application stream preface timed out"))?
 }
 
 #[cfg(test)]
@@ -991,31 +975,4 @@ mod tests {
             .unwrap();
         assert_eq!(read, 0);
     }
-}
-
-/// Stream-scoped media routing on the existing authenticated connection.
-pub use moq_tokio::shared_iroh as media;
-
-/// Route a media stream or return an ordinary compressed application stream.
-/// Authentication must finish before this function is called.
-pub async fn accept_iroh_stream(
-    media: &media::Mux,
-    send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-) -> anyhow::Result<Option<(Reader, iroh::endpoint::SendStream)>> {
-    tokio::time::timeout(PREFACE_TIMEOUT, async {
-        let mut prefix = [0; 1];
-        recv.read_exact(&mut prefix).await?;
-        if prefix[0] == media::PREFIX {
-            media.route_bi(send, recv).await?;
-            return Ok(None);
-        }
-        anyhow::ensure!(prefix[0] == 0x28, "invalid RPC stream prefix");
-        Ok(Some((
-            Reader::new(std::io::Cursor::new(prefix).chain(recv)),
-            send,
-        )))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("application stream preface timed out"))?
 }

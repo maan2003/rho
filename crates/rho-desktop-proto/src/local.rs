@@ -1,10 +1,10 @@
 //! Direct same-user local desktop access, including across mount namespaces.
 use std::os::linux::net::SocketAddrExt;
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::{MAX_HEADER, Request, Response, VERSION};
+use crate::{Request, Response, MAX_HEADER, VERSION};
 
 pub async fn connect(address: &str) -> Result<tokio::net::UnixStream> {
     let address = address.to_owned();

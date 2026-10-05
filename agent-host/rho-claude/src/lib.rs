@@ -25,7 +25,7 @@ pub use transcript::*;
 const DEFAULT_COMMAND: &str = "claude";
 #[allow(dead_code)]
 const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "320000";
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "390000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -122,6 +122,9 @@ impl ClaudeCodeOptions {
         // conflict with Rho's own git guidance; the github-workflow skill
         // owns that territory instead.
         command.env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1");
+        // Its nudge after quiet turns asks for a status Rho's own prompt
+        // already governs, so agents sent one per step.
+        command.env("CLAUDE_CODE_SILENT_TURN_REMINDER", "0");
         for (name, value) in &self.env {
             command.env(name, value);
         }
@@ -184,15 +187,6 @@ impl ClaudeCode {
             .await
     }
 
-    pub async fn send_user_message_with_uuid(
-        &mut self,
-        text: impl Into<String>,
-        uuid: String,
-    ) -> Result<()> {
-        self.write_message(&protocol::InputMessage::user_with_uuid(text, uuid))
-            .await
-    }
-
     pub async fn send_user_content_with_uuid(
         &mut self,
         content: Vec<rho_agent_types::ContentPart>,
@@ -216,16 +210,6 @@ impl ClaudeCode {
         self.write_message(&protocol::InputMessage::user_content_with_uuid(
             content, uuid,
         ))
-        .await
-    }
-
-    pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
-        self.write_control_request(serde_json::json!({
-                "subtype": "apply_flag_settings",
-                "settings": {
-                    "effortLevel": effort.as_arg(),
-                },
-        }))
         .await
     }
 
@@ -508,18 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_user_message_with_uuid() {
-        assert_eq!(
-            serde_json::to_value(protocol::InputMessage::user_with_uuid(
-                "hello",
-                "prompt-1".to_owned()
-            ))
-            .unwrap()["uuid"],
-            "prompt-1"
-        );
-    }
-
-    #[test]
     fn builds_user_message_with_base64_image() {
         let message = protocol::InputMessage::user_content_with_uuid(
             vec![
@@ -625,6 +597,56 @@ mod tests {
         assert_eq!(message.subtype, protocol::ResultSubtype::ErrorMaxTurns);
         assert!(message.is_error);
         assert_eq!(message.errors, ["too many turns"]);
+    }
+
+    #[test]
+    fn failed_results_preserve_api_and_cli_explanations() {
+        for (wire, expected) in [
+            // Claude reports quota failures as a successful CLI execution.
+            (
+                json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": "You've hit your session limit · resets 5:30pm (UTC)"
+                }),
+                "You've hit your session limit · resets 5:30pm (UTC)",
+            ),
+            (
+                json!({
+                    "subtype": "error_during_execution",
+                    "is_error": true,
+                    "errors": ["first failure", "second failure"],
+                    "result": "less specific result"
+                }),
+                "first failure\nsecond failure",
+            ),
+            (
+                json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "errors": [" ", ""],
+                    "result": "API unavailable"
+                }),
+                "API unavailable",
+            ),
+            (
+                json!({
+                    "subtype": "error_max_turns",
+                    "is_error": true,
+                    "errors": [],
+                    "result": " "
+                }),
+                "Claude Code reached its turn limit",
+            ),
+            (
+                json!({"subtype": "success", "is_error": true}),
+                "Claude Code reported an error without details",
+            ),
+        ] {
+            let message: protocol::ResultMessage = serde_json::from_value(wire).unwrap();
+            assert!(message.is_error);
+            assert_eq!(message.failure_message(), expected);
+        }
     }
 
     #[test]

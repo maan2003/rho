@@ -7,6 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.9](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.8...moq-mux-v0.10.9) - 2026-09-30
+
+### Added
+
+- *(srt)* select a program of a multi-program feed ([#4569](https://github.com/moq-dev/moq/pull/4569))
+- *(moq-mux)* estimate the catalog framerate ([#4576](https://github.com/moq-dev/moq/pull/4576))
+- *(cli)* linger export ts across a broadcast that leaves and returns ([#4504](https://github.com/moq-dev/moq/pull/4504))
+- *(ts)* import one program of a multiplex, or each as its own broadcast ([#4505](https://github.com/moq-dev/moq/pull/4505))
+- *(srt)* log the TS importer's per-stream counters on ingest ([#4506](https://github.com/moq-dev/moq/pull/4506))
+- *(mux)* report every TS elementary stream's access units and quiet time ([#4502](https://github.com/moq-dev/moq/pull/4502))
+
+### Fixed
+
+- *(moq-mux)* signal a new time base when the DTS reserve steps the PCR back ([#4574](https://github.com/moq-dev/moq/pull/4574))
+- *(mux)* publish the 48 kHz decoder rate for Opus imports ([#4443](https://github.com/moq-dev/moq/pull/4443))
+- *(mux)* follow the stream's reorder depth in TS export ([#4500](https://github.com/moq-dev/moq/pull/4500))
+- *(mux)* rebind single-track FLV export to a better rendition before the header ([#4445](https://github.com/moq-dev/moq/pull/4445))
+- *(mux)* LOC video groups end with the duration marker ([#4450](https://github.com/moq-dev/moq/pull/4450))
+
+## [0.10.8](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.7...moq-mux-v0.10.8) - 2026-09-27
+
+### Added
+
+- *(mux)* detect delay and jitter on JSON and binary tracks ([#4270](https://github.com/moq-dev/moq/pull/4270))
+
+### Fixed
+
+- *(fmp4)* carry Opus pre-skip and gain through dOps ([#4294](https://github.com/moq-dev/moq/pull/4294))
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.10.7](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.6...moq-mux-v0.10.7) - 2026-09-26
+
+### Added
+
+- *(mux)* forward importer discontinuities through publishers ([#4239](https://github.com/moq-dev/moq/pull/4239))
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+### Other
+
+- rename CLAUDE.md to AGENTS.md ([#4235](https://github.com/moq-dev/moq/pull/4235))
+
+## [0.10.6](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.5...moq-mux-v0.10.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, hang, moq-binary, moq-loc
+
+## [0.10.5](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.4...moq-mux-v0.10.5) - 2026-09-25
+
+### Added
+
+- *(ffi)* advertise JSON tracks in the catalog, add binary data tracks ([#4137](https://github.com/moq-dev/moq/pull/4137))
+
+### Fixed
+
+- *(audio)* honor and validate Opus stream descriptions ([#4130](https://github.com/moq-dev/moq/pull/4130))
+
+### Other
+
+- *(capture)* drive native capture through clock edge cases in CI ([#4125](https://github.com/moq-dev/moq/pull/4125))
+
+## [0.10.4](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.3...moq-mux-v0.10.4) - 2026-09-25
+
+### Added
+
+- *(libmoq)* advertise JSON tracks in the catalog, add binary data tracks ([#4073](https://github.com/moq-dev/moq/pull/4073))
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+### Fixed
+
+- *(moq-mux)* order TS export by media time, not arrival ([#4001](https://github.com/moq-dev/moq/pull/4001))
+
+## [0.10.3](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.2...moq-mux-v0.10.3) - 2026-09-25
+
+### Fixed
+
+- *(moq-mux)* every TS elementary stream re-anchors below the live edge ([#3997](https://github.com/moq-dev/moq/pull/3997))
+- *(net)* a broadcast exists only while announced ([#4021](https://github.com/moq-dev/moq/pull/4021))
+
+## [0.10.2](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.1...moq-mux-v0.10.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, moq-binary, moq-json, hang, moq-loc
+
+## [0.10.1](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.0...moq-mux-v0.10.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-json, hang
+
+## [0.10.0](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.16...moq-mux-v0.10.0) - 2026-09-23
+
+### Added
+
+- *(json)* edit a snapshot value through a closure ([#3889](https://github.com/moq-dev/moq/pull/3889))
+- *(moq-mux)* record the TS mux rate and pad export to it ([#3831](https://github.com/moq-dev/moq/pull/3831))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(net)* [**breaking**] one name per announce, request, and origin config concept ([#3725](https://github.com/moq-dev/moq/pull/3725))
+- *(json)* [**breaking**] Config means the same thing in json and binary ([#3718](https://github.com/moq-dev/moq/pull/3718))
+- *(hang)* [**breaking**] one continuous broadcast clock at the catalog root ([#3675](https://github.com/moq-dev/moq/pull/3675))
+- [**breaking**] refuse released spellings and drop unused deprecated APIs ([#3719](https://github.com/moq-dev/moq/pull/3719))
+- *(drafts)* specify the MPEG-TS catalog extension and carry it over MSF ([#3720](https://github.com/moq-dev/moq/pull/3720))
+- *(hang)* [**breaking**] timelines only move forward ([#3711](https://github.com/moq-dev/moq/pull/3711))
+
+### Fixed
+
+- *(moq-json)* a lost snapshot group is not fatal ([#3907](https://github.com/moq-dev/moq/pull/3907))
+- *(moq-mux)* keep a group's last frame duration at its own scale ([#3906](https://github.com/moq-dev/moq/pull/3906))
+- *(mux)* read the inline SI form every published moq-cli writes ([#3871](https://github.com/moq-dev/moq/pull/3871))
+- *(ci)* repair nightly and meta-review failures ([#3799](https://github.com/moq-dev/moq/pull/3799))
+
+### Other
+
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(quest)* complete the media release review ([#3878](https://github.com/moq-dev/moq/pull/3878))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- *(mux)* [**breaking**] share media rate policy ([#3840](https://github.com/moq-dev/moq/pull/3840))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- *(mux)* stop copies_share_one_epoch racing the clock ([#3752](https://github.com/moq-dev/moq/pull/3752))
+- Merge origin/main into dev
+- Merge origin/main into dev
+
 ### Changed
 
 - [**breaking**] One handle publishes a rendition. `catalog::Producer::{video,audio,text,track}` and

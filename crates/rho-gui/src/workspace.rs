@@ -867,9 +867,10 @@ impl Workspace {
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor
         });
-        // A menu owns its focused keys before GPUI resolves keybindings. In particular,
-        // Vim binds `g` as the prefix of several multi-stroke commands, so an ordinary
-        // `on_key_down` handler would not see a menu's one-stroke `g` until another key
+        // A menu owns its focused keys before GPUI resolves keybindings. In
+        // particular, Vim binds `g` as the prefix of several
+        // multi-stroke commands, so an ordinary `on_key_down` handler
+        // would not see a menu's one-stroke `g` until another key
         // arrived (or the prefix timer expired).
         let transient_keystroke_listener =
             cx.listener(|this, event: &gpui::KeystrokeEvent, window, cx| {
@@ -1407,47 +1408,53 @@ impl Workspace {
                     .map_or_else(|| registry.agent_id_label(agent_id), str::to_owned),
             )
         };
-        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, &name));
+        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, name));
+        // An agent already shown as a card above is not listed again.
+        let dealt = rows
+            .next
+            .iter()
+            .filter_map(|row| match row.card {
+                rho_dealer::NodeId::Agent(agent_id) => Some(agent_id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
         // An agent working for another agent belongs to it and is not the
         // reader's to watch; only the ones the reader manages are listed.
-        // Nor one the user put away. A running turn decides how loudly an
-        // agent may ask; a mute and a snooze decide whether it may ask at
-        // all, and neither is a cursor, so a turn starting does not take
-        // either back. This list read neither, which is why muting or
-        // snoozing a working agent did nothing a reader could see until
-        // the turn ended.
-        let running = self
+        // Nor one the user put away: a mute and a snooze are not cursors,
+        // and a list that ignored them would keep showing what the reader
+        // asked not to see.
+        let mut recent = self
             .registry
             .known_agents()
             .copied()
             .filter(|agent_id| {
-                self.registry.owned_by_user(*agent_id)
+                !dealt.contains(agent_id)
+                    && self.registry.owned_by_user(*agent_id)
                     && !self
                         .attention
                         .marks
                         .get(&rho_dealer::NodeId::Agent(*agent_id))
                         .facts()
                         .put_away(now)
-                    && {
-                        let facts = self.registry.agent_facts(*agent_id);
-                        facts
-                            .runtime
-                            .map_or(facts.turn_running, |activity| activity.is_busy())
-                    }
+            })
+            .filter_map(|agent_id| {
+                let sent = self.registry.agent_digest(agent_id)?.last_sent_at?;
+                Some((sent, agent_id))
             })
             .collect::<Vec<_>>();
-        // Sorted by what the row shows, or the order is of something the
-        // reader cannot see. Only the name: what it is doing is in the
-        // transcript, and Home says only that it is.
-        let mut running = running
+        recent.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        rows.recent = recent
             .into_iter()
-            .map(|agent_id| crate::home::RunningRow {
+            .take(crate::home::HOME_CAP)
+            .map(|(sent, agent_id)| crate::home::RecentRow {
                 agent_id,
                 name: name(agent_id),
+                label: format!(
+                    "{} ago",
+                    crate::home::elapsed_label(sent.0 as i64, now.as_millisecond())
+                ),
             })
-            .collect::<Vec<_>>();
-        running.sort_by(|a, b| a.name.cmp(&b.name));
-        rows.running = running;
+            .collect();
         let local = jiff::Zoned::now();
         rows.piles = self
             .attention
@@ -1481,6 +1488,10 @@ impl Workspace {
             // A running agent is not a card: its row opens the agent.
             crate::home::HomeTarget::Agent(agent_id) => {
                 self.select_agent_inner(Some(agent_id), true, window, cx);
+                return;
+            }
+            crate::home::HomeTarget::Recent => {
+                view.update(cx, |view, cx| view.toggle_recent(cx));
                 return;
             }
             crate::home::HomeTarget::Pile(name) => {
@@ -1812,16 +1823,25 @@ impl Workspace {
                     return;
                 }
                 for agent_id in &changed {
-                    let facts = self.registry.agent_facts(*agent_id);
+                    let digest = self.registry.agent_digest(*agent_id);
                     rho_journal::record(rho_journal::Event::AgentChanged {
                         agent: agent_id.encoded(),
                         title: self.registry.agent_display_label(*agent_id),
-                        turn_running: facts.turn_running,
-                        turn_started_at: facts.turn_started_at.map(|at| at.0),
-                        last_turn_ended: facts.last_turn_ended.map(|at| at.0),
-                        last_user_message_at: facts.last_user_message_at.0,
-                        needs_you: facts.needs_you_hint,
-                        errored: facts.errored,
+                        last_user_message_at: self
+                            .registry
+                            .agent_facts(*agent_id)
+                            .last_user_message_at
+                            .0,
+                        last_sent_at: digest.and_then(|digest| digest.last_sent_at).map(|at| at.0),
+                        unread: digest
+                            .and_then(|digest| {
+                                digest
+                                    .unread
+                                    .iter()
+                                    .map(|unread| unread.said)
+                                    .min_by_key(|said| said.strength())
+                            })
+                            .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
                 // Their marks go with them: an agent that just arrived may
@@ -1831,7 +1851,8 @@ impl Workspace {
                     self.show_status(*agent_id, cx);
                 }
                 self.invalidate_dealer_signals(cx);
-                // Status is workspace chrome, not part of the transcript editor.
+                // Status is workspace chrome, not part of the transcript
+                // editor.
                 if matches!(
                     self.active_surface().key,
                     SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if changed.contains(&id)
@@ -1896,14 +1917,14 @@ impl Workspace {
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
-            if let TranscriptFrame::Live(
-                rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
-            ) = &frame
+            if let TranscriptFrame::Live(rho_agents_client::protocol::transcript::Live::Snapshot {
+                state,
+                ..
+            }) = &frame
+                && self.registry.set_runtime(agent_id, state.clone())
             {
-                if self.registry.set_runtime(agent_id, state.clone()) {
-                    self.invalidate_dealer_signals(cx);
-                    self.refresh_home(cx);
-                }
+                self.invalidate_dealer_signals(cx);
+                self.refresh_home(cx);
             }
             let Some((summary, old_context, usage_changed, became_live)) =
                 self.apply_frame_state(agent_id, frame)
@@ -1977,8 +1998,9 @@ impl Workspace {
                 self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.selection.active_pane(), ActivePane::Startup) {
-                    // The startup scaffold guessed before agent host data existed;
-                    // refresh it now that workdir names and topics are known.
+                    // The startup scaffold guessed before agent host data
+                    // existed; refresh it now that workdir
+                    // names and topics are known.
                     self.seed_draft(false, window, cx);
                 }
                 // The focus set is this client's to keep; an agent host that
@@ -2025,9 +2047,10 @@ impl Workspace {
             }
             ConnEvent::Disconnected(reason) => {
                 self.desktop_sessions.remove(&host);
-                // An agent host that goes is an agent host that is no longer asking;
-                // the request still has to be answered, or it is left
-                // blocked on a channel nobody will send on.
+                // An agent host that goes is an agent host that is no longer
+                // asking; the request still has to be answered,
+                // or it is left blocked on a channel nobody
+                // will send on.
                 if self.git_approval.answer(GitApprovalDecision::Done) {
                     self.finish_overlay_focus(window, cx);
                 }
@@ -2397,7 +2420,7 @@ impl Workspace {
 
     /// The agent's status line, at the end of its transcript.
     fn show_status(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let text = self.registry.agent_activity(agent_id).map(str::to_owned);
+        let text = self.registry.agent_status(agent_id).map(str::to_owned);
         self.show(agent_id, TranscriptFrame::Status(text), cx);
     }
 
@@ -5041,7 +5064,6 @@ impl Workspace {
                 blocks: Vec::new(),
                 status: rho_agents_client::state::UiAgentStatus::Idle,
                 runtime: None,
-                awaiting_human: None,
                 context_used: None,
                 usage: Default::default(),
             })
@@ -5457,6 +5479,10 @@ impl Workspace {
         self.open_prompt_inner(prompt, complete, on_change, on_submit, None, window, cx);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "prompt callbacks remain explicit alongside the GPUI window/context"
+    )]
     fn open_prompt_inner(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
@@ -7352,7 +7378,8 @@ impl Workspace {
             .gap_3()
             .child(div().flex().flex_row().items_center().gap_1p5().children(
                 quota.into_iter().enumerate().flat_map(|(index, summary)| {
-                    // Colour is the provider's, always; the number says how low.
+                    // Colour is the provider's, always; the number says how
+                    // low.
                     let color = match summary.model.as_str() {
                         "gpt" => colors.terminal_ansi_cyan,
                         "opus" | "fable" => gpui::rgb(0xd97757).into(),
@@ -7945,10 +7972,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_eof))
             .on_action(
                 cx.listener(|this, _: &crate::SlackSidebarFocus, window, cx| {
-                    if this.active_context == ContextId::Slack {
-                        if let Some(list) = this.slack_list_view(window, cx) {
-                            window.focus(&list.read(cx).editor().focus_handle(cx), cx);
-                        }
+                    if this.active_context == ContextId::Slack
+                        && let Some(list) = this.slack_list_view(window, cx)
+                    {
+                        window.focus(&list.read(cx).editor().focus_handle(cx), cx);
                     }
                 }),
             )

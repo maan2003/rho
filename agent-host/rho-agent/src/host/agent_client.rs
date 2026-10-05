@@ -210,6 +210,12 @@ impl AgentClient {
     pub fn status(&self) -> AgentStatus {
         self.0.services.status.borrow().clone()
     }
+    pub fn statuses(&self) -> watch::Receiver<AgentStatus> {
+        self.0.services.status.subscribe()
+    }
+    pub(crate) fn status_cell(&self) -> &watch::Sender<AgentStatus> {
+        &self.0.services.status
+    }
     pub fn head(&self) -> crate::log::AgentHead {
         self.0.services.db.read().get_agent(self.0.services.agent)
     }
@@ -223,6 +229,8 @@ impl AgentClient {
     pub fn notice_carried(&self) {
         self.send(Control::NoticeCarried);
     }
+    /// Asks the worker to send its status again: an adopted agent's host
+    /// has none yet.
     pub fn tell_tail(&self) {
         self.send(Control::TellTail);
     }
@@ -273,9 +281,6 @@ impl AgentClient {
             body,
         })
         .await
-    }
-    pub async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
-        self.request(Control::Effort(effort)).await
     }
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
         self.request(Control::Role(role)).await

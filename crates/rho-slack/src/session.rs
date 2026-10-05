@@ -21,7 +21,7 @@ use crate::events::WsEvent;
 use crate::health::{Health, Signal};
 use crate::mirror::{Draft, Mirror, Saved, Scope, unit_scope, unit_summary};
 use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
-use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
+use crate::socket::{Timings, Wire, run_feed, run_socket};
 use crate::types::{ChannelId, Message, Reaction, Reason, ThreadKey, Ts, UserId};
 
 /// How often health is re-examined. An outage produces no events at all, so
@@ -104,7 +104,7 @@ pub enum SessionEvent {
         result: crate::api::ViewSubmission,
     },
     ExternalOptions {
-        message: Message,
+        message: Box<Message>,
         action: crate::block::Interaction,
         options: Vec<crate::block::InteractionOption>,
     },
@@ -3041,7 +3041,7 @@ impl Session {
             let fetched = task.await;
             let _ = this.update(cx, |_, cx| match fetched {
                 Ok(Ok(options)) => cx.emit(SessionEvent::ExternalOptions {
-                    message,
+                    message: Box::new(message),
                     action,
                     options,
                 }),
@@ -4023,15 +4023,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or_default()
-}
-
-/// A convenience for hosts: the poll that the transport would have run, for
-/// a catch-up the caller wants to await.
-pub async fn catch_up_poll(
-    client: &Client,
-    newest: Option<&Ts>,
-) -> anyhow::Result<Vec<crate::api::ActivityItem>> {
-    poll_feed(client, newest).await
 }
 
 #[cfg(test)]

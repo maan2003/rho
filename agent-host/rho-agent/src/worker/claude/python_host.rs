@@ -420,7 +420,6 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let notebook = Notebook::new(
             rho_tool_shell::ShellTools::in_directory(
-                std::time::Duration::from_secs(5),
                 directory.to_str().unwrap().into(),
                 Default::default(),
             ),

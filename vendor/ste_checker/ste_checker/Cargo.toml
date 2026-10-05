@@ -1,0 +1,18 @@
+[package]
+name = "ste_checker"
+version = "0.2.0"
+edition = "2024"
+description = "Procedural ASD-STE100 (Simplified Technical English) checker for Markdown"
+license = "BlueOak-1.0.0"
+repository = "https://github.com/valeratrades/ste_checker"
+readme = "../README.md"
+publish = false
+
+[dependencies]
+harper-brill.workspace = true
+harper-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

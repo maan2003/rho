@@ -152,16 +152,22 @@ impl Subscription {
 
 impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription").field("id", &self.id).finish_non_exhaustive()
+        f.debug_struct("Subscription")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut state = self.watcher.0.state.lock().unwrap();
-        let Some(subscribed) = state.subscriptions.remove(&self.id) else { return };
+        let Some(subscribed) = state.subscriptions.remove(&self.id) else {
+            return;
+        };
         for wd in subscribed.watches {
-            let Some(interests) = state.watches.get_mut(&wd) else { continue };
+            let Some(interests) = state.watches.get_mut(&wd) else {
+                continue;
+            };
             interests.remove(&self.id);
             if interests.is_empty() {
                 state.watches.remove(&wd);
@@ -198,7 +204,9 @@ impl Adding<'_> {
                     interest.names.insert(name.to_owned());
                 }
                 // A missing ancestor's creation shows in the last one watched.
-                Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR => {
+                Err(error)
+                    if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR =>
+                {
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -219,7 +227,8 @@ impl Adding<'_> {
         if contents && (path.is_dir() || path.is_file()) {
             match self.add(path) {
                 Ok(interest) => interest.all = true,
-                Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR => {}
+                Err(error)
+                    if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -246,7 +255,13 @@ impl Adding<'_> {
             .unwrap()
             .watches
             .insert(wd);
-        Ok(self.state.watches.entry(wd).or_default().entry(self.id).or_default())
+        Ok(self
+            .state
+            .watches
+            .entry(wd)
+            .or_default()
+            .entry(self.id)
+            .or_default())
     }
 }
 
@@ -270,12 +285,20 @@ impl Inner {
             }
             let wd = event.wd();
             let itself = flags.intersects(
-                ReadFlags::IGNORED | ReadFlags::UNMOUNT | ReadFlags::DELETE_SELF | ReadFlags::MOVE_SELF,
+                ReadFlags::IGNORED
+                    | ReadFlags::UNMOUNT
+                    | ReadFlags::DELETE_SELF
+                    | ReadFlags::MOVE_SELF,
             );
-            let Some(interests) = state.watches.get(&wd) else { continue };
-            let name = event.file_name().map(|name| OsStr::from_bytes(name.to_bytes()));
+            let Some(interests) = state.watches.get(&wd) else {
+                continue;
+            };
+            let name = event
+                .file_name()
+                .map(|name| OsStr::from_bytes(name.to_bytes()));
             for (id, interest) in interests {
-                if itself || interest.all || name.is_some_and(|name| interest.names.contains(name)) {
+                if itself || interest.all || name.is_some_and(|name| interest.names.contains(name))
+                {
                     state.subscriptions[id].stale.store(true, Ordering::Release);
                 }
             }
@@ -297,7 +320,10 @@ impl State {
 
 fn drain_forever(inner: &Inner) {
     loop {
-        let mut fds = [rustix::event::PollFd::new(&inner.fd, rustix::event::PollFlags::IN)];
+        let mut fds = [rustix::event::PollFd::new(
+            &inner.fd,
+            rustix::event::PollFlags::IN,
+        )];
         match rustix::event::poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
@@ -315,7 +341,10 @@ mod tests {
 
     fn watch(watcher: &Watcher, contents: &[PathBuf], names: &[PathBuf]) -> Subscription {
         watcher
-            .watch(contents.iter().map(PathBuf::as_path), names.iter().map(PathBuf::as_path))
+            .watch(
+                contents.iter().map(PathBuf::as_path),
+                names.iter().map(PathBuf::as_path),
+            )
             .unwrap()
     }
 
@@ -376,8 +405,8 @@ mod tests {
         let (one, two) = (root.path().join("one"), root.path().join("two"));
         std::fs::write(&one, "").unwrap();
         std::fs::write(&two, "").unwrap();
-        let first = watch(&watcher, &[one.clone()], &[]);
-        let second = watch(&watcher, &[two.clone()], &[]);
+        let first = watch(&watcher, std::slice::from_ref(&one), &[]);
+        let second = watch(&watcher, std::slice::from_ref(&two), &[]);
         let both = watch(&watcher, &[one.clone(), two.clone()], &[]);
         std::fs::write(&two, "x").unwrap();
         assert!(!first.changed().unwrap());

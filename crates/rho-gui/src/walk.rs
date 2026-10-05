@@ -974,7 +974,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         error: None,
         started_at: Some(UnixMs(10)),
         finished_at: Some(UnixMs(20)),
-        metadata: None,
     };
     let mut blocks = Vec::with_capacity(prefill_turns * 3 + 3);
     if prefill == Prefill::ShortTurns {
@@ -1010,7 +1009,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
             blocks,
             status: UiAgentStatus::Streaming,
             runtime: None,
-            awaiting_human: None,
             context_used: None,
             usage: Default::default(),
         };
@@ -1047,7 +1045,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
         runtime: None,
-        awaiting_human: None,
         context_used: None,
         usage: Default::default(),
     }

@@ -31,8 +31,9 @@ pub fn prepare(
         .map(|(source, target)| {
             let file = File::open(source)
                 .with_context(|| format!("open Claude mount source {}", source.display()))?;
-            // Clone the subtree directly from its open path. Unlike a bind through
-            // /proc/self/fd, a detached tree can cross the child's namespace clone.
+            // Clone the subtree directly from its open path. Unlike a bind
+            // through /proc/self/fd, a detached tree can cross the
+            // child's namespace clone.
             let tree = unsafe {
                 libc::syscall(
                     libc::SYS_open_tree,

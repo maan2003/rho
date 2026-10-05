@@ -1219,7 +1219,7 @@ impl Mirror {
 fn invalidate_stale_history(write: &mut rho_db::WriteTxn) {
     let current = write
         .open_table(CACHE_GENERATION)
-        .get(&())
+        .get(())
         .map(|generation| generation.value());
     if current.as_deref() == Some(CURRENT_CACHE_GENERATION) {
         return;
@@ -1246,7 +1246,7 @@ fn invalidate_stale_history(write: &mut rho_db::WriteTxn) {
     }
     write
         .open_table(CACHE_GENERATION)
-        .insert(&(), &CURRENT_CACHE_GENERATION.to_owned());
+        .insert((), CURRENT_CACHE_GENERATION.to_owned());
 }
 
 /// The timestamp part of a composed key.
@@ -1795,7 +1795,7 @@ mod compatibility_tests {
             );
             write
                 .open_table(OTHER_CLIENT_STATE)
-                .insert(&(), "credential sentinel");
+                .insert((), "credential sentinel");
             write.commit();
         });
 
@@ -1821,7 +1821,7 @@ mod compatibility_tests {
         assert_eq!(
             db.read()
                 .open_table(OTHER_CLIENT_STATE)
-                .get(&())
+                .get(())
                 .map(|value| value.value().to_owned()),
             Some("credential sentinel".to_owned()),
             "opening Slack's mirror does not wipe the shared client database"

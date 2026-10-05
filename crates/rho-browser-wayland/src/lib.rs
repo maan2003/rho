@@ -1476,8 +1476,9 @@ impl<K: BrowserPageKey> State<K> {
             );
         }
 
-        // Smithay applies synchronized child state at its effectively-unsynchronized
-        // ancestor. Reconcile every current slot only at that transaction anchor.
+        // Smithay applies synchronized child state at its
+        // effectively-unsynchronized ancestor. Reconcile every current
+        // slot only at that transaction anchor.
         let mut surfaces = Vec::new();
         with_surface_tree_upward(
             &root,
