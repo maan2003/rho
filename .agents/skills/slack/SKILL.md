@@ -60,30 +60,41 @@ to create one from `rho slack manifest` and run `rho slack init`.
 
 ## Waiting for replies
 
-Subscribe to the threads you wait on. One `ThreadSubscriptions` per
-notebook serves all of them with one long poll, and each callback gets the
-raw Slack events of its thread: replies, edits, deletions, and reactions to
-the root message. The callback decides what matters and calls `notify()`;
-then end your turn instead of polling. Events count from when the object
-is created, so create it before you post.
+Subscribe to every thread you post in and expect an answer from: the
+thread of a new message (its `ts`), or the existing thread you replied in
+(its `thread_ts`). People answer in threads, and nothing else tells you
+they did. One `Subscriptions` per notebook serves all subscriptions with
+one long poll, and each callback gets the raw Slack events: replies,
+edits, deletions, and reactions to the root message. The callback decides
+what matters and calls `notify()`; then end your turn instead of polling.
+Events count from when the object is created, so create it before your
+first post and keep it.
 
 ```python
-from slack_sdk.rho import ThreadSubscriptions
-threads = ThreadSubscriptions(slack)
+from slack_sdk.rho import Subscriptions
+subs = Subscriptions(slack)
 sent = await slack.chat_postMessage(channel=dm, text="Could you review #42? <url>")
 
 def on_event(event):
     if event["type"] in ("rho_truncated", "rho_error") or event.get("user") == user:
         notify(event)
 
-threads.subscribe(sent["channel"], sent["ts"], on_event)
-# when done with the thread, and with all threads:
-threads.unsubscribe(sent["channel"], sent["ts"])
-threads.close()
+subs.subscribe(sent["channel"], sent["ts"], on_event)
+# when done with the thread, and with all subscriptions:
+subs.unsubscribe(sent["channel"], sent["ts"])
+subs.close()
 ```
 
+`subs.subscribe(channel, None, callback)` subscribes to a whole channel,
+threads included, for example when the task waits for someone to mention
+the bot there. The bot sees only channels it is a member of. Filter in the
+callback, for example on `f"<@{bot_user_id}>" in event.get("text", "")`
+with `bot_user_id` from `auth_test`, and subscribe to the thread of any
+message you answer.
+
 `{"type": "rho_truncated"}` means the host lost events, for example after
-it restarted: read the thread again with `conversations_replies`.
+it restarted: read the thread or channel again with
+`conversations_replies` or `conversations_history`.
 `{"type": "rho_error", "error": ...}` means the host refused the poll, for
 example without an app token; polling stops until the next `subscribe`.
 Subscriptions live in the notebook only; after a notebook restart,

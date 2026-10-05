@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from slack_sdk.rho import ThreadSubscriptions
+from slack_sdk.rho import Subscriptions
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -191,7 +191,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
         self.assertEqual(requests[1]["query"], {"cursor": ["7:1"], "timeout": ["20"]})
 
-    async def test_thread_subscriptions_route_events_to_their_threads(self):
+    async def test_subscriptions_route_events_to_their_threads_and_channels(self):
         def envelope(event):
             return {"envelope_id": "e", "type": "events_api", "payload": {"event": event}}
 
@@ -201,16 +201,17 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         edit_b = {"type": "message", "subtype": "message_changed", "channel": "C2",
                   "message": {"ts": "6.0", "thread_ts": "5.0", "text": "edited"}}
         reaction_a = {"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}
+        root_c2 = {"type": "message", "channel": "C2", "ts": "9.0", "text": "@bot hello"}
         polls = [
-            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a]],
+            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a, root_c2]],
              "cursor": "7:5", "truncated": False},
             {"ok": True, "events": [], "cursor": "8:0", "truncated": True},
             {"ok": True, "events": [], "cursor": "8:0", "truncated": False},
         ]
-        a, b = [], []
+        a, b, c2 = [], [], []
 
         async def body():
-            threads = ThreadSubscriptions()
+            threads = Subscriptions()
 
             def on_a(event):
                 a.append(event)
@@ -221,6 +222,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
 
             threads.subscribe("D1", "1.0", on_a)
             threads.subscribe("C2", "5.0", on_b)
+            threads.subscribe("C2", None, c2.append)
             while len(self.fake.requests) < 3:
                 await asyncio.sleep(0.01)
             threads.close()
@@ -230,6 +232,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         truncated = {"type": "rho_truncated"}
         self.assertEqual(a, [reply_a, root_a, reaction_a, truncated])
         self.assertEqual(b, [edit_b, truncated])
+        self.assertEqual(c2, [edit_b, root_c2, truncated])
         self.assertEqual([r["query"].get("cursor") for r in requests[:3]], [None, ["7:5"], ["8:0"]])
 
     async def test_thread_subscriptions_count_events_from_creation(self):
@@ -244,7 +247,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         got = []
 
         async def body():
-            threads = ThreadSubscriptions()
+            threads = Subscriptions()
             # The first poll is out before the agent posts and subscribes.
             while not self.fake.requests:
                 await asyncio.sleep(0.01)
@@ -268,7 +271,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         got = []
 
         async def body():
-            threads = ThreadSubscriptions()
+            threads = Subscriptions()
             threads.subscribe("D1", "1.0", got.append)
             await asyncio.wait_for(asyncio.shield(threads._poller), 5)
             self.assertEqual(len(self.fake.requests), 1)
