@@ -287,7 +287,8 @@ pub(crate) struct SlackArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum SlackCommand {
-    /// Install the host-held Slack bot token that agents call Slack with.
+    /// Install the host-held Slack tokens: the bot token agents call Slack
+    /// with, and the app token its Socket Mode connection uses.
     Init,
 }
 

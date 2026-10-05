@@ -57,6 +57,8 @@ async fn adapted_slack_sdk_is_importable_in_the_notebook() {
     let cell = notebook.run(
         r#"from slack_sdk import WebClient
 from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 assert AsyncWebClient().base_url == WebClient().base_url == "http://slack/api/"
 print("slack_sdk import ready")"#
             .into(),

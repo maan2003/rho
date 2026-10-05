@@ -463,8 +463,8 @@
               build-system = [ ps.setuptools ];
               dependencies = [ ps.httpx ];
               postInstall = ''
-                cp ${./agent-host/rho-notebook/src/slack_sdk/web}/*.py \
-                  "$out/${pkgs.python3.sitePackages}/slack_sdk/web/"
+                cp -r ${./agent-host/rho-notebook/src/slack_sdk}/. \
+                  "$out/${pkgs.python3.sitePackages}/slack_sdk/"
               '';
               doCheck = false;
             };

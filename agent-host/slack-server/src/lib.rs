@@ -5,8 +5,12 @@
 //! The server adds the bot token, so no agent holds it. The scopes the user
 //! grants the Slack app decide what the bot may do; the server refuses only
 //! the methods that would revoke, uninstall or reconfigure the app itself.
+//!
+//! One method is the server's own: `rho.events` long-polls the events the
+//! app's Socket Mode connection receives (see [`events`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
@@ -18,13 +22,23 @@ use axum::routing::any;
 use reqwest::{Client, Url};
 use tokio::net::UnixListener;
 
+mod events;
+
+pub use events::{Events, run_socket_mode};
+
 pub type TokenProvider = Arc<dyn Fn() -> Result<String> + Send + Sync>;
 
 struct AppState {
     client: Client,
     token_provider: TokenProvider,
+    app_token: TokenProvider,
     slack_api_url: Url,
+    events: Arc<Events>,
 }
+
+/// How long `rho.events` waits when the agent does not say, and at most.
+const DEFAULT_WAIT: Duration = Duration::from_secs(20);
+const MAX_WAIT: Duration = Duration::from_secs(300);
 
 /// Methods an agent may not call, by exact name or by `prefix.`.
 const REFUSED: &[&str] = &[
@@ -36,7 +50,12 @@ const REFUSED: &[&str] = &[
     "tooling.",
 ];
 
-pub fn router(token_provider: TokenProvider, slack_api_url: Url) -> Router {
+pub fn router(
+    token_provider: TokenProvider,
+    app_token: TokenProvider,
+    slack_api_url: Url,
+    events: Arc<Events>,
+) -> Router {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let state = Arc::new(AppState {
         client: Client::builder()
@@ -44,7 +63,9 @@ pub fn router(token_provider: TokenProvider, slack_api_url: Url) -> Router {
             .build()
             .expect("static Slack HTTP client configuration is valid"),
         token_provider,
+        app_token,
         slack_api_url,
+        events,
     });
     Router::new()
         .route("/api/{method}", any(call))
@@ -71,6 +92,9 @@ async fn call(
             .all(|c| c.is_ascii_alphanumeric() || c == '.')
     {
         return slack_error("rho_invalid_method");
+    }
+    if method == "rho.events" {
+        return wait_for_events(&state, query.as_deref().unwrap_or_default()).await;
     }
     if REFUSED.iter().any(|refused| {
         method == *refused || (refused.ends_with('.') && method.starts_with(refused))
@@ -110,6 +134,33 @@ async fn call(
         Ok(body) => (status, forwarded, body).into_response(),
         Err(error) => slack_error(&format!("rho_slack_unreachable: {error}")),
     }
+}
+
+/// `rho.events`: `cursor`, `channel`, `thread_ts` and `timeout` (seconds)
+/// arrive as query parameters.
+async fn wait_for_events(state: &AppState, query: &str) -> Response {
+    if events::present(&state.app_token).is_none() {
+        return slack_error("rho_no_slack_app_token: run `rho slack init` on the agent host");
+    }
+    let mut cursor = None;
+    let mut filter = events::Filter::default();
+    let mut timeout = DEFAULT_WAIT;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match &*key {
+            "cursor" => cursor = Some(value.into_owned()),
+            "channel" => filter.channel = Some(value.into_owned()),
+            "thread_ts" => filter.thread_ts = Some(value.into_owned()),
+            "timeout" => match value.parse::<f64>() {
+                Ok(seconds) if seconds >= 0.0 => {
+                    timeout = Duration::from_secs_f64(seconds).min(MAX_WAIT)
+                }
+                _ => return slack_error("invalid_arguments: timeout"),
+            },
+            _ => {}
+        }
+    }
+    let reply = state.events.wait(cursor.as_deref(), &filter, timeout).await;
+    axum::Json(reply).into_response()
 }
 
 /// A failure in Slack's own shape, so `slack_sdk` raises `SlackApiError` with
@@ -176,7 +227,12 @@ mod tests {
     }
 
     async fn server(token: &'static str, slack: Url) -> String {
-        let app = router(Arc::new(move || Ok(token.to_owned())), slack);
+        let app = router(
+            Arc::new(move || Ok(token.to_owned())),
+            Arc::new(move || Ok(token.to_owned())),
+            slack,
+            Arc::default(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -247,19 +303,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rho_events_long_polls_with_query_parameters() {
+        let (slack, seen) = fake_slack().await;
+        let events = Arc::new(Events::default());
+        let app = router(
+            Arc::new(|| Ok("xoxb-host".to_owned())),
+            Arc::new(|| Ok("xapp-host".to_owned())),
+            slack,
+            events.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let poll = |query: String| {
+            let server = server.clone();
+            async move {
+                reqwest::get(format!("{server}/api/rho.events?{query}"))
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let start = poll("timeout=0".into()).await;
+        assert_eq!(start["events"], json!([]));
+        let cursor = start["cursor"].as_str().unwrap().to_owned();
+        let reply = message_after(
+            &events,
+            poll(format!("cursor={cursor}&channel=D1&timeout=5")),
+        );
+        assert_eq!(
+            reply.await["events"],
+            json!([{"payload": {"event": {"channel": "D1", "ts": "2.0"}}}])
+        );
+        assert_eq!(
+            poll("timeout=-1".into()).await,
+            json!({"ok": false, "error": "invalid_arguments: timeout"})
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Runs `poll`, and pushes an event for another channel and then one for
+    /// `D1` while it waits.
+    async fn message_after(events: &Arc<Events>, poll: impl Future<Output = Value>) -> Value {
+        let events = events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            events.push(json!({"payload": {"event": {"channel": "C9", "ts": "1.0"}}}));
+            events.push(json!({"payload": {"event": {"channel": "D1", "ts": "2.0"}}}));
+        });
+        poll.await
+    }
+
+    #[tokio::test]
     async fn without_a_token_says_how_to_install_one() {
         let (slack, seen) = fake_slack().await;
         let server = server("  ", slack).await;
 
-        let body = reqwest::get(format!("{server}/api/auth.test"))
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
+        for method in ["auth.test", "rho.events"] {
+            let body = reqwest::get(format!("{server}/api/{method}"))
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
 
-        assert_eq!(body["ok"], false);
-        assert!(body["error"].as_str().unwrap().contains("rho slack init"));
+            assert_eq!(body["ok"], false);
+            assert!(body["error"].as_str().unwrap().contains("rho slack init"));
+        }
         assert!(seen.lock().unwrap().is_empty());
     }
 }

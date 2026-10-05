@@ -16097,11 +16097,15 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "futures-util",
+ "rand 0.10.3",
  "reqwest 0.13.5",
  "rustls",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
  "url",
 ]
 

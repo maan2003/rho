@@ -3,13 +3,24 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
+from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
+
+ENVELOPE = {"envelope_id": "e1", "type": "events_api",
+            "payload": {"event": {"type": "message", "channel": "D1", "text": "LGTM"}}}
+EVENTS = [
+    {"ok": True, "events": [ENVELOPE], "cursor": "7:1", "truncated": False},
+    {"ok": True, "events": [], "cursor": "7:1", "truncated": False},
+]
 
 
 class FakeSlackServer:
@@ -29,7 +40,9 @@ class FakeSlackServer:
         api = url.path.removeprefix("/api/")
         self.requests.append(dict(method=method, api=api, query=parse_qs(url.query), headers=headers, body=body))
         reply = self.replies[api]
-        payload = json.dumps(reply.pop(0) if isinstance(reply, list) else reply).encode()
+        if isinstance(reply, list):
+            reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        payload = json.dumps(reply).encode()
         writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                      f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
         await writer.drain()
@@ -39,7 +52,7 @@ class FakeSlackServer:
 class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
     async def run_with(self, replies, body):
         with tempfile.TemporaryDirectory() as directory:
-            fake = FakeSlackServer(directory, replies)
+            fake = self.fake = FakeSlackServer(directory, replies)
             server = await asyncio.start_unix_server(fake.serve, fake.path)
             with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
                 async with server:
@@ -123,6 +136,44 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(request["headers"]["content-type"].startswith("multipart/form-data; boundary="))
         self.assertIn(b'name="channels"\r\n\r\nC1', request["body"])
         self.assertIn(b"log line", request["body"])
+
+    async def test_async_socket_mode_client_runs_listeners_from_rho_events(self):
+        async def body():
+            client = AsyncSocketModeClient(app_token="xapp-agent-guess")
+            seen = asyncio.Event()
+
+            async def listener(client, request):
+                self.assertEqual((request.type, request.envelope_id), ("events_api", "e1"))
+                self.assertEqual(request.payload["event"]["text"], "LGTM")
+                await client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+                seen.set()
+
+            client.socket_mode_request_listeners.append(listener)
+            await client.connect()
+            await asyncio.wait_for(seen.wait(), 5)
+            while len(self.fake.requests) < 2:
+                await asyncio.sleep(0.01)
+            await client.close()
+            self.assertFalse(await client.is_connected())
+
+        requests = await self.run_with({"rho.events": list(EVENTS)}, body)
+
+        self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
+        self.assertEqual(requests[1]["query"], {"cursor": ["7:1"], "timeout": ["20"]})
+
+    async def test_sync_socket_mode_client_runs_listeners_from_rho_events(self):
+        async def body():
+            client = SocketModeClient(app_token="xapp-agent-guess")
+            seen = threading.Event()
+            client.socket_mode_request_listeners.append(
+                lambda client, request: seen.set() if request.envelope_id == "e1" else None)
+            client.connect()
+            self.assertTrue(await asyncio.to_thread(seen.wait, 5))
+            client.close()
+
+        requests = await self.run_with({"rho.events": list(EVENTS)}, body)
+
+        self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
 
 
 if __name__ == "__main__":

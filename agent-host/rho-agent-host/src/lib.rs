@@ -347,12 +347,23 @@ fn spawn_slack_server(
     secrets: PlatformSecrets,
 ) -> anyhow::Result<()> {
     let slack_api_url = url::Url::parse("https://slack.com/api/")?;
-    let token_provider: slack_server::TokenProvider = Arc::new(move || {
-        secrets
-            .get("SLACK_BOT_TOKEN")
-            .context("reading SLACK_BOT_TOKEN")
-    });
-    let router = slack_server::router(token_provider, slack_api_url);
+    let secret = |name: &'static str| -> slack_server::TokenProvider {
+        let secrets = secrets.clone();
+        Arc::new(move || secrets.get(name).with_context(|| format!("reading {name}")))
+    };
+    let events = Arc::new(slack_server::Events::default());
+    tokio::spawn(slack_server::run_socket_mode(
+        events.clone(),
+        secret("SLACK_BOT_TOKEN"),
+        secret("SLACK_APP_TOKEN"),
+        slack_api_url.clone(),
+    ));
+    let router = slack_server::router(
+        secret("SLACK_BOT_TOKEN"),
+        secret("SLACK_APP_TOKEN"),
+        slack_api_url,
+        events,
+    );
     tokio::spawn(async move {
         if let Err(error) = slack_server::serve(listener, router).await {
             tracing::error!(%error, "slack server stopped");
