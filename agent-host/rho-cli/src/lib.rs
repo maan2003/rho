@@ -308,8 +308,8 @@ pub(crate) struct NotionArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum NotionCommand {
-    /// Sign this host in to Notion MCP as you, in a browser: agents then
-    /// read and write Notion as you.
+    /// Sign this host in to Notion MCP as you, in a browser, and name the
+    /// root page agents work under.
     Init,
 }
 

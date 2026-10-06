@@ -9,13 +9,20 @@ pub(crate) async fn run(args: NotionArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Signs this host in to Notion MCP as the user: agents then act as them.
+/// Signs this host in to Notion MCP as the user, and names the page agents
+/// work under.
 async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    eprintln!("Agents create pages under one root page, and reach only it and the pages under it.");
+    let root = crate::github::prompt_token("Root page URL (create an empty page for agents): ")?;
+    anyhow::ensure!(
+        notion_server::page_id(&root).is_some(),
+        "not a Notion page URL or ID"
+    );
     let client = notion_server::oauth::http_client();
     let endpoints = notion_server::Endpoints::notion();
     let pending = notion_server::oauth::begin(&client, &endpoints).await?;
     eprintln!(
-        "Open this address in a browser and approve access. Agents on this host act as the Notion user you approve as.\n\n{}\n",
+        "Open this address in a browser and approve access. Agents write as the Notion user you approve as.\n\n{}\n",
         pending.url
     );
     eprintln!(
@@ -31,6 +38,7 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
         secrets: vec![
             (notion_server::CLIENT_ID.to_owned(), grant.client_id),
             (notion_server::REFRESH_TOKEN.to_owned(), grant.refresh_token),
+            (notion_server::ROOT_PAGE.to_owned(), root),
         ],
     };
     match host_call(&socket_path, call).await? {
