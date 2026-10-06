@@ -26,12 +26,11 @@ The notebook has `rho_notion`, a client of Notion's hosted MCP tools
 through the agent host, which holds the sign-in. It is async only.
 
 ```python
-from rho_notion import Notion, NotionError, text
-notion = Notion()
+import rho_notion as notion
 for tool in await notion.tools():   # names, descriptions, argument schemas
     print(tool["name"], tool["description"][:200])
 page = await notion.call("notion-fetch", id="<page URL or ID>")
-print(text(page))                     # Notion-flavoured Markdown
+print(notion.text(page))              # Notion-flavoured Markdown
 ```
 
 Read a tool's `description` and `inputSchema` before its first use: they
@@ -48,7 +47,7 @@ call:
 Writes need no approval: write when the task calls for it. Prefer
 `notion-update-page`'s search-and-replace edits over rewriting a page.
 
-`NotionError` carries the reason: `rho_tool_unavailable` for a tool not
+`notion.NotionError` carries the reason: `rho_tool_unavailable` for a tool not
 on the list (do not work around it), `rho_no_notion_grant` or
 `rho_notion_unauthorized` when the host is not signed in (ask the user
 to run `rho notion init` on the agent host), or Notion's own error.
