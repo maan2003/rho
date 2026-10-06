@@ -372,6 +372,20 @@ fn spawn_slack_server(
     Ok(())
 }
 
+fn spawn_notion_server(listener: tokio::net::UnixListener, secrets: PlatformSecrets) {
+    let read = secrets.clone();
+    let router = notion_server::router(
+        Arc::new(move |name| read.get(name)),
+        Arc::new(move |rotated| secrets.install_merge(rotated).map(|_| ())),
+        notion_server::Endpoints::notion(),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = notion_server::serve(listener, router).await {
+            tracing::error!(%error, "notion server stopped");
+        }
+    });
+}
+
 fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
@@ -381,17 +395,22 @@ fn start_runtime_sockets(
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
     let slack_socket = paths.slack_socket();
+    let notion_socket = paths.notion_socket();
     prepare_socket_path(paths.socket(), "rho-agent-host")?;
     prepare_socket_path(&octo_socket, "octo")?;
     prepare_socket_path(&slack_socket, "slack")?;
+    prepare_socket_path(&notion_socket, "notion")?;
     let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
         .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
     let slack_listener = tokio::net::UnixListener::bind(&slack_socket)
         .with_context(|| format!("bind slack socket {}", slack_socket.display()))?;
+    let notion_listener = tokio::net::UnixListener::bind(&notion_socket)
+        .with_context(|| format!("bind notion socket {}", notion_socket.display()))?;
     let listener = tokio::net::UnixListener::bind(paths.socket())
         .with_context(|| format!("bind rho-agent-host socket {}", paths.socket().display()))?;
     spawn_octo_server(octo_listener, secrets.clone())?;
-    spawn_slack_server(slack_listener, secrets)?;
+    spawn_slack_server(slack_listener, secrets.clone())?;
+    spawn_notion_server(notion_listener, secrets);
     Ok(RuntimeSockets {
         paths,
         server: Server::from_listener(listener),
@@ -1550,6 +1569,7 @@ mod tests {
         assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
         assert!(paths.slack_socket().exists());
+        assert!(paths.notion_socket().exists());
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert_eq!(

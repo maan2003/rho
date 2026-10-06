@@ -10398,6 +10398,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "notion-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13868,6 +13885,7 @@ dependencies = [
  "libc",
  "moq-net",
  "notify",
+ "notion-server",
  "octo-server",
  "prefix-id",
  "redb",
@@ -14095,6 +14113,7 @@ dependencies = [
  "clap",
  "dirs 7.0.0",
  "libc",
+ "notion-server",
  "prefix-id",
  "rho-agent",
  "rho-agent-host",

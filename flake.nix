@@ -468,8 +468,25 @@
               '';
               doCheck = false;
             };
+            # The client of the host's Notion server; see
+            # agent-host/rho-notebook/src/rho_notion.
+            rhoNotion = ps.buildPythonPackage {
+              pname = "rho-notion";
+              version = "0.1.0";
+              src = ./agent-host/rho-notebook/src/rho_notion;
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/rho_notion"
+                cp *.py "$out/${pkgs.python3.sitePackages}/rho_notion/"
+                runHook postInstall
+              '';
+              dependencies = [ ps.httpx ];
+              doCheck = false;
+            };
           in
-          [ ps.pyyaml ps.httpx ghapi pythonLs slackSdk ]
+          [ ps.pyyaml ps.httpx ghapi pythonLs slackSdk rhoNotion ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
@@ -623,6 +640,7 @@
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
                 cp -r ${./.agents/skills/slack} $out/share/rho/skills/slack
+                cp -r ${./.agents/skills/notion} $out/share/rho/skills/notion
                 chmod -R u+w $out/share/rho/skills
               ''
               + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

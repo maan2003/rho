@@ -39,6 +39,7 @@ rho-claude.workspace = true
 rho-claude-usage.workspace = true
 rho-agent-types.workspace = true
 slack-server.workspace = true
+notion-server.workspace = true
 rho-agents-client.workspace = true
 rho-db.workspace = true
 rho-ledger-server.workspace = true

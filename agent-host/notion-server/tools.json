@@ -1,0 +1,18 @@
+{
+  "tools": [
+    "notion-search",
+    "notion-fetch",
+    "notion-create-pages",
+    "notion-update-page",
+    "notion-duplicate-page",
+    "notion-create-comment",
+    "notion-get-comments",
+    "notion-get-users",
+    "notion-get-teams",
+    "notion-get-async-task",
+    "notion-get-tool-access",
+    "notion-query-data-sources",
+    "notion-create-database",
+    "notion-update-data-source"
+  ]
+}
