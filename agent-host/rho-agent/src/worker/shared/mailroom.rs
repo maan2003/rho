@@ -116,7 +116,12 @@ impl Bridge {
 }
 
 /// Gating ste_checker rules; every other rule is off.
-const STE_RULES: &[&str] = &["sentence-length", "contraction", "ing-verb", "semicolon"];
+const STE_RULES: &[&str] = &[
+    "sentence-length",
+    "contraction",
+    "ing-after-preposition",
+    "semicolon",
+];
 
 static STE: LazyLock<Ctx> = LazyLock::new(|| {
     let config = AppConfig {
@@ -235,18 +240,19 @@ mod tests {
 
     #[test]
     fn underlines_each_finding_on_its_own_line() {
-        let findings =
-            ste_findings("Done.\n\nI am running the tests. Stop the job; then wait for it.");
+        let findings = ste_findings(
+            "Done.\n\nI am running the tests before changing code. Stop the job; then wait for it.",
+        );
         assert_eq!(
             findings,
             [
-                "line 3, ing-verb: `running` is an -ing verb form. Use a simple tense, for example \
-                 `is running` -> `runs`. Put a quoted word in a code span.\n    \
-                 I am running the tests. Stop the job; then…\n    \
-                 \x20    ^^^^^^^",
+                "line 3, ing-after-preposition: `before changing` hides who acts. Write a clause with \
+                 a subject, for example `before selecting a fix` -> `before I select a fix`.\n    \
+                 I am running the tests before changing code. Stop the job; then wait…\n    \
+                 \x20                             ^^^^^^^^",
                 "line 3, semicolon: A semicolon is not allowed. Write two sentences.\n    \
-                 …the tests. Stop the job; then wait for it.\n    \
-                 \x20                       ^",
+                 …changing code. Stop the job; then wait for it.\n    \
+                 \x20                           ^",
             ],
         );
     }

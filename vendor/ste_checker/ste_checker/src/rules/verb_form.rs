@@ -63,6 +63,45 @@ pub fn ing_as_verb(doc: &Document, tags: &Tags, _ctx: &Ctx) -> Vec<Lint> {
 		.collect()
 }
 
+/// A gerund that a preposition takes as its object: `before selecting a fix`. It hides who
+/// acts, so it reads worse than a clause with a subject: `before I select a fix`.
+const PREPOSITIONS: &[&str] = &[
+	"about", "after", "before", "by", "for", "from", "in", "into", "of", "on", "since", "through", "upon", "via", "when", "while", "with", "without",
+];
+/// -ing words that are adjectives in practice, whatever the tagger says.
+const ADJECTIVES: &[&str] = &["existing", "missing", "pending", "remaining", "outstanding", "following", "upcoming", "ongoing"];
+
+pub fn ing_after_preposition(doc: &Document, tags: &Tags, _ctx: &Ctx) -> Vec<Lint> {
+	let src = doc.get_source();
+	let tokens = doc.get_tokens();
+	// The word `i` steps over whitespace to, if any: a token in between ends the phrase.
+	let word_at = |i: usize| tokens.get(i).filter(|t| t.kind.is_word() && !tags.in_heading(t.span));
+	let next_word = |i: usize, back: bool| {
+		let ws = if back { i.checked_sub(1)? } else { i + 1 };
+		tokens.get(ws).filter(|t| t.kind.is_whitespace())?;
+		let at = if back { ws.checked_sub(1)? } else { ws + 1 };
+		word_at(at).map(|t| (at, t))
+	};
+	prose_words(doc, tags)
+		.filter(|(i, t)| tags.pos(*i) == Some(UPOS::VERB) && t.kind.is_verb_progressive_form())
+		.filter(|(_, t)| !ADJECTIVES.contains(&t.get_str(src).to_lowercase().as_str()))
+		.filter_map(|(i, t)| {
+			let (_, prep) = next_word(i, true)?;
+			let prep = prep.get_str(src).to_lowercase();
+			// Without an object the word is a noun: `get the terms in writing`.
+			(PREPOSITIONS.contains(&prep.as_str()) && next_word(i, false).is_some()).then(|| Lint {
+				span: t.span,
+				lint_kind: LintKind::Style,
+				message: format!(
+					"`{prep} {}` hides who acts. Write a clause with a subject, for example `before selecting a fix` -> `before I select a fix`.",
+					t.get_str(src)
+				),
+				..Default::default()
+			})
+		})
+		.collect()
+}
+
 /// Pairs an auxiliary from `auxiliaries` with the verb it governs. Only negation may sit
 /// between the two, so `is to run` and `has to be` do not read as one construction.
 fn aux_pairs<'a>(doc: &'a Document, tags: &'a Tags, auxiliaries: &[&str]) -> Vec<(&'a Token, &'a Token)> {

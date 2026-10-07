@@ -20,6 +20,7 @@ pub const RULES: &[(&str, Rule)] = &[
 	("passive-voice", verb_form::passive),
 	("compound-tense", verb_form::compound_tense),
 	("ing-verb", verb_form::ing_as_verb),
+	("ing-after-preposition", verb_form::ing_after_preposition),
 	("contraction", contraction::contraction),
 	("semicolon", semicolon::semicolon),
 ];

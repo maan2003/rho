@@ -25,6 +25,7 @@ fn corpus_calibration() {
 			("passive-voice", 40),
 			("compound-tense", 3),
 			("ing-verb", 58),
+			("ing-after-preposition", 3),
 			("contraction", 10),
 			("semicolon", 68),
 		]
@@ -47,6 +48,7 @@ fn glossary_absorbs_technical_vocabulary() {
 			("passive-voice", 40),
 			("compound-tense", 3),
 			("ing-verb", 58),
+			("ing-after-preposition", 3),
 			("contraction", 10),
 			("semicolon", 68),
 		]
@@ -208,6 +210,30 @@ fn gerund_after_a_noun_is_a_technical_noun() {
 	// A progressive verb has its auxiliary in front of it, so it never matches.
 	assert_eq!(flagged("It is watching the channel.", "ing-verb", &ctx), vec!["watching"]);
 	assert_eq!(flagged("The model is chosen by choosing a tier.", "ing-verb", &ctx), vec!["choosing"]);
+}
+
+/// Only a gerund that a preposition takes, with an object of its own, hides who acts. A
+/// progressive verb, a participle clause and an -ing adjective or noun all read clearly.
+#[test]
+fn ing_after_a_preposition_needs_a_subject() {
+	let ctx = Ctx::new(AppConfig::default(), Glossary::default());
+	for (text, word) in [
+		("I will check that reproduction before selecting a fix.", "selecting"),
+		("It stops an old consumer from ignoring a rule.", "ignoring"),
+	] {
+		assert_eq!(flagged(text, "ing-after-preposition", &ctx), vec![word], "{text}");
+	}
+	for clear in [
+		"I am checking the logs.",
+		"The test passes, including key rotation.",
+		"Edits of existing text need approval.",
+		"Nothing is missing from the output.",
+		"Get all token terms in writing.",
+		"Restart the running agents.",
+		"The host does signaling with your token.",
+	] {
+		assert_eq!(flagged(clear, "ing-after-preposition", &ctx), Vec::<String>::new(), "{clear}");
+	}
 }
 
 /// Both numbers, printed and floored rather than targeted. A change that trades one for the other

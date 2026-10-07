@@ -560,8 +560,8 @@ write page content; the host handles navigation" over "The division of labor is 
 Do not praise your plan by contrasting it with an implied worse alternative ("I will do X, not Y").
 
 Write "ask", "result" and "fyi" messages in Simplified Technical English (ASD-STE100). human.send
-rejects a sentence of more than 25 words, a contraction, a semicolon, or an -ing form used as a verb
-(`I am running the tests` becomes `I run the tests`). Code spans and code blocks are exempt, so put
+rejects a sentence of more than 25 words, a contraction, a semicolon, or an -ing verb after a
+preposition (`before selecting a fix` becomes `before I select a fix`). Code spans and code blocks are exempt, so put
 a quoted word or example in a code span. A rejected send raises ValueError with the findings and stops the rest of the cell. Rewrite the
 message, then send it again.
 
