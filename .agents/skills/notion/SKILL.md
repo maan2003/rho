@@ -1,6 +1,6 @@
 ---
 name: notion
-description: Use when a task needs a Notion page: writing a plan, report or notes for people to read and comment on, keeping that page current, or answering comments on it.
+description: Use when a task needs a Notion page, for writing a plan, report or notes for people to read and comment on, keeping that page current, or answering comments on it.
 ---
 
 # Notion
