@@ -20,7 +20,7 @@ fn corpus_calibration() {
 			("unapproved-word", 381),
 			("wrong-pos", 113),
 			("unknown-word", 1156),
-			("sentence-length", 74),
+			("sentence-length", 73),
 			("noun-cluster", 3),
 			("passive-voice", 40),
 			("compound-tense", 3),
@@ -43,7 +43,7 @@ fn glossary_absorbs_technical_vocabulary() {
 			("unapproved-word", 370),
 			("wrong-pos", 90),
 			("unknown-word", 978),
-			("sentence-length", 74),
+			("sentence-length", 73),
 			("noun-cluster", 3),
 			("passive-voice", 40),
 			("compound-tense", 3),
@@ -210,6 +210,24 @@ fn gerund_after_a_noun_is_a_technical_noun() {
 	// A progressive verb has its auxiliary in front of it, so it never matches.
 	assert_eq!(flagged("It is watching the channel.", "ing-verb", &ctx), vec!["watching"]);
 	assert_eq!(flagged("The model is chosen by choosing a tier.", "ing-verb", &ctx), vec!["choosing"]);
+}
+
+/// A lone letter before a period reads to Harper as an initial, so without the split each pair
+/// counts as one sentence of 26 words. A unit of two letters already ends a sentence.
+#[test]
+fn a_period_after_a_lone_letter_ends_the_sentence() {
+	let ctx = Ctx::new(AppConfig::default(), Glossary::default());
+	let fill = "one two three four five six seven eight nine ten";
+	for text in [
+		format!("Give the agent {fill} history before date X. Then ask it {fill} after X."),
+		format!("The fastest response took {fill} 2.60 s. The fastest other response took {fill} 3 s."),
+		format!("It took {fill} more or 5 ms. The other run took {fill} or 6 ms."),
+	] {
+		assert_eq!(flagged(&text, "sentence-length", &ctx), Vec::<String>::new(), "{text}");
+	}
+	// Without a capital after it, the period is inside the sentence: 27 words.
+	let text = format!("Give the agent {fill} history before date X. then ask it {fill}.");
+	assert_eq!(flagged(&text, "sentence-length", &ctx).len(), 1, "{text}");
 }
 
 /// Only a gerund that a preposition takes, with an object of its own, hides who acts. A
