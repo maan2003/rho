@@ -127,12 +127,12 @@ pub async fn run_socket_mode(
     let client = Client::new();
     let mut reported = false;
     loop {
-        let Some(app) = present(&app_token) else {
+        if present(&app_token).is_none() {
             // Not configured yet: `rho slack init` may install it later.
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
-        };
-        match connect(&events, &client, &bot_token, &app, &slack_api_url).await {
+        }
+        match connect(&events, &client, &bot_token, &app_token, &slack_api_url).await {
             Ok(()) => reported = false,
             Err(error) => {
                 if !reported {
@@ -152,31 +152,52 @@ pub(crate) fn present(token: &TokenProvider) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-/// One connection, until Slack asks the client to reconnect.
+/// How often a connection checks that its tokens are still installed.
+const TOKEN_CHECK: Duration = Duration::from_secs(10);
+
+/// One connection, until Slack asks the client to reconnect or `rho slack
+/// init` installs other tokens. A connection made with an old app token
+/// would keep delivering the old app's events.
 async fn connect(
     events: &Events,
     client: &Client,
     bot_token: &TokenProvider,
-    app_token: &str,
+    app_token: &TokenProvider,
     slack_api_url: &Url,
 ) -> Result<()> {
+    let tokens = || (present(bot_token), present(app_token));
+    let installed = tokens();
+    let (bot, Some(app)) = &installed else {
+        return Ok(());
+    };
     // The bot's own messages would wake every agent that waits after it posts.
-    let me = match present(bot_token) {
-        Some(bot) => call(client, slack_api_url, "auth.test", &bot).await?,
+    let me = match bot {
+        Some(bot) => call(client, slack_api_url, "auth.test", bot).await?,
         None => Value::Null,
     };
     let own = |event: &Value| {
         (me.get("user_id").is_some() && event.get("user") == me.get("user_id"))
             || (me.get("bot_id").is_some() && event.get("bot_id") == me.get("bot_id"))
     };
-    let open = call(client, slack_api_url, "apps.connections.open", app_token).await?;
+    let open = call(client, slack_api_url, "apps.connections.open", app).await?;
     let url = open["url"]
         .as_str()
         .context("apps.connections.open gave no url")?;
     let (mut socket, _) = tokio_tungstenite::connect_async(url)
         .await
         .context("connecting to the Socket Mode URL")?;
-    while let Some(frame) = socket.next().await {
+    let mut check = tokio::time::interval(TOKEN_CHECK);
+    loop {
+        let frame = tokio::select! {
+            frame = socket.next() => frame,
+            _ = check.tick() => {
+                if tokens() != installed {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else { break };
         let Frame::Text(text) = frame.context("reading Socket Mode")? else {
             continue;
         };
@@ -388,7 +409,7 @@ mod tests {
             &events,
             &Client::new(),
             &(Arc::new(|| Ok("xoxb-1".into())) as TokenProvider),
-            "xapp-1",
+            &(Arc::new(|| Ok("xapp-1".into())) as TokenProvider),
             &api,
         )
         .await
@@ -407,5 +428,62 @@ mod tests {
             .map(|(_, e)| e.clone())
             .collect();
         assert_eq!(buffered, [others(), interactive()]);
+    }
+
+    #[tokio::test]
+    async fn socket_mode_reconnects_when_other_tokens_are_installed() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ws = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}/", ws.local_addr().unwrap());
+        let http = Router::new()
+            .route(
+                "/api/auth.test",
+                post(|| async { axum::Json(json!({"ok": true, "user_id": "UBOT"})) }),
+            )
+            .route(
+                "/api/apps.connections.open",
+                post(move || async move { axum::Json(json!({"ok": true, "url": ws_url})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = Url::parse(&format!("http://{}/api/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
+
+        let app = Arc::new(Mutex::new("xapp-old".to_owned()));
+        let installed = app.clone();
+        let (switched, on_switch) = tokio::sync::oneshot::channel();
+        let slack = tokio::spawn(async move {
+            let (stream, _) = ws.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Frame::text(json!({"type": "hello"}).to_string()))
+                .await
+                .unwrap();
+            // `rho slack init` installs a new app; the old one stays quiet.
+            *installed.lock().unwrap() = "xapp-new".to_owned();
+            switched.send(()).unwrap();
+            socket.next().await
+        });
+
+        let app_token: TokenProvider = Arc::new(move || Ok(app.lock().unwrap().clone()));
+        let connection = tokio::spawn(async move {
+            connect(
+                &Events::default(),
+                &Client::new(),
+                &(Arc::new(|| Ok("xoxb-1".into())) as TokenProvider),
+                &app_token,
+                &api,
+            )
+            .await
+        });
+        on_switch.await.unwrap();
+        // Skip the wait for the next check.
+        tokio::time::pause();
+        tokio::time::timeout(TOKEN_CHECK * 2, connection)
+            .await
+            .expect("the connection ends once the app token changes")
+            .unwrap()
+            .unwrap();
+        // The old connection is gone, not left open beside the new one.
+        assert!(!matches!(slack.await.unwrap(), Some(Ok(Frame::Text(_)))));
     }
 }
