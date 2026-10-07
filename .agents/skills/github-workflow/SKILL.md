@@ -17,7 +17,7 @@ pr = await api.pulls.get(PR_NUMBER)
 
 ## Calls and results
 
-- Methods are async; use `await`. `GhApi(..., sync=True)` is the blocking variant.
+- The client is async-only; use `await` for API calls.
 - Owner/repo defaults can be overridden per call with `owner=` and `repo=`.
 - Discover available methods with `from python_ls import xdir`, then
   `xdir(api)` / `xdir(api.pulls)`. Inspect signatures/docs for parameters.

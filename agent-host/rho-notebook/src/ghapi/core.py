@@ -14,8 +14,8 @@ from urllib.parse import quote
 import httpx2
 from fastcore.all import *
 from fastspec.spec import SpecParser
-from fastspec.oapi import OpenAPIClient, OpFunc, SyncOpFunc
-from fasttransport.core import AsyncTransport, SyncTransport
+from fastspec.oapi import OpenAPIClient, OpFunc
+from fasttransport.core import AsyncTransport
 from fasttransport.errors import APIError
 from .gh_spec import spec
 
@@ -65,12 +65,6 @@ class GhTransport(AsyncTransport):
         self._pre(method, url, kwargs)
         return self._post(await super().request(method, url, raw=True, **kwargs), raw)
 
-
-class GhSyncTransport(SyncTransport, GhTransport):
-    "Sync twin of `GhTransport`: same debug, header, and rate-limit handling over a blocking `SyncTransport`"
-    def request(self, method, url, *, raw=False, **kwargs):
-        self._pre(method, url, kwargs)
-        return self._post(SyncTransport.request(self, method, url, raw=True, **kwargs), raw)
 
 # %% ../nbs/00_core.ipynb #cecd0177
 _gh_override = ContextVar('_gh_override', default={})
@@ -123,26 +117,21 @@ class GhOpFunc(OpFunc):
         return super()._prep(args, kwargs)
 
 
-class GhSyncOpFunc(SyncOpFunc, GhOpFunc):
-    "Sync twin using the same operation validation before blocking requests."
-
-
 class GhApi(OpenAPIClient):
     "Octo-backed client generated from the selected pinned ghapi REST metadata."
     def __init__(self, owner=None, repo=None, *, debug=None, limit_cb=None,
-                 timeout=60.0, sync=False):
+                 timeout=60.0):
         kwargs = {}
         if owner: kwargs['owner'] = owner
         if repo: kwargs['repo'] = repo
         self.headers = {'Accept': 'application/vnd.github+json'}
         self.token, self.gh_host = None, GH_HOST
-        tcls, fcls = (GhSyncTransport, GhSyncOpFunc) if sync else (GhTransport, GhOpFunc)
         socket = Path(os.environ['RHO_SOCKET_PATH']).with_name('octo.sock')
-        transport = (httpx2.HTTPTransport if sync else httpx2.AsyncHTTPTransport)(uds=str(socket))
-        client = (httpx2.Client if sync else httpx2.AsyncClient)(transport=transport, follow_redirects=False, timeout=timeout)
-        self.transport = tcls(debug=debug, limit_cb=limit_cb, timeout=timeout,
-                              base_headers=self.headers, client=client)
-        self.ops = [fcls(o, self.transport, self.gh_host, defaults=_LiveDefaults(kwargs)) for o in pspec.ops]
+        transport = httpx2.AsyncHTTPTransport(uds=str(socket))
+        client = httpx2.AsyncClient(transport=transport, follow_redirects=False, timeout=timeout)
+        self.transport = GhTransport(debug=debug, limit_cb=limit_cb, timeout=timeout,
+                                     base_headers=self.headers, client=client)
+        self.ops = [GhOpFunc(o, self.transport, self.gh_host, defaults=_LiveDefaults(kwargs)) for o in pspec.ops]
         self.func_dict = {f'{o.path}:{o.verb.upper()}': o for o in self.ops}
         self.groups = mk_groups(self.ops)
         for k, v in self.groups.items(): setattr(self, k, v)
@@ -236,12 +225,11 @@ _attachment_types = {
 }
 
 @patch
-def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
+async def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
     """Upload one local image/video through Octo and return its asset response (`.url`).
 
     Uses this client's repository defaults or explicit owner/repo overrides.
     Does not post a comment or edit a body. Requires repository write access.
-    Async clients must await the result; sync clients return it directly.
     """
     path = Path(path)
     content_type = _attachment_types.get(path.suffix.lower())
@@ -255,15 +243,8 @@ def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
         raise ValueError(f"Attachment must be nonempty and at most {limit} bytes")
     body = path.read_bytes()
 
-    def upload(repository):
-        return self("/user-attachments/assets", verb="POST",
-                    query={"name": path.name, "content_type": content_type,
-                           "repository_id": repository.id},
-                    headers={"Content-Type": "application/octet-stream"}, data=body)
-
-    if isinstance(self.transport, GhSyncTransport):
-        return upload(self.repos.get(owner=owner, repo=repo))
-
-    async def run():
-        return await upload(await self.repos.get(owner=owner, repo=repo))
-    return run()
+    repository = await self.repos.get(owner=owner, repo=repo)
+    return await self("/user-attachments/assets", verb="POST",
+                      query={"name": path.name, "content_type": content_type,
+                             "repository_id": repository.id},
+                      headers={"Content-Type": "application/octet-stream"}, data=body)

@@ -44,7 +44,7 @@ owner/repo overrides, and `pr_status`/`check_status` presentation.
 one PR, not the gh CLI's personal PR overview.
 
 Requests use the host's Octo Unix socket without Python-side credentials.
-Both async and sync generated methods reject unknown keywords, missing required
+The async-only generated methods reject unknown keywords, missing required
 parameters, and undeclared `query_`/`body_` fields. Use `result['items']` for
 search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
 `headers_={"Accept": "application/vnd.github.diff"}` or
@@ -53,9 +53,9 @@ search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
 
 `await api.upload_attachment(path, owner=..., repo=...)` uploads a local
 image/video and returns the asset response (`.url`). Owner/repo overrides are
-optional; client defaults apply. A sync client uses the same method without
-`await`. The helper resolves the numeric repository ID with `repos.get` and
-sends raw bytes through the host's fixed `POST /user-attachments/assets` route.
+optional; client defaults apply. The helper resolves the numeric repository ID
+with `repos.get`, then sends raw bytes through the host's fixed
+`POST /user-attachments/assets` route.
 Only that operation targets `uploads.github.com`; ordinary REST requests still
 target `api.github.com`. The pinned REST metadata is unchanged.
 
