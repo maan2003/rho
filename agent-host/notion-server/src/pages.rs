@@ -1,4 +1,4 @@
-//! Which pages agents reach: the root page `rho notion init` names, and
+//! Which pages agents reach: the root page `rho notion root` names, and
 //! the pages under it. Agents create pages there, and read, edit and
 //! comment on them; the rest of the user's workspace stays out of reach.
 //!
@@ -83,7 +83,7 @@ fn root(state: &AppState) -> Result<String, Failure> {
         .ok_or_else(|| {
             Failure::Refused(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "rho_no_notion_root: run `rho notion init` on the agent host".to_owned(),
+                "rho_no_notion_root: run `rho notion root <page URL>` on the agent host".to_owned(),
             )
         })
 }

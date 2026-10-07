@@ -521,6 +521,10 @@ mod tests {
     type Written = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn server(grant: bool, notion: &Url) -> (String, Written) {
+        server_with(grant, true, notion).await
+    }
+
+    async fn server_with(grant: bool, root: bool, notion: &Url) -> (String, Written) {
         let written: Written = Arc::default();
         let read = written.clone();
         let write = written.clone();
@@ -535,11 +539,11 @@ mod tests {
                     .rev()
                     .find(|(key, _)| key == name)
                     .map(|(_, value)| value.clone());
-                match (grant, name, rotated) {
-                    (true, _, Some(value)) => Ok(value),
-                    (true, CLIENT_ID, None) => Ok("client".to_owned()),
-                    (true, REFRESH_TOKEN, None) => Ok("r1".to_owned()),
-                    (true, ROOT_PAGE, None) => Ok(url(ROOT)),
+                match (name, rotated) {
+                    (_, Some(value)) => Ok(value),
+                    (CLIENT_ID, None) if grant => Ok("client".to_owned()),
+                    (REFRESH_TOKEN, None) if grant => Ok("r1".to_owned()),
+                    (ROOT_PAGE, None) if root => Ok(url(ROOT)),
                     _ => anyhow::bail!("no {name}"),
                 }
             }),
@@ -824,13 +828,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_grant_says_how_to_install_one() {
+    async fn without_a_grant_or_a_root_says_how_to_install_them() {
         let (notion, fake) = fake().await;
-        let (server, _) = server(false, &notion).await;
-
-        let (status, body) = call(&server, "notion-fetch", json!({"id": ROOT})).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body["error"].as_str().unwrap().contains("rho notion init"));
+        for (grant, root, command) in [
+            (false, true, "rho notion init"),
+            (true, false, "rho notion root"),
+        ] {
+            let (server, _) = server_with(grant, root, &notion).await;
+            let (status, body) = call(&server, "notion-fetch", json!({"id": ROOT})).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(body["error"].as_str().unwrap().contains(command), "{body}");
+        }
         assert!(fake.lock().unwrap().seen.is_empty());
     }
 }

@@ -308,9 +308,14 @@ pub(crate) struct NotionArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum NotionCommand {
-    /// Sign this host in to Notion MCP as you, in a browser, and name the
-    /// root page agents work under.
+    /// Sign this host in to Notion MCP as you, in a browser.
     Init,
+    /// Name the page agents work under: they reach only it and the pages
+    /// under it.
+    Root {
+        /// The page's URL or ID.
+        page: String,
+    },
 }
 
 #[derive(Clone, clap::Args)]

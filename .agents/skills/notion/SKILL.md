@@ -8,7 +8,7 @@ description: Use when a task needs a Notion page: writing a plan, report or note
 ## When
 
 Agents own pages in one area of the user's Notion: the root page the user
-named in `rho notion init`, and the pages under it. Create a page there
+named with `rho notion root`, and the pages under it. Create a page there
 when the task needs a document people read and comment on, keep it
 current while the task runs, and answer its comments. Nothing else in
 the workspace is reachable.
@@ -51,9 +51,10 @@ Notion's own documentation: read it before a tool's first use.
 Writes need no approval: write when the task calls for it.
 `notion.NotionError` carries the reason: `rho_page_outside_root` for a
 page outside the root, `rho_tool_unavailable` for a tool not on the list
-(do not work around either), `rho_no_notion_grant`,
-`rho_no_notion_root` or `rho_notion_unauthorized` when the host is not
-set up (ask the user to run `rho notion init` on the agent host), or
+(do not work around either), `rho_no_notion_grant` or
+`rho_notion_unauthorized` when the host is not signed in (ask the user to
+run `rho notion init` on the agent host), `rho_no_notion_root` when it has
+no root page (ask the user to run `rho notion root <page URL>`), or
 Notion's own error.
 
 ## Waiting for comments
