@@ -1,6 +1,6 @@
 //! GitHub REST operations from the same pinned metadata used by ghapi.
 //! Reads and writes share a method/path allowlist. Credentials and signed
-//! redirects stay on the host; branch-changing APIs are not exposed.
+//! redirects stay on the host; only selected APIs are exposed.
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
@@ -609,7 +609,7 @@ mod tests {
                 writes += 1;
             }
         }
-        assert_eq!((reads, writes), (91, 40));
+        assert_eq!((reads, writes), (91, 42));
         let uploads: Vec<_> = operations()
             .iter()
             .filter(|op| op.group == "attachments")
@@ -619,7 +619,7 @@ mod tests {
             (uploads[0].verb.as_str(), uploads[0].path.as_str()),
             ("POST", "/user-attachments/assets")
         );
-        for name in ["merge", "merge_async", "update_branch", "dismiss_review"] {
+        for name in ["update_branch", "dismiss_review"] {
             assert!(
                 !operations()
                     .iter()
@@ -1365,6 +1365,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pr_merges_relay_pinned_payloads_results_and_github_rejections() {
+        let cases = vec![
+            (
+                "/repos/acme/widget/pulls/17/merge",
+                json!({"sha":"a".repeat(40),"merge_method":"squash","commit_title":"Reviewed title","commit_message":"Reviewed message"}),
+                StatusCode::OK,
+                json!({"merged":true,"sha":"c".repeat(40),"message":"Pull Request successfully merged"}),
+            ),
+            (
+                "/repos/acme/widget/pulls/17/merge",
+                json!({"sha":"b".repeat(40),"merge_method":"rebase"}),
+                StatusCode::CONFLICT,
+                json!({"message":"Head branch was modified. Review and try again."}),
+            ),
+            (
+                "/repos/acme/widget/pulls/17/merge",
+                json!({"sha":"a".repeat(40),"merge_method":"merge"}),
+                StatusCode::METHOD_NOT_ALLOWED,
+                json!({"message":"Required approving reviews are missing."}),
+            ),
+            (
+                "/repos/acme/widget/pulls/17/merge-async",
+                json!({"sha":"a".repeat(40),"merge_method":"squash","merge_action":"default"}),
+                StatusCode::ACCEPTED,
+                json!({"status":"pending","details":{"uuid":"merge-request-19","expected_head_sha":"a".repeat(40)}}),
+            ),
+            (
+                "/repos/acme/widget/pulls/17/merge-async",
+                json!({"sha":"b".repeat(40),"merge_action":"direct_merge"}),
+                StatusCode::CONFLICT,
+                json!({"status":"pending","details":{"uuid":"existing-request-23","message":"Another request is pending"}}),
+            ),
+            (
+                "/repos/acme/widget/pulls/17/merge-async",
+                json!({"sha":"a".repeat(40),"merge_action":"merge_queue"}),
+                StatusCode::OK,
+                json!({"status":"enqueued","details":{"message":"Added to queue, not merged"}}),
+            ),
+        ];
+        let replies: Vec<_> = cases
+            .iter()
+            .map(|(_, _, status, result)| (*status, result.clone()))
+            .collect();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen = captured.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                let replies = replies.clone();
+                async move {
+                    assert_eq!(method, Method::PUT);
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "Bearer host-token-test"
+                    );
+                    assert!(!headers.contains_key(header::COOKIE));
+                    let mut seen = seen.lock().await;
+                    let reply = replies[seen.len()].clone();
+                    seen.push((uri.to_string(), body.to_vec()));
+                    (reply.0, Json(reply.1))
+                }
+            },
+        )))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        for (path, payload, status, expected) in cases {
+            let body = serde_json::to_vec(&payload).unwrap();
+            let response = client
+                .put(format!("{base}{path}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer agent-token")
+                .header(header::COOKIE, "session=agent")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert_eq!(response.json::<Value>().await.unwrap(), expected);
+            assert_eq!(
+                captured.lock().await.last().unwrap(),
+                &(path.to_owned(), body)
+            );
+        }
+        assert_eq!(captured.lock().await.len(), 6);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn unavailable_methods_and_paths_never_obtain_credentials() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
@@ -1379,17 +1469,23 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
         for (method, path, body) in [
+            (Method::POST, "repos/acme/widget/pulls/7/merge", json!({})),
+            (Method::PATCH, "repos/acme/widget/pulls/7/merge", json!({})),
+            (
+                Method::POST,
+                "repos/acme/widget/pulls/7/merge-async",
+                json!({}),
+            ),
+            (
+                Method::PUT,
+                "repos/acme/widget/pulls/7/merge/extra",
+                json!({}),
+            ),
             (Method::GET, "user-attachments/assets", Value::Null),
             (Method::DELETE, "user-attachments/assets", Value::Null),
             (Method::POST, "user-attachments/assets/7", json!({})),
             (Method::POST, "user-attachments/assets/../other", json!({})),
             (Method::POST, "user-attachments/%2e%2e/assets", json!({})),
-            (Method::PUT, "repos/acme/widget/pulls/7/merge", json!({})),
-            (
-                Method::PUT,
-                "repos/acme/widget/pulls/7/merge-async",
-                json!({}),
-            ),
             (
                 Method::PUT,
                 "repos/acme/widget/pulls/7/update-branch",

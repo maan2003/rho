@@ -23,10 +23,10 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             [o for o in spec["ops"] if (o["group"], o["name"]) not in custom],
             key=lambda o: (o["group"], o["name"]),
         )}
-        self.assertEqual(len(spec["ops"]), 133)
-        self.assertEqual(len(upstream["ops"]), 131)
+        self.assertEqual(len(spec["ops"]), 135)
+        self.assertEqual(len(upstream["ops"]), 133)
         writes = {(op["group"], op["name"]) for op in upstream["ops"] if op["verb"] != "GET"}
-        self.assertEqual(len(writes), 40)
+        self.assertEqual(len(writes), 42)
         self.assertEqual({name for group, name in writes if group == "issues"},
                          {
                              "create", "update", "create_comment", "update_comment", "delete_comment",
@@ -38,7 +38,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                          })
         self.assertEqual(sum(op["verb"] == "GET" for op in upstream["ops"]), 91)
         canonical = json.dumps(upstream, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "adde59131429ceeac4213e46b74a41b52de46af1abfde27358583d81027f4502")
+        self.assertEqual(hashlib.sha256(canonical).hexdigest(), "d63f08f43c2ba055770debb52a9bd2e67d83b35b822048ff0e55bd3ad9dd4658")
         self.assertEqual({o["group"] for o in spec["ops"]},
                          {"actions", "checks", "git", "issues", "pulls", "reactions", "repos", "search"})
         draft = next(o for o in spec["ops"] if (o["group"], o["name"]) == ("pulls", "set_draft"))
@@ -46,6 +46,32 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                          ("PUT", "/repos/{owner}/{repo}/pulls/{pull_number}/draft", ["draft"]))
         self.assertIn("draft", draft["required_params"])
 
+
+    async def test_pr_merge_methods_preserve_head_sha_and_merge_options(self):
+        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+            for sync in (False, True):
+                with self.subTest(sync=sync):
+                    api = GhApi("acme", "widget", sync=sync)
+                    request = Mock(return_value={"merged": True}) if sync else AsyncMock(return_value={"merged": True})
+                    api.transport.request = request
+                    for name, kwargs, expected in (
+                        ("merge", {"sha": "a" * 40, "merge_method": "squash",
+                                   "commit_title": "Reviewed title", "commit_message": "Reviewed message"},
+                         {"sha": "a" * 40, "merge_method": "squash",
+                          "commit_title": "Reviewed title", "commit_message": "Reviewed message"}),
+                        ("merge_async", {"sha": "b" * 40, "merge_method": "rebase", "merge_action": "merge_queue"},
+                         {"sha": "b" * 40, "merge_method": "rebase", "merge_action": "merge_queue"}),
+                    ):
+                        result = getattr(api.pulls, name)(17, **kwargs)
+                        if not sync:
+                            result = await result
+                        self.assertTrue(result.merged)
+                        self.assertEqual(request.call_args.args,
+                                         ("PUT", "http://octo/repos/acme/widget/pulls/17/" + name.replace("_", "-")))
+                        self.assertEqual(request.call_args.kwargs["params"], {})
+                        self.assertEqual(request.call_args.kwargs["json"], expected)
+                    for name in ("update_branch", "dismiss_review"):
+                        self.assertFalse(hasattr(api.pulls, name), name)
 
     async def test_expanded_collaboration_and_code_read_methods(self):
         with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):

@@ -5292,6 +5292,116 @@
     },
     {
       "group": "pulls",
+      "name": "merge",
+      "path": "/repos/{owner}/{repo}/pulls/{pull_number}/merge",
+      "verb": "PUT",
+      "summary": "Merge a pull request",
+      "route_params": [
+        "owner",
+        "repo",
+        "pull_number"
+      ],
+      "body_params": [
+        "commit_title",
+        "commit_message",
+        "sha",
+        "merge_method"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "owner",
+        "pull_number",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "pull_number": "int",
+        "commit_title": "str",
+        "commit_message": "str",
+        "sha": "str",
+        "merge_method": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "pull_number": "The number that identifies the pull request.",
+        "commit_title": "Title for the automatic commit message.",
+        "commit_message": "Extra detail to append to automatic commit message.",
+        "sha": "SHA that pull request head must match to allow merge.",
+        "merge_method": "The merge method to use."
+      },
+      "body_examples": {
+        "response-if-merge-was-successful": {
+          "summary": "",
+          "value": {
+            "commit_title": "Expand enum",
+            "commit_message": "Add a new value to the merge_method enum"
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request"
+    },
+    {
+      "group": "pulls",
+      "name": "merge_async",
+      "path": "/repos/{owner}/{repo}/pulls/{pull_number}/merge-async",
+      "verb": "PUT",
+      "summary": "Merge a pull request asynchronously",
+      "route_params": [
+        "owner",
+        "repo",
+        "pull_number"
+      ],
+      "body_params": [
+        "commit_title",
+        "commit_message",
+        "sha",
+        "merge_method",
+        "merge_action"
+      ],
+      "request_content_type": "application/json",
+      "required_params": [
+        "owner",
+        "pull_number",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "pull_number": "int",
+        "commit_title": "str",
+        "commit_message": "str",
+        "sha": "str",
+        "merge_method": "str",
+        "merge_action": "str"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository. The name is not case sensitive.",
+        "repo": "The name of the repository without the `.git` extension. The name is not case sensitive.",
+        "pull_number": "The number that identifies the pull request.",
+        "commit_title": "Title for the automatic commit message.",
+        "commit_message": "Extra detail to append to automatic commit message.",
+        "sha": "SHA that pull request head must match to allow merge. If not provided, the current head of the PR at the time of the request will be used; if the PR is pushed in between the merge being requested and being executed, the merge will be cancelled.",
+        "merge_method": "The merge method to use.",
+        "merge_action": "The action that will be taken to merge the pull request. `direct_merge` merges the pull request directly without using a merge queue; `merge_queue` adds the pull request to a merge queue; `default` selects the most appropriate option."
+      },
+      "body_examples": {
+        "default": {
+          "summary": "",
+          "value": {
+            "commit_title": "Fix race condition",
+            "commit_message": "Avoids a race by trying to read the file and handling the exception if it does not exist.",
+            "sha": "6358cd125586d9def8c3e5943f23506202da81cc",
+            "merge_method": "squash",
+            "merge_action": "default"
+          }
+        }
+      },
+      "docs_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request-asynchronously"
+    },
+    {
+      "group": "pulls",
       "name": "review_decision",
       "path": "/repos/{owner}/{repo}/pulls/{pull_number}/review-decision",
       "verb": "GET",

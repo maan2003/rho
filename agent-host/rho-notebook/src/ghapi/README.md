@@ -4,8 +4,8 @@ Based on [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5,
 [`81b28a5`](https://github.com/AnswerDotAI/ghapi/commit/81b28a5325b311e9878a676a57fef801093242f6)
 (Apache-2.0; see `LICENSE`).
 
-`gh_spec.json` contains complete, unmodified upstream metadata for 131 REST
-operations: 91 reads and 40 writes. It also defines Octo-only
+`gh_spec.json` contains complete, unmodified upstream metadata for 133 REST
+operations: 91 reads and 42 writes. It also defines Octo-only
 `pulls.review_decision` and `pulls.set_draft` helpers backed by fixed,
 typed GraphQL operations.
 
@@ -26,8 +26,10 @@ and `""` remain values. Octo does not drop or interpret nulls: GitHub decides
 whether a field accepts null. There is no schema generator, REST request/response
 model, or write wrapper.
 
-The selected PR surface excludes merging (sync/async), head-branch updates,
-and dismissing another review. Generic GraphQL, Git/ref/content writes,
+The selected PR surface includes standard and asynchronous merges. Merge calls
+require specific user approval and project-required reviews/checks; pin the
+reviewed head with `sha`. Head-branch updates and review dismissal remain excluded.
+Generic GraphQL, Git/ref/content writes,
 repository administration, credential operations, workflow dispatch/deployment,
 issue locking/pinning/suggestion moderation, and label/milestone administration
 are not exposed. `issues.update` still supports milestone assignment.

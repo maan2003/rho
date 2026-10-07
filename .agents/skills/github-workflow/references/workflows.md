@@ -31,6 +31,22 @@ issue/PR metadata. Reviewers use `pulls.request_reviewers` and
 `pulls.remove_requested_reviewers`. Re-check existing posts before retrying
 an uncertain write; Octo does not deduplicate them.
 
+## Merge an approved PR
+
+Get the user's approval for this merge and wait for the project's required
+review approvals and checks. Read the current PR and its review/CI status.
+If its head changed after review or approval, resolve that before proceeding.
+Pin the reviewed head to prevent a different revision from merging:
+```python
+result = await api.pulls.merge(number, sha=reviewed_head_sha, merge_method="squash")
+```
+Check `result.merged`; an HTTP response alone is not proof of a merge.
+`pulls.merge_async(number, sha=reviewed_head_sha, merge_action="default")`
+supports asynchronous/merge-queue requests. Poll
+`pulls.get_merge_async_result(number, result.details.uuid)` while pending.
+`enqueued` means queued, not merged; confirm with `pulls.get(number).merged`.
+Do not bypass repository rules or blindly retry a rejected/uncertain merge.
+
 ## CI, logs, and reruns
 
 After a push, inspect the current head:
