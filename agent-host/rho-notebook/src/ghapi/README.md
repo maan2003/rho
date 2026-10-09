@@ -23,8 +23,8 @@ client still checks declared argument names and missing required parameters.
 
 Omission or `UNSET` leaves a field out; `None` sends JSON null, and `False`, `0`,
 and `""` remain values. Octo does not drop or interpret nulls: GitHub decides
-whether a field accepts null. There is no schema generator, REST request/response
-model, or write wrapper.
+whether a field accepts null. There is no schema generator or REST request/response
+model.
 
 The selected PR surface includes standard and asynchronous merges. Merge calls
 require specific user approval and project-required reviews/checks; pin the
@@ -50,6 +50,13 @@ search rows: attribute `.items` is a dict method. Full PR diff/patch reads use
 `headers_={"Accept": "application/vnd.github.diff"}` or
 `application/vnd.github.patch`. Draft/ready transitions use
 `await api.pulls.set_draft(number, draft=True/False)`.
+`pulls.update(number, draft=True/False, ...)` also supports draft state without
+changing the pinned REST metadata. It sends other edits through PATCH first,
+then changes draft state through the fixed Octo helper and reads the refreshed PR.
+The writes are not atomic; if the draft transition fails, earlier edits can remain.
+Draft must be a boolean and cannot be combined with `stream=True`; `raw_=True`
+returns the final PR read response. Omitted draft or `UNSET` preserves ordinary
+PATCH behavior.
 
 `await api.upload_attachment(path, owner=..., repo=...)` uploads a local
 image/video and returns the asset response (`.url`). Owner/repo overrides are

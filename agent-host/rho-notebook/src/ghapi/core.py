@@ -6,6 +6,7 @@ Upstream: https://github.com/AnswerDotAI/ghapi (81b28a5325b311e9878a676a57fef801
 from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime
+from dataclasses import replace
 import os
 import stat
 from pathlib import Path
@@ -116,6 +117,27 @@ class GhOpFunc(OpFunc):
                 raise TypeError(f"{self.name}: unsupported {option} field(s): {', '.join(sorted(unknown))}")
         return super()._prep(args, kwargs)
 
+    async def __call__(self, *args, **kwargs):
+        if self.group != "pulls" or self.name != "update":
+            return await super().__call__(*args, **kwargs)
+        stream, url, headers, query, route, kw = self._prep(args, kwargs)
+        draft = kw["body"].pop("draft", UNSET)
+        if draft is UNSET:
+            if stream: return self._stream(url, headers=headers, query=query, **kw)
+            return await self._request(url, headers=headers, query=query, **kw)
+        if not isinstance(draft, bool):
+            raise TypeError("update: draft must be a bool")
+        if stream:
+            raise TypeError("update: draft cannot be combined with stream=True")
+        # GitHub's PATCH does not accept draft. These two writes are not atomic:
+        # stop on either failure and never retry an uncertain write here.
+        if kw["body"]:
+            await self._request(url, headers=headers, query=query, **kw)
+        await self.client.request("PUT", url + "/draft",
+                                  headers=headers, json={"draft": draft})
+        return dict2obj(await self.client.request("GET", url, headers=headers,
+                                                 raw=kwargs.get("raw_", False)))
+
 
 class GhApi(OpenAPIClient):
     "Octo-backed client generated from the selected pinned ghapi REST metadata."
@@ -131,7 +153,14 @@ class GhApi(OpenAPIClient):
         client = httpx2.AsyncClient(transport=transport, follow_redirects=False, timeout=timeout)
         self.transport = GhTransport(debug=debug, limit_cb=limit_cb, timeout=timeout,
                                      base_headers=self.headers, client=client)
-        self.ops = [GhOpFunc(o, self.transport, self.gh_host, defaults=_LiveDefaults(kwargs)) for o in pspec.ops]
+        self.ops = []
+        for op in pspec.ops:
+            if op.group == "pulls" and op.name == "update":
+                op = replace(op, body_params=[*op.body_params, "draft"],
+                             param_types={**op.param_types, "draft": bool},
+                             param_docs={**op.param_docs, "draft":
+                                 "Change draft state through Octo after other edits; writes are not atomic."})
+            self.ops.append(GhOpFunc(op, self.transport, self.gh_host, defaults=_LiveDefaults(kwargs)))
         self.func_dict = {f'{o.path}:{o.verb.upper()}': o for o in self.ops}
         self.groups = mk_groups(self.ops)
         for k, v in self.groups.items(): setattr(self, k, v)

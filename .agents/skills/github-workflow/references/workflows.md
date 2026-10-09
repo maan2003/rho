@@ -10,8 +10,11 @@ pr = await api.pulls.create(head="rho/CHANGE", base="BASE",
                             title="TITLE", body="BODY", draft=True)
 ```
 Use `draft=False` or omit it for a normal PR. Edit with
-`api.pulls.update(number, title=..., body=..., base=..., state=...)`.
-Draft transitions use `api.pulls.set_draft(number, draft=True/False)`.
+`await api.pulls.update(number, title=..., body=..., base=..., state=..., draft=False)`.
+`draft=False` marks ready for review; `draft=True` converts to draft.
+Mixed edits update PR fields first, then draft state, and return the refreshed PR.
+These writes are not atomic: if the draft transition fails, other edits can remain.
+For only draft state, `await api.pulls.set_draft(number, draft=True/False)` remains available.
 `api.pulls.review_decision(number)` returns `.review_decision` (`NONE` when null).
 
 ```python

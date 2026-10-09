@@ -54,6 +54,93 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     GhApi(sync=sync)
         self.assertTrue(inspect.iscoroutinefunction(GhApi.upload_attachment))
 
+    async def test_pr_update_routes_draft_separately_and_returns_refreshed_pr(self):
+        from fastcore.all import UNSET
+
+        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+            api = GhApi("acme", "widget")
+            self.assertIn("draft", inspect.signature(api.pulls.update).parameters)
+            request = AsyncMock()
+            api.transport.request = request
+            for draft in (False, True):
+                with self.subTest(draft=draft):
+                    request.reset_mock()
+                    request.side_effect = [
+                        {"draft": draft}, {"number": 17, "draft": draft, "title": "Current"},
+                    ]
+                    result = await api.pulls.update(17, draft=draft)
+                    self.assertEqual((result.number, result.draft, result.title), (17, draft, "Current"))
+                    self.assertEqual([c.args for c in request.call_args_list], [
+                        ("PUT", "http://octo/repos/acme/widget/pulls/17/draft"),
+                        ("GET", "http://octo/repos/acme/widget/pulls/17"),
+                    ])
+                    self.assertEqual(request.call_args_list[0].kwargs["json"], {"draft": draft})
+
+            request.reset_mock()
+            request.side_effect = [
+                {"number": 23, "title": "Edited", "draft": True},
+                {"draft": False},
+                {"number": 23, "title": "Edited", "draft": False},
+            ]
+            result = await api.pulls.update(
+                pull_number=23, owner="other", repo="project",
+                title="Edited", body=None, maintainer_can_modify=False,
+                draft=True, body_={"draft": False}, headers_={"X-Test": "yes"})
+            self.assertEqual((result.number, result.title, result.draft), (23, "Edited", False))
+            self.assertEqual([c.args for c in request.call_args_list], [
+                ("PATCH", "http://octo/repos/other/project/pulls/23"),
+                ("PUT", "http://octo/repos/other/project/pulls/23/draft"),
+                ("GET", "http://octo/repos/other/project/pulls/23"),
+            ])
+            self.assertEqual(request.call_args_list[0].kwargs["json"],
+                             {"title": "Edited", "body": None, "maintainer_can_modify": False})
+            self.assertEqual(request.call_args_list[1].kwargs["json"], {"draft": False})
+            for call in request.call_args_list:
+                self.assertEqual(call.kwargs["headers"], {"X-Test": "yes"})
+
+            request.reset_mock()
+            request.side_effect = None
+            raw = object()
+            request.return_value = raw
+            self.assertIs(await api.pulls.update(31, draft=False, raw_=True), raw)
+            self.assertTrue(request.call_args.kwargs["raw"])
+            request.reset_mock()
+            await api.pulls.update(31, title="Only metadata", draft=UNSET)
+            request.assert_awaited_once()
+            self.assertEqual(request.call_args.args, ("PATCH", "http://octo/repos/acme/widget/pulls/31"))
+            self.assertEqual(request.call_args.kwargs["json"], {"title": "Only metadata"})
+
+    async def test_pr_update_validates_before_writes_and_stops_on_failure(self):
+        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+            api = GhApi("acme", "widget")
+            request = AsyncMock()
+            api.transport.request = request
+            for kwargs in (
+                {"draft": None}, {"draft": 0}, {"draft": "false"},
+                {"draft": False, "stream": True},
+                {"draft": False, "title": "Edited", "sttae": "closed"},
+                {"body_": {"draft": False, "sttae": "closed"}},
+                {"draft": False, "owner": None},
+            ):
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(TypeError):
+                        await api.pulls.update(17, **kwargs)
+            request.assert_not_called()
+            with self.assertRaises(TypeError):
+                await api.pulls.update(draft=False)
+            request.assert_not_called()
+
+            for failure_at, responses, methods in (
+                ("metadata", [RuntimeError("metadata rejected")], ["PATCH"]),
+                ("draft", [{"title": "Edited"}, RuntimeError("draft rejected")], ["PATCH", "PUT"]),
+            ):
+                with self.subTest(failure_at=failure_at):
+                    request.reset_mock()
+                    request.side_effect = responses
+                    with self.assertRaisesRegex(RuntimeError, failure_at + " rejected"):
+                        await api.pulls.update(17, title="Edited", draft=False)
+                    self.assertEqual([c.args[0] for c in request.call_args_list], methods)
+
     async def test_pr_merge_methods_preserve_head_sha_and_merge_options(self):
         with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
             api = GhApi("acme", "widget")
@@ -443,6 +530,13 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                             }),
                             ("PUT", "/repos/acme/widget/pulls/17/draft", {"draft": True}),
                             ("PUT", "/repos/acme/widget/pulls/17/draft", {"draft": False}),
+                        ])
+                        updated = await api.pulls.update(23, title="Ready PR", draft=False)
+                        self.assertEqual(updated.id, 42)
+                        self.assertEqual(requests[-3:], [
+                            ("PATCH", "/repos/acme/widget/pulls/23", {"title": "Ready PR"}),
+                            ("PUT", "/repos/acme/widget/pulls/23/draft", {"draft": False}),
+                            ("GET", "/repos/acme/widget/pulls/23", None),
                         ])
                         diff = await api.pulls.get(17,
                                             headers_={"Accept": "application/vnd.github.diff"})
