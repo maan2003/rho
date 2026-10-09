@@ -66,6 +66,9 @@
       "return_im",
       "users"
     ],
+    "conversations.join": [
+      "channel"
+    ],
     "chat.postMessage": [
       "channel",
       "text",

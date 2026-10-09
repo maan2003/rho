@@ -44,7 +44,8 @@ cursor pagination:
   `conversations_info`, `conversations_history`, `conversations_replies`,
   `conversations_list`, `conversations_members`, `reactions_get`,
   `chat_getPermalink`.
-- Writes: `conversations_open`, `chat_postMessage`, `chat_update`,
+- Writes: `conversations_open`, `conversations_join` (public channels
+  only; a private channel needs an invite), `chat_postMessage`, `chat_update`,
   `chat_delete`, `reactions_add`, `reactions_remove`, and
   `files_upload_v2` (through `files_getUploadURLExternal` and
   `files_completeUploadExternal`).

@@ -24,9 +24,11 @@ oauth_config:
       - im:read
       - im:history
       - mpim:read
+      - mpim:write
       - mpim:history
       - channels:read
       - channels:history
+      - channels:join
       - groups:read
       - groups:history
       - users:read
