@@ -24,7 +24,7 @@ from asyncio import events
 from concurrent.futures import thread as executor_thread
 
 CELL = contextvars.ContextVar('rho_cell', default=None)
-OUTPUT_TOKEN_LIMIT = 10000
+OUTPUT_TOKEN_LIMIT = 100000
 # Ended tasks `Task.from_session_id` still finds: a report can name a task
 # that ends before the model's next cell runs.
 ENDED_TASKS_KEPT = 1000

@@ -179,7 +179,7 @@ The Python standard library, PyYAML, and HTTPX are available. Python runs in-pro
 security sandbox. Cwd is notebook-local; other process-global APIs retain their normal semantics.
 Native extension packages are unsupported.
 
-Output budgets are capped at 10000 tokens. Commands retain their first 4 MiB. Displayed session
+Output budgets are capped at 100000 tokens. Commands retain their first 4 MiB. Displayed session
 IDs are reusable labels; use Python handles to control work.
 
 ### Compaction and restart

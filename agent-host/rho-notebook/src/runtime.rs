@@ -265,7 +265,7 @@ impl Driver {
             Kind::Task,
             name,
             SourceId(parent),
-            10000,
+            100_000,
             None,
             None,
         ));

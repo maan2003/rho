@@ -16,7 +16,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 
-const MAX_OUTPUT_TOKENS: usize = 10_000;
+const MAX_OUTPUT_TOKENS: usize = 100_000;
 const APPROX_BYTES_PER_TOKEN: u64 = 4;
 
 #[derive(Debug)]

@@ -22,7 +22,7 @@ use crate::source::{
 };
 
 /// How much of one cell's own output a report carries.
-const CELL_TOKENS: usize = 10000;
+const CELL_TOKENS: usize = 100_000;
 /// Images one source may show.
 const IMAGE_LIMIT: usize = 20;
 

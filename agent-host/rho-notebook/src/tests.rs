@@ -308,6 +308,20 @@ async fn a_caught_created_task_exception_is_not_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn budgets_above_ten_thousand_tokens_return_whole_output() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run(
+        "print('p' * 100000, max_tokens=30000)\njob = command(\"head -c 100000 /dev/zero | tr '\\\\0' c\", max_tokens=30000)"
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(text.contains(&"p".repeat(100000)), "print was cut");
+    assert!(text.contains(&"c".repeat(100000)), "command was cut");
+    assert!(!text.contains("truncated"), "{}", &text[..200]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
     let (notebook, wake) = notebook();
     let cell = notebook

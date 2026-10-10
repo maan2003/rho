@@ -26,6 +26,9 @@ const DEFAULT_COMMAND: &str = "claude";
 #[allow(dead_code)]
 const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "390000";
+/// Above this Claude Code saves a tool result to a file for its own read
+/// tools, which Rho disables; the notebook's budgets bound results instead.
+const MAX_MCP_OUTPUT_TOKENS: &str = "1000000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -116,6 +119,7 @@ impl ClaudeCodeOptions {
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
             CLAUDE_CODE_AUTO_COMPACT_WINDOW,
         );
+        command.env("MAX_MCP_OUTPUT_TOKENS", MAX_MCP_OUTPUT_TOKENS);
         command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
         // Built-in commit and PR workflow instructions are written for git and

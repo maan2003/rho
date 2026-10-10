@@ -15,7 +15,7 @@ use crate::runtime::{Build, Inbox, Message, Reply, resolved};
 use crate::source::{CommandExit, Kind, Log, Process, Source, SourceId};
 
 const LOG_LIMIT: usize = 4 * 1024 * 1024;
-const OUTPUT_TOKEN_LIMIT: usize = 10000;
+const OUTPUT_TOKEN_LIMIT: usize = 100_000;
 
 fn command_name(cmd: &str) -> String {
     let mut name = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
