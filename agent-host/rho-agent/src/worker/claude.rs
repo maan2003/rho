@@ -2576,7 +2576,11 @@ impl ClaudeLoop {
                 let Some(item) = ClaudeStreamItem::from_content_block(content_block)? else {
                     return Ok(());
                 };
-                let streaming = item.to_streaming_context_item()?;
+                // A call the model misnamed is not a context item. Claude Code
+                // answers it with an error, so the turn goes on without it.
+                let Ok(streaming) = item.to_streaming_context_item() else {
+                    return Ok(());
+                };
                 self.stream_items.insert(index, item);
                 let slot = self.tail_slot(index);
                 self.pending_response
