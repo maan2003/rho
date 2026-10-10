@@ -1104,9 +1104,8 @@ pub(crate) fn claude_prompt(
 
 ## Claude Code transport
 
-The `exec` described below is the `mcp__py__exec` tool, with one Python source
-string. Claude Code built-in tools are disabled; make one notebook call per
-response. CLI Result prose is not a final answer and is not delivered to anyone.
+The `exec` tool described below takes one Python source string. Claude Code
+built-in tools are disabled; make one notebook call per response. CLI Result prose is not a final answer and is not delivered to anyone.
 If you write prose without a call, the host will remind you to make one;
 repeated prose-only responses stop until the user writes.
 When an exec that called end_turn() returns, Claude Code ends your turn.
@@ -1662,7 +1661,8 @@ mod tests {
         }
         assert!(claude[0].contains("human.send(text, *, kind)"));
         for prompt in &claude {
-            assert!(prompt.contains("mcp__py__exec"));
+            assert!(prompt.contains("The `exec` tool described below"));
+            assert!(!prompt.contains("mcp__py__exec"));
             assert!(prompt.contains("The check-in comes 120 seconds after your last response"));
         }
     }
@@ -1684,7 +1684,8 @@ mod tests {
             let prompt = claude_prompt(None, Some(&team), role);
             assert!(prompt.contains("eng-child"));
             assert!(prompt.contains("eng-parent"));
-            assert!(prompt.contains("mcp__py__exec"));
+            assert!(prompt.contains("The `exec` tool described below"));
+            assert!(!prompt.contains("mcp__py__exec"));
             assert!(prompt.contains("agents.message(*, agent_id: str"));
             assert!(prompt.contains("end_turn()"));
             assert!(prompt.contains("CLI Result prose is not a final answer"));

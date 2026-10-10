@@ -1570,6 +1570,8 @@ impl ClaudeLoop {
         options.session = session;
         options.set_env("RHO_AGENT_ID", self.role.full_handle(self.agent_id));
         self.ensure_python().await?;
+        // SDK-hosted tools use their bare names, matching Rho's native exec.
+        options.set_env("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", "1");
         // Tool search would defer the one tool behind a lookup; the deny
         // list in the generated settings removes ToolSearch too. The
         // timeout is the CLI's ceiling on an open exec call.
@@ -2538,7 +2540,7 @@ impl ClaudeLoop {
             rho_claude::protocol::MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block: rho_claude::protocol::StreamContentBlock::ToolUse { id, name, .. },
-            } if name == "mcp__py__exec" => {
+            } if matches!(name.as_str(), "exec" | "mcp__py__exec") => {
                 let id = rho_agent_types::transcript::ExecId::try_from(id.as_str())?;
                 self.response_execs.insert(*index, id.clone());
                 self.observe_exec(id, rho_agent_types::ExecMilestone::FirstBlock, now)
@@ -2913,7 +2915,7 @@ mod tests {
             1,
             ClaudeStreamItem::ToolUse {
                 id: "exec-1".into(),
-                name: "mcp__py__exec".into(),
+                name: "exec".into(),
                 arguments: r#"{"source":"human.send('Hel"#.into(),
             },
         );
@@ -2938,7 +2940,7 @@ mod tests {
         let mut pending = PendingInferenceResponse::default();
         let call = ClaudeStreamItem::ToolUse {
             id: "call-1".into(),
-            name: "mcp__py__exec".into(),
+            name: "exec".into(),
             arguments: "{}".into(),
         };
         pending.apply(
@@ -3005,7 +3007,7 @@ mod tests {
             4,
             ClaudeStreamItem::ToolUse {
                 id: "call-1".into(),
-                name: "mcp__py__exec".into(),
+                name: "exec".into(),
                 arguments: "{\"code\":\"print(1)\"}".into(),
             },
         );

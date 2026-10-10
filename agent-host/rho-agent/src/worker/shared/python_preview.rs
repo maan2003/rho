@@ -12,7 +12,7 @@ pub(crate) fn tool_preview(
     use rho_agents_client::protocol::transcript::ArgumentsFormat;
     let source = match (name, format) {
         ("exec", ArgumentsFormat::Text) => arguments.to_owned(),
-        ("mcp__py__exec", ArgumentsFormat::Json) => {
+        ("exec" | "mcp__py__exec", ArgumentsFormat::Json) => {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) {
                 value.get("source")?.as_str()?.to_owned()
             } else {
@@ -693,7 +693,7 @@ mod tests {
         {
             let prefix = &arguments[..i];
             let draft = tool_preview(
-                "mcp__py__exec",
+                "exec",
                 prefix,
                 rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
             );

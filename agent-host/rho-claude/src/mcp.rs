@@ -7,8 +7,8 @@ use rho_agent_types::ToolOutputStatus;
 use rho_agent_types::transcript::{ExecId, ToolName, ToolOutput, ToolSpec, ToolType};
 use serde_json::{Value, json};
 
-/// The server's name in Claude Code, which is where the model's tool name
-/// `mcp__py__exec` comes from: Claude Code offers no other naming.
+/// The SDK server's routing name. Rho sets `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`
+/// so the model sees the bare tool name `exec`.
 pub const SERVER_NAME: &str = "py";
 pub const TOOL_NAME: &str = "exec";
 
