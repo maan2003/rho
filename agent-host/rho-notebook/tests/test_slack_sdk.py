@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from slack_sdk.rho import Subscriptions
+from slack_sdk.rho import Subscriptions, download
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -47,8 +47,10 @@ class FakeSlackServer:
             reply = reply.pop(0) if len(reply) > 1 else reply[0]
         if callable(reply):
             reply = await reply()
-        payload = json.dumps(reply).encode()
-        writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        status, reply = reply if isinstance(reply, tuple) else (200, reply)
+        payload, content_type = ((reply, "application/octet-stream") if isinstance(reply, bytes)
+                                 else (json.dumps(reply).encode(), "application/json"))
+        writer.write(f"HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n"
                      f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
         await writer.drain()
         writer.close()
@@ -166,6 +168,25 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         get_url, complete = requests
         self.assertEqual(get_url["query"], {"filename": ["ci.log"], "length": ["8"]})
         self.assertEqual(json.loads(complete["query"]["files"][0]), [{"id": "F1", "title": "ci.log"}])
+
+    async def test_download_returns_the_bytes_and_raises_on_refusals(self):
+        url = "https://files.slack.com/files-pri/T1-F1/download/a b.tgz?origin_team=T1&x=1"
+        tgz = bytes(range(256)) * 3
+
+        async def body():
+            self.assertEqual(await download(url), tgz)
+            for error in ("rho_invalid_arguments: url must start with https://files.slack.com/", "HTTP 403"):
+                with self.assertRaises(SlackApiError) as raised:
+                    await download(url)
+                self.assertEqual(raised.exception.response["error"], error)
+
+        requests = await self.run_with({"/download": [
+            tgz,
+            (400, {"ok": False, "error": "rho_invalid_arguments: url must start with https://files.slack.com/"}),
+            (403, b"<html>login</html>"),
+        ]}, body)
+
+        self.assertEqual([(r["method"], r["query"]) for r in requests], [("GET", {"url": [url]})] * 3)
 
     async def test_async_socket_mode_client_runs_listeners_from_rho_events(self):
         async def body():

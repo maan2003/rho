@@ -61,6 +61,13 @@
       "channel",
       "message_ts"
     ],
+    "files.info": [
+      "file",
+      "count",
+      "cursor",
+      "limit",
+      "page"
+    ],
     "conversations.open": [
       "channel",
       "return_im",

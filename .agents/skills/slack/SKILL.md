@@ -43,7 +43,7 @@ cursor pagination:
 - Reads: `auth_test`, `users_info`, `users_lookupByEmail`, `users_list`,
   `conversations_info`, `conversations_history`, `conversations_replies`,
   `conversations_list`, `conversations_members`, `reactions_get`,
-  `chat_getPermalink`.
+  `chat_getPermalink`, `files_info`.
 - Writes: `conversations_open`, `conversations_join` (public channels
   only; a private channel needs an invite), `chat_postMessage`, `chat_update`,
   `chat_delete`, `reactions_add`, `reactions_remove`, and
@@ -58,6 +58,23 @@ succeeds also depends on the scopes the user gave the app: report
 `missing_scope` to the user. `rho_no_slack_token` or
 `rho_no_slack_app_token` means the host has no Slack app yet: ask the user
 to create one from `rho slack manifest` and run `rho slack init`.
+
+## Downloading files
+
+A file someone shared is in the message's `files`, or from
+`files_info(file=...)`. Its `url_private_download` needs the bot token, so
+fetch it through the host; it fetches only `https://files.slack.com/` URLs
+and raises `SlackApiError` on a refusal:
+
+```python
+from slack_sdk.rho import download
+info = (await slack.files_info(file="F0123ABCD"))["file"]
+Path(info["name"]).write_bytes(await download(info["url_private_download"]))
+```
+
+The bot sees only files shared in conversations it is in. `missing_scope`
+from `files_info`, or `HTTP 302` from `download`, means the app lacks
+`files:read`: ask the user to add it and reinstall the app.
 
 ## Waiting for replies
 

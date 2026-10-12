@@ -7,7 +7,8 @@
 //! with people. Slack validates the arguments.
 //!
 //! One method is the server's own: `rho.events` long-polls the events the
-//! app's Socket Mode connection receives (see [`events`]).
+//! app's Socket Mode connection receives (see [`events`]). `GET /download`
+//! fetches a file Slack hosts, which also needs the bot token.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -15,11 +16,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, get};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use tokio::net::UnixListener;
@@ -35,6 +36,7 @@ struct AppState {
     token_provider: TokenProvider,
     app_token: TokenProvider,
     slack_api_url: Url,
+    slack_files_url: Url,
     events: Arc<Events>,
 }
 
@@ -88,6 +90,7 @@ pub fn router(
     token_provider: TokenProvider,
     app_token: TokenProvider,
     slack_api_url: Url,
+    slack_files_url: Url,
     events: Arc<Events>,
 ) -> Router {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -99,10 +102,12 @@ pub fn router(
         token_provider,
         app_token,
         slack_api_url,
+        slack_files_url,
         events,
     });
     Router::new()
         .route("/api/{method}", any(call))
+        .route("/download", get(download))
         .with_state(state)
 }
 
@@ -140,9 +145,8 @@ async fn call(
     if method == "rho.events" {
         return wait_for_events(&state, query.as_deref().unwrap_or_default()).await;
     }
-    let token = match (state.token_provider)() {
-        Ok(token) if !token.trim().is_empty() => token.trim().to_owned(),
-        _ => return slack_error("rho_no_slack_token: run `rho slack init` on the agent host"),
+    let Some(token) = bot_token(&state) else {
+        return slack_error(NO_TOKEN);
     };
     let mut url = state.slack_api_url.clone();
     url.path_segments_mut()
@@ -173,6 +177,58 @@ async fn call(
         Ok(body) => (status, forwarded, body).into_response(),
         Err(error) => slack_error(&format!("rho_slack_unreachable: {error}")),
     }
+}
+
+fn bot_token(state: &AppState) -> Option<String> {
+    let token = (state.token_provider)().ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+const NO_TOKEN: &str = "rho_no_slack_token: run `rho slack init` on the agent host";
+
+/// `GET /download?url=...`: the bytes of a file Slack hosts, such as a
+/// file's `url_private_download`, fetched with the bot token. The token goes
+/// only to Slack's file host. A refusal is a Slack-shaped error with a
+/// non-2xx status, so it cannot pass for the file.
+async fn download(State(state): State<Arc<AppState>>, RawQuery(query): RawQuery) -> Response {
+    let url = url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes())
+        .find(|(name, _)| name == "url")
+        .and_then(|(_, url)| Url::parse(&url).ok())
+        .filter(|url| url.origin() == state.slack_files_url.origin());
+    let Some(url) = url else {
+        let error = format!(
+            "rho_invalid_arguments: url must start with {}",
+            state.slack_files_url
+        );
+        return (StatusCode::BAD_REQUEST, slack_error(&error)).into_response();
+    };
+    let Some(token) = bot_token(&state) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, slack_error(NO_TOKEN)).into_response();
+    };
+    let response = match state.client.get(url).bearer_auth(token).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = format!("rho_slack_unreachable: {error}");
+            return (StatusCode::BAD_GATEWAY, slack_error(&error)).into_response();
+        }
+    };
+    let mut forwarded = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::RETRY_AFTER,
+    ] {
+        if let Some(value) = response.headers().get(&name) {
+            forwarded.insert(name, value.clone());
+        }
+    }
+    (
+        response.status(),
+        forwarded,
+        Body::from_stream(response.bytes_stream()),
+    )
+        .into_response()
 }
 
 /// `rho.events`: `cursor` and `timeout` (seconds) arrive as query parameters.
@@ -265,6 +321,7 @@ mod tests {
         let app = router(
             Arc::new(move || Ok(token.to_owned())),
             Arc::new(move || Ok(token.to_owned())),
+            slack.clone(),
             slack,
             Arc::default(),
         );
@@ -340,12 +397,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn downloads_only_from_the_file_host_with_the_host_token() {
+        let (slack, seen) = fake_slack().await;
+        let files = slack.origin().ascii_serialization();
+        let port = slack.port().unwrap();
+        let server = server("xoxb-host", slack).await;
+        let download = |url: &str| {
+            reqwest::Client::new()
+                .get(format!("{server}/download"))
+                .query(&[("url", url)])
+                .bearer_auth("xoxb-agent")
+                .send()
+        };
+
+        for url in [
+            format!("http://localhost:{port}/files-pri/T1-F1/a.tgz"),
+            format!("https://127.0.0.1:{port}/files-pri/T1-F1/a.tgz"),
+            format!("http://127.0.0.1:{}/files-pri/T1-F1/a.tgz", port + 1),
+            "files-pri/T1-F1/a.tgz".to_owned(),
+        ] {
+            let response = download(&url).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{url}");
+            let error = response.json::<Value>().await.unwrap()["error"].clone();
+            assert!(
+                error
+                    .as_str()
+                    .unwrap()
+                    .starts_with("rho_invalid_arguments: url must start with"),
+                "{url}: {error}"
+            );
+        }
+        let missing = reqwest::get(format!("{server}/download")).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty());
+
+        let response = download(&format!("{files}/files-pri/T1-F1/a.tgz?t=1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(
+                "GET".to_owned(),
+                "/files-pri/T1-F1/a.tgz?t=1".to_owned(),
+                "Bearer xoxb-host".to_owned(),
+                String::new(),
+                String::new(),
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn rho_events_long_polls_with_query_parameters() {
         let (slack, seen) = fake_slack().await;
         let events = Arc::new(Events::default());
         let app = router(
             Arc::new(|| Ok("xoxb-host".to_owned())),
             Arc::new(|| Ok("xapp-host".to_owned())),
+            slack.clone(),
             slack,
             events.clone(),
         );

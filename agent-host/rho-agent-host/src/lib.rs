@@ -362,6 +362,7 @@ fn spawn_slack_server(
         secret("SLACK_BOT_TOKEN"),
         secret("SLACK_APP_TOKEN"),
         slack_api_url,
+        url::Url::parse("https://files.slack.com/")?,
         events,
     );
     tokio::spawn(async move {

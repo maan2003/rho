@@ -1,4 +1,5 @@
-"""Thread and channel subscriptions over the agent host's Slack event buffer.
+"""Thread and channel subscriptions over the agent host's Slack event buffer,
+and downloads of files Slack hosts.
 
 Not part of upstream slack_sdk. An agent subscribes to the threads and
 channels it cares about. One long poll of `rho.events` serves them all and
@@ -10,6 +11,8 @@ only.
 import asyncio
 import inspect
 import logging
+import os
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
@@ -94,6 +97,23 @@ class Subscriptions:
                 await result
         except Exception:
             self.logger.exception("A Slack subscription callback failed")
+
+
+async def download(url: str, *, timeout: float = 300) -> bytes:
+    """The bytes of a file Slack hosts, such as `url_private_download` from
+    `files_info`. The host adds the bot token and fetches only
+    `https://files.slack.com/` URLs. Raises `SlackApiError` when the host or
+    Slack refuses."""
+    socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+    async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=timeout) as client:
+        resp = await client.get("http://slack/download", params={"url": url})
+    if resp.status_code != 200:
+        try:
+            error = resp.json()["error"]
+        except (ValueError, KeyError, TypeError):
+            error = f"HTTP {resp.status_code}"
+        raise SlackApiError(f"Downloading {url} failed", {"ok": False, "error": error})
+    return resp.content
 
 
 def _thread(event: dict) -> Tuple[Optional[str], Optional[str]]:
