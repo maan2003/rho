@@ -1135,6 +1135,14 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
         },
+        (
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Medium1 | EngineerIntelligence::High1,
+            },
+            AgentRole::Engineer { .. },
+        ) => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium1,
+        },
         (_, AgentRole::Engineer { .. }) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         },
@@ -1172,24 +1180,26 @@ mod tests {
     }
 
     #[test]
-    fn every_non_mini_engineer_spawns_a_medium_engineer() {
-        let medium = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        };
-        for intelligence in [
-            EngineerIntelligence::Medium,
-            EngineerIntelligence::High,
-            EngineerIntelligence::Medium1,
-            EngineerIntelligence::High1,
+    fn engineers_spawn_engineers_of_their_family() {
+        for (parent, child) in [
+            (EngineerIntelligence::Medium, EngineerIntelligence::Medium),
+            (EngineerIntelligence::High, EngineerIntelligence::Medium),
+            (EngineerIntelligence::Medium1, EngineerIntelligence::Medium1),
+            (EngineerIntelligence::High1, EngineerIntelligence::Medium1),
         ] {
             assert_eq!(
                 child_role(
-                    AgentRole::Engineer { intelligence },
+                    AgentRole::Engineer {
+                        intelligence: parent
+                    },
                     AgentRole::Engineer {
                         intelligence: EngineerIntelligence::High,
                     },
                 ),
-                medium
+                AgentRole::Engineer {
+                    intelligence: child
+                },
+                "{parent:?}"
             );
         }
     }
