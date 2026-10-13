@@ -390,10 +390,20 @@ mod tests {
         }
         assert!(seen.lock().unwrap().is_empty());
 
-        reqwest::get(format!("{server}/api/conversations.replies"))
-            .await
-            .unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 1);
+        let listed = [
+            "conversations.replies",
+            "conversations.canvases.create",
+            "canvases.edit",
+            "pins.list",
+            "bookmarks.add",
+        ];
+        for method in listed {
+            reqwest::get(format!("{server}/api/{method}"))
+                .await
+                .unwrap();
+        }
+        let forwarded: Vec<String> = seen.lock().unwrap().iter().map(|r| r.1.clone()).collect();
+        assert_eq!(forwarded, listed.map(|method| format!("/api/{method}")));
     }
 
     #[tokio::test]

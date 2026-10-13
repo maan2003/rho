@@ -68,6 +68,16 @@
       "limit",
       "page"
     ],
+    "pins.list": [
+      "channel"
+    ],
+    "bookmarks.list": [
+      "channel_id"
+    ],
+    "canvases.sections.lookup": [
+      "canvas_id",
+      "criteria"
+    ],
     "conversations.open": [
       "channel",
       "return_im",
@@ -126,6 +136,47 @@
       "file",
       "file_comment",
       "timestamp"
+    ],
+    "conversations.canvases.create": [
+      "channel_id",
+      "document_content"
+    ],
+    "canvases.create": [
+      "title",
+      "document_content",
+      "channel_id"
+    ],
+    "canvases.edit": [
+      "canvas_id",
+      "changes"
+    ],
+    "pins.add": [
+      "channel",
+      "timestamp"
+    ],
+    "pins.remove": [
+      "channel",
+      "timestamp"
+    ],
+    "bookmarks.add": [
+      "channel_id",
+      "title",
+      "type",
+      "emoji",
+      "entity_id",
+      "link",
+      "parent_id"
+    ],
+    "bookmarks.edit": [
+      "bookmark_id",
+      "channel_id",
+      "emoji",
+      "link",
+      "title"
+    ],
+    "bookmarks.remove": [
+      "bookmark_id",
+      "channel_id"
     ],
     "files.getUploadURLExternal": [
       "filename",

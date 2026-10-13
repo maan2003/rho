@@ -37,6 +37,12 @@ oauth_config:
       - reactions:write
       - files:read
       - files:write
+      - pins:read
+      - pins:write
+      - bookmarks:read
+      - bookmarks:write
+      - canvases:read
+      - canvases:write
 settings:
   event_subscriptions:
     bot_events:
