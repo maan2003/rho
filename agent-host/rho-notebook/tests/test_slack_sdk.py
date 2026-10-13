@@ -223,13 +223,16 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
                   "message": {"ts": "6.0", "thread_ts": "5.0", "text": "edited"}}
         reaction_a = {"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}
         root_c2 = {"type": "message", "channel": "C2", "ts": "9.0", "text": "@bot hello"}
+        canvas_change = {"type": "file_change", "file_id": "F1", "file": {"id": "F1"}}
+        other_file = {"type": "file_change", "file_id": "F2", "file": {"id": "F2"}}
         polls = [
-            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a, root_c2]],
+            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a, root_c2,
+                                                    canvas_change, other_file]],
              "cursor": "7:5", "truncated": False},
             {"ok": True, "events": [], "cursor": "8:0", "truncated": True},
             {"ok": True, "events": [], "cursor": "8:0", "truncated": False},
         ]
-        a, b, c2 = [], [], []
+        a, b, c2, f1 = [], [], [], []
 
         async def body():
             threads = Subscriptions()
@@ -244,6 +247,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
             threads.subscribe("D1", "1.0", on_a)
             threads.subscribe("C2", "5.0", on_b)
             threads.subscribe("C2", None, c2.append)
+            threads.subscribe("F1", None, f1.append)
             while len(self.fake.requests) < 3:
                 await asyncio.sleep(0.01)
             threads.close()
@@ -254,6 +258,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a, [reply_a, root_a, reaction_a, truncated])
         self.assertEqual(b, [edit_b, truncated])
         self.assertEqual(c2, [edit_b, root_c2, truncated])
+        self.assertEqual(f1, [canvas_change, truncated])
         self.assertEqual([r["query"].get("cursor") for r in requests[:3]], [None, ["7:5"], ["8:0"]])
 
     async def test_thread_subscriptions_count_events_from_creation(self):

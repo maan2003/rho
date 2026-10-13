@@ -27,7 +27,9 @@ class Subscriptions:
     """`subscribe(channel, thread_ts, callback)` calls `callback(event)` for
     each new message, edit or deletion in that thread, and each reaction to
     its root message. With `thread_ts=None` it does so for everything in the
-    channel, threads included. Sync and async callbacks both work.
+    channel, threads included. `subscribe(file_id, None, callback)` calls it
+    for each `file_change` of that file, such as a canvas. Sync and async
+    callbacks both work.
 
     Events count from when this object was created, so create it before
     posting the message whose replies you wait for.
@@ -85,7 +87,7 @@ class Subscriptions:
                 if not event:
                     continue
                 channel, thread_ts = _thread(event)
-                for key in ((channel, thread_ts), (channel, None)):
+                for key in dict.fromkeys(((channel, thread_ts), (channel, None))):
                     callback = self.subscriptions.get(key)
                     if callback:
                         await self._call(callback, event)
@@ -117,10 +119,11 @@ async def download(url: str, *, timeout: float = 300) -> bytes:
 
 
 def _thread(event: dict) -> Tuple[Optional[str], Optional[str]]:
-    """The (channel, thread root ts) an event belongs to."""
+    """The (channel, thread root ts) an event belongs to. A file event belongs
+    to the file, as a channel without threads."""
     # Edits and deletions carry the message one level down; reactions name
     # theirs as an item.
     item = event.get("item") or {}
     message = event.get("message") or event.get("previous_message") or event
-    channel = event.get("channel") or item.get("channel")
+    channel = event.get("channel") or item.get("channel") or event.get("file_id")
     return channel, message.get("thread_ts") or message.get("ts") or item.get("ts")

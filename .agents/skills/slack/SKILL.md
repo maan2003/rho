@@ -76,6 +76,13 @@ info = (await slack.files_info(file="F0123ABCD"))["file"]
 Path(info["name"]).write_bytes(await download(info["url_private_download"]))
 ```
 
+A canvas is a file too: `download` gives its content as HTML. Read it
+before you edit a canvas others also edit, and change only your sections
+with `canvases_edit`. To hear about edits, subscribe to the file ID:
+`subs.subscribe(file_id, None, on_event)` gets each `file_change` event,
+your own edits included. The event names only the file, so download it
+again to see what changed.
+
 The bot sees only files shared in conversations it is in. `missing_scope`
 from `files_info`, or `HTTP 302` from `download`, means the app lacks
 `files:read`: ask the user to add it and reinstall the app.

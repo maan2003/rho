@@ -52,6 +52,7 @@ settings:
       - message.groups
       - reaction_added
       - reaction_removed
+      - file_change
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
