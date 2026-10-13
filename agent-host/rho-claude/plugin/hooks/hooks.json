@@ -1,0 +1,4 @@
+{
+  "description": "prompt.compose puts the Rho prompt into the system prompt; prompt.context drops the claudeMd block it came from and the account's email",
+  "modules": ["./register.ts"]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "rho",
+  "version": "0.1.0",
+  "description": "Moves Rho's instructions from the first user message into the system prompt, in place of the Claude Code sections that contradict them."
+}

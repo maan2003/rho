@@ -106,6 +106,7 @@ impl ClaudeAgent {
             process: None,
             claude_prompt_path: None,
             claude_settings_path: None,
+            claude_plugin_dir: None,
             claude_account: None,
             python: None,
             mailroom,
@@ -313,6 +314,8 @@ pub(crate) struct ClaudeLoop {
     /// The generated `settings.json` of a Python-mode agent, kept alive for
     /// the same reason as the prompt.
     claude_settings_path: Option<tempfile::TempPath>,
+    /// Rho's Claude Code plugin, written once and loaded by every spawn.
+    claude_plugin_dir: Option<tempfile::TempDir>,
     /// The account the running process was spawned on, so a switch is
     /// noticed at the next turn.
     claude_account: Option<String>,
@@ -1670,6 +1673,20 @@ impl ClaudeLoop {
             ".md",
             &prompt,
         )?;
+        let plugin_dir = match &self.claude_plugin_dir {
+            Some(dir) => dir,
+            None => {
+                let dir = tempfile::Builder::new()
+                    .prefix("rho-claude-plugin-")
+                    .tempdir()
+                    .context("create the Claude plugin directory")?;
+                self.claude_plugin_dir.insert(dir)
+            }
+        };
+        let plugin_dir = Utf8PathBuf::try_from(plugin_dir.path().to_owned())
+            .context("Claude plugin directory path is not valid UTF-8")?;
+        rho_claude::plugin::write(&plugin_dir)?;
+        options.plugin_dir = Some(plugin_dir);
         // A Python-mode agent runs on the account's own settings with every
         // Claude tool denied, so the notebook is all the model has. The
         // generated file covers the account's `settings.json`.

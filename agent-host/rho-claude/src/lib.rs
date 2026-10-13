@@ -15,6 +15,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub mod accounts;
 pub mod mcp;
 pub mod namespace;
+pub mod plugin;
 pub mod protocol;
 pub mod settings;
 mod transcript;
@@ -40,6 +41,8 @@ pub struct ClaudeCodeOptions {
     pub effort: Effort,
     pub session: Session,
     pub env: Vec<(String, String)>,
+    /// A plugin to load for this session only, such as [`plugin`]'s.
+    pub plugin_dir: Option<Utf8PathBuf>,
 }
 
 impl ClaudeCodeOptions {
@@ -57,6 +60,7 @@ impl ClaudeCodeOptions {
             effort,
             session: Session::New { session_id },
             env: Vec::new(),
+            plugin_dir: None,
         }
     }
 
@@ -80,7 +84,15 @@ impl ClaudeCodeOptions {
             self.model.as_arg().to_owned(),
             "--effort".to_owned(),
             self.effort.as_arg().to_owned(),
+            // Render the system prompt on every request rather than once per
+            // conversation, so a prompt edit reaches agents that already exist.
+            "--system-prompt-snapshot".to_owned(),
+            "off".to_owned(),
         ];
+        if let Some(dir) = &self.plugin_dir {
+            args.push("--plugin-dir".to_owned());
+            args.push(dir.to_string());
+        }
         match &self.session {
             Session::New { session_id } => {
                 args.push("--session-id".to_owned());
@@ -442,6 +454,8 @@ mod tests {
                 "sonnet",
                 "--effort",
                 "medium",
+                "--system-prompt-snapshot",
+                "off",
                 "--session-id",
                 "00000000-0000-4000-8000-000000000000",
             ]
