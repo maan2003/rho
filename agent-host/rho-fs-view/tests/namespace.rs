@@ -7,7 +7,6 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use camino::Utf8Path;
 use rho_fs_view::{MAX_BOUNDED_READ, read_file_bounded};
 
 mod common;
@@ -79,17 +78,6 @@ async fn run() {
     let layout_path = temp.path().join("layout");
     let layout = rho_fs_view::WorksetLayout::new(&workset).unwrap();
     std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
-    assert_eq!(
-        workset.host_path(Utf8Path::new("/src")).unwrap(),
-        workset.root()
-    );
-    assert!(
-        !workset
-            .host_path(Utf8Path::new("/src/missing"))
-            .unwrap()
-            .is_dir()
-    );
-    assert!(workset.host_path(Utf8Path::new("/src/../outside")).is_err());
 
     // Bounded reads use paths in the current filesystem (the host here,
     // /src in a workset process), without a host-visible path translation.

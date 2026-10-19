@@ -4,8 +4,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// An agent's place: the workset it works in and its working directory
-/// there as it sees it (`/src/<repo>/...`), and what was cloned to make
-/// the workset when its creation cloned it. Stored inline on the agent record.
+/// as it sees it, and what was cloned to make the workset when its
+/// creation cloned it. The directory is usually in the workset
+/// (`/src/<repo>/...`); one outside `/src` is a host directory, which the
+/// view shows at its own path. Stored inline on the agent record.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub struct Place {
     pub workset: String,

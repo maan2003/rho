@@ -13,7 +13,7 @@ use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::host::AgentClient;
 use rho_agent::host::pool::AgentPool;
 use rho_agent_hosts::protocol::GitProviderFrame;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, Place};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -29,7 +29,6 @@ mod realtime;
 mod secret_store;
 mod transcript;
 mod usage;
-pub mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
@@ -801,13 +800,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             }
             result = &mut shutdown => {
                 result?;
-                if let Some((shutdown, listener)) = iroh_listener.take() {
-                    let _ = shutdown.send(());
-                    listener.await.context("close iroh listener")?;
-                }
-                services.pool.flush_agent_usage(None).await;
-                return Ok(());
+                break;
             }
+            () = services.stop.notified() => break,
             connection = runtime.server.accept() => {
                 let connection = connection?;
                 let services = services.clone();
@@ -820,6 +815,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             }
         }
     }
+    if let Some((shutdown, listener)) = iroh_listener.take() {
+        let _ = shutdown.send(());
+        listener.await.context("close iroh listener")?;
+    }
+    services.pool.flush_agent_usage(None).await;
+    Ok(())
 }
 
 /// Replaces this agent host with whatever binary its path now names, keeping
@@ -1177,6 +1178,10 @@ struct Services {
     git_transport: GitTransportBroker,
     /// At most one GUI owns the voice session's microphone and playback.
     voice_lease: Arc<TokioMutex<()>>,
+    /// How many agents sessions are open: clients attached right now.
+    sessions: std::sync::atomic::AtomicUsize,
+    /// Asks the main loop to shut down as on `SIGTERM`.
+    stop: tokio::sync::Notify,
 }
 
 impl Services {
@@ -1205,6 +1210,8 @@ impl Services {
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
+            sessions: std::sync::atomic::AtomicUsize::new(0),
+            stop: tokio::sync::Notify::new(),
         };
         Ok(registry)
     }
@@ -1237,7 +1244,7 @@ impl Services {
                     .with_context(|| format!("no repository name in {origin}"))?;
                 let worksets = self.pool.worksets();
                 let workset = worksets.create().await?;
-                let cwd = visible_path(&workset, &workset.root().join(&name))?;
+                let cwd = Utf8Path::new(rho_fs_view::MOUNT_ROOT).join(&name);
                 let place = Place {
                     workset: workset.id().to_owned(),
                     cwd,
@@ -1255,6 +1262,23 @@ impl Services {
                     .context("agents no longer work in the user's own checkout")?
                     .clone();
                 rho_agent::StartPlace::new(place)
+            }
+            StartMode::Here { cwd } => {
+                let cwd = expand_home(&cwd).unwrap_or(cwd);
+                anyhow::ensure!(
+                    !cwd.starts_with(rho_fs_view::MOUNT_ROOT),
+                    "{cwd} is inside another workset's view"
+                );
+                let cwd = Utf8PathBuf::try_from(
+                    cwd.canonicalize()
+                        .with_context(|| format!("working directory {cwd}"))?,
+                )?;
+                let workset = self.pool.worksets().create().await?;
+                rho_agent::StartPlace::new(Place {
+                    workset: workset.id().to_owned(),
+                    cwd,
+                    origin: None,
+                })
             }
             StartMode::Join(JoinTarget::User { .. }) => {
                 anyhow::bail!(
@@ -1351,10 +1375,7 @@ where
             let rho_rtc::protocol::Open { offer_sdp } = open.unpack()?;
             realtime::serve(services, reader, writer, offer_sdp).await
         }
-        Protocol::Workspace => {
-            let rho_files::protocol::Open { workspace } = open.unpack()?;
-            agents::serve_workspace_channel(services, reader, writer, workspace).await
-        }
+        Protocol::Workspace => anyhow::bail!("the workspace file protocol is no longer served"),
     }
 }
 
@@ -1434,31 +1455,6 @@ async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()
         *data = prepared.content.data;
     }
     validate_image_content(content)
-}
-
-/// The workset behind an agent's place and the root of the git checkout
-/// (or plain directory) its working directory is in, on the host.
-async fn open_checkout(
-    services: &Services,
-    workspace: &WorkspaceInfo,
-) -> anyhow::Result<(rho_fs_view::Workset, Utf8PathBuf)> {
-    let place = workspace
-        .place()
-        .context("agents no longer work in the user's own checkout")?;
-    let (workset, host_cwd) = services.pool.open_workset(place).await?;
-    let (root, _) = rho_fs_view::resolve_workdir_root(host_cwd.as_std_path())?;
-    Ok((workset, root))
-}
-
-/// Where a host directory inside `workset` appears to its agents.
-fn visible_path(
-    workset: &rho_fs_view::Workset,
-    host_path: &Utf8Path,
-) -> anyhow::Result<Utf8PathBuf> {
-    let relative = host_path
-        .strip_prefix(workset.root())
-        .with_context(|| format!("{host_path} is outside workset {}", workset.id()))?;
-    Ok(Utf8Path::new(rho_fs_view::MOUNT_ROOT).join(relative))
 }
 
 fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {

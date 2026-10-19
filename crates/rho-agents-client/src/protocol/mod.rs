@@ -275,6 +275,10 @@ pub enum StartMode {
     /// The SAME place as the target: the new agent works in the target
     /// agent's directory, seeing its edits instantly.
     Join(JoinTarget),
+    /// An empty workset of its own, working in `cwd`: a directory on the
+    /// host, which the workset's view shows as it is. What an ad hoc `rho`
+    /// asks for, repository or not.
+    Here { cwd: Utf8PathBuf },
 }
 
 /// Whose workspace [`StartMode::Join`] joins.

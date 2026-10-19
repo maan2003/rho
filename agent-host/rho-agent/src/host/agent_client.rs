@@ -45,12 +45,6 @@ impl AgentClient {
         agent: AgentId,
     ) -> anyhow::Result<Self> {
         let place = pool.db().read().get_agent(agent).config.place;
-        let (_, cwd) = pool.open_workset(&place).await?;
-        anyhow::ensure!(
-            cwd.is_dir(),
-            "working directory does not exist: {}",
-            place.cwd
-        );
         let process = pool.process(&place).await?;
         Self::connect(pool, agent, process, Some(place.cwd)).await
     }

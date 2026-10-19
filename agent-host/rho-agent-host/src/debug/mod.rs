@@ -203,23 +203,14 @@ fn try_host_lock(host_lock: &Path) -> anyhow::Result<Option<std::fs::File>> {
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let role = parse_role(role)?;
     let cwd = std::env::current_dir().context("read current directory")?;
-    // A rendering runs on the invoking directory adopted as a workset. It
-    // never runs a command, so no namespace is built and no store server
-    // is needed; the state root only has to exist.
-    let worksets = rho_fs_view::Worksets::open(
-        rho_fs_view::Worksets::default_root()?,
-        rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
-        Default::default(),
-        rho_fs_view::StoreService::None,
-    )
-    .await?;
-    let workset = worksets.adopt(&cwd)?;
-    let place = rho_agent_types::Place {
-        workset: workset.id().to_owned(),
-        cwd: rho_fs_view::MOUNT_ROOT.into(),
-        origin: None,
-    };
-    let surface = rho_agent::render_agent_surface(&workset, &place, role)?;
+    let cwd = camino::Utf8PathBuf::try_from(cwd).context("current directory is not UTF-8")?;
+    // The prompt an agent would get with the invoking directory as its
+    // workset, which it sees as `/src`.
+    let surface = rho_agent::render_agent_surface(
+        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
+        &cwd,
+        role,
+    )?;
 
     println!("# System prompt\n");
     if surface.system_prompt.is_empty() {

@@ -8,10 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use camino::Utf8PathBuf;
 use rho_agent_types::{AgentId, AgentRole, EngineerIntelligence, Place};
 use rho_db::RhoDb;
-use rho_fs_view::{Workset, Worksets};
+use rho_fs_view::Worksets;
 use tokio::sync::{Mutex, broadcast};
 
 use super::AgentClient;
@@ -625,6 +624,18 @@ impl AgentPool {
         agent
     }
 
+    /// The loaded agents with work in hand: responding, running tasks, or
+    /// holding input. An agent that is not loaded has none.
+    pub async fn working(&self) -> Vec<AgentId> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, agent)| !agent.status_cell().borrow().settled())
+            .map(|(agent_id, _)| *agent_id)
+            .collect()
+    }
+
     /// Whether any client is looking at this agent right now. Read by the
     /// loops on every publish, so it is a plain lock and no await.
     pub fn is_live(&self, agent_id: AgentId) -> bool {
@@ -822,15 +833,9 @@ impl AgentPool {
                 },
             };
             let StartPlace { place, prepare } = start;
-            let workset = pool.worksets.open_workset(&place.workset).await?;
-            let host_cwd = workset.host_path(&place.cwd)?;
-            if prepare.is_none() {
-                anyhow::ensure!(
-                    host_cwd.is_dir(),
-                    "working directory does not exist: {}",
-                    place.cwd
-                );
-            }
+            // The workset must exist; its directory is the worker's to
+            // check, since only the worker sees the view it is in.
+            pool.worksets.open_workset(&place.workset).await?;
             let mut write = pool.db.write().await;
             let agent_id = write.alloc_agent_id();
             let lock = pool
@@ -1069,14 +1074,6 @@ impl AgentPool {
             role.handle_prefix(),
             self.agent_id_prefix(agent_id)
         )
-    }
-
-    /// The workset behind a persisted place and its working directory on the
-    /// host.
-    pub async fn open_workset(&self, place: &Place) -> anyhow::Result<(Workset, Utf8PathBuf)> {
-        let workset = self.worksets.open_workset(&place.workset).await?;
-        let host_cwd = workset.host_path(&place.cwd)?;
-        Ok((workset, host_cwd))
     }
 
     /// Loads a persisted agent if it is not already running. The returned
@@ -1322,7 +1319,7 @@ mod tests {
         let (pool, mut place) = test_pool(directory.path()).await;
         let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
         place.cwd = "/src/not-cloned-yet".into();
-        let host_cwd = workset.host_path(&place.cwd).unwrap();
+        let host_cwd = workset.root().join("not-cloned-yet");
         let (entered, preparing) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let db = pool.db.clone();
@@ -1402,7 +1399,8 @@ mod tests {
         let (pool, place) = test_pool(directory.path()).await;
         let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
         for name in ["parent", "checkout"] {
-            let dir = workset.host_path(&place.cwd).unwrap().join(name);
+            // The pool's place is the workset root, `/src`.
+            let dir = workset.root().join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
             let skill_dir = dir.join(".agents/skills/catalogue-fixture");
@@ -1454,6 +1452,13 @@ mod tests {
                 child.place().workset,
                 read.get_agent(parent_id).place().workset
             );
+            let backing = camino::Utf8PathBuf::from_path_buf(
+                workset
+                    .root()
+                    .join(expected.strip_prefix("/src/").unwrap())
+                    .into(),
+            )
+            .unwrap();
 
             // The selected directory supplies the child's guidance, immediately
             // after workspace context; identity belongs with
@@ -1466,7 +1471,7 @@ mod tests {
             .team()
             .unwrap();
             let rendered = crate::prompt::prompt(
-                &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
                 Some(&team),
                 child.config.role,
             );
@@ -1501,14 +1506,14 @@ mod tests {
                 },
             ] {
                 let native = crate::prompt::prompt(
-                    &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                    &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
                     Some(&team),
                     role,
                 );
                 let claude = crate::prompt::claude_prompt(
-                    Some(&crate::prompt::WorksetPrompt::for_host(
-                        &workset,
-                        child.place(),
+                    Some(&crate::prompt::WorksetPrompt::backed(
+                        &child.place().cwd,
+                        &backing,
                     )),
                     Some(&team),
                     role,
@@ -1538,7 +1543,7 @@ mod tests {
         }
 
         let count = pool.db.read().list_agent_ids().len();
-        for invalid in ["/tmp", "/src/missing", "checkout", "/src/../src/checkout"] {
+        for invalid in ["checkout"] {
             let result =
                 crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(Some(invalid)))
                     .await;

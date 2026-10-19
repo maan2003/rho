@@ -1,7 +1,7 @@
 //! The agents part of the agent host, and the parts about one agent's workset:
-//! its terminals, shells and workspace files. The agents session carries
-//! the journal, the live tails, new agents and the quota; requests,
-//! terminals, shells and workspace channels are streams of their own.
+//! its terminals and shells. The agents session carries the journal, the
+//! live tails, new agents and the quota; requests, terminals and shells are
+//! streams of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_types::{AgentId, Seq, WorkspaceInfo};
+use rho_agent_types::{AgentId, Seq};
 use rho_agents_client::protocol::{
     AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
     GlobalUsage, NewAgent, Open, QuotaHistory, QuotaUsage, RecordVisualization, Request,
@@ -21,9 +21,7 @@ use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::{
-    NEXT_CONNECTION_ID, Services, open_checkout, prepare_image_content, usage, workspace_channel,
-};
+use crate::{NEXT_CONNECTION_ID, Services, prepare_image_content, usage};
 
 /// Serves one agents stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -126,6 +124,23 @@ where
     }
 }
 
+/// One open agents session, counted in [`Services::sessions`] for as long
+/// as it lives, however the session ends.
+struct Attached(Arc<Services>);
+
+impl Attached {
+    fn new(services: &Arc<Services>) -> Self {
+        services.sessions.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(services))
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.sessions.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// How many journal entries travel in one `ServerFrame::Log` while a
 /// client is catching up. A cold client's first copy is a whole history,
 /// so it goes in pages the connection can interleave.
@@ -149,6 +164,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let _attached = Attached::new(&services);
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerFrame>();
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
@@ -869,165 +885,6 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-/// Serves a bounded typed file channel rooted in one workspace checkout.
-pub(crate) async fn serve_workspace_channel<R, W>(
-    services: Arc<Services>,
-    mut reader: R,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-) -> anyhow::Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let checkout = match open_checkout(&services, &workspace).await {
-        Ok((_, checkout)) => checkout,
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    let files = match workspace_channel::WorkspaceFiles::open(checkout) {
-        Ok(files) => Arc::new(files),
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    let watcher_setup = match files.start_watcher() {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("watch workspace: {error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    write_frame(&mut writer, &Opened::Ready).await?;
-
-    use rho_files::protocol::{WorkspaceClientFrame, WorkspaceServerFrame};
-    let mut changes = watcher_setup.changes;
-    let changes_overflowed = watcher_setup.overflowed;
-    let mut watcher_ready = Some(watcher_setup.ready);
-    // Keep the watcher alive after its asynchronous directory registration
-    // completes. The leading underscore documents that ownership is the only
-    // purpose of this value.
-    let mut _watcher = None;
-    let mut pending_watch_directories = std::collections::BTreeSet::<camino::Utf8PathBuf>::new();
-    loop {
-        tokio::select! {
-            result = async { watcher_ready.as_mut().expect("watcher setup is enabled").await }, if watcher_ready.is_some() => {
-                // Drop the completed JoinHandle before retaining its watcher.
-                watcher_ready.take();
-                match result {
-                    Ok(Ok(watcher)) => {
-                        _watcher = Some(watcher);
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "workspace watcher registration failed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "workspace watcher registration task failed");
-                    }
-                }
-                if let Some(watcher) = _watcher.as_mut() {
-                    for directory in std::mem::take(&mut pending_watch_directories) {
-                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
-                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
-                        }
-                    }
-                }
-                // A watcher cannot report changes made before its directory
-                // registration completed. Treat that window like overflow; the
-                // GUI already reconciles it by reloading open buffers and
-                // scheduling a fresh semantic barrier.
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &WorkspaceServerFrame::Changed {
-                        paths: Vec::new(),
-                        rescan: true,
-                    },
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-            frame = rho_rpc::protocol::read_frame_limited::<_, WorkspaceClientFrame>(
-                &mut reader,
-                rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-            ) => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) if error.chain().any(|cause| {
-                        cause.downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
-                    }) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                let response = match frame {
-                    WorkspaceClientFrame::Open { request_id, path } => {
-                        let result = files.read(path.clone()).await;
-                        WorkspaceServerFrame::Opened { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Reload { request_id, path } => {
-                        let result = files.read(path.clone()).await;
-                        WorkspaceServerFrame::Reloaded { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Save { request_id, path, revision, contents } => {
-                        let result = files.save(path.clone(), Some(revision), contents).await;
-                        WorkspaceServerFrame::Saved { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Overwrite { request_id, path, contents } => {
-                        let result = files.save(path.clone(), None, contents).await;
-                        WorkspaceServerFrame::Saved { request_id, path, result }
-                    }
-                };
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &response,
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-            Some(first) = changes.recv() => {
-                let (paths, directories, explicit_rescan) =
-                    workspace_channel::drain_changes(first, &mut changes);
-                pending_watch_directories.extend(directories);
-                if let Some(watcher) = _watcher.as_mut() {
-                    for directory in std::mem::take(&mut pending_watch_directories) {
-                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
-                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
-                        }
-                    }
-                }
-                let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
-                let rescan = explicit_rescan || overflowed;
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &WorkspaceServerFrame::Changed { paths, rescan },
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-        }
-    }
-}
-/// The bodies one raw row carries, for a client that asked by position:
 /// a request's tool results whole, or a response as the transcript draws
 /// it. Rows a rewind hid still answer; the client asked for one it holds.
 fn agent_detail(

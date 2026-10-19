@@ -669,13 +669,6 @@ impl Workset {
         names.sort();
         Ok(names)
     }
-
-    /// Maps a path as the agent sees it (absolute below `/src`, or relative
-    /// to it) onto the host directory, refusing `.` and `..` components.
-    pub fn host_path(&self, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
-        let relative = visible_relative(layout::MOUNT_ROOT, visible)?;
-        Ok(self.0.root.join(relative))
-    }
 }
 
 /// The path below `visible_root` that `path` denotes; a relative `path` is

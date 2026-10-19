@@ -66,6 +66,8 @@ rho_rpc::calls! {
         /// own beside the database; it is the caller's to delete. A report
         /// can outgrow a frame.
         DebugReport(DebugReport) -> camino::Utf8PathBuf;
+        /// Refused, with the reason, while the host is in use.
+        ShutdownIfIdle(ShutdownIfIdle) -> ();
     }
 }
 
@@ -130,6 +132,13 @@ pub struct IrohRevoke {
 /// and ready to open without repair.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot;
+
+/// Stops the agent host if nothing uses it: no agents session is open and
+/// no agent is working. An ad hoc `rho` that started the host asks this as
+/// it leaves; the host decides, so a client that attached meanwhile keeps
+/// it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShutdownIfIdle;
 
 /// Drops the savepoints the agent host's migrations recorded, once they are
 /// verified: in its own write, so the agent host keeps running.

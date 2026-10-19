@@ -64,13 +64,6 @@ async fn worksets_clone_through_the_mirror_store() {
     assert_eq!(by_url, first_workset.root().join("remote"));
     assert_eq!(first_workset.repos().unwrap(), vec!["project", "remote"]);
     assert_eq!(only_store(temp.path()), store);
-    assert_eq!(
-        first_workset
-            .host_path(Utf8Path::new("/src/project/file.txt"))
-            .unwrap(),
-        project.join("file.txt")
-    );
-    assert!(first_workset.host_path(Utf8Path::new("/src/../x")).is_err());
     std::fs::write(first_workset.root().join("not-a-repo"), "").unwrap();
     assert!(
         first_workset
