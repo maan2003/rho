@@ -852,7 +852,10 @@ fn config_name(config: rho_agent_types::AgentRole) -> String {
 }
 
 fn place_name(place: &rho_agent_types::Place) -> String {
-    format!("{} in workset {}", place.cwd, place.workset)
+    match place.workset {
+        Some(workset) => format!("{} in workset {workset}", place.cwd),
+        None => format!("{} on the host", place.cwd),
+    }
 }
 
 #[cfg(test)]

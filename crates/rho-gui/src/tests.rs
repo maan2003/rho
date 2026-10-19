@@ -3101,9 +3101,8 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
                     vec![story::UiAgentHead {
                         spawn_name: Some("worker".to_owned()),
                         place: Place {
-                            workset: "0123456789ab".to_owned(),
+                            workset: Some("0123456789ab".parse().unwrap()),
                             cwd: "/src/rho".into(),
-                            origin: Some("/tmp/rho".into()),
                         },
                         ..ui_head(agent_id)
                     }],
@@ -4938,9 +4937,8 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
         role: rho_agent_types::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
         place: rho_agent_types::Place {
-            workset: "0123456789ab".into(),
+            workset: Some("0123456789ab".parse().unwrap()),
             cwd: "/src/tmp".into(),
-            origin: None,
         },
         spawned_by: story::UiSpawnedBy::Direct,
         parent: None,

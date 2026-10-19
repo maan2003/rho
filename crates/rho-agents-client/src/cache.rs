@@ -749,9 +749,8 @@ mod tests {
                 role: Default::default(),
                 runtime: RuntimeKind::Rho,
                 place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+                    workset: Some("0123456789ab".parse().unwrap()),
                     cwd: "/src/repo".into(),
-                    origin: None,
                 },
                 spawned_by: SpawnedBy::Direct,
                 spawn_name: Some("the deploy".to_owned()),

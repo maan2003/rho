@@ -563,9 +563,8 @@ mod tests {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
                 place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+                    workset: Some("0123456789ab".parse().unwrap()),
                     cwd: "/src/repo".into(),
-                    origin: None,
                 },
                 spawned_by: SpawnedBy::Direct,
                 spawn_name: None,

@@ -252,10 +252,8 @@ pub struct Workspace {
     /// by host — the same repository path on two machines is two projects.
     /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
-    remote_projects: HashMap<
-        (HostId, rho_agent_types::WorkspaceInfo),
-        gpui::WeakEntity<rho_files::RemoteProjectState>,
-    >,
+    remote_projects:
+        HashMap<(HostId, rho_agent_types::Place), gpui::WeakEntity<rho_files::RemoteProjectState>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
@@ -2441,7 +2439,7 @@ impl Workspace {
         let agent = self.registry.agent_by_label(target);
         StartBase {
             host: agent.and_then(|agent_id| self.host_of(agent_id)),
-            workspace: agent.and_then(|agent_id| self.registry.agent_workspace(agent_id)),
+            place: agent.and_then(|agent_id| self.registry.agent_place(agent_id).cloned()),
         }
     }
 
@@ -3223,7 +3221,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
+        let Some(workspace) = self.registry.agent_place(agent_id).cloned() else {
             self.notice_on(
                 None,
                 "open: agent has no workspace",
@@ -3870,26 +3868,12 @@ impl Workspace {
         });
     }
 
-    /// Where a new agent works when the draft doesn't say: the selected
-    /// agent sets the precedent, else the first registered workdir.
+    /// Where a new agent works when the draft doesn't say: the first
+    /// registered workdir.
     fn draft_default_workdir(&self) -> Option<HostPath> {
-        self.selection
-            .selected_agent()
-            .and_then(|agent_id| self.agent_workdir(agent_id))
-            .or_else(|| {
-                self.hosts.workdirs().first().map(|workdir| HostPath {
-                    host: workdir.host,
-                    path: workdir.path.clone(),
-                })
-            })
-    }
-
-    /// What an agent's workset was cloned from, as a host-qualified workdir:
-    /// what a new sibling agent should inherit.
-    fn agent_workdir(&self, agent_id: AgentId) -> Option<HostPath> {
-        Some(HostPath {
-            host: self.host_of(agent_id)?,
-            path: self.registry.agent_origin(agent_id)?,
+        self.hosts.workdirs().first().map(|workdir| HostPath {
+            host: workdir.host,
+            path: workdir.path.clone(),
         })
     }
 
@@ -4548,7 +4532,7 @@ impl Workspace {
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
-        workspace: rho_agent_types::WorkspaceInfo,
+        workspace: rho_agent_types::Place,
         path: Utf8PathBuf,
         cx: &mut Context<Self>,
     ) {
@@ -4663,7 +4647,7 @@ impl Workspace {
     fn cached_remote_project(
         &mut self,
         host: HostId,
-        workspace: &rho_agent_types::WorkspaceInfo,
+        workspace: &rho_agent_types::Place,
     ) -> Option<RemoteProject> {
         let key = (host, workspace.clone());
         let state = self.remote_projects.get(&key)?.clone();
@@ -4679,7 +4663,7 @@ impl Workspace {
     fn cache_remote_project(
         &mut self,
         host: HostId,
-        workspace: rho_agent_types::WorkspaceInfo,
+        workspace: rho_agent_types::Place,
         opened: RemoteProject,
     ) -> RemoteProject {
         if let Some(existing) = self.cached_remote_project(host, &workspace) {
@@ -6807,16 +6791,14 @@ impl Workspace {
     }
 
     /// The workdir a new thing under an area inherits: the repository of
-    /// the area or the labels it carries, then the agent itself when the
-    /// area is an agent. The caller falls back to the host's only workdir.
+    /// the area or the labels it carries. The caller falls back to the
+    /// host's only workdir.
     fn area_workdir(&self, area: &rho_dealer::NodeId) -> Option<HostPath> {
-        if let Some(url) = self.attention.marks.repository_of(area) {
-            return Some(HostPath {
-                host: self.hosts.primary()?,
-                path: url.into(),
-            });
-        }
-        self.agent_workdir(area.agent()?)
+        let url = self.attention.marks.repository_of(area)?;
+        Some(HostPath {
+            host: self.hosts.primary()?,
+            path: url.into(),
+        })
     }
 
     /// The usage screen, built once and kept. A series that arrives while

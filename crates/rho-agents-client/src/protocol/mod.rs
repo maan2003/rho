@@ -8,7 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Place, Seq};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -272,22 +272,13 @@ pub enum StartMode {
     /// A fresh workset holding a clone of `repo` (a URL or a host-side
     /// path), with a new change on top of the revset.
     NewOn { repo: Utf8PathBuf, revset: String },
-    /// The SAME place as the target: the new agent works in the target
-    /// agent's directory, seeing its edits instantly.
-    Join(JoinTarget),
-    /// An empty workset of its own, working in `cwd`: a directory on the
-    /// host, which the workset's view shows as it is. What an ad hoc `rho`
-    /// asks for, repository or not.
+    /// The SAME place as another agent, sent back verbatim from the
+    /// mirror's `Created`: the new agent works in that agent's directory,
+    /// seeing its edits instantly.
+    Join(Place),
+    /// No workset, working in `cwd`, a directory on the host as it is.
+    /// What an ad hoc `rho` asks for, repository or not.
     Here { cwd: Utf8PathBuf },
-}
-
-/// Whose workspace [`StartMode::Join`] joins.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum JoinTarget {
-    /// A known workspace, sent back verbatim from the mirror's `Created`.
-    Workspace(WorkspaceInfo),
-    /// The user's own checkout of `repo`.
-    User { repo: Utf8PathBuf },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

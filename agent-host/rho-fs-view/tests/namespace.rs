@@ -24,8 +24,7 @@ fn main() {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "--inside") {
         let bytes = std::fs::read(&args[2]).unwrap();
-        let layout: rho_fs_view::WorksetLayout =
-            senax_encoder::decode(&mut bytes.as_slice()).unwrap();
+        let layout: rho_fs_view::Layout = senax_encoder::decode(&mut bytes.as_slice()).unwrap();
         unsafe {
             layout.build().unwrap();
             layout.enter().unwrap();
@@ -76,7 +75,7 @@ async fn run() {
     std::os::unix::fs::symlink("../file.txt", checkout.join("sub/inside")).unwrap();
 
     let layout_path = temp.path().join("layout");
-    let layout = rho_fs_view::WorksetLayout::new(&workset).unwrap();
+    let layout = rho_fs_view::Layout::workset(&workset).unwrap();
     std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
 
     // Bounded reads use paths in the current filesystem (the host here,

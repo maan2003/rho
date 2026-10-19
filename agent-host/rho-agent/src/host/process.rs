@@ -21,7 +21,8 @@ pub(crate) type AgentRoute = mpsc::UnboundedSender<(transport::Packet, Arc<()>)>
 /// successor: the same pid, so the worker is still its child.
 #[derive(senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Handed {
-    pub(crate) workset: String,
+    /// `None` for the host process.
+    pub(crate) workset: Option<rho_agent_types::WorksetId>,
     pub(crate) pid: u32,
     /// The connections, open across exec.
     pub(crate) fd: i32,
@@ -275,7 +276,10 @@ impl Process {
     /// What a successor needs to take this process over, once it is idle
     /// and not reading. Holds the writers between frames and clears
     /// `CLOEXEC` on the connections.
-    pub(crate) async fn hand(&self, workset: String) -> anyhow::Result<Handed> {
+    pub(crate) async fn hand(
+        &self,
+        workset: Option<rho_agent_types::WorksetId>,
+    ) -> anyhow::Result<Handed> {
         use std::os::fd::AsRawFd as _;
         // Whatever is sent after this stays queued; no frame is cut short.
         self.sender.hold().await?;
@@ -313,11 +317,10 @@ impl Process {
 
     pub(crate) async fn start(
         pool: &Arc<crate::host::pool::AgentPool>,
-        workset: &rho_fs_view::Workset,
+        layout: rho_fs_view::Layout,
         claude: rho_claude::accounts::ClaudePaths,
         admission: Arc<tokio::sync::RwLock<()>>,
     ) -> anyhow::Result<Arc<Self>> {
-        let layout = rho_fs_view::WorksetLayout::new(workset)?;
         let startup = Startup {
             version: protocol::VERSION,
             layout,
@@ -798,7 +801,7 @@ mod tests {
         worker.send(port, answer(9)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(routed.try_recv().is_err(), "nothing more is read");
-        let handed = old.hand("workset".into()).await.unwrap();
+        let handed = old.hand(None).await.unwrap();
 
         let new = Process::connect(
             &inference,

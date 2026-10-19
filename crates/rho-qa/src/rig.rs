@@ -22,8 +22,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_types::{AgentRole, ContentPart};
 use rho_agents_client::protocol::transcript::TranscriptEvent;
 use rho_agents_client::protocol::{
-    ClientFrame as AgentsClientFrame, JoinTarget, NewAgent, ServerFrame as AgentsServerFrame,
-    StartMode,
+    ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame, StartMode,
 };
 use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};
@@ -1158,9 +1157,9 @@ async fn probe_async(name: &str) -> Result<()> {
         .await?;
     client.create(NewAgent {
         role: AgentRole::default(),
-        start: StartMode::Join(JoinTarget::User {
-            repo: workspace.try_into().context("rig workspace is not UTF-8")?,
-        }),
+        start: StartMode::Here {
+            cwd: workspace.try_into().context("rig workspace is not UTF-8")?,
+        },
         content: Some(vec![ContentPart::Text {
             text: "Complete one deterministic rig probe turn.".to_owned(),
         }]),

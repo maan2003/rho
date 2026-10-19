@@ -775,9 +775,8 @@ mod tests {
 
     pub(crate) fn test_place() -> Place {
         Place {
-            workset: "0123456789ab".into(),
+            workset: Some("0123456789ab".parse().unwrap()),
             cwd: "/src/repo".into(),
-            origin: None,
         }
     }
 

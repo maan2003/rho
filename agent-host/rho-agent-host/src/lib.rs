@@ -14,7 +14,7 @@ use rho_agent::host::AgentClient;
 use rho_agent::host::pool::AgentPool;
 use rho_agent_hosts::protocol::GitProviderFrame;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place};
-use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
+use rho_agents_client::protocol::{AuthState, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
 use rho_rpc::protocol::server::{Server, ServerConnection};
@@ -1246,9 +1246,8 @@ impl Services {
                 let workset = worksets.create().await?;
                 let cwd = Utf8Path::new(rho_fs_view::MOUNT_ROOT).join(&name);
                 let place = Place {
-                    workset: workset.id().to_owned(),
+                    workset: Some(workset.id()),
                     cwd,
-                    origin: Some(origin.clone()),
                 };
                 rho_agent::StartPlace::pending(place, async move {
                     let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
@@ -1256,35 +1255,19 @@ impl Services {
                     Ok(())
                 })
             }
-            StartMode::Join(JoinTarget::Workspace(info)) => {
-                let place = info
-                    .place()
-                    .context("agents no longer work in the user's own checkout")?
-                    .clone();
-                rho_agent::StartPlace::new(place)
-            }
+            StartMode::Join(place) => rho_agent::StartPlace::new(place),
             StartMode::Here { cwd } => {
                 let cwd = expand_home(&cwd).unwrap_or(cwd);
+                // A workset's `/src` exists only in its view, never here.
                 anyhow::ensure!(
                     !cwd.starts_with(rho_fs_view::MOUNT_ROOT),
-                    "{cwd} is inside another workset's view"
+                    "{cwd} is inside a workset's view, which the agent host cannot see"
                 );
                 let cwd = Utf8PathBuf::try_from(
                     cwd.canonicalize()
                         .with_context(|| format!("working directory {cwd}"))?,
                 )?;
-                let workset = self.pool.worksets().create().await?;
-                rho_agent::StartPlace::new(Place {
-                    workset: workset.id().to_owned(),
-                    cwd,
-                    origin: None,
-                })
-            }
-            StartMode::Join(JoinTarget::User { .. }) => {
-                anyhow::bail!(
-                    "agents no longer work in the user's own checkout: start on the \
-                     repository's URL or path instead"
-                );
+                rho_agent::StartPlace::new(Place { cwd, workset: None })
             }
         };
         let (agent_id, agent) = self.pool.create(role, None, start).await?;

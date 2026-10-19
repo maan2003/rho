@@ -605,21 +605,10 @@ impl AgentMap {
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_place(agent_id).map(|place| place.cwd.clone())
     }
-    /// What the agent's workset was cloned from: the thing a new agent
-    /// started "like this one" clones again.
-    pub fn agent_origin(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
-        self.agent_place(agent_id)
-            .and_then(|place| place.origin.clone())
-    }
     /// Where the agent works.
     pub fn agent_place(&self, agent_id: AgentId) -> Option<&rho_agent_types::Place> {
         self.agent_identity(agent_id)
             .map(|identity| &identity.place)
-    }
-    /// The agent's place as a request names it (opening its files, its
-    /// diff, joining it).
-    pub fn agent_workspace(&self, agent_id: AgentId) -> Option<rho_agent_types::WorkspaceInfo> {
-        self.agent_place(agent_id).map(|place| place.clone().into())
     }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_agent_types::AgentRole> {
         self.agent_identity(agent_id).map(|identity| identity.role)
@@ -823,9 +812,8 @@ mod tests {
             role: rho_agent_types::AgentRole::default(),
             runtime: RuntimeKind::Rho,
             place: rho_agent_types::Place {
-                workset: "0123456789ab".into(),
+                workset: Some("0123456789ab".parse().unwrap()),
                 cwd: "/src/repo".into(),
-                origin: None,
             },
             spawned_by: SpawnedBy::Direct,
             spawn_name: None,

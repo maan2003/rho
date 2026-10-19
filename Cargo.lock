@@ -14356,6 +14356,7 @@ dependencies = [
  "camino",
  "dirs 7.0.0",
  "libc",
+ "rho-agent-types",
  "rho-git",
  "senax-encoder",
  "serde_json",

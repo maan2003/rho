@@ -33,12 +33,16 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
     unsafe {
         startup.layout.build()?;
     }
-    startup.claude = rho_claude::namespace::install_sources(
-        &startup.claude,
-        std::path::Path::new("/"),
-        startup.layout.state.as_std_path(),
-        config_home,
-    )?;
+    // Only a workset's namespace can take the mounts; the host process
+    // runs no Claude agent.
+    if startup.layout.mount.is_some() {
+        startup.claude = rho_claude::namespace::install_sources(
+            &startup.claude,
+            std::path::Path::new("/"),
+            startup.layout.state.as_std_path(),
+            config_home,
+        )?;
+    }
     unsafe { startup.layout.enter()? };
     // Returns freed memory to the system while the workset is idle. Started
     // only now: unsharing the user namespace needs a single thread.

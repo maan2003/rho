@@ -9,31 +9,42 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::layout::MOUNT_ROOT;
-use crate::{PathOverrides, UserEnvironment, Workset};
+use crate::{PathOverrides, UserEnvironment, Workset, WorksetId, Worksets};
 
 /// Largest file [`read_file_bounded`] will ever return.
 pub const MAX_BOUNDED_READ: usize = 64 * 1024 * 1024;
 
-/// Filesystem inputs for the one execution process of a workset.
-/// The agent host supplies paths; the single-threaded child builds the mounts.
+/// Filesystem inputs for one execution process: a workset's, or the one
+/// host process that runs agents without a workset. The agent host
+/// supplies paths; the single-threaded child builds the mounts.
 #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
-pub struct WorksetLayout {
-    pub workset: String,
-    pub source: Utf8PathBuf,
-    pub store_root: Utf8PathBuf,
+pub struct Layout {
+    /// The workset mounted at `/src`. Without one, the process runs on the
+    /// host as it is: no namespace, so no user namespaces are needed.
+    pub mount: Option<WorksetMount>,
     pub store_socket: Option<Utf8PathBuf>,
     pub cache: Utf8PathBuf,
     pub state: Utf8PathBuf,
     pub paths: PathOverrides,
 }
 
-impl WorksetLayout {
-    pub fn new(workset: &Workset) -> anyhow::Result<Self> {
+/// What a workset's namespace mounts.
+#[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct WorksetMount {
+    pub workset: WorksetId,
+    pub source: Utf8PathBuf,
+    pub store_root: Utf8PathBuf,
+}
+
+impl Layout {
+    pub fn workset(workset: &Workset) -> anyhow::Result<Self> {
         let owner = workset.owner()?;
         Ok(Self {
-            workset: workset.id().to_owned(),
-            source: workset.root().to_owned(),
-            store_root: owner.store_root(),
+            mount: Some(WorksetMount {
+                workset: workset.id(),
+                source: workset.root().to_owned(),
+                store_root: owner.store_root(),
+            }),
             store_socket: owner.store_socket(),
             cache: owner.cache_dir(),
             state: workset.state_dir()?,
@@ -41,15 +52,29 @@ impl WorksetLayout {
         })
     }
 
+    /// The host process: agents that work in host directories.
+    pub fn host(worksets: &Worksets) -> Self {
+        Self {
+            mount: None,
+            store_socket: worksets.store_socket(),
+            cache: worksets.cache_dir(),
+            state: worksets.root().join("host").join("state"),
+            paths: worksets.path_overrides.clone(),
+        }
+    }
+
     /// # Safety
     /// Only call in a fresh process before starting any threads.
     pub unsafe fn build(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.state)?;
+        let Some(mount) = &self.mount else {
+            return Ok(());
+        };
         crate::layout::unshare_identity_user_namespace()?;
         crate::layout::unshare_mount_namespace()?;
-        std::fs::create_dir_all(&self.state)?;
         let mounts = crate::layout::Mounts {
-            src: self.source.clone().into_std_path_buf(),
-            store_root: self.store_root.clone().into_std_path_buf(),
+            src: mount.source.clone().into_std_path_buf(),
+            store_root: mount.store_root.clone().into_std_path_buf(),
             store_socket: self
                 .store_socket
                 .clone()
@@ -67,7 +92,9 @@ impl WorksetLayout {
     pub unsafe fn enter(&self) -> anyhow::Result<()> {
         close_inherited_fds_on_exec()?;
         let environment = UserEnvironment::new(std::env::vars_os().collect());
-        std::env::set_current_dir(MOUNT_ROOT)?;
+        if self.mount.is_some() {
+            std::env::set_current_dir(MOUNT_ROOT)?;
+        }
         let mut command = tokio::process::Command::new("");
         self.configure_environment(&environment, &mut command);
         for (key, _) in std::env::vars_os() {

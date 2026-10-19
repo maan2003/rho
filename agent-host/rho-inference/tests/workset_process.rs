@@ -220,9 +220,8 @@ async fn fixture(
     .unwrap();
     let workset = worksets.create().await.unwrap();
     let place = rho_agent_types::Place {
-        workset: workset.id().to_owned(),
+        workset: Some(workset.id()),
         cwd: "/src".into(),
-        origin: None,
     };
     let db = rho_db::RhoDb::open(root.join("agents.redb"));
     let inference = rho_inference::Accounts::new_with_config(

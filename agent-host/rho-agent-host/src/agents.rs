@@ -635,9 +635,8 @@ pub(crate) async fn handle_agent_command(
                 .read()
                 .get_agent(agent_id)
                 .place()
-                .workset
-                .clone();
-            services.pool.restart_workset(&workset, true).await?;
+                .workset;
+            services.pool.restart_workset(workset, true).await?;
         }
     }
     Ok(())
@@ -1026,9 +1025,8 @@ mod tests {
                     prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
                 },
                 place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+                    workset: Some("0123456789ab".parse().unwrap()),
                     cwd: "/src/rho".into(),
-                    origin: None,
                 },
                 spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
                 spawn_name: None,
