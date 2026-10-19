@@ -1162,19 +1162,6 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let paths_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
         let paths = create_pipeline(
             "paths",
             "vs_path",
@@ -1185,7 +1172,7 @@ impl WgpuRendererCore {
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(paths_blend),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             1,
@@ -1851,7 +1838,7 @@ impl WgpuRendererCore {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
             premultiplied_alpha: premultiplied_alpha as u32,
             output_color_space: self.rendering_params.output_color_space as u32,
-            framebuffer_is_srgb: self.target_format.is_srgb() as u32,
+            framebuffer_is_srgb: self.target_format.has_srgb_suffix() as u32,
             _pad: [0; 3],
         };
         let path_globals = GlobalParams {
@@ -2451,6 +2438,8 @@ impl WgpuRendererCore {
                     hal_texture,
                     &descriptor,
                     wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+                    // The producer wrote the DMA-BUF; wgpu must not clear it.
+                    true,
                 )
         };
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -3471,10 +3460,7 @@ impl WgpuHeadlessRenderer {
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
         self.check_gpu_errors()?;
 
-        let mapped_data = readback_buffer
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|error| anyhow::anyhow!("Failed to read mapped headless buffer: {error}"))?;
+        let mapped_data = readback_buffer.slice(..).get_mapped_range()?;
         let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
         let mut pixels = Vec::with_capacity(pixel_capacity);

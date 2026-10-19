@@ -50,13 +50,16 @@ test-support = [
     "tree-sitter-html",
     "proptest",
     "unindent",
+    "dep:pretty_assertions",
+    "dep:assets",
+    "dep:indoc",
 ]
 
 [dependencies]
 web-time.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
-assets.workspace = true
+assets = { workspace = true, optional = true }
 base64.workspace = true
 breadcrumbs = { workspace = true, optional = true }
 client = { workspace = true, optional = true }
@@ -75,7 +78,7 @@ fuzzy = { workspace = true, optional = true }
 fs = { workspace = true, optional = true }
 git = { workspace = true, optional = true }
 gpui.workspace = true
-indoc.workspace = true
+indoc = { workspace = true, optional = true }
 edit_prediction_types = { workspace = true, optional = true }
 itertools.workspace = true
 language.workspace = true
@@ -88,7 +91,7 @@ menu = { workspace = true, optional = true }
 multi_buffer.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
-pretty_assertions.workspace = true
+pretty_assertions = { workspace = true, optional = true }
 project = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
@@ -126,16 +129,18 @@ uuid.workspace = true
 vim_mode_setting.workspace = true
 workspace = { workspace = true, optional = true }
 zed_actions.workspace = true
-zlog.workspace = true
 
 [dev-dependencies]
+assets.workspace = true
 ctor.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
 languages = {workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
 markdown = { workspace = true, features = ["test-support"] }
 multi_buffer = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 proptest-derive.workspace = true

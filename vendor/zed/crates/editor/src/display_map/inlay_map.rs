@@ -16,13 +16,14 @@ use collections::BTreeSet;
 use language::InlayId;
 use language::{Chunk, Edit, LanguageAwareStyling, Point, TextSummary};
 use multi_buffer::{
-    MBTextSummary, MultiBufferOffset, MultiBufferRow, MultiBufferRows, MultiBufferSnapshot,
+    Anchor, MBTextSummary, MultiBufferOffset, MultiBufferRow, MultiBufferRows, MultiBufferSnapshot,
     RowInfo, ToOffset,
 };
 use smallvec::SmallVec;
 use std::{
     cmp, iter,
     ops::{Add, AddAssign, Range, Sub, SubAssign},
+    slice,
     sync::Arc,
 };
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
@@ -1072,7 +1073,7 @@ impl InlayMap {
     }
 
     #[ztracing::instrument(skip_all)]
-    pub fn current_inlays(&self) -> impl Iterator<Item = &Inlay> + Default {
+    pub fn current_inlays(&self) -> slice::Iter<'_, Inlay> {
         self.inlays.iter()
     }
 
@@ -1711,6 +1712,42 @@ impl InlaySnapshot {
         .collect()
     }
 
+    pub(super) fn inlay_offset_range(
+        &self,
+        inlay_id: InlayId,
+        position: Anchor,
+    ) -> Option<Range<InlayOffset>> {
+        let buffer_offset = position.to_offset(&self.buffer);
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
+        cursor.seek(&buffer_offset, Bias::Left);
+        while let Some(transform) = cursor.item() {
+            if cursor.start().0 > buffer_offset {
+                break;
+            }
+            if let Transform::Inlay(inlay) = transform
+                && inlay.id == inlay_id
+            {
+                return Some(cursor.start().1..cursor.end().1);
+            }
+            cursor.next();
+        }
+        None
+    }
+
+    pub(super) fn inlay_hint_at_offset(&self, offset: InlayOffset) -> Option<(&Inlay, usize)> {
+        let (start, _, transform) =
+            self.transforms
+                .find::<InlayOffset, _>((), &offset, Bias::Right);
+        match transform {
+            Some(Transform::Inlay(inlay)) if matches!(inlay.id, InlayId::Hint(_)) => {
+                Some((inlay, offset - start))
+            }
+            _ => None,
+        }
+    }
+
     #[ztracing::instrument(skip_all)]
     fn check_invariants(&self) {
         #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -2011,6 +2048,7 @@ mod tests {
                 Anchor::Min,
                 &InlayHint {
                     label: InlayHintLabel::String("a".to_string()),
+                    text_edits: None,
                     position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
                     padding_left: false,
                     padding_right: false,
@@ -2031,6 +2069,7 @@ mod tests {
                 Anchor::Min,
                 &InlayHint {
                     label: InlayHintLabel::String("a".to_string()),
+                    text_edits: None,
                     position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
                     padding_left: true,
                     padding_right: true,
@@ -2051,6 +2090,7 @@ mod tests {
                 Anchor::Min,
                 &InlayHint {
                     label: InlayHintLabel::String(" a ".to_string()),
+                    text_edits: None,
                     position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
                     padding_left: false,
                     padding_right: false,
@@ -2071,6 +2111,7 @@ mod tests {
                 Anchor::Min,
                 &InlayHint {
                     label: InlayHintLabel::String(" a ".to_string()),
+                    text_edits: None,
                     position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
                     padding_left: true,
                     padding_right: true,
@@ -2094,6 +2135,7 @@ mod tests {
                 Anchor::Min,
                 &InlayHint {
                     label: InlayHintLabel::String("🎨".to_string()),
+                    text_edits: None,
                     position: text::Anchor::min_for_buffer(BufferId::new(1).unwrap()),
                     padding_left: true,
                     padding_right: true,

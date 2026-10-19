@@ -372,7 +372,7 @@ fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
 
     mermaid_render::MermaidTheme {
         dark_mode: is_dark,
-        font_family: mermaid_font_family(theme_settings.ui_font.family.as_ref()),
+        font_family: mermaid_font_family(theme_settings.mermaid_font_family().as_ref()),
         background: colors.editor_background.into(),
         primary_color: colors.surface_background.into(),
         primary_text_color: colors.text.into(),

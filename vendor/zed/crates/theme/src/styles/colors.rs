@@ -463,11 +463,11 @@ pub enum ThemeColorField {
 }
 
 impl ThemeColors {
-    pub fn surface_overlay_background(&self) -> Color {
-        if self.surface_background.is_opaque() {
-            self.surface_background
+    pub fn panel_background_for_overlay(&self) -> Color {
+        if self.panel_background.is_opaque() {
+            self.panel_background
         } else if self.background.is_opaque() {
-            self.background.blend(self.surface_background)
+            self.background.blend(self.panel_background)
         } else {
             self.panel_overlay_background
         }
@@ -651,11 +651,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn surface_overlay_background() {
+    fn panel_background_for_overlay() {
         let mut colors = ThemeColors::light();
         colors.panel_overlay_background = gpui::rgb(0xff0000).into();
 
-        for (surface, background, expected) in [
+        for (panel, background, expected) in [
             (0x58585a00, 0xdcdcddff, 0xdcdcddff),
             (0x00000080, 0xdcdcddff, 0xa1a1a2ff),
             (0xebebecff, 0x24252900, 0xebebecff),
@@ -663,12 +663,12 @@ mod tests {
             (0xebebec00, 0x24252980, 0xff0000ff),
             (0x24252980, 0x24252980, 0xff0000ff),
         ] {
-            colors.surface_background = gpui::rgba(surface).into();
+            colors.panel_background = gpui::rgba(panel).into();
             colors.background = gpui::rgba(background).into();
             assert_eq!(
-                u32::from(Rgba::from(colors.surface_overlay_background())),
+                u32::from(Rgba::from(colors.panel_background_for_overlay())),
                 expected,
-                "surface {surface:#010x}, background {background:#010x}"
+                "panel {panel:#010x}, background {background:#010x}"
             );
         }
     }

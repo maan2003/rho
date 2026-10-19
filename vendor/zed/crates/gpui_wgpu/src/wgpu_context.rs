@@ -468,6 +468,7 @@ impl WgpuContext {
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            default_queue: wgpu::QueueDescriptor::default(),
         };
         #[cfg(target_os = "linux")]
         let external = if adapter.get_info().backend == wgpu::Backend::Vulkan
