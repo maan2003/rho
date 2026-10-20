@@ -3,7 +3,7 @@
 //! live tails, new agents and the quota; requests, terminals and shells are
 //! streams of their own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -359,7 +359,21 @@ fn spawn_log_follow(
                 let Some(head) = send_history(&services.db, &outgoing_tx, &agent_ids).await else {
                     return;
                 };
-                (head, Some(agent_ids.into_iter().collect::<HashSet<_>>()))
+                let held = agent_ids.into_iter().collect::<HashSet<_>>();
+                let others = services.db.read().list_agents();
+                let entries = agent_directory(
+                    &services.db,
+                    others
+                        .into_iter()
+                        .filter(|(agent_id, _)| !held.contains(agent_id)),
+                );
+                if outgoing_tx
+                    .send(rho_agents_client::protocol::ServerFrame::Directory { entries })
+                    .is_err()
+                {
+                    return;
+                }
+                (head, Some(held))
             }
         };
         let wanted = |agent_id: &AgentId| {
@@ -371,8 +385,27 @@ fn spawn_log_follow(
             // Taken before the rows are read: an agent's status arrives
             // after the rows it reflects commit, so they go out first.
             let changed = statuses.take();
-            if !send_journal_from(&services.db, &outgoing_tx, &mut sent, &wanted).await {
+            let mut passed = BTreeSet::new();
+            if !send_journal_from(&services.db, &outgoing_tx, &mut sent, &wanted, &mut passed).await
+            {
                 return;
+            }
+            // The agents whose rows went by unsent are named again.
+            if !passed.is_empty() {
+                let heads = {
+                    let read = services.db.read();
+                    passed
+                        .into_iter()
+                        .filter_map(|agent_id| Some((agent_id, read.try_get_agent(agent_id)?)))
+                        .collect::<Vec<_>>()
+                };
+                let entries = agent_directory(&services.db, heads);
+                if outgoing_tx
+                    .send(rho_agents_client::protocol::ServerFrame::Directory { entries })
+                    .is_err()
+                {
+                    return;
+                }
             }
             for (agent_id, status) in changed {
                 if !wanted(&agent_id) {
@@ -456,13 +489,15 @@ async fn send_history(
     Some(head)
 }
 
-/// Pages the journal out from after `sent`, moving it as it goes. False
-/// when the connection is gone.
+/// Pages the journal out from after `sent`, moving it as it goes, and
+/// adds to `passed` each agent whose rows it left out as not `wanted`.
+/// False when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
     wanted: &impl Fn(&AgentId) -> bool,
+    passed: &mut BTreeSet<AgentId>,
 ) -> bool {
     let mut carries = Carries::new();
     loop {
@@ -473,7 +508,13 @@ async fn send_journal_from(
         *sent = *last;
         let entries = page
             .into_iter()
-            .filter(|(_, agent_id, _, _)| wanted(agent_id))
+            .filter(|(_, agent_id, _, _)| {
+                let wanted = wanted(agent_id);
+                if !wanted {
+                    passed.insert(*agent_id);
+                }
+                wanted
+            })
             .filter_map(|(seq, agent_id, pos, event)| {
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
@@ -527,12 +568,15 @@ fn strip_row(
     crate::transcript::strip(event, prior_carry)
 }
 
-/// Every agent, by its head and its first and last rows: one read each, and
-/// none of the log between.
-fn agent_directory(db: &RhoDb) -> Vec<rho_agents_client::protocol::DirectoryEntry> {
+/// These agents, by their heads and their first and last rows: one read
+/// each, and none of the log between.
+fn agent_directory(
+    db: &RhoDb,
+    agents: impl IntoIterator<Item = (AgentId, rho_agent::log::AgentHead)>,
+) -> Vec<rho_agents_client::protocol::DirectoryEntry> {
     let read = db.read();
     let mut carries = Carries::new();
-    read.list_agents()
+    agents
         .into_iter()
         .filter_map(|(agent_id, head)| {
             let first = rho_agent::log::AgentEventPos::new(0);
@@ -649,12 +693,6 @@ where
         Request::AgentLog(call) => {
             respond(writer, call, |call| async {
                 agent_log_page(&services.db, call)
-            })
-            .await
-        }
-        Request::AgentDirectory(call) => {
-            respond(writer, call, |_| async {
-                Ok(agent_directory(&services.db))
             })
             .await
         }
@@ -1147,6 +1185,7 @@ fn detail_result(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use rho_agent::AgentEvent;
@@ -1219,7 +1258,22 @@ mod tests {
         write.append_agent_event(followed, &said("after"));
         write.commit();
         let mut sent = head;
-        assert!(send_journal_from(&db, &tx, &mut sent, &|agent| *agent == followed).await);
+        let mut passed = BTreeSet::new();
+        assert!(
+            send_journal_from(
+                &db,
+                &tx,
+                &mut sent,
+                &|agent| *agent == followed,
+                &mut passed
+            )
+            .await
+        );
+        assert_eq!(
+            passed,
+            [other].into(),
+            "the other agent's row went by unsent"
+        );
         let mut after = Vec::new();
         while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
             after.extend(entries);
@@ -1245,7 +1299,8 @@ mod tests {
             }),
         );
         write.commit();
-        let directory = agent_directory(&db);
+        let directory =
+            agent_directory(&db, rho_agent::db::AgentReadTxnExt::list_agents(&db.read()));
         assert_eq!(
             directory
                 .iter()
@@ -1324,7 +1379,7 @@ mod tests {
         write.commit();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_journal_from(&db, &tx, &mut Seq(0), &|_| true).await);
+        assert!(send_journal_from(&db, &tx, &mut Seq(0), &|_| true, &mut BTreeSet::new()).await);
         let mut reported = Vec::new();
         while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
             for entry in entries {

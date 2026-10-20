@@ -33,7 +33,7 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
-use rho_agents_client::protocol::{AgentCommand, AgentDirectory, NewAgent};
+use rho_agents_client::protocol::{AgentCommand, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
@@ -1119,38 +1119,6 @@ impl Workspace {
         });
     }
 
-    /// A scratch session's names for the agents it has not opened: each as
-    /// its first row says, with the title and last activity the host
-    /// keeps. An agent already held keeps the digest its rows made. The
-    /// directory knows when an agent last wrote, not what, so that stands
-    /// in for when it last sent: Home's recent list is the scratch
-    /// session's way back to an agent.
-    pub(crate) fn directory_arrived(
-        &mut self,
-        host: HostId,
-        entries: Vec<rho_agents_client::protocol::DirectoryEntry>,
-        cx: &mut Context<Self>,
-    ) {
-        let agents = entries
-            .into_iter()
-            .filter(|entry| self.registry.agent_digest(entry.agent_id).is_none())
-            .filter_map(|entry| {
-                let mut agent =
-                    rho_agents_client::MirroredAgent::new(host, entry.agent_id, &entry.created)?;
-                agent.identity.role = entry.role;
-                agent.digest.title = entry.title;
-                agent.digest.last_active = entry.last_active;
-                agent.digest.last_sent_at = Some(entry.last_active);
-                Some(agent)
-            })
-            .collect::<Vec<_>>();
-        let changed = self.registry.told(agents);
-        self.push_agent_marks(&changed);
-        self.invalidate_dealer_signals(cx);
-        self.refresh_home(cx);
-        cx.notify();
-    }
-
     /// Attaches an agent host. The name is registered with the registry first
     /// so that labels and chrome can qualify by host from the moment the
     /// host exists, not only once it answers.
@@ -1995,11 +1963,6 @@ impl Workspace {
             } => {
                 self.registry
                     .set_host_data(host, machine_seed, agent_counter);
-                if self.scratch.is_some() {
-                    self.call(host, AgentDirectory {}, cx, move |this, entries, cx| {
-                        this.directory_arrived(host, entries, cx)
-                    });
-                }
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::Named(named) => match named {

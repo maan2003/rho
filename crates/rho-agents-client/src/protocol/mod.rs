@@ -46,8 +46,6 @@ rho_rpc::calls! {
         SetAuthAccountEnabled(SetAuthAccountEnabled) -> ();
         /// Bulk: one agent's rows, a page at a time.
         AgentLog(AgentLog) -> AgentLogPage, priority None;
-        /// Bulk: every agent, named but not read.
-        AgentDirectory(AgentDirectory) -> Vec<DirectoryEntry>, priority None;
     }
 }
 
@@ -138,12 +136,8 @@ pub struct AgentLogPage {
     pub next: Option<AgentPos>,
 }
 
-/// Every agent on the host, named but not read: for a client that holds
-/// only the agents it opens and still finds the rest.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct AgentDirectory {}
-
-/// One agent as the directory names it.
+/// One agent a [`ClientFrame::FollowAgents`] does not hold, named but not
+/// read: see [`ServerFrame::Directory`].
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub struct DirectoryEntry {
     pub agent_id: AgentId,
@@ -173,7 +167,8 @@ pub enum ClientFrame {
     /// [`ServerFrame::Log`] pages, every entry stamped with the journal
     /// head the follow started from. Then it follows from that head with
     /// only these agents' rows, and sends [`ServerFrame::Live`] statuses
-    /// for only these agents, at most 256 of them. A later `Follow` or
+    /// for only these agents, at most 256 of them. Every other agent it
+    /// names in [`ServerFrame::Directory`]. A later `Follow` or
     /// `FollowAgents` replaces it. A host older than this frame closes the
     /// session.
     FollowAgents { agent_ids: Vec<AgentId> },
@@ -238,6 +233,11 @@ pub enum ServerFrame {
     /// and every ten minutes besides, because burn and resets move with
     /// time alone.
     QuotaUsage { summaries: Vec<QuotaSummary> },
+    /// On a [`ClientFrame::FollowAgents`] stream, the agents it does not
+    /// hold: all of them after the held agents' history, and then each one
+    /// again whenever a row of its lands, so a new agent, a new title, or
+    /// new activity reaches a client that reads none of their rows.
+    Directory { entries: Vec<DirectoryEntry> },
 }
 
 /// Window represented by each point in the agent-cost distribution graph.

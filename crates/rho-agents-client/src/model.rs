@@ -246,6 +246,11 @@ impl Model {
                 };
                 let held = self.scratch_holds().expect("a scratch model");
                 if held != asked {
+                    // What the directory said of a newly held agent gives
+                    // way to the fold of its history, which the host sends.
+                    for agent_id in held.difference(&asked) {
+                        self.agents.remove(agent_id);
+                    }
                     let follow = ClientFrame::FollowAgents {
                         agent_ids: held.into_iter().collect(),
                     };
@@ -364,7 +369,46 @@ impl Model {
                 host,
                 msg: ModelMsg::QuotaUsage { summaries },
             }],
+            AgentFrame::Directory { entries } => self.named(host, entries),
         }
+    }
+
+    /// Agents a scratch model does not hold, as the directory names them:
+    /// each stands in for the fold of its rows until it is held, and is
+    /// then folded from its history afresh ([`ModelCommand::Follow`]).
+    fn named(
+        &mut self,
+        host: HostId,
+        entries: Vec<crate::protocol::DirectoryEntry>,
+    ) -> Vec<ModelEvent> {
+        let Some(scratch) = &self.scratch else {
+            return Vec::new();
+        };
+        let agents = entries
+            .into_iter()
+            // Sent before the host heard the agent was held: its rows say more.
+            .filter(|entry| !scratch.held.contains(&entry.agent_id))
+            .filter_map(|entry| {
+                let mut agent = crate::MirroredAgent::new(host, entry.agent_id, &entry.created)?;
+                agent.identity.role = entry.role;
+                agent.digest.title = entry.title;
+                agent.digest.last_active = entry.last_active;
+                // Home's recent list orders by what was last sent; the
+                // directory knows only the newest row.
+                agent.digest.last_sent_at = Some(entry.last_active);
+                Some(agent)
+            })
+            .collect::<Vec<_>>();
+        if agents.is_empty() {
+            return Vec::new();
+        }
+        for agent in &agents {
+            self.agents.insert(agent.agent_id(), agent.clone());
+        }
+        vec![ModelEvent {
+            host,
+            msg: ModelMsg::Changed { agents },
+        }]
     }
 
     /// What the window hears of an opened stream: whose ids these are,
@@ -430,8 +474,7 @@ impl Model {
         let follow = match scratch {
             // Everything after the newest entry held.
             None => ClientFrame::Follow { since: slot.seq },
-            // Nothing open yet: nothing of the journal is wanted.
-            Some(held) if held.is_empty() => return out,
+            // Even with nothing open: the directory comes with it.
             Some(held) => ClientFrame::FollowAgents {
                 agent_ids: held.into_iter().collect(),
             },
@@ -798,7 +841,7 @@ mod tests {
         model.attach(HOST, "local".to_owned());
         let mut frames = recorded(&mut model);
         let out = model.ingest(HOST, head(0, 3));
-        assert!(sent(&mut frames).is_empty());
+        assert_eq!(sent(&mut frames), [follow_agents(&[])]);
         assert!(matches!(&out[..], [
             ModelEvent { msg: ModelMsg::Host { .. }, .. },
             ModelEvent { msg: ModelMsg::Named(Err(error)), .. },
@@ -811,7 +854,11 @@ mod tests {
         model.attach(HOST, "local".to_owned());
         let mut frames = recorded(&mut model);
         let out = model.ingest(HOST, head(0, 3));
-        assert!(sent(&mut frames).is_empty(), "nothing open, nothing asked");
+        assert_eq!(
+            sent(&mut frames),
+            [follow_agents(&[])],
+            "nothing open asks for no rows, and so for the directory"
+        );
         assert!(
             !out.iter()
                 .any(|event| matches!(event.msg, ModelMsg::Named(_)))
@@ -849,6 +896,46 @@ mod tests {
                 follow_agents(&[agent(2)]),
             ]
         );
+    }
+
+    #[test]
+    fn a_scratch_model_takes_the_directory_for_agents_it_does_not_hold_until_it_holds_them() {
+        let mut model = Model::scratch(None);
+        model.attach(HOST, "local".to_owned());
+        model.ingest(HOST, head(0, 3));
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
+        let entry = |agent_id, title: &str| crate::protocol::DirectoryEntry {
+            agent_id,
+            created: created(0, agent_id).event,
+            role: AgentRole::default(),
+            title: Some(title.to_owned()),
+            last_active: rho_agent_types::UnixMs(50),
+        };
+        let out = model.ingest(
+            HOST,
+            AgentFrame::Directory {
+                entries: vec![entry(agent(1), "stale"), entry(agent(2), "named")],
+            },
+        );
+        assert_eq!(changed(&out), [agent(2)], "the held agent's rows say more");
+        let named = &model.agents[&agent(2)];
+        assert_eq!(named.title(), Some("named"));
+        assert_eq!(named.digest.last_active, rho_agent_types::UnixMs(50));
+        assert_eq!(named.digest.last_sent_at, Some(rho_agent_types::UnixMs(50)));
+
+        // Held, it is folded from its history alone: nothing of the
+        // directory's guesses survives.
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1), agent(2)])));
+        let out = model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![created(40, agent(2)), presented(40, agent(2), 1, "folded")],
+            },
+        );
+        assert_eq!(changed(&out), [agent(2)]);
+        let folded = &model.agents[&agent(2)];
+        assert_eq!(folded.title(), Some("folded"));
+        assert_eq!(folded.digest.last_sent_at, None);
     }
 
     #[test]

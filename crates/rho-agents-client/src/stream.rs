@@ -45,6 +45,10 @@ pub enum AgentFrame {
     },
     /// The host's quota: every account's latest usage.
     QuotaUsage { summaries: Vec<QuotaSummary> },
+    /// Agents a scratch follow does not hold, named but not read.
+    Directory {
+        entries: Vec<protocol::DirectoryEntry>,
+    },
 }
 
 /// An agents-stream frame tagged with the host it came from.
@@ -161,6 +165,7 @@ impl HostStream for AgentStream {
                         ServerFrame::QuotaUsage { summaries } => {
                             AgentFrame::QuotaUsage { summaries }
                         }
+                        ServerFrame::Directory { entries } => AgentFrame::Directory { entries },
                         // Nothing here asks for a detail body: the
                         // transcript draws a call's line and never its
                         // output.
