@@ -1,13 +1,11 @@
-//! Live-namespace behaviour: bounded reads below `/src`, cloning through
-//! the mirror store from inside the namespace, and the Claude home mount
-//! stack. Runs without the libtest harness because the identity user
-//! namespace must be created while the process is still single-threaded.
+//! Live-namespace behaviour: cloning through the mirror store from inside
+//! the namespace, and the Claude home mount stack. Runs without the libtest
+//! harness because the identity user namespace must be created while the
+//! process is still single-threaded.
 
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use rho_fs_view::{MAX_BOUNDED_READ, read_file_bounded};
 
 mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
@@ -67,78 +65,11 @@ async fn run() {
     let remote = daemon.url("remote.git");
     let root = open_worksets(temp.path()).await;
     let workset = root.create().await.unwrap();
-    let checkout = workset.clone_repo(&remote, Some("project")).await.unwrap();
-    let outside = temp.path().join("outside.txt");
-    std::fs::write(&outside, "secret\n").unwrap();
-    std::os::unix::fs::symlink(&outside, checkout.join("escape")).unwrap();
-    std::fs::create_dir(checkout.join("sub")).unwrap();
-    std::os::unix::fs::symlink("../file.txt", checkout.join("sub/inside")).unwrap();
+    workset.clone_repo(&remote, Some("project")).await.unwrap();
 
     let layout_path = temp.path().join("layout");
     let layout = rho_fs_view::Layout::workset(&workset).unwrap();
     std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
-
-    // Bounded reads use paths in the current filesystem (the host here,
-    // /src in a workset process), without a host-visible path translation.
-    let source = workset.root();
-    let file = source.join("project/file.txt");
-    let inside = source.join("project/sub/inside");
-    assert_eq!(
-        read_file_bounded(source, file.as_std_path(), 1024)
-            .await
-            .unwrap(),
-        b"one\n"
-    );
-    assert_eq!(
-        read_file_bounded(source, inside.as_std_path(), 4)
-            .await
-            .unwrap(),
-        b"one\n"
-    );
-    assert!(
-        read_file_bounded(source, file.as_std_path(), 3)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(source, file.as_std_path(), MAX_BOUNDED_READ + 1)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(source, source.join("project/escape").as_std_path(), 1024)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(source, Path::new("project/file.txt"), 1024)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(source, source.join("../outside.txt").as_std_path(), 1024)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(
-            source,
-            source.join("project/../../etc/passwd").as_std_path(),
-            1024
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        read_file_bounded(source, Path::new("/etc/passwd"), 1024)
-            .await
-            .is_err()
-    );
-    assert!(
-        read_file_bounded(source, source.join("project/sub").as_std_path(), 1024)
-            .await
-            .is_err()
-    );
 
     // Notes created after the namespace exists use the existing state mount.
     let notes = workset.state_dir().unwrap().join("notes");

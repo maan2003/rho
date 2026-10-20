@@ -25,7 +25,7 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{Layout, MAX_BOUNDED_READ, WorksetMount, read_file_bounded};
+pub use ns::{Layout, WorksetMount};
 pub use rho_agent_types::WorksetId;
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
@@ -643,27 +643,6 @@ impl Workset {
     }
 }
 
-/// The path below `visible_root` that `path` denotes; a relative `path` is
-/// taken relative to the root.
-pub(crate) fn visible_relative<'a>(
-    visible_root: &str,
-    path: &'a Utf8Path,
-) -> anyhow::Result<&'a Utf8Path> {
-    anyhow::ensure!(
-        !path.components().any(|component| matches!(
-            component,
-            camino::Utf8Component::CurDir | camino::Utf8Component::ParentDir
-        )),
-        "path must not contain . or .. components: {path}"
-    );
-    if path.is_absolute() {
-        path.strip_prefix(visible_root)
-            .with_context(|| format!("path is outside {visible_root}: {path}"))
-    } else {
-        Ok(path)
-    }
-}
-
 /// Whether `path` is the root of a git checkout: a `.git` directory, or the
 /// `.git` file of a worktree.
 fn is_git_checkout(path: &Path) -> bool {
@@ -775,17 +754,5 @@ mod tests {
         let connection = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let _ = listener.accept().await.unwrap();
         drop(connection);
-    }
-
-    #[test]
-    fn visible_paths_stay_below_the_root() {
-        assert_eq!(
-            visible_relative("/src", Utf8Path::new("/src/a/b")).unwrap(),
-            "a/b"
-        );
-        assert_eq!(visible_relative("/src", Utf8Path::new("a")).unwrap(), "a");
-        assert!(visible_relative("/src", Utf8Path::new("/src/../x")).is_err());
-        assert!(visible_relative("/src", Utf8Path::new("/srcx/a")).is_err());
-        assert!(visible_relative("/src", Utf8Path::new("./a")).is_err());
     }
 }
