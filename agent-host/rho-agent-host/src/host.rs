@@ -238,7 +238,6 @@ where
                 let link = rho_iroh_auth::PairingLink {
                     endpoint_id: auth.server_endpoint_id(),
                     key: auth.mint_pairing_key().await,
-                    name: host_name(),
                 };
                 Ok(link.to_string())
             })
@@ -258,29 +257,6 @@ where
             })
             .await
         }
-    }
-}
-
-/// This machine's name as a client labels it: the kernel's host name, made
-/// fit for a link.
-fn host_name() -> String {
-    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    let name = name
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(64)
-        .collect::<String>();
-    if rho_iroh_auth::valid_host_name(&name) {
-        name
-    } else {
-        "host".to_owned()
     }
 }
 

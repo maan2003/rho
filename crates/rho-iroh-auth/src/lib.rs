@@ -10,7 +10,6 @@ mod shared;
 pub use server::{ApproveError, IrohAuth, PAIRING_TTL, PreapprovedEndpoint, ServerAuthDecision};
 pub use shared::{
     EnrollmentCode, PAIRING_SCHEME, PairingKey, PairingLink, ParseEnrollmentCodeError,
-    valid_host_name,
 };
 
 /// Then 32 bytes: a [`PairingKey`], or zeros for none.

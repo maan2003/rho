@@ -3423,7 +3423,7 @@ impl Workspace {
 
     /// Attaches an agent host named on the spot, for a machine that is not
     /// worth putting in the host list.
-    pub fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
         let spec = match HostSpec::parse(spec, "rho") {
             Ok(spec) => spec,
             Err(error) => {
@@ -3471,20 +3471,47 @@ impl Workspace {
     }
 
     /// Prompt for `<name>=unix:<socket>`, `<name>=iroh:<id>@<ssh-dest>`, or a
-    /// pairing link.
+    /// pairing link, which then asks for its name.
     pub(crate) fn prompt_host_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
-                if !input.trim().is_empty() {
-                    workspace.cmd_host_attach(&input, cx);
+                let input = input.trim();
+                if input.starts_with(rho_iroh_auth::PAIRING_SCHEME) {
+                    workspace.prompt_link_name(input.to_owned(), window, cx);
+                } else if !input.is_empty() {
+                    workspace.cmd_host_attach(input, cx);
                 }
             },
         );
         self.open_prompt("attach host:", complete, on_submit, window, cx);
+    }
+
+    /// Prompt for what to call the host a pairing link reaches. A link can
+    /// come from anywhere, even a Slack message, so it attaches only once
+    /// the user has named it; cancelling the prompt drops it.
+    pub fn prompt_link_name(&mut self, link: String, window: &mut Window, cx: &mut Context<Self>) {
+        let link = match link.parse::<rho_iroh_auth::PairingLink>() {
+            Ok(link) => link,
+            Err(error) => {
+                let message = format!("attach: {error}");
+                return self.notice_on(None, &message, StyleClass::StatusError, cx);
+            }
+        };
+        let id = link.endpoint_id.fmt_short().to_string();
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  name: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.cmd_host_attach(&format!("{}={link}", name.trim()), cx);
+            },
+        );
+        self.open_prompt(format!("name host {id}:"), complete, on_submit, window, cx);
     }
 
     /// Prompt (completing over attached hosts) for one to detach.

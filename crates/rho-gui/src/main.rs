@@ -39,8 +39,9 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
-    /// A pairing link (`rho://…`, which `rho` prints on the host) to attach
-    /// and pair with. With a rho-gui already running, it goes to that one.
+    /// A pairing link (`rho://…`, which `rho` prints on the host) to name,
+    /// attach and pair with. With a rho-gui already running, it goes to that
+    /// one.
     #[arg(value_name = "LINK")]
     link: Option<String>,
 
@@ -421,8 +422,8 @@ fn run() -> Result<()> {
                 }
             };
             let open = move |link: String, cx: &mut App| {
-                let _ = window.update(cx, |workspace, _, cx| {
-                    workspace.cmd_host_attach(&link, cx);
+                let _ = window.update(cx, |workspace, window, cx| {
+                    workspace.prompt_link_name(link, window, cx);
                 });
             };
             if let Some(link) = link {

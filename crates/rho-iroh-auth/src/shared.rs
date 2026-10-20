@@ -144,34 +144,20 @@ impl std::str::FromStr for PairingKey {
 }
 
 /// What an agent host prints for a client to pair with it:
-/// `rho://<endpoint-id>?key=<pairing-key>&name=<name>`. The endpoint id is
-/// all iroh needs to find the host; the name labels it in the client.
+/// `rho://<endpoint-id>?key=<pairing-key>`. The endpoint id is all iroh
+/// needs to find the host. The link names nothing: the client asks its user
+/// what to call the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairingLink {
     pub endpoint_id: EndpointId,
     pub key: PairingKey,
-    pub name: String,
 }
 
 pub const PAIRING_SCHEME: &str = "rho://";
 
-/// Whether a host name can go in a link as it is, and be typed as a host
-/// name in the client.
-pub fn valid_host_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
 impl fmt::Display for PairingLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{PAIRING_SCHEME}{}?key={}&name={}",
-            self.endpoint_id, self.key, self.name
-        )
+        write!(f, "{PAIRING_SCHEME}{}?key={}", self.endpoint_id, self.key)
     }
 }
 
@@ -188,20 +174,16 @@ impl std::str::FromStr for PairingLink {
             .trim_end_matches('/')
             .parse()
             .map_err(|error| format!("invalid endpoint id in pairing link: {error}"))?;
-        let (mut key, mut name) = (None, None);
+        let mut key = None;
+        // Other parameters are room for what a later host adds.
         for pair in query.split('&') {
-            match pair.split_once('=') {
-                Some(("key", value)) => key = Some(value.parse()?),
-                Some(("name", value)) if valid_host_name(value) => name = Some(value.to_owned()),
-                Some(("name", value)) => return Err(format!("invalid host name `{value}`")),
-                // Room for what a later host adds.
-                _ => {}
+            if let Some(("key", value)) = pair.split_once('=') {
+                key = Some(value.parse()?);
             }
         }
         Ok(Self {
             endpoint_id,
             key: key.ok_or("a pairing link has a key")?,
-            name: name.ok_or("a pairing link has a name")?,
         })
     }
 }
@@ -283,14 +265,13 @@ mod pairing_tests {
         let link = PairingLink {
             endpoint_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
             key: PairingKey::from_bytes([0xa5; 32]),
-            name: "m2sh".to_owned(),
         };
         let text = link.to_string();
         assert!(text.starts_with("rho://"), "{text}");
         assert!(text.contains(&"a5".repeat(32)), "{text}");
         assert_eq!(text.parse::<PairingLink>().unwrap(), link);
         // A later host may add parameters, in any order.
-        let reordered = format!("rho://{}?name=m2sh&v=2&key={}", link.endpoint_id, link.key);
+        let reordered = format!("rho://{}?v=2&key={}", link.endpoint_id, link.key);
         assert_eq!(reordered.parse::<PairingLink>().unwrap(), link);
     }
 
@@ -298,11 +279,10 @@ mod pairing_tests {
     fn a_link_without_its_key_or_with_a_bad_one_is_refused() {
         let id = iroh::SecretKey::from_bytes(&[3; 32]).public();
         for text in [
-            format!("rho://{id}?name=m2sh"),
-            format!("rho://{id}?key=abc&name=m2sh"),
-            format!("rho://{id}?key={}&name=m2sh", "g".repeat(64)),
-            format!("rho://{id}?key={}&name=a%20b", "0".repeat(64)),
-            format!("https://{id}?key={}&name=m2sh", "0".repeat(64)),
+            format!("rho://{id}?v=2"),
+            format!("rho://{id}?key=abc"),
+            format!("rho://{id}?key={}", "g".repeat(64)),
+            format!("https://{id}?key={}", "0".repeat(64)),
         ] {
             assert!(text.parse::<PairingLink>().is_err(), "{text}");
         }
