@@ -520,8 +520,27 @@
         # Evaluation in rho-devshell-builder records what the evaluator
         # read; the agent base's `nix develop` takes local flakes' dev shells
         # from the builder's cache.
-        nixFork =
-          (nix.packages.${system}.nix.appendPatches [
+        nixFork = patchNix nix.packages.${system}.nix;
+        # The same for another system, cross-compiled from this one: what
+        # `rho-bin` ships rho-devshell-builder with.
+        nixForkFor =
+          target:
+          if target == system then
+            nixFork
+          else
+            # Patched in the package set, so the Nix that builds its manual
+            # is too: unpatched, newer Meson cannot build it.
+            (import pkgs.path {
+              localSystem = system;
+              crossSystem = target;
+              overlays = [
+                nix.overlays.default
+                (_final: prev: { nix = patchNix prev.nix; })
+              ];
+            }).nix;
+        patchNix =
+          nixPackage:
+          (nixPackage.appendPatches [
             ./nix/patches/nix-0001-libexpr-record-what-evaluation-observes-of-local-inp.patch
             ./nix/patches/nix-0002-libstore-BuildEnvironment-toRcScript-C-API.patch
             ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DE.patch
@@ -584,6 +603,7 @@
             fenix = flakebox.inputs.fenix.packages.${system};
             libraries = guiLibraries;
             skills = bundledSkills;
+            nix = nixForkFor target;
           };
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':

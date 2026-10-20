@@ -15,6 +15,9 @@
   libraries,
   webrtcPrebuilts,
   skills,
+  # Rho's patched Nix built for `system`: rho-devshell-builder links its C
+  # API, and the archive carries its libraries at share/rho/lib.
+  nix,
 }:
 
 let
@@ -49,12 +52,21 @@ let
     map (lib: "${pkgs.lib.getDev lib}/lib/pkgconfig") linked
     ++ map (lib: "${pkgs.lib.getDev lib}/share/pkgconfig") linked
   );
+  # Every shared library Nix's libraries load, but the C runtime the
+  # machine supplies itself: glibc, and GCC's libstdc++ and libgcc_s.
+  # The dev output's closure has the C API's libraries, which `nix` itself
+  # does not reference.
+  nixLibraries = pkgs.closureInfo {
+    rootPaths = [
+      nix
+      (pkgs.lib.getDev nix)
+    ];
+  };
   # Crates that pass bare `-l` flags rely on the linker search path.
   libSearchFlags = pkgs.lib.concatMapStringsSep " " (
     lib: "-L native=${pkgs.lib.getLib lib}/lib"
   ) linked;
-  # The `rho` package's binaries, but rho-devshell-builder: it links Nix's C
-  # API, patched, which this archive does not carry.
+  # The `rho` package's binaries.
   packages = [
     "rho-cli"
     "rho-gui"
@@ -63,6 +75,7 @@ let
     "rho-inference"
     "rho-shell"
     "rho-devshell-daemon"
+    "rho-devshell-builder"
     "git-remote-octo"
   ];
 in
@@ -141,7 +154,26 @@ pkgs.writeShellApplication {
     export AR_${ccTarget}=${crossCc.bintools.bintools}/bin/${crossCc.targetPrefix}ar
     export CARGO_TARGET_${cargoTarget}_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes ${linkerFlags} ${libSearchFlags}"
     export PKG_CONFIG_ALLOW_CROSS=1
-    export PKG_CONFIG_PATH_${ccTarget}=${pkgConfigPath}
+    # Nix's .pc files name its own dependencies' (bdw-gc and more), which
+    # its dev output propagates rather than carries.
+    nix_pc=""
+    declare -A seen=()
+    propagated() {
+      local path
+      for path in "$@"; do
+        [[ -n "''${seen[$path]-}" ]] && continue
+        seen[$path]=1
+        for dir in "$path/lib/pkgconfig" "$path/share/pkgconfig"; do
+          [[ -d "$dir" ]] && nix_pc="$nix_pc:$dir"
+        done
+        if [[ -f "$path/nix-support/propagated-build-inputs" ]]; then
+          # shellcheck disable=SC2046
+          propagated $(cat "$path/nix-support/propagated-build-inputs")
+        fi
+      done
+    }
+    propagated ${pkgs.lib.getDev nix}
+    export PKG_CONFIG_PATH_${ccTarget}=${pkgConfigPath}$nix_pc
     export PROTOC=${pkgs.protobuf}/bin/protoc
     export LIBCLANG_PATH=${pkgs.libclang.lib}/lib
     export BINDGEN_EXTRA_CLANG_ARGS_${ccTarget}="--target=${target} --sysroot=${
@@ -163,9 +195,20 @@ pkgs.writeShellApplication {
     mkdir -p "$stage/bin" "$stage/share/rho/skills"
     binaries="$CARGO_TARGET_DIR/${target}/release"
     for binary in rho rho-gui rho-term rho-agent-host rho-agent-worker rho-shell rho-pager \
-      rho-devshell-daemon git-remote-octo; do
+      rho-devshell-daemon rho-devshell-builder git-remote-octo; do
       llvm-objcopy --strip-debug "$binaries/$binary" "$stage/bin/$binary"
     done
+    mkdir -p "$stage/share/rho/lib"
+    while read -r path; do
+      case "$path" in
+        *-glibc-*|*-gcc-*|*-libgcc*) continue ;;
+      esac
+      if [[ -d "$path/lib" ]]; then
+        find "$path/lib" -maxdepth 1 -name '*.so*' \( -type f -o -type l \) \
+          -exec cp --no-dereference --no-clobber -t "$stage/share/rho/lib" {} +
+      fi
+    done < ${nixLibraries}/store-paths
+    chmod -R u+w "$stage/share/rho/lib"
     for skill in ${pkgs.lib.concatStringsSep " " skills}; do
       cp -r "$repo/.agents/skills/$skill" "$stage/share/rho/skills/$skill"
     done
