@@ -14,6 +14,8 @@
   pythonSitePackages,
   findutils,
   cargoSharedCache,
+  # What rho-gui links: the GUI side's libraries for this machine.
+  libraries,
 }:
 
 let
@@ -35,7 +37,8 @@ stdenv.mkDerivation {
   buildInputs = [
     (lib.getLib stdenv.cc.cc)
     python3
-  ];
+  ]
+  ++ libraries;
 
   installPhase = ''
     runHook preInstall

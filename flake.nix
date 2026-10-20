@@ -573,6 +573,7 @@
             agentNix = pkgs.nix;
           };
           inherit pythonSitePackages findutils cargoSharedCache;
+          libraries = guiLibraries pkgs;
         };
         rhoBinBuild =
           target:
@@ -636,7 +637,7 @@
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-term -p rho-tui -p rho-agent-host -p rho-inference -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
+            packageCargoExtraArgs = "-p rho-cli -p rho-gui -p rho-term -p rho-tui -p rho-agent-host -p rho-inference -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
             # Each copied tree is its own store path: `${buildSrc}/vendor/…`
             # would make the dependency cache depend on every source file,
             # rebuilding all dependencies on any commit.
