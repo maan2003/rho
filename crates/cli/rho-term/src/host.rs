@@ -39,12 +39,17 @@ impl Host {
             });
         }
         let program = std::env::current_exe()?.with_file_name("rho-agent-host");
-        std::process::Command::new(&program)
+        // The terminal is ours, so what the host says goes to a file beside
+        // its socket, read back if it does not come up.
+        let log_path = socket.with_file_name("rho-agent-host.log");
+        let log = std::fs::File::create(&log_path)
+            .with_context(|| format!("create {}", log_path.display()))?;
+        let mut child = std::process::Command::new(&program)
             .arg("--socket-path")
             .arg(&socket)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
             .spawn()
             .with_context(|| format!("start {}", program.display()))?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -57,10 +62,22 @@ impl Host {
                         started: true,
                     });
                 }
-                Err(error) if tokio::time::Instant::now() >= deadline => {
-                    return Err(error.context("the agent host did not come up"));
+                Err(error) => {
+                    let exited = child.try_wait()?;
+                    if exited.is_none() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    let how = match exited {
+                        Some(status) => format!("the agent host exited with {status}"),
+                        None => "the agent host did not come up in 10 s".to_owned(),
+                    };
+                    return Err(error.context(format!(
+                        "{how}; the end of {}:\n{}",
+                        log_path.display(),
+                        log_tail(&log_path)
+                    )));
                 }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
     }
@@ -136,4 +153,11 @@ impl Host {
         }
         refusal
     }
+}
+
+/// The last lines of a log, to show where it stopped.
+fn log_tail(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(20)..].join("\n")
 }
