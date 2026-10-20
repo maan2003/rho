@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -228,24 +228,7 @@ pub(crate) enum SnoozeUnit {
     Weeks,
 }
 
-/// A scratch session's own state: the agent it was started on, until it is
-/// opened. It opens once the agent's history has arrived, since a
-/// transcript opened before that has nothing to show.
-struct Scratch {
-    /// Agents asked for before their rows were here: the one it was
-    /// started on, a draft just made, one picked from the directory.
-    /// Followed, and opened again when their history arrives.
-    to_open: BTreeSet<AgentId>,
-    /// Told why, when the host has no agent the handle names: a session
-    /// started on an agent has nothing to show without it.
-    missing: Missing,
-}
-
-type Missing = Box<dyn Fn(String, &mut App)>;
-
 pub struct Workspace {
-    /// Set in a scratch session ([`Workspace::scratch`]).
-    scratch: Option<Scratch>,
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
     /// them, and the agent host's live tail. Also the focus set every host
@@ -561,11 +544,7 @@ impl Workspace {
     /// The agents whose rows the model hands up: the transcripts this
     /// client has open. Everything else it says as a digest.
     pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
-        let mut followed = self.transcripts.open_agents();
-        if let Some(scratch) = &self.scratch {
-            followed.extend(&scratch.to_open);
-        }
-        followed
+        self.transcripts.open_agents()
     }
 
     fn note_followed(&self) {
@@ -585,13 +564,6 @@ impl Workspace {
         }
         let events = self.agents_client.read_rows(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
-            // A scratch session holds none of an agent until it is asked
-            // for: follow it, and open it again once its rows are here.
-            if let Some(scratch) = &mut self.scratch
-                && scratch.to_open.insert(agent_id)
-            {
-                self.note_followed();
-            }
             return false;
         }
         self.note_followed();
@@ -744,48 +716,12 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(specs, None, window, cx)
-    }
-
-    /// A scratch session (`rho-gui --scratch`): it opens on the agent a
-    /// handle names, once the host has named it, or on a draft of a new
-    /// one in the current directory. Its model holds only the agents it
-    /// opens, and the host's directory names the rest. It starts no Slack
-    /// and asks for no secret phrase: it is not the user's desk.
-    pub fn scratch(
-        specs: Vec<HostSpec>,
-        handle: Option<String>,
-        missing: impl Fn(String, &mut App) + 'static,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let scratch = Scratch {
-            to_open: BTreeSet::new(),
-            missing: Box::new(missing),
-        };
-        Self::build(specs, Some((handle, scratch)), window, cx)
-    }
-
-    fn build(
-        specs: Vec<HostSpec>,
-        scratch: Option<(Option<String>, Scratch)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let (handle, scratch) = scratch.unzip();
-        let drafting = handle == Some(None);
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let (agents_client, changes) = match handle {
-            Some(handle) => rho_agents_client::model::AgentsClient::spawn_scratch(handle),
-            None => rho_agents_client::model::AgentsClient::spawn(),
-        };
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::spawn();
         #[cfg(test)]
-        let (agents_client, changes) = {
-            let _ = handle;
-            rho_agents_client::model::AgentsClient::detached()
-        };
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
         // Each stream of a host has its own reader: the agents stream goes
         // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_agent_hosts::HostEvent>();
@@ -1028,7 +964,6 @@ impl Workspace {
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
-            scratch,
         };
         let no_hosts = specs.is_empty();
         for spec in specs {
@@ -1051,13 +986,6 @@ impl Workspace {
         this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.invalidate_dealer_signals(cx);
-        if this.scratch.is_some() {
-            if drafting {
-                // Once the workspace exists, so the draft can take focus.
-                cx.defer_in(window, |this, window, cx| this.draft_here(window, cx));
-            }
-            return this;
-        }
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack. And when there is no session it says so: rho
@@ -1093,30 +1021,6 @@ impl Workspace {
             });
         }
         this
-    }
-
-    /// A scratch session started on no agent: a draft of one that works in
-    /// place where rho-gui started.
-    fn draft_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let here = std::env::current_dir()
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_default();
-        self.draft_model.update(cx, |draft, cx| {
-            draft.set_workdir_text(&here, cx);
-            draft.set_start_mode(rho_agents_client::StartFieldMode::Here, cx);
-            // In place has no base to name.
-            draft.set_start_text("", cx);
-        });
-        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
-        self.display_surface(draft, cx);
-        self.focus_active_surface(window, cx);
-        // The draft exists to be written in, so it opens ready to type:
-        // straight to its editor, once vim has taken it on, since an action
-        // dispatched before the first frame reaches no focused editor.
-        let editor = self.active_editor(cx);
-        window.defer(cx, move |window, cx| {
-            vim::enter_insert_mode(&editor, window, cx);
-        });
     }
 
     /// Attaches an agent host. The name is registered with the registry first
@@ -1919,16 +1823,6 @@ impl Workspace {
                             .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
-                if let Some(scratch) = &mut self.scratch {
-                    let arrived = changed
-                        .iter()
-                        .copied()
-                        .filter(|id| scratch.to_open.remove(id))
-                        .collect::<Vec<_>>();
-                    for agent_id in arrived {
-                        self.open_agent(agent_id, window, cx);
-                    }
-                }
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
@@ -1965,19 +1859,6 @@ impl Workspace {
                     .set_host_data(host, machine_seed, agent_counter);
                 cx.notify();
             }
-            rho_agents_client::model::ModelMsg::Named(named) => match named {
-                // A stream opened again names the agent already open.
-                Ok(agent_id) if self.models.contains_key(&agent_id) => {}
-                Ok(agent_id) => {
-                    if let Some(scratch) = &mut self.scratch {
-                        scratch.to_open.insert(agent_id);
-                    }
-                }
-                Err(error) => match &self.scratch {
-                    Some(scratch) => (scratch.missing)(error, cx),
-                    None => self.echo(&error, StyleClass::SystemImportant, cx),
-                },
-            },
             rho_agents_client::model::ModelMsg::Auth { auth } => {
                 self.quotas.set_auth(host, auth);
                 if let Some(view) = self.usage.opened_view() {

@@ -219,7 +219,7 @@ dependencies = [
  "rustix 1.1.5",
  "rustix-openpty",
  "serde",
- "signal-hook 0.4.4",
+ "signal-hook",
  "unicode-width 0.2.2",
  "vte",
  "windows-sys 0.59.0",
@@ -3402,21 +3402,6 @@ name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
-
-[[package]]
-name = "crossterm"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
-dependencies = [
- "bitflags 2.13.2",
- "document-features",
- "mio",
- "parking_lot",
- "rustix 1.1.5",
- "signal-hook 0.3.18",
- "signal-hook-mio",
-]
 
 [[package]]
 name = "crunchy"
@@ -13160,6 +13145,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14127,6 +14118,7 @@ dependencies = [
  "libc",
  "notion-server",
  "prefix-id",
+ "qrcode",
  "rho-agent",
  "rho-agent-host",
  "rho-agent-hosts",
@@ -14430,10 +14422,8 @@ dependencies = [
  "rho-rtc",
  "rho-shell-view",
  "rho-slack",
- "rho-term",
  "rho-terminal",
  "rho-transcript",
- "rho-tty",
  "rho-window",
  "rodio",
  "rust-embed",
@@ -14519,6 +14509,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "iroh",
+ "rand 0.10.3",
  "redb",
  "redb-derive",
  "rho-db",
@@ -14774,36 +14765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-term"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "camino",
- "clap",
- "json-stream",
- "prefix-id",
- "rand 0.10.3",
- "rho-agent-hosts",
- "rho-agent-types",
- "rho-agents-client",
- "rho-rpc",
- "rho-term-ui",
- "serde_json",
- "tokio",
- "vt100",
-]
-
-[[package]]
-name = "rho-term-ui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "unicode-segmentation",
- "unicode-width 0.2.2",
- "vt100",
-]
-
-[[package]]
 name = "rho-terminal"
 version = "0.1.0"
 dependencies = [
@@ -14853,21 +14814,6 @@ dependencies = [
  "text",
  "theme",
  "theme_settings",
-]
-
-[[package]]
-name = "rho-tty"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "crossterm",
- "futures",
- "gpui",
- "parking_lot",
- "raw-window-handle",
- "unicode-width 0.2.2",
- "uuid",
 ]
 
 [[package]]
@@ -16046,33 +15992,12 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
-name = "signal-hook"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
  "libc",
  "signal-hook-registry",
-]
-
-[[package]]
-name = "signal-hook-mio"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
-dependencies = [
- "libc",
- "mio",
- "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -18822,17 +18747,6 @@ checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
  "libc",
-]
-
-[[package]]
-name = "vt100"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
-dependencies = [
- "itoa",
- "unicode-width 0.2.2",
- "vte",
 ]
 
 [[package]]

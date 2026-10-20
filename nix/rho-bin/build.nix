@@ -54,23 +54,18 @@ let
   );
   # Every shared library Nix's libraries load, but the C runtime the
   # machine supplies itself: glibc, and GCC's libstdc++ and libgcc_s.
-  # The dev output's closure has the C API's libraries, which `nix` itself
-  # does not reference.
-  nixLibraries = pkgs.closureInfo {
-    rootPaths = [
-      nix
-      (pkgs.lib.getDev nix)
-    ];
-  };
+  # Its libraries alone: the whole of `nix` would build its manual, which
+  # needs a Nix for the build machine as well.
+  nixLibs = pkgs.lib.attrValues nix.libs;
+  nixLibraries = pkgs.closureInfo { rootPaths = nixLibs; };
   # Crates that pass bare `-l` flags rely on the linker search path.
   libSearchFlags = pkgs.lib.concatMapStringsSep " " (
     lib: "-L native=${pkgs.lib.getLib lib}/lib"
-  ) linked;
+  ) (linked ++ nixLibs);
   # The `rho` package's binaries.
   packages = [
     "rho-cli"
     "rho-gui"
-    "rho-term"
     "rho-agent-host"
     "rho-inference"
     "rho-shell"
@@ -172,7 +167,7 @@ pkgs.writeShellApplication {
         fi
       done
     }
-    propagated ${pkgs.lib.getDev nix}
+    propagated ${pkgs.lib.concatMapStringsSep " " pkgs.lib.getDev nixLibs}
     export PKG_CONFIG_PATH_${ccTarget}=${pkgConfigPath}$nix_pc
     export PROTOC=${pkgs.protobuf}/bin/protoc
     export LIBCLANG_PATH=${pkgs.libclang.lib}/lib
@@ -194,7 +189,7 @@ pkgs.writeShellApplication {
     rm -rf "$stage"
     mkdir -p "$stage/bin" "$stage/share/rho/skills"
     binaries="$CARGO_TARGET_DIR/${target}/release"
-    for binary in rho rho-gui rho-term rho-agent-host rho-agent-worker rho-shell rho-pager \
+    for binary in rho rho-gui rho-agent-host rho-agent-worker rho-shell rho-pager \
       rho-devshell-daemon rho-devshell-builder git-remote-octo; do
       llvm-objcopy --strip-debug "$binaries/$binary" "$stage/bin/$binary"
     done
