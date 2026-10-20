@@ -14430,6 +14430,7 @@ dependencies = [
  "rho-rtc",
  "rho-shell-view",
  "rho-slack",
+ "rho-term",
  "rho-terminal",
  "rho-transcript",
  "rho-tty",

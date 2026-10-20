@@ -609,7 +609,7 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
     let workspace = cx.add_window(|window, cx| {
         Workspace::for_one_agent(
             specs.clone(),
-            "eng-1".to_owned(),
+            rho_agents_client::model::OneAgent::Handle("eng-1".to_owned()),
             move |error, _| told.borrow_mut().push(error),
             window,
             cx,
@@ -669,6 +669,41 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(*missing.borrow(), ["no agent `eng-9` on this host"]);
+}
+
+/// A window on one agent with no handle drafts a new agent that works in
+/// place, where rho-gui started.
+#[gpui::test]
+fn a_workspace_for_one_new_agent_opens_on_a_draft_here(cx: &mut TestAppContext) {
+    story::reset();
+    cx.update(init_test_app);
+    let specs = vec![HostSpec {
+        name: "local".to_owned(),
+        target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock")),
+    }];
+    let workspace = cx.add_window(|window, cx| {
+        Workspace::for_one_agent(
+            specs.clone(),
+            rho_agents_client::model::OneAgent::Unnamed,
+            |_, _| {},
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let here = std::env::current_dir().unwrap().display().to_string();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.active_surface().key,
+                crate::pane::SurfaceKey::Draft
+            );
+            let draft = workspace.draft_model_for_test();
+            let draft = draft.read(cx);
+            assert_eq!(draft.workdir_text(cx), here);
+            assert_eq!(draft.start_mode(), rho_agents_client::StartFieldMode::Here);
+        })
+        .unwrap();
 }
 
 #[gpui::test]

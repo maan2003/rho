@@ -39,14 +39,17 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
-    /// Open only this agent, `eng-k3f9` or the start of its id: the GUI
-    /// holds it alone, in memory, and writes nothing to disk. Without
-    /// `--attach` it attaches the local agent host.
+    /// Open only this agent, `eng-k3f9` or the start of its id, instead of
+    /// the desk. See `--tty` for what a window on one agent is.
     #[arg(long, value_name = "HANDLE")]
     agent: Option<String>,
 
-    /// Draw in this terminal instead of a window. The log goes to
-    /// `rho-gui.log` in the state directory.
+    /// Draw in this terminal instead of a window, on one agent: the one
+    /// `--agent` names, or a draft of a new one that works in this
+    /// directory. A window on one agent holds it alone, in memory, and
+    /// writes nothing to disk. Without `--attach` it attaches the agent
+    /// host on this machine, and starts it when it is not running. The
+    /// log goes to `rho-gui.log` in the state directory.
     #[arg(long)]
     tty: bool,
 
@@ -323,7 +326,12 @@ fn run(args: Args) -> Result<()> {
     // it later. A second rho stops at the door rather than running on with
     // none of its own state. After an unclean stop redb rebuilds its
     // allocator from every page, which is paid here, before the window.
-    let db = if args.agent.is_some() {
+    // The desk, or a window on one agent.
+    let one_agent = (args.tty || args.agent.is_some()).then(|| match &args.agent {
+        Some(handle) => rho_agents_client::model::OneAgent::Handle(handle.clone()),
+        None => rho_agents_client::model::OneAgent::Unnamed,
+    });
+    let db = if one_agent.is_some() {
         rho_db::client::shared_in_memory()
     } else {
         rho_db::client::open_shared(&client_state_dir)
@@ -355,7 +363,17 @@ fn run(args: Args) -> Result<()> {
     }
 
     let tty = args.tty;
-    let one_agent = args.agent.clone();
+    // A window on one agent with no host named uses this machine's, and
+    // starts it if it is not running: it stops it on the way out unless
+    // something else still uses it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let started_host = if one_agent.is_some() && args.attach.is_empty() {
+        Some(runtime.block_on(rho_term::host::Host::connect_or_start(None))?)
+    } else {
+        None
+    };
     // Why a window on one agent closed: said once the terminal is back.
     let missing = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let missing_in_app = missing.clone();
@@ -456,6 +474,11 @@ fn run(args: Args) -> Result<()> {
         }
     });
 
+    if let Some(host) = started_host
+        && let Some(why) = runtime.block_on(host.leave())
+    {
+        eprintln!("rho-gui: the agent host stays up: {why}");
+    }
     match missing.take() {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
@@ -872,10 +895,15 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 /// and a first run attaches nothing: `space h` attaches a host, and the
 /// set attached is what the next start finds.
 fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
-    if args.attach.is_empty() && args.agent.is_some() {
+    if args.attach.is_empty() && (args.tty || args.agent.is_some()) {
         return Ok(vec![HostSpec {
             name: "local".to_owned(),
-            target: AttachTarget::Unix(rho_rpc::protocol::socket_path()?),
+            // Where `Host::connect_or_start` found or started it.
+            target: AttachTarget::Unix(
+                rho_rpc::protocol::RuntimePaths::resolve(None::<PathBuf>)?
+                    .socket()
+                    .to_owned(),
+            ),
         }]);
     }
     if args.attach.is_empty() {

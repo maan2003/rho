@@ -733,13 +733,14 @@ impl Workspace {
         Self::build(specs, None, window, cx)
     }
 
-    /// A workspace for the one agent `handle` names (`rho-gui --agent`).
-    /// Its model holds that agent alone, and it opens the agent once the
-    /// host has named it. It starts no Slack and asks for no secret
-    /// phrase: it is a window on one agent, not the user's desk.
+    /// A workspace for one agent (`rho-gui --tty`, `rho-gui --agent`): an
+    /// agent a handle names, opened once the host has named it, or a draft
+    /// of a new one in the current directory. Its model holds that agent
+    /// alone. It starts no Slack and asks for no secret phrase: it is a
+    /// window on one agent, not the user's desk.
     pub fn for_one_agent(
         specs: Vec<HostSpec>,
-        handle: String,
+        handle: rho_agents_client::model::OneAgent,
         missing: impl Fn(String, &mut App) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -753,11 +754,12 @@ impl Workspace {
 
     fn build(
         specs: Vec<HostSpec>,
-        one_agent: Option<(String, OneAgent)>,
+        one_agent: Option<(rho_agents_client::model::OneAgent, OneAgent)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (handle, one_agent) = one_agent.unzip();
+        let drafting = handle == Some(rho_agents_client::model::OneAgent::Unnamed);
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
@@ -1036,6 +1038,10 @@ impl Workspace {
         // Seed the listing before any event arrives ("+ new agent").
         this.invalidate_dealer_signals(cx);
         if this.one_agent.is_some() {
+            if drafting {
+                // Once the workspace exists, so the draft can take focus.
+                cx.defer_in(window, |this, window, cx| this.draft_here(window, cx));
+            }
             return this;
         }
         // Slack runs from startup, not from the first time the surface is
@@ -1073,6 +1079,30 @@ impl Workspace {
             });
         }
         this
+    }
+
+    /// A window on one agent, before there is one: a draft of an agent
+    /// that works in place where rho-gui started.
+    fn draft_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let here = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        self.draft_model.update(cx, |draft, cx| {
+            draft.set_workdir_text(&here, cx);
+            draft.set_start_mode(rho_agents_client::StartFieldMode::Here, cx);
+            // In place has no base to name.
+            draft.set_start_text("", cx);
+        });
+        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
+        self.display_surface(draft, cx);
+        self.focus_active_surface(window, cx);
+        // The draft exists to be written in, so it opens ready to type:
+        // straight to its editor, once vim has taken it on, since an action
+        // dispatched before the first frame reaches no focused editor.
+        let editor = self.active_editor(cx);
+        window.defer(cx, move |window, cx| {
+            vim::enter_insert_mode(&editor, window, cx);
+        });
     }
 
     /// Attaches an agent host. The name is registered with the registry first
@@ -2618,6 +2648,10 @@ impl Workspace {
                 return;
             }
         };
+        if self.one_agent.is_some() {
+            // The window is this agent's from now on.
+            self.agents_client.follow_only(agent_id);
+        }
         self.note_agent_created(host, agent_id);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
