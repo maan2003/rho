@@ -41,6 +41,7 @@ use rho_agents_client::protocol::{
 use rho_agents_client::state::UiAgentStatus;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_view::draft::DraftModel;
+use rho_agents_view::render::TranscriptView;
 use rho_agents_view::{AgentModel, AgentModelEvent, DraftFieldClear, DraftValueCycle};
 use rho_term::agent::{Directory, Followed, resolve, short_handle};
 use rho_term::host::Host;
@@ -55,7 +56,8 @@ actions!(
         Leave,
         LeaveIfEmpty,
         NextField,
-        PreviousField
+        PreviousField,
+        ToggleView
     ]
 );
 
@@ -107,6 +109,8 @@ enum Screen {
     },
     Agent {
         followed: Box<Followed>,
+        /// The conversation, or every call the agent made.
+        view: TranscriptView,
         model: Entity<AgentModel>,
         editor: Entity<Editor>,
         _subscription: gpui::Subscription,
@@ -295,6 +299,13 @@ fn init(cx: &mut App) -> Result<()> {
             Some("RhoDraft > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-t", DraftValueCycle, Some("RhoDraft > Editor")),
+        // An agent's screen: Tab outside insert mode turns between the
+        // conversation and the activity.
+        KeyBinding::new(
+            "tab",
+            ToggleView,
+            Some("RhoTui > Editor && !RhoDraft && vim_mode != insert && !showing_completions"),
+        ),
         KeyBinding::new(
             "ctrl-u",
             DraftFieldClear,
@@ -379,7 +390,9 @@ impl Root {
                 window.focus(&editor.focus_handle(cx), cx);
                 Screen::Draft { model, editor }
             }
-            Phase::Following(followed) => Self::agent_screen(followed, window, cx),
+            Phase::Following(followed) => {
+                Self::agent_screen(followed, TranscriptView::Conversation, window, cx)
+            }
         };
         let frames = cx.spawn(async move |this, cx| {
             while let Some(frame) = from_host.recv().await {
@@ -426,11 +439,13 @@ impl Root {
     /// the prompt under it, the cursor in the prompt.
     fn agent_screen(
         followed: Box<Followed>,
+        view: TranscriptView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Screen {
         let model = cx.new(|cx| {
-            AgentModel::new(
+            AgentModel::with_view(
+                view,
                 Rc::new(NoCompletions),
                 rho_agents_client::remote::AgentsLink::detached(),
                 cx,
@@ -446,6 +461,7 @@ impl Root {
         });
         Screen::Agent {
             followed,
+            view,
             model,
             editor,
             _subscription: subscription,
@@ -648,7 +664,12 @@ impl Root {
         let _ = self.to_host.send(ClientFrame::Focus {
             agent_ids: vec![agent_id],
         });
-        self.screen = Self::agent_screen(Box::new(Followed::new(agent_id)), window, cx);
+        self.screen = Self::agent_screen(
+            Box::new(Followed::new(agent_id)),
+            TranscriptView::Conversation,
+            window,
+            cx,
+        );
         window.focus(&self.editor().focus_handle(cx), cx);
         let host = self.host.clone();
         let log = self
@@ -727,6 +748,42 @@ impl Root {
                 cx.propagate();
             }
         }
+    }
+
+    /// Between the conversation and every call the agent made: a model of
+    /// the other view over the same fold, with what the prompt held.
+    fn toggle_view(&mut self, _: &ToggleView, window: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Agent {
+            followed,
+            view,
+            model,
+            ..
+        } = &mut self.screen
+        else {
+            return;
+        };
+        let empty = Box::new(Followed::new(followed.agent_id));
+        let followed = std::mem::replace(followed, empty);
+        let (view, model) = (*view, model.clone());
+        let prompt = model.read(cx).prompt_text(cx);
+        let view = match view {
+            TranscriptView::Conversation => TranscriptView::Activity,
+            TranscriptView::Activity => TranscriptView::Conversation,
+        };
+        self.screen = Self::agent_screen(followed, view, window, cx);
+        if let Screen::Agent { model, .. } = &self.screen {
+            model.update(cx, |model, cx| model.set_prompt_text(&prompt, cx));
+        }
+        window.focus(&self.editor().focus_handle(cx), cx);
+        // The activity has no prompt to write in; it opens for reading, once
+        // vim has taken the new editor on.
+        if view == TranscriptView::Activity {
+            let editor = self.editor().clone();
+            window.defer(cx, move |window, cx| {
+                vim::enter_normal_mode(&editor, window, cx);
+            });
+        }
+        self.sync(FrameSummary::everything(), cx);
     }
 
     fn stop(&mut self, _: &Stop, _: &mut Window, cx: &mut Context<Self>) {
@@ -815,7 +872,7 @@ impl Root {
                     false,
                 );
             }
-            Screen::Agent { followed, .. } => {
+            Screen::Agent { followed, view, .. } => {
                 push(
                     &mut text,
                     &format!(" {}", self.directory.label(followed.agent_id)),
@@ -840,6 +897,11 @@ impl Root {
                 {
                     push(&mut text, &format!(" · {tasks} running"), dim, false);
                 }
+                let other = match view {
+                    TranscriptView::Conversation => " · Tab: activity",
+                    TranscriptView::Activity => " · activity · Tab: chat",
+                };
+                push(&mut text, other, dim, false);
                 push(&mut text, " · Ctrl-C stops · Ctrl-Q leaves", dim, false);
             }
         }
@@ -872,6 +934,7 @@ impl Render for Root {
             .on_action(cx.listener(Self::previous_field))
             .on_action(cx.listener(Self::cycle_value))
             .on_action(cx.listener(Self::clear_field))
+            .on_action(cx.listener(Self::toggle_view))
             .size_full()
             .flex()
             .flex_col()
@@ -894,9 +957,11 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui::{App, AsyncApp, WindowOptions};
+    use gpui::{App, WindowOptions};
     use rho_agent_types::{AgentIdDomain, AgentRole, Place, SendKind, UnixMs};
-    use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy};
+    use rho_agents_client::protocol::transcript::{
+        InferenceState, Item, RuntimeKind, SpawnedBy, StreamingResponse,
+    };
     use rho_tty::Headless;
 
     use super::*;
@@ -907,38 +972,45 @@ mod tests {
 
     /// An agent asked `hi` that answered `hello back`.
     fn answered() -> Phase {
+        following(&[("hi", "hello back")])
+    }
+
+    /// An agent asked each question that gave each answer.
+    fn following(exchanges: &[(&str, &str)]) -> Phase {
         let at = UnixMs(0);
-        let events = [
-            TranscriptEvent::Created {
-                role: AgentRole::default(),
-                runtime: RuntimeKind::Rho,
-                place: Place {
-                    cwd: "/src/repo".into(),
-                    workset: None,
+        let mut events = vec![TranscriptEvent::Created {
+            role: AgentRole::default(),
+            runtime: RuntimeKind::Rho,
+            place: Place {
+                cwd: "/src/repo".into(),
+                workset: None,
+            },
+            spawned_by: SpawnedBy::Direct,
+            spawn_name: None,
+            parent: None,
+            model: "test-model".to_owned(),
+            at,
+        }];
+        for (asked, answer) in exchanges {
+            events.extend([
+                TranscriptEvent::Message {
+                    from: None,
+                    text: (*asked).to_owned(),
+                    at,
                 },
-                spawned_by: SpawnedBy::Direct,
-                spawn_name: None,
-                parent: None,
-                model: "test-model".to_owned(),
-                at,
-            },
-            TranscriptEvent::Message {
-                from: None,
-                text: "hi".to_owned(),
-                at,
-            },
-            TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at,
-            },
-            TranscriptEvent::MessageSent {
-                to: None,
-                text: "hello back".to_owned(),
-                kind: SendKind::Result,
-                at,
-            },
-        ];
+                TranscriptEvent::Sent {
+                    results: Vec::new(),
+                    compaction: false,
+                    at,
+                },
+                TranscriptEvent::MessageSent {
+                    to: None,
+                    text: (*answer).to_owned(),
+                    kind: SendKind::Result,
+                    at,
+                },
+            ]);
+        }
         let rows: Vec<_> = events
             .into_iter()
             .enumerate()
@@ -951,16 +1023,19 @@ mod tests {
 
     /// Runs the screen over `phase` on a headless terminal, with no agent
     /// host behind it, and hands `script` the terminal to drive.
+    /// What the test hands the screen as the agent host would.
+    type HostFeed = tokio::sync::mpsc::UnboundedSender<Result<ServerFrame>>;
+
     fn run<F>(cols: u16, rows: u16, phase: Phase, script: F)
     where
-        F: AsyncFnOnce(Headless, &mut AsyncApp) + 'static,
+        F: AsyncFnOnce(Headless, HostFeed) + 'static,
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (to_host, _outgoing) = tokio::sync::mpsc::unbounded_channel();
-        let (_incoming, from_host) = tokio::sync::mpsc::unbounded_channel();
+        let (feed, from_host) = tokio::sync::mpsc::unbounded_channel();
         let connected = Connected {
             host: Arc::new(Host::at("/nonexistent/rho-tui-test.sock".into())),
             to_host,
@@ -981,7 +1056,7 @@ mod tests {
             })
             .unwrap();
             cx.spawn(async move |cx| {
-                script(term.clone(), cx).await;
+                script(term.clone(), feed).await;
                 cx.update(|cx| cx.quit());
             })
             .detach();
@@ -1057,6 +1132,104 @@ mod tests {
                 .filter(|&col| term.background(col, 2) != background)
                 .collect();
             assert_eq!(selected, [1, 2, 3], "`hel`, and the block cursor on `l`");
+        });
+    }
+
+    /// Wide characters take two cells, and the cursor goes past both.
+    #[test]
+    fn wide_characters_take_two_cells() {
+        run(
+            40,
+            8,
+            following(&[("日本語 ok", "🙂 done")]),
+            async |term, _| {
+                term.settled().await;
+                let screen = lines(&term);
+                assert_eq!(screen[..3], ["│日本語 ok", "", " 🙂 done"]);
+                term.type_text("日本");
+                term.settled().await;
+                assert_eq!(lines(&term)[4], "│日本");
+                assert_eq!(term.cursor(), Some((5, 4)));
+            },
+        );
+    }
+
+    /// A transcript taller than the terminal opens on its end, and the
+    /// wheel scrolls back to its start.
+    #[test]
+    fn the_wheel_scrolls_a_long_transcript() {
+        let answers: Vec<String> = (0..20).map(|n| format!("answer {n}")).collect();
+        let exchanges: Vec<(&str, &str)> = answers.iter().map(|a| ("q", a.as_str())).collect();
+        run(40, 8, following(&exchanges), async |term, _| {
+            term.settled().await;
+            let screen = lines(&term).join("\n");
+            assert!(screen.contains("answer 19"), "{screen}");
+            assert!(!screen.contains("answer 0\n"), "{screen}");
+            for _ in 0..40 {
+                term.scroll(5, 2, true);
+            }
+            term.settled().await;
+            let screen = lines(&term);
+            assert_eq!(screen[0], "│q", "{screen:?}");
+            assert_eq!(screen[2], " answer 0", "{screen:?}");
+        });
+    }
+
+    /// Tab outside insert mode turns to the activity and back, keeping
+    /// what the prompt held.
+    #[test]
+    fn tab_turns_between_the_conversation_and_the_activity() {
+        run(60, 8, answered(), async |term, _| {
+            term.settled().await;
+            term.type_text("draft");
+            term.press("escape");
+            term.press("tab");
+            term.settled().await;
+            let screen = lines(&term);
+            assert!(screen[7].contains(" · activity · Tab: chat"), "{screen:?}");
+            term.press("tab");
+            term.settled().await;
+            let screen = lines(&term);
+            assert!(screen[7].contains(" · Tab: activity"), "{screen:?}");
+            assert_eq!(screen[4], "│draft", "{screen:?}");
+        });
+    }
+
+    /// A response shows as it streams, and the status line says the agent
+    /// is at work until it stops.
+    #[test]
+    fn a_streaming_response_grows_in_place() {
+        let streaming = |text: &str| {
+            let live = Live::Snapshot {
+                state: RuntimeState {
+                    inference: InferenceState::Responding,
+                    ..RuntimeState::default()
+                },
+                response: Some(StreamingResponse {
+                    id: "response".into(),
+                    items: vec![Item::Text {
+                        text: text.into(),
+                        phase: None,
+                    }],
+                }),
+                draft: None,
+            };
+            Ok(ServerFrame::Live {
+                agent_id: agent(),
+                live,
+            })
+        };
+        run(50, 8, answered(), async move |term, feed| {
+            term.settled().await;
+            feed.send(streaming("first wo")).unwrap();
+            term.settled().await;
+            let screen = lines(&term).join("\n");
+            assert!(screen.contains("first wo"), "{screen}");
+            feed.send(streaming("first words, then more")).unwrap();
+            term.settled().await;
+            let screen = lines(&term).join("\n");
+            assert!(screen.contains("first words, then more"), "{screen}");
+            assert!(!screen.contains(" idle "), "{screen}");
         });
     }
 

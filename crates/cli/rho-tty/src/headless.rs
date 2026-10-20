@@ -6,7 +6,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures::channel::oneshot;
 
 use crate::dispatcher::MainMsg;
@@ -79,6 +81,21 @@ impl Headless {
             _ => panic!("no key {rest:?} in {key:?}"),
         };
         self.send(key_event(code, modifiers));
+    }
+
+    /// Turns the mouse wheel a notch over a cell, back through what is
+    /// shown when `up`.
+    pub fn scroll(&self, col: u16, row: u16, up: bool) {
+        self.send(Event::Mouse(MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
     }
 
     /// The terminal changed size.
