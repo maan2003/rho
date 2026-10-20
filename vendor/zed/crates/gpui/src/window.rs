@@ -3012,6 +3012,33 @@ impl Window {
         self.scale_factor
     }
 
+    /// `length` along `axis`, rounded up to the platform's layout grid when
+    /// it has one ([`PlatformWindow::layout_grid`]), for widths an element
+    /// computes itself rather than through layout. Unchanged otherwise.
+    pub fn ceil_to_layout_grid(&self, length: Pixels, axis: crate::Axis) -> Pixels {
+        match self.platform_window.layout_grid() {
+            Some(grid) => {
+                let step = match axis {
+                    crate::Axis::Horizontal => grid.width,
+                    crate::Axis::Vertical => grid.height,
+                };
+                step * (length / step).ceil()
+            }
+            None => length,
+        }
+    }
+
+    /// How many layout units one logical pixel is on each axis: layout
+    /// snaps to whole units. Device pixels, so the scale factor, unless the
+    /// platform lays out on a coarser grid (a terminal's cells, see
+    /// [`PlatformWindow::layout_grid`]).
+    pub fn layout_scale(&self) -> Size<f32> {
+        match self.platform_window.layout_grid() {
+            Some(grid) => size(1.0 / f32::from(grid.width), 1.0 / f32::from(grid.height)),
+            None => size(self.scale_factor, self.scale_factor),
+        }
+    }
+
     /// Overrides the display scale factor for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
@@ -3650,13 +3677,13 @@ impl Window {
         // Layout all root elements. Like the root element on the web, which
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
-        let scale_factor = self.scale_factor();
+        let scale = self.layout_scale();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         self.layout_engine
             .as_mut()
             .unwrap()
-            .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
+            .stretch_auto_size_to_fill(root_layout_id, root_size, scale);
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3673,7 +3700,7 @@ impl Window {
             self.layout_engine
                 .as_mut()
                 .unwrap()
-                .stretch_auto_size_to_fill(prompt_layout_id, root_size, scale_factor);
+                .stretch_auto_size_to_fill(prompt_layout_id, root_size, scale);
             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
             prompt_element = Some(element);
             self.prompt = Some(prompt);
@@ -5334,12 +5361,12 @@ impl Window {
         cx.layout_id_buffer.clear();
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
+        let scale = self.layout_scale();
 
         self.layout_engine.as_mut().unwrap().request_layout(
             style,
             rem_size,
-            scale_factor,
+            scale,
             &cx.layout_id_buffer,
         )
     }
@@ -5360,11 +5387,11 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
+        let scale = self.layout_scale();
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale, measure)
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -5392,12 +5419,12 @@ impl Window {
     pub fn layout_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
         self.invalidator.debug_assert_prepaint();
 
-        let scale_factor = self.scale_factor();
+        let scale = self.layout_scale();
         let mut bounds = self
             .layout_engine
             .as_mut()
             .unwrap()
-            .layout_bounds(layout_id, scale_factor)
+            .layout_bounds(layout_id, scale)
             .map(Into::into);
         let snapped_offset = self.pixel_snap_point(self.element_offset());
         bounds.origin += snapped_offset;

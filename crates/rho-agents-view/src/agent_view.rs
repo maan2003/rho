@@ -117,6 +117,8 @@ pub struct AgentModel {
     initial_load_started: bool,
     initial_load_ready: bool,
     initial_load: Option<Task<()>>,
+    /// What moved while the bulk load composed, synced once it is ready.
+    pending_sync: Option<FrameSummary>,
     /// The agent this model is of, once its bulk load has started.
     agent_id: Option<AgentId>,
     /// What history the reader has asked for and has not been given yet.
@@ -220,6 +222,7 @@ impl AgentModel {
             initial_load_started: false,
             initial_load_ready: false,
             initial_load: None,
+            pending_sync: None,
             agent_id: None,
             history_want: None,
             composing: false,
@@ -663,6 +666,9 @@ impl AgentModel {
             .collect()
     }
 
+    /// Shows what moved in the agent's state. Until the bulk load is
+    /// ready it is held, and the first sync after `Loaded` (with
+    /// [`FrameSummary::nothing`] if nothing else moved) shows it.
     pub fn sync(
         &mut self,
         state: &UiAgentState,
@@ -671,6 +677,14 @@ impl AgentModel {
         agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
         cx: &mut Context<Self>,
     ) {
+        let summary = self
+            .pending_sync
+            .take()
+            .map_or(summary, |pending| pending.merge(summary));
+        if !self.initial_load_ready {
+            self.pending_sync = Some(summary);
+            return;
+        }
         self.transcript
             .sync(state, summary, now_ms, agent_label, cx);
     }

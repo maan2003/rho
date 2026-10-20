@@ -17,6 +17,14 @@ pub struct Host {
 }
 
 impl Host {
+    /// The host behind `socket`, taken as running and not ours to stop.
+    pub fn at(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            started: false,
+        }
+    }
+
     /// The host behind the socket, started beside this binary when nothing
     /// answers.
     pub async fn connect_or_start(socket: Option<PathBuf>) -> Result<Self> {

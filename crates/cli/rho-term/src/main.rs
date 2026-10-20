@@ -11,8 +11,6 @@
 //! client attached meanwhile or an agent still works; the host decides.
 //! Losing the terminal leaves everything running, to attach again.
 
-mod agent;
-mod host;
 mod projection;
 mod screen;
 
@@ -28,10 +26,10 @@ use rho_agents_client::protocol::{
     AgentCommand, AgentLog, ClientFrame, NewAgent, ServerFrame, StartMode, UserMessage,
 };
 use rho_agents_client::state::{UiAgentStatus, UiBlock, UiToolStatus};
+use rho_term::agent::{Directory, Followed, resolve, short_handle};
+use rho_term::host::Host;
 use rho_term_ui::{Color, Event, Key, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 
-use crate::agent::{Directory, Followed, resolve, short_handle};
-use crate::host::Host;
 use crate::projection::View;
 use crate::screen::Transcript;
 
@@ -243,7 +241,7 @@ async fn run(args: Args) -> Result<()> {
                 let moved = match frame {
                     ServerFrame::Log { entries } => {
                         directory.tell(&entries);
-                        followed.tell(&entries)
+                        followed.tell(&entries).is_some()
                     }
                     ServerFrame::Live { agent_id, live } if agent_id == followed.agent_id => {
                         if let rho_agents_client::protocol::transcript::Live::Snapshot { state, .. } = &live {

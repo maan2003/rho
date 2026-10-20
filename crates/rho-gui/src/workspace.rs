@@ -254,10 +254,6 @@ pub struct Workspace {
     /// closes, the remote channel and cache entry naturally expire.
     remote_projects:
         HashMap<(HostId, rho_agent_types::Place), gpui::WeakEntity<rho_files::RemoteProjectState>>,
-    /// Accumulated change summaries for materialized but hidden views; they
-    /// render once, with the merged summary, when next selected.
-    pending_syncs: HashMap<AgentId, FrameSummary>,
-    activity_pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
     pub(crate) agents_client: rho_agents_client::model::AgentsClient,
@@ -645,16 +641,8 @@ impl Workspace {
         if started {
             return;
         }
-        if !model.read(cx).initial_load_ready() {
-            let pending = match model.read(cx).view() {
-                TranscriptView::Conversation => &mut self.pending_syncs,
-                TranscriptView::Activity => &mut self.activity_pending_syncs,
-            };
-            pending
-                .entry(agent_id)
-                .and_modify(|pending| *pending = pending.merge(summary))
-                .or_insert(summary);
-        } else if let Some(state) = self.transcripts.state(&agent_id) {
+        // The model holds what moves while its first load composes.
+        if let Some(state) = self.transcripts.state(&agent_id) {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
@@ -673,20 +661,19 @@ impl Workspace {
         view: TranscriptView,
         cx: &mut Context<Self>,
     ) {
-        let (models, pending) = match view {
-            TranscriptView::Conversation => (&self.models, &mut self.pending_syncs),
-            TranscriptView::Activity => (&self.activity_models, &mut self.activity_pending_syncs),
+        let models = match view {
+            TranscriptView::Conversation => &self.models,
+            TranscriptView::Activity => &self.activity_models,
         };
         let Some(model) = models.get(&agent_id).cloned() else {
             return;
         };
-        if let Some(summary) = pending.remove(&agent_id)
-            && let Some(state) = self.transcripts.state(&agent_id)
-        {
+        // What moved while it loaded.
+        if let Some(state) = self.transcripts.state(&agent_id) {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
-                    summary,
+                    FrameSummary::nothing(),
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
                     cx,
@@ -911,8 +898,6 @@ impl Workspace {
             models: HashMap::new(),
             activity_models: HashMap::new(),
             remote_projects: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            activity_pending_syncs: HashMap::new(),
             agents_client,
             desktop_streams,
             draft_model,
@@ -1126,9 +1111,7 @@ impl Workspace {
             self.active.remove(agent_id);
             self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
-            self.pending_syncs.remove(&agent_id);
             self.activity_models.remove(&agent_id);
-            self.activity_pending_syncs.remove(&agent_id);
         }
         self.note_followed();
         self.forget_contexts(|context| !contexts.contains(context));
@@ -1349,7 +1332,6 @@ impl Workspace {
     fn forget_surface(&mut self, key: &SurfaceKey) {
         if let SurfaceKey::Activity(agent_id) = key {
             self.activity_models.remove(agent_id);
-            self.activity_pending_syncs.remove(agent_id);
             for surfaces in self.surfaces.values_mut() {
                 surfaces.retain(|surface| surface.key != *key);
             }
@@ -1766,7 +1748,6 @@ impl Workspace {
             for key in gone {
                 if let SurfaceKey::Activity(agent_id) = key {
                     self.activity_models.remove(&agent_id);
-                    self.activity_pending_syncs.remove(&agent_id);
                 }
                 history.forget(&key);
             }
@@ -3707,8 +3688,6 @@ impl Workspace {
     fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         self.transcripts.forget(agent_id);
         self.note_followed();
-        self.pending_syncs.remove(&agent_id);
-        self.activity_pending_syncs.remove(&agent_id);
         self.registry.mark_not_live(agent_id);
         if let Some(model) = self.models.get(&agent_id).cloned() {
             model.update(cx, |model, _| model.clear_preview_editor());
@@ -4765,18 +4744,15 @@ impl Workspace {
         if told {
             self.sync_agent_model(*agent_id, &model, FrameSummary::everything(), false, cx);
         }
-        let pending = match view {
-            TranscriptView::Conversation => &mut self.pending_syncs,
-            TranscriptView::Activity => &mut self.activity_pending_syncs,
-        };
+        // A load that finished while another view was current left what
+        // moved meanwhile held in the model.
         if model.read(cx).initial_load_ready()
-            && let (Some(summary), Some(state)) =
-                (pending.remove(agent_id), self.transcripts.state(agent_id))
+            && let Some(state) = self.transcripts.state(agent_id)
         {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
-                    summary,
+                    FrameSummary::nothing(),
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
                     cx,

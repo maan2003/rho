@@ -14853,6 +14853,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-tty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "crossterm",
+ "futures",
+ "gpui",
+ "parking_lot",
+ "raw-window-handle",
+ "unicode-width 0.2.2",
+ "uuid",
+]
+
+[[package]]
+name = "rho-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "camino",
+ "clap",
+ "editor",
+ "futures",
+ "gpui",
+ "language",
+ "project",
+ "rand 0.10.3",
+ "release_channel",
+ "rho-agent-types",
+ "rho-agents-client",
+ "rho-agents-view",
+ "rho-term",
+ "rho-tty",
+ "semver",
+ "settings",
+ "text",
+ "theme",
+ "theme_settings",
+ "tokio",
+ "vim",
+ "vim_mode_setting",
+]
+
+[[package]]
 name = "rho-visualizations"
 version = "0.1.0"
 dependencies = [

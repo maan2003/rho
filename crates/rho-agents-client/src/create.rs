@@ -26,6 +26,8 @@ pub enum StartFieldMode {
     NewOn,
     /// The same directory as the target agent.
     Join,
+    /// The workdir itself, in place: no clone, and no target.
+    Here,
 }
 
 /// What the agents map says about the label in the start field: which host
@@ -106,6 +108,12 @@ pub fn parse_start(
                 .to_owned()
         })
     };
+    // Here starts in the workdir alone: whatever the start field names is
+    // not where it works.
+    let base = match mode {
+        StartFieldMode::Here => StartBase::default(),
+        StartFieldMode::NewOn | StartFieldMode::Join => base,
+    };
     let base_host = base.host;
     if let Some(selected) = selected_host {
         if let Some(workdir) = &workdir
@@ -175,6 +183,9 @@ pub fn parse_start(
                 "join target must be an agent label, not `{target}`"
             ));
         }
+        (StartFieldMode::Here, _, _) => StartMode::Here {
+            cwd: require_workdir()?.path,
+        },
     };
     Ok((host, start))
 }
@@ -266,6 +277,36 @@ mod tests {
         )
         .expect_err("two hosts cannot both be right");
         assert!(refusal.contains("an agent cannot start from a base on another host"));
+    }
+
+    /// In place works in the workdir, on the workdir's host: whatever the
+    /// start field still names, even an agent on another host, is not
+    /// where it starts.
+    #[test]
+    fn in_place_starts_in_the_workdir_whatever_the_start_field_says() {
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
+        let (host, start) = parse_start(
+            &hosts,
+            StartFieldMode::Here,
+            "eng-1234",
+            Some(HostPath {
+                host: HostId(2),
+                path: Utf8PathBuf::from("/src/notes"),
+            }),
+            None,
+            StartBase {
+                host: Some(HostId(1)),
+                place: None,
+            },
+        )
+        .expect("a workdir is all in place needs");
+        assert_eq!(host, HostId(2));
+        assert_eq!(
+            start,
+            StartMode::Here {
+                cwd: Utf8PathBuf::from("/src/notes")
+            }
+        );
     }
 
     /// The default start is a name, not a revision; what goes on the wire is

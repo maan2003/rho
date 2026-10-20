@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use rho_agent_types::{AgentId, AgentIdDomain, AgentPos};
 use rho_agents_client::protocol::transcript::{Live, LogEntry, TranscriptEvent};
 use rho_agents_client::state::UiAgentState;
-use rho_agents_client::store::AgentStore;
+use rho_agents_client::store::{AgentStore, FrameSummary};
 use rho_agents_client::{AgentIdentity, HostId, MirroredAgent, TranscriptFold};
 
 pub struct Followed {
@@ -24,9 +24,9 @@ impl Followed {
         }
     }
 
-    /// Folds this agent's rows out of a run of the journal. Returns whether
-    /// the transcript moved.
-    pub fn tell(&mut self, entries: &[LogEntry]) -> bool {
+    /// Folds this agent's rows out of a run of the journal. Returns what
+    /// moved, if anything did.
+    pub fn tell(&mut self, entries: &[LogEntry]) -> Option<FrameSummary> {
         for entry in entries
             .iter()
             .filter(|entry| entry.agent_id == self.agent_id)
@@ -37,25 +37,20 @@ impl Followed {
     }
 
     /// Folds a run of this agent's own rows, oldest first.
-    pub fn tell_rows(&mut self, rows: &[(AgentPos, TranscriptEvent)]) -> bool {
+    pub fn tell_rows(&mut self, rows: &[(AgentPos, TranscriptEvent)]) -> Option<FrameSummary> {
         for (pos, event) in rows {
             self.fold.tell(*pos, event);
         }
         self.settle()
     }
 
-    fn settle(&mut self) -> bool {
-        match self.fold.delta() {
-            Some(delta) => {
-                self.store.apply_fold_delta(self.agent_id, delta);
-                true
-            }
-            None => false,
-        }
+    fn settle(&mut self) -> Option<FrameSummary> {
+        let delta = self.fold.delta()?;
+        Some(self.store.apply_fold_delta(self.agent_id, delta))
     }
 
-    pub fn live(&mut self, live: Live) {
-        self.store.apply_live(self.agent_id, live);
+    pub fn live(&mut self, live: Live) -> FrameSummary {
+        self.store.apply_live(self.agent_id, live)
     }
 
     pub fn state(&self) -> Option<&UiAgentState> {
@@ -85,6 +80,11 @@ impl Directory {
 
     pub fn get(&self, agent_id: AgentId) -> Option<&AgentIdentity> {
         self.agents.get(&agent_id)
+    }
+
+    /// Every agent's label, for a screen that names them before it asks.
+    pub fn labels(&self) -> HashMap<AgentId, String> {
+        self.agents.keys().map(|&id| (id, self.label(id))).collect()
     }
 
     /// How a message names another agent: its handle, cut short.

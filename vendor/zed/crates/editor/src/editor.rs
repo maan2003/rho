@@ -13550,7 +13550,8 @@ impl EditorSnapshot {
             && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
         {
             GutterDimensions {
-                width: ch_width * 0.5,
+                // Half a character, but a whole cell in a terminal.
+                width: window.ceil_to_layout_grid(ch_width * 0.5, gpui::Axis::Horizontal),
                 ..Default::default()
             }
         } else if self.show_gutter
