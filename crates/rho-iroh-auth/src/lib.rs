@@ -15,6 +15,8 @@ pub use shared::{
 
 /// Then 32 bytes: a [`PairingKey`], or zeros for none.
 const AUTH_REQUEST: &[u8] = b"rho-auth-v2\n";
+/// A client from before pairing keys: no key follows.
+const AUTH_REQUEST_V1: &[u8] = b"rho-auth-v1\n";
 const AUTH_ACK: &[u8] = b"ack\n";
 const MAX_AUTH_RESPONSE_LEN: usize = 128;
 
@@ -75,9 +77,12 @@ pub async fn authenticate_server_connection(
         let (mut send, mut recv) = connection.accept_bi().await?;
         let mut request = [0; AUTH_REQUEST.len()];
         recv.read_exact(&mut request).await?;
-        anyhow::ensure!(request == AUTH_REQUEST, "invalid iroh auth request");
         let mut key = [0; 32];
-        recv.read_exact(&mut key).await?;
+        if request == AUTH_REQUEST {
+            recv.read_exact(&mut key).await?;
+        } else {
+            anyhow::ensure!(request == AUTH_REQUEST_V1, "invalid iroh auth request");
+        }
         let pairing = (key != [0; 32]).then(|| PairingKey::from_bytes(key));
         // Pin trust established at admission for this connection. Revocation
         // affects later connections, not one whose authenticated handshake
