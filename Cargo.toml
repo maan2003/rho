@@ -39,7 +39,6 @@ members = [
   "crates/cli/rho-term",
   "crates/cli/rho-term-ui",
   "crates/cli/rho-tty",
-  "crates/cli/rho-tui",
   "crates/json-stream",
   "crates/octo-types",
   "crates/prefix-id",
