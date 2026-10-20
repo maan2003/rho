@@ -8,7 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Place, Seq};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Place, Seq, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -46,6 +46,8 @@ rho_rpc::calls! {
         SetAuthAccountEnabled(SetAuthAccountEnabled) -> ();
         /// Bulk: one agent's rows, a page at a time.
         AgentLog(AgentLog) -> AgentLogPage, priority None;
+        /// Bulk: every agent, named but not read.
+        AgentDirectory(AgentDirectory) -> Vec<DirectoryEntry>, priority None;
     }
 }
 
@@ -136,6 +138,26 @@ pub struct AgentLogPage {
     pub next: Option<AgentPos>,
 }
 
+/// Every agent on the host, named but not read: for a client that holds
+/// only the agents it opens and still finds the rest.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct AgentDirectory {}
+
+/// One agent as the directory names it.
+#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
+pub struct DirectoryEntry {
+    pub agent_id: AgentId,
+    /// Its first row, the `Created` the journal carries: who it is and
+    /// where it works.
+    pub created: transcript::TranscriptEvent,
+    /// Its role now, which a `RoleChanged` may have moved since.
+    pub role: AgentRole,
+    /// The title generated for it. A spawn name, in `created`, beats it.
+    pub title: Option<String>,
+    /// When its newest row was written.
+    pub last_active: UnixMs,
+}
+
 /// What a client says on its agents session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
@@ -151,8 +173,9 @@ pub enum ClientFrame {
     /// [`ServerFrame::Log`] pages, every entry stamped with the journal
     /// head the follow started from. Then it follows from that head with
     /// only these agents' rows, and sends [`ServerFrame::Live`] statuses
-    /// for only these agents. A later `Follow` or `FollowAgents` replaces
-    /// it. A host older than this frame closes the session.
+    /// for only these agents, at most 256 of them. A later `Follow` or
+    /// `FollowAgents` replaces it. A host older than this frame closes the
+    /// session.
     FollowAgents { agent_ids: Vec<AgentId> },
     /// The agents whose live frames this client wants: the ones on screen.
     /// Everything durable arrives on the journal regardless, so this only

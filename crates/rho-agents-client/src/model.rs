@@ -57,10 +57,10 @@ pub enum ModelMsg {
         machine_seed: u64,
         agent_counter: u64,
     },
-    /// The agent a model for one agent holds, as the host's ids name it,
-    /// or why the handle names none. Each time the host's agents stream
-    /// opens, after [`ModelMsg::Host`].
-    Scoped(Result<AgentId, String>),
+    /// The agent a scratch model was started on, as the host's ids name
+    /// it, or why its handle names none. Each time the host's agents
+    /// stream opens, after [`ModelMsg::Host`].
+    Named(Result<AgentId, String>),
     /// Which provider accounts the host's agents may run on.
     Auth { auth: crate::protocol::AuthState },
     /// An agent was created on the host, by any client or agent, and the
@@ -96,9 +96,6 @@ pub enum ModelCommand {
     DetachHost(HostId),
     /// The agents whose rows the main thread wants, replaced wholesale.
     Follow(BTreeSet<AgentId>),
-    /// A model of one agent holds this one from now on: the agent a draft
-    /// just became.
-    FollowOnly(AgentId),
 }
 
 /// What reaches the model, in the order the main thread and the
@@ -153,23 +150,27 @@ pub struct Model {
     /// The disk copy, read once: hosts are attached one at a time and each
     /// takes the agents filed under its name.
     stored: Option<crate::cache::Loaded>,
-    /// For a model of one agent, which: it holds that agent and nothing
-    /// else, reads none of the disk copy, and asks the host for only that
-    /// agent's rows.
-    scope: Option<OneAgent>,
+    /// Set for a scratch model: it holds only the agents the window has
+    /// open, reads none of the disk copy, and asks the host for only those
+    /// agents' rows.
+    scratch: Option<Scratch>,
 }
 
-/// The agent a model of one agent holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OneAgent {
-    /// None yet: the window drafts a new one, and names it once the host
-    /// has made it ([`ModelCommand::FollowOnly`]).
-    Unnamed,
-    /// The one a handle names, `eng-k3f9` or the start of its id, once a
-    /// host's journal head says which ids it has handed out.
-    Handle(String),
-    Agent(AgentId),
+/// What a scratch model holds: the agents the window follows, and the one
+/// it was started on, each read whole from the host when it is opened.
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    /// The handle it was started on, until a host's journal head says
+    /// which agent that is.
+    handle: Option<String>,
+    named: Option<AgentId>,
+    /// What the hosts were last asked for.
+    held: BTreeSet<AgentId>,
 }
+
+/// At most this many agents in a scratch model's follow, as the host
+/// takes them.
+const SCRATCH_HELD: usize = 256;
 
 impl Default for Model {
     fn default() -> Self {
@@ -184,16 +185,37 @@ impl Model {
             agents: BTreeMap::new(),
             followed: BTreeSet::new(),
             stored: None,
-            scope: None,
+            scratch: None,
         }
     }
 
-    /// A model of one agent ([`OneAgent`]).
-    pub fn scoped(one_agent: OneAgent) -> Self {
+    /// A scratch model ([`Scratch`]), started on the agent `handle` names
+    /// (`eng-k3f9` or the start of its id) or on none.
+    pub fn scratch(handle: Option<String>) -> Self {
         Self {
-            scope: Some(one_agent),
+            scratch: Some(Scratch {
+                handle,
+                ..Scratch::default()
+            }),
             ..Self::new()
         }
+    }
+
+    /// What a scratch model holds now, kept as what the hosts are asked
+    /// for; `None` for a model of everything.
+    fn scratch_holds(&mut self) -> Option<BTreeSet<AgentId>> {
+        let scratch = self.scratch.as_mut()?;
+        let mut held: BTreeSet<AgentId> =
+            self.followed.iter().copied().chain(scratch.named).collect();
+        if held.len() > SCRATCH_HELD {
+            tracing::warn!(
+                open = held.len(),
+                "a scratch session follows only {SCRATCH_HELD} agents"
+            );
+            held = held.into_iter().take(SCRATCH_HELD).collect();
+        }
+        scratch.held = held.clone();
+        Some(held)
     }
 
     pub fn command(&mut self, command: ModelCommand) -> Vec<ModelEvent> {
@@ -219,20 +241,19 @@ impl Model {
             }
             ModelCommand::Follow(agents) => {
                 self.followed = agents;
-                Vec::new()
-            }
-            ModelCommand::FollowOnly(agent_id) => {
-                if self.scope.is_none() {
+                let Some(asked) = self.scratch.as_ref().map(|scratch| scratch.held.clone()) else {
                     return Vec::new();
-                }
-                self.scope = Some(OneAgent::Agent(agent_id));
-                for slot in self.hosts.values_mut() {
+                };
+                let held = self.scratch_holds().expect("a scratch model");
+                if held != asked {
                     let follow = ClientFrame::FollowAgents {
-                        agent_ids: vec![agent_id],
+                        agent_ids: held.into_iter().collect(),
                     };
-                    match &slot.commands {
-                        Some(commands) => commands.send(follow),
-                        None => slot.follow_pending = Some(follow),
+                    for slot in self.hosts.values_mut() {
+                        match &slot.commands {
+                            Some(commands) => commands.send(follow.clone()),
+                            None => slot.follow_pending = Some(follow.clone()),
+                        }
                     }
                 }
                 Vec::new()
@@ -244,7 +265,7 @@ impl Model {
     /// it: the cursor `Follow` will send, and the agents already folded.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
-        if self.scope.is_some() {
+        if self.scratch.is_some() {
             self.hosts.insert(host, slot);
             return Vec::new();
         }
@@ -292,24 +313,21 @@ impl Model {
                 agent_counter,
             } => {
                 // A handle is resolved once, against the first host that
-                // names its agent; after that the model holds that agent.
-                let scoped = match &self.scope {
-                    Some(OneAgent::Handle(handle)) => {
-                        let resolved = crate::find::resolve(handle, machine_seed, agent_counter);
-                        if let Ok(agent_id) = resolved {
-                            self.scope = Some(OneAgent::Agent(agent_id));
+                // names its agent.
+                let named = self
+                    .scratch
+                    .as_mut()
+                    .and_then(|scratch| match scratch.handle.take() {
+                        Some(handle) => {
+                            let resolved =
+                                crate::find::resolve(&handle, machine_seed, agent_counter);
+                            scratch.named = resolved.as_ref().ok().copied();
+                            Some(resolved)
                         }
-                        Some(resolved)
-                    }
-                    Some(OneAgent::Agent(agent_id)) => Some(Ok(*agent_id)),
-                    Some(OneAgent::Unnamed) | None => None,
-                };
-                let mut out = match scoped {
-                    // Nothing to follow: the screen says why.
-                    Some(Err(_)) => Vec::new(),
-                    _ => self.ready(host, machine_seed, journal_head),
-                };
-                out.extend(self.scoped_out(host, machine_seed, agent_counter, scoped));
+                        None => scratch.named.map(Ok),
+                    });
+                let mut out = self.ready(host, machine_seed, journal_head);
+                out.extend(self.opened(host, machine_seed, agent_counter, named));
                 out
             }
             AgentFrame::Auth { auth } => vec![ModelEvent {
@@ -350,13 +368,13 @@ impl Model {
     }
 
     /// What the window hears of an opened stream: whose ids these are,
-    /// then, for a model of one agent, which agent that is.
-    fn scoped_out(
+    /// then, for a scratch model started on a handle, which agent it names.
+    fn opened(
         &self,
         host: HostId,
         machine_seed: u64,
         agent_counter: u64,
-        scoped: Option<Result<AgentId, String>>,
+        named: Option<Result<AgentId, String>>,
     ) -> Vec<ModelEvent> {
         let mut out = vec![ModelEvent {
             host,
@@ -365,9 +383,9 @@ impl Model {
                 agent_counter,
             },
         }];
-        out.extend(scoped.map(|scoped| ModelEvent {
+        out.extend(named.map(|named| ModelEvent {
             host,
-            msg: ModelMsg::Scoped(scoped),
+            msg: ModelMsg::Named(named),
         }));
         out
     }
@@ -376,6 +394,7 @@ impl Model {
     /// and whether it is the database this copy counts in. Asks for the
     /// tail, or for `follow` where the model holds only some agents.
     fn ready(&mut self, host: HostId, machine_seed: u64, journal_head: Seq) -> Vec<ModelEvent> {
+        let scratch = self.scratch_holds();
         let slot = self
             .hosts
             .entry(host)
@@ -408,14 +427,14 @@ impl Model {
             started_over,
             "following the host's journal"
         );
-        let follow = match &self.scope {
+        let follow = match scratch {
             // Everything after the newest entry held.
             None => ClientFrame::Follow { since: slot.seq },
-            Some(OneAgent::Agent(agent_id)) => ClientFrame::FollowAgents {
-                agent_ids: vec![*agent_id],
+            // Nothing open yet: nothing of the journal is wanted.
+            Some(held) if held.is_empty() => return out,
+            Some(held) => ClientFrame::FollowAgents {
+                agent_ids: held.into_iter().collect(),
             },
-            // No agent yet: nothing of the journal is wanted.
-            Some(OneAgent::Unnamed | OneAgent::Handle(_)) => return out,
         };
         match &slot.commands {
             Some(commands) => commands.send(follow),
@@ -530,11 +549,11 @@ impl AgentsClient {
         Self::spawn_model(Model::new())
     }
 
-    /// Starts a model of one agent ([`Model::scoped`]).
-    pub fn spawn_scoped(
-        one_agent: OneAgent,
+    /// Starts a scratch model ([`Model::scratch`]).
+    pub fn spawn_scratch(
+        handle: Option<String>,
     ) -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
-        Self::spawn_model(Model::scoped(one_agent))
+        Self::spawn_model(Model::scratch(handle))
     }
 
     fn spawn_model(model: Model) -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
@@ -603,12 +622,6 @@ impl AgentsClient {
     /// The agents whose rows the window wants, replaced wholesale.
     pub fn follow(&self, agents: BTreeSet<AgentId>) {
         self.command(ModelCommand::Follow(agents));
-    }
-
-    /// A model of one agent holds `agent_id` from now on; any other model
-    /// goes on as it was.
-    pub fn follow_only(&self, agent_id: AgentId) {
-        self.command(ModelCommand::FollowOnly(agent_id));
     }
 
     /// Every row the disk copy holds for an agent. The copy may trail the
@@ -738,109 +751,112 @@ mod tests {
         std::iter::from_fn(|| frames.try_recv().ok()).collect()
     }
 
-    #[test]
-    fn a_model_of_one_agent_asks_for_that_agent_and_says_which_it_is() {
-        let mut model = Model::scoped(OneAgent::Handle(format!(
-            "eng-{}",
-            &agent(2).encoded()[..4]
-        )));
-        model.attach(HOST, "local".to_owned());
-        let (commands, mut frames) = AgentCommands::recorded();
+    fn recorded(model: &mut Model) -> futures_mpsc::UnboundedReceiver<ClientFrame> {
+        let (commands, frames) = AgentCommands::recorded();
         model.command(ModelCommand::HostCommands {
             host: HOST,
             commands,
         });
+        frames
+    }
+
+    fn follow_agents(agents: &[AgentId]) -> ClientFrame {
+        ClientFrame::FollowAgents {
+            agent_ids: agents.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_scratch_model_started_on_a_handle_asks_for_that_agent_and_says_which() {
+        let mut model = Model::scratch(Some(format!("eng-{}", &agent(2).encoded()[..4])));
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
         let out = model.ingest(HOST, head(0, 3));
         assert_eq!(
             sent(&mut frames),
-            [ClientFrame::FollowAgents {
-                agent_ids: vec![agent(2)]
-            }],
+            [follow_agents(&[agent(2)])],
             "never the whole journal"
         );
         assert!(matches!(out[..], [
             ModelEvent { msg: ModelMsg::Host { .. }, .. },
-            ModelEvent { msg: ModelMsg::Scoped(Ok(id)), .. },
+            ModelEvent { msg: ModelMsg::Named(Ok(id)), .. },
         ] if id == agent(2)));
     }
 
     #[test]
-    fn a_model_of_one_agent_dialled_late_still_follows_only_it() {
-        let mut model = Model::scoped(OneAgent::Handle(agent(1).encoded()[..5].to_owned()));
+    fn a_scratch_model_dialled_late_still_asks_for_its_agent() {
+        let mut model = Model::scratch(Some(agent(1).encoded()[..5].to_owned()));
         model.attach(HOST, "local".to_owned());
         model.ingest(HOST, head(0, 3));
-        let (commands, mut frames) = AgentCommands::recorded();
-        model.command(ModelCommand::HostCommands {
-            host: HOST,
-            commands,
-        });
-        assert_eq!(
-            sent(&mut frames),
-            [ClientFrame::FollowAgents {
-                agent_ids: vec![agent(1)]
-            }]
-        );
+        let mut frames = recorded(&mut model);
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1)])]);
     }
 
     #[test]
     fn a_handle_that_names_no_agent_follows_nothing_and_says_why() {
-        let mut model = Model::scoped(OneAgent::Handle("eng-zzzz".to_owned()));
+        let mut model = Model::scratch(Some("eng-zzzz".to_owned()));
         model.attach(HOST, "local".to_owned());
-        let (commands, mut frames) = AgentCommands::recorded();
-        model.command(ModelCommand::HostCommands {
-            host: HOST,
-            commands,
-        });
+        let mut frames = recorded(&mut model);
         let out = model.ingest(HOST, head(0, 3));
         assert!(sent(&mut frames).is_empty());
         assert!(matches!(&out[..], [
             ModelEvent { msg: ModelMsg::Host { .. }, .. },
-            ModelEvent { msg: ModelMsg::Scoped(Err(error)), .. },
+            ModelEvent { msg: ModelMsg::Named(Err(error)), .. },
         ] if error.contains("eng-zzzz")));
     }
 
     #[test]
-    fn a_model_of_a_draft_follows_nothing_until_the_draft_is_an_agent() {
-        let mut model = Model::scoped(OneAgent::Unnamed);
+    fn a_scratch_model_asks_for_what_the_window_opens_and_only_on_change() {
+        let mut model = Model::scratch(None);
         model.attach(HOST, "local".to_owned());
-        let (commands, mut frames) = AgentCommands::recorded();
-        model.command(ModelCommand::HostCommands {
-            host: HOST,
-            commands,
-        });
+        let mut frames = recorded(&mut model);
         let out = model.ingest(HOST, head(0, 3));
-        assert!(sent(&mut frames).is_empty(), "no journal for a draft");
+        assert!(sent(&mut frames).is_empty(), "nothing open, nothing asked");
         assert!(
             !out.iter()
-                .any(|event| matches!(event.msg, ModelMsg::Scoped(_)))
+                .any(|event| matches!(event.msg, ModelMsg::Named(_)))
         );
-        model.command(ModelCommand::FollowOnly(agent(3)));
-        assert_eq!(
-            sent(&mut frames),
-            [ClientFrame::FollowAgents {
-                agent_ids: vec![agent(3)]
-            }]
+
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3), agent(1)])));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1), agent(3)])]);
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1), agent(3)])));
+        assert!(
+            sent(&mut frames).is_empty(),
+            "the same set is not asked again"
         );
-        // A stream opened again asks for the same agent.
+
+        // A stream opened again asks for the same agents.
         model.ingest(HOST, head(0, 3));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1), agent(3)])]);
+
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3)])));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(3)])]);
+    }
+
+    #[test]
+    fn a_scratch_model_keeps_the_agent_it_was_started_on_when_its_view_closes() {
+        let mut model = Model::scratch(Some(agent(2).encoded()[..5].to_owned()));
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
+        model.ingest(HOST, head(0, 3));
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
+        model.command(ModelCommand::Follow(BTreeSet::new()));
         assert_eq!(
             sent(&mut frames),
-            [ClientFrame::FollowAgents {
-                agent_ids: vec![agent(3)]
-            }]
+            [
+                follow_agents(&[agent(2)]),
+                follow_agents(&[agent(1), agent(2)]),
+                follow_agents(&[agent(2)]),
+            ]
         );
     }
 
     #[test]
-    fn a_model_of_everything_ignores_follow_only() {
+    fn a_model_of_everything_says_nothing_when_the_window_follows() {
         let mut model = Model::new();
         model.hosts.insert(HOST, HostModel::new("local".to_owned()));
-        let (commands, mut frames) = AgentCommands::recorded();
-        model.command(ModelCommand::HostCommands {
-            host: HOST,
-            commands,
-        });
-        model.command(ModelCommand::FollowOnly(agent(3)));
+        let mut frames = recorded(&mut model);
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3)])));
         assert!(sent(&mut frames).is_empty());
     }
 
@@ -857,7 +873,7 @@ mod tests {
         assert_eq!(sent(&mut frames), [ClientFrame::Follow { since: Seq(0) }]);
         assert!(
             !out.iter()
-                .any(|event| matches!(event.msg, ModelMsg::Scoped(_)))
+                .any(|event| matches!(event.msg, ModelMsg::Named(_)))
         );
     }
 

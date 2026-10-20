@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -33,7 +33,7 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
-use rho_agents_client::protocol::{AgentCommand, NewAgent};
+use rho_agents_client::protocol::{AgentCommand, AgentDirectory, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
@@ -228,21 +228,24 @@ pub(crate) enum SnoozeUnit {
     Weeks,
 }
 
-/// A workspace for one agent: the agent the host named, until it is
+/// A scratch session's own state: the agent it was started on, until it is
 /// opened. It opens once the agent's history has arrived, since a
 /// transcript opened before that has nothing to show.
-struct OneAgent {
-    to_open: Option<AgentId>,
-    /// Told why, when the host has no agent the handle names: a window on
-    /// one agent has nothing to show without it.
+struct Scratch {
+    /// Agents asked for before their rows were here: the one it was
+    /// started on, a draft just made, one picked from the directory.
+    /// Followed, and opened again when their history arrives.
+    to_open: BTreeSet<AgentId>,
+    /// Told why, when the host has no agent the handle names: a session
+    /// started on an agent has nothing to show without it.
     missing: Missing,
 }
 
 type Missing = Box<dyn Fn(String, &mut App)>;
 
 pub struct Workspace {
-    /// Set in a workspace for one agent ([`Workspace::for_one_agent`]).
-    one_agent: Option<OneAgent>,
+    /// Set in a scratch session ([`Workspace::scratch`]).
+    scratch: Option<Scratch>,
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
     /// them, and the agent host's live tail. Also the focus set every host
@@ -558,7 +561,11 @@ impl Workspace {
     /// The agents whose rows the model hands up: the transcripts this
     /// client has open. Everything else it says as a digest.
     pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
-        self.transcripts.open_agents()
+        let mut followed = self.transcripts.open_agents();
+        if let Some(scratch) = &self.scratch {
+            followed.extend(&scratch.to_open);
+        }
+        followed
     }
 
     fn note_followed(&self) {
@@ -578,6 +585,13 @@ impl Workspace {
         }
         let events = self.agents_client.read_rows(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
+            // A scratch session holds none of an agent until it is asked
+            // for: follow it, and open it again once its rows are here.
+            if let Some(scratch) = &mut self.scratch
+                && scratch.to_open.insert(agent_id)
+            {
+                self.note_followed();
+            }
             return false;
         }
         self.note_followed();
@@ -733,38 +747,38 @@ impl Workspace {
         Self::build(specs, None, window, cx)
     }
 
-    /// A workspace for one agent (`rho-gui --tty`, `rho-gui --agent`): an
-    /// agent a handle names, opened once the host has named it, or a draft
-    /// of a new one in the current directory. Its model holds that agent
-    /// alone. It starts no Slack and asks for no secret phrase: it is a
-    /// window on one agent, not the user's desk.
-    pub fn for_one_agent(
+    /// A scratch session (`rho-gui --scratch`): it opens on the agent a
+    /// handle names, once the host has named it, or on a draft of a new
+    /// one in the current directory. Its model holds only the agents it
+    /// opens, and the host's directory names the rest. It starts no Slack
+    /// and asks for no secret phrase: it is not the user's desk.
+    pub fn scratch(
         specs: Vec<HostSpec>,
-        handle: rho_agents_client::model::OneAgent,
+        handle: Option<String>,
         missing: impl Fn(String, &mut App) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let one_agent = OneAgent {
-            to_open: None,
+        let scratch = Scratch {
+            to_open: BTreeSet::new(),
             missing: Box::new(missing),
         };
-        Self::build(specs, Some((handle, one_agent)), window, cx)
+        Self::build(specs, Some((handle, scratch)), window, cx)
     }
 
     fn build(
         specs: Vec<HostSpec>,
-        one_agent: Option<(rho_agents_client::model::OneAgent, OneAgent)>,
+        scratch: Option<(Option<String>, Scratch)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (handle, one_agent) = one_agent.unzip();
-        let drafting = handle == Some(rho_agents_client::model::OneAgent::Unnamed);
+        let (handle, scratch) = scratch.unzip();
+        let drafting = handle == Some(None);
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
         let (agents_client, changes) = match handle {
-            Some(handle) => rho_agents_client::model::AgentsClient::spawn_scoped(handle),
+            Some(handle) => rho_agents_client::model::AgentsClient::spawn_scratch(handle),
             None => rho_agents_client::model::AgentsClient::spawn(),
         };
         #[cfg(test)]
@@ -1014,7 +1028,7 @@ impl Workspace {
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
-            one_agent,
+            scratch,
         };
         let no_hosts = specs.is_empty();
         for spec in specs {
@@ -1037,7 +1051,7 @@ impl Workspace {
         this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.invalidate_dealer_signals(cx);
-        if this.one_agent.is_some() {
+        if this.scratch.is_some() {
             if drafting {
                 // Once the workspace exists, so the draft can take focus.
                 cx.defer_in(window, |this, window, cx| this.draft_here(window, cx));
@@ -1081,8 +1095,8 @@ impl Workspace {
         this
     }
 
-    /// A window on one agent, before there is one: a draft of an agent
-    /// that works in place where rho-gui started.
+    /// A scratch session started on no agent: a draft of one that works in
+    /// place where rho-gui started.
     fn draft_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let here = std::env::current_dir()
             .map(|dir| dir.display().to_string())
@@ -1103,6 +1117,38 @@ impl Workspace {
         window.defer(cx, move |window, cx| {
             vim::enter_insert_mode(&editor, window, cx);
         });
+    }
+
+    /// A scratch session's names for the agents it has not opened: each as
+    /// its first row says, with the title and last activity the host
+    /// keeps. An agent already held keeps the digest its rows made. The
+    /// directory knows when an agent last wrote, not what, so that stands
+    /// in for when it last sent: Home's recent list is the scratch
+    /// session's way back to an agent.
+    pub(crate) fn directory_arrived(
+        &mut self,
+        host: HostId,
+        entries: Vec<rho_agents_client::protocol::DirectoryEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let agents = entries
+            .into_iter()
+            .filter(|entry| self.registry.agent_digest(entry.agent_id).is_none())
+            .filter_map(|entry| {
+                let mut agent =
+                    rho_agents_client::MirroredAgent::new(host, entry.agent_id, &entry.created)?;
+                agent.identity.role = entry.role;
+                agent.digest.title = entry.title;
+                agent.digest.last_active = entry.last_active;
+                agent.digest.last_sent_at = Some(entry.last_active);
+                Some(agent)
+            })
+            .collect::<Vec<_>>();
+        let changed = self.registry.told(agents);
+        self.push_agent_marks(&changed);
+        self.invalidate_dealer_signals(cx);
+        self.refresh_home(cx);
+        cx.notify();
     }
 
     /// Attaches an agent host. The name is registered with the registry first
@@ -1905,10 +1951,15 @@ impl Workspace {
                             .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
-                if let Some(one_agent) = &mut self.one_agent
-                    && let Some(agent_id) = one_agent.to_open.take_if(|id| changed.contains(id))
-                {
-                    self.open_agent(agent_id, window, cx);
+                if let Some(scratch) = &mut self.scratch {
+                    let arrived = changed
+                        .iter()
+                        .copied()
+                        .filter(|id| scratch.to_open.remove(id))
+                        .collect::<Vec<_>>();
+                    for agent_id in arrived {
+                        self.open_agent(agent_id, window, cx);
+                    }
                 }
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
@@ -1944,18 +1995,23 @@ impl Workspace {
             } => {
                 self.registry
                     .set_host_data(host, machine_seed, agent_counter);
+                if self.scratch.is_some() {
+                    self.call(host, AgentDirectory {}, cx, move |this, entries, cx| {
+                        this.directory_arrived(host, entries, cx)
+                    });
+                }
                 cx.notify();
             }
-            rho_agents_client::model::ModelMsg::Scoped(scoped) => match scoped {
+            rho_agents_client::model::ModelMsg::Named(named) => match named {
                 // A stream opened again names the agent already open.
-                Ok(agent_id) if self.registry.agent_digest(agent_id).is_some() => {}
+                Ok(agent_id) if self.models.contains_key(&agent_id) => {}
                 Ok(agent_id) => {
-                    if let Some(one_agent) = &mut self.one_agent {
-                        one_agent.to_open = Some(agent_id);
+                    if let Some(scratch) = &mut self.scratch {
+                        scratch.to_open.insert(agent_id);
                     }
                 }
-                Err(error) => match &self.one_agent {
-                    Some(one_agent) => (one_agent.missing)(error, cx),
+                Err(error) => match &self.scratch {
+                    Some(scratch) => (scratch.missing)(error, cx),
                     None => self.echo(&error, StyleClass::SystemImportant, cx),
                 },
             },
@@ -2648,10 +2704,6 @@ impl Workspace {
                 return;
             }
         };
-        if self.one_agent.is_some() {
-            // The window is this agent's from now on.
-            self.agents_client.follow_only(agent_id);
-        }
         self.note_agent_created(host, agent_id);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));

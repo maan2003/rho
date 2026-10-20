@@ -591,10 +591,10 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
     cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx))
 }
 
-/// A window on one agent opens it once its history has arrived, and quits
-/// with the reason when the host names no such agent.
+/// A scratch session started on an agent opens it once its history has
+/// arrived, and quits with the reason when the host names no such agent.
 #[gpui::test]
-fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
+fn a_scratch_session_on_an_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
     use rho_agents_client::model::ModelMsg;
     use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
 
@@ -607,9 +607,9 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
     let missing = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let told = missing.clone();
     let workspace = cx.add_window(|window, cx| {
-        Workspace::for_one_agent(
+        Workspace::scratch(
             specs.clone(),
-            rho_agents_client::model::OneAgent::Handle("eng-1".to_owned()),
+            Some("eng-1".to_owned()),
             move |error, _| told.borrow_mut().push(error),
             window,
             cx,
@@ -632,7 +632,7 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
     let arrived = |id| rho_agents_client::MirroredAgent::new(host, id, &created).unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_model_event(host, ModelMsg::Scoped(Ok(agent(1))), window, cx);
+            workspace.handle_model_event(host, ModelMsg::Named(Ok(agent(1))), window, cx);
             assert_eq!(
                 workspace.current_surface_name_for_test(),
                 "home",
@@ -662,7 +662,7 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
             );
             workspace.handle_model_event(
                 host,
-                ModelMsg::Scoped(Err("no agent `eng-9` on this host".to_owned())),
+                ModelMsg::Named(Err("no agent `eng-9` on this host".to_owned())),
                 window,
                 cx,
             );
@@ -671,25 +671,87 @@ fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
     assert_eq!(*missing.borrow(), ["no agent `eng-9` on this host"]);
 }
 
-/// A window on one agent with no handle drafts a new agent that works in
+/// A scratch session started on no agent drafts a new one that works in
 /// place, where rho-gui started.
 #[gpui::test]
-fn a_workspace_for_one_new_agent_opens_on_a_draft_here(cx: &mut TestAppContext) {
+fn the_directory_names_agents_the_session_does_not_hold(cx: &mut TestAppContext) {
+    use rho_agents_client::model::ModelMsg;
+    use rho_agents_client::protocol::DirectoryEntry;
+    use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
+
     story::reset();
     cx.update(init_test_app);
     let specs = vec![HostSpec {
         name: "local".to_owned(),
         target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock")),
     }];
-    let workspace = cx.add_window(|window, cx| {
-        Workspace::for_one_agent(
-            specs.clone(),
-            rho_agents_client::model::OneAgent::Unnamed,
-            |_, _| {},
-            window,
-            cx,
-        )
-    });
+    let workspace =
+        cx.add_window(|window, cx| Workspace::scratch(specs.clone(), None, |_, _| {}, window, cx));
+    let host = HostId::default();
+    let created = TranscriptEvent::Created {
+        role: Default::default(),
+        runtime: RuntimeKind::Rho,
+        place: rho_agent_types::Place {
+            cwd: "/src/repo".into(),
+            workset: None,
+        },
+        spawned_by: SpawnedBy::Direct,
+        spawn_name: None,
+        parent: None,
+        model: "test-model".to_owned(),
+        at: UnixMs(0),
+    };
+    let entry = |id, title: &str| DirectoryEntry {
+        agent_id: id,
+        created: created.clone(),
+        role: Default::default(),
+        title: Some(title.to_owned()),
+        last_active: UnixMs(50),
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let mut held = rho_agents_client::MirroredAgent::new(host, agent(1), &created).unwrap();
+            held.digest.title = Some("followed".to_owned());
+            held.digest.last_active = UnixMs(90);
+            workspace.handle_model_event(
+                host,
+                ModelMsg::Changed { agents: vec![held] },
+                window,
+                cx,
+            );
+            workspace.directory_arrived(
+                host,
+                vec![entry(agent(1), "stale"), entry(agent(2), "named")],
+                cx,
+            );
+            let held = workspace.registry.agent_digest(agent(1)).unwrap();
+            assert_eq!(
+                held.title.as_deref(),
+                Some("followed"),
+                "the followed agent keeps its news"
+            );
+            assert_eq!(held.last_active, UnixMs(90));
+            let named = workspace
+                .registry
+                .agent_digest(agent(2))
+                .expect("the directory names it");
+            assert_eq!(named.title.as_deref(), Some("named"));
+            assert_eq!(named.last_active, UnixMs(50));
+            assert_eq!(named.last_sent_at, Some(UnixMs(50)));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_scratch_session_on_no_agent_opens_on_a_draft_here(cx: &mut TestAppContext) {
+    story::reset();
+    cx.update(init_test_app);
+    let specs = vec![HostSpec {
+        name: "local".to_owned(),
+        target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock")),
+    }];
+    let workspace =
+        cx.add_window(|window, cx| Workspace::scratch(specs.clone(), None, |_, _| {}, window, cx));
     cx.run_until_parked();
     let here = std::env::current_dir().unwrap().display().to_string();
     workspace

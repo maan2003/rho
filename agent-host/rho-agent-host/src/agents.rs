@@ -279,7 +279,7 @@ where
                 ));
             }
             ClientFrame::FollowAgents { agent_ids } => {
-                if agent_ids.len() > 64 {
+                if agent_ids.len() > 256 {
                     break Err(anyhow::anyhow!("too many followed agents"));
                 }
                 if let Some(previous) = follow.take() {
@@ -527,6 +527,48 @@ fn strip_row(
     crate::transcript::strip(event, prior_carry)
 }
 
+/// Every agent, by its head and its first and last rows: one read each, and
+/// none of the log between.
+fn agent_directory(db: &RhoDb) -> Vec<rho_agents_client::protocol::DirectoryEntry> {
+    let read = db.read();
+    let mut carries = Carries::new();
+    read.list_agents()
+        .into_iter()
+        .filter_map(|(agent_id, head)| {
+            let first = rho_agent::log::AgentEventPos::new(0);
+            let created = strip_row(
+                db,
+                &mut carries,
+                agent_id,
+                first,
+                &read.agent_event(agent_id, first)?,
+            )?;
+            let last_active = head
+                .next
+                .pos
+                .checked_sub(1)
+                .map(rho_agent::log::AgentEventPos::new)
+                .and_then(|last| {
+                    strip_row(
+                        db,
+                        &mut carries,
+                        agent_id,
+                        last,
+                        &read.agent_event(agent_id, last)?,
+                    )
+                })
+                .map_or(created.at(), |event| event.at());
+            Some(rho_agents_client::protocol::DirectoryEntry {
+                agent_id,
+                created,
+                role: head.config.role,
+                title: head.generated_title,
+                last_active,
+            })
+        })
+        .collect()
+}
+
 /// One page of an agent's rows, stripped as the journal strips them.
 fn agent_log_page(
     db: &RhoDb,
@@ -607,6 +649,12 @@ where
         Request::AgentLog(call) => {
             respond(writer, call, |call| async {
                 agent_log_page(&services.db, call)
+            })
+            .await
+        }
+        Request::AgentDirectory(call) => {
+            respond(writer, call, |_| async {
+                Ok(agent_directory(&services.db))
             })
             .await
         }
@@ -1108,7 +1156,7 @@ mod tests {
     use rho_agents_client::protocol::ServerFrame;
     use rho_agents_client::protocol::transcript::TranscriptEvent;
 
-    use super::{detail_result, send_history, send_journal_from};
+    use super::{agent_directory, detail_result, send_history, send_journal_from};
 
     /// A follow of one agent sends that agent's history at the head, then
     /// only its new rows, though another agent writes between them.
@@ -1184,6 +1232,32 @@ mod tests {
         );
         assert!(
             matches!(&after[0].event, TranscriptEvent::Received { text, .. } if text == "after")
+        );
+
+        let mut write = db.write().await;
+        write.append_agent_event(
+            other,
+            &AgentEvent::Entry(Entry::Received {
+                at: UnixMs(7),
+                id: rho_agent::entry::MessageId(2),
+                from: rho_agent::entry::Party::Human,
+                body: vec![rho_agent::entry::Block::Text("late".into())],
+            }),
+        );
+        write.commit();
+        let directory = agent_directory(&db);
+        assert_eq!(
+            directory
+                .iter()
+                .map(|entry| (entry.agent_id, entry.last_active))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            [(followed, UnixMs(1)), (other, UnixMs(7))].into(),
+            "each agent by its last row"
+        );
+        assert!(
+            directory
+                .iter()
+                .all(|entry| matches!(entry.created, TranscriptEvent::Created { .. }))
         );
     }
 

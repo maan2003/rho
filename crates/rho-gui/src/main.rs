@@ -39,17 +39,21 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
-    /// Open only this agent, `eng-k3f9` or the start of its id, instead of
-    /// the desk. See `--tty` for what a window on one agent is.
+    /// A scratch session instead of the desk: it opens on a draft of a new
+    /// agent that works in this directory, holds only the agents it opens,
+    /// keeps them in memory, and writes nothing to disk. Without
+    /// `--attach` it attaches the agent host on this machine, and starts it
+    /// when it is not running.
+    #[arg(long)]
+    scratch: bool,
+
+    /// A scratch session that opens on this agent, `eng-k3f9` or the start
+    /// of its id, rather than on a draft.
     #[arg(long, value_name = "HANDLE")]
     agent: Option<String>,
 
-    /// Draw in this terminal instead of a window, on one agent: the one
-    /// `--agent` names, or a draft of a new one that works in this
-    /// directory. A window on one agent holds it alone, in memory, and
-    /// writes nothing to disk. Without `--attach` it attaches the agent
-    /// host on this machine, and starts it when it is not running. The
-    /// log goes to `rho-gui.log` in the state directory.
+    /// Draw in this terminal instead of a window. The log goes to
+    /// `rho-gui.log` in the state directory.
     #[arg(long)]
     tty: bool,
 
@@ -238,33 +242,46 @@ fn main() {
         return;
     }
     let args = Args::parse();
+    // The terminal is the screen: whatever writes to stderr, tracing or a
+    // library such as ALSA, goes to the log instead, and the terminal's
+    // own stderr comes back for the last word.
+    let terminal_stderr = args.tty.then(stderr_to_log).flatten();
     init_tracing(args.tty);
-    if let Err(error) = run(args) {
+    let result = run(args);
+    if let Some(stderr) = terminal_stderr {
+        // SAFETY: both are open descriptors this process owns.
+        unsafe { libc::dup2(stderr, libc::STDERR_FILENO) };
+    }
+    if let Err(error) = result {
         eprintln!("rho-gui: {error:#}");
         std::process::exit(1);
     }
 }
 
-/// To stderr, or to a file when the terminal is the screen.
+/// Points stderr at `rho-gui.log` in the state directory. Returns where
+/// stderr pointed before, or `None` when the log cannot be opened.
+fn stderr_to_log() -> Option<libc::c_int> {
+    use std::os::fd::AsRawFd as _;
+    let dir = default_client_state_dir().ok()?;
+    fs::create_dir_all(&dir).ok()?;
+    let log = fs::File::create(dir.join("rho-gui.log")).ok()?;
+    // SAFETY: plain descriptor calls on descriptors this process owns; the
+    // log stays open as stderr once `log` is dropped.
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        (saved >= 0 && libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO) >= 0).then_some(saved)
+    }
+}
+
+/// To stderr, without colour when stderr is the log.
 fn init_tracing(tty: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-    let result = if tty {
-        let log = default_client_state_dir().and_then(|dir| {
-            fs::create_dir_all(&dir)?;
-            Ok(fs::File::create(dir.join("rho-gui.log"))?)
-        });
-        match log {
-            Ok(log) => subscriber
-                .with_ansi(false)
-                .with_writer(Mutex::new(log))
-                .try_init(),
-            Err(_) => return,
-        }
-    } else {
-        subscriber.with_writer(std::io::stderr).try_init()
-    };
-    if let Err(error) = result {
+    if let Err(error) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(!tty)
+        .with_writer(std::io::stderr)
+        .try_init()
+    {
         eprintln!("rho-gui: failed to initialize tracing: {error}");
     }
     tracing::info!("rho-gui tracing initialized");
@@ -326,12 +343,9 @@ fn run(args: Args) -> Result<()> {
     // it later. A second rho stops at the door rather than running on with
     // none of its own state. After an unclean stop redb rebuilds its
     // allocator from every page, which is paid here, before the window.
-    // The desk, or a window on one agent.
-    let one_agent = (args.tty || args.agent.is_some()).then(|| match &args.agent {
-        Some(handle) => rho_agents_client::model::OneAgent::Handle(handle.clone()),
-        None => rho_agents_client::model::OneAgent::Unnamed,
-    });
-    let db = if one_agent.is_some() {
+    // The desk, or a scratch session started on this agent or on none.
+    let scratch = (args.scratch || args.agent.is_some()).then(|| args.agent.clone());
+    let db = if scratch.is_some() {
         rho_db::client::shared_in_memory()
     } else {
         rho_db::client::open_shared(&client_state_dir)
@@ -363,18 +377,18 @@ fn run(args: Args) -> Result<()> {
     }
 
     let tty = args.tty;
-    // A window on one agent with no host named uses this machine's, and
-    // starts it if it is not running: it stops it on the way out unless
-    // something else still uses it.
+    // A scratch session with no host named uses this machine's, and starts
+    // it if it is not running: it stops it on the way out unless something
+    // else still uses it.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let started_host = if one_agent.is_some() && args.attach.is_empty() {
+    let started_host = if scratch.is_some() && args.attach.is_empty() {
         Some(runtime.block_on(rho_term::host::Host::connect_or_start(None))?)
     } else {
         None
     };
-    // Why a window on one agent closed: said once the terminal is back.
+    // Why a scratch session closed: said once the terminal is back.
     let missing = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let missing_in_app = missing.clone();
     let application = if tty {
@@ -455,8 +469,8 @@ fn run(args: Args) -> Result<()> {
         };
         if let Err(error) = cx.open_window(window_options, move |window, cx| {
             let missing = missing_in_app.clone();
-            cx.new(|cx| match one_agent.clone() {
-                Some(handle) => Workspace::for_one_agent(
+            cx.new(|cx| match scratch.clone() {
+                Some(handle) => Workspace::scratch(
                     specs.clone(),
                     handle,
                     move |error, cx| {
@@ -895,7 +909,7 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 /// and a first run attaches nothing: `space h` attaches a host, and the
 /// set attached is what the next start finds.
 fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
-    if args.attach.is_empty() && (args.tty || args.agent.is_some()) {
+    if args.attach.is_empty() && (args.scratch || args.agent.is_some()) {
         return Ok(vec![HostSpec {
             name: "local".to_owned(),
             // Where `Host::connect_or_start` found or started it.
