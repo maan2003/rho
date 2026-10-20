@@ -12,7 +12,7 @@ pub struct WaylandArgs {
 }
 pub fn run(args: WaylandArgs) -> Result<()> {
     anyhow::ensure!(cfg!(target_os = "linux"), "agent desktops require Linux");
-    let program = concat!(env!("RHO_AGENT_BASE"), "/bin/rho-agent-desktop");
+    let program = rho_fs_view::agent_base().join("bin/rho-agent-desktop");
     let status = Command::new(program)
         .arg("wayland")
         .args(args.args)

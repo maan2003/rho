@@ -29,35 +29,57 @@ pub use ns::{Layout, MAX_BOUNDED_READ, WorksetMount, read_file_bounded};
 pub use rho_agent_types::WorksetId;
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
-/// The agent's base userland: a nix `buildEnv` fixed at build
-/// time whose `bin/` is the agent's PATH, after the agent's own nix
-/// profile. It holds Rho's patched git, the CA bundle and the pinned
-/// flake registry.
-pub const AGENT_BASE: &str = env!(
-    "RHO_AGENT_BASE",
-    "RHO_AGENT_BASE must name the agent base (flake.nix agentBase) at build time"
-);
+/// A piece of Rho's runtime: the store path the build named, else, for the
+/// relocatable `rho-bin` archive built with none, the one installed at
+/// `../share/rho/<name>` beside this executable, as
+/// `rho_context_config` finds its bundled skills.
+pub fn bundled(name: &str, built: Option<&'static str>) -> Option<PathBuf> {
+    if let Some(path) = built {
+        return Some(path.into());
+    }
+    let exe = std::env::current_exe().ok()?;
+    std::fs::canonicalize(exe.parent()?.parent()?.join("share/rho").join(name)).ok()
+}
+
+/// The agent's base userland: a nix `buildEnv` (flake.nix agentBase) whose
+/// `bin/` is the agent's PATH, after the agent's own nix profile. It holds
+/// Rho's patched git, the CA bundle and the pinned flake registry.
+pub fn agent_base() -> &'static Path {
+    static BASE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        bundled("agent-base", option_env!("RHO_AGENT_BASE")).expect(
+            "no agent base: build with RHO_AGENT_BASE (flake.nix agentBase) \
+             or install one at ../share/rho/agent-base",
+        )
+    });
+    &BASE
+}
 
 /// Rho's patched git (`nix/patches/git-rho-store.patch`): the keeper
 /// fetches with it, the agent host clones with it, and agents see it as `git`.
 /// Without the store socket in its environment it is plain git.
-pub const GIT: &str = concat!(env!("RHO_AGENT_BASE"), "/bin/git");
+pub fn git() -> PathBuf {
+    agent_base().join("bin/git")
+}
 
 /// Rho's find fork (`flake.nix` findutils), which goes ahead of a dev
 /// shell's own `PATH` so its deny roots hold there too.
-pub const FIND_BIN: Option<&str> = option_env!("RHO_FIND_BIN");
+pub fn find_bin() -> Option<PathBuf> {
+    bundled("find-bin", option_env!("RHO_FIND_BIN"))
+}
 
 /// The shared-cache cargo fork (`flake.nix` cargoSharedCache), used ahead of
 /// a dev shell's cargo.
-pub const SHARED_CARGO_BIN: Option<&str> = option_env!("RHO_SHARED_CARGO_BIN");
+pub fn shared_cargo_bin() -> Option<PathBuf> {
+    bundled("shared-cargo-bin", option_env!("RHO_SHARED_CARGO_BIN"))
+}
 
 /// The directory Rho's git really lives in; the workset PATH
 /// is the user's own with this first.
 pub fn git_dir() -> PathBuf {
-    std::fs::canonicalize(GIT)
+    std::fs::canonicalize(git())
         .ok()
         .and_then(|git| git.parent().map(Path::to_owned))
-        .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
+        .unwrap_or_else(|| agent_base().join("bin"))
 }
 
 /// `rho-devshell-builder`, which runs programs in flake dev shells:
@@ -370,7 +392,7 @@ impl Worksets {
 
     /// A host-side command with the user's environment and the store
     /// wired in.
-    pub fn command(&self, program: &str) -> tokio::process::Command {
+    pub fn command(&self, program: impl AsRef<OsStr>) -> tokio::process::Command {
         let mut command = base_command(program, &self.environment, &self.path_overrides);
         command.envs(self.store_environment());
         command
@@ -378,7 +400,7 @@ impl Worksets {
 }
 
 fn base_command(
-    program: &str,
+    program: impl AsRef<OsStr>,
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
 ) -> tokio::process::Command {
@@ -406,7 +428,7 @@ async fn git_identity(
         let value = match environment.get(author) {
             Some(value) => Some(value.to_owned()),
             None => {
-                let mut command = base_command(GIT, environment, path_overrides);
+                let mut command = base_command(git(), environment, path_overrides);
                 command.args(["config", "--get", key]);
                 match command.output().await {
                     Ok(output) if output.status.success() => {
@@ -460,7 +482,7 @@ fn start_store(
 ) -> anyhow::Result<StoreHandle> {
     let keeper = MirrorStore::new(
         root.join("stores").into_std_path_buf(),
-        PathBuf::from(GIT),
+        git(),
         keeper_environment(environment, path_overrides),
         refresh,
     );
@@ -579,7 +601,7 @@ impl Workset {
         let cloned = match owner.store.as_ref().and_then(|store| store.keeper.as_ref()) {
             Some(keeper) => {
                 let mirror = keeper.ensure(remote_url).await?;
-                let git = rho_git::client::Git::new(GIT);
+                let git = rho_git::client::Git::new(git());
                 let url = remote_url.to_owned();
                 let dest = target.clone();
                 tokio::task::spawn_blocking(move || {

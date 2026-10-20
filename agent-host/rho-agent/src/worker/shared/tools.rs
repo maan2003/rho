@@ -46,7 +46,10 @@ pub(crate) fn host_tools(
         .with_env("RHO_AGENT_ID", role.full_handle(agent_id))
         .with_env(
             "RIPGREP_CONFIG_PATH",
-            format!("{}/etc/ripgreprc", rho_fs_view::AGENT_BASE),
+            rho_fs_view::agent_base()
+                .join("etc/ripgreprc")
+                .display()
+                .to_string(),
         );
     let agent_host = host.map(|host| {
         let host = Arc::clone(host);

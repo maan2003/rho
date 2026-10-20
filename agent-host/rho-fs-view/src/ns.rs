@@ -121,11 +121,11 @@ impl Layout {
         command.envs(environment.0.iter().map(|(name, value)| (name, value)));
         let path = environment.get("PATH").map(|path| self.paths.add_to(path));
         command.env("PATH", prepend_path(&crate::git_dir(), path.as_deref()));
-        if let Some(find) = crate::FIND_BIN {
+        if let Some(find) = crate::find_bin() {
             command.env("RHO_DEVSHELL_PATH_PREFIX", find);
         }
         // The cargo ahead of a dev shell's own.
-        if let Some(cargo) = crate::SHARED_CARGO_BIN {
+        if let Some(cargo) = crate::shared_cargo_bin() {
             command.env("RHO_DEVSHELL_CARGO", cargo);
         }
         if let Some(socket) = &self.store_socket {

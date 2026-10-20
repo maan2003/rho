@@ -9,7 +9,7 @@ async fn worksets_clone_through_the_mirror_store() {
     let root = open_worksets(temp.path()).await;
     let socket = root.store_socket().expect("keeper running");
     assert!(socket.exists());
-    assert!(std::path::Path::new(rho_fs_view::GIT).is_file());
+    assert!(rho_fs_view::git().is_file());
     let remote_url = daemon.url("remote.git");
     let remote_url = remote_url.as_str();
 

@@ -41,7 +41,7 @@ pub fn setup_remote(temp: &Path) -> (PathBuf, PathBuf) {
 /// Runs Rho's git in `dir` with the store wired in exactly as for an
 /// agent.
 pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
-    let mut command = root.command(rho_fs_view::GIT);
+    let mut command = root.command(rho_fs_view::git());
     command.current_dir(dir).args(args);
     let output = command.output().await.unwrap();
     assert!(

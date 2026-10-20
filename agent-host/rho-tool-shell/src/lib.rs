@@ -223,7 +223,7 @@ impl ShellTools {
         workdir: Option<&str>,
         stdin: bool,
     ) -> Result<ProcessSession> {
-        let mut command = Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE));
+        let mut command = Command::new(rho_fs_view::agent_base().join("bin/rho-bash"));
         // An absolute model-supplied cwd wins; a relative one resolves
         // against the tool's working directory (join handles both).
         let cwd = workdir.map_or_else(

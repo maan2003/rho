@@ -169,60 +169,70 @@
                 mainProgram = "rho-agent-desktop";
               };
             });
-        agentBase = pkgs.buildEnv {
-          name = "rho-agent-base";
-          # NixOS's core and default system packages (nixos/modules/config/
-          # system-path.nix), minus what has no meaning in a view (acl,
-          # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
-          # Rho's fork (find with deny roots); then Rho's own list.
-          paths = [
-            rhoGit
-            findutils
-            (pkgs.lib.lowPrio rhoBash)
-            nixFork
-          ]
-          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
-          ++ (with pkgs; [
-            bashInteractive
-            bzip2
-            # Keep small commands from loading the multicall binary's unrelated
-            # libraries (notably OpenSSL) on every exec.
-            (coreutils-full.override { singleBinary = false; })
-            cpio
-            curl
-            diffutils
-            gawk
-            getent
-            getconf
-            gnugrep
-            gnupatch
-            gnused
-            gnutar
-            gzip
-            xz
-            less
-            ncurses
-            netcat
-            procps
-            time
-            util-linux
-            which
-            zstd
-            perl
-            rsync
-            strace
-            openssh
-            ripgrep
-            fd
-            just
-            python3
-            uv
-            nodejs
-            cacert
-            agentRegistry
-            agentRipgreprc
-          ]);
-        };
+        # `rho-bin`'s base leaves out what a machine would compile for hours
+        # before its first agent: the agent desktop, and Nix patched for
+        # rho-devshell-builder, which `rho-bin` does not ship either.
+        mkAgentBase =
+          {
+            desktop ? true,
+            agentNix ? nixFork,
+          }:
+          pkgs.buildEnv {
+            name = "rho-agent-base";
+            # NixOS's core and default system packages (nixos/modules/config/
+            # system-path.nix), minus what has no meaning in a view (acl,
+            # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
+            # Rho's fork (find with deny roots); then Rho's own list.
+            paths = [
+              rhoGit
+              findutils
+              (pkgs.lib.lowPrio rhoBash)
+              agentNix
+            ]
+            ++ pkgs.lib.optionals (desktop && pkgs.stdenv.hostPlatform.isLinux) [ rhoAgentDesktop ]
+            ++ (with pkgs; [
+              bashInteractive
+              bzip2
+              # Keep small commands from loading the multicall binary's unrelated
+              # libraries (notably OpenSSL) on every exec.
+              (coreutils-full.override { singleBinary = false; })
+              cpio
+              curl
+              diffutils
+              gawk
+              getent
+              getconf
+              gnugrep
+              gnupatch
+              gnused
+              gnutar
+              gzip
+              xz
+              less
+              ncurses
+              netcat
+              procps
+              time
+              util-linux
+              which
+              zstd
+              perl
+              rsync
+              strace
+              openssh
+              ripgrep
+              fd
+              just
+              python3
+              uv
+              nodejs
+              cacert
+              agentRegistry
+              agentRipgreprc
+            ]);
+          };
+        agentBase = mkAgentBase { };
+
         # Cargo with a shared, fine-grained build cache: agents' dev shells use
         # it ahead of their own cargo.
         cargoSharedCache = pkgs.rustPlatform.buildRustPackage {
@@ -398,7 +408,10 @@
                 hash = "sha256-aG7l2KVLMUVwTO1prt28YykHbNyEHfD//xFh+T021Xk=";
               };
               build-system = [ ps.setuptools ];
-              dependencies = [ fastcore ps.httpx2 ];
+              dependencies = [
+                fastcore
+                ps.httpx2
+              ];
               doCheck = false;
             };
             fastspec = ps.buildPythonPackage {
@@ -411,7 +424,10 @@
                 hash = "sha256-pdMq/4osnf19szO5SxEm8/99D+DGGuVNo/IZc5KvP/o=";
               };
               build-system = [ ps.setuptools ];
-              dependencies = [ fastcore fasttransport ];
+              dependencies = [
+                fastcore
+                fasttransport
+              ];
               doCheck = false;
             };
             # xdir/ls for exploring notebook objects; packaged from a pinned
@@ -446,7 +462,11 @@
                 cp *.py *.json "$out/${pkgs.python3.sitePackages}/ghapi/"
                 runHook postInstall
               '';
-              dependencies = [ fastcore fastspec fasttransport ];
+              dependencies = [
+                fastcore
+                fastspec
+                fasttransport
+              ];
               doCheck = false;
             };
             # Upstream slack_sdk, with its request transport replaced by the
@@ -486,7 +506,14 @@
               doCheck = false;
             };
           in
-          [ ps.pyyaml ps.httpx ghapi pythonLs slackSdk rhoNotion ]
+          [
+            ps.pyyaml
+            ps.httpx
+            ghapi
+            pythonLs
+            slackSdk
+            rhoNotion
+          ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
@@ -513,22 +540,49 @@
           pkgs.pkg-config
           pkgs.protobuf
         ];
-        guiBuildInputs = [
-          pkgs.alsa-lib
-          pkgs.fontconfig
-          pkgs.freetype
-          pkgs.glib
-          pkgs.libdrm
-          pkgs.libgbm
-          pkgs.libglvnd
-          pkgs.libva
-          pkgs.libvpx
-          pkgs.libxkbcommon
-          pkgs.openssl
-          pkgs.vulkan-loader
-          pkgs.wayland
+        # A package set's libraries the GUI side links: here, and for
+        # `rho-bin`'s other architecture.
+        guiLibraries = p: [
+          p.alsa-lib
+          p.fontconfig
+          p.freetype
+          p.glib
+          p.libdrm
+          p.libgbm
+          p.libglvnd
+          p.libva
+          p.libvpx
+          p.libxkbcommon
+          p.openssl
+          p.vulkan-loader
+          p.wayland
         ];
+        guiBuildInputs = guiLibraries pkgs;
         guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
+        # The skills the `rho` package ships at share/rho/skills.
+        bundledSkills = [
+          "github-workflow"
+          "rho-wayland"
+          "rho-workstreams"
+          "slack"
+          "notion"
+        ];
+        rhoBin = pkgs.callPackage ./nix/rho-bin {
+          agentBase = mkAgentBase {
+            desktop = false;
+            agentNix = pkgs.nix;
+          };
+          inherit pythonSitePackages findutils cargoSharedCache;
+        };
+        rhoBinBuild =
+          target:
+          import ./nix/rho-bin/build.nix {
+            inherit pkgs webrtcPrebuilts;
+            system = target;
+            fenix = flakebox.inputs.fenix.packages.${system};
+            libraries = guiLibraries;
+            skills = bundledSkills;
+          };
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
           let
@@ -636,11 +690,11 @@
                 # The host starts this sibling for every workset.
                 test -x "$out/bin/rho-agent-worker"
                 mkdir -p $out/share/rho/skills
-                cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
-                cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
-                cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
-                cp -r ${./.agents/skills/slack} $out/share/rho/skills/slack
-                cp -r ${./.agents/skills/notion} $out/share/rho/skills/notion
+              ''
+              + pkgs.lib.concatMapStrings (skill: ''
+                cp -r ${./.agents/skills + "/${skill}"} $out/share/rho/skills/${skill}
+              '') bundledSkills
+              + ''
                 chmod -R u+w $out/share/rho/skills
               ''
               + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
@@ -719,6 +773,13 @@
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           rho-agent-desktop = rhoAgentDesktop;
+        }
+        // pkgs.lib.optionalAttrs (builtins.elem system rhoBin.meta.platforms) {
+          rho-bin = rhoBin;
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          rho-bin-build = rhoBinBuild "aarch64-linux";
+          rho-bin-build-x86_64 = rhoBinBuild "x86_64-linux";
         };
 
         ci = {
