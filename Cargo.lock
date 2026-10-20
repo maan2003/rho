@@ -14778,6 +14778,7 @@ dependencies = [
  "camino",
  "clap",
  "json-stream",
+ "prefix-id",
  "rand 0.10.3",
  "rho-agent-hosts",
  "rho-agent-types",

@@ -382,10 +382,7 @@ async fn send_journal_from(
     outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
 ) -> bool {
-    // Each agent's newest visible step as of the rows already paged, so a
-    // request reads its carry back from the log once per agent, not once
-    // per request: that walk is as long as the gap since the last step.
-    let mut carries = HashMap::<AgentId, Option<rho_agent::inference::Carry>>::new();
+    let mut carries = Carries::new();
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
         let Some((last, _, _, _)) = page.last() else {
@@ -395,31 +392,11 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                let mut prior_carry = None;
-                match &event {
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
-                        carry, ..
-                    }) => {
-                        carries.insert(agent_id, Some(carry.clone()));
-                    }
-                    rho_agent::AgentEvent::Rewound { .. } => {
-                        carries.remove(&agent_id);
-                    }
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
-                        ..
-                    }) => {
-                        prior_carry = carries
-                            .entry(agent_id)
-                            .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
-                            .as_ref();
-                    }
-                    _ => {}
-                }
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: crate::transcript::strip(&event, prior_carry)?,
+                    event: strip_row(db, &mut carries, agent_id, pos, &event)?,
                 })
             })
             .collect::<Vec<_>>();
@@ -433,6 +410,65 @@ async fn send_journal_from(
         // Catching up must never starve the connection's own traffic.
         tokio::task::yield_now().await;
     }
+}
+
+/// Each agent's newest visible step as of the rows already read, so a
+/// request reads its carry back from the log once per agent, not once per
+/// request: that walk is as long as the gap since the last step.
+type Carries = HashMap<AgentId, Option<rho_agent::inference::Carry>>;
+
+/// A row as clients read it, or `None` for one they never see.
+fn strip_row(
+    db: &RhoDb,
+    carries: &mut Carries,
+    agent_id: AgentId,
+    pos: rho_agent::log::AgentEventPos,
+    event: &rho_agent::AgentEvent<'_>,
+) -> Option<rho_agents_client::protocol::transcript::TranscriptEvent> {
+    let mut prior_carry = None;
+    match event {
+        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { carry, .. }) => {
+            carries.insert(agent_id, Some(carry.clone()));
+        }
+        rho_agent::AgentEvent::Rewound { .. } => {
+            carries.remove(&agent_id);
+        }
+        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent { .. }) => {
+            prior_carry = carries
+                .entry(agent_id)
+                .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
+                .as_ref();
+        }
+        _ => {}
+    }
+    crate::transcript::strip(event, prior_carry)
+}
+
+/// One page of an agent's rows, stripped as the journal strips them.
+fn agent_log_page(
+    db: &RhoDb,
+    rho_agents_client::protocol::AgentLog { agent_id, from }: rho_agents_client::protocol::AgentLog,
+) -> anyhow::Result<rho_agents_client::protocol::AgentLogPage> {
+    let page = db.read().agent_rows(agent_id, from.into(), LOG_PAGE);
+    anyhow::ensure!(
+        !page.is_empty() || from.0 > 0,
+        "no agent {} on this host",
+        agent_id.encoded()
+    );
+    let next = (page.len() == LOG_PAGE)
+        .then(|| page.last().map(|(pos, _)| pos.next().into()))
+        .flatten();
+    let mut carries = Carries::new();
+    let rows = page
+        .iter()
+        .filter_map(|(pos, event)| {
+            Some((
+                (*pos).into(),
+                strip_row(db, &mut carries, agent_id, *pos, event)?,
+            ))
+        })
+        .collect();
+    Ok(rho_agents_client::protocol::AgentLogPage { rows, next })
 }
 
 /// Answers one call with its handler's reply: the call names the reply's
@@ -482,6 +518,12 @@ where
                 write.set_claude_account(&name);
                 write.commit();
                 claude_accounts(&services.db, &services.claude)
+            })
+            .await
+        }
+        Request::AgentLog(call) => {
+            respond(writer, call, |call| async {
+                agent_log_page(&services.db, call)
             })
             .await
         }

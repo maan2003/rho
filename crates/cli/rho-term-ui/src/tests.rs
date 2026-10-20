@@ -90,6 +90,23 @@ fn virtual_input_shutdown_wakes_blocked_reader() {
     assert!(matches!(event, Event::Eof));
 }
 
+/// A handle outlives its terminal; a sync asked for after the terminal is
+/// gone has no redraw thread to answer it and must not wait for one.
+#[test]
+fn redraw_sync_after_drop_returns() {
+    let buf = SharedBuffer::new();
+    let (term, handle, _input_tx) = Term::new_virtual(40, 5, "> ", Box::new(buf));
+    drop(term);
+    let (done_tx, done_rx) = path_std_sync::mpsc::channel();
+    thread::spawn(move || {
+        handle.redraw_sync();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(path_std_time::Duration::from_secs(2))
+        .expect("redraw_sync must return once the terminal is dropped");
+}
+
 /// Once virtual input is closed, EOF must be sticky across repeated reads. The
 /// internal shutdown channel stays connected through `TermHandle`, so this test
 /// prevents a regression where only the first EOF wakeup is delivered and the
@@ -1800,6 +1817,29 @@ fn assert_full_redraw_after(
         before + 1,
         "operation should require exactly one full redraw"
     );
+}
+
+/// The gap above the prompt appears once something is drawn above it, and
+/// stays one row while history grows past it: it is never fossilized into
+/// scrollback between two history blocks.
+#[test]
+fn prompt_gap_sits_between_blocks_and_prompt() {
+    let buf = SharedBuffer::new();
+    let mut parser = vt100::Parser::new(6, 40, 20);
+    let (_term, handle, _input_tx) = Term::new_virtual(40, 6, "> ", Box::new(buf.clone()));
+    handle.set_prompt_gap(true);
+    flush_redraws(&handle, &buf, &mut parser);
+    assert_eq!(vt100_rows(&parser, 40)[0].trim_end(), ">");
+
+    handle.print_output(plain_block("one"));
+    flush_redraws(&handle, &buf, &mut parser);
+    handle.print_output(plain_block("two"));
+    flush_redraws(&handle, &buf, &mut parser);
+    let rows: Vec<String> = vt100_rows(&parser, 40)
+        .iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    assert_eq!(&rows[..4], &["one", "two", "", ">"]);
 }
 
 /// After a capped full redraw, the renderer's internal viewport must remain

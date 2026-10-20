@@ -417,6 +417,11 @@ fn layout_tail(st: &SharedState, history_height: usize) -> TailLayout {
         width,
         &mut lines,
     );
+    // The gap is drawn with the active blocks, so it never fossilizes into
+    // the history above it.
+    if st.editor.prompt_gap && history_height + lines.len() > 0 {
+        lines.push(CellRow::new(Vec::new()));
+    }
     let active_height = lines.len();
     let above_end = history_height + lines.len();
 

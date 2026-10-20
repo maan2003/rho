@@ -187,6 +187,8 @@ struct PromptEditorState {
     right_prompt: StyledText,
     /// Placeholder rendered while the editable input is empty.
     input_placeholder: StyledText,
+    /// Whether a blank row separates the prompt from the blocks above it.
+    prompt_gap: bool,
     /// Current editable input.
     buffer: String,
     /// Byte offset of the input cursor.
@@ -766,10 +768,13 @@ impl TermHandle {
     /// Requests a repaint and blocks until the redraw thread has rendered
     /// the state as of this call.
     ///
-    /// After an output failure this returns immediately.
+    /// After an output failure or once the terminal is dropped this returns
+    /// immediately.
     pub fn redraw_sync(&self) {
         let mut st = self.lock();
-        if st.terminal.output_failure.is_some() {
+        // Once the terminal is shut down no redraw thread is left to
+        // answer; its final render covered every earlier request.
+        if st.terminal.output_failure.is_some() || st.terminal.shutdown {
             return;
         }
         st.terminal.sync_requested = st.terminal.sync_requested.wrapping_add(1);
@@ -919,6 +924,12 @@ impl TermHandle {
     /// Replaces the placeholder shown while the input is empty.
     pub fn set_input_placeholder(&self, text: impl Into<StyledText>) {
         self.lock().editor.input_placeholder = text.into();
+    }
+
+    /// Keeps a blank row between the prompt and whatever is drawn above
+    /// it, once anything is.
+    pub fn set_prompt_gap(&self, gap: bool) {
+        self.lock().editor.prompt_gap = gap;
     }
 
     /// Returns a copy of the current input buffer.

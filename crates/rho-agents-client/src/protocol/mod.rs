@@ -44,6 +44,8 @@ rho_rpc::calls! {
         /// Answered with the accounts as they stand after the switch.
         SetClaudeAccount(SetClaudeAccount) -> ClaudeAccountList;
         SetAuthAccountEnabled(SetAuthAccountEnabled) -> ();
+        /// Bulk: one agent's rows, a page at a time.
+        AgentLog(AgentLog) -> AgentLogPage, priority None;
     }
 }
 
@@ -117,6 +119,21 @@ pub struct SetClaudeAccount {
 pub struct SetAuthAccountEnabled {
     pub name: String,
     pub enabled: bool,
+}
+
+/// One agent's rows from `from` on, as the journal would carry them: for a
+/// client that wants one agent without reading every agent's journal.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct AgentLog {
+    pub agent_id: AgentId,
+    pub from: AgentPos,
+}
+
+#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
+pub struct AgentLogPage {
+    pub rows: Vec<(AgentPos, transcript::TranscriptEvent)>,
+    /// Where the next page starts; `None` once the log is read to its end.
+    pub next: Option<AgentPos>,
 }
 
 /// What a client says on its agents session.

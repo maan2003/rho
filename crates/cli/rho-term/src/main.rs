@@ -21,16 +21,16 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use rho_agent_types::{AgentRole, ContentPart, Seq};
+use rho_agent_types::{AgentPos, AgentRole, ContentPart};
 use rho_agents_client::create::{DEFAULT_ROLE, cycle_agent_role_text, parse_agent_role};
 use rho_agents_client::protocol::transcript::RuntimeState;
 use rho_agents_client::protocol::{
-    AgentCommand, ClientFrame, NewAgent, ServerFrame, StartMode, UserMessage,
+    AgentCommand, AgentLog, ClientFrame, NewAgent, ServerFrame, StartMode, UserMessage,
 };
 use rho_agents_client::state::{UiAgentStatus, UiBlock, UiToolStatus};
 use rho_term_ui::{Color, Event, Key, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 
-use crate::agent::{Directory, Followed, short_handle};
+use crate::agent::{Directory, Followed, resolve, short_handle};
 use crate::host::Host;
 use crate::projection::View;
 use crate::screen::Transcript;
@@ -78,39 +78,41 @@ async fn run(args: Args) -> Result<()> {
     parse_agent_role(&args.role).map_err(|error| anyhow::anyhow!(error))?;
     let host = Host::connect_or_start(args.socket_path).await?;
     let (to_host, mut from_host, session) = host.session().await?;
-    let journal_head = match from_host.recv().await.context("the agent host closed")?? {
-        ServerFrame::JournalHead { journal_head, .. } => journal_head,
-        _ => anyhow::bail!("the agent host did not open with its journal head"),
-    };
+    let (journal_head, machine_seed, agent_counter) =
+        match from_host.recv().await.context("the agent host closed")?? {
+            ServerFrame::JournalHead {
+                journal_head,
+                machine_seed,
+                agent_counter,
+            } => (journal_head, machine_seed, agent_counter),
+            _ => anyhow::bail!("the agent host did not open with its journal head"),
+        };
+    // Every row after the head arrives on the session; one agent's rows
+    // before it are asked for on their own.
+    to_host.send(ClientFrame::Follow {
+        since: journal_head,
+    })?;
     let mut directory = Directory::default();
     let mut phase = match &args.command {
-        None => {
-            // A new agent's rows all come after the head.
-            to_host.send(ClientFrame::Follow {
-                since: journal_head,
-            })?;
-            Phase::Draft { role: args.role }
-        }
+        None => Phase::Draft { role: args.role },
         Some(Command::Attach { agent }) => {
-            // Its rows are somewhere in the journal: read it all, then find
-            // it. The rows read on the way are folded once it is found.
-            to_host.send(ClientFrame::Follow { since: Seq(0) })?;
-            let mut entries = Vec::new();
-            let mut read = Seq(0);
-            while read < journal_head {
-                if let ServerFrame::Log { entries: page } =
-                    from_host.recv().await.context("the agent host closed")??
-                {
-                    read = page.last().map_or(read, |entry| entry.seq);
-                    entries.extend(page);
-                }
-            }
-            directory.tell(&entries);
-            let agent_id = directory
-                .find(agent)
+            let agent_id = resolve(agent, machine_seed, agent_counter)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let mut followed = Followed::new(agent_id);
-            followed.tell(&entries);
+            // Rows the session carries meanwhile wait in its channel and are
+            // folded after these; the fold drops the ones read twice.
+            let mut from = AgentPos(0);
+            loop {
+                let page = host.call(AgentLog { agent_id, from }).await?;
+                for (_, event) in &page.rows {
+                    directory.tell_one(agent_id, event);
+                }
+                followed.tell_rows(&page.rows);
+                match page.next {
+                    Some(next) => from = next,
+                    None => break,
+                }
+            }
             to_host.send(ClientFrame::Focus {
                 agent_ids: vec![agent_id],
             })?;
@@ -119,6 +121,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     let (term, handle) = Term::new(Span::new("› ", Style::default().fg(Color::Cyan).bold()))?;
+    handle.set_prompt_gap(true);
     let status = handle.new_block(StyledBlock::new(""));
     handle.push_below(status);
     let mut transcript = Transcript::new(handle.clone(), View::Chat);
@@ -276,11 +279,13 @@ async fn run(args: Args) -> Result<()> {
     handle.set_buffer(String::new(), 0);
     handle.set_input_placeholder(StyledText::new());
     handle.remove_below(status);
-    handle.request_input_shutdown();
+    // The input thread still holds the terminal, so this draws.
     handle.redraw_sync();
+    // With nobody to take its events, the input thread stops at its next
+    // one, which the shutdown provides; it drops the terminal on the way
+    // out, and then the terminal is the user's again and safe to print to.
     drop(events);
-    // The input thread owns the terminal: once it has dropped it, the
-    // terminal is the user's again and it is safe to print.
+    handle.request_input_shutdown();
     let _ = tokio::task::spawn_blocking(move || input.join()).await;
     drop(to_host);
     drop(from_host);
@@ -300,8 +305,8 @@ async fn run(args: Args) -> Result<()> {
 }
 
 /// The terminal's input, read on a thread of its own: `get_next_event`
-/// blocks. The thread owns the terminal and restores it when it ends,
-/// after the last event or once input is shut down.
+/// blocks. The thread owns the terminal and restores it when it ends:
+/// once nobody takes its events, or on a terminal error.
 fn spawn_input(
     term: Term,
 ) -> (
@@ -311,9 +316,11 @@ fn spawn_input(
     let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
     let thread = std::thread::spawn(move || {
         loop {
+            // Ctrl-D is an event like any other: the terminal stays up
+            // until the session has drawn its last frame.
             let event = term.get_next_event();
-            let end = matches!(event, Ok(Event::Eof) | Err(_));
-            if events.send(event).is_err() || end {
+            let failed = event.is_err();
+            if events.send(event).is_err() || failed {
                 break;
             }
         }
