@@ -145,6 +145,15 @@ pub enum ClientFrame {
     /// every later append on any agent, and the live tails, are pushed on
     /// this stream. A second `Follow` replaces the first.
     Follow { since: Seq },
+    /// After [`ServerFrame::JournalHead`], instead of `Follow`: only these
+    /// agents, for a client that shows one of them and holds nothing of
+    /// the rest. The host answers with each agent's whole history as
+    /// [`ServerFrame::Log`] pages, every entry stamped with the journal
+    /// head the follow started from. Then it follows from that head with
+    /// only these agents' rows, and sends [`ServerFrame::Live`] statuses
+    /// for only these agents. A later `Follow` or `FollowAgents` replaces
+    /// it. A host older than this frame closes the session.
+    FollowAgents { agent_ids: Vec<AgentId> },
     /// The agents whose live frames this client wants: the ones on screen.
     /// Everything durable arrives on the journal regardless, so this only
     /// decides who streams partial text and tools in flight. Replaces the
@@ -387,6 +396,9 @@ mod tests {
         });
         round_trips(ClientFrame::Focus { agent_ids: vec![] });
         round_trips(ClientFrame::Follow { since: Seq(9) });
+        round_trips(ClientFrame::FollowAgents {
+            agent_ids: vec![agent_id],
+        });
         round_trips(ClientFrame::Detail {
             agent_id,
             pos: AgentPos(3),
