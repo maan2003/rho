@@ -58,6 +58,7 @@ let
   packages = [
     "rho-cli"
     "rho-term"
+    "rho-tui"
     "rho-agent-host"
     "rho-inference"
     "rho-shell"
@@ -161,7 +162,7 @@ pkgs.writeShellApplication {
     rm -rf "$stage"
     mkdir -p "$stage/bin" "$stage/share/rho/skills"
     binaries="$CARGO_TARGET_DIR/${target}/release"
-    for binary in rho rho-term rho-agent-host rho-agent-worker rho-shell rho-pager \
+    for binary in rho rho-term rho-tui rho-agent-host rho-agent-worker rho-shell rho-pager \
       rho-devshell-daemon git-remote-octo; do
       llvm-objcopy --strip-debug "$binaries/$binary" "$stage/bin/$binary"
     done
