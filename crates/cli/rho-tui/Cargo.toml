@@ -32,5 +32,6 @@ text.workspace = true
 theme = { path = "../../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../../vendor/zed/crates/theme_settings" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
-vim = { path = "../../../vendor/zed/crates/vim", default-features = false }
+# Its `zed-workspace` code is the half that matches a `native` editor.
+vim = { path = "../../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
 vim_mode_setting = { path = "../../../vendor/zed/crates/vim_mode_setting" }
