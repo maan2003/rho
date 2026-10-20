@@ -228,7 +228,21 @@ pub(crate) enum SnoozeUnit {
     Weeks,
 }
 
+/// A workspace for one agent: the agent the host named, until it is
+/// opened. It opens once the agent's history has arrived, since a
+/// transcript opened before that has nothing to show.
+struct OneAgent {
+    to_open: Option<AgentId>,
+    /// Told why, when the host has no agent the handle names: a window on
+    /// one agent has nothing to show without it.
+    missing: Missing,
+}
+
+type Missing = Box<dyn Fn(String, &mut App)>;
+
 pub struct Workspace {
+    /// Set in a workspace for one agent ([`Workspace::for_one_agent`]).
+    one_agent: Option<OneAgent>,
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
     /// them, and the agent host's live tail. Also the focus set every host
@@ -716,12 +730,46 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(specs, None, window, cx)
+    }
+
+    /// A workspace for the one agent `handle` names (`rho-gui --agent`).
+    /// Its model holds that agent alone, and it opens the agent once the
+    /// host has named it. It starts no Slack and asks for no secret
+    /// phrase: it is a window on one agent, not the user's desk.
+    pub fn for_one_agent(
+        specs: Vec<HostSpec>,
+        handle: String,
+        missing: impl Fn(String, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let one_agent = OneAgent {
+            to_open: None,
+            missing: Box::new(missing),
+        };
+        Self::build(specs, Some((handle, one_agent)), window, cx)
+    }
+
+    fn build(
+        specs: Vec<HostSpec>,
+        one_agent: Option<(String, OneAgent)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (handle, one_agent) = one_agent.unzip();
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let (agents_client, changes) = rho_agents_client::model::AgentsClient::spawn();
+        let (agents_client, changes) = match handle {
+            Some(handle) => rho_agents_client::model::AgentsClient::spawn_scoped(handle),
+            None => rho_agents_client::model::AgentsClient::spawn(),
+        };
         #[cfg(test)]
-        let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
+        let (agents_client, changes) = {
+            let _ = handle;
+            rho_agents_client::model::AgentsClient::detached()
+        };
         // Each stream of a host has its own reader: the agents stream goes
         // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_agent_hosts::HostEvent>();
@@ -964,6 +1012,7 @@ impl Workspace {
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
+            one_agent,
         };
         let no_hosts = specs.is_empty();
         for spec in specs {
@@ -986,6 +1035,9 @@ impl Workspace {
         this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.invalidate_dealer_signals(cx);
+        if this.one_agent.is_some() {
+            return this;
+        }
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack. And when there is no session it says so: rho
@@ -1823,6 +1875,11 @@ impl Workspace {
                             .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
+                if let Some(one_agent) = &mut self.one_agent
+                    && let Some(agent_id) = one_agent.to_open.take_if(|id| changed.contains(id))
+                {
+                    self.open_agent(agent_id, window, cx);
+                }
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
@@ -1859,6 +1916,19 @@ impl Workspace {
                     .set_host_data(host, machine_seed, agent_counter);
                 cx.notify();
             }
+            rho_agents_client::model::ModelMsg::Scoped(scoped) => match scoped {
+                // A stream opened again names the agent already open.
+                Ok(agent_id) if self.registry.agent_digest(agent_id).is_some() => {}
+                Ok(agent_id) => {
+                    if let Some(one_agent) = &mut self.one_agent {
+                        one_agent.to_open = Some(agent_id);
+                    }
+                }
+                Err(error) => match &self.one_agent {
+                    Some(one_agent) => (one_agent.missing)(error, cx),
+                    None => self.echo(&error, StyleClass::SystemImportant, cx),
+                },
+            },
             rho_agents_client::model::ModelMsg::Auth { auth } => {
                 self.quotas.set_auth(host, auth);
                 if let Some(view) = self.usage.opened_view() {

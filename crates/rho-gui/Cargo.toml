@@ -64,6 +64,7 @@ rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view = { workspace = true }
 rho-agent-hosts = { workspace = true, features = ["client"] }
+rho-tty = { path = "../cli/rho-tty" }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }

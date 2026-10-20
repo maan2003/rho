@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{AgentId, AgentIdDomain, AgentPos};
+use rho_agent_types::{AgentId, AgentPos};
+pub use rho_agents_client::find::resolve;
 use rho_agents_client::protocol::transcript::{Live, LogEntry, TranscriptEvent};
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};
@@ -95,25 +96,6 @@ impl Directory {
                 .map_or("agent", |identity| identity.role.handle_prefix()),
             agent_id,
         )
-    }
-}
-
-/// The agent a handle or the start of an id names, `eng-k3f9…` or just
-/// `k3f9`, among the ids this host has handed out.
-pub fn resolve(text: &str, machine_seed: u64, agent_counter: u64) -> Result<AgentId, String> {
-    let text = text.trim();
-    let prefix = match text.split_once('-') {
-        Some(("eng" | "adv", id)) => id,
-        _ => text,
-    };
-    match AgentId::from_prefix(prefix, agent_counter + 1, &AgentIdDomain(machine_seed)) {
-        Ok(prefix_id::PrefixResolution::Unique(id)) => Ok(id),
-        Ok(prefix_id::PrefixResolution::Ambiguous { .. }) => {
-            Err(format!("`{text}` names more than one agent"))
-        }
-        Ok(prefix_id::PrefixResolution::NotFound) | Err(_) => {
-            Err(format!("no agent `{text}` on this host"))
-        }
     }
 }
 

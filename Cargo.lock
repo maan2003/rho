@@ -14432,6 +14432,7 @@ dependencies = [
  "rho-slack",
  "rho-terminal",
  "rho-transcript",
+ "rho-tty",
  "rho-window",
  "rodio",
  "rust-embed",

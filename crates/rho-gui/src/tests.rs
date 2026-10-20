@@ -591,6 +591,86 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
     cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx))
 }
 
+/// A window on one agent opens it once its history has arrived, and quits
+/// with the reason when the host names no such agent.
+#[gpui::test]
+fn a_workspace_for_one_agent_opens_it_once_it_arrives(cx: &mut TestAppContext) {
+    use rho_agents_client::model::ModelMsg;
+    use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
+
+    story::reset();
+    cx.update(init_test_app);
+    let specs = vec![HostSpec {
+        name: "local".to_owned(),
+        target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock")),
+    }];
+    let missing = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let told = missing.clone();
+    let workspace = cx.add_window(|window, cx| {
+        Workspace::for_one_agent(
+            specs.clone(),
+            "eng-1".to_owned(),
+            move |error, _| told.borrow_mut().push(error),
+            window,
+            cx,
+        )
+    });
+    let host = HostId::default();
+    let created = TranscriptEvent::Created {
+        role: Default::default(),
+        runtime: RuntimeKind::Rho,
+        place: rho_agent_types::Place {
+            cwd: "/src/repo".into(),
+            workset: None,
+        },
+        spawned_by: SpawnedBy::Direct,
+        spawn_name: None,
+        parent: None,
+        model: "test-model".to_owned(),
+        at: UnixMs(0),
+    };
+    let arrived = |id| rho_agents_client::MirroredAgent::new(host, id, &created).unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_model_event(host, ModelMsg::Scoped(Ok(agent(1))), window, cx);
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "home",
+                "nothing to show yet"
+            );
+            // Another agent's news opens nothing.
+            workspace.handle_model_event(
+                host,
+                ModelMsg::Changed {
+                    agents: vec![arrived(agent(2))],
+                },
+                window,
+                cx,
+            );
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            workspace.handle_model_event(
+                host,
+                ModelMsg::Changed {
+                    agents: vec![arrived(agent(1))],
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.active_surface().key,
+                crate::pane::SurfaceKey::Transcript(agent(1))
+            );
+            workspace.handle_model_event(
+                host,
+                ModelMsg::Scoped(Err("no agent `eng-9` on this host".to_owned())),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    assert_eq!(*missing.borrow(), ["no agent `eng-9` on this host"]);
+}
+
 #[gpui::test]
 fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

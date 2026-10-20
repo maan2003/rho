@@ -77,6 +77,16 @@ impl AgentCommands {
     }
 }
 
+#[cfg(test)]
+impl AgentCommands {
+    /// Commands with nothing behind them but a record of what was sent.
+    pub(crate) fn recorded() -> (Self, futures_mpsc::UnboundedReceiver<ClientFrame>) {
+        let (commands, sent) = futures_mpsc::unbounded();
+        let focus = Arc::new(Mutex::new(None));
+        (Self { commands, focus }, sent)
+    }
+}
+
 /// One host's agents stream, as the host keeps it across reconnects.
 pub(crate) struct AgentStream {
     host: HostId,

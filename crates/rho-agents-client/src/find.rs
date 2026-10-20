@@ -6,9 +6,28 @@
 //! agent ended up with: they remember the label, or the thing they last
 //! asked for. Every one of those names finds it.
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, AgentIdDomain};
 
 use crate::map::AgentMap;
+
+/// The agent a handle or the start of an id names, `eng-k3f9…` or just
+/// `k3f9`, among the ids this host has handed out.
+pub fn resolve(text: &str, machine_seed: u64, agent_counter: u64) -> Result<AgentId, String> {
+    let text = text.trim();
+    let prefix = match text.split_once('-') {
+        Some(("eng" | "adv", id)) => id,
+        _ => text,
+    };
+    match AgentId::from_prefix(prefix, agent_counter + 1, &AgentIdDomain(machine_seed)) {
+        Ok(prefix_id::PrefixResolution::Unique(id)) => Ok(id),
+        Ok(prefix_id::PrefixResolution::Ambiguous { .. }) => {
+            Err(format!("`{text}` names more than one agent"))
+        }
+        Ok(prefix_id::PrefixResolution::NotFound) | Err(_) => {
+            Err(format!("no agent `{text}` on this host"))
+        }
+    }
+}
 
 /// One agent as an answer to a query: the name a row shows for it, the
 /// other names it answers to, and how recently it was used.

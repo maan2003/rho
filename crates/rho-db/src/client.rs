@@ -54,6 +54,13 @@ pub fn open_shared(state_dir: &Path) -> std::io::Result<RhoDb> {
     Ok(SHARED.get_or_init(|| db).clone())
 }
 
+/// An empty database in memory, as this process's one: for a session that
+/// keeps nothing and so needs no file, no lock, and no second-opener door.
+/// Everything over it works as over the file, and goes with the process.
+pub fn shared_in_memory() -> RhoDb {
+    SHARED.get_or_init(RhoDb::in_memory).clone()
+}
+
 /// The database this process opened, if it has. `None` is not an error:
 /// a test, or a tool that never opened one, has no client database and
 /// every cache over it is simply absent.
