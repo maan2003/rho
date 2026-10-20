@@ -69,10 +69,11 @@ pub async fn bind_iroh_client(secret: iroh::SecretKey) -> anyhow::Result<iroh::E
 pub async fn authenticate_iroh_client(
     connection: &iroh::endpoint::Connection,
     client_endpoint_id: iroh::EndpointId,
+    pairing: Option<&rho_iroh_auth::PairingKey>,
 ) -> anyhow::Result<rho_iroh_auth::ClientAuthResult> {
     tokio::time::timeout(
         AUTH_TIMEOUT,
-        rho_iroh_auth::authenticate_client(connection, client_endpoint_id),
+        rho_iroh_auth::authenticate_client(connection, client_endpoint_id, pairing),
     )
     .await
     .map_err(|_| anyhow::anyhow!("iroh authentication timed out"))?

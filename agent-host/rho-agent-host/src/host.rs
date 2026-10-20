@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GitProvided, GitProviderFrame, GitTransportPolicy,
-    GuiTelemetryUpload, IrohApprove, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet,
-    PlatformStatus, Request, ShutdownIfIdle, Snapshot,
+    GuiTelemetryUpload, IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open,
+    PlatformSecretsSet, PlatformStatus, Request, ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -232,6 +232,18 @@ where
             )
             .await
         }
+        Request::IrohPair(call) => {
+            respond(writer, call, |IrohPair| async move {
+                let auth = iroh()?;
+                let link = rho_iroh_auth::PairingLink {
+                    endpoint_id: auth.server_endpoint_id(),
+                    key: auth.mint_pairing_key().await,
+                    name: host_name(),
+                };
+                Ok(link.to_string())
+            })
+            .await
+        }
         Request::IrohRevoke(call) => {
             respond(writer, call, |IrohRevoke { endpoint_id }| async move {
                 let auth = iroh()?;
@@ -246,6 +258,29 @@ where
             })
             .await
         }
+    }
+}
+
+/// This machine's name as a client labels it: the kernel's host name, made
+/// fit for a link.
+fn host_name() -> String {
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let name = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    if rho_iroh_auth::valid_host_name(&name) {
+        name
+    } else {
+        "host".to_owned()
     }
 }
 

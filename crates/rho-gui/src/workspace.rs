@@ -3423,7 +3423,7 @@ impl Workspace {
 
     /// Attaches an agent host named on the spot, for a machine that is not
     /// worth putting in the host list.
-    pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
+    pub fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
         let spec = match HostSpec::parse(spec, "rho") {
             Ok(spec) => spec,
             Err(error) => {
@@ -3470,7 +3470,8 @@ impl Workspace {
         );
     }
 
-    /// Prompt for `<name>=unix:<socket>` or `<name>=iroh:<id>@<ssh-dest>`.
+    /// Prompt for `<name>=unix:<socket>`, `<name>=iroh:<id>@<ssh-dest>`, or a
+    /// pairing link.
     pub(crate) fn prompt_host_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(

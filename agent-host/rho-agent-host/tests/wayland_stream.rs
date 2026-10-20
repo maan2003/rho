@@ -126,7 +126,7 @@ layout { background-color "#315b97"; }
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
         rho_rpc::protocol::client::call(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
         let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_rpc::protocol::IROH_ALPN)).await??;
-        ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id()).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
+        ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id(),None).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());
         let m=mux.clone(); let uni=tokio::spawn(async move {m.receive_uni().await});
         let m=mux.clone(); let bi=tokio::spawn(async move {m.receive_bi().await});

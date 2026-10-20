@@ -39,6 +39,11 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
+    /// A pairing link (`rho://…`, which `rho` prints on the host) to attach
+    /// and pair with. With a rho-gui already running, it goes to that one.
+    #[arg(value_name = "LINK")]
+    link: Option<String>,
+
     /// Write a Dial9 CPU/frame trace on exit (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
@@ -257,6 +262,11 @@ fn run() -> Result<()> {
         let stdout = std::io::stdout();
         return rho_journal::dump(&client_state_dir, kind.as_deref(), stdout.lock());
     }
+    if let Some(link) = &args.link
+        && rho_gui::links::hand_off(&client_state_dir, link)
+    {
+        return Ok(());
+    }
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -310,6 +320,7 @@ fn run() -> Result<()> {
     rho_agent_hosts::fido::init(db.clone());
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
+    let link = args.link.clone();
     let local_socket = specs.iter().find_map(|spec| match &spec.target {
         AttachTarget::Unix(socket) => Some(socket),
         AttachTarget::Iroh { .. } => None,
@@ -399,12 +410,25 @@ fn run() -> Result<()> {
                 app_id: Some("rho-gui".to_owned()),
                 ..Default::default()
             };
-            if let Err(error) = cx.open_window(window_options, move |window, cx| {
+            let window = match cx.open_window(window_options, move |window, cx| {
                 cx.new(|cx| Workspace::new(specs.clone(), window, cx))
             }) {
-                eprintln!("rho-gui: failed to open window: {error:#}");
-                cx.quit();
+                Ok(window) => window,
+                Err(error) => {
+                    eprintln!("rho-gui: failed to open window: {error:#}");
+                    cx.quit();
+                    return;
+                }
+            };
+            let open = move |link: String, cx: &mut App| {
+                let _ = window.update(cx, |workspace, _, cx| {
+                    workspace.cmd_host_attach(&link, cx);
+                });
+            };
+            if let Some(link) = link {
+                open(link, cx);
             }
+            rho_gui::links::listen(&client_state_dir, open, cx);
         });
 
     Ok(())
