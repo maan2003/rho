@@ -1,7 +1,7 @@
 {
   "aarch64-linux": {
-    "version": "20261020-gd79131fd86d9",
-    "url": "https://pub-c02578899b644007b0b5aae08b7e73b3.r2.dev/rho-bin/20261020-gd79131fd86d9/aarch64-linux/rho-bin_20261020-gd79131fd86d9_aarch64-linux.tar.zst",
-    "hash": "sha256-7HOJ7on05Q4OwUZP79icrrqtBWZjl2ejQSi8kEqTP2g="
+    "version": "20261020-gd80778fe181a",
+    "url": "https://pub-c02578899b644007b0b5aae08b7e73b3.r2.dev/rho-bin/20261020-gd80778fe181a/aarch64-linux/rho-bin_20261020-gd80778fe181a_aarch64-linux.tar.zst",
+    "hash": "sha256-BFEJQAR6tzK2WThdMb5VhMTeQ24dSW/+BLLMN+p0d4w="
   }
 }
