@@ -219,9 +219,9 @@ where
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
         let mut parser = Parser::new();
         #[cfg(not(target_family = "wasm"))]
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
+        if let Some(store) = wasm_store() {
+            parser.set_wasm_store(store).unwrap();
+        }
         parser
     });
     // Tree-sitter auto-resets the parser at the end of a successful parse,
@@ -242,6 +242,26 @@ where
 {
     let mut cursor = QueryCursorHandle::new();
     func(cursor.deref_mut())
+}
+
+/// A store for Wasm grammars, or none where the process may not map
+/// executable memory (a W^X kernel, systemd's `MemoryDenyWriteExecute`).
+/// Native grammars parse either way; only Wasm grammars then fail to load.
+#[cfg(not(target_family = "wasm"))]
+fn wasm_store() -> Option<WasmStore> {
+    static UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match WasmStore::new(&WASM_ENGINE) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            if !UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("Wasm grammars are unavailable: {error:?}");
+            }
+            None
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
