@@ -113,6 +113,7 @@ uuid.workspace = true
 util = { path = "../../vendor/zed/crates/util" }
 vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
+zbus.workspace = true
 
 # unprefixed_malloc routes C-library allocations (freetype, fontconfig,
 # drivers) through jemalloc too; profiling stays inert until MALLOC_CONF

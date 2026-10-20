@@ -14449,6 +14449,7 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
+ "zbus",
 ]
 
 [[package]]

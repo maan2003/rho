@@ -243,6 +243,9 @@ pub struct Workspace {
     /// What the user is writing to each agent, kept on disk as it is
     /// typed: a restart or an evicted view puts it back.
     drafts: HashMap<AgentId, String>,
+    /// Pairing links that came while the user was naming another link's host:
+    /// each is asked about once that prompt closes.
+    waiting_links: std::collections::VecDeque<String>,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -423,6 +426,10 @@ pub struct Workspace {
 /// Target-independent application state transitions. Transport adapters feed
 /// these methods; native and browser layout code only decide when to render
 /// the resulting canonical registry/store/model state.
+/// How the prompt for a pairing link's host name starts; the endpoint id
+/// follows.
+const LINK_NAME_PROMPT: &str = "name host ";
+
 impl Workspace {
     fn ensure_agent_model(
         &mut self,
@@ -893,6 +900,7 @@ impl Workspace {
             drafts: rho_agents_client::cache::read_drafts()
                 .into_iter()
                 .collect(),
+            waiting_links: Default::default(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -3492,8 +3500,17 @@ impl Workspace {
 
     /// Prompt for what to call the host a pairing link reaches. A link can
     /// come from anywhere, even a Slack message, so it attaches only once
-    /// the user has named it; cancelling the prompt drops it.
+    /// the user has named it; cancelling the prompt drops it. A link that
+    /// comes while another is being named waits for that prompt to close.
     pub fn prompt_link_name(&mut self, link: String, window: &mut Window, cx: &mut Context<Self>) {
+        let naming = self
+            .minibuffer
+            .as_ref()
+            .is_some_and(|minibuffer| minibuffer.prompt().starts_with(LINK_NAME_PROMPT));
+        if naming {
+            self.waiting_links.push_back(link);
+            return;
+        }
         let link = match link.parse::<rho_iroh_auth::PairingLink>() {
             Ok(link) => link,
             Err(error) => {
@@ -3506,12 +3523,31 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
                   name: String,
-                  _window: &mut Window,
+                  window: &mut Window,
                   cx: &mut Context<Workspace>| {
                 workspace.cmd_host_attach(&format!("{}={link}", name.trim()), cx);
+                workspace.prompt_waiting_link(window, cx);
             },
         );
-        self.open_prompt(format!("name host {id}:"), complete, on_submit, window, cx);
+        let on_cancel = std::rc::Rc::new(
+            |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                workspace.prompt_waiting_link(window, cx);
+            },
+        );
+        self.open_prompt_cancellable(
+            format!("{LINK_NAME_PROMPT}{id}:"),
+            complete,
+            on_submit,
+            on_cancel,
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_waiting_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(link) = self.waiting_links.pop_front() {
+            self.prompt_link_name(link, window, cx);
+        }
     }
 
     /// Prompt (completing over attached hosts) for one to detach.

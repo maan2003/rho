@@ -1,5 +1,6 @@
 //! The Rho GPUI client views and native application integration.
 
+pub mod application;
 pub(crate) mod attention;
 pub(crate) mod browser;
 pub(crate) mod chime;
@@ -8,7 +9,6 @@ pub(crate) mod create;
 pub(crate) mod find;
 pub(crate) mod git_approval;
 pub mod home;
-pub mod links;
 pub mod minibuffer;
 pub mod note_view;
 pub(crate) mod overlay;

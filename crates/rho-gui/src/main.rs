@@ -263,11 +263,17 @@ fn run() -> Result<()> {
         let stdout = std::io::stdout();
         return rho_journal::dump(&client_state_dir, kind.as_deref(), stdout.lock());
     }
-    if let Some(link) = &args.link
-        && rho_gui::links::hand_off(&client_state_dir, link)
-    {
-        return Ok(());
-    }
+    // The name before the database: a second rho-gui hands its link (or, with
+    // none, asks to be brought forward) to the one that runs, and one that is
+    // starting already gets what is asked of it meanwhile.
+    let application = match rho_gui::application::claim(args.link.clone()) {
+        Ok(rho_gui::application::Claim::Ours(service)) => Some(service),
+        Ok(rho_gui::application::Claim::HandedOff) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(%error, "no {} on the session bus; links from elsewhere cannot reach this rho-gui", rho_gui::application::NAME);
+            None
+        }
+    };
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -421,15 +427,16 @@ fn run() -> Result<()> {
                     return;
                 }
             };
-            let open = move |link: String, cx: &mut App| {
-                let _ = window.update(cx, |workspace, window, cx| {
-                    workspace.prompt_link_name(link, window, cx);
-                });
-            };
-            if let Some(link) = link {
-                open(link, cx);
+            match application {
+                Some(service) => rho_gui::application::serve(service, window, cx),
+                None => {
+                    if let Some(link) = link {
+                        let _ = window.update(cx, |workspace, window, cx| {
+                            workspace.prompt_link_name(link, window, cx);
+                        });
+                    }
+                }
             }
-            rho_gui::links::listen(&client_state_dir, open, cx);
         });
 
     Ok(())

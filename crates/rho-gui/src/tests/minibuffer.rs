@@ -150,3 +150,51 @@ fn a_cancellable_prompt_runs_its_cancel_handler_on_escape(cx: &mut TestAppContex
         "Escape closes the external interaction exactly once"
     );
 }
+
+/// Links from outside wait their turn: a second one that comes while the
+/// first is being named is asked about once that prompt closes, rather than
+/// putting the first away unseen.
+#[gpui::test]
+fn a_link_that_comes_while_another_is_named_waits_for_it(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let link = |seed: u8| {
+        let id = iroh::SecretKey::from([seed; 32]).public();
+        (
+            format!("rho://{id}?key={}", "ab".repeat(32)),
+            id.fmt_short().to_string(),
+        )
+    };
+    let ((first, first_id), (second, second_id)) = (link(1), link(2));
+    let prompt = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, _| {
+                workspace.minibuffer.as_ref().map(|m| m.prompt().to_owned())
+            })
+            .unwrap()
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prompt_link_name(first, window, cx);
+            workspace.prompt_link_name(second, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        prompt(cx),
+        Some(format!("name host {first_id}:")),
+        "the first is asked first"
+    );
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    assert_eq!(
+        prompt(cx),
+        Some(format!("name host {second_id}:")),
+        "dropping the first asks about the second"
+    );
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    assert_eq!(prompt(cx), None, "and then nothing waits");
+}
