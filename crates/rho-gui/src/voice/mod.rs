@@ -1,10 +1,11 @@
-//! The voice session: whether the desk is listening, on whose agent host, and
+//! The voice session: whether the desk is listening, to which agent, and
 //! whether the microphone is open.
 //!
-//! Voice is one session for the whole client and it belongs to a host —
-//! the agent host does the listening, so the session dies when that agent host
-//! goes. It also survives its own failures: a session the user asked for
-//! is started again when its task ends unexpectedly, which is why wanting
+//! Voice is one session for the whole client and it belongs to one agent,
+//! the one whose thread the user started it from, and so to that agent's
+//! host — the agent host does the listening, so the session dies when that
+//! agent host goes. It also survives its own failures: a session the user asked
+//! for is started again when its task ends unexpectedly, which is why wanting
 //! a session and having one are two different facts here.
 //!
 //! The task itself is spawned by the host, because it reports back into the
@@ -14,6 +15,7 @@
 pub(crate) mod rtc;
 
 use rho_agent_hosts::HostId;
+use rho_agent_types::AgentId;
 
 /// A session that is actually running.
 struct Running {
@@ -36,8 +38,9 @@ pub(crate) struct Voice {
     /// A session that ends on its own is started again; one the user ended
     /// is not.
     wanted: bool,
-    /// The agent host running it. The session is torn down with that host.
-    host: Option<HostId>,
+    /// The agent the user talks to, and the agent host running the session.
+    /// The session is torn down with that host.
+    target: Option<(HostId, AgentId)>,
 }
 
 impl Voice {
@@ -51,15 +54,16 @@ impl Voice {
         self.wanted
     }
 
-    /// The agent host the session is on, if there is one.
-    pub(crate) fn host(&self) -> Option<HostId> {
-        self.host
+    /// The agent the session talks to and the agent host it is on, if
+    /// there is one.
+    pub(crate) fn target(&self) -> Option<(HostId, AgentId)> {
+        self.target
     }
 
     /// Whether voice is running on this host, so a host going away knows
     /// whether it is taking the session with it.
     pub(crate) fn is_on(&self, host: HostId) -> bool {
-        self.host == Some(host)
+        self.target.is_some_and(|(on, _)| on == host)
     }
 
     /// Whether the microphone is closed.
@@ -83,11 +87,11 @@ impl Voice {
         self.muted = false;
     }
 
-    /// The user has asked for a session on `host`. Recorded before the
-    /// session exists, and kept if it fails to start: which agent host voice
-    /// belongs to is the ask, not the outcome.
-    pub(crate) fn wants_host(&mut self, host: HostId) {
-        self.host = Some(host);
+    /// The user has asked for a session with `agent` on `host`. Recorded
+    /// before the session exists, and kept if it fails to start: which agent
+    /// voice belongs to is the ask, not the outcome.
+    pub(crate) fn wants(&mut self, host: HostId, agent: AgentId) {
+        self.target = Some((host, agent));
         self.wanted = true;
     }
 

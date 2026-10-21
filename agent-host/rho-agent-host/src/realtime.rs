@@ -1,16 +1,23 @@
 //! Host-owned OpenAI realtime signaling and sideband.
 //!
 //! The GUI owns only WebRTC media. Provider control events and commands stay
-//! on the agent host's authenticated sideband connection. No agent stands
-//! behind the voice session yet: a delegation is answered with that fact so the
-//! model never promises work.
+//! on the agent host's authenticated sideband connection. The session belongs
+//! to one agent: the live model starts with that agent's thread, hands each
+//! request to it as a user message, and hears back what the agent sends the
+//! user (see [`thread`]).
+
+mod thread;
 
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::log::AgentEventPos;
+use rho_agent_types::{AgentId, ContentPart};
+use rho_agents_client::protocol::{AgentCommand, UserMessage};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
-    ContextChannel, ProviderEvent, Sideband, SidebandConfig, call_id_from_location,
+    ContextChannel, ProviderEvent, Sideband, SidebandConfig, TranscriptState, call_id_from_location,
 };
 use rho_rpc::protocol::{read_frame, write_frame};
 use rho_rtc::protocol::{Opened, RealtimeClientFrame, RealtimeServerFrame};
@@ -19,8 +26,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Services;
 
-const NO_BACKEND_REPLY: &str =
-    "No agent is attached to the voice session in this build, so that cannot be done by voice yet.";
+/// The live model's instructions, adapted from the ChatGPT app's voice
+/// prompt. The thread's startup context is appended.
+const INSTRUCTIONS: &str = include_str!("realtime/voice.md");
+/// How far back in the agent's log the startup context looks for turns.
+const CONTEXT_SCAN_BACK: u64 = 2_000;
 const MAX_SDP_BYTES: usize = 256 * 1024;
 const SIGNALING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CALL_URL: &str =
@@ -31,6 +41,7 @@ pub(crate) async fn serve<R, W>(
     mut reader: R,
     mut writer: W,
     offer_sdp: String,
+    agent_id: AgentId,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -50,12 +61,13 @@ where
         }
     };
     let opened = async {
+        let instructions = instructions(&services, agent_id)?;
         let auth = services.inference.auth().await?;
         let credential = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
             .context("join realtime OAuth resolver")??;
         validate_sdp(&offer_sdp, "offer")?;
-        create_call(credential, offer_sdp).await
+        create_call(credential, offer_sdp, instructions).await
     }
     .await;
     let opened = match opened {
@@ -102,6 +114,13 @@ where
 
     write_frame(&mut writer, &RealtimeServerFrame::SidebandReady).await?;
 
+    // Replies are what the agent writes from here on.
+    let mut feed = rho_agent::journal::feed(services.pool.db());
+    let mut cursor = next_pos(&services, agent_id);
+    // The request the agent's messages answer: the latest one, until the
+    // agent completes it.
+    let mut active: Option<String> = None;
+    let mut transcript = TranscriptState::default();
     let result: anyhow::Result<()> = async {
         loop {
             tokio::select! {
@@ -110,14 +129,63 @@ where
                     Ok(RealtimeClientFrame::Close) | Err(_) => break,
                 }
             }
+            appended = feed.recv() => {
+                match appended {
+                    Ok(appended) if appended.agent_id != agent_id => continue,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+                let head = next_pos(&services, agent_id);
+                let events = {
+                    let read = services.pool.db().read();
+                    (cursor..head)
+                        .filter_map(|pos| read.agent_event(agent_id, AgentEventPos { pos }))
+                        .collect::<Vec<_>>()
+                };
+                cursor = head;
+                for event in &events {
+                    let (Some(id), Some((channel, text, complete))) =
+                        (active.as_deref(), thread::reply(event))
+                    else {
+                        continue;
+                    };
+                    sideband.append_delegation(id, channel, &text).await?;
+                    if complete {
+                        active = None;
+                    }
+                }
+            }
             event = sideband.next_event() => {
                 match event {
-                    Ok(Some(ProviderEvent::DelegationCreated { id, .. })) => {
-                        sideband
-                            .append_delegation(&id, ContextChannel::Speakable, NO_BACKEND_REPLY)
-                            .await?;
+                    Ok(Some(ProviderEvent::DelegationCreated { id, text })) => {
+                        let message = thread::delegation(&text, &transcript.take_snapshot());
+                        let delivered = crate::agents::handle_agent_command(
+                            &services,
+                            AgentCommand::Send {
+                                agent_id,
+                                messages: vec![UserMessage {
+                                    id: rho_agent::entry::MessageId::new().0,
+                                    content: vec![ContentPart::Text { text: message }],
+                                }],
+                            },
+                        )
+                        .await;
+                        match delivered {
+                            Ok(()) => active = Some(id),
+                            Err(error) => {
+                                sideband
+                                    .append_delegation(
+                                        &id,
+                                        ContextChannel::Speakable,
+                                        &format!("[COMPLETE] The request did not reach the agent: {error:#}"),
+                                    )
+                                    .await?;
+                            }
+                        }
                     }
-                    Ok(Some(ProviderEvent::TranscriptDelta { .. } | ProviderEvent::TranscriptDone { .. })) => {}
+                    Ok(Some(event @ (ProviderEvent::TranscriptDelta { .. } | ProviderEvent::TranscriptDone { .. }))) => {
+                        transcript.apply(&event);
+                    }
                     Ok(Some(ProviderEvent::Error(error))) => {
                         write_frame(&mut writer, &RealtimeServerFrame::Error(error)).await?;
                         break;
@@ -157,12 +225,42 @@ where
     result
 }
 
+/// The live model's instructions with the agent's thread appended.
+fn instructions(services: &Services, agent_id: AgentId) -> anyhow::Result<String> {
+    let read = services.pool.db().read();
+    let head = read
+        .try_get_agent(agent_id)
+        .context("voice is attached to an agent this host does not have")?;
+    let end = head.next.pos;
+    let said = (end.saturating_sub(CONTEXT_SCAN_BACK)..end)
+        .filter_map(|pos| read.agent_event(agent_id, AgentEventPos { pos }))
+        .filter_map(|event| thread::Said::of(&event));
+    Ok(match thread::startup_context(said) {
+        Some(context) => format!("{INSTRUCTIONS}\n{context}"),
+        None => INSTRUCTIONS.to_owned(),
+    })
+}
+
+/// Where the agent's next log row will land.
+fn next_pos(services: &Services, agent_id: AgentId) -> u64 {
+    services
+        .pool
+        .db()
+        .read()
+        .try_get_agent(agent_id)
+        .map_or(0, |head| head.next.pos)
+}
+
 struct OpenedCall {
     answer_sdp: String,
     sideband: SidebandConfig,
 }
 
-async fn create_call(credential: ResolvedOAuth, offer_sdp: String) -> anyhow::Result<OpenedCall> {
+async fn create_call(
+    credential: ResolvedOAuth,
+    offer_sdp: String,
+    instructions: String,
+) -> anyhow::Result<OpenedCall> {
     let account_id = credential
         .account_id
         .context("realtime requires a ChatGPT account id")?;
@@ -175,11 +273,7 @@ async fn create_call(credential: ResolvedOAuth, offer_sdp: String) -> anyhow::Re
         sdp: offer_sdp,
         session: CreateCallSession {
             model: RealtimeModel::GptLive11Codex,
-            instructions: "You are Rho's voice assistant. Be concise, natural, warm, and \
-                 interruption-friendly. No agent is attached to this session, so when a \
-                 request needs work done in the user's repositories or services, say plainly \
-                 that voice cannot do that yet."
-                .to_owned(),
+            instructions,
             audio: SessionAudio {
                 output: AudioOutput { voice: Voice::Cove },
             },

@@ -14690,6 +14690,7 @@ dependencies = [
  "bytes",
  "futures",
  "libwebrtc",
+ "rho-agent-types",
  "rho-rpc",
  "rho-rtc",
  "rodio",

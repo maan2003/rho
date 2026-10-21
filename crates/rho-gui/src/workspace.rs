@@ -2369,16 +2369,28 @@ impl Workspace {
             self.notice_on(None, message, StyleClass::SystemInfo, cx);
             return;
         }
+        // Voice talks to the agent the user is looking at.
+        let Some(agent_id) = self.selection.selected_agent() else {
+            self.notice_on(
+                None,
+                "voice: open an agent thread first",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let Some(host) = self.host_of(agent_id) else {
+            self.notice_on(
+                None,
+                "voice: this agent's host is unknown",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
         self.voice.unmute();
-        // Voice follows what the user is looking at: start on the selected
-        // agent's agent host.
-        let host = self
-            .selection
-            .selected_agent()
-            .and_then(|agent_id| self.host_of(agent_id))
-            .filter(|host| self.hosts.is_online(*host))
-            .or_else(|| self.hosts.primary());
-        self.start_voice(host, cx);
+        self.voice.wants(host, agent_id);
+        self.start_voice(cx);
     }
 
     pub(crate) fn cmd_end_voice(&mut self, cx: &mut Context<Self>) {
@@ -2391,26 +2403,19 @@ impl Workspace {
         }
     }
 
-    fn start_voice(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
+    fn start_voice(&mut self, cx: &mut Context<Self>) {
         if self.voice.running() {
             return;
         }
-        let Some(host) = host.or(self.voice.host()).or_else(|| self.hosts.primary()) else {
-            self.notice_on(
-                None,
-                "voice: no agent host attached",
-                StyleClass::SystemInfo,
-                cx,
-            );
+        let Some((host, agent_id)) = self.voice.target() else {
             return;
         };
-        self.voice.wants_host(host);
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
-        let task = crate::voice::rtc::start(&connection.link(), stop_rx, input_muted_rx);
+        let task = crate::voice::rtc::start(&connection.link(), agent_id, stop_rx, input_muted_rx);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
@@ -2430,9 +2435,12 @@ impl Workspace {
                     Err(error) => format!("voice failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                let host = this.voice.host().filter(|host| this.hosts.is_online(*host));
-                if host.is_some() && this.voice.wanted() {
-                    this.start_voice(host, cx);
+                let online = this
+                    .voice
+                    .target()
+                    .is_some_and(|(host, _)| this.hosts.is_online(host));
+                if online && this.voice.wanted() {
+                    this.start_voice(cx);
                 }
             });
         });

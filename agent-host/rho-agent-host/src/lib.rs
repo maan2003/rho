@@ -1355,8 +1355,11 @@ where
             agents::serve_terminals(services, open.unpack()?, reader, writer).await
         }
         Protocol::Voice => {
-            let rho_rtc::protocol::Open { offer_sdp } = open.unpack()?;
-            realtime::serve(services, reader, writer, offer_sdp).await
+            let rho_rtc::protocol::Open {
+                offer_sdp,
+                agent_id,
+            } = open.unpack()?;
+            realtime::serve(services, reader, writer, offer_sdp, agent_id).await
         }
         Protocol::Workspace => anyhow::bail!("the workspace file protocol is no longer served"),
     }

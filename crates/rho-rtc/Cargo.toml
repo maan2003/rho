@@ -20,6 +20,7 @@ client = [
 
 [dependencies]
 bytes.workspace = true
+rho-agent-types.workspace = true
 rho-rpc.workspace = true
 senax-encoder.workspace = true
 
