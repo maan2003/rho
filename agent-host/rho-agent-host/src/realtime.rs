@@ -174,7 +174,7 @@ async fn create_call(credential: ResolvedOAuth, offer_sdp: String) -> anyhow::Re
     let body = CreateCallRequest {
         sdp: offer_sdp,
         session: CreateCallSession {
-            model: RealtimeModel::GptLive1Codex,
+            model: RealtimeModel::GptLive11Codex,
             instructions: "You are Rho's voice assistant. Be concise, natural, warm, and \
                  interruption-friendly. No agent is attached to this session, so when a \
                  request needs work done in the user's repositories or services, say plainly \
@@ -273,8 +273,8 @@ struct CreateCallSession {
 
 #[derive(Serialize)]
 enum RealtimeModel {
-    #[serde(rename = "gpt-live-1-codex")]
-    GptLive1Codex,
+    #[serde(rename = "gpt-live-1.1-codex")]
+    GptLive11Codex,
 }
 
 #[derive(Serialize)]
@@ -322,8 +322,8 @@ mod tests {
     #[test]
     fn uses_codex_live_model() {
         assert_eq!(
-            serde_json::to_value(RealtimeModel::GptLive1Codex).unwrap(),
-            "gpt-live-1-codex"
+            serde_json::to_value(RealtimeModel::GptLive11Codex).unwrap(),
+            "gpt-live-1.1-codex"
         );
     }
 }
