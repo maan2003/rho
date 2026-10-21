@@ -2448,12 +2448,19 @@ impl Workspace {
                     .await;
             }
             let _ = this.update(cx, |this, cx| {
-                this.voice.finished();
-                let message = match result {
+                let had_connected = this.voice.finished();
+                let message = match &result {
                     Ok(()) => "voice stopped listening".to_owned(),
-                    Err(error) => format!("voice failed: {error:#}"),
+                    Err(error) => {
+                        tracing::warn!("voice session failed: {error:#}");
+                        format!("voice failed: {error:#}")
+                    }
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                if !had_connected {
+                    this.voice.end();
+                }
+                cx.notify();
                 let online = this
                     .voice
                     .target()
@@ -7542,30 +7549,6 @@ impl Workspace {
                     ))
                 }),
             ))
-            .children(self.voice.shown().and_then(|(agent, shown)| {
-                // Voice talks to a thread that is not in view: say so here,
-                // so an open microphone is never out of sight.
-                let in_view = matches!(
-                    self.active_surface().key,
-                    SurfaceKey::Transcript(viewed) if viewed == agent
-                );
-                (!in_view).then(|| {
-                    let color = match shown {
-                        crate::voice::Shown::Listening => status.error,
-                        crate::voice::Shown::Connecting => status.warning,
-                        crate::voice::Shown::Muted => colors.text_muted,
-                    };
-                    let word = match shown {
-                        crate::voice::Shown::Listening => "● voice",
-                        crate::voice::Shown::Connecting => "voice…",
-                        crate::voice::Shown::Muted => "voice muted",
-                    };
-                    div().text_color(color).child(format!(
-                        "{word} · {}",
-                        self.registry.agent_display_label(agent)
-                    ))
-                })
-            }))
             .children(self.abnormal_connection_text().map(|connection| {
                 div()
                     .id(gpui::LiveOwner::every(
@@ -7581,6 +7564,30 @@ impl Workspace {
                     .size(px(7.))
                     .rounded_full()
                     .bg(status.error)
+            }))
+            .children(self.voice.shown().map(|(agent, shown)| {
+                // Voice is a mode word beside the editor's: three letters,
+                // on every surface, so an open microphone is never out of
+                // sight. Away from its thread it names the agent it hears.
+                let (word, color) = match shown {
+                    crate::voice::Shown::Connecting => ("MIC…", status.warning),
+                    crate::voice::Shown::Listening => ("MIC", status.error),
+                    crate::voice::Shown::Muted => ("MUT", colors.text_muted),
+                };
+                let away = !matches!(
+                    self.active_surface().key,
+                    SurfaceKey::Transcript(viewed) if viewed == agent
+                );
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .children(away.then(|| {
+                        div()
+                            .text_color(colors.text_muted)
+                            .child(self.registry.agent_display_label(agent))
+                    }))
+                    .child(div().text_color(color).child(word))
             }))
             .child(div().text_color(mode_color).child(mode_word(&mode)))
             .into_any_element()
@@ -7801,50 +7808,12 @@ impl Workspace {
                     .h_full()
                     .relative()
                     .overflow_hidden()
-                    .child(self.render_surface(self.active_surface(), cx)),
+                    .child(self.render_surface(self.active_surface())),
             )
             .into_any_element()
     }
 
-    /// The bar under a thread the voice session talks to, in reverse so it
-    /// is plain from across the room that the microphone belongs to this
-    /// thread: where the user would type, they are speaking.
-    fn render_voice_bar(&self, agent_id: AgentId, cx: &App) -> Option<gpui::AnyElement> {
-        let (voice_agent, shown) = self.voice.shown()?;
-        if voice_agent != agent_id {
-            return None;
-        }
-        let colors = cx.theme().colors();
-        let status = cx.theme().status();
-        let (background, label) = match shown {
-            crate::voice::Shown::Connecting => (status.warning, "VOICE  connecting…"),
-            crate::voice::Shown::Listening => (status.error, "● VOICE  listening"),
-            crate::voice::Shown::Muted => (colors.text_muted, "VOICE  muted"),
-        };
-        let hint = match shown {
-            crate::voice::Shown::Muted => "` unmute · SPC i e end",
-            _ => "` mute · SPC i e end",
-        };
-        Some(
-            div()
-                .id("rho-voice-bar")
-                .flex_none()
-                .w_full()
-                .px_2()
-                .py_1()
-                .flex()
-                .flex_row()
-                .justify_between()
-                .bg(background)
-                .text_color(colors.editor_background)
-                .font_weight(gpui::FontWeight::BOLD)
-                .child(label)
-                .child(div().font_weight(gpui::FontWeight::NORMAL).child(hint))
-                .into_any_element(),
-        )
-    }
-
-    fn render_surface(&self, surface: &Surface, cx: &App) -> gpui::AnyElement {
+    fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
         match &surface.view {
             SurfaceView::Draft { editor, .. } => div()
                 .id("rho-surface-draft")
@@ -7886,13 +7855,7 @@ impl Workspace {
                 .key_context("RhoTranscript")
                 .size_full()
                 .overflow_hidden()
-                .flex()
-                .flex_col()
-                .child(div().flex_1().min_h_0().child(editor.clone()))
-                .children(match surface.key {
-                    SurfaceKey::Transcript(agent_id) => self.render_voice_bar(agent_id, cx),
-                    _ => None,
-                })
+                .child(editor.clone())
                 .into_any_element(),
             SurfaceView::File(view) => div()
                 .id("rho-surface-file")

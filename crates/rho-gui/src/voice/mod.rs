@@ -157,8 +157,10 @@ impl Voice {
         self.wanted = false;
     }
 
-    /// The session has ended, however it ended.
-    pub(crate) fn finished(&mut self) {
-        self.running = None;
+    /// The session has ended, however it ended. Answers whether it had
+    /// connected: one that never did fails the same way when started again
+    /// (no microphone, say), so it is not.
+    pub(crate) fn finished(&mut self) -> bool {
+        self.running.take().is_some_and(|it| it.connected)
     }
 }
