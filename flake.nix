@@ -566,6 +566,7 @@
           "rho-workstreams"
           "slack"
           "notion"
+          "proving-changes"
         ];
         rhoBin = pkgs.callPackage ./nix/rho-bin {
           agentBase = mkAgentBase {
