@@ -26,6 +26,11 @@ pub(crate) fn pixel_size((cols, rows): (u16, u16)) -> Size<Pixels> {
 }
 
 impl PlatformDisplay for TtyDisplay {
+    /// A terminal has no refresh rate gpui can pace by.
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn id(&self) -> DisplayId {
         DisplayId::new(0)
     }
@@ -169,6 +174,8 @@ impl WindowInner {
                 require_presentation: false,
                 force_render: self.force_render.replace(false),
                 host_vsync: None,
+                signal_at: None,
+                signal_source: gpui::FrameRequestSource::LocalSchedule,
             });
             self.callbacks.borrow_mut().request_frame = Some(callback);
         }
@@ -229,6 +236,9 @@ impl raw_window_handle::HasDisplayHandle for TtyWindow {
 }
 
 impl PlatformWindow for TtyWindow {
+    /// The window is the terminal, which never moves to another display.
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {}
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.display.bounds()
     }

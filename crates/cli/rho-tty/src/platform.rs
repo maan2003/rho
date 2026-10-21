@@ -210,6 +210,9 @@ pub(crate) fn leave_terminal() {
 const BATCH: Duration = Duration::from_millis(8);
 
 impl Platform for TtyPlatform {
+    /// The one display is the terminal, which never changes.
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {}
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.background.clone()
     }
