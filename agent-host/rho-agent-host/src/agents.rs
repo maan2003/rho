@@ -1,7 +1,7 @@
 //! The agents part of the agent host, and the parts about one agent's workset:
-//! its terminals, shells and workspace files. The agents session carries
-//! the journal, the live tails, new agents and the quota; requests,
-//! terminals, shells and workspace channels are streams of their own.
+//! its terminals and shells. The agents session carries the journal, the
+//! live tails, new agents and the quota; requests, terminals and shells are
+//! streams of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_types::{AgentId, Seq, WorkspaceInfo};
+use rho_agent_types::{AgentId, Seq};
 use rho_agents_client::protocol::{
     AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
     GlobalUsage, NewAgent, Open, QuotaHistory, QuotaUsage, RecordVisualization, Request,
@@ -21,9 +21,7 @@ use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::{
-    NEXT_CONNECTION_ID, Services, open_checkout, prepare_image_content, usage, workspace_channel,
-};
+use crate::{NEXT_CONNECTION_ID, Services, prepare_image_content, usage};
 
 /// Serves one agents stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -126,6 +124,23 @@ where
     }
 }
 
+/// One open agents session, counted in [`Services::sessions`] for as long
+/// as it lives, however the session ends.
+struct Attached(Arc<Services>);
+
+impl Attached {
+    fn new(services: &Arc<Services>) -> Self {
+        services.sessions.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(services))
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.sessions.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// How many journal entries travel in one `ServerFrame::Log` while a
 /// client is catching up. A cold client's first copy is a whole history,
 /// so it goes in pages the connection can interleave.
@@ -149,6 +164,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let _attached = Attached::new(&services);
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerFrame>();
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
@@ -259,7 +275,20 @@ where
                 follow = Some(spawn_log_follow(
                     Arc::clone(&services),
                     outgoing_tx.clone(),
-                    since,
+                    Scope::All { since },
+                ));
+            }
+            ClientFrame::FollowAgents { agent_ids } => {
+                if agent_ids.len() > 256 {
+                    break Err(anyhow::anyhow!("too many followed agents"));
+                }
+                if let Some(previous) = follow.take() {
+                    previous.abort();
+                }
+                follow = Some(spawn_log_follow(
+                    Arc::clone(&services),
+                    outgoing_tx.clone(),
+                    Scope::Agents(agent_ids),
                 ));
             }
             ClientFrame::Focus { agent_ids } => {
@@ -317,22 +346,38 @@ where
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
-    since: Seq,
+    scope: Scope,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Both subscribed before the first read, so nothing that lands
         // during it is lost; the seq drops duplicate rows.
         let statuses = services.pool.watch_statuses().await;
         let mut feed = rho_agent::journal::feed(&services.db);
-        let mut sent = since;
+        let (mut sent, agents) = match scope {
+            Scope::All { since } => (since, None),
+            Scope::Agents(agent_ids) => {
+                let Some(head) = send_history(&services.db, &outgoing_tx, &agent_ids).await else {
+                    return;
+                };
+                (head, Some(agent_ids.into_iter().collect::<HashSet<_>>()))
+            }
+        };
+        let wanted = |agent_id: &AgentId| {
+            agents
+                .as_ref()
+                .is_none_or(|agents| agents.contains(agent_id))
+        };
         loop {
             // Taken before the rows are read: an agent's status arrives
             // after the rows it reflects commit, so they go out first.
             let changed = statuses.take();
-            if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
+            if !send_journal_from(&services.db, &outgoing_tx, &mut sent, &wanted).await {
                 return;
             }
             for (agent_id, status) in changed {
+                if !wanted(&agent_id) {
+                    continue;
+                }
                 let live = rho_agents_client::protocol::transcript::Live::Snapshot {
                     state: status.runtime.clone(),
                     response: status.response.clone(),
@@ -359,17 +404,67 @@ fn spawn_log_follow(
     })
 }
 
+/// What a follow sends: the whole journal from a seq, or a few agents.
+enum Scope {
+    All { since: Seq },
+    Agents(Vec<AgentId>),
+}
+
+/// Each agent's whole history, as `Log` pages stamped with the journal
+/// head read before it. Returns that head, where the follow goes on from,
+/// or `None` when the connection is gone. A row that lands between the
+/// head and the read goes out twice, here and in the follow; the reader
+/// drops a position it already holds.
+async fn send_history(
+    db: &RhoDb,
+    outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
+    agent_ids: &[AgentId],
+) -> Option<Seq> {
+    let head = db.read().journal_head();
+    for &agent_id in agent_ids {
+        let mut from = rho_agent_types::AgentPos(0);
+        // An agent this host does not hold has no history to send.
+        while let Ok(page) =
+            agent_log_page(db, rho_agents_client::protocol::AgentLog { agent_id, from })
+        {
+            let entries = page
+                .rows
+                .into_iter()
+                .map(
+                    |(pos, event)| rho_agents_client::protocol::transcript::LogEntry {
+                        seq: head,
+                        agent_id,
+                        pos,
+                        event,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if !entries.is_empty()
+                && outgoing_tx
+                    .send(rho_agents_client::protocol::ServerFrame::Log { entries })
+                    .is_err()
+            {
+                return None;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            from = next;
+            tokio::task::yield_now().await;
+        }
+    }
+    Some(head)
+}
+
 /// Pages the journal out from after `sent`, moving it as it goes. False
 /// when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
+    wanted: &impl Fn(&AgentId) -> bool,
 ) -> bool {
-    // Each agent's newest visible step as of the rows already paged, so a
-    // request reads its carry back from the log once per agent, not once
-    // per request: that walk is as long as the gap since the last step.
-    let mut carries = HashMap::<AgentId, Option<rho_agent::inference::Carry>>::new();
+    let mut carries = Carries::new();
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
         let Some((last, _, _, _)) = page.last() else {
@@ -378,32 +473,13 @@ async fn send_journal_from(
         *sent = *last;
         let entries = page
             .into_iter()
+            .filter(|(_, agent_id, _, _)| wanted(agent_id))
             .filter_map(|(seq, agent_id, pos, event)| {
-                let mut prior_carry = None;
-                match &event {
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
-                        carry, ..
-                    }) => {
-                        carries.insert(agent_id, Some(carry.clone()));
-                    }
-                    rho_agent::AgentEvent::Rewound { .. } => {
-                        carries.remove(&agent_id);
-                    }
-                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
-                        ..
-                    }) => {
-                        prior_carry = carries
-                            .entry(agent_id)
-                            .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
-                            .as_ref();
-                    }
-                    _ => {}
-                }
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: crate::transcript::strip(&event, prior_carry)?,
+                    event: strip_row(db, &mut carries, agent_id, pos, &event)?,
                 })
             })
             .collect::<Vec<_>>();
@@ -417,6 +493,107 @@ async fn send_journal_from(
         // Catching up must never starve the connection's own traffic.
         tokio::task::yield_now().await;
     }
+}
+
+/// Each agent's newest visible step as of the rows already read, so a
+/// request reads its carry back from the log once per agent, not once per
+/// request: that walk is as long as the gap since the last step.
+type Carries = HashMap<AgentId, Option<rho_agent::inference::Carry>>;
+
+/// A row as clients read it, or `None` for one they never see.
+fn strip_row(
+    db: &RhoDb,
+    carries: &mut Carries,
+    agent_id: AgentId,
+    pos: rho_agent::log::AgentEventPos,
+    event: &rho_agent::AgentEvent<'_>,
+) -> Option<rho_agents_client::protocol::transcript::TranscriptEvent> {
+    let mut prior_carry = None;
+    match event {
+        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { carry, .. }) => {
+            carries.insert(agent_id, Some(carry.clone()));
+        }
+        rho_agent::AgentEvent::Rewound { .. } => {
+            carries.remove(&agent_id);
+        }
+        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent { .. }) => {
+            prior_carry = carries
+                .entry(agent_id)
+                .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
+                .as_ref();
+        }
+        _ => {}
+    }
+    crate::transcript::strip(event, prior_carry)
+}
+
+/// Every agent, by its head and its first and last rows: one read each, and
+/// none of the log between.
+fn agent_directory(db: &RhoDb) -> Vec<rho_agents_client::protocol::DirectoryEntry> {
+    let read = db.read();
+    let mut carries = Carries::new();
+    read.list_agents()
+        .into_iter()
+        .filter_map(|(agent_id, head)| {
+            let first = rho_agent::log::AgentEventPos::new(0);
+            let created = strip_row(
+                db,
+                &mut carries,
+                agent_id,
+                first,
+                &read.agent_event(agent_id, first)?,
+            )?;
+            let last_active = head
+                .next
+                .pos
+                .checked_sub(1)
+                .map(rho_agent::log::AgentEventPos::new)
+                .and_then(|last| {
+                    strip_row(
+                        db,
+                        &mut carries,
+                        agent_id,
+                        last,
+                        &read.agent_event(agent_id, last)?,
+                    )
+                })
+                .map_or(created.at(), |event| event.at());
+            Some(rho_agents_client::protocol::DirectoryEntry {
+                agent_id,
+                created,
+                role: head.config.role,
+                title: head.generated_title,
+                last_active,
+            })
+        })
+        .collect()
+}
+
+/// One page of an agent's rows, stripped as the journal strips them.
+fn agent_log_page(
+    db: &RhoDb,
+    rho_agents_client::protocol::AgentLog { agent_id, from }: rho_agents_client::protocol::AgentLog,
+) -> anyhow::Result<rho_agents_client::protocol::AgentLogPage> {
+    let page = db.read().agent_rows(agent_id, from.into(), LOG_PAGE);
+    anyhow::ensure!(
+        !page.is_empty() || from.0 > 0,
+        "no agent {} on this host",
+        agent_id.encoded()
+    );
+    let next = (page.len() == LOG_PAGE)
+        .then(|| page.last().map(|(pos, _)| pos.next().into()))
+        .flatten();
+    let mut carries = Carries::new();
+    let rows = page
+        .iter()
+        .filter_map(|(pos, event)| {
+            Some((
+                (*pos).into(),
+                strip_row(db, &mut carries, agent_id, *pos, event)?,
+            ))
+        })
+        .collect();
+    Ok(rho_agents_client::protocol::AgentLogPage { rows, next })
 }
 
 /// Answers one call with its handler's reply: the call names the reply's
@@ -466,6 +643,18 @@ where
                 write.set_claude_account(&name);
                 write.commit();
                 claude_accounts(&services.db, &services.claude)
+            })
+            .await
+        }
+        Request::AgentLog(call) => {
+            respond(writer, call, |call| async {
+                agent_log_page(&services.db, call)
+            })
+            .await
+        }
+        Request::AgentDirectory(call) => {
+            respond(writer, call, |_| async {
+                Ok(agent_directory(&services.db))
             })
             .await
         }
@@ -619,9 +808,8 @@ pub(crate) async fn handle_agent_command(
                 .read()
                 .get_agent(agent_id)
                 .place()
-                .workset
-                .clone();
-            services.pool.restart_workset(&workset, true).await?;
+                .workset;
+            services.pool.restart_workset(workset, true).await?;
         }
     }
     Ok(())
@@ -869,165 +1057,6 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-/// Serves a bounded typed file channel rooted in one workspace checkout.
-pub(crate) async fn serve_workspace_channel<R, W>(
-    services: Arc<Services>,
-    mut reader: R,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-) -> anyhow::Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let checkout = match open_checkout(&services, &workspace).await {
-        Ok((_, checkout)) => checkout,
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    let files = match workspace_channel::WorkspaceFiles::open(checkout) {
-        Ok(files) => Arc::new(files),
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    let watcher_setup = match files.start_watcher() {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            let _ = write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: format!("watch workspace: {error:#}"),
-                },
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    write_frame(&mut writer, &Opened::Ready).await?;
-
-    use rho_files::protocol::{WorkspaceClientFrame, WorkspaceServerFrame};
-    let mut changes = watcher_setup.changes;
-    let changes_overflowed = watcher_setup.overflowed;
-    let mut watcher_ready = Some(watcher_setup.ready);
-    // Keep the watcher alive after its asynchronous directory registration
-    // completes. The leading underscore documents that ownership is the only
-    // purpose of this value.
-    let mut _watcher = None;
-    let mut pending_watch_directories = std::collections::BTreeSet::<camino::Utf8PathBuf>::new();
-    loop {
-        tokio::select! {
-            result = async { watcher_ready.as_mut().expect("watcher setup is enabled").await }, if watcher_ready.is_some() => {
-                // Drop the completed JoinHandle before retaining its watcher.
-                watcher_ready.take();
-                match result {
-                    Ok(Ok(watcher)) => {
-                        _watcher = Some(watcher);
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "workspace watcher registration failed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "workspace watcher registration task failed");
-                    }
-                }
-                if let Some(watcher) = _watcher.as_mut() {
-                    for directory in std::mem::take(&mut pending_watch_directories) {
-                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
-                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
-                        }
-                    }
-                }
-                // A watcher cannot report changes made before its directory
-                // registration completed. Treat that window like overflow; the
-                // GUI already reconciles it by reloading open buffers and
-                // scheduling a fresh semantic barrier.
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &WorkspaceServerFrame::Changed {
-                        paths: Vec::new(),
-                        rescan: true,
-                    },
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-            frame = rho_rpc::protocol::read_frame_limited::<_, WorkspaceClientFrame>(
-                &mut reader,
-                rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-            ) => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) if error.chain().any(|cause| {
-                        cause.downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
-                    }) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                let response = match frame {
-                    WorkspaceClientFrame::Open { request_id, path } => {
-                        let result = files.read(path.clone()).await;
-                        WorkspaceServerFrame::Opened { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Reload { request_id, path } => {
-                        let result = files.read(path.clone()).await;
-                        WorkspaceServerFrame::Reloaded { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Save { request_id, path, revision, contents } => {
-                        let result = files.save(path.clone(), Some(revision), contents).await;
-                        WorkspaceServerFrame::Saved { request_id, path, result }
-                    }
-                    WorkspaceClientFrame::Overwrite { request_id, path, contents } => {
-                        let result = files.save(path.clone(), None, contents).await;
-                        WorkspaceServerFrame::Saved { request_id, path, result }
-                    }
-                };
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &response,
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-            Some(first) = changes.recv() => {
-                let (paths, directories, explicit_rescan) =
-                    workspace_channel::drain_changes(first, &mut changes);
-                pending_watch_directories.extend(directories);
-                if let Some(watcher) = _watcher.as_mut() {
-                    for directory in std::mem::take(&mut pending_watch_directories) {
-                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
-                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
-                        }
-                    }
-                }
-                let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
-                let rescan = explicit_rescan || overflowed;
-                rho_rpc::protocol::write_frame_limited(
-                    &mut writer,
-                    &WorkspaceServerFrame::Changed { paths, rescan },
-                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
-                )
-                .await?;
-            }
-        }
-    }
-}
-/// The bodies one raw row carries, for a client that asked by position:
 /// a request's tool results whole, or a response as the transcript draws
 /// it. Rows a rewind hid still answer; the client asked for one it holds.
 fn agent_detail(
@@ -1127,7 +1156,110 @@ mod tests {
     use rho_agents_client::protocol::ServerFrame;
     use rho_agents_client::protocol::transcript::TranscriptEvent;
 
-    use super::{detail_result, send_journal_from};
+    use super::{agent_directory, detail_result, send_history, send_journal_from};
+
+    /// A follow of one agent sends that agent's history at the head, then
+    /// only its new rows, though another agent writes between them.
+    #[tokio::test]
+    async fn a_follow_of_one_agent_sends_its_history_then_only_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let created = AgentEvent::Created {
+            role: Default::default(),
+            binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
+            runtime: rho_agent::log::AgentRuntime::Rho {
+                prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
+            },
+            place: rho_agent_types::Place {
+                workset: Some("0123456789ab".parse().unwrap()),
+                cwd: "/src/rho".into(),
+            },
+            spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
+            spawn_name: None,
+            created_at: UnixMs(0),
+            parent: None,
+        };
+        let said = |text: &str| {
+            AgentEvent::Entry(Entry::Received {
+                at: UnixMs(1),
+                id: rho_agent::entry::MessageId(1),
+                from: rho_agent::entry::Party::Human,
+                body: vec![rho_agent::entry::Block::Text(text.into())],
+            })
+        };
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let followed = write.alloc_agent_id();
+        let other = write.alloc_agent_id();
+        write.append_agent_event(followed, &created);
+        write.append_agent_event(other, &created);
+        write.append_agent_event(other, &said("not this one"));
+        write.append_agent_event(followed, &said("before"));
+        write.commit();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let head = send_history(&db, &tx, &[followed]).await.unwrap();
+        assert_eq!(head, Seq(4));
+        let mut history = Vec::new();
+        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
+            history.extend(entries);
+        }
+        assert!(
+            history
+                .iter()
+                .all(|entry| entry.agent_id == followed && entry.seq == head)
+        );
+        assert_eq!(
+            history.iter().map(|entry| entry.pos.0).collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        let mut write = db.write().await;
+        write.append_agent_event(other, &said("still not"));
+        write.append_agent_event(followed, &said("after"));
+        write.commit();
+        let mut sent = head;
+        assert!(send_journal_from(&db, &tx, &mut sent, &|agent| *agent == followed).await);
+        let mut after = Vec::new();
+        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
+            after.extend(entries);
+        }
+        assert_eq!(sent, Seq(6));
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(
+            (after[0].agent_id, after[0].pos.0, after[0].seq),
+            (followed, 2, Seq(6))
+        );
+        assert!(
+            matches!(&after[0].event, TranscriptEvent::Received { text, .. } if text == "after")
+        );
+
+        let mut write = db.write().await;
+        write.append_agent_event(
+            other,
+            &AgentEvent::Entry(Entry::Received {
+                at: UnixMs(7),
+                id: rho_agent::entry::MessageId(2),
+                from: rho_agent::entry::Party::Human,
+                body: vec![rho_agent::entry::Block::Text("late".into())],
+            }),
+        );
+        write.commit();
+        let directory = agent_directory(&db);
+        assert_eq!(
+            directory
+                .iter()
+                .map(|entry| (entry.agent_id, entry.last_active))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            [(followed, UnixMs(1)), (other, UnixMs(7))].into(),
+            "each agent by its last row"
+        );
+        assert!(
+            directory
+                .iter()
+                .all(|entry| matches!(entry.created, TranscriptEvent::Created { .. }))
+        );
+    }
 
     #[tokio::test]
     async fn a_request_after_a_rewind_reports_the_step_still_standing() {
@@ -1169,9 +1301,8 @@ mod tests {
                     prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
                 },
                 place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+                    workset: Some("0123456789ab".parse().unwrap()),
                     cwd: "/src/rho".into(),
-                    origin: None,
                 },
                 spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
                 spawn_name: None,
@@ -1193,7 +1324,7 @@ mod tests {
         write.commit();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
+        assert!(send_journal_from(&db, &tx, &mut Seq(0), &|_| true).await);
         let mut reported = Vec::new();
         while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
             for entry in entries {

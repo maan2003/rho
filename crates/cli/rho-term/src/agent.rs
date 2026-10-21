@@ -1,0 +1,107 @@
+//! One agent as this CLI follows it: its rows folded into a transcript,
+//! the host's live tail on top.
+
+use std::collections::HashMap;
+
+use rho_agent_types::{AgentId, AgentPos};
+pub use rho_agents_client::find::resolve;
+use rho_agents_client::protocol::transcript::{Live, LogEntry, TranscriptEvent};
+use rho_agents_client::state::UiAgentState;
+use rho_agents_client::store::{AgentStore, FrameSummary};
+use rho_agents_client::{AgentIdentity, HostId, MirroredAgent, TranscriptFold};
+
+pub struct Followed {
+    pub agent_id: AgentId,
+    fold: TranscriptFold,
+    store: AgentStore,
+}
+
+impl Followed {
+    pub fn new(agent_id: AgentId) -> Self {
+        Self {
+            agent_id,
+            fold: TranscriptFold::default(),
+            store: AgentStore::default(),
+        }
+    }
+
+    /// Folds this agent's rows out of a run of the journal. Returns what
+    /// moved, if anything did.
+    pub fn tell(&mut self, entries: &[LogEntry]) -> Option<FrameSummary> {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.agent_id == self.agent_id)
+        {
+            self.fold.tell(entry.pos, &entry.event);
+        }
+        self.settle()
+    }
+
+    /// Folds a run of this agent's own rows, oldest first.
+    pub fn tell_rows(&mut self, rows: &[(AgentPos, TranscriptEvent)]) -> Option<FrameSummary> {
+        for (pos, event) in rows {
+            self.fold.tell(*pos, event);
+        }
+        self.settle()
+    }
+
+    fn settle(&mut self) -> Option<FrameSummary> {
+        let delta = self.fold.delta()?;
+        Some(self.store.apply_fold_delta(self.agent_id, delta))
+    }
+
+    pub fn live(&mut self, live: Live) -> FrameSummary {
+        self.store.apply_live(self.agent_id, live)
+    }
+
+    pub fn state(&self) -> Option<&UiAgentState> {
+        self.store.get(&self.agent_id)
+    }
+}
+
+/// Every agent the journal has named so far, from its `Created` row: for
+/// finding the one to attach to, and for naming the ones it talks to.
+#[derive(Default)]
+pub struct Directory {
+    agents: HashMap<AgentId, AgentIdentity>,
+}
+
+impl Directory {
+    pub fn tell(&mut self, entries: &[LogEntry]) {
+        for entry in entries {
+            self.tell_one(entry.agent_id, &entry.event);
+        }
+    }
+
+    pub fn tell_one(&mut self, agent_id: AgentId, event: &TranscriptEvent) {
+        if let Some(agent) = MirroredAgent::new(HostId(0), agent_id, event) {
+            self.agents.insert(agent_id, agent.identity);
+        }
+    }
+
+    pub fn get(&self, agent_id: AgentId) -> Option<&AgentIdentity> {
+        self.agents.get(&agent_id)
+    }
+
+    /// Every agent's label, for a screen that names them before it asks.
+    pub fn labels(&self) -> HashMap<AgentId, String> {
+        self.agents.keys().map(|&id| (id, self.label(id))).collect()
+    }
+
+    /// How a message names another agent: its handle, cut short.
+    pub fn label(&self, agent_id: AgentId) -> String {
+        short_handle(
+            self.agents
+                .get(&agent_id)
+                .map_or("agent", |identity| identity.role.handle_prefix()),
+            agent_id,
+        )
+    }
+}
+
+/// `eng-k3f9a1`: enough of the id to tell agents apart on one host and to
+/// attach with.
+pub fn short_handle(prefix: &str, agent_id: AgentId) -> String {
+    let encoded = agent_id.encoded();
+    format!("{prefix}-{}", &encoded[..encoded.len().min(6)])
+}

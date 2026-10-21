@@ -8,9 +8,9 @@
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, HostPath, Hosts};
-use rho_agent_types::{AgentRole, EngineerIntelligence, WorkspaceInfo};
+use rho_agent_types::{AgentRole, EngineerIntelligence, Place};
 
-use crate::protocol::{JoinTarget, StartMode};
+use crate::protocol::StartMode;
 
 /// The user-facing name for selecting the first available conventional base.
 pub const DEFAULT_START: &str = "auto";
@@ -26,15 +26,17 @@ pub enum StartFieldMode {
     NewOn,
     /// The same directory as the target agent.
     Join,
+    /// The workdir itself, in place: no clone, and no target.
+    Here,
 }
 
 /// What the agents map says about the label in the start field: which host
-/// that agent is on, and the workspace it works in. Both are the map's to
+/// that agent is on, and the place it works in. Both are the map's to
 /// answer, so the caller looks them up and hands them in.
 #[derive(Clone, Debug, Default)]
 pub struct StartBase {
     pub host: Option<HostId>,
-    pub workspace: Option<WorkspaceInfo>,
+    pub place: Option<Place>,
 }
 
 /// Whether text names a repository to clone rather than a place on a
@@ -106,6 +108,12 @@ pub fn parse_start(
                 .to_owned()
         })
     };
+    // Here starts in the workdir alone: whatever the start field names is
+    // not where it works.
+    let base = match mode {
+        StartFieldMode::Here => StartBase::default(),
+        StartFieldMode::NewOn | StartFieldMode::Join => base,
+    };
     let base_host = base.host;
     if let Some(selected) = selected_host {
         if let Some(workdir) = &workdir
@@ -138,8 +146,7 @@ pub fn parse_start(
             .or_else(|| hosts.primary())
             .ok_or_else(|| "not connected to an agent host".to_owned())?,
     };
-    let workspace = base.workspace;
-    let start = match (mode, target, workspace) {
+    let start = match (mode, target, base.place) {
         (StartFieldMode::NewOn, "", _) => {
             return Err(
                 "pick a base: a git revision like `origin/main` or an agent label".to_owned(),
@@ -147,27 +154,13 @@ pub fn parse_start(
         }
         // An agent's change lives in its own clone, which a fresh clone
         // cannot see: work with it by joining it.
-        (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workset(_))) => {
+        (StartFieldMode::NewOn, _, Some(_)) => {
             return Err(format!(
                 "`{target}` is an agent: Shift-Tab to Join mode to work in its directory, \
                  or base on a git revision like `origin/main`"
             ));
         }
-        // An agent in the user's checkout works on the user's own change.
-        (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-            StartMode::NewOn {
-                repo,
-                revset: "@".to_owned(),
-            }
-        }
         (StartFieldMode::NewOn, _, None) => {
-            if target.eq_ignore_ascii_case("user") {
-                return Err(
-                    "`user` is a join target; base on a git revision like `origin/main`, \
-                     or Shift-Tab to Join mode"
-                        .to_owned(),
-                );
-            }
             if target
                 .strip_prefix('@')
                 .is_some_and(|label| label.starts_with('a'))
@@ -184,20 +177,15 @@ pub fn parse_start(
                 .to_owned(),
             }
         }
-        (StartFieldMode::Join, _, Some(workspace)) => {
-            StartMode::Join(JoinTarget::Workspace(workspace))
-        }
+        (StartFieldMode::Join, _, Some(place)) => StartMode::Join(place),
         (StartFieldMode::Join, target, None) => {
-            if target.is_empty() || target.eq_ignore_ascii_case("user") {
-                StartMode::Join(JoinTarget::User {
-                    repo: require_workdir()?.path,
-                })
-            } else {
-                return Err(format!(
-                    "join target must be `user` or an agent label, not `{target}`"
-                ));
-            }
+            return Err(format!(
+                "join target must be an agent label, not `{target}`"
+            ));
         }
+        (StartFieldMode::Here, _, _) => StartMode::Here {
+            cwd: require_workdir()?.path,
+        },
     };
     Ok((host, start))
 }
@@ -284,11 +272,41 @@ mod tests {
             None,
             StartBase {
                 host: Some(HostId(1)),
-                workspace: None,
+                place: None,
             },
         )
         .expect_err("two hosts cannot both be right");
         assert!(refusal.contains("an agent cannot start from a base on another host"));
+    }
+
+    /// In place works in the workdir, on the workdir's host: whatever the
+    /// start field still names, even an agent on another host, is not
+    /// where it starts.
+    #[test]
+    fn in_place_starts_in_the_workdir_whatever_the_start_field_says() {
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
+        let (host, start) = parse_start(
+            &hosts,
+            StartFieldMode::Here,
+            "eng-1234",
+            Some(HostPath {
+                host: HostId(2),
+                path: Utf8PathBuf::from("/src/notes"),
+            }),
+            None,
+            StartBase {
+                host: Some(HostId(1)),
+                place: None,
+            },
+        )
+        .expect("a workdir is all in place needs");
+        assert_eq!(host, HostId(2));
+        assert_eq!(
+            start,
+            StartMode::Here {
+                cwd: Utf8PathBuf::from("/src/notes")
+            }
+        );
     }
 
     /// The default start is a name, not a revision; what goes on the wire is

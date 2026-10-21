@@ -219,7 +219,7 @@ dependencies = [
  "rustix 1.1.5",
  "rustix-openpty",
  "serde",
- "signal-hook",
+ "signal-hook 0.4.4",
  "unicode-width 0.2.2",
  "vte",
  "windows-sys 0.59.0",
@@ -3359,6 +3359,21 @@ name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
+name = "crossterm"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
+dependencies = [
+ "bitflags 2.13.2",
+ "document-features",
+ "mio",
+ "parking_lot",
+ "rustix 1.1.5",
+ "signal-hook 0.3.18",
+ "signal-hook-mio",
+]
 
 [[package]]
 name = "crunchy"
@@ -13767,7 +13782,6 @@ dependencies = [
  "json-stream",
  "libc",
  "moq-net",
- "notify",
  "notion-server",
  "octo-server",
  "prefix-id",
@@ -13784,7 +13798,6 @@ dependencies = [
  "rho-desktop-media",
  "rho-desktop-proto",
  "rho-fake-model",
- "rho-files",
  "rho-fs-view",
  "rho-image",
  "rho-inference",
@@ -13803,7 +13816,6 @@ dependencies = [
  "senax-encoder",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "slack-server",
  "tempfile",
  "tikv-jemalloc-ctl",
@@ -14227,6 +14239,7 @@ dependencies = [
  "camino",
  "dirs 7.0.0",
  "libc",
+ "rho-agent-types",
  "rho-git",
  "senax-encoder",
  "serde_json",
@@ -14300,8 +14313,10 @@ dependencies = [
  "rho-rtc",
  "rho-shell-view",
  "rho-slack",
+ "rho-term",
  "rho-terminal",
  "rho-transcript",
+ "rho-tty",
  "rho-window",
  "rodio",
  "rust-embed",
@@ -14558,6 +14573,7 @@ dependencies = [
  "bytes",
  "futures",
  "libwebrtc",
+ "rho-agent-types",
  "rho-rpc",
  "rho-rtc",
  "rodio",
@@ -14641,6 +14657,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-term"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "clap",
+ "json-stream",
+ "prefix-id",
+ "rand 0.10.3",
+ "rho-agent-hosts",
+ "rho-agent-types",
+ "rho-agents-client",
+ "rho-rpc",
+ "rho-term-ui",
+ "serde_json",
+ "tokio",
+ "vt100",
+]
+
+[[package]]
+name = "rho-term-ui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "vt100",
+]
+
+[[package]]
 name = "rho-terminal"
 version = "0.1.0"
 dependencies = [
@@ -14690,6 +14736,51 @@ dependencies = [
  "text",
  "theme",
  "theme_settings",
+]
+
+[[package]]
+name = "rho-tty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "crossterm",
+ "futures",
+ "gpui",
+ "parking_lot",
+ "raw-window-handle",
+ "unicode-width 0.2.2",
+ "uuid",
+]
+
+[[package]]
+name = "rho-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "camino",
+ "clap",
+ "editor",
+ "futures",
+ "gpui",
+ "language",
+ "project",
+ "rand 0.10.3",
+ "release_channel",
+ "rho-agent-types",
+ "rho-agents-client",
+ "rho-agents-view",
+ "rho-term",
+ "rho-tty",
+ "semver",
+ "settings",
+ "text",
+ "theme",
+ "theme_settings",
+ "tokio",
+ "vim",
+ "vim_mode_setting",
 ]
 
 [[package]]
@@ -15114,9 +15205,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -15864,12 +15955,33 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
 dependencies = [
  "libc",
  "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -16858,7 +16970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -18615,6 +18727,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.2",
+ "vte",
+]
+
+[[package]]
 name = "vte"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19253,18 +19376,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

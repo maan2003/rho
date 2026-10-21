@@ -5,6 +5,8 @@ Exceptions:
 
 - agent-host/rho-ci contains vendored selfci source code and is licensed under
   MPL-2.0.
+- crates/cli/rho-term-ui is derived from dpc/tau's terminal crates
+  (https://github.com/dpc/tau) and is licensed under MPL-2.0.
 - crates/rho-gui is licensed under GPL-3.0-or-later because it links
   GPL-licensed Zed-derived dependencies. Its license text is in
   crates/rho-gui/LICENSE.

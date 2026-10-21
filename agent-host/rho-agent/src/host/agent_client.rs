@@ -45,12 +45,6 @@ impl AgentClient {
         agent: AgentId,
     ) -> anyhow::Result<Self> {
         let place = pool.db().read().get_agent(agent).config.place;
-        let (_, cwd) = pool.open_workset(&place).await?;
-        anyhow::ensure!(
-            cwd.is_dir(),
-            "working directory does not exist: {}",
-            place.cwd
-        );
         let process = pool.process(&place).await?;
         Self::connect(pool, agent, process, Some(place.cwd)).await
     }
@@ -283,6 +277,12 @@ impl AgentClient {
         .await
     }
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
+        use crate::log::AgentRoleSessionProfile as _;
+        anyhow::ensure!(
+            self.head().place().workset.is_some()
+                || role.session_profile().claude_model().is_none(),
+            "a Claude agent needs a workset"
+        );
         self.request(Control::Role(role)).await
     }
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {

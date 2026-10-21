@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GitProvided, GitProviderFrame, GitTransportPolicy,
     GuiTelemetryUpload, IrohApprove, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet,
-    PlatformStatus, Request, Snapshot,
+    PlatformStatus, Request, ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -197,6 +197,12 @@ where
             })
             .await
         }
+        Request::ShutdownIfIdle(call) => {
+            respond(writer, call, |ShutdownIfIdle| async move {
+                shutdown_if_idle(services).await
+            })
+            .await
+        }
         Request::IrohApprove(call) => {
             respond(writer, call, |IrohApprove { code }| async move {
                 let auth = iroh()?;
@@ -241,6 +247,23 @@ where
             .await
         }
     }
+}
+
+/// Stops the host unless a client is attached or an agent is working.
+async fn shutdown_if_idle(services: &Services) -> anyhow::Result<()> {
+    let sessions = services.sessions.load(std::sync::atomic::Ordering::SeqCst);
+    anyhow::ensure!(sessions == 0, "{sessions} client(s) still attached");
+    let working = services.pool.working().await;
+    if !working.is_empty() {
+        let names = working
+            .iter()
+            .map(|agent_id| services.pool.agent_handle(*agent_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("agents still working: {names}");
+    }
+    services.stop.notify_one();
+    Ok(())
 }
 
 fn install_platform_secrets(

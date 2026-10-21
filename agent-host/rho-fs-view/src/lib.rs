@@ -25,38 +25,61 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{MAX_BOUNDED_READ, WorksetLayout, read_file_bounded};
+pub use ns::{Layout, MAX_BOUNDED_READ, WorksetMount, read_file_bounded};
+pub use rho_agent_types::WorksetId;
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
-/// The agent's base userland: a nix `buildEnv` fixed at build
-/// time whose `bin/` is the agent's PATH, after the agent's own nix
-/// profile. It holds Rho's patched git, the CA bundle and the pinned
-/// flake registry.
-pub const AGENT_BASE: &str = env!(
-    "RHO_AGENT_BASE",
-    "RHO_AGENT_BASE must name the agent base (flake.nix agentBase) at build time"
-);
+/// A piece of Rho's runtime: the store path the build named, else, for the
+/// relocatable `rho-bin` archive built with none, the one installed at
+/// `../share/rho/<name>` beside this executable, as
+/// `rho_context_config` finds its bundled skills.
+pub fn bundled(name: &str, built: Option<&'static str>) -> Option<PathBuf> {
+    if let Some(path) = built {
+        return Some(path.into());
+    }
+    let exe = std::env::current_exe().ok()?;
+    std::fs::canonicalize(exe.parent()?.parent()?.join("share/rho").join(name)).ok()
+}
+
+/// The agent's base userland: a nix `buildEnv` (flake.nix agentBase) whose
+/// `bin/` is the agent's PATH, after the agent's own nix profile. It holds
+/// Rho's patched git, the CA bundle and the pinned flake registry.
+pub fn agent_base() -> &'static Path {
+    static BASE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        bundled("agent-base", option_env!("RHO_AGENT_BASE")).expect(
+            "no agent base: build with RHO_AGENT_BASE (flake.nix agentBase) \
+             or install one at ../share/rho/agent-base",
+        )
+    });
+    &BASE
+}
 
 /// Rho's patched git (`nix/patches/git-rho-store.patch`): the keeper
 /// fetches with it, the agent host clones with it, and agents see it as `git`.
 /// Without the store socket in its environment it is plain git.
-pub const GIT: &str = concat!(env!("RHO_AGENT_BASE"), "/bin/git");
+pub fn git() -> PathBuf {
+    agent_base().join("bin/git")
+}
 
 /// Rho's find fork (`flake.nix` findutils), which goes ahead of a dev
 /// shell's own `PATH` so its deny roots hold there too.
-pub const FIND_BIN: Option<&str> = option_env!("RHO_FIND_BIN");
+pub fn find_bin() -> Option<PathBuf> {
+    bundled("find-bin", option_env!("RHO_FIND_BIN"))
+}
 
 /// The shared-cache cargo fork (`flake.nix` cargoSharedCache), used ahead of
 /// a dev shell's cargo.
-pub const SHARED_CARGO_BIN: Option<&str> = option_env!("RHO_SHARED_CARGO_BIN");
+pub fn shared_cargo_bin() -> Option<PathBuf> {
+    bundled("shared-cargo-bin", option_env!("RHO_SHARED_CARGO_BIN"))
+}
 
 /// The directory Rho's git really lives in; the workset PATH
 /// is the user's own with this first.
 pub fn git_dir() -> PathBuf {
-    std::fs::canonicalize(GIT)
+    std::fs::canonicalize(git())
         .ok()
         .and_then(|git| git.parent().map(Path::to_owned))
-        .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
+        .unwrap_or_else(|| agent_base().join("bin"))
 }
 
 /// `rho-devshell-builder`, which runs programs in flake dev shells:
@@ -184,9 +207,7 @@ pub struct Worksets {
     /// `GIT_AUTHOR_*` and `GIT_COMMITTER_*` for agents: the user's, from
     /// their environment or their git config. Empty when unknown.
     identity: Vec<(OsString, OsString)>,
-    worksets: Mutex<BTreeMap<String, Weak<WorksetInner>>>,
-    /// Host directories adopted as worksets for this process's lifetime.
-    adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
+    worksets: Mutex<BTreeMap<WorksetId, Weak<WorksetInner>>>,
 }
 
 /// The running keeper and its socket.
@@ -240,7 +261,6 @@ impl Worksets {
             store,
             identity,
             worksets: Mutex::new(BTreeMap::new()),
-            adopted: std::sync::Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -272,26 +292,6 @@ impl Worksets {
 
     pub fn path_overrides(&self) -> &PathOverrides {
         &self.path_overrides
-    }
-
-    /// Reconstitutes a host-owned workset in a worker without allocating
-    /// another identity or directory. The agent host has already resolved its
-    /// root.
-    pub fn attach(self: &Arc<Self>, id: String, root: Utf8PathBuf) -> anyhow::Result<Workset> {
-        anyhow::ensure!(
-            root.is_absolute() && root.is_dir(),
-            "invalid workset root: {root}"
-        );
-        self.adopted
-            .lock()
-            .expect("poison")
-            .insert(id.clone(), root.clone());
-        Ok(Workset(Arc::new(WorksetInner {
-            id,
-            root,
-            owner: Arc::downgrade(self),
-            operation_lock: Mutex::new(()),
-        })))
     }
 
     pub fn root(&self) -> &Utf8Path {
@@ -333,45 +333,15 @@ impl Worksets {
         }
     }
 
-    /// Adopts an existing host directory as a workset for the lifetime of
-    /// this process: for evaluations, renderings and tests that work on a
-    /// directory the user already has. Nothing is written to the state root.
-    pub fn adopt(self: &Arc<Self>, directory: impl AsRef<Path>) -> anyhow::Result<Workset> {
-        self.adopt_as(format!("adopted-{}", random_workset_id()?), directory)
-    }
-
-    /// Adopt under an id recorded earlier, so agents placed in it resume.
-    pub fn adopt_as(
-        self: &Arc<Self>,
-        id: String,
-        directory: impl AsRef<Path>,
-    ) -> anyhow::Result<Workset> {
-        let root = absolute_utf8(directory.as_ref())?;
-        anyhow::ensure!(root.is_dir(), "not a directory: {root}");
-        self.adopted
-            .lock()
-            .unwrap()
-            .insert(id.clone(), root.clone());
-        let workset = Arc::new(WorksetInner {
-            id: id.clone(),
-            root,
-            owner: Arc::downgrade(self),
-            operation_lock: Mutex::new(()),
-        });
-        // Not memoized weakly: an adopted workset is looked up by its
-        // recorded directory instead.
-        Ok(Workset(workset))
-    }
-
     pub async fn create(self: &Arc<Self>) -> anyhow::Result<Workset> {
         for _ in 0..64 {
             let workset_id = random_workset_id()?;
-            let base = self.root.join("worksets").join(&workset_id);
+            let base = self.root.join("worksets").join(workset_id.to_string());
             match std::fs::create_dir(&base) {
                 Ok(()) => {
                     std::fs::create_dir(base.join("src"))
                         .with_context(|| format!("create workset {workset_id}"))?;
-                    return self.open_workset(&workset_id).await;
+                    return self.open_workset(workset_id).await;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error).context("allocate workset directory"),
@@ -380,38 +350,40 @@ impl Worksets {
         anyhow::bail!("could not allocate a unique workset id")
     }
 
-    pub async fn open_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<Workset> {
-        validate_name(workset_id)?;
+    pub async fn open_workset(self: &Arc<Self>, workset_id: WorksetId) -> anyhow::Result<Workset> {
         let mut worksets = self.worksets.lock().await;
-        if let Some(workset) = worksets.get(workset_id).and_then(Weak::upgrade) {
+        if let Some(workset) = worksets.get(&workset_id).and_then(Weak::upgrade) {
             return Ok(Workset(workset));
         }
-        let adopted = self.adopted.lock().unwrap().get(workset_id).cloned();
-        let root = match adopted {
-            Some(root) => root,
-            None => self.root.join("worksets").join(workset_id).join("src"),
-        };
+        let root = self
+            .root
+            .join("worksets")
+            .join(workset_id.to_string())
+            .join("src");
         anyhow::ensure!(root.is_dir(), "workset does not exist: {workset_id}");
         let workset = Arc::new(WorksetInner {
-            id: workset_id.to_owned(),
+            id: workset_id,
             root,
             owner: Arc::downgrade(self),
             operation_lock: Mutex::new(()),
         });
-        worksets.insert(workset_id.to_owned(), Arc::downgrade(&workset));
+        worksets.insert(workset_id, Arc::downgrade(&workset));
         Ok(Workset(workset))
     }
 
     /// Ids of every workset directory under the root.
-    pub fn list(&self) -> anyhow::Result<Vec<String>> {
+    pub fn list(&self) -> anyhow::Result<Vec<WorksetId>> {
         let dir = self.root.join("worksets");
         let mut ids = Vec::new();
         for entry in std::fs::read_dir(&dir).with_context(|| format!("list worksets in {dir}"))? {
             let entry = entry?;
             if entry.path().join("src").is_dir()
-                && let Ok(name) = entry.file_name().into_string()
+                && let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
             {
-                ids.push(name);
+                ids.push(id);
             }
         }
         ids.sort();
@@ -420,7 +392,7 @@ impl Worksets {
 
     /// A host-side command with the user's environment and the store
     /// wired in.
-    pub fn command(&self, program: &str) -> tokio::process::Command {
+    pub fn command(&self, program: impl AsRef<OsStr>) -> tokio::process::Command {
         let mut command = base_command(program, &self.environment, &self.path_overrides);
         command.envs(self.store_environment());
         command
@@ -428,7 +400,7 @@ impl Worksets {
 }
 
 fn base_command(
-    program: &str,
+    program: impl AsRef<OsStr>,
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
 ) -> tokio::process::Command {
@@ -456,7 +428,7 @@ async fn git_identity(
         let value = match environment.get(author) {
             Some(value) => Some(value.to_owned()),
             None => {
-                let mut command = base_command(GIT, environment, path_overrides);
+                let mut command = base_command(git(), environment, path_overrides);
                 command.args(["config", "--get", key]);
                 match command.output().await {
                     Ok(output) if output.status.success() => {
@@ -510,7 +482,7 @@ fn start_store(
 ) -> anyhow::Result<StoreHandle> {
     let keeper = MirrorStore::new(
         root.join("stores").into_std_path_buf(),
-        PathBuf::from(GIT),
+        git(),
         keeper_environment(environment, path_overrides),
         refresh,
     );
@@ -538,15 +510,15 @@ pub struct Workset(Arc<WorksetInner>);
 
 #[derive(Debug)]
 struct WorksetInner {
-    id: String,
+    id: WorksetId,
     root: Utf8PathBuf,
     owner: Weak<Worksets>,
     operation_lock: Mutex<()>,
 }
 
 impl Workset {
-    pub fn id(&self) -> &str {
-        &self.0.id
+    pub fn id(&self) -> WorksetId {
+        self.0.id
     }
 
     /// Host path of the directory presented at `/src`.
@@ -561,7 +533,7 @@ impl Workset {
             .owner()?
             .root
             .join("worksets")
-            .join(&self.0.id)
+            .join(self.0.id.to_string())
             .join("state"))
     }
 
@@ -629,7 +601,7 @@ impl Workset {
         let cloned = match owner.store.as_ref().and_then(|store| store.keeper.as_ref()) {
             Some(keeper) => {
                 let mirror = keeper.ensure(remote_url).await?;
-                let git = rho_git::client::Git::new(GIT);
+                let git = rho_git::client::Git::new(git());
                 let url = remote_url.to_owned();
                 let dest = target.clone();
                 tokio::task::spawn_blocking(move || {
@@ -668,13 +640,6 @@ impl Workset {
         }
         names.sort();
         Ok(names)
-    }
-
-    /// Maps a path as the agent sees it (absolute below `/src`, or relative
-    /// to it) onto the host directory, refusing `.` and `..` components.
-    pub fn host_path(&self, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
-        let relative = visible_relative(layout::MOUNT_ROOT, visible)?;
-        Ok(self.0.root.join(relative))
     }
 }
 
@@ -750,13 +715,13 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn random_workset_id() -> anyhow::Result<String> {
+fn random_workset_id() -> anyhow::Result<WorksetId> {
     let mut bytes = [0_u8; 6];
     let read = unsafe { libc::syscall(libc::SYS_getrandom, bytes.as_mut_ptr(), bytes.len(), 0) };
     if read != bytes.len() as libc::c_long {
         return Err(std::io::Error::last_os_error()).context("generate workset id");
     }
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(WorksetId(bytes))
 }
 
 fn absolute_utf8(path: &Path) -> anyhow::Result<Utf8PathBuf> {

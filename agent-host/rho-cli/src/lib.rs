@@ -26,6 +26,9 @@ mod wayland;
 mod tests;
 
 pub fn main() -> Result<()> {
+    if let Some(args) = chat_args(std::env::args().skip(1)) {
+        return exec_chat(args);
+    }
     let args = Args::parse_or_exit(std::env::args().skip(1));
     // Ordinary utilities die quietly on a closed pipe. Evaluations own live
     // agent work: BrokenPipe must unwind through cancellation, not kill us
@@ -90,6 +93,29 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
         Protocol::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
         Protocol::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
+}
+
+/// The arguments for `rho-term`, when the command line asks for a chat:
+/// nothing at all, `attach`, or flags that are the chat's (`--role`). The
+/// host's own commands and `--help` stay here.
+fn chat_args(args: impl Iterator<Item = String>) -> Option<Vec<String>> {
+    let args = args.collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        None | Some("attach") => Some(args),
+        Some("-h" | "--help" | "-V" | "--version") => None,
+        Some(flag) if flag.starts_with('-') => Some(args),
+        Some(_) => None,
+    }
+}
+
+/// Becomes `rho-term`, the ad hoc chat with an agent. It is its own binary,
+/// installed beside this one, because it is a client of the host: it holds
+/// the transcript fold that crates here must not reach.
+fn exec_chat(args: Vec<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let program = std::env::current_exe()?.with_file_name("rho-term");
+    let error = std::process::Command::new(&program).args(args).exec();
+    Err(error).with_context(|| format!("run {}", program.display()))
 }
 
 /// Approves a pending iroh enrollment over the agent host's Unix socket, so
@@ -175,7 +201,11 @@ enum Command {
 }
 
 #[derive(Parser)]
-#[command(name = "rho")]
+#[command(
+    name = "rho",
+    after_help = "Run `rho` alone to start an agent here and chat with it, \
+                  or `rho attach <agent>` to open one that exists (see `rho-term --help`)."
+)]
 struct Cli {
     #[command(subcommand)]
     command: CliCommand,

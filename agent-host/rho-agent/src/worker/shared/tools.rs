@@ -46,7 +46,10 @@ pub(crate) fn host_tools(
         .with_env("RHO_AGENT_ID", role.full_handle(agent_id))
         .with_env(
             "RIPGREP_CONFIG_PATH",
-            format!("{}/etc/ripgreprc", rho_fs_view::AGENT_BASE),
+            rho_fs_view::agent_base()
+                .join("etc/ripgreprc")
+                .display()
+                .to_string(),
         );
     let agent_host = host.map(|host| {
         let host = Arc::clone(host);
@@ -153,6 +156,24 @@ impl Agents {
 #[pyclass(extends = Agents, frozen, module = "__main__")]
 struct EngineerAgents;
 
+/// A spawned agent shares its spawner's view, so the spawner checks the
+/// directory there: the host cannot see it.
+fn spawn_workdir(workdir: Option<String>) -> PyResult<Option<String>> {
+    let Some(workdir) = workdir else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(&workdir);
+    if !path.is_absolute() {
+        return Err(PyValueError::new_err("workdir must be an absolute path"));
+    }
+    if !path.is_dir() {
+        return Err(PyValueError::new_err(format!(
+            "workdir is not a directory: {workdir}"
+        )));
+    }
+    Ok(Some(workdir))
+}
+
 #[pymethods]
 impl EngineerAgents {
     /// Start an Engineer on `prompt`, optionally in `workdir`.
@@ -167,7 +188,7 @@ impl EngineerAgents {
         let call = AgentCall::SpawnEngineer(SpawnArgs {
             task_name,
             prompt,
-            workdir,
+            workdir: spawn_workdir(workdir)?,
         });
         ask(
             py,
@@ -190,7 +211,7 @@ impl EngineerAgents {
         let call = AgentCall::SpawnUserOwnedEngineer(SpawnArgs {
             task_name,
             prompt,
-            workdir,
+            workdir: spawn_workdir(workdir)?,
         });
         ask(
             py,
@@ -305,5 +326,22 @@ impl Papercut {
     fn __call__(&self, py: Python<'_>, description: String) -> PyResult<Py<PyAny>> {
         let call = SharedCall::Papercut(PapercutArgs { description });
         ask(py, &self.agent_host, "papercut", call)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn spawn_workdir_must_exist_in_the_spawners_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().to_str().unwrap().to_owned();
+        let missing = dir.path().join("missing").to_str().unwrap().to_owned();
+        assert_eq!(super::spawn_workdir(None).unwrap(), None);
+        assert_eq!(
+            super::spawn_workdir(Some(existing.clone())).unwrap(),
+            Some(existing)
+        );
+        assert!(super::spawn_workdir(Some(missing)).is_err());
+        assert!(super::spawn_workdir(Some("relative".into())).is_err());
     }
 }

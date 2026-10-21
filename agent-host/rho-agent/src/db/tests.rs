@@ -447,9 +447,8 @@ fn event_text(event: &AgentEvent<'_>) -> String {
 /// Tests exercise agent records only; any workspace info will do.
 pub(crate) fn test_workspace() -> Place {
     Place {
-        workset: "0123456789ab".into(),
+        workset: Some("0123456789ab".parse().unwrap()),
         cwd: "/src/rho".into(),
-        origin: None,
     }
 }
 

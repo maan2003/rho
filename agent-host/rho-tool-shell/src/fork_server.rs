@@ -344,7 +344,7 @@ mod tests {
     use super::*;
 
     fn command() -> tokio::process::Command {
-        tokio::process::Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE))
+        tokio::process::Command::new(rho_fs_view::agent_base().join("bin/rho-bash"))
     }
 
     async fn run(server: &Arc<Server>, cwd: &Path, source: &str) -> (ExitStatus, Vec<u8>, Vec<u8>) {

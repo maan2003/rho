@@ -39,6 +39,24 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
+    /// A scratch session instead of the desk: it opens on a draft of a new
+    /// agent that works in this directory, holds only the agents it opens,
+    /// keeps them in memory, and writes nothing to disk. Without
+    /// `--attach` it attaches the agent host on this machine, and starts it
+    /// when it is not running.
+    #[arg(long)]
+    scratch: bool,
+
+    /// A scratch session that opens on this agent, `eng-k3f9` or the start
+    /// of its id, rather than on a draft.
+    #[arg(long, value_name = "HANDLE")]
+    agent: Option<String>,
+
+    /// Draw in this terminal instead of a window. The log goes to
+    /// `rho-gui.log` in the state directory.
+    #[arg(long)]
+    tty: bool,
+
     /// Write a Dial9 CPU/frame trace on exit (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
@@ -223,17 +241,44 @@ fn main() {
         }
         return;
     }
-    init_tracing();
-    if let Err(error) = run() {
+    let args = Args::parse();
+    // The terminal is the screen: whatever writes to stderr, tracing or a
+    // library such as ALSA, goes to the log instead, and the terminal's
+    // own stderr comes back for the last word.
+    let terminal_stderr = args.tty.then(stderr_to_log).flatten();
+    init_tracing(args.tty);
+    let result = run(args);
+    if let Some(stderr) = terminal_stderr {
+        // SAFETY: both are open descriptors this process owns.
+        unsafe { libc::dup2(stderr, libc::STDERR_FILENO) };
+    }
+    if let Err(error) = result {
         eprintln!("rho-gui: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn init_tracing() {
+/// Points stderr at `rho-gui.log` in the state directory. Returns where
+/// stderr pointed before, or `None` when the log cannot be opened.
+fn stderr_to_log() -> Option<libc::c_int> {
+    use std::os::fd::AsRawFd as _;
+    let dir = default_client_state_dir().ok()?;
+    fs::create_dir_all(&dir).ok()?;
+    let log = fs::File::create(dir.join("rho-gui.log")).ok()?;
+    // SAFETY: plain descriptor calls on descriptors this process owns; the
+    // log stays open as stderr once `log` is dropped.
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        (saved >= 0 && libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO) >= 0).then_some(saved)
+    }
+}
+
+/// To stderr, without colour when stderr is the log.
+fn init_tracing(tty: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(!tty)
         .with_writer(std::io::stderr)
         .try_init()
     {
@@ -247,8 +292,7 @@ fn default_client_state_dir() -> Result<PathBuf> {
     Ok(base.join("rho"))
 }
 
-fn run() -> Result<()> {
-    let args = Args::parse();
+fn run(args: Args) -> Result<()> {
     let client_state_dir = default_client_state_dir()?;
     if let Some(Command::Journal {
         command: JournalCommand::Dump { kind },
@@ -299,8 +343,14 @@ fn run() -> Result<()> {
     // it later. A second rho stops at the door rather than running on with
     // none of its own state. After an unclean stop redb rebuilds its
     // allocator from every page, which is paid here, before the window.
-    let db = rho_db::client::open_shared(&client_state_dir)
-        .context("open the client database; exit the other rho first")?;
+    // The desk, or a scratch session started on this agent or on none.
+    let scratch = (args.scratch || args.agent.is_some()).then(|| args.agent.clone());
+    let db = if scratch.is_some() {
+        rho_db::client::shared_in_memory()
+    } else {
+        rho_db::client::open_shared(&client_state_dir)
+            .context("open the client database; exit the other rho first")?
+    };
     if let Err(error) = rho_journal::init(db.clone(), rho_gui::dealer_policy_snapshot()) {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
@@ -326,88 +376,127 @@ fn run() -> Result<()> {
         tracing::warn!(%error, "passive GUI CPU profiling is unavailable");
     }
 
-    gpui_platform::application()
-        .with_assets(RhoAssets)
-        .run(move |cx: &mut App| {
-            const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-            cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
-                gpui::UserIdleEvent::Idle => {
-                    rho_journal::record(rho_journal::Event::UserIdle {
-                        timeout_s: USER_IDLE_TIMEOUT.as_secs(),
-                    });
-                }
-                gpui::UserIdleEvent::Resumed => {
-                    rho_journal::record(rho_journal::Event::UserResumed);
-                }
-            });
-            let mut profiler = profiler;
-            if let Some(profiler) = &mut profiler {
-                // Window drawing and this application callback share GPUI's
-                // foreground thread.
-                profiler.draw_tid = rho_profiling::current_tid();
-                let checkpoint = Arc::clone(&profiler.checkpoint);
-                let executor = cx.background_executor().clone();
-                cx.background_spawn(async move {
-                    let mut ticks = 0u8;
-                    loop {
-                        executor.timer(Duration::from_secs(5)).await;
-                        checkpoint.collect();
-                        ticks += 1;
-                        // Collect often enough that GPUI's bounded timing
-                        // rings cannot wrap, but keep the full JSON rewrite
-                        // out of the workload's hot path.
-                        if ticks == 6 {
-                            ticks = 0;
-                            checkpoint.spawn_periodic_write();
-                        }
-                    }
-                })
-                .detach();
+    let tty = args.tty;
+    // A scratch session with no host named uses this machine's, and starts
+    // it if it is not running: it stops it on the way out unless something
+    // else still uses it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let started_host = if scratch.is_some() && args.attach.is_empty() {
+        Some(runtime.block_on(rho_term::host::Host::connect_or_start(None))?)
+    } else {
+        None
+    };
+    // Why a scratch session closed: said once the terminal is back.
+    let missing = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let missing_in_app = missing.clone();
+    let application = if tty {
+        rho_tty::application()
+    } else {
+        gpui_platform::application()
+    };
+    application.with_assets(RhoAssets).run(move |cx: &mut App| {
+        const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+        cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
+            gpui::UserIdleEvent::Idle => {
+                rho_journal::record(rho_journal::Event::UserIdle {
+                    timeout_s: USER_IDLE_TIMEOUT.as_secs(),
+                });
             }
-            cx.on_app_quit(move |_| {
-                if let Some(profiler) = profiler.take() {
-                    finish_profiling(profiler);
-                }
-                rho_gui::telemetry::shutdown_passive_cpu_profile();
-                // Before the tokio runtime goes with the app: a host
-                // supervisor still waiting out a reconnect delay would be
-                // polled into the runtime's shutdown and panic there.
-                rho_agent_hosts::connection::close();
-                rho_journal::flush();
-                // Closing rather than flushing: a mirror left open is a
-                // file redb finds unclean, and the next start rebuilds its
-                // allocator from every page to be sure of it.
-                rho_agents_client::cache::close();
-                std::future::ready(())
-            })
-            .detach();
-
-            if let Err(error) = init_app(cx) {
-                eprintln!("rho-gui: {error:#}");
-                cx.quit();
-                return;
-            }
-
-            quit_on_termination_signal(cx);
-
-            rho_browser::init(&client_state_dir, browser_socket.clone(), cx);
-            cx.activate(true);
-
-            // Wayland compositors resolve the launcher icon by matching this
-            // app_id against rho-gui.desktop.
-            let window_options = WindowOptions {
-                app_id: Some("rho-gui".to_owned()),
-                ..Default::default()
-            };
-            if let Err(error) = cx.open_window(window_options, move |window, cx| {
-                cx.new(|cx| Workspace::new(specs.clone(), window, cx))
-            }) {
-                eprintln!("rho-gui: failed to open window: {error:#}");
-                cx.quit();
+            gpui::UserIdleEvent::Resumed => {
+                rho_journal::record(rho_journal::Event::UserResumed);
             }
         });
+        let mut profiler = profiler;
+        if let Some(profiler) = &mut profiler {
+            // Window drawing and this application callback share GPUI's
+            // foreground thread.
+            profiler.draw_tid = rho_profiling::current_tid();
+            let checkpoint = Arc::clone(&profiler.checkpoint);
+            let executor = cx.background_executor().clone();
+            cx.background_spawn(async move {
+                let mut ticks = 0u8;
+                loop {
+                    executor.timer(Duration::from_secs(5)).await;
+                    checkpoint.collect();
+                    ticks += 1;
+                    // Collect often enough that GPUI's bounded timing
+                    // rings cannot wrap, but keep the full JSON rewrite
+                    // out of the workload's hot path.
+                    if ticks == 6 {
+                        ticks = 0;
+                        checkpoint.spawn_periodic_write();
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.on_app_quit(move |_| {
+            if let Some(profiler) = profiler.take() {
+                finish_profiling(profiler);
+            }
+            rho_gui::telemetry::shutdown_passive_cpu_profile();
+            // Before the tokio runtime goes with the app: a host
+            // supervisor still waiting out a reconnect delay would be
+            // polled into the runtime's shutdown and panic there.
+            rho_agent_hosts::connection::close();
+            rho_journal::flush();
+            // Closing rather than flushing: a mirror left open is a
+            // file redb finds unclean, and the next start rebuilds its
+            // allocator from every page to be sure of it.
+            rho_agents_client::cache::close();
+            std::future::ready(())
+        })
+        .detach();
 
-    Ok(())
+        if let Err(error) = init_app(tty, cx) {
+            eprintln!("rho-gui: {error:#}");
+            cx.quit();
+            return;
+        }
+
+        quit_on_termination_signal(cx);
+
+        rho_browser::init(&client_state_dir, browser_socket.clone(), cx);
+        cx.activate(true);
+
+        // Wayland compositors resolve the launcher icon by matching this
+        // app_id against rho-gui.desktop.
+        let window_options = WindowOptions {
+            app_id: Some("rho-gui".to_owned()),
+            ..Default::default()
+        };
+        if let Err(error) = cx.open_window(window_options, move |window, cx| {
+            let missing = missing_in_app.clone();
+            cx.new(|cx| match scratch.clone() {
+                Some(handle) => Workspace::scratch(
+                    specs.clone(),
+                    handle,
+                    move |error, cx| {
+                        *missing.borrow_mut() = Some(error);
+                        cx.quit();
+                    },
+                    window,
+                    cx,
+                ),
+                None => Workspace::new(specs.clone(), window, cx),
+            })
+        }) {
+            eprintln!("rho-gui: failed to open window: {error:#}");
+            cx.quit();
+        }
+    });
+
+    if let Some(host) = started_host
+        && let Some(why) = runtime.block_on(host.leave())
+    {
+        eprintln!("rho-gui: the agent host stays up: {why}");
+    }
+    match missing.take() {
+        Some(error) => anyhow::bail!("{error}"),
+        None => Ok(()),
+    }
 }
 
 fn quit_on_termination_signal(cx: &mut App) {
@@ -820,6 +909,17 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 /// and a first run attaches nothing: `space h` attaches a host, and the
 /// set attached is what the next start finds.
 fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
+    if args.attach.is_empty() && (args.scratch || args.agent.is_some()) {
+        return Ok(vec![HostSpec {
+            name: "local".to_owned(),
+            // Where `Host::connect_or_start` found or started it.
+            target: AttachTarget::Unix(
+                rho_rpc::protocol::RuntimePaths::resolve(None::<PathBuf>)?
+                    .socket()
+                    .to_owned(),
+            ),
+        }]);
+    }
     if args.attach.is_empty() {
         return Ok(rho_agent_hosts::saved::load(db));
     }
@@ -837,7 +937,17 @@ fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
     Ok(specs)
 }
 
-fn init_app(cx: &mut App) -> Result<()> {
+/// A terminal cell is one line of one size: every font is that size, and a
+/// line is that tall.
+const TTY_SETTINGS: &str = r#"{
+  "buffer_font_size": 16,
+  "ui_font_size": 16,
+  "agent_buffer_font_size": 16,
+  "agent_ui_font_size": 16,
+  "buffer_line_height": { "custom": 1.0 }
+}"#;
+
+fn init_app(tty: bool, cx: &mut App) -> Result<()> {
     gpui_tokio::init(cx);
     RhoAssets.load_fonts(cx)?;
     let settings_path = settings_path()?;
@@ -847,6 +957,10 @@ fn init_app(cx: &mut App) -> Result<()> {
         .set_user_settings(&user_settings, cx)
         .result()
         .with_context(|| format!("failed to load settings from {}", settings_path.display()))?;
+    if tty {
+        // The layer merged last, over the user's own.
+        store.set_server_settings(TTY_SETTINGS, cx)?;
+    }
     cx.set_global(store);
     apply_text_rendering_mode(cx);
     cx.observe_global::<SettingsStore>(apply_text_rendering_mode)

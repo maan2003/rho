@@ -4,7 +4,7 @@
 
 The native `Agent` and `ClaudeLoop` are separate concrete runtimes. There is no
 universal runtime trait and Claude Code is not a raw inference provider.
-One workset process contains its agents' runtimes, notebooks, local tools,
+One workset process (or the host process, for agents without a workset) contains its agents' runtimes, notebooks, local tools,
 jobs, provider transports, retained terminals, and interactive shells. The agent host alone owns the shared
 database, account and route policy, naming tasks, workset allocation, pool,
 subscriptions, and UI projection. Each runtime serializes its own controls and
@@ -122,7 +122,9 @@ Commands inherit the process environment, with explicit command overrides and
 per-directory devshell additions. Normal execution inherits the namespace. Claude launcher children alone clone it to install
 private provider overlays; no generic agent namespace or setup thread is needed.
 The namespace exposes the host filesystem, with the workset mounted at `/src`;
-there is no alternate filesystem mode.
+there is no alternate filesystem mode. An agent whose `Place` has no workset
+works in a host directory and runs in the one host process, which builds no
+namespace and so needs no user namespaces. Claude agents need a workset.
 
 Agent retirement requires the runtime's serialized permission and fences new
 admission; coalesced observations are not authority. Activation and retirement

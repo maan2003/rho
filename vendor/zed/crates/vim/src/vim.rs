@@ -631,6 +631,36 @@ pub fn exit_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App
     })
 }
 
+/// Puts an application-owned editor in normal mode, as Escape would, without
+/// relying on focus-chain action routing before the editor has been drawn.
+pub fn enter_normal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let mode = if HelixModeSetting::get_global(cx).0 {
+            Mode::HelixNormal
+        } else {
+            Mode::Normal
+        };
+        vim.switch_mode(mode, false, window, cx);
+        true
+    })
+}
+
+/// Puts an application-owned editor in insert mode, as `i` would, without
+/// relying on focus-chain action routing before the editor has been drawn.
+pub fn enter_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        vim.prepare_for_insert(window, cx);
+        vim.switch_mode(Mode::Insert, false, window, cx);
+        true
+    })
+}
+
 /// Returns whether an application-owned editor is still in a Deal mode.
 pub fn editor_in_deal_mode(editor: &Entity<Editor>, cx: &App) -> bool {
     editor

@@ -1,0 +1,18 @@
+# Inline terminal UI for the `rho` CLI: styled blocks over native
+# scrollback with a multiline prompt. Derived from dpc/tau's
+# tau-term-screen and tau-cli-term-raw crates.
+[package]
+edition.workspace = true
+license = "MPL-2.0"
+name = "rho-term-ui"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+vt100.workspace = true

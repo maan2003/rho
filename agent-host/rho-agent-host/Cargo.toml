@@ -31,7 +31,6 @@ futures.workspace = true
 iroh.workspace = true
 json-stream.workspace = true
 libc.workspace = true
-notify.workspace = true
 octo-server.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
@@ -51,14 +50,12 @@ rho-profiling.workspace = true
 rho-rpc = { workspace = true, features = ["server"] }
 rho-visualizations.workspace = true
 rho-fs-view.workspace = true
-rho-files.workspace = true
 rho-shell-view.workspace = true
 rho-terminal.workspace = true
 rustix = { version = "1", features = ["process"] }
 rustix-openpty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 reqwest.workspace = true
 redb.workspace = true
 tempfile.workspace = true

@@ -17,7 +17,7 @@ use gpui::{
     div,
 };
 use language::{Buffer, BufferEvent, Capability};
-use rho_agent_types::WorkspaceInfo;
+use rho_agent_types::Place;
 use theme::ActiveTheme as _;
 
 use crate::channel::WorkspaceChannel;
@@ -254,7 +254,7 @@ pub struct RemoteProject {
 
 pub fn open_remote_project(
     link: &rho_agent_hosts::Link,
-    workspace: WorkspaceInfo,
+    workspace: Place,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {
     let channel_task = crate::channel::open(link, workspace);

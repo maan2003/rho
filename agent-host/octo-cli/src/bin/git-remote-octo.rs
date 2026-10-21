@@ -271,6 +271,18 @@ struct HttpHelper {
     output: std::io::BufReader<ChildStdout>,
 }
 
+/// The relocatable `rho-bin` archive's patched git-remote-http: in the agent
+/// base installed beside this executable, where `rho_fs_view::bundled`
+/// finds it.
+fn bundled_remote_http() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let helper = exe
+        .parent()?
+        .parent()?
+        .join("share/rho/agent-base/libexec/git-core/git-remote-http");
+    helper.is_file().then_some(helper)
+}
+
 impl HttpHelper {
     fn spawn(remote_name: &str, remote: &Remote) -> Result<Self> {
         let socket = rho_rpc::protocol::RuntimePaths::from_env()?.octo_socket();
@@ -285,6 +297,7 @@ impl HttpHelper {
         let remote_http: PathBuf = std::env::var_os("OCTO_REMOTE_HTTP")
             .map(PathBuf::from)
             .or_else(|| option_env!("OCTO_REMOTE_HTTP").map(PathBuf::from))
+            .or_else(bundled_remote_http)
             .context(
                 "OCTO_REMOTE_HTTP is not set and git-remote-octo was built \
                  without Rho's patched git-remote-http",

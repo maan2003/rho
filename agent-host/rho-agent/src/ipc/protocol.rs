@@ -171,7 +171,7 @@ pub(crate) fn encode(message: &Message<'_>) -> io::Result<bytes::Bytes> {
 #[derive(senax_encoder::Encode, senax_encoder::Decode)]
 pub(crate) struct Startup {
     pub version: u32,
-    pub layout: rho_fs_view::WorksetLayout,
+    pub layout: rho_fs_view::Layout,
     pub claude: rho_claude::accounts::ClaudePaths,
     pub responses_base_url: String,
 }

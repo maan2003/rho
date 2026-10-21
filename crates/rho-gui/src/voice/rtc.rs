@@ -18,19 +18,36 @@ struct RealtimeChannel {
 /// Runs voice against the host until `stop` fires or the session fails.
 pub(crate) fn start(
     link: &rho_agent_hosts::Link,
+    agent_id: rho_agent_types::AgentId,
     stop: tokio::sync::oneshot::Receiver<()>,
     input_muted: tokio::sync::watch::Receiver<bool>,
+    connected: tokio::sync::oneshot::Sender<()>,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
-    link.run(|dialer| run(move |offer_sdp| dial(dialer, offer_sdp), stop, input_muted))
+    link.run(move |dialer| {
+        run(
+            move |offer_sdp| dial(dialer, offer_sdp, agent_id),
+            stop,
+            input_muted,
+            connected,
+        )
+    })
 }
 
 async fn dial(
     dialer: rho_agent_hosts::Dialer,
     offer_sdp: String,
+    agent_id: rho_agent_types::AgentId,
 ) -> anyhow::Result<RealtimeChannel> {
     // Interactive streams outrank the sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
-    write_open(&mut stream, &rho_rtc::protocol::Open { offer_sdp }).await?;
+    write_open(
+        &mut stream,
+        &rho_rtc::protocol::Open {
+            offer_sdp,
+            agent_id,
+        },
+    )
+    .await?;
     let answer_sdp = match read_frame(&mut stream).await? {
         rho_rtc::protocol::Opened::Answer { answer_sdp } => answer_sdp,
         rho_rtc::protocol::Opened::Refused { reason } => anyhow::bail!("{reason}"),
@@ -54,6 +71,7 @@ async fn run<D, F>(
     dial: D,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     mut input_muted: tokio::sync::watch::Receiver<bool>,
+    connected: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()>
 where
     D: FnOnce(String) -> F,
@@ -96,6 +114,7 @@ where
     session.set_input_muted(*input_muted.borrow())?;
     session.start_audio()?;
     tracing::info!("realtime client session established");
+    let _ = connected.send(());
 
     let result: anyhow::Result<()> = async {
         loop {

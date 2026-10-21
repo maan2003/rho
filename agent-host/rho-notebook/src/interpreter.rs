@@ -103,7 +103,18 @@ pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
     KERNEL
         .get_or_try_init(py, || {
             let sys_path = py.import("sys")?.getattr("path")?;
-            sys_path.call_method1("insert", (0, env!("RHO_PYTHON_SITE_PACKAGES")))?;
+            let site_packages = rho_fs_view::bundled(
+                "python-site-packages",
+                option_env!("RHO_PYTHON_SITE_PACKAGES"),
+            )
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "no Python site-packages: build with RHO_PYTHON_SITE_PACKAGES \
+                     or install them at ../share/rho/python-site-packages",
+                )
+            })?;
+            // A str: the import system skips the `pathlib.Path` a PathBuf becomes.
+            sys_path.call_method1("insert", (0, site_packages.to_string_lossy()))?;
             sys_path.call_method1("insert", (0, ""))?;
             PyModule::from_code(
                 py,

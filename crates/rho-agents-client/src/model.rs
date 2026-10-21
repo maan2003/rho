@@ -57,6 +57,10 @@ pub enum ModelMsg {
         machine_seed: u64,
         agent_counter: u64,
     },
+    /// The agent a scratch model was started on, as the host's ids name
+    /// it, or why its handle names none. Each time the host's agents
+    /// stream opens, after [`ModelMsg::Host`].
+    Named(Result<AgentId, String>),
     /// Which provider accounts the host's agents may run on.
     Auth { auth: crate::protocol::AuthState },
     /// An agent was created on the host, by any client or agent, and the
@@ -109,9 +113,9 @@ pub enum ToModel {
 struct HostModel {
     name: String,
     commands: Option<AgentCommands>,
-    /// A `Ready` answered before this client could speak back. The follow
-    /// goes out the moment it can.
-    follow_pending: bool,
+    /// The follow a `Ready` asked for before this client could speak
+    /// back. It goes out the moment it can.
+    follow_pending: Option<ClientFrame>,
     machine_seed: u64,
     seq: Seq,
     /// The journal head `Ready` named. Until `seq` reaches it the main
@@ -128,7 +132,7 @@ impl HostModel {
         Self {
             name,
             commands: None,
-            follow_pending: false,
+            follow_pending: None,
             machine_seed: 0,
             seq: Seq(0),
             head: Seq(0),
@@ -146,7 +150,27 @@ pub struct Model {
     /// The disk copy, read once: hosts are attached one at a time and each
     /// takes the agents filed under its name.
     stored: Option<crate::cache::Loaded>,
+    /// Set for a scratch model: it holds only the agents the window has
+    /// open, reads none of the disk copy, and asks the host for only those
+    /// agents' rows.
+    scratch: Option<Scratch>,
 }
+
+/// What a scratch model holds: the agents the window follows, and the one
+/// it was started on, each read whole from the host when it is opened.
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    /// The handle it was started on, until a host's journal head says
+    /// which agent that is.
+    handle: Option<String>,
+    named: Option<AgentId>,
+    /// What the hosts were last asked for.
+    held: BTreeSet<AgentId>,
+}
+
+/// At most this many agents in a scratch model's follow, as the host
+/// takes them.
+const SCRATCH_HELD: usize = 256;
 
 impl Default for Model {
     fn default() -> Self {
@@ -161,7 +185,37 @@ impl Model {
             agents: BTreeMap::new(),
             followed: BTreeSet::new(),
             stored: None,
+            scratch: None,
         }
+    }
+
+    /// A scratch model ([`Scratch`]), started on the agent `handle` names
+    /// (`eng-k3f9` or the start of its id) or on none.
+    pub fn scratch(handle: Option<String>) -> Self {
+        Self {
+            scratch: Some(Scratch {
+                handle,
+                ..Scratch::default()
+            }),
+            ..Self::new()
+        }
+    }
+
+    /// What a scratch model holds now, kept as what the hosts are asked
+    /// for; `None` for a model of everything.
+    fn scratch_holds(&mut self) -> Option<BTreeSet<AgentId>> {
+        let scratch = self.scratch.as_mut()?;
+        let mut held: BTreeSet<AgentId> =
+            self.followed.iter().copied().chain(scratch.named).collect();
+        if held.len() > SCRATCH_HELD {
+            tracing::warn!(
+                open = held.len(),
+                "a scratch session follows only {SCRATCH_HELD} agents"
+            );
+            held = held.into_iter().take(SCRATCH_HELD).collect();
+        }
+        scratch.held = held.clone();
+        Some(held)
     }
 
     pub fn command(&mut self, command: ModelCommand) -> Vec<ModelEvent> {
@@ -171,13 +225,10 @@ impl Model {
                 let Some(slot) = self.hosts.get_mut(&host) else {
                     return Vec::new();
                 };
-                slot.commands = Some(commands);
-                if std::mem::take(&mut slot.follow_pending) {
-                    slot.commands
-                        .as_ref()
-                        .expect("just set")
-                        .send(ClientFrame::Follow { since: slot.seq });
+                if let Some(follow) = slot.follow_pending.take() {
+                    commands.send(follow);
                 }
+                slot.commands = Some(commands);
                 Vec::new()
             }
             ModelCommand::DetachHost(host) => {
@@ -190,6 +241,21 @@ impl Model {
             }
             ModelCommand::Follow(agents) => {
                 self.followed = agents;
+                let Some(asked) = self.scratch.as_ref().map(|scratch| scratch.held.clone()) else {
+                    return Vec::new();
+                };
+                let held = self.scratch_holds().expect("a scratch model");
+                if held != asked {
+                    let follow = ClientFrame::FollowAgents {
+                        agent_ids: held.into_iter().collect(),
+                    };
+                    for slot in self.hosts.values_mut() {
+                        match &slot.commands {
+                            Some(commands) => commands.send(follow.clone()),
+                            None => slot.follow_pending = Some(follow.clone()),
+                        }
+                    }
+                }
                 Vec::new()
             }
         }
@@ -199,6 +265,10 @@ impl Model {
     /// it: the cursor `Follow` will send, and the agents already folded.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
+        if self.scratch.is_some() {
+            self.hosts.insert(host, slot);
+            return Vec::new();
+        }
         let stored = self.stored.get_or_insert_with(crate::cache::load);
         if let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) {
             slot.machine_seed = cursor.machine_seed;
@@ -242,14 +312,22 @@ impl Model {
                 journal_head,
                 agent_counter,
             } => {
+                // A handle is resolved once, against the first host that
+                // names its agent.
+                let named = self
+                    .scratch
+                    .as_mut()
+                    .and_then(|scratch| match scratch.handle.take() {
+                        Some(handle) => {
+                            let resolved =
+                                crate::find::resolve(&handle, machine_seed, agent_counter);
+                            scratch.named = resolved.as_ref().ok().copied();
+                            Some(resolved)
+                        }
+                        None => scratch.named.map(Ok),
+                    });
                 let mut out = self.ready(host, machine_seed, journal_head);
-                out.push(ModelEvent {
-                    host,
-                    msg: ModelMsg::Host {
-                        machine_seed,
-                        agent_counter,
-                    },
-                });
+                out.extend(self.opened(host, machine_seed, agent_counter, named));
                 out
             }
             AgentFrame::Auth { auth } => vec![ModelEvent {
@@ -289,10 +367,34 @@ impl Model {
         }
     }
 
+    /// What the window hears of an opened stream: whose ids these are,
+    /// then, for a scratch model started on a handle, which agent it names.
+    fn opened(
+        &self,
+        host: HostId,
+        machine_seed: u64,
+        agent_counter: u64,
+        named: Option<Result<AgentId, String>>,
+    ) -> Vec<ModelEvent> {
+        let mut out = vec![ModelEvent {
+            host,
+            msg: ModelMsg::Host {
+                machine_seed,
+                agent_counter,
+            },
+        }];
+        out.extend(named.map(|named| ModelEvent {
+            host,
+            msg: ModelMsg::Named(named),
+        }));
+        out
+    }
+
     /// An agents stream that has opened: how far the host's journal runs,
     /// and whether it is the database this copy counts in. Asks for the
-    /// tail.
+    /// tail, or for `follow` where the model holds only some agents.
     fn ready(&mut self, host: HostId, machine_seed: u64, journal_head: Seq) -> Vec<ModelEvent> {
+        let scratch = self.scratch_holds();
         let slot = self
             .hosts
             .entry(host)
@@ -325,10 +427,18 @@ impl Model {
             started_over,
             "following the host's journal"
         );
-        match &slot.commands {
+        let follow = match scratch {
             // Everything after the newest entry held.
-            Some(commands) => commands.send(ClientFrame::Follow { since: slot.seq }),
-            None => slot.follow_pending = true,
+            None => ClientFrame::Follow { since: slot.seq },
+            // Nothing open yet: nothing of the journal is wanted.
+            Some(held) if held.is_empty() => return out,
+            Some(held) => ClientFrame::FollowAgents {
+                agent_ids: held.into_iter().collect(),
+            },
+        };
+        match &slot.commands {
+            Some(commands) => commands.send(follow),
+            None => slot.follow_pending = Some(follow),
         }
         out
     }
@@ -436,11 +546,22 @@ impl AgentsClient {
     /// task: it must not take its turn behind the frames it feeds. The
     /// receiver is what the window hears.
     pub fn spawn() -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
+        Self::spawn_model(Model::new())
+    }
+
+    /// Starts a scratch model ([`Model::scratch`]).
+    pub fn spawn_scratch(
+        handle: Option<String>,
+    ) -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
+        Self::spawn_model(Model::scratch(handle))
+    }
+
+    fn spawn_model(model: Model) -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
         let (incoming, incoming_rx) = futures_mpsc::unbounded();
         let (changes_tx, changes) = futures_mpsc::unbounded();
         std::thread::Builder::new()
             .name("rho-model".to_owned())
-            .spawn(move || futures::executor::block_on(run(incoming_rx, changes_tx)))
+            .spawn(move || futures::executor::block_on(run(model, incoming_rx, changes_tx)))
             .expect("spawn the model thread");
         (
             Self {
@@ -524,10 +645,10 @@ impl AgentsClient {
 }
 
 async fn run(
+    mut model: Model,
     mut incoming: futures_mpsc::UnboundedReceiver<ToModel>,
     changes: futures_mpsc::UnboundedSender<ModelEvent>,
 ) {
-    let mut model = Model::new();
     while let Some(item) = incoming.next().await {
         let out = match item {
             ToModel::Event(AgentEvent { host, frame }) => model.ingest(host, frame),
@@ -563,9 +684,8 @@ mod tests {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
                 place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+                    workset: Some("0123456789ab".parse().unwrap()),
                     cwd: "/src/repo".into(),
-                    origin: None,
                 },
                 spawned_by: SpawnedBy::Direct,
                 spawn_name: None,
@@ -617,6 +737,144 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    fn head(machine_seed: u64, agent_counter: u64) -> AgentFrame {
+        AgentFrame::JournalHead {
+            machine_seed,
+            journal_head: Seq(40),
+            agent_counter,
+        }
+    }
+
+    fn sent(frames: &mut futures_mpsc::UnboundedReceiver<ClientFrame>) -> Vec<ClientFrame> {
+        std::iter::from_fn(|| frames.try_recv().ok()).collect()
+    }
+
+    fn recorded(model: &mut Model) -> futures_mpsc::UnboundedReceiver<ClientFrame> {
+        let (commands, frames) = AgentCommands::recorded();
+        model.command(ModelCommand::HostCommands {
+            host: HOST,
+            commands,
+        });
+        frames
+    }
+
+    fn follow_agents(agents: &[AgentId]) -> ClientFrame {
+        ClientFrame::FollowAgents {
+            agent_ids: agents.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_scratch_model_started_on_a_handle_asks_for_that_agent_and_says_which() {
+        let mut model = Model::scratch(Some(format!("eng-{}", &agent(2).encoded()[..4])));
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
+        let out = model.ingest(HOST, head(0, 3));
+        assert_eq!(
+            sent(&mut frames),
+            [follow_agents(&[agent(2)])],
+            "never the whole journal"
+        );
+        assert!(matches!(out[..], [
+            ModelEvent { msg: ModelMsg::Host { .. }, .. },
+            ModelEvent { msg: ModelMsg::Named(Ok(id)), .. },
+        ] if id == agent(2)));
+    }
+
+    #[test]
+    fn a_scratch_model_dialled_late_still_asks_for_its_agent() {
+        let mut model = Model::scratch(Some(agent(1).encoded()[..5].to_owned()));
+        model.attach(HOST, "local".to_owned());
+        model.ingest(HOST, head(0, 3));
+        let mut frames = recorded(&mut model);
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1)])]);
+    }
+
+    #[test]
+    fn a_handle_that_names_no_agent_follows_nothing_and_says_why() {
+        let mut model = Model::scratch(Some("eng-zzzz".to_owned()));
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
+        let out = model.ingest(HOST, head(0, 3));
+        assert!(sent(&mut frames).is_empty());
+        assert!(matches!(&out[..], [
+            ModelEvent { msg: ModelMsg::Host { .. }, .. },
+            ModelEvent { msg: ModelMsg::Named(Err(error)), .. },
+        ] if error.contains("eng-zzzz")));
+    }
+
+    #[test]
+    fn a_scratch_model_asks_for_what_the_window_opens_and_only_on_change() {
+        let mut model = Model::scratch(None);
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
+        let out = model.ingest(HOST, head(0, 3));
+        assert!(sent(&mut frames).is_empty(), "nothing open, nothing asked");
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event.msg, ModelMsg::Named(_)))
+        );
+
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3), agent(1)])));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1), agent(3)])]);
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1), agent(3)])));
+        assert!(
+            sent(&mut frames).is_empty(),
+            "the same set is not asked again"
+        );
+
+        // A stream opened again asks for the same agents.
+        model.ingest(HOST, head(0, 3));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(1), agent(3)])]);
+
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3)])));
+        assert_eq!(sent(&mut frames), [follow_agents(&[agent(3)])]);
+    }
+
+    #[test]
+    fn a_scratch_model_keeps_the_agent_it_was_started_on_when_its_view_closes() {
+        let mut model = Model::scratch(Some(agent(2).encoded()[..5].to_owned()));
+        model.attach(HOST, "local".to_owned());
+        let mut frames = recorded(&mut model);
+        model.ingest(HOST, head(0, 3));
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
+        model.command(ModelCommand::Follow(BTreeSet::new()));
+        assert_eq!(
+            sent(&mut frames),
+            [
+                follow_agents(&[agent(2)]),
+                follow_agents(&[agent(1), agent(2)]),
+                follow_agents(&[agent(2)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_model_of_everything_says_nothing_when_the_window_follows() {
+        let mut model = Model::new();
+        model.hosts.insert(HOST, HostModel::new("local".to_owned()));
+        let mut frames = recorded(&mut model);
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(3)])));
+        assert!(sent(&mut frames).is_empty());
+    }
+
+    #[test]
+    fn a_model_of_everything_follows_the_journal_from_its_cursor() {
+        let mut model = Model::new();
+        model.hosts.insert(HOST, HostModel::new("local".to_owned()));
+        let (commands, mut frames) = AgentCommands::recorded();
+        model.command(ModelCommand::HostCommands {
+            host: HOST,
+            commands,
+        });
+        let out = model.ingest(HOST, head(0, 3));
+        assert_eq!(sent(&mut frames), [ClientFrame::Follow { since: Seq(0) }]);
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event.msg, ModelMsg::Named(_)))
+        );
     }
 
     #[test]

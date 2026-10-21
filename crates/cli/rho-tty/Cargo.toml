@@ -1,0 +1,22 @@
+# A gpui platform drawn into a terminal: the window is the terminal grid,
+# each glyph is one cell, and the Scene gpui already builds is painted as
+# characters and colours. Rho's buffers (the Zed editor, vim mode, the
+# transcript) then run in a terminal unchanged.
+[package]
+edition.workspace = true
+license = "MPL-2.0"
+name = "rho-tty"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+gpui = { path = "../../../vendor/zed/crates/gpui", default-features = false }
+parking_lot = "0.12"
+raw-window-handle = "0.6"
+unicode-width = "0.2"
+uuid = "1"

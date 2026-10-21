@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -33,7 +33,7 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
 use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
-use rho_agents_client::protocol::{AgentCommand, NewAgent};
+use rho_agents_client::protocol::{AgentCommand, AgentDirectory, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
@@ -228,7 +228,24 @@ pub(crate) enum SnoozeUnit {
     Weeks,
 }
 
+/// A scratch session's own state: the agent it was started on, until it is
+/// opened. It opens once the agent's history has arrived, since a
+/// transcript opened before that has nothing to show.
+struct Scratch {
+    /// Agents asked for before their rows were here: the one it was
+    /// started on, a draft just made, one picked from the directory.
+    /// Followed, and opened again when their history arrives.
+    to_open: BTreeSet<AgentId>,
+    /// Told why, when the host has no agent the handle names: a session
+    /// started on an agent has nothing to show without it.
+    missing: Missing,
+}
+
+type Missing = Box<dyn Fn(String, &mut App)>;
+
 pub struct Workspace {
+    /// Set in a scratch session ([`Workspace::scratch`]).
+    scratch: Option<Scratch>,
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
     /// them, and the agent host's live tail. Also the focus set every host
@@ -252,14 +269,8 @@ pub struct Workspace {
     /// by host — the same repository path on two machines is two projects.
     /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
-    remote_projects: HashMap<
-        (HostId, rho_agent_types::WorkspaceInfo),
-        gpui::WeakEntity<rho_files::RemoteProjectState>,
-    >,
-    /// Accumulated change summaries for materialized but hidden views; they
-    /// render once, with the merged summary, when next selected.
-    pending_syncs: HashMap<AgentId, FrameSummary>,
-    activity_pending_syncs: HashMap<AgentId, FrameSummary>,
+    remote_projects:
+        HashMap<(HostId, rho_agent_types::Place), gpui::WeakEntity<rho_files::RemoteProjectState>>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
     pub(crate) agents_client: rho_agents_client::model::AgentsClient,
@@ -550,7 +561,11 @@ impl Workspace {
     /// The agents whose rows the model hands up: the transcripts this
     /// client has open. Everything else it says as a digest.
     pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
-        self.transcripts.open_agents()
+        let mut followed = self.transcripts.open_agents();
+        if let Some(scratch) = &self.scratch {
+            followed.extend(&scratch.to_open);
+        }
+        followed
     }
 
     fn note_followed(&self) {
@@ -570,6 +585,13 @@ impl Workspace {
         }
         let events = self.agents_client.read_rows(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
+            // A scratch session holds none of an agent until it is asked
+            // for: follow it, and open it again once its rows are here.
+            if let Some(scratch) = &mut self.scratch
+                && scratch.to_open.insert(agent_id)
+            {
+                self.note_followed();
+            }
             return false;
         }
         self.note_followed();
@@ -647,16 +669,8 @@ impl Workspace {
         if started {
             return;
         }
-        if !model.read(cx).initial_load_ready() {
-            let pending = match model.read(cx).view() {
-                TranscriptView::Conversation => &mut self.pending_syncs,
-                TranscriptView::Activity => &mut self.activity_pending_syncs,
-            };
-            pending
-                .entry(agent_id)
-                .and_modify(|pending| *pending = pending.merge(summary))
-                .or_insert(summary);
-        } else if let Some(state) = self.transcripts.state(&agent_id) {
+        // The model holds what moves while its first load composes.
+        if let Some(state) = self.transcripts.state(&agent_id) {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
@@ -675,20 +689,19 @@ impl Workspace {
         view: TranscriptView,
         cx: &mut Context<Self>,
     ) {
-        let (models, pending) = match view {
-            TranscriptView::Conversation => (&self.models, &mut self.pending_syncs),
-            TranscriptView::Activity => (&self.activity_models, &mut self.activity_pending_syncs),
+        let models = match view {
+            TranscriptView::Conversation => &self.models,
+            TranscriptView::Activity => &self.activity_models,
         };
         let Some(model) = models.get(&agent_id).cloned() else {
             return;
         };
-        if let Some(summary) = pending.remove(&agent_id)
-            && let Some(state) = self.transcripts.state(&agent_id)
-        {
+        // What moved while it loaded.
+        if let Some(state) = self.transcripts.state(&agent_id) {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
-                    summary,
+                    FrameSummary::nothing(),
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
                     cx,
@@ -731,12 +744,48 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(specs, None, window, cx)
+    }
+
+    /// A scratch session (`rho-gui --scratch`): it opens on the agent a
+    /// handle names, once the host has named it, or on a draft of a new
+    /// one in the current directory. Its model holds only the agents it
+    /// opens, and the host's directory names the rest. It starts no Slack
+    /// and asks for no secret phrase: it is not the user's desk.
+    pub fn scratch(
+        specs: Vec<HostSpec>,
+        handle: Option<String>,
+        missing: impl Fn(String, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let scratch = Scratch {
+            to_open: BTreeSet::new(),
+            missing: Box::new(missing),
+        };
+        Self::build(specs, Some((handle, scratch)), window, cx)
+    }
+
+    fn build(
+        specs: Vec<HostSpec>,
+        scratch: Option<(Option<String>, Scratch)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (handle, scratch) = scratch.unzip();
+        let drafting = handle == Some(None);
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let (agents_client, changes) = rho_agents_client::model::AgentsClient::spawn();
+        let (agents_client, changes) = match handle {
+            Some(handle) => rho_agents_client::model::AgentsClient::spawn_scratch(handle),
+            None => rho_agents_client::model::AgentsClient::spawn(),
+        };
         #[cfg(test)]
-        let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
+        let (agents_client, changes) = {
+            let _ = handle;
+            rho_agents_client::model::AgentsClient::detached()
+        };
         // Each stream of a host has its own reader: the agents stream goes
         // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_agent_hosts::HostEvent>();
@@ -913,8 +962,6 @@ impl Workspace {
             models: HashMap::new(),
             activity_models: HashMap::new(),
             remote_projects: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            activity_pending_syncs: HashMap::new(),
             agents_client,
             desktop_streams,
             draft_model,
@@ -981,6 +1028,7 @@ impl Workspace {
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
+            scratch,
         };
         let no_hosts = specs.is_empty();
         for spec in specs {
@@ -1003,6 +1051,13 @@ impl Workspace {
         this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.invalidate_dealer_signals(cx);
+        if this.scratch.is_some() {
+            if drafting {
+                // Once the workspace exists, so the draft can take focus.
+                cx.defer_in(window, |this, window, cx| this.draft_here(window, cx));
+            }
+            return this;
+        }
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack. And when there is no session it says so: rho
@@ -1038,6 +1093,62 @@ impl Workspace {
             });
         }
         this
+    }
+
+    /// A scratch session started on no agent: a draft of one that works in
+    /// place where rho-gui started.
+    fn draft_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let here = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        self.draft_model.update(cx, |draft, cx| {
+            draft.set_workdir_text(&here, cx);
+            draft.set_start_mode(rho_agents_client::StartFieldMode::Here, cx);
+            // In place has no base to name.
+            draft.set_start_text("", cx);
+        });
+        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
+        self.display_surface(draft, cx);
+        self.focus_active_surface(window, cx);
+        // The draft exists to be written in, so it opens ready to type:
+        // straight to its editor, once vim has taken it on, since an action
+        // dispatched before the first frame reaches no focused editor.
+        let editor = self.active_editor(cx);
+        window.defer(cx, move |window, cx| {
+            vim::enter_insert_mode(&editor, window, cx);
+        });
+    }
+
+    /// A scratch session's names for the agents it has not opened: each as
+    /// its first row says, with the title and last activity the host
+    /// keeps. An agent already held keeps the digest its rows made. The
+    /// directory knows when an agent last wrote, not what, so that stands
+    /// in for when it last sent: Home's recent list is the scratch
+    /// session's way back to an agent.
+    pub(crate) fn directory_arrived(
+        &mut self,
+        host: HostId,
+        entries: Vec<rho_agents_client::protocol::DirectoryEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let agents = entries
+            .into_iter()
+            .filter(|entry| self.registry.agent_digest(entry.agent_id).is_none())
+            .filter_map(|entry| {
+                let mut agent =
+                    rho_agents_client::MirroredAgent::new(host, entry.agent_id, &entry.created)?;
+                agent.identity.role = entry.role;
+                agent.digest.title = entry.title;
+                agent.digest.last_active = entry.last_active;
+                agent.digest.last_sent_at = Some(entry.last_active);
+                Some(agent)
+            })
+            .collect::<Vec<_>>();
+        let changed = self.registry.told(agents);
+        self.push_agent_marks(&changed);
+        self.invalidate_dealer_signals(cx);
+        self.refresh_home(cx);
+        cx.notify();
     }
 
     /// Attaches an agent host. The name is registered with the registry first
@@ -1128,9 +1239,7 @@ impl Workspace {
             self.active.remove(agent_id);
             self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
-            self.pending_syncs.remove(&agent_id);
             self.activity_models.remove(&agent_id);
-            self.activity_pending_syncs.remove(&agent_id);
         }
         self.note_followed();
         self.forget_contexts(|context| !contexts.contains(context));
@@ -1351,7 +1460,6 @@ impl Workspace {
     fn forget_surface(&mut self, key: &SurfaceKey) {
         if let SurfaceKey::Activity(agent_id) = key {
             self.activity_models.remove(agent_id);
-            self.activity_pending_syncs.remove(agent_id);
             for surfaces in self.surfaces.values_mut() {
                 surfaces.retain(|surface| surface.key != *key);
             }
@@ -1768,7 +1876,6 @@ impl Workspace {
             for key in gone {
                 if let SurfaceKey::Activity(agent_id) = key {
                     self.activity_models.remove(&agent_id);
-                    self.activity_pending_syncs.remove(&agent_id);
                 }
                 history.forget(&key);
             }
@@ -1844,6 +1951,16 @@ impl Workspace {
                             .map(|said| format!("{said:?}").to_lowercase()),
                     });
                 }
+                if let Some(scratch) = &mut self.scratch {
+                    let arrived = changed
+                        .iter()
+                        .copied()
+                        .filter(|id| scratch.to_open.remove(id))
+                        .collect::<Vec<_>>();
+                    for agent_id in arrived {
+                        self.open_agent(agent_id, window, cx);
+                    }
+                }
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
@@ -1878,8 +1995,26 @@ impl Workspace {
             } => {
                 self.registry
                     .set_host_data(host, machine_seed, agent_counter);
+                if self.scratch.is_some() {
+                    self.call(host, AgentDirectory {}, cx, move |this, entries, cx| {
+                        this.directory_arrived(host, entries, cx)
+                    });
+                }
                 cx.notify();
             }
+            rho_agents_client::model::ModelMsg::Named(named) => match named {
+                // A stream opened again names the agent already open.
+                Ok(agent_id) if self.models.contains_key(&agent_id) => {}
+                Ok(agent_id) => {
+                    if let Some(scratch) = &mut self.scratch {
+                        scratch.to_open.insert(agent_id);
+                    }
+                }
+                Err(error) => match &self.scratch {
+                    Some(scratch) => (scratch.missing)(error, cx),
+                    None => self.echo(&error, StyleClass::SystemImportant, cx),
+                },
+            },
             rho_agents_client::model::ModelMsg::Auth { auth } => {
                 self.quotas.set_auth(host, auth);
                 if let Some(view) = self.usage.opened_view() {
@@ -2232,18 +2367,31 @@ impl Workspace {
                 false => "voice microphone unmuted",
             };
             self.notice_on(None, message, StyleClass::SystemInfo, cx);
+            cx.notify();
             return;
         }
+        // Voice talks to the agent the user is looking at.
+        let Some(agent_id) = self.selection.selected_agent() else {
+            self.notice_on(
+                None,
+                "voice: open an agent thread first",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let Some(host) = self.host_of(agent_id) else {
+            self.notice_on(
+                None,
+                "voice: this agent's host is unknown",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
         self.voice.unmute();
-        // Voice follows what the user is looking at: start on the selected
-        // agent's agent host.
-        let host = self
-            .selection
-            .selected_agent()
-            .and_then(|agent_id| self.host_of(agent_id))
-            .filter(|host| self.hosts.is_online(*host))
-            .or_else(|| self.hosts.primary());
-        self.start_voice(host, cx);
+        self.voice.wants(host, agent_id);
+        self.start_voice(cx);
     }
 
     pub(crate) fn cmd_end_voice(&mut self, cx: &mut Context<Self>) {
@@ -2256,26 +2404,37 @@ impl Workspace {
         }
     }
 
-    fn start_voice(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
+    fn start_voice(&mut self, cx: &mut Context<Self>) {
         if self.voice.running() {
             return;
         }
-        let Some(host) = host.or(self.voice.host()).or_else(|| self.hosts.primary()) else {
-            self.notice_on(
-                None,
-                "voice: no agent host attached",
-                StyleClass::SystemInfo,
-                cx,
-            );
+        let Some((host, agent_id)) = self.voice.target() else {
             return;
         };
-        self.voice.wants_host(host);
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
-        let task = crate::voice::rtc::start(&connection.link(), stop_rx, input_muted_rx);
+        let (connected, connected_rx) = tokio::sync::oneshot::channel();
+        let task = crate::voice::rtc::start(
+            &connection.link(),
+            agent_id,
+            stop_rx,
+            input_muted_rx,
+            connected,
+        );
+        // Only the session that sent it can be up: a failed session drops
+        // its sender, and this ends without a word.
+        cx.spawn(async move |this, cx| {
+            if connected_rx.await.is_ok() {
+                let _ = this.update(cx, |this, cx| {
+                    this.voice.connected();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
@@ -2289,15 +2448,25 @@ impl Workspace {
                     .await;
             }
             let _ = this.update(cx, |this, cx| {
-                this.voice.finished();
-                let message = match result {
+                let had_connected = this.voice.finished();
+                let message = match &result {
                     Ok(()) => "voice stopped listening".to_owned(),
-                    Err(error) => format!("voice failed: {error:#}"),
+                    Err(error) => {
+                        tracing::warn!("voice session failed: {error:#}");
+                        format!("voice failed: {error:#}")
+                    }
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                let host = this.voice.host().filter(|host| this.hosts.is_online(*host));
-                if host.is_some() && this.voice.wanted() {
-                    this.start_voice(host, cx);
+                if !had_connected {
+                    this.voice.end();
+                }
+                cx.notify();
+                let online = this
+                    .voice
+                    .target()
+                    .is_some_and(|(host, _)| this.hosts.is_online(host));
+                if online && this.voice.wanted() {
+                    this.start_voice(cx);
                 }
             });
         });
@@ -2441,7 +2610,7 @@ impl Workspace {
         let agent = self.registry.agent_by_label(target);
         StartBase {
             host: agent.and_then(|agent_id| self.host_of(agent_id)),
-            workspace: agent.and_then(|agent_id| self.registry.agent_workspace(agent_id)),
+            place: agent.and_then(|agent_id| self.registry.agent_place(agent_id).cloned()),
         }
     }
 
@@ -3223,7 +3392,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
+        let Some(workspace) = self.registry.agent_place(agent_id).cloned() else {
             self.notice_on(
                 None,
                 "open: agent has no workspace",
@@ -3709,8 +3878,6 @@ impl Workspace {
     fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         self.transcripts.forget(agent_id);
         self.note_followed();
-        self.pending_syncs.remove(&agent_id);
-        self.activity_pending_syncs.remove(&agent_id);
         self.registry.mark_not_live(agent_id);
         if let Some(model) = self.models.get(&agent_id).cloned() {
             model.update(cx, |model, _| model.clear_preview_editor());
@@ -3870,26 +4037,12 @@ impl Workspace {
         });
     }
 
-    /// Where a new agent works when the draft doesn't say: the selected
-    /// agent sets the precedent, else the first registered workdir.
+    /// Where a new agent works when the draft doesn't say: the first
+    /// registered workdir.
     fn draft_default_workdir(&self) -> Option<HostPath> {
-        self.selection
-            .selected_agent()
-            .and_then(|agent_id| self.agent_workdir(agent_id))
-            .or_else(|| {
-                self.hosts.workdirs().first().map(|workdir| HostPath {
-                    host: workdir.host,
-                    path: workdir.path.clone(),
-                })
-            })
-    }
-
-    /// What an agent's workset was cloned from, as a host-qualified workdir:
-    /// what a new sibling agent should inherit.
-    fn agent_workdir(&self, agent_id: AgentId) -> Option<HostPath> {
-        Some(HostPath {
-            host: self.host_of(agent_id)?,
-            path: self.registry.agent_origin(agent_id)?,
+        self.hosts.workdirs().first().map(|workdir| HostPath {
+            host: workdir.host,
+            path: workdir.path.clone(),
         })
     }
 
@@ -4548,7 +4701,7 @@ impl Workspace {
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
-        workspace: rho_agent_types::WorkspaceInfo,
+        workspace: rho_agent_types::Place,
         path: Utf8PathBuf,
         cx: &mut Context<Self>,
     ) {
@@ -4663,7 +4816,7 @@ impl Workspace {
     fn cached_remote_project(
         &mut self,
         host: HostId,
-        workspace: &rho_agent_types::WorkspaceInfo,
+        workspace: &rho_agent_types::Place,
     ) -> Option<RemoteProject> {
         let key = (host, workspace.clone());
         let state = self.remote_projects.get(&key)?.clone();
@@ -4679,7 +4832,7 @@ impl Workspace {
     fn cache_remote_project(
         &mut self,
         host: HostId,
-        workspace: rho_agent_types::WorkspaceInfo,
+        workspace: rho_agent_types::Place,
         opened: RemoteProject,
     ) -> RemoteProject {
         if let Some(existing) = self.cached_remote_project(host, &workspace) {
@@ -4781,18 +4934,15 @@ impl Workspace {
         if told {
             self.sync_agent_model(*agent_id, &model, FrameSummary::everything(), false, cx);
         }
-        let pending = match view {
-            TranscriptView::Conversation => &mut self.pending_syncs,
-            TranscriptView::Activity => &mut self.activity_pending_syncs,
-        };
+        // A load that finished while another view was current left what
+        // moved meanwhile held in the model.
         if model.read(cx).initial_load_ready()
-            && let (Some(summary), Some(state)) =
-                (pending.remove(agent_id), self.transcripts.state(agent_id))
+            && let Some(state) = self.transcripts.state(agent_id)
         {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
-                    summary,
+                    FrameSummary::nothing(),
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
                     cx,
@@ -6807,16 +6957,14 @@ impl Workspace {
     }
 
     /// The workdir a new thing under an area inherits: the repository of
-    /// the area or the labels it carries, then the agent itself when the
-    /// area is an agent. The caller falls back to the host's only workdir.
+    /// the area or the labels it carries. The caller falls back to the
+    /// host's only workdir.
     fn area_workdir(&self, area: &rho_dealer::NodeId) -> Option<HostPath> {
-        if let Some(url) = self.attention.marks.repository_of(area) {
-            return Some(HostPath {
-                host: self.hosts.primary()?,
-                path: url.into(),
-            });
-        }
-        self.agent_workdir(area.agent()?)
+        let url = self.attention.marks.repository_of(area)?;
+        Some(HostPath {
+            host: self.hosts.primary()?,
+            path: url.into(),
+        })
     }
 
     /// The usage screen, built once and kept. A series that arrives while
@@ -7416,6 +7564,30 @@ impl Workspace {
                     .size(px(7.))
                     .rounded_full()
                     .bg(status.error)
+            }))
+            .children(self.voice.shown().map(|(agent, shown)| {
+                // Voice is a mode word beside the editor's: three letters,
+                // on every surface, so an open microphone is never out of
+                // sight. Away from its thread it names the agent it hears.
+                let (word, color) = match shown {
+                    crate::voice::Shown::Connecting => ("MIC…", status.warning),
+                    crate::voice::Shown::Listening => ("MIC", status.error),
+                    crate::voice::Shown::Muted => ("MUT", colors.text_muted),
+                };
+                let away = !matches!(
+                    self.active_surface().key,
+                    SurfaceKey::Transcript(viewed) if viewed == agent
+                );
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .children(away.then(|| {
+                        div()
+                            .text_color(colors.text_muted)
+                            .child(self.registry.agent_display_label(agent))
+                    }))
+                    .child(div().text_color(color).child(word))
             }))
             .child(div().text_color(mode_color).child(mode_word(&mode)))
             .into_any_element()

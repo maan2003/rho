@@ -29,8 +29,8 @@ pub(crate) struct EvalArgs {
     /// Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]
     pub role: String,
-    /// Use this LIVE working directory. Defaults to an empty temporary
-    /// directory.
+    /// Use this LIVE working directory, a host directory with no workset,
+    /// which Claude roles cannot use. Defaults to an empty fresh workset.
     #[arg(long)]
     pub workdir: Option<PathBuf>,
     /// Keep the run's database and worksets in this directory instead of
@@ -136,19 +136,8 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
         None => KeptOrTemp::Temp(tempfile::tempdir().context("create isolated evaluation state")?),
     };
-    let workdir = match args.workdir {
-        Some(ref path) => path
-            .canonicalize()
-            .context("resolve live evaluation workdir")?,
-        None => {
-            let path = temp.path().join("work");
-            std::fs::create_dir(&path)?;
-            path
-        }
-    };
     let env = UserEnvironment::new(std::env::vars_os().collect());
-    // An eval adopts its directory as a workset; no
-    // mirror keeper runs, so `git` inside is the plain one.
+    // No mirror keeper runs, so `git` inside is the plain one.
     let worksets = Worksets::open(
         temp.path().join("state"),
         env,
@@ -172,7 +161,6 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 }
                 prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {handle}"),
             };
-            let workset = read.get_agent(id).place().workset.clone();
             drop(read);
             if let Some(n) = args.rewind_to {
                 let sent = requests_sent(&db, id);
@@ -183,19 +171,31 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 write.rewind_agent(rho_agent_types::UnixMs::now(), id, at.next());
                 write.commit();
             }
-            Some((id, workset))
+            Some(id)
         }
         None => None,
     };
-    // A resumed agent finds its workset under the id it recorded.
-    let workset = match &resume {
-        Some((_, workset)) => worksets.adopt_as(workset.clone(), &workdir)?,
-        None => worksets.adopt(&workdir)?,
+    // A live workdir is a host directory, with no workset; the default is
+    // a fresh workset, which Claude roles need. A resumed agent keeps the
+    // place it recorded.
+    let place = match (resume, &args.workdir) {
+        (Some(id), _) => db.read().get_agent(id).place().clone(),
+        (None, Some(path)) => Place {
+            cwd: camino::Utf8PathBuf::try_from(
+                path.canonicalize()
+                    .context("resolve live evaluation workdir")?,
+            )?,
+            workset: None,
+        },
+        (None, None) => Place {
+            cwd: rho_fs_view::MOUNT_ROOT.into(),
+            workset: Some(worksets.create().await?.id()),
+        },
     };
-    let place = Place {
-        workset: workset.id().to_owned(),
-        cwd: rho_fs_view::MOUNT_ROOT.into(),
-        origin: None,
+    // Where the agent's files are, as this process sees them.
+    let workdir = match place.workset {
+        Some(workset) => worksets.open_workset(workset).await?.root().to_owned(),
+        None => place.cwd.clone(),
     };
     rho_inference::ensure_crypto_provider();
     let inference = rho_inference::Accounts::new(db.clone()).await?;
@@ -237,7 +237,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     };
     let mut feed = rho_agent::journal::feed(&db);
     let (id, agent) = match resume {
-        Some((id, _)) => {
+        Some(id) => {
             let (id, agent, _) = pool.load(id).await?;
             (id, agent)
         }
@@ -263,7 +263,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
         _ => None,
     };
-    emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir}))?;
+    emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir.as_str()}))?;
     // Subscribed before the prompt goes, so its work is seen starting.
     let mut statuses = agent.statuses();
     match prompt {

@@ -38,6 +38,7 @@ impl StartFieldModeLabel for StartFieldMode {
         match self {
             Self::NewOn => "On top of: ",
             Self::Join => "Join: ",
+            Self::Here => "In place: ",
         }
     }
 }
@@ -304,12 +305,24 @@ impl DraftModel {
         self.update_start_target_hint(cx);
     }
 
+    /// Starts the draft in a given mode, for a host that knows how its
+    /// agents start before the user says.
+    pub fn set_start_mode(&mut self, mode: StartFieldMode, cx: &mut Context<Self>) {
+        self.start_mode = mode;
+        for editor in self.live_editors() {
+            self.insert_start_label_to(&editor, cx);
+        }
+        self.update_start_target_hint(cx);
+        cx.notify();
+    }
+
     /// Shift-Tab while the cursor is in the start field: cycle how the
     /// target is interpreted (the field label shows the mode).
     pub fn cycle_start_mode(&mut self, cx: &mut Context<Self>) {
         self.start_mode = match self.start_mode {
             StartFieldMode::NewOn => StartFieldMode::Join,
-            StartFieldMode::Join => StartFieldMode::NewOn,
+            StartFieldMode::Join => StartFieldMode::Here,
+            StartFieldMode::Here => StartFieldMode::NewOn,
         };
         for editor in self.live_editors() {
             self.insert_start_label_to(&editor, cx);

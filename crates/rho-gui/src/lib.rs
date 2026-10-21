@@ -324,6 +324,9 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("space", RootTransient, Some(context)),
             KeyBinding::new("q", SurfaceClose, Some(context)),
+            // Voice: starts on the thread in view, then mutes and unmutes.
+            // Vim's jump to a mark is given up for it.
+            KeyBinding::new("`", VoiceToggle, Some(context)),
         ]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),

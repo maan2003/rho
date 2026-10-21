@@ -1,8 +1,8 @@
 //! Development runner: enters a workset namespace the way the agent host does
-//! and runs one command in it. `--src` is adopted as the workset; `--state`
-//! is a state root (its `stores/` is the mirror store). With `--store` the
-//! keeper runs and `git` inside is Rho's patched git, as under the
-//! agent host; without it no keeper runs and `git` inside is the plain one.
+//! and runs one command in it. `--src` is shown as a fresh workset's `/src`;
+//! `--state` is a state root (its `stores/` is the mirror store). With
+//! `--store` the keeper runs and `git` inside is Rho's patched git, as under
+//! the agent host; without it no keeper runs and `git` inside is the plain one.
 
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;
@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     let incoming = std::env::args_os().collect::<Vec<_>>();
     if incoming.get(1).is_some_and(|arg| arg == "--enter-layout") {
         let bytes = std::fs::read(&incoming[2])?;
-        let layout: rho_fs_view::WorksetLayout = senax_encoder::decode(&mut bytes.as_slice())
+        let layout: rho_fs_view::Layout = senax_encoder::decode(&mut bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid workset layout"))?;
         unsafe {
             layout.build()?;
@@ -81,8 +81,11 @@ fn main() -> anyhow::Result<()> {
             },
         )
         .await?;
-        let workset = worksets.adopt(&src)?;
-        let layout = rho_fs_view::WorksetLayout::new(&workset)?;
+        let workset = worksets.create().await?;
+        let mut layout = rho_fs_view::Layout::workset(&workset)?;
+        if let Some(mount) = &mut layout.mount {
+            mount.source = camino::Utf8PathBuf::try_from(src.clone())?;
+        }
         let mut description = tempfile::NamedTempFile::new()?;
         std::io::Write::write_all(
             &mut description,

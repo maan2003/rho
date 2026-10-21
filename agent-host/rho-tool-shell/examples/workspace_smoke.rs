@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "--inside") {
         let bytes = std::fs::read(&args[2])?;
-        let layout: rho_fs_view::WorksetLayout = senax_encoder::decode(&mut bytes.as_slice())
+        let layout: rho_fs_view::Layout = senax_encoder::decode(&mut bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid layout"))?;
         unsafe {
             layout.build()?;
@@ -75,7 +75,7 @@ async fn run() -> anyhow::Result<()> {
         started.elapsed()
     );
 
-    let layout = rho_fs_view::WorksetLayout::new(&workset)?;
+    let layout = rho_fs_view::Layout::workset(&workset)?;
     let path = temp.path().join("layout");
     std::fs::write(
         &path,

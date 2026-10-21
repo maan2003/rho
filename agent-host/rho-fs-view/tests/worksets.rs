@@ -1,5 +1,3 @@
-use camino::Utf8Path;
-
 mod common;
 use common::{GitDaemon, git, only_store, open_worksets, setup_remote, store_git};
 
@@ -11,7 +9,7 @@ async fn worksets_clone_through_the_mirror_store() {
     let root = open_worksets(temp.path()).await;
     let socket = root.store_socket().expect("keeper running");
     assert!(socket.exists());
-    assert!(std::path::Path::new(rho_fs_view::GIT).is_file());
+    assert!(rho_fs_view::git().is_file());
     let remote_url = daemon.url("remote.git");
     let remote_url = remote_url.as_str();
 
@@ -64,13 +62,6 @@ async fn worksets_clone_through_the_mirror_store() {
     assert_eq!(by_url, first_workset.root().join("remote"));
     assert_eq!(first_workset.repos().unwrap(), vec!["project", "remote"]);
     assert_eq!(only_store(temp.path()), store);
-    assert_eq!(
-        first_workset
-            .host_path(Utf8Path::new("/src/project/file.txt"))
-            .unwrap(),
-        project.join("file.txt")
-    );
-    assert!(first_workset.host_path(Utf8Path::new("/src/../x")).is_err());
     std::fs::write(first_workset.root().join("not-a-repo"), "").unwrap();
     assert!(
         first_workset
@@ -138,11 +129,11 @@ async fn worksets_clone_through_the_mirror_store() {
     assert!(second_workset.checkout(&second, "--orphan").await.is_err());
 
     // A restarted agent host replaces the keeper and reopens worksets.
-    let second_id = second_workset.id().to_owned();
+    let second_id = second_workset.id();
     drop(second_workset);
     drop(root);
     let root = open_worksets(temp.path()).await;
-    let reopened = root.open_workset(&second_id).await.unwrap();
+    let reopened = root.open_workset(second_id).await.unwrap();
     assert_eq!(reopened.repos().unwrap(), vec!["project"]);
     let again = reopened
         .clone_repo(remote_url, Some("again"))
@@ -153,16 +144,5 @@ async fn worksets_clone_through_the_mirror_store() {
         "three\n"
     );
 
-    // An adopted directory is a workset for this process only.
-    let adopted = root.adopt(&source).unwrap();
-    assert!(adopted.id().starts_with("adopted-"));
-    assert_eq!(
-        adopted.root(),
-        Utf8Path::from_path(&source.canonicalize().unwrap()).unwrap()
-    );
-    assert_eq!(
-        root.open_workset(adopted.id()).await.unwrap().root(),
-        adopted.root()
-    );
-    assert!(!root.list().unwrap().iter().any(|id| id == adopted.id()));
+    assert!(root.list().unwrap().contains(&second_id));
 }

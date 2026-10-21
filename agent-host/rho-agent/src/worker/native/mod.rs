@@ -1465,12 +1465,14 @@ fn until(at: UnixMs) -> Duration {
 /// The model-facing surface of a role, for a reader: the prompt and the tool
 /// entry point a new agent of that role would get, without constructing a
 /// notebook.
+/// `cwd` is the working directory as the agent would see it; its files are
+/// read from `backing`, the same directory as this process reaches it.
 pub fn render_agent_surface(
-    workset: &rho_fs_view::Workset,
-    place: &rho_agent_types::Place,
+    cwd: &camino::Utf8Path,
+    backing: &camino::Utf8Path,
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
-    let place = prompt::WorksetPrompt::for_host(workset, place);
+    let place = prompt::WorksetPrompt::backed(cwd, backing);
     let binding = role.session_profile();
     if binding.claude_model().is_some() {
         return Ok(crate::RenderedAgentSurface {

@@ -187,6 +187,14 @@ pub trait AgentReadTxnExt {
     /// The agent's history as it stands: every row a later `Rewound` did
     /// not take back, oldest first, and where the next row goes.
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
+    /// Up to `limit` of the agent's rows from `from` on, hidden ones too,
+    /// as the journal names them.
+    fn agent_rows(
+        &self,
+        agent_id: AgentId,
+        from: AgentEventPos,
+        limit: usize,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
     /// Frozen native replay range for the log's current visible branch.
     fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary;
     fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery;
@@ -432,6 +440,18 @@ impl AgentReadTxnExt for ReadTxn {
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
         let (next, records) = self.agent_event_records(agent_id);
         (next, records.into_iter().map(|(_, event)| event).collect())
+    }
+
+    fn agent_rows(
+        &self,
+        agent_id: AgentId,
+        from: AgentEventPos,
+        limit: usize,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
+        let log = self.open_table(AGENT_LOG);
+        rows(log.range((agent_id, from.pos)..=(agent_id, u64::MAX)))
+            .take(limit)
+            .collect()
     }
 
     fn agent_event_records(

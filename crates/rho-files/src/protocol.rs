@@ -3,7 +3,7 @@
 //! on a channel of their own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::WorkspaceInfo;
+use rho_agent_types::Place;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// File access for one agent's workspace. Answered with
@@ -12,7 +12,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 /// closes the channel and its filesystem watcher.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Open {
-    pub workspace: WorkspaceInfo,
+    pub workspace: Place,
 }
 
 impl rho_rpc::protocol::ProtocolOpen for Open {

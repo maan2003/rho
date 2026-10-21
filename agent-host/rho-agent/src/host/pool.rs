@@ -8,10 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use camino::Utf8PathBuf;
 use rho_agent_types::{AgentId, AgentRole, EngineerIntelligence, Place};
 use rho_db::RhoDb;
-use rho_fs_view::{Workset, Worksets};
+use rho_fs_view::{Layout, WorksetId, Worksets};
 use tokio::sync::{Mutex, broadcast};
 
 use super::AgentClient;
@@ -60,6 +59,14 @@ const MAX_WORKING_CHILDREN: usize = 20;
 pub const MAX_LOADED: usize = 100;
 const ID_LABEL_HEADROOM: u64 = 200;
 
+/// What a log line calls the process for `workset`.
+fn process_label(workset: Option<WorksetId>) -> String {
+    match workset {
+        Some(workset) => format!("workset {workset}"),
+        None => "host process".to_owned(),
+    }
+}
+
 struct ResponseNotification {
     sender: AgentId,
     recipients: Vec<AgentId>,
@@ -73,7 +80,8 @@ struct ExecutionSlot {
 }
 
 pub struct AgentPool {
-    processes: Mutex<HashMap<String, Arc<ExecutionSlot>>>,
+    /// By workset; `None` is the host process, for agents without one.
+    processes: Mutex<HashMap<Option<WorksetId>, Arc<ExecutionSlot>>>,
 
     responses: tokio::sync::mpsc::Sender<ResponseNotification>,
     db: RhoDb,
@@ -225,11 +233,11 @@ impl AgentPool {
     }
 
     /// The worksets agents work in.
-    async fn execution_slot(&self, workset: &str) -> Arc<ExecutionSlot> {
+    async fn execution_slot(&self, workset: Option<WorksetId>) -> Arc<ExecutionSlot> {
         self.processes
             .lock()
             .await
-            .entry(workset.to_owned())
+            .entry(workset)
             .or_default()
             .clone()
     }
@@ -239,7 +247,7 @@ impl AgentPool {
         agent: AgentId,
     ) -> anyhow::Result<Arc<crate::host::Process>> {
         let place = self.db.read().get_agent(agent).config.place;
-        let slot = self.execution_slot(&place.workset).await;
+        let slot = self.execution_slot(place.workset).await;
         let _admission = slot.admission.clone().read_owned().await;
         let place = self.db.read().get_agent(agent).config.place;
         self.process(&place).await
@@ -272,19 +280,18 @@ impl AgentPool {
         self: &Arc<Self>,
         place: &Place,
     ) -> anyhow::Result<Arc<crate::host::Process>> {
-        let slot = self.execution_slot(&place.workset).await;
+        let slot = self.execution_slot(place.workset).await;
         let mut process = slot.process.lock().await;
         if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
             return Ok(process.clone());
         }
-        let workset = self.worksets.open_workset(&place.workset).await?;
-        let started = crate::host::Process::start(
-            self,
-            &workset,
-            self.claude.clone(),
-            slot.admission.clone(),
-        )
-        .await?;
+        let layout = match place.workset {
+            Some(workset) => Layout::workset(&self.worksets.open_workset(workset).await?)?,
+            None => Layout::host(&self.worksets),
+        };
+        let started =
+            crate::host::Process::start(self, layout, self.claude.clone(), slot.admission.clone())
+                .await?;
         *process = Some(started.clone());
         Ok(started)
     }
@@ -301,7 +308,7 @@ impl AgentPool {
             .lock()
             .await
             .iter()
-            .map(|(workset, slot)| (workset.clone(), slot.clone()))
+            .map(|(workset, slot)| (*workset, slot.clone()))
             .collect::<Vec<_>>();
         let mut processes = Vec::new();
         for (workset, slot) in slots {
@@ -333,7 +340,7 @@ impl AgentPool {
             futures::future::try_join_all(
                 processes
                     .iter()
-                    .map(|(workset, process)| process.hand(workset.clone())),
+                    .map(|(workset, process)| process.hand(*workset)),
             )
             .await
         })
@@ -362,7 +369,7 @@ impl AgentPool {
     /// whether it replaced one.
     pub async fn restart_workset(
         self: &Arc<Self>,
-        workset: &str,
+        workset: Option<WorksetId>,
         force: bool,
     ) -> anyhow::Result<bool> {
         let slot = self.execution_slot(workset).await;
@@ -454,7 +461,7 @@ impl AgentPool {
                     .lock()
                     .await
                     .iter()
-                    .map(|(workset, slot)| (workset.clone(), slot.clone()))
+                    .map(|(workset, slot)| (*workset, slot.clone()))
                     .collect::<Vec<_>>();
                 for (workset, slot) in slots {
                     let stale = slot
@@ -466,12 +473,11 @@ impl AgentPool {
                     if !stale {
                         continue;
                     }
-                    match pool.restart_workset(&workset, false).await {
-                        Ok(true) => eprintln!("rho-agent: replaced stale workset {workset}"),
+                    let label = process_label(workset);
+                    match pool.restart_workset(workset, false).await {
+                        Ok(true) => eprintln!("rho-agent: replaced stale {label}"),
                         Ok(false) => {}
-                        Err(error) => {
-                            eprintln!("rho-agent: replacing stale workset {workset}: {error:#}")
-                        }
+                        Err(error) => eprintln!("rho-agent: replacing stale {label}: {error:#}"),
                     }
                 }
             }
@@ -483,13 +489,14 @@ impl AgentPool {
     pub async fn adopt(self: &Arc<Self>, handed: Vec<crate::host::Handed>) {
         for handed in handed {
             if let Err(error) = self.adopt_process(&handed).await {
-                eprintln!("rho-agent: not taking over {}: {error:#}", handed.workset);
+                let label = process_label(handed.workset);
+                eprintln!("rho-agent: not taking over {label}: {error:#}");
             }
         }
     }
 
     async fn adopt_process(self: &Arc<Self>, handed: &crate::host::Handed) -> anyhow::Result<()> {
-        let slot = self.execution_slot(&handed.workset).await;
+        let slot = self.execution_slot(handed.workset).await;
         let process = crate::host::Process::adopt(self, handed, slot.admission.clone()).await?;
         *slot.process.lock().await = Some(process.clone());
         for &agent_id in &handed.agents {
@@ -623,6 +630,18 @@ impl AgentPool {
             self.touch(agent_id);
         }
         agent
+    }
+
+    /// The loaded agents with work in hand: responding, running tasks, or
+    /// holding input. An agent that is not loaded has none.
+    pub async fn working(&self) -> Vec<AgentId> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, agent)| !agent.status_cell().borrow().settled())
+            .map(|(agent_id, _)| *agent_id)
+            .collect()
     }
 
     /// Whether any client is looking at this agent right now. Read by the
@@ -808,7 +827,7 @@ impl AgentPool {
         // Admission and its per-ID ownership lock outlive cancellation of
         // the API caller. Never leave an unregistered worker still draining.
         tokio::spawn(async move {
-            let slot = pool.execution_slot(&start.place.workset).await;
+            let slot = pool.execution_slot(start.place.workset).await;
             let admission = slot.admission.clone().read_owned().await;
             let mode = config.session_profile();
             let runtime = match mode {
@@ -822,14 +841,16 @@ impl AgentPool {
                 },
             };
             let StartPlace { place, prepare } = start;
-            let workset = pool.worksets.open_workset(&place.workset).await?;
-            let host_cwd = workset.host_path(&place.cwd)?;
-            if prepare.is_none() {
-                anyhow::ensure!(
-                    host_cwd.is_dir(),
-                    "working directory does not exist: {}",
-                    place.cwd
-                );
+            // The workset must exist; its directory is the worker's to
+            // check, since only the worker sees the view it is in.
+            match place.workset {
+                Some(workset) => drop(pool.worksets.open_workset(workset).await?),
+                // Claude Code runs in mounts of its own, which the host
+                // process, having no namespace, cannot make.
+                None => anyhow::ensure!(
+                    matches!(runtime, AgentRuntime::Rho { .. }),
+                    "a Claude agent needs a workset"
+                ),
             }
             let mut write = pool.db.write().await;
             let agent_id = write.alloc_agent_id();
@@ -1071,14 +1092,6 @@ impl AgentPool {
         )
     }
 
-    /// The workset behind a persisted place and its working directory on the
-    /// host.
-    pub async fn open_workset(&self, place: &Place) -> anyhow::Result<(Workset, Utf8PathBuf)> {
-        let workset = self.worksets.open_workset(&place.workset).await?;
-        let host_cwd = workset.host_path(&place.cwd)?;
-        Ok((workset, host_cwd))
-    }
-
     /// Loads a persisted agent if it is not already running. The returned
     /// bool is true when this call started it.
     pub fn load(
@@ -1088,8 +1101,8 @@ impl AgentPool {
         let pool = self.clone();
         Box::pin(async move {
             tokio::spawn(async move {
-                let workset = pool.db.read().get_agent(agent_id).place().workset.clone();
-                let slot = pool.execution_slot(&workset).await;
+                let workset = pool.db.read().get_agent(agent_id).place().workset;
+                let slot = pool.execution_slot(workset).await;
                 let admission = slot.admission.clone().read_owned().await;
                 let lock = pool
                     .load_locks
@@ -1239,9 +1252,8 @@ mod tests {
         .unwrap();
         let workset = worksets.create().await.unwrap();
         let place = Place {
-            workset: workset.id().to_owned(),
+            workset: Some(workset.id()),
             cwd: "/src".into(),
-            origin: None,
         };
         let db = RhoDb::open(root.join("agents.redb"));
         let inference = crate::inference::testing::accounts();
@@ -1320,9 +1332,13 @@ mod tests {
     async fn pending_placement_commits_before_preparing_and_outlives_caller_cancellation() {
         let directory = tempfile::tempdir().unwrap();
         let (pool, mut place) = test_pool(directory.path()).await;
-        let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
+        let workset = pool
+            .worksets
+            .open_workset(place.workset.unwrap())
+            .await
+            .unwrap();
         place.cwd = "/src/not-cloned-yet".into();
-        let host_cwd = workset.host_path(&place.cwd).unwrap();
+        let host_cwd = workset.root().join("not-cloned-yet");
         let (entered, preparing) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let db = pool.db.clone();
@@ -1400,9 +1416,14 @@ mod tests {
     async fn child_workdir_selects_existing_directory_before_creation() {
         let directory = tempfile::tempdir().unwrap();
         let (pool, place) = test_pool(directory.path()).await;
-        let workset = pool.worksets.open_workset(&place.workset).await.unwrap();
+        let workset = pool
+            .worksets
+            .open_workset(place.workset.unwrap())
+            .await
+            .unwrap();
         for name in ["parent", "checkout"] {
-            let dir = workset.host_path(&place.cwd).unwrap().join(name);
+            // The pool's place is the workset root, `/src`.
+            let dir = workset.root().join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
             let skill_dir = dir.join(".agents/skills/catalogue-fixture");
@@ -1454,6 +1475,13 @@ mod tests {
                 child.place().workset,
                 read.get_agent(parent_id).place().workset
             );
+            let backing = camino::Utf8PathBuf::from_path_buf(
+                workset
+                    .root()
+                    .join(expected.strip_prefix("/src/").unwrap())
+                    .into(),
+            )
+            .unwrap();
 
             // The selected directory supplies the child's guidance, immediately
             // after workspace context; identity belongs with
@@ -1466,7 +1494,7 @@ mod tests {
             .team()
             .unwrap();
             let rendered = crate::prompt::prompt(
-                &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
                 Some(&team),
                 child.config.role,
             );
@@ -1501,14 +1529,14 @@ mod tests {
                 },
             ] {
                 let native = crate::prompt::prompt(
-                    &crate::prompt::WorksetPrompt::for_host(&workset, child.place()),
+                    &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
                     Some(&team),
                     role,
                 );
                 let claude = crate::prompt::claude_prompt(
-                    Some(&crate::prompt::WorksetPrompt::for_host(
-                        &workset,
-                        child.place(),
+                    Some(&crate::prompt::WorksetPrompt::backed(
+                        &child.place().cwd,
+                        &backing,
                     )),
                     Some(&team),
                     role,
@@ -1538,7 +1566,7 @@ mod tests {
         }
 
         let count = pool.db.read().list_agent_ids().len();
-        for invalid in ["/tmp", "/src/missing", "checkout", "/src/../src/checkout"] {
+        for invalid in ["checkout"] {
             let result =
                 crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(Some(invalid)))
                     .await;
@@ -1930,7 +1958,7 @@ mod tests {
         // Caller cancellation cannot release admission for an enqueued create.
         let process = pool.execution(first_id).await.unwrap();
         let slot = pool
-            .execution_slot(&pool.db().read().get_agent(first_id).config.place.workset)
+            .execution_slot(pool.db().read().get_agent(first_id).config.place.workset)
             .await;
         let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
@@ -1982,13 +2010,13 @@ mod tests {
             .unwrap();
         let first = pool.execution(agent_id).await.unwrap();
         assert!(
-            !pool.restart_workset(&place.workset, false).await.unwrap(),
+            !pool.restart_workset(place.workset, false).await.unwrap(),
             "current build"
         );
         assert!(!*first.closed.borrow());
 
         first.make_stale();
-        assert!(pool.restart_workset(&place.workset, false).await.unwrap());
+        assert!(pool.restart_workset(place.workset, false).await.unwrap());
         assert!(*first.closed.borrow());
         let second = pool.execution(agent_id).await.unwrap();
         assert_ne!(second.pid, first.pid);
@@ -2012,12 +2040,12 @@ mod tests {
             .unwrap();
         second.make_stale();
         assert!(
-            !pool.restart_workset(&place.workset, false).await.unwrap(),
+            !pool.restart_workset(place.workset, false).await.unwrap(),
             "a terminal is open"
         );
         assert!(!*second.closed.borrow());
 
-        assert!(pool.restart_workset(&place.workset, true).await.unwrap());
+        assert!(pool.restart_workset(place.workset, true).await.unwrap());
         assert!(*second.closed.borrow());
         let third = pool.execution(agent_id).await.unwrap();
         assert_ne!(third.pid, second.pid);

@@ -1395,6 +1395,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
+    /// The grid layout snaps to, in logical pixels on each axis, when it is
+    /// coarser than device pixels: a terminal's cell. `None` snaps to
+    /// device pixels.
+    fn layout_grid(&self) -> Option<Size<Pixels>> {
+        None
+    }
+
     // Mobile platform methods.
 
     /// The regions of this window currently obscured or reserved by the

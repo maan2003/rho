@@ -177,10 +177,13 @@ pub(crate) struct WorksetPrompt {
 }
 
 impl WorksetPrompt {
-    /// Worker paths are already in the workset namespace.
+    /// Worker paths are already in the workset namespace. A checkout's
+    /// root counts where the working directory is: inside the workset only
+    /// within it, and a host directory's wherever its checkout begins.
     pub fn new(cwd: &camino::Utf8Path) -> Self {
         let roots = rho_fs_view::resolve_workdir_root(cwd.as_std_path()).map(|(root, _)| {
-            let root = if root.starts_with(rho_fs_view::MOUNT_ROOT) {
+            let in_workset = cwd.starts_with(rho_fs_view::MOUNT_ROOT);
+            let root = if !in_workset || root.starts_with(rho_fs_view::MOUNT_ROOT) {
                 root
             } else {
                 cwd.to_owned()
@@ -190,22 +193,22 @@ impl WorksetPrompt {
         Self::discover(cwd, roots)
     }
 
-    /// Only the host's read-only preview needs visible/backing path
-    /// translation.
-    pub fn for_host(workset: &rho_fs_view::Workset, place: &rho_agent_types::Place) -> Self {
+    /// A preview outside the worker: `cwd` as the agent sees it, with its
+    /// files read from `backing`, the same directory as this process
+    /// reaches it. The checkout root is as many levels above `cwd` as it is
+    /// above `backing`.
+    pub fn backed(cwd: &camino::Utf8Path, backing: &camino::Utf8Path) -> Self {
         let roots = (|| {
-            let cwd = workset.host_path(&place.cwd)?;
-            let (root, _) = rho_fs_view::resolve_workdir_root(cwd.as_std_path())?;
-            let root = if root.starts_with(workset.root()) {
-                root
-            } else {
-                cwd
-            };
-            let visible = camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT)
-                .join(root.strip_prefix(workset.root())?);
-            anyhow::Ok((visible, root))
+            let (root, _) = rho_fs_view::resolve_workdir_root(backing.as_std_path())?;
+            let backing = camino::Utf8PathBuf::try_from(backing.as_std_path().canonicalize()?)?;
+            let depth = backing.strip_prefix(&root)?.components().count();
+            let visible = cwd
+                .ancestors()
+                .nth(depth)
+                .ok_or_else(|| anyhow::anyhow!("{root} is above the agent's view of {cwd}"))?;
+            anyhow::Ok((visible.to_owned(), root))
         })();
-        Self::discover(&place.cwd, roots)
+        Self::discover(cwd, roots)
     }
 
     fn discover(
