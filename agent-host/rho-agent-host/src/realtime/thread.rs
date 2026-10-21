@@ -120,6 +120,22 @@ pub(super) fn delegation(input: &str, transcript_delta: &str) -> String {
     format!("<realtime_delegation>\n  <input>{input}</input>\n{delta}</realtime_delegation>")
 }
 
+/// What a reader is shown of a user message that is a spoken request: the
+/// request itself, marked as spoken, in place of the markup the agent reads.
+/// `None` for any other message.
+pub(crate) fn shown_to_reader(text: &str) -> Option<String> {
+    let start = text.find("<realtime_delegation>")?;
+    let input = text[start..]
+        .split_once("<input>")?
+        .1
+        .split_once("</input>")?
+        .0
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    Some(format!("{}🎤 {}", &text[..start], input.trim()))
+}
+
 /// What the live model is told of one row of the agent's log, on which
 /// channel, and whether it ends the request. Progress is a `[STATUS]` the
 /// model may keep to itself; a result, a question, or a stop is the
@@ -290,6 +306,21 @@ mod tests {
         assert!(message.contains("newest words</transcript_delta>"));
         assert!(!message.contains("OLD"));
         assert!(message.contains("<transcript_delta>…"));
+    }
+
+    #[test]
+    fn a_reader_sees_the_spoken_request_and_not_the_markup() {
+        let message = delegation("fix <b> & ship", "user: fix b and ship");
+        assert_eq!(
+            shown_to_reader(&message).as_deref(),
+            Some("🎤 fix <b> & ship")
+        );
+        let after_notice = format!("Your workset moved.\n{message}");
+        assert_eq!(
+            shown_to_reader(&after_notice).as_deref(),
+            Some("Your workset moved.\n🎤 fix <b> & ship")
+        );
+        assert_eq!(shown_to_reader("typed <input>x</input>"), None);
     }
 
     #[test]

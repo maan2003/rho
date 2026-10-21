@@ -181,13 +181,21 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
                 Party::Human => None,
                 Party::Agent(id) => Some(*id),
             },
-            text: body
-                .iter()
-                .filter_map(|block| match block {
-                    Block::Text(text) => Some(text.as_str()),
-                    Block::Image(_) => None,
-                })
-                .collect(),
+            text: {
+                let text: String = body
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text(text) => Some(text.as_str()),
+                        Block::Image(_) => None,
+                    })
+                    .collect();
+                // A spoken request reads as what was asked, not as the
+                // markup the agent is handed.
+                match from {
+                    Party::Human => crate::realtime::shown_to_reader(&text).unwrap_or(text),
+                    Party::Agent(_) => text,
+                }
+            },
             at: *at,
         },
         Entry::RequestSent {

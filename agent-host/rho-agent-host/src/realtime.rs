@@ -22,6 +22,7 @@ use rho_openai_realtime::{
 use rho_rpc::protocol::{read_frame, write_frame};
 use rho_rtc::protocol::{Opened, RealtimeClientFrame, RealtimeServerFrame};
 use serde::{Deserialize, Serialize};
+pub(crate) use thread::shown_to_reader;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Services;

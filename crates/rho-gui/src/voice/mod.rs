@@ -25,6 +25,18 @@ struct Running {
     /// a moment later, so this is `None` while a stop is in flight.
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     input_muted: tokio::sync::watch::Sender<bool>,
+    /// Whether the media and the sideband are both up, so the user is heard.
+    connected: bool,
+}
+
+/// What the user is shown of a session they asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// Asked for, not heard yet: starting, or starting again after a
+    /// failure.
+    Connecting,
+    Listening,
+    Muted,
 }
 
 /// What the desk knows about voice.
@@ -64,6 +76,28 @@ impl Voice {
     /// whether it is taking the session with it.
     pub(crate) fn is_on(&self, host: HostId) -> bool {
         self.target.is_some_and(|(on, _)| on == host)
+    }
+
+    /// The agent a session the user wants talks to, and how it is.
+    /// `None` once the user has ended it, even while it is still stopping.
+    pub(crate) fn shown(&self) -> Option<(AgentId, Shown)> {
+        let (_, agent) = self.target.filter(|_| self.wanted)?;
+        let connected = self.running.as_ref().is_some_and(|it| it.connected);
+        Some((
+            agent,
+            match (connected, self.muted) {
+                (false, _) => Shown::Connecting,
+                (true, false) => Shown::Listening,
+                (true, true) => Shown::Muted,
+            },
+        ))
+    }
+
+    /// The running session is up: the user is heard from now on.
+    pub(crate) fn connected(&mut self) {
+        if let Some(running) = &mut self.running {
+            running.connected = true;
+        }
     }
 
     /// Whether the microphone is closed.
@@ -106,6 +140,7 @@ impl Voice {
             _task: task,
             stop: Some(stop),
             input_muted,
+            connected: false,
         });
     }
 

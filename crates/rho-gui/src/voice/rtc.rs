@@ -21,12 +21,14 @@ pub(crate) fn start(
     agent_id: rho_agent_types::AgentId,
     stop: tokio::sync::oneshot::Receiver<()>,
     input_muted: tokio::sync::watch::Receiver<bool>,
+    connected: tokio::sync::oneshot::Sender<()>,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(move |dialer| {
         run(
             move |offer_sdp| dial(dialer, offer_sdp, agent_id),
             stop,
             input_muted,
+            connected,
         )
     })
 }
@@ -69,6 +71,7 @@ async fn run<D, F>(
     dial: D,
     mut stop: tokio::sync::oneshot::Receiver<()>,
     mut input_muted: tokio::sync::watch::Receiver<bool>,
+    connected: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()>
 where
     D: FnOnce(String) -> F,
@@ -111,6 +114,7 @@ where
     session.set_input_muted(*input_muted.borrow())?;
     session.start_audio()?;
     tracing::info!("realtime client session established");
+    let _ = connected.send(());
 
     let result: anyhow::Result<()> = async {
         loop {
