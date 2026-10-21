@@ -887,18 +887,22 @@ async fn connect_iroh(
             );
             endpoint
         }
-        IrohAccess::Fido => crate::fido::endpoint()
+        IrohAccess::Fido | IrohAccess::Link { .. } => crate::fido::endpoint()
             .await
             .context("security key identity")?,
+    };
+    let pairing = match access {
+        IrohAccess::Link { key } => Some(key),
+        _ => None,
     };
     let connection = endpoint
         .connect(host_id, rho_rpc::protocol::IROH_ALPN)
         .await
         .context("connect to agent host over iroh")?;
-    match rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await? {
+    match rho_rpc::authenticate_iroh_client(&connection, endpoint.id(), pairing).await? {
         rho_iroh_auth::ClientAuthResult::Approved => {}
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code)
-            if matches!(access, IrohAccess::Fido) =>
+            if matches!(access, IrohAccess::Fido | IrohAccess::Link { .. }) =>
         {
             events.unbounded_send(ConnEvent::Disconnected(format!(
                 "enroll this rho on the host: rho iroh approve {code}"

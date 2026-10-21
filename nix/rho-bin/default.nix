@@ -51,6 +51,10 @@ stdenv.mkDerivation {
     ln -s ${cargoSharedCache}/bin $out/share/rho/shared-cargo-bin
     runHook postInstall
   '';
+  # rho-devshell-builder's Nix, and what Nix loads, come in the archive.
+  preFixup = ''
+    addAutoPatchelfSearchPath $out/share/rho/lib
+  '';
 
   meta = {
     description = "Rho's CLI and agent host, prebuilt";

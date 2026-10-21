@@ -62,7 +62,8 @@ impl SavedHost {
                     ssh_destination: ssh_destination.clone(),
                     remote_rho: remote_rho.clone(),
                 },
-                IrohAccess::Fido => SavedTarget::IrohFido {
+                // The key is spent once the host has seen it.
+                IrohAccess::Fido | IrohAccess::Link { .. } => SavedTarget::IrohFido {
                     endpoint_id: endpoint_id.to_string(),
                 },
             },
@@ -180,6 +181,7 @@ mod tests {
                     remote_rho,
                 } => format!("iroh:{endpoint_id}@{ssh_destination} via {remote_rho}"),
                 IrohAccess::Fido => format!("iroh:{endpoint_id} via security key"),
+                IrohAccess::Link { .. } => format!("iroh:{endpoint_id} via a pairing link"),
             },
         };
         format!("{}={target}", spec.name)
@@ -226,6 +228,30 @@ mod tests {
             "detaching the last host saves an empty set"
         );
     }
+    /// A host attached from a pairing link comes back by its identity alone:
+    /// the key was spent when the host saw it.
+    #[test]
+    fn a_linked_host_is_saved_without_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(dir.path()).unwrap();
+        let endpoint_id = iroh::SecretKey::from([5; 32]).public();
+        let linked = HostSpec {
+            name: "m2sh".to_owned(),
+            target: AttachTarget::Iroh {
+                endpoint_id,
+                access: IrohAccess::Link {
+                    key: "ab".repeat(32).parse().unwrap(),
+                },
+            },
+        };
+        save(&db, [&linked]);
+        let loaded = load(&db);
+        assert_eq!(
+            loaded.iter().map(describe).collect::<Vec<_>>(),
+            [format!("m2sh=iroh:{endpoint_id} via security key")]
+        );
+    }
+
     #[test]
     fn legacy_ssh_row_decodes_after_new_variant_is_added() {
         let db_dir = tempfile::tempdir().unwrap();

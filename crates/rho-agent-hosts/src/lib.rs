@@ -73,7 +73,7 @@ impl AttachTarget {
                 ..
             } => format!("iroh via {ssh_destination}"),
             Self::Iroh {
-                access: IrohAccess::Fido,
+                access: IrohAccess::Fido | IrohAccess::Link { .. },
                 ..
             } => "iroh via security key".to_owned(),
         }
@@ -89,6 +89,11 @@ pub enum IrohAccess {
         remote_rho: String,
     },
     Fido,
+    /// [`IrohAccess::Fido`] from a pairing link: the key in it has the host
+    /// trust this identity, once, and after that the identity is enough.
+    Link {
+        key: rho_iroh_auth::PairingKey,
+    },
 }
 
 /// One agent host to attach: the short name it is known by in this client, and
@@ -103,9 +108,30 @@ pub struct HostSpec {
 #[cfg(feature = "client")]
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
-    /// the attach prompt: `<name>=unix:<socket>` or
-    /// `<name>=iroh:<endpoint-id>[@<ssh-destination>]`.
+    /// the attach prompt: `<name>=unix:<socket>`,
+    /// `<name>=iroh:<endpoint-id>[@<ssh-destination>]`, or
+    /// `<name>=rho://…` for a pairing link.
     pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.starts_with(rho_iroh_auth::PAIRING_SCHEME) {
+            return Err("a pairing link needs a name: <name>=rho://…".to_owned());
+        }
+        let link = text
+            .split_once('=')
+            .filter(|(_, link)| link.starts_with(rho_iroh_auth::PAIRING_SCHEME));
+        if let Some((name, link)) = link {
+            let link = link.parse::<rho_iroh_auth::PairingLink>()?;
+            if name.is_empty() {
+                return Err("host name is empty".to_owned());
+            }
+            return Ok(Self {
+                name: name.to_owned(),
+                target: AttachTarget::Iroh {
+                    endpoint_id: link.endpoint_id,
+                    access: IrohAccess::Link { key: link.key },
+                },
+            });
+        }
         let (name, target) = text
             .trim()
             .split_once('=')
@@ -221,6 +247,15 @@ mod parse_tests {
         assert!(
             matches!(fido.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Fido } if endpoint_id == id)
         );
+        let key = "ab".repeat(32);
+        let link = HostSpec::parse(&format!("phone=rho://{id}?key={key}"), "rho").unwrap();
+        assert_eq!(link.name, "phone");
+        assert!(
+            matches!(&link.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Link { key: shown } } if *endpoint_id == id && shown.to_string() == key)
+        );
+        // The client names the host, never the link.
+        assert!(HostSpec::parse(&format!("rho://{id}?key={key}"), "rho").is_err());
+        assert!(HostSpec::parse(&format!("=rho://{id}?key={key}"), "rho").is_err());
         let ssh = HostSpec::parse(&format!("fern=iroh:{id}@other-host"), "/opt/rho").unwrap();
         assert!(
             matches!(ssh.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Ssh { ssh_destination, remote_rho } } if endpoint_id == id && ssh_destination == "other-host" && remote_rho == "/opt/rho")

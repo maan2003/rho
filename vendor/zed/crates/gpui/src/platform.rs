@@ -1283,6 +1283,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Raises and focuses the window with an activation token from elsewhere: on Wayland, an
+    /// xdg-activation token that another client (a launcher, the app that opened a link)
+    /// was given. Platforms without such tokens activate as usual.
+    fn activate_with_token(&self, _token: String) {
+        self.activate();
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;

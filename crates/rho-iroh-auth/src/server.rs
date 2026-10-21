@@ -8,7 +8,7 @@ use redb::{TableDefinition, TypeName};
 use redb_derive::Value;
 use rho_db::RhoDb;
 
-use crate::shared::{EnrollmentCode, enrollment_code};
+use crate::shared::{EnrollmentCode, PairingKey, enrollment_code};
 
 const TRUSTED_CLIENTS: TableDefinition<TrustedClientId, TrustedClientValue> =
     TableDefinition::new("rho_iroh_auth_trusted_clients_v1");
@@ -62,6 +62,47 @@ struct IrohAuthInner {
     trusted: TrustedClients,
     memory_trusted: tokio::sync::Mutex<MemoryTrustedClients>,
     pending: tokio::sync::Mutex<PendingEnrollments>,
+    pairing: tokio::sync::Mutex<PairingKeys>,
+}
+
+/// How long a pairing key printed by the host stays good.
+pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
+/// Live keys at most: each is a link someone asked for on the host.
+const MAX_PAIRING_KEYS: usize = 64;
+
+/// Pairing keys not yet spent, until they expire.
+#[derive(Debug, Default)]
+struct PairingKeys {
+    live: HashMap<PairingKey, Instant>,
+}
+
+impl PairingKeys {
+    fn mint(&mut self) -> PairingKey {
+        self.prune();
+        if self.live.len() >= MAX_PAIRING_KEYS
+            && let Some(oldest) = self
+                .live
+                .iter()
+                .min_by_key(|(_, expires_at)| **expires_at)
+                .map(|(key, _)| *key)
+        {
+            self.live.remove(&oldest);
+        }
+        let key = PairingKey::generate();
+        self.live.insert(key, Instant::now() + PAIRING_TTL);
+        key
+    }
+
+    /// Whether `key` was live; it is not any more.
+    fn spend(&mut self, key: &PairingKey) -> bool {
+        self.prune();
+        self.live.remove(key).is_some()
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.live.retain(|_, expires_at| *expires_at > now);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -325,6 +366,7 @@ impl IrohAuth {
                 trusted: TrustedClients::new(db),
                 memory_trusted: tokio::sync::Mutex::new(MemoryTrustedClients::default()),
                 pending: tokio::sync::Mutex::new(pending),
+                pairing: tokio::sync::Mutex::new(PairingKeys::default()),
             }),
         }
     }
@@ -349,9 +391,20 @@ impl IrohAuth {
 
     /// Check trust and, for an unknown client, register the exporter-bound code
     /// independently verifiable by that client.
-    pub async fn authenticate_connection(&self, conn: &Connection) -> ServerAuthDecision {
+    /// A live `pairing` key trusts the client for good, and is spent.
+    pub async fn authenticate_connection(
+        &self,
+        conn: &Connection,
+        pairing: Option<PairingKey>,
+    ) -> ServerAuthDecision {
         let client_endpoint_id = conn.remote_id();
         if self.is_trusted_endpoint(client_endpoint_id).await {
+            return ServerAuthDecision::Approved;
+        }
+        if let Some(key) = pairing
+            && self.inner.pairing.lock().await.spend(&key)
+        {
+            self.inner.trusted.trust(client_endpoint_id).await;
             return ServerAuthDecision::Approved;
         }
         let code = enrollment_code(conn, self.inner.server_endpoint_id, client_endpoint_id);
@@ -390,6 +443,11 @@ impl IrohAuth {
             return true;
         }
         self.inner.trusted.is_trusted(client_endpoint_id).await
+    }
+
+    /// A new pairing key, good for one client within [`PAIRING_TTL`].
+    pub async fn mint_pairing_key(&self) -> PairingKey {
+        self.inner.pairing.lock().await.mint()
     }
 
     /// Trust the exact client key associated with this active code.

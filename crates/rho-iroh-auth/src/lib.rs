@@ -7,10 +7,15 @@
 mod server;
 mod shared;
 
-pub use server::{ApproveError, IrohAuth, PreapprovedEndpoint, ServerAuthDecision};
-pub use shared::{EnrollmentCode, ParseEnrollmentCodeError};
+pub use server::{ApproveError, IrohAuth, PAIRING_TTL, PreapprovedEndpoint, ServerAuthDecision};
+pub use shared::{
+    EnrollmentCode, PAIRING_SCHEME, PairingKey, PairingLink, ParseEnrollmentCodeError,
+};
 
-const AUTH_REQUEST: &[u8] = b"rho-auth-v1\n";
+/// Then 32 bytes: a [`PairingKey`], or zeros for none.
+const AUTH_REQUEST: &[u8] = b"rho-auth-v2\n";
+/// A client from before pairing keys: no key follows.
+const AUTH_REQUEST_V1: &[u8] = b"rho-auth-v1\n";
 const AUTH_ACK: &[u8] = b"ack\n";
 const MAX_AUTH_RESPONSE_LEN: usize = 128;
 
@@ -26,12 +31,16 @@ pub enum ClientAuthResult {
 }
 
 /// Open the mandatory first stream and read the server's bounded auth result.
+/// A `pairing` key pairs a client the host does not trust yet.
 pub async fn authenticate_client(
     connection: &iroh::endpoint::Connection,
     client_endpoint_id: iroh::EndpointId,
+    pairing: Option<&PairingKey>,
 ) -> anyhow::Result<ClientAuthResult> {
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(AUTH_REQUEST).await?;
+    let key: &[u8; 32] = pairing.map_or(&[0; 32], PairingKey::as_bytes);
+    send.write_all(key).await?;
     let response = recv.read_to_end(MAX_AUTH_RESPONSE_LEN).await?;
     let response = std::str::from_utf8(&response)?;
     let result = if response == "approved\n" {
@@ -67,7 +76,13 @@ pub async fn authenticate_server_connection(
         let (mut send, mut recv) = connection.accept_bi().await?;
         let mut request = [0; AUTH_REQUEST.len()];
         recv.read_exact(&mut request).await?;
-        anyhow::ensure!(request == AUTH_REQUEST, "invalid iroh auth request");
+        let mut key = [0; 32];
+        if request == AUTH_REQUEST {
+            recv.read_exact(&mut key).await?;
+        } else {
+            anyhow::ensure!(request == AUTH_REQUEST_V1, "invalid iroh auth request");
+        }
+        let pairing = (key != [0; 32]).then(|| PairingKey::from_bytes(key));
         // Pin trust established at admission for this connection. Revocation
         // affects later connections, not one whose authenticated handshake
         // already passed admission. Unknown peers may still become approved
@@ -80,7 +95,7 @@ pub async fn authenticate_server_connection(
                 );
                 ServerAuthDecision::Approved
             }
-            None => auth.authenticate_connection(connection).await,
+            None => auth.authenticate_connection(connection, pairing).await,
         };
         let response = match &decision {
             ServerAuthDecision::Approved => "approved\n".to_owned(),

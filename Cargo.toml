@@ -36,10 +36,6 @@ members = [
   "agent-host/rho-visualizations",
   "agent-host/rho-watch",
   "agent-host/rho-web-search",
-  "crates/cli/rho-term",
-  "crates/cli/rho-term-ui",
-  "crates/cli/rho-tty",
-  "crates/cli/rho-tui",
   "crates/json-stream",
   "crates/octo-types",
   "crates/prefix-id",
@@ -99,10 +95,6 @@ chacha20poly1305 = "0.11"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 clock = { path = "vendor/zed/crates/clock" }
-crossterm = { version = "0.29", default-features = false, features = [
-  "bracketed-paste",
-  "events",
-] }
 devenv-nix-backend = { path = "vendor/devenv/devenv-nix-backend" }
 dirs = { version = "7", default-features = false }
 fnv = "1"
@@ -172,7 +164,6 @@ rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "agent-host/rho-shell" }
 rho-shell-view = { path = "crates/rho-shell-view" }
 rho-slack = { path = "crates/rho-slack", default-features = false }
-rho-term-ui = { path = "crates/cli/rho-term-ui" }
 rho-terminal = { path = "crates/rho-terminal" }
 rho-tool-shell = { path = "agent-host/rho-tool-shell" }
 rho-transcript = { path = "crates/rho-transcript" }
@@ -213,7 +204,6 @@ tracing = { version = "0.1", default-features = false, features = [
   "attributes",
   "std",
 ] }
-unicode-segmentation = "1"
 unicode-width = "0.2"
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }

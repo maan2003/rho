@@ -18,6 +18,7 @@ use rho_rpc::protocol::{Answer, Call, client};
 mod eval;
 mod github;
 mod notion;
+mod share;
 mod slack;
 mod visualization;
 mod wayland;
@@ -26,9 +27,6 @@ mod wayland;
 mod tests;
 
 pub fn main() -> Result<()> {
-    if let Some(args) = chat_args(std::env::args().skip(1)) {
-        return exec_chat(args);
-    }
     let args = Args::parse_or_exit(std::env::args().skip(1));
     // Ordinary utilities die quietly on a closed pipe. Evaluations own live
     // agent work: BrokenPipe must unwind through cancellation, not kill us
@@ -66,6 +64,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
+        Command::Share(args) => share::run(args).await,
         Command::Github(args) => github::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::Notion(args) => notion::run(args).await,
@@ -93,29 +92,6 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
         Protocol::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
         Protocol::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
-}
-
-/// The arguments for `rho-term`, when the command line asks for a chat:
-/// nothing at all, `attach`, or flags that are the chat's (`--role`). The
-/// host's own commands and `--help` stay here.
-fn chat_args(args: impl Iterator<Item = String>) -> Option<Vec<String>> {
-    let args = args.collect::<Vec<_>>();
-    match args.first().map(String::as_str) {
-        None | Some("attach") => Some(args),
-        Some("-h" | "--help" | "-V" | "--version") => None,
-        Some(flag) if flag.starts_with('-') => Some(args),
-        Some(_) => None,
-    }
-}
-
-/// Becomes `rho-term`, the ad hoc chat with an agent. It is its own binary,
-/// installed beside this one, because it is a client of the host: it holds
-/// the transcript fold that crates here must not reach.
-fn exec_chat(args: Vec<String>) -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
-    let program = std::env::current_exe()?.with_file_name("rho-term");
-    let error = std::process::Command::new(&program).args(args).exec();
-    Err(error).with_context(|| format!("run {}", program.display()))
 }
 
 /// Approves a pending iroh enrollment over the agent host's Unix socket, so
@@ -192,6 +168,7 @@ enum Command {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    Share(share::ShareArgs),
     Github(GithubArgs),
     Slack(SlackArgs),
     Notion(NotionArgs),
@@ -203,12 +180,12 @@ enum Command {
 #[derive(Parser)]
 #[command(
     name = "rho",
-    after_help = "Run `rho` alone to start an agent here and chat with it, \
-                  or `rho attach <agent>` to open one that exists (see `rho-term --help`)."
+    after_help = "Run `rho` alone for a link that pairs rho-gui with this machine's agent \
+                  host; it starts one, for as long as it runs, when none is running."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: CliCommand,
+    command: Option<CliCommand>,
 }
 
 #[derive(Subcommand)]
@@ -224,6 +201,9 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    /// Print a link that pairs rho-gui with this machine's agent host (what
+    /// `rho` alone does).
+    Share(share::ShareArgs),
     Github(GithubArgs),
     Slack(SlackArgs),
     Notion(NotionArgs),
@@ -372,7 +352,13 @@ impl Args {
 
     fn try_parse(args: impl Iterator<Item = String>) -> std::result::Result<Self, clap::Error> {
         let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
-        let command = match cli.command {
+        let Some(command) = cli.command else {
+            return Ok(Self {
+                command: Command::Share(share::ShareArgs::default()),
+            });
+        };
+        let command = match command {
+            CliCommand::Share(args) => Command::Share(args),
             CliCommand::Auth { command } => Command::Auth(command),
             CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
             CliCommand::Debug(args) => Command::Debug(args),

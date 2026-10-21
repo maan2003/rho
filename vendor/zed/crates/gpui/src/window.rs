@@ -7332,6 +7332,13 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// [`Self::activate_window`] with an activation token from elsewhere (see
+    /// [`PlatformWindow::activate_with_token`]), for an app asked to come forward by
+    /// another: the compositor would refuse a token of its own.
+    pub fn activate_window_with_token(&self, token: String) {
+        self.platform_window.activate_with_token(token);
+    }
+
     /// Requests that the operating system draw attention to this window.
     pub fn request_attention(&self) {
         self.platform_window.request_attention();

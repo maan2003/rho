@@ -64,8 +64,6 @@ rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view = { workspace = true }
 rho-agent-hosts = { workspace = true, features = ["client"] }
-rho-term = { path = "../cli/rho-term" }
-rho-tty = { path = "../cli/rho-tty" }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
@@ -115,6 +113,7 @@ uuid.workspace = true
 util = { path = "../../vendor/zed/crates/util" }
 vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
+zbus.workspace = true
 
 # unprefixed_malloc routes C-library allocations (freetype, fontconfig,
 # drivers) through jemalloc too; profiling stays inert until MALLOC_CONF

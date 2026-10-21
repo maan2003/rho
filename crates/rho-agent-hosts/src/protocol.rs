@@ -57,6 +57,9 @@ rho_rpc::calls! {
         IrohTrustInMemory(IrohTrustInMemory) -> ();
         /// Answered with the revoked endpoint id.
         IrohRevoke(IrohRevoke) -> String;
+        /// Answered with a `rho://` pairing link, good for one client for
+        /// ten minutes.
+        IrohPair(IrohPair) -> String;
         /// Answered with where the copy is, in a directory of its own
         /// beside the database; the copy is the caller's to delete.
         Snapshot(Snapshot) -> camino::Utf8PathBuf;
@@ -121,6 +124,11 @@ pub struct IrohApprove {
 pub struct IrohTrustInMemory {
     pub endpoint_id: String,
 }
+
+/// Mints a pairing link: the client that opens it is trusted persistently,
+/// as `IrohApprove` would trust it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct IrohPair;
 
 /// Revokes persistent trust for an iroh client endpoint.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]

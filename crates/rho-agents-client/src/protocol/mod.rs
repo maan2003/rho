@@ -8,7 +8,7 @@
 //! ([`Open::Request`]) on a stream of its own.
 
 use camino::Utf8PathBuf;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Place, Seq, UnixMs};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Place, Seq};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
@@ -46,8 +46,6 @@ rho_rpc::calls! {
         SetAuthAccountEnabled(SetAuthAccountEnabled) -> ();
         /// Bulk: one agent's rows, a page at a time.
         AgentLog(AgentLog) -> AgentLogPage, priority None;
-        /// Bulk: every agent, named but not read.
-        AgentDirectory(AgentDirectory) -> Vec<DirectoryEntry>, priority None;
     }
 }
 
@@ -138,26 +136,6 @@ pub struct AgentLogPage {
     pub next: Option<AgentPos>,
 }
 
-/// Every agent on the host, named but not read: for a client that holds
-/// only the agents it opens and still finds the rest.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct AgentDirectory {}
-
-/// One agent as the directory names it.
-#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
-pub struct DirectoryEntry {
-    pub agent_id: AgentId,
-    /// Its first row, the `Created` the journal carries: who it is and
-    /// where it works.
-    pub created: transcript::TranscriptEvent,
-    /// Its role now, which a `RoleChanged` may have moved since.
-    pub role: AgentRole,
-    /// The title generated for it. A spawn name, in `created`, beats it.
-    pub title: Option<String>,
-    /// When its newest row was written.
-    pub last_active: UnixMs,
-}
-
 /// What a client says on its agents session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
@@ -167,16 +145,6 @@ pub enum ClientFrame {
     /// every later append on any agent, and the live tails, are pushed on
     /// this stream. A second `Follow` replaces the first.
     Follow { since: Seq },
-    /// After [`ServerFrame::JournalHead`], instead of `Follow`: only these
-    /// agents, for a client that shows one of them and holds nothing of
-    /// the rest. The host answers with each agent's whole history as
-    /// [`ServerFrame::Log`] pages, every entry stamped with the journal
-    /// head the follow started from. Then it follows from that head with
-    /// only these agents' rows, and sends [`ServerFrame::Live`] statuses
-    /// for only these agents, at most 256 of them. A later `Follow` or
-    /// `FollowAgents` replaces it. A host older than this frame closes the
-    /// session.
-    FollowAgents { agent_ids: Vec<AgentId> },
     /// The agents whose live frames this client wants: the ones on screen.
     /// Everything durable arrives on the journal regardless, so this only
     /// decides who streams partial text and tools in flight. Replaces the
@@ -419,9 +387,6 @@ mod tests {
         });
         round_trips(ClientFrame::Focus { agent_ids: vec![] });
         round_trips(ClientFrame::Follow { since: Seq(9) });
-        round_trips(ClientFrame::FollowAgents {
-            agent_ids: vec![agent_id],
-        });
         round_trips(ClientFrame::Detail {
             agent_id,
             pos: AgentPos(3),

@@ -17,23 +17,18 @@ fn pr_commands_are_not_available() {
     assert!(Args::try_parse(["pr", "status"].into_iter().map(str::to_owned)).is_err());
 }
 
-/// A bare `rho`, `rho attach` and the chat's flags go to `rho-term`; the
-/// host's commands and help do not.
+/// A bare `rho` is `rho share`; `attach` and the old chat's flags are
+/// gone with the chat.
 #[test]
-fn bare_rho_and_attach_are_the_chat() {
-    let chat = |args: &[&str]| chat_args(args.iter().map(|arg| (*arg).to_owned()));
-    assert_eq!(chat(&[]), Some(vec![]));
-    assert_eq!(
-        chat(&["attach", "abc"]),
-        Some(vec!["attach".to_owned(), "abc".to_owned()])
-    );
-    assert_eq!(
-        chat(&["--role", "high-eng"]),
-        Some(vec!["--role".to_owned(), "high-eng".to_owned()])
-    );
-    assert_eq!(chat(&["--help"]), None);
-    assert_eq!(chat(&["eval", "task"]), None);
-    assert!(Args::try_parse(std::iter::empty()).is_err());
+fn bare_rho_is_share() {
+    let parse = |args: &[&str]| Args::try_parse(args.iter().map(|arg| (*arg).to_owned()));
+    assert!(matches!(parse(&[]).unwrap().command, Command::Share(_)));
+    assert!(matches!(
+        parse(&["share"]).unwrap().command,
+        Command::Share(_)
+    ));
+    assert!(parse(&["attach", "abc"]).is_err());
+    assert!(parse(&["--role", "high-eng"]).is_err());
 }
 
 #[test]

@@ -1,18 +1,10 @@
-use std::ffi::{CString, OsStr, OsString};
-use std::fs::File;
-use std::io::Read as _;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::os::unix::ffi::OsStrExt as _;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::layout::MOUNT_ROOT;
 use crate::{PathOverrides, UserEnvironment, Workset, WorksetId, Worksets};
-
-/// Largest file [`read_file_bounded`] will ever return.
-pub const MAX_BOUNDED_READ: usize = 64 * 1024 * 1024;
 
 /// Filesystem inputs for one execution process: a workset's, or the one
 /// host process that runs agents without a workset. The agent host
@@ -139,49 +131,6 @@ pub(crate) fn devshell_cache(cache: &Utf8Path) -> Utf8PathBuf {
     cache.join("rho-devshell")
 }
 
-/// Read a regular file at an absolute path beneath `root`, refusing lexical
-/// escapes, symlinks that escape `root`, and files above the bounded limit.
-pub async fn read_file_bounded(
-    root: &Utf8Path,
-    path: &Path,
-    max_len: usize,
-) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        max_len <= MAX_BOUNDED_READ,
-        "read limit {max_len} exceeds {MAX_BOUNDED_READ} bytes"
-    );
-    anyhow::ensure!(root.is_absolute(), "root must be absolute: {root}");
-    let path = Utf8Path::from_path(path).context("path is not valid UTF-8")?;
-    anyhow::ensure!(path.is_absolute(), "file path must be absolute: {path}");
-    let relative = crate::visible_relative(root.as_str(), path)?
-        .as_std_path()
-        .to_owned();
-    let root = root.to_owned();
-    let display = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let mut file = open_beneath(root.as_std_path(), &relative)
-            .with_context(|| format!("open {display}"))?;
-        let metadata = file.metadata()?;
-        anyhow::ensure!(metadata.is_file(), "not a regular file: {display}");
-        anyhow::ensure!(
-            metadata.len() <= max_len as u64,
-            "{display} is {} bytes, over the {max_len} byte limit",
-            metadata.len()
-        );
-        let mut contents = Vec::with_capacity(metadata.len() as usize);
-        file.by_ref()
-            .take(max_len as u64 + 1)
-            .read_to_end(&mut contents)?;
-        anyhow::ensure!(
-            contents.len() <= max_len,
-            "{display} grew past the {max_len} byte limit while reading"
-        );
-        Ok(contents)
-    })
-    .await
-    .context("bounded read task panicked")?
-}
-
 /// `PATH` with `bin` first (and not repeated later).
 fn prepend_path(bin: &Path, path: Option<&OsStr>) -> OsString {
     let rest = path
@@ -193,44 +142,6 @@ fn prepend_path(bin: &Path, path: Option<&OsStr>) -> OsString {
         .unwrap_or_default();
     std::env::join_paths(std::iter::once(bin.to_owned()).chain(rest))
         .unwrap_or_else(|_| bin.as_os_str().to_owned())
-}
-
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-/// Opens `path` below `root` with the kernel refusing any resolution step
-/// (symlink, `..`, magic link) that would leave `root`. Symlinks that stay
-/// inside are followed.
-fn open_beneath(root: &Path, path: &Path) -> anyhow::Result<File> {
-    let root = File::open(root).with_context(|| format!("open workset {}", root.display()))?;
-    let path =
-        CString::new(path.as_os_str().as_bytes()).context("file path contains a NUL byte")?;
-    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-    const RESOLVE_BENEATH: u64 = 0x08;
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH,
-    };
-    // SAFETY: `path` and `how` outlive the syscall; a non-negative result is
-    // a descriptor this process now owns.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            std::mem::size_of::<OpenHow>(),
-        )
-    } as i32;
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 pub(crate) fn close_inherited_fds_on_exec() -> std::io::Result<()> {

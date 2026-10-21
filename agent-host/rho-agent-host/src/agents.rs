@@ -275,20 +275,7 @@ where
                 follow = Some(spawn_log_follow(
                     Arc::clone(&services),
                     outgoing_tx.clone(),
-                    Scope::All { since },
-                ));
-            }
-            ClientFrame::FollowAgents { agent_ids } => {
-                if agent_ids.len() > 256 {
-                    break Err(anyhow::anyhow!("too many followed agents"));
-                }
-                if let Some(previous) = follow.take() {
-                    previous.abort();
-                }
-                follow = Some(spawn_log_follow(
-                    Arc::clone(&services),
-                    outgoing_tx.clone(),
-                    Scope::Agents(agent_ids),
+                    since,
                 ));
             }
             ClientFrame::Focus { agent_ids } => {
@@ -346,38 +333,22 @@ where
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
-    scope: Scope,
+    since: Seq,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Both subscribed before the first read, so nothing that lands
         // during it is lost; the seq drops duplicate rows.
         let statuses = services.pool.watch_statuses().await;
         let mut feed = rho_agent::journal::feed(&services.db);
-        let (mut sent, agents) = match scope {
-            Scope::All { since } => (since, None),
-            Scope::Agents(agent_ids) => {
-                let Some(head) = send_history(&services.db, &outgoing_tx, &agent_ids).await else {
-                    return;
-                };
-                (head, Some(agent_ids.into_iter().collect::<HashSet<_>>()))
-            }
-        };
-        let wanted = |agent_id: &AgentId| {
-            agents
-                .as_ref()
-                .is_none_or(|agents| agents.contains(agent_id))
-        };
+        let mut sent = since;
         loop {
             // Taken before the rows are read: an agent's status arrives
             // after the rows it reflects commit, so they go out first.
             let changed = statuses.take();
-            if !send_journal_from(&services.db, &outgoing_tx, &mut sent, &wanted).await {
+            if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
                 return;
             }
             for (agent_id, status) in changed {
-                if !wanted(&agent_id) {
-                    continue;
-                }
                 let live = rho_agents_client::protocol::transcript::Live::Snapshot {
                     state: status.runtime.clone(),
                     response: status.response.clone(),
@@ -404,65 +375,12 @@ fn spawn_log_follow(
     })
 }
 
-/// What a follow sends: the whole journal from a seq, or a few agents.
-enum Scope {
-    All { since: Seq },
-    Agents(Vec<AgentId>),
-}
-
-/// Each agent's whole history, as `Log` pages stamped with the journal
-/// head read before it. Returns that head, where the follow goes on from,
-/// or `None` when the connection is gone. A row that lands between the
-/// head and the read goes out twice, here and in the follow; the reader
-/// drops a position it already holds.
-async fn send_history(
-    db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
-    agent_ids: &[AgentId],
-) -> Option<Seq> {
-    let head = db.read().journal_head();
-    for &agent_id in agent_ids {
-        let mut from = rho_agent_types::AgentPos(0);
-        // An agent this host does not hold has no history to send.
-        while let Ok(page) =
-            agent_log_page(db, rho_agents_client::protocol::AgentLog { agent_id, from })
-        {
-            let entries = page
-                .rows
-                .into_iter()
-                .map(
-                    |(pos, event)| rho_agents_client::protocol::transcript::LogEntry {
-                        seq: head,
-                        agent_id,
-                        pos,
-                        event,
-                    },
-                )
-                .collect::<Vec<_>>();
-            if !entries.is_empty()
-                && outgoing_tx
-                    .send(rho_agents_client::protocol::ServerFrame::Log { entries })
-                    .is_err()
-            {
-                return None;
-            }
-            let Some(next) = page.next else {
-                break;
-            };
-            from = next;
-            tokio::task::yield_now().await;
-        }
-    }
-    Some(head)
-}
-
 /// Pages the journal out from after `sent`, moving it as it goes. False
 /// when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
-    wanted: &impl Fn(&AgentId) -> bool,
 ) -> bool {
     let mut carries = Carries::new();
     loop {
@@ -473,7 +391,6 @@ async fn send_journal_from(
         *sent = *last;
         let entries = page
             .into_iter()
-            .filter(|(_, agent_id, _, _)| wanted(agent_id))
             .filter_map(|(seq, agent_id, pos, event)| {
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
@@ -525,48 +442,6 @@ fn strip_row(
         _ => {}
     }
     crate::transcript::strip(event, prior_carry)
-}
-
-/// Every agent, by its head and its first and last rows: one read each, and
-/// none of the log between.
-fn agent_directory(db: &RhoDb) -> Vec<rho_agents_client::protocol::DirectoryEntry> {
-    let read = db.read();
-    let mut carries = Carries::new();
-    read.list_agents()
-        .into_iter()
-        .filter_map(|(agent_id, head)| {
-            let first = rho_agent::log::AgentEventPos::new(0);
-            let created = strip_row(
-                db,
-                &mut carries,
-                agent_id,
-                first,
-                &read.agent_event(agent_id, first)?,
-            )?;
-            let last_active = head
-                .next
-                .pos
-                .checked_sub(1)
-                .map(rho_agent::log::AgentEventPos::new)
-                .and_then(|last| {
-                    strip_row(
-                        db,
-                        &mut carries,
-                        agent_id,
-                        last,
-                        &read.agent_event(agent_id, last)?,
-                    )
-                })
-                .map_or(created.at(), |event| event.at());
-            Some(rho_agents_client::protocol::DirectoryEntry {
-                agent_id,
-                created,
-                role: head.config.role,
-                title: head.generated_title,
-                last_active,
-            })
-        })
-        .collect()
 }
 
 /// One page of an agent's rows, stripped as the journal strips them.
@@ -649,12 +524,6 @@ where
         Request::AgentLog(call) => {
             respond(writer, call, |call| async {
                 agent_log_page(&services.db, call)
-            })
-            .await
-        }
-        Request::AgentDirectory(call) => {
-            respond(writer, call, |_| async {
-                Ok(agent_directory(&services.db))
             })
             .await
         }
@@ -1156,110 +1025,7 @@ mod tests {
     use rho_agents_client::protocol::ServerFrame;
     use rho_agents_client::protocol::transcript::TranscriptEvent;
 
-    use super::{agent_directory, detail_result, send_history, send_journal_from};
-
-    /// A follow of one agent sends that agent's history at the head, then
-    /// only its new rows, though another agent writes between them.
-    #[tokio::test]
-    async fn a_follow_of_one_agent_sends_its_history_then_only_its_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let created = AgentEvent::Created {
-            role: Default::default(),
-            binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
-            runtime: rho_agent::log::AgentRuntime::Rho {
-                prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
-            },
-            place: rho_agent_types::Place {
-                workset: Some("0123456789ab".parse().unwrap()),
-                cwd: "/src/rho".into(),
-            },
-            spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
-            spawn_name: None,
-            created_at: UnixMs(0),
-            parent: None,
-        };
-        let said = |text: &str| {
-            AgentEvent::Entry(Entry::Received {
-                at: UnixMs(1),
-                id: rho_agent::entry::MessageId(1),
-                from: rho_agent::entry::Party::Human,
-                body: vec![rho_agent::entry::Block::Text(text.into())],
-            })
-        };
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let followed = write.alloc_agent_id();
-        let other = write.alloc_agent_id();
-        write.append_agent_event(followed, &created);
-        write.append_agent_event(other, &created);
-        write.append_agent_event(other, &said("not this one"));
-        write.append_agent_event(followed, &said("before"));
-        write.commit();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let head = send_history(&db, &tx, &[followed]).await.unwrap();
-        assert_eq!(head, Seq(4));
-        let mut history = Vec::new();
-        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
-            history.extend(entries);
-        }
-        assert!(
-            history
-                .iter()
-                .all(|entry| entry.agent_id == followed && entry.seq == head)
-        );
-        assert_eq!(
-            history.iter().map(|entry| entry.pos.0).collect::<Vec<_>>(),
-            [0, 1]
-        );
-
-        let mut write = db.write().await;
-        write.append_agent_event(other, &said("still not"));
-        write.append_agent_event(followed, &said("after"));
-        write.commit();
-        let mut sent = head;
-        assert!(send_journal_from(&db, &tx, &mut sent, &|agent| *agent == followed).await);
-        let mut after = Vec::new();
-        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
-            after.extend(entries);
-        }
-        assert_eq!(sent, Seq(6));
-        assert_eq!(after.len(), 1, "{after:?}");
-        assert_eq!(
-            (after[0].agent_id, after[0].pos.0, after[0].seq),
-            (followed, 2, Seq(6))
-        );
-        assert!(
-            matches!(&after[0].event, TranscriptEvent::Received { text, .. } if text == "after")
-        );
-
-        let mut write = db.write().await;
-        write.append_agent_event(
-            other,
-            &AgentEvent::Entry(Entry::Received {
-                at: UnixMs(7),
-                id: rho_agent::entry::MessageId(2),
-                from: rho_agent::entry::Party::Human,
-                body: vec![rho_agent::entry::Block::Text("late".into())],
-            }),
-        );
-        write.commit();
-        let directory = agent_directory(&db);
-        assert_eq!(
-            directory
-                .iter()
-                .map(|entry| (entry.agent_id, entry.last_active))
-                .collect::<std::collections::BTreeMap<_, _>>(),
-            [(followed, UnixMs(1)), (other, UnixMs(7))].into(),
-            "each agent by its last row"
-        );
-        assert!(
-            directory
-                .iter()
-                .all(|entry| matches!(entry.created, TranscriptEvent::Created { .. }))
-        );
-    }
+    use super::{detail_result, send_journal_from};
 
     #[tokio::test]
     async fn a_request_after_a_rewind_reports_the_step_still_standing() {
@@ -1324,7 +1090,7 @@ mod tests {
         write.commit();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_journal_from(&db, &tx, &mut Seq(0), &|_| true).await);
+        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
         let mut reported = Vec::new();
         while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
             for entry in entries {

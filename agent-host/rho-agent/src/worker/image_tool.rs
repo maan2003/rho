@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use rho_agent_types::transcript::{ImageContent, ImageDetail};
 
 #[derive(Clone)]
@@ -41,15 +42,38 @@ impl ImageTools {
         } else {
             self.cwd.as_std_path().join(args.path)
         };
-        let bytes = rho_fs_view::read_file_bounded(
-            camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-            &visible,
-            rho_image::MAX_SOURCE_BYTES,
-        )
-        .await?;
+        // Any file the notebook could open itself: its Python reads
+        // anywhere this process can, so a narrower view would protect nothing.
+        let path = visible.clone();
+        let bytes = tokio::task::spawn_blocking(move || read_bounded(&path))
+            .await
+            .context("image read task panicked")??;
         let prepared = rho_image::prepare_with_detail(bytes, args.detail).await?;
         Ok((visible, prepared))
     }
+}
+
+/// A regular file of at most [`rho_image::MAX_SOURCE_BYTES`].
+fn read_bounded(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let max_len = rho_image::MAX_SOURCE_BYTES;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "not a regular file: {}", path.display());
+    anyhow::ensure!(
+        metadata.len() <= max_len as u64,
+        "{} is {} bytes, over the {max_len} byte limit",
+        path.display(),
+        metadata.len()
+    );
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_len as u64 + 1).read_to_end(&mut contents)?;
+    anyhow::ensure!(
+        contents.len() <= max_len,
+        "{} grew past the {max_len} byte limit while reading",
+        path.display()
+    );
+    Ok(contents)
 }
 
 #[cfg(test)]
@@ -59,8 +83,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn loads_an_image_outside_the_workset() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let path = temp.path().join("capture.png");
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(3, 2, Rgba([1, 2, 3, 255])))
+            .save(&path)
+            .unwrap();
+        let (text, image) = ImageTools::new("/src".into())
+            .view(ViewImageArgs {
+                path: path.clone(),
+                detail: ImageDetail::High,
+            })
+            .await
+            .unwrap();
+        assert!(text.contains("(3x2)"), "{text}");
+        assert_eq!(image.media_type, "image/png");
+    }
+
+    #[tokio::test]
     async fn loads_relative_path_with_original_detail() {
-        let temp = tempfile::tempdir_in("/src").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let source =
             DynamicImage::ImageRgba8(ImageBuffer::from_pixel(4096, 1, Rgba([10, 20, 30, 255])));
         let work = temp.path().join("work");
