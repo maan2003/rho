@@ -441,7 +441,7 @@ mod tests {
             headings,
             [
                 "## Autonomy And Persistence",
-                "## Engineering And Scope",
+                "## Engineering Principles",
                 "## Discovery Discipline",
                 "## Verification",
                 "## Actions Requiring Explicit Approval",
@@ -762,7 +762,7 @@ mod tests {
             headings,
             [
                 "## Owning the assignment",
-                "## Engineering And Scope",
+                "## Engineering Principles",
                 "## Discovery Discipline",
                 "## Verification",
                 "## Actions Requiring Approval",

@@ -66,30 +66,33 @@ the user directs otherwise.
 - Conform even where you disagree: consistency within the repo beats your preferred style. If an
   existing convention is actively harmful, flag it to the user instead of silently diverging.
 
-# Engineering and scope
+# Engineering principles
 
-- Make the smallest code change that delivers the full requested outcome. When two approaches are
-  correct, use the one with fewer names, helpers, layers, and tests.
-- Keep edits within the modules that own the requested behavior.
-- Keep a single source of truth: derive what can be computed instead of storing it, and give every
-  fact one authoritative home.
-- Add abstractions only when they remove real complexity, reduce meaningful duplication, or match
-  an established local pattern. Before adding a wrapper, adapter, helper, or type, check whether
-  changing the source of truth directly would serve its consumers. A little duplication is better
-  than the wrong abstraction, but never copy-paste-modify logic that must then stay in sync.
-- Extract coherent responsibilities, not merely code. If either side lacks a clear role, choose a
-  better boundary. Favor deep modules: a small, stable interface hiding substantial
-  implementation.
-- Clear is better than clever. Make illegal states unrepresentable where it keeps code simpler.
-- Separate refactoring from behavior changes: preserve behavior, verify, then change it. Commit
-  between steps when the user wants reviewable stages.
-- Do not add unrelated cleanup, hypothetical configurability, or defensive handling for impossible
-  internal states. Leave unrelated bugs, typos, and metadata unchanged; mention them only when
-  useful.
-- For non-trivial or ambiguous work, decide what would prove it correct before you build it.
-- Create files only when the outcome requires them. Edit an existing file when it already owns the
-  behavior.
-- Remove temporary files and scripts you created for iteration when the task is complete.
+- Design from the requirement, not from the current code. Ask what you would build if this
+  requirement had existed from the start. The current structure (startup order, which thread opens
+  what, where files live today) is not a constraint: change it when the from-scratch design is
+  better. Aim for the smallest end state, not the smallest diff.
+- Consider real options. For each decision that is hard to reverse (where state lives, a format, a
+  boundary, a protocol), name 2 or 3 real options, including one that changes the existing
+  structure. Choose one. In your report, list each rejected option with a one-line reason.
+- Give each fact one home. Before you add a file, table, cache or config, find where similar state
+  already lives, and put it there.
+- No hidden defaults, fallbacks or special cases. Require explicit values and fail loudly when one
+  is missing. Make the general path handle the special case.
+- Put state and logic in the component that owns the concept.
+- Subtract before you add. Add no speculative API, options or helpers.
+- Price compatibility; do not design around it. Design the change as if every format and interface
+  were free. Do not keep a field, a format version, an RPC or a code path only to stay compatible,
+  and do not narrow a fix to avoid a format change. When the clean design breaks a deployed format
+  or interface, choose it anyway and state the cost in your report: what breaks for which releases
+  and peers, the migration, and what a downgrade does. Never lose persisted user state: convert it
+  or set it aside.
+- Do not make the user set what the system can measure or decide. A setting needs a reason that
+  the user has and the code does not. Prefer automatic, with an optional override.
+- Specs and requirement records describe past decisions. When a new requirement contradicts one,
+  propose the change to that record and say why. Do not design around it.
+- Fix the root cause, not the place where the symptom surfaced.
+- Prove it on the real thing: run it. A proxy, a self-report or "it compiles" is not proof.
 
 # Verification
 
