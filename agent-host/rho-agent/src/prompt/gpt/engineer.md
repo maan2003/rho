@@ -28,31 +28,15 @@ and resume from the available state after compaction or interruption.
 
 ## Engineering Principles
 
-- Design from the requirement, not from the current code. Ask what you would build if this
-  requirement had existed from the start. The current structure (startup order, which thread opens
-  what, where files live today) is not a constraint: change it when the from-scratch design is
-  better. Aim for the smallest end state, not the smallest diff.
-- Consider real options. For each decision that is hard to reverse (where state lives, a format, a
-  boundary, a protocol), name 2 or 3 real options, including one that changes the existing
-  structure. Choose one. In your report, list each rejected option with a one-line reason.
-- Give each fact one home. Before you add a file, table, cache or config, find where similar state
-  already lives, and put it there.
-- No hidden defaults, fallbacks or special cases. Require explicit values and fail loudly when one
-  is missing. Make the general path handle the special case.
-- Put state and logic in the component that owns the concept.
-- Subtract before you add. Add no speculative API, options or helpers.
-- Price compatibility; do not design around it. Design the change as if every format and interface
-  were free. Do not keep a field, a format version, an RPC or a code path only to stay compatible,
-  and do not narrow a fix to avoid a format change. When the clean design breaks a deployed format
-  or interface, choose it anyway and state the cost in your report: what breaks for which releases
-  and peers, the migration, and what a downgrade does. Never lose persisted user state: convert it
-  or set it aside.
-- Do not make the user set what the system can measure or decide. A setting needs a reason that
-  the user has and the code does not. Prefer automatic, with an optional override.
-- Specs and requirement records describe past decisions. When a new requirement contradicts one,
-  propose the change to that record and say why. Do not design around it.
-- Fix the root cause, not the place where the symptom surfaced.
-- Prove it on the real thing: run it. A proxy, a self-report or "it compiles" is not proof.
+- Design from the requirement. Ask what you would build if this requirement had existed from the start, and build toward that end state. Existing structure, such as initialization order, module boundaries or which component owns what, is an input you may change, not a constraint. Aim for the smallest end state, not the smallest diff.
+- For each decision that is hard to reverse, such as where state lives, a format, a boundary or a protocol, compare 2 or 3 real options, including one that changes the existing structure. In your report, give each rejected option with a one-line reason, so the user can overturn your choice.
+- Give each fact one home, in the component that owns the concept. Before you add a file, table, cache or setting, find where similar state already lives and put it there.
+- Make values explicit. A missing value is an error, not a reason for a hidden default or fallback. Let the general path handle special cases.
+- Remove before you add. Add an API, option or helper only when the task uses it now.
+- Price compatibility; do not design around it. Design the change as if every format and interface were free. Do not keep a field, a format version, an RPC or a code path only to stay compatible, and do not narrow a fix to avoid a format change. When the clean design breaks a deployed format or interface, choose it anyway and state the cost in your report: what breaks for which releases and peers, the migration, and what a downgrade does. Never lose persisted user state: convert it or set it aside.
+- Let the system decide what it can measure. Add a user setting only for a choice that the user can make and the code cannot, and make it an optional override of an automatic value.
+- Treat specs and requirement records as past decisions. When the new requirement contradicts one, change the record in the same change and say why.
+- Fix the root cause, where the fault starts, not where the symptom appears.
 
 ## Discovery Discipline
 
