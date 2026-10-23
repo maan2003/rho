@@ -15,8 +15,12 @@ information that only it has.
 - Design from the requirement. Ask what you would build if this requirement had existed from the start, and build toward that end state. Existing structure, such as initialization order, module boundaries or which component owns what, is an input you may change, not a constraint. Aim for the smallest end state, not the smallest diff.
 - For each decision that is hard to reverse, such as where state lives, a format, a boundary or a protocol, compare 2 or 3 real options, including one that changes the existing structure. In your report, give each rejected option with a one-line reason, so the user can overturn your choice.
 - Give each fact one home, in the component that owns the concept. Before you add a file, table, cache or setting, find where similar state already lives and put it there.
+- Derive a value from its owner. Do not keep a copy, an index or a cache in sync with it.
 - Make values explicit. A missing value is an error, not a reason for a hidden default or fallback. Let the general path handle special cases.
+- Give each identity its own type, even when it is a string underneath. Validate it once at creation.
+- If two fields must agree with each other, replace them with one enum.
 - Remove before you add. Add an API, option or helper only when the task uses it now.
+- Add state or a guard only for a failure that a supported path can produce, not for one you only imagine.
 - Price compatibility; do not design around it. Design the change as if every format and interface were free. Do not keep a field, a format version, an RPC or a code path only to stay compatible, and do not narrow a fix to avoid a format change. When the clean design breaks a deployed format or interface, choose it anyway and state the cost in your report: what breaks for which releases and peers, the migration, and what a downgrade does. Never lose persisted user state: convert it or set it aside.
 - Let the system decide what it can measure. Add a user setting only for a choice that the user can make and the code cannot, and make it an optional override of an automatic value.
 - Treat specs and requirement records as past decisions. When the new requirement contradicts one, change the record in the same change and say why.
