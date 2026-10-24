@@ -2618,14 +2618,7 @@ impl Workspace {
             }
         };
         self.note_agent_created(host, agent_id);
-        if let Some(key) = self.hosts.get(host).map(|entry| entry.target.key())
-            && self.last_placed.as_ref() != Some(&key)
-        {
-            if let Some(db) = rho_db::client::shared() {
-                rho_agent_hosts::saved::save_last_placed(&db, &key);
-            }
-            self.last_placed = Some(key);
-        }
+        self.remember_placement(host);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
             self.write_marks(writes, cx);
@@ -3407,21 +3400,83 @@ impl Workspace {
     }
 
     /// The attached agent hosts and how each is doing, as one notice line.
-    pub(crate) fn cmd_hosts(&mut self, cx: &mut Context<Self>) {
-        let listing = self
-            .hosts
-            .iter()
-            .map(|host| {
-                format!(
-                    "{} {} · {}",
-                    host.name,
-                    host.status.label(),
-                    host.target.describe()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.notice_on(None, &listing, StyleClass::SystemInfo, cx);
+    /// Lists the attached hosts in the minibuffer, each with whether it
+    /// answers, its agents, and where it is. Choosing one makes it this
+    /// client's default for new work.
+    pub(crate) fn prompt_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hosts.is_empty() {
+            return self.notice_on(None, "no agent hosts attached", StyleClass::SystemInfo, cx);
+        }
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .hosts
+                .iter()
+                .filter(|host| host.name.to_lowercase().contains(&needle))
+                .map(|host| crate::commands::Candidate {
+                    value: host.name.clone(),
+                    description: workspace.host_summary(host.id),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace.cmd_host_default(input.trim(), cx);
+            },
+        );
+        self.open_prompt("default host:", complete, on_submit, window, cx);
+    }
+
+    /// What the hosts list says of one host: whether it answers, how many
+    /// agents it runs, whether new work goes there by default, and where
+    /// it is.
+    pub(crate) fn host_summary(&self, id: HostId) -> String {
+        let Some(host) = self.hosts.get(id) else {
+            return String::new();
+        };
+        let agents = match self.registry.host_agents(id).len() {
+            1 => "1 agent".to_owned(),
+            n => format!("{n} agents"),
+        };
+        let default = if self.default_host() == Some(id) {
+            " · default"
+        } else {
+            ""
+        };
+        format!(
+            "{} · {agents}{default} · {}",
+            host.status.label(),
+            host.target.describe()
+        )
+    }
+
+    pub(crate) fn cmd_host_default(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.by_name(name).map(|host| host.id) else {
+            let message = format!("default host: no host named `{name}`");
+            return self.notice_on(None, &message, StyleClass::StatusError, cx);
+        };
+        self.remember_placement(host);
+        self.refresh_draft_host(cx);
+        let message = format!("new agents go to {name} by default");
+        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+    }
+
+    /// Makes `host` this client's default: the last placement, kept by
+    /// machine so it outlives the host's name and this run.
+    fn remember_placement(&mut self, host: HostId) {
+        let Some(key) = self.hosts.get(host).map(|entry| entry.target.key()) else {
+            return;
+        };
+        if self.last_placed.as_ref() == Some(&key) {
+            return;
+        }
+        if let Some(db) = rho_db::client::shared() {
+            rho_agent_hosts::saved::save_last_placed(&db, &key);
+        }
+        self.last_placed = Some(key);
     }
 
     /// Attaches an agent host named on the spot, for a machine that is not
@@ -6045,7 +6100,7 @@ impl Workspace {
             Command::SlackMarkUnread => self.slack_mark_unread(window, cx),
             Command::SlackSaveForLater => self.slack_save_for_later(window, cx),
             Command::SlackRegister => self.prompt_slack_register(window, cx),
-            Command::HostsList => self.cmd_hosts(cx),
+            Command::HostsList => self.prompt_hosts(window, cx),
             Command::HostAttach => self.prompt_host_attach(window, cx),
             Command::HostDetach => self.prompt_host_detach(window, cx),
             Command::HostAuth => self.open_host_auth_transient(window, cx),

@@ -515,7 +515,7 @@ pub(crate) fn slack_menu() -> Menu {
 /// they live one level down rather than on the root's crowded first row.
 pub(crate) fn hosts_menu() -> Menu {
     Menu::new("hosts")
-        .item("l", "list", MenuAction::Command(Command::HostsList))
+        .item("l", "list…", MenuAction::Command(Command::HostsList))
         .item("a", "attach…", MenuAction::Command(Command::HostAttach))
         .item("d", "detach…", MenuAction::Command(Command::HostDetach))
         .item("u", "auth…", MenuAction::Command(Command::HostAuth))

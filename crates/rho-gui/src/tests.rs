@@ -6805,6 +6805,18 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
         1,
         "moss is the default now"
     );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let fern = workspace.host_summary(HostId(0));
+            let moss = workspace.host_summary(HostId(1));
+            assert!(fern.starts_with("online · 0 agents · /"), "{fern}");
+            assert!(moss.contains(" · default · "), "{moss}");
+            workspace.cmd_host_default("fern", cx);
+            assert!(workspace.host_summary(HostId(0)).contains(" · default · "));
+            assert!(!workspace.host_summary(HostId(1)).contains("default"));
+            workspace.cmd_host_default("moss", cx);
+        })
+        .unwrap();
 
     // An area that names fern places its agents there, over the last
     // placement, because the desk said so.
