@@ -1106,6 +1106,9 @@ impl Workspace {
         if self.voice.is_on(host) {
             self.voice.stop();
         }
+        if self.git_approval.forget_host(host) && !self.git_approval.waiting() {
+            self.finish_overlay_focus(window, cx);
+        }
         self.hosts.detach(host);
         self.refresh_draft_host(cx);
         self.quotas.forget(host);
@@ -2042,10 +2045,10 @@ impl Workspace {
             ConnEvent::Disconnected(reason) => {
                 self.desktop_sessions.remove(&host);
                 // An agent host that goes is an agent host that is no longer
-                // asking; the request still has to be answered,
-                // or it is left blocked on a channel nobody
-                // will send on.
-                if self.git_approval.answer(GitApprovalDecision::Done) {
+                // asking; its requests still have to be answered, or they
+                // are left blocked on a channel nobody will send on. The
+                // other hosts' requests stay.
+                if self.git_approval.forget_host(host) && !self.git_approval.waiting() {
                     self.finish_overlay_focus(window, cx);
                 }
                 // The host's agents stay in the rail with their retained
@@ -2095,7 +2098,7 @@ impl Workspace {
                 // no, and a menu is a choice with nothing typed into it,
                 // reopened at no cost — a prompt has the reader's text in
                 // it, and that is what "another prompt is active" means.
-                if self.minibuffer.is_some() || self.git_approval.waiting() {
+                if self.minibuffer.is_some() {
                     let _ = response.send(GitApprovalDecision::Deny);
                     let source = self.error_source(host);
                     self.notice_on(
@@ -2114,17 +2117,20 @@ impl Workspace {
                     true => format!("{}: {prompt}", self.hosts.host_label(host)),
                     false => prompt,
                 };
-                self.git_approval.ask(request_id, prompt, response);
-                self.overlay_focus.capture(window, cx);
-                window.focus(self.git_approval.focus_handle(), cx);
+                let first = !self.git_approval.waiting();
+                self.git_approval.ask(host, request_id, prompt, response);
+                if first {
+                    self.overlay_focus.capture(window, cx);
+                    window.focus(self.git_approval.focus_handle(), cx);
+                }
                 self.echo = None;
                 cx.notify();
             }
             ConnEvent::GitTransportDone { request_id } => {
-                if self.git_approval.done(request_id) {
+                if self.git_approval.done(host, request_id) && !self.git_approval.waiting() {
                     self.finish_overlay_focus(window, cx);
-                    cx.notify();
                 }
+                cx.notify();
             }
         }
         // Every agent host event funnels through here, so this one call is
@@ -2730,18 +2736,6 @@ impl Workspace {
     /// Every command a transient can run goes through one of these
     /// `cmd_*` methods: no textual grammar, no dispatch enum — the menu
     /// item closure is the command.
-    fn require_connected(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.connected() {
-            self.notice_on(
-                None,
-                "not connected to an agent host",
-                StyleClass::SystemInfo,
-                cx,
-            );
-        }
-        self.connected()
-    }
-
     /// The selected agent's agent host must be answering for an agent-scoped
     /// command to mean anything; another host being up is no help.
     fn require_agent_online(&mut self, agent_id: AgentId, cx: &mut Context<Self>) -> bool {
@@ -5547,10 +5541,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.git_approval.answer(decision) {
+        if self.git_approval.answer(decision) && !self.git_approval.waiting() {
             self.finish_overlay_focus(window, cx);
-            cx.notify();
         }
+        cx.notify();
     }
 
     /// Opens a completing-read prompt in the bottom strip: the primitive

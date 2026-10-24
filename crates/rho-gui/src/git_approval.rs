@@ -10,30 +10,37 @@
 //! menu, and like them it borrows the bottom strip and takes focus while
 //! it is up.
 
+use std::collections::VecDeque;
+
 use gpui::prelude::*;
 use gpui::{AnyElement, App, FocusHandle, TextStyle, Window, div};
+use rho_agent_hosts::HostId;
 use rho_agent_hosts::connection::GitApprovalDecision;
 use theme::ActiveTheme as _;
 
 /// A request waiting for the user's answer, and the channel the agent host is
-/// blocked on.
+/// blocked on. Request ids are each host's own, so the host is part of
+/// which request it is.
 struct Pending {
+    host: HostId,
     request_id: u64,
     prompt: String,
     response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
 }
 
-/// The approval prompt, up or not.
+/// The approval prompt: the requests waiting, oldest first. The first is
+/// the one shown; the rest wait their turn rather than being refused, since
+/// two hosts asking at once is ordinary.
 pub(crate) struct GitApproval {
     focus: FocusHandle,
-    pending: Option<Pending>,
+    pending: VecDeque<Pending>,
 }
 
 impl GitApproval {
     pub(crate) fn new(cx: &mut App) -> Self {
         Self {
             focus: cx.focus_handle(),
-            pending: None,
+            pending: VecDeque::new(),
         }
     }
 
@@ -45,46 +52,60 @@ impl GitApproval {
 
     /// Whether a request is waiting for an answer.
     pub(crate) fn waiting(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
     }
 
-    /// Holds a request until the user answers it.
+    /// Holds a request until the user answers it, behind any already
+    /// waiting.
     pub(crate) fn ask(
         &mut self,
+        host: HostId,
         request_id: u64,
         prompt: String,
         response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
     ) {
-        self.pending = Some(Pending {
+        self.pending.push_back(Pending {
+            host,
             request_id,
             prompt,
             response,
         });
     }
 
-    /// Answers the waiting request, and says whether there was one. The
-    /// agent host is blocked until this happens, which is why every caller
-    /// that ends the prompt goes through here.
+    /// Answers the request shown, and says whether there was one. The agent
+    /// host is blocked until this happens, which is why every caller that
+    /// ends the prompt goes through here.
     pub(crate) fn answer(&mut self, decision: GitApprovalDecision) -> bool {
-        let Some(pending) = self.pending.take() else {
+        let Some(pending) = self.pending.pop_front() else {
             return false;
         };
         let _ = pending.response.send(decision);
         true
     }
 
-    /// The agent host has finished with this request on its own. Answers
-    /// whether it was the one being waited on — another request's `Done`
-    /// says nothing about this one.
-    pub(crate) fn done(&mut self, request_id: u64) -> bool {
-        if !self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.request_id == request_id)
-        {
-            return false;
+    /// The agent host has finished with this request on its own. Says
+    /// whether it was the one shown; another host's `Done`, or this host's
+    /// for another request, takes nothing else away.
+    pub(crate) fn done(&mut self, host: HostId, request_id: u64) -> bool {
+        self.settle(|pending| pending.host == host && pending.request_id == request_id)
+    }
+
+    /// A host that went away asks nothing any more: its requests are
+    /// answered, the other hosts' stay. Says whether the one shown went.
+    pub(crate) fn forget_host(&mut self, host: HostId) -> bool {
+        self.settle(|pending| pending.host == host)
+    }
+
+    fn settle(&mut self, matches: impl Fn(&Pending) -> bool) -> bool {
+        let shown = self.pending.front().is_some_and(&matches);
+        let (gone, kept) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition::<VecDeque<_>, _>(|pending| matches(pending));
+        self.pending = kept;
+        for pending in gone {
+            let _ = pending.response.send(GitApprovalDecision::Done);
         }
-        self.answer(GitApprovalDecision::Done)
+        shown
     }
 
     /// The prompt as it is drawn in the bottom strip: what is being asked,
@@ -95,7 +116,7 @@ impl GitApproval {
         window: &Window,
         cx: &App,
     ) -> Option<AnyElement> {
-        let pending = self.pending.as_ref()?;
+        let pending = self.pending.front()?;
         let colors = cx.theme().colors();
         let mut deny = div().flex().flex_row().px_1().child("n deny");
         if self.focus.is_focused(window) {
@@ -122,7 +143,12 @@ impl GitApproval {
                                         .child("Git approval"),
                                 )
                                 .child("·")
-                                .child(pending.prompt.clone()),
+                                .child(pending.prompt.clone())
+                                .children((self.pending.len() > 1).then(|| {
+                                    div()
+                                        .text_color(colors.text_muted)
+                                        .child(format!("· {} more", self.pending.len() - 1))
+                                })),
                         )
                         .child(
                             div()
@@ -137,5 +163,51 @@ impl GitApproval {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(
+        approval: &mut GitApproval,
+        host: u32,
+        request_id: u64,
+    ) -> tokio::sync::oneshot::Receiver<GitApprovalDecision> {
+        let (response, answered) = tokio::sync::oneshot::channel();
+        approval.ask(
+            HostId(host),
+            request_id,
+            format!("{host}#{request_id}"),
+            response,
+        );
+        answered
+    }
+
+    /// Two hosts can both be waiting, with the same request id; each is
+    /// answered by what concerns it, and the user's answer goes to the
+    /// one shown.
+    #[gpui::test]
+    fn requests_from_two_hosts_wait_their_turn(cx: &mut gpui::TestAppContext) {
+        let mut approval = cx.update(GitApproval::new);
+        let mut fern = ask(&mut approval, 0, 1);
+        let mut moss = ask(&mut approval, 1, 1);
+        let mut moss_later = ask(&mut approval, 1, 2);
+
+        assert!(
+            !approval.done(HostId(1), 1),
+            "moss's request is not the one shown"
+        );
+        assert_eq!(moss.try_recv(), Ok(GitApprovalDecision::Done));
+        assert!(fern.try_recv().is_err(), "fern still waits");
+
+        assert!(approval.answer(GitApprovalDecision::Allow));
+        assert_eq!(fern.try_recv(), Ok(GitApprovalDecision::Allow));
+        assert!(approval.waiting(), "moss's second request is next");
+
+        assert!(approval.forget_host(HostId(1)), "the shown request went");
+        assert_eq!(moss_later.try_recv(), Ok(GitApprovalDecision::Done));
+        assert!(!approval.waiting());
     }
 }
