@@ -264,6 +264,9 @@ debug = "line-tables-only"
 inherits = "release"
 
 [patch.crates-io]
+# Local pulseaudio-rs fork: with no cookie file the client sends a cookie of
+# zeros of the native length, which PipeWire's pulse server requires.
+pulseaudio = { path = "vendor/pulseaudio-rs" }
 # Local noq fork: adds per-send-stream weights to fair scheduling while
 # preserving noq's strict priority classes. Keep both crates patched because
 # `noq` exposes the API and `noq-proto` owns the packet scheduler.

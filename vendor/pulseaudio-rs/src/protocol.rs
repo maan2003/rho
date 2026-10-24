@@ -25,6 +25,9 @@ pub const MIN_VERSION: u16 = 13;
 /// any higher version, but features added by versions higher than this are not supported.
 pub const MAX_VERSION: u16 = 35;
 
+/// The length of the authentication cookie servers expect.
+pub const COOKIE_LENGTH: usize = 256;
+
 /// The size of a message header.
 pub const DESCRIPTOR_SIZE: usize = 5 * 4;
 

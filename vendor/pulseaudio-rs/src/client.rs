@@ -95,7 +95,13 @@ impl Client {
         let protocol_version;
         {
             let mut reader = BufReader::new(&mut socket);
-            let cookie = cookie.as_ref().map(AsRef::as_ref).unwrap_or(&[]).to_owned();
+            // Without a cookie, a cookie of zeros of the native length, as libpulse always
+            // sends one: PipeWire's pulse server refuses AUTH with any other length, and a
+            // PulseAudio server that does not check cookies ignores its content.
+            let cookie = cookie
+                .as_ref()
+                .map(|cookie| cookie.as_ref().to_owned())
+                .unwrap_or_else(|| vec![0; protocol::COOKIE_LENGTH]);
             let auth = protocol::AuthParams {
                 version: protocol::MAX_VERSION,
                 supports_shm: false,
