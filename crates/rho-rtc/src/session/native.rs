@@ -18,7 +18,6 @@ use libwebrtc::peer_connection_factory::{
     ContinualGatheringPolicy, IceServer, PeerConnectionFactory, RtcConfiguration,
 };
 use libwebrtc::session_description::{SdpType, SessionDescription};
-use rodio::microphone::MicrophoneBuilder;
 use rodio::source::UniformSourceIterator;
 use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
 use tokio::sync::{mpsc, oneshot};
@@ -28,6 +27,12 @@ use super::*;
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u32 = 1;
 const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 100;
+/// How long opening the microphone may take. In a sandbox that asks the
+/// person first (drv on the phone), the capture stream waits unlinked until
+/// they allow the microphone, so this is their time to answer, not a
+/// server's latency. rodio's microphone allows 100 ms, which is why it is
+/// not used for capture.
+const MICROPHONE_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct RtcSession {
     peer: PeerConnection,
@@ -200,13 +205,16 @@ impl RtcSession {
         self.events.recv().await
     }
 
-    pub fn start_audio(&mut self) -> anyhow::Result<()> {
+    /// Opens the microphone and starts sending it. Waits for the person to
+    /// allow the microphone where the platform asks them.
+    pub async fn start_audio(&mut self) -> anyhow::Result<()> {
         if self.microphone_task.is_none() {
             let source = self
                 .audio_source
                 .take()
                 .context("RTC audio has already started")?;
-            self.microphone_task = Some(start_microphone(source, Arc::clone(&self.input_muted))?);
+            self.microphone_task =
+                Some(start_microphone(source, Arc::clone(&self.input_muted)).await?);
             tracing::info!("started realtime microphone after sideband readiness");
         }
         Ok(())
@@ -268,29 +276,27 @@ pub(crate) fn add_ice_candidates(
     Ok(completed)
 }
 
-fn start_microphone(
+async fn start_microphone(
     source: NativeAudioSource,
     input_muted: Arc<AtomicBool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let microphone = MicrophoneBuilder::new()
-        .default_device()?
-        .default_config()?
-        .prefer_sample_rates([
-            rodio::nz!(48_000),
-            rodio::nz!(96_000),
-            rodio::nz!(44_100),
-            rodio::nz!(16_000),
-        ])
-        .prefer_channel_counts([rodio::nz!(1), rodio::nz!(2)])
-        .prefer_buffer_sizes(512..)
-        .open_stream()?;
-    let sample_rate = microphone.sample_rate().get();
-    let channels = microphone.channels().get();
-    tracing::info!(sample_rate, channels, "opened realtime microphone");
     let (tx, mut rx) = mpsc::channel::<Vec<i16>>(16);
+    let (opened_tx, opened_rx) = oneshot::channel();
+    // The stream is opened and kept on its own thread: opening blocks until
+    // the person answers, and the stream is read with blocking receives.
     std::thread::Builder::new()
         .name("rho-rtc-microphone".to_owned())
         .spawn(move || {
+            let (_stream, microphone) = match open_microphone() {
+                Ok(opened) => {
+                    let _ = opened_tx.send(Ok(()));
+                    opened
+                }
+                Err(error) => {
+                    let _ = opened_tx.send(Err(error));
+                    return;
+                }
+            };
             let mut microphone =
                 UniformSourceIterator::new(microphone, rodio::nz!(1), rodio::nz!(48_000));
             let mut frame_count = 0_u64;
@@ -313,6 +319,9 @@ fn start_microphone(
                 }
             }
         })?;
+    opened_rx
+        .await
+        .context("the microphone thread ended before opening it")??;
     Ok(tokio::spawn(async move {
         while let Some(mut samples) = rx.recv().await {
             if input_muted.load(Ordering::Relaxed) {
@@ -330,6 +339,106 @@ fn start_microphone(
             }
         }
     }))
+}
+
+/// The default input device, at its own default configuration, and the
+/// stream that feeds it. The stream must be kept for the samples to come.
+fn open_microphone() -> anyhow::Result<(rodio::cpal::Stream, MicrophoneSource)> {
+    use rodio::cpal::SampleFormat;
+    use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
+
+    let device = rodio::cpal::default_host()
+        .default_input_device()
+        .context("no microphone")?;
+    let supported = device
+        .default_input_config()
+        .context("read the microphone's configuration")?;
+    let format = supported.sample_format();
+    anyhow::ensure!(
+        matches!(
+            format,
+            SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32
+        ),
+        "the microphone gives {format:?} samples, which voice does not read"
+    );
+    let config = supported.config();
+    let channels = ChannelCount::new(config.channels).context("a microphone with no channels")?;
+    let sample_rate =
+        SampleRate::new(config.sample_rate).context("a microphone with no sample rate")?;
+    let (tx, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+    let stream = device
+        .build_input_stream_raw(
+            config,
+            format,
+            move |data, _| {
+                let samples = match format {
+                    SampleFormat::F32 => data.as_slice::<f32>().map(<[f32]>::to_vec),
+                    SampleFormat::I16 => data
+                        .as_slice::<i16>()
+                        .map(|data| data.iter().map(|&v| f32::from(v) / 32_768.0).collect()),
+                    SampleFormat::I32 => data
+                        .as_slice::<i32>()
+                        .map(|data| data.iter().map(|&v| v as f32 / 2_147_483_648.0).collect()),
+                    _ => None,
+                };
+                // A reader that is behind loses audio rather than delaying it.
+                let _ = tx.try_send(samples.unwrap_or_default());
+            },
+            |error| tracing::warn!(%error, "realtime microphone stream failed"),
+            Some(MICROPHONE_OPEN_TIMEOUT),
+        )
+        .context("open the microphone")?;
+    stream.play().context("start the microphone")?;
+    tracing::info!(
+        sample_rate = sample_rate.get(),
+        channels = channels.get(),
+        "opened realtime microphone"
+    );
+    Ok((
+        stream,
+        MicrophoneSource {
+            receiver,
+            buffered: VecDeque::new(),
+            channels,
+            sample_rate,
+        },
+    ))
+}
+
+/// The microphone's samples as a rodio source, so they can be resampled.
+struct MicrophoneSource {
+    receiver: std::sync::mpsc::Receiver<Vec<f32>>,
+    buffered: VecDeque<f32>,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+}
+
+impl Iterator for MicrophoneSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(sample) = self.buffered.pop_front() {
+                return Some(sample);
+            }
+            self.buffered.extend(self.receiver.recv().ok()?);
+        }
+    }
+}
+
+impl rodio::Source for MicrophoneSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+    fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
 }
 
 pub(crate) struct RealtimePlayback {

@@ -112,7 +112,17 @@ where
             }
     }
     session.set_input_muted(*input_muted.borrow())?;
-    session.start_audio()?;
+    // Opening the microphone waits for the person to allow it, where the
+    // platform asks; a stop while they decide still stops.
+    tokio::select! {
+        biased;
+        _ = &mut stop => {
+            drop(session);
+            let _ = channel.requests.try_send(RealtimeClientFrame::Close);
+            return Ok(());
+        }
+        started = session.start_audio() => started?,
+    }
     tracing::info!("realtime client session established");
     let _ = connected.send(());
 
