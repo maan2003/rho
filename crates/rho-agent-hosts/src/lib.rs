@@ -60,8 +60,34 @@ pub enum AttachTarget {
     },
 }
 
+/// Which machine a host is, the same however it is reached and on every
+/// client: its iroh endpoint id, or `unix:<socket>` for a local one. Its
+/// name is only what this client calls it.
+#[cfg(feature = "client")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HostKey(String);
+
+#[cfg(feature = "client")]
+impl HostKey {
+    /// A key as the desk stored it.
+    pub fn from_stored(text: String) -> Self {
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(feature = "client")]
 impl AttachTarget {
+    pub fn key(&self) -> HostKey {
+        match self {
+            Self::Unix(path) => HostKey(format!("unix:{}", path.display())),
+            Self::Iroh { endpoint_id, .. } => HostKey(endpoint_id.to_string()),
+        }
+    }
+
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
         match self {

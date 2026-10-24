@@ -124,6 +124,10 @@ impl Hosts {
         self.hosts.iter_mut().find(|entry| entry.id == host)
     }
 
+    pub fn by_key(&self, key: &crate::HostKey) -> Option<&Host> {
+        self.hosts.iter().find(|entry| entry.target.key() == *key)
+    }
+
     pub fn by_name(&self, name: &str) -> Option<&Host> {
         self.hosts.iter().find(|entry| entry.name == name)
     }

@@ -153,6 +153,13 @@ pub enum Fact {
         node: NodeId,
         pile: String,
     },
+    /// Which agent host work under a label runs on: the host's identity
+    /// (an iroh endpoint id, or `unix:<socket>`), the same on every
+    /// device. Later still than `Piled`, for the same reason.
+    Host {
+        label: uuid::Uuid,
+        host: Option<String>,
+    },
 }
 
 impl Fact {
@@ -171,7 +178,8 @@ impl Fact {
             | Self::About { node, .. } => Some(node.clone()),
             Self::Label { label, .. }
             | Self::Unlabel { label }
-            | Self::Repository { label, .. } => Some(NodeId::Label(*label)),
+            | Self::Repository { label, .. }
+            | Self::Host { label, .. } => Some(NodeId::Label(*label)),
             Self::Retract { .. } => None,
         }
     }

@@ -6805,4 +6805,50 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
         1,
         "moss is the default now"
     );
+
+    // An area that names fern places its agents there, over the last
+    // placement, because the desk said so.
+    let area = uuid::Uuid::new_v4();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let fern_key = socket("fern").key().as_str().to_owned();
+            workspace.write_marks(
+                vec![
+                    rho_dealer::facts::Fact::Label {
+                        label: area,
+                        name: "infra".to_owned(),
+                        parent: None,
+                    }
+                    .into(),
+                    rho_dealer::facts::Fact::Host {
+                        label: area,
+                        host: Some(fern_key),
+                    }
+                    .into(),
+                ],
+                cx,
+            );
+            workspace.new_agent_in_area(Some(rho_dealer::NodeId::Label(area)), window, cx);
+        })
+        .unwrap();
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("third", window, cx));
+            workspace.draft_model_for_test().update(cx, |draft, cx| {
+                draft.set_workdir_text("https://example.com/r.git", cx)
+            });
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert!(
+        story::calls(&mut on_moss).is_empty(),
+        "the area overrides moss"
+    );
+    assert_eq!(
+        story::calls(&mut on_fern).len(),
+        1,
+        "the area's host gets it"
+    );
 }

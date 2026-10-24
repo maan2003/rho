@@ -3969,12 +3969,27 @@ impl Workspace {
         }
     }
 
+    /// The draft's placement. Its default is the host the draft's area
+    /// names, when it names one, else this client's default.
     fn draft_placement(&self) -> Placement {
+        let area_host = self
+            .draft_area
+            .as_ref()
+            .and_then(|area| self.attention.marks.host_of(area));
+        let default = match area_host {
+            // A host this client has not attached is no default: the
+            // draft asks rather than run the area's work elsewhere.
+            Some(key) => self
+                .hosts
+                .by_key(&rho_agent_hosts::HostKey::from_stored(key))
+                .map(|host| host.id),
+            None => self.default_host(),
+        };
         Placement {
             chosen: self
                 .draft_host
                 .filter(|host| self.hosts.get(*host).is_some()),
-            default: self.default_host(),
+            default,
         }
     }
 
@@ -6014,6 +6029,7 @@ impl Workspace {
             Command::SecretPhrase => self.prompt_secret_phrase(window, cx),
             Command::ProjectAdd => self.prompt_project_add(window, cx),
             Command::ProjectRemove => self.prompt_project_remove(window, cx),
+            Command::AreaHost => self.prompt_area_host(window, cx),
             Command::EndVoice => self.cmd_end_voice(cx),
             Command::PastePrompt => self.cmd_paste_prompt(window, cx),
             Command::ClearPromptImages => self.cmd_clear_prompt_attachments(cx),
@@ -6268,6 +6284,106 @@ impl Workspace {
             },
         );
         self.open_prompt("project url [name]:", complete, on_submit, window, cx);
+    }
+
+    /// `space p h`: which host an area's agents run on. Asks for the
+    /// area, then the host; an empty host takes the area's back.
+    pub(crate) fn prompt_area_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .attention
+                .marks
+                .labels()
+                .into_iter()
+                .filter(|(_, path)| path.to_lowercase().contains(&needle))
+                .map(|(id, path)| {
+                    let host = workspace
+                        .attention
+                        .marks
+                        .host_of(&rho_dealer::NodeId::Label(id))
+                        .map(|key| workspace.host_key_label(&key))
+                        .unwrap_or_default();
+                    crate::commands::Candidate {
+                        value: path,
+                        description: host,
+                    }
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let path = input.trim().to_owned();
+                match workspace.attention.marks.label_at(&path) {
+                    Some(label) => workspace.prompt_area_host_for(label, path, window, cx),
+                    None if path.is_empty() => {}
+                    None => workspace.notice_on(
+                        None,
+                        &format!("no area `{path}`"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            },
+        );
+        self.open_prompt("area:", complete, on_submit, window, cx);
+    }
+
+    fn prompt_area_host_for(
+        &mut self,
+        label: uuid::Uuid,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .hosts
+                .iter()
+                .filter(|host| host.name.to_lowercase().contains(&needle))
+                .map(|host| crate::commands::Candidate {
+                    value: host.name.clone(),
+                    description: host.status.label(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let name = input.trim();
+                let host = match name {
+                    "" => None,
+                    name => match workspace.hosts.by_name(name) {
+                        Some(host) => Some(host.target.key().as_str().to_owned()),
+                        None => {
+                            let message = format!("no attached host named `{name}`");
+                            workspace.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                            return;
+                        }
+                    },
+                };
+                workspace.write_marks(
+                    vec![rho_dealer::facts::Fact::Host { label, host }.into()],
+                    cx,
+                );
+                workspace.refresh_draft_host(cx);
+            },
+        );
+        self.open_prompt(format!("host for {path}:"), complete, on_submit, window, cx);
+    }
+
+    /// What this client calls the host a stored key names, or the key
+    /// itself for a host it has not attached.
+    fn host_key_label(&self, key: &str) -> String {
+        self.hosts
+            .by_key(&rho_agent_hosts::HostKey::from_stored(key.to_owned()))
+            .map_or_else(|| key.to_owned(), |host| host.name.clone())
     }
 
     /// Prompt (completing over registered projects) for one to remove.

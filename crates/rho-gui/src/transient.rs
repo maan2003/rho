@@ -118,6 +118,7 @@ pub(crate) enum Command {
     // Projects.
     ProjectAdd,
     ProjectRemove,
+    AreaHost,
     // Input.
     EndVoice,
     PastePrompt,
@@ -671,6 +672,7 @@ pub(crate) fn projects_menu() -> Menu {
     Menu::new("projects")
         .item("a", "add…", MenuAction::Command(Command::ProjectAdd))
         .item("r", "remove…", MenuAction::Command(Command::ProjectRemove))
+        .item("h", "area host…", MenuAction::Command(Command::AreaHost))
 }
 
 /// `space s u`: the usage screen, in the two windows worth looking at.

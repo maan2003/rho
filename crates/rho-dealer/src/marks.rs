@@ -35,6 +35,8 @@ pub struct NodeMarks {
     pub parent: Option<uuid::Uuid>,
     /// The repository work under a label happens in.
     pub repository: Option<String>,
+    /// The agent host work under a label runs on, by its identity.
+    pub host: Option<String>,
 }
 
 static EMPTY: NodeMarks = NodeMarks {
@@ -47,6 +49,7 @@ static EMPTY: NodeMarks = NodeMarks {
     about: None,
     parent: None,
     repository: None,
+    host: None,
 };
 
 impl NodeMarks {
@@ -182,6 +185,7 @@ impl Marks {
                 }
                 Fact::Unlabel { .. } => marks.deleted = true,
                 Fact::Repository { url, .. } => marks.repository = url.clone(),
+                Fact::Host { host, .. } => marks.host = host.clone(),
                 Fact::Labeled { label, present, .. } => {
                     match present {
                         true => marks.labels.insert(*label),
@@ -338,6 +342,20 @@ impl Marks {
     /// The repository work on a node happens in: the first its labels
     /// name, looking up through each label's parents.
     pub fn repository_of(&self, node: &NodeId) -> Option<String> {
+        self.inherited(node, |marks| marks.repository.clone())
+    }
+
+    /// The host work under `node` runs on: its own label's, else the
+    /// nearest one above, as with the repository.
+    pub fn host_of(&self, node: &NodeId) -> Option<String> {
+        self.inherited(node, |marks| marks.host.clone())
+    }
+
+    fn inherited(
+        &self,
+        node: &NodeId,
+        read: impl Fn(&NodeMarks) -> Option<String>,
+    ) -> Option<String> {
         let mut labels: Vec<uuid::Uuid> = match node {
             NodeId::Label(id) => vec![*id],
             _ => self.get(node).labels.iter().copied().collect(),
@@ -350,8 +368,8 @@ impl Marks {
                     continue;
                 }
                 let marks = self.get(&NodeId::Label(id));
-                if let Some(url) = &marks.repository {
-                    return Some(url.clone());
+                if let Some(value) = read(marks) {
+                    return Some(value);
                 }
                 above.extend(marks.parent);
             }
