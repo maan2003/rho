@@ -891,6 +891,7 @@ impl ClaudeLoop {
                     return Ok(());
                 }
                 let at = rho_agent_types::UnixMs::now();
+                let mut steps = Steps::new();
                 let reviving = matches!(source, InputSource::Human(_)) && self.archived;
                 if reviving {
                     self.fresh_notebook(at).await?;
@@ -940,6 +941,7 @@ impl ClaudeLoop {
                         .await?;
                     self.apply_name(named);
                 }
+                steps.mark("name");
                 // Keep CLI slash commands intact. Any retained output remains
                 // queued until the command finishes and the CLI is idle.
                 let slash_command = matches!(content.first(), Some(ContentPart::Text { text }) if text.trim_start().starts_with('/'));
@@ -981,6 +983,7 @@ impl ClaudeLoop {
                     self.fail(error).await?;
                     return Ok(());
                 }
+                steps.mark("process");
                 let message = match source {
                     InputSource::Human(id) => Some((id, Party::Human)),
                     InputSource::Agent(sender) => Some((MessageId::new(), Party::Agent(sender))),
@@ -1007,6 +1010,7 @@ impl ClaudeLoop {
                     })
                     .await?;
                 }
+                steps.mark("received");
                 self.queued_turns.push_back(ClaudeTurn {
                     uuid: uuid.clone(),
                     content: Arc::clone(&content),
@@ -1016,6 +1020,7 @@ impl ClaudeLoop {
                 });
                 self.state.queued_inputs.push(input);
                 self.published();
+                steps.mark("published");
                 // A turn-opening send starts the turn now: waiting for the
                 // CLI's first stream event (seconds on a cold spawn) leaves
                 // the agent looking idle while it is working.
@@ -1031,17 +1036,24 @@ impl ClaudeLoop {
                     .send_user_content_with_uuid((*content).clone(), uuid)
                     .await
                 {
+                    steps.mark("written");
                     if let Some(accepted) = accepted {
                         let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
                     }
                     self.fail(error).await?;
                 } else {
+                    steps.mark("written");
                     if let Some(id) = output_id {
                         self.output_handed_off(id).await?;
                     }
                     if let Some(accepted) = accepted {
                         let _ = accepted.send(Ok(()));
                     }
+                    steps.mark("handed off");
+                    eprintln!(
+                        "rho-agent: Claude input of {} in {steps}",
+                        self.agent_id.encoded()
+                    );
                 }
                 if reviving {
                     while let Some((content, uuid, sender, id)) = self.deferred.pop_front() {
@@ -3218,5 +3230,40 @@ mod tests {
 
         assert!(state.queued_inputs.is_empty());
         assert!(!promote_queued_user_message(&mut state));
+    }
+}
+
+/// How long each step of taking a message in took, for the log: the time
+/// from a message to Claude Code is latency every reply pays.
+struct Steps {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    marks: Vec<(&'static str, Duration)>,
+}
+
+impl Steps {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            start: now,
+            last: now,
+            marks: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.marks.push((step, now - self.last));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Steps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}:", self.last - self.start)?;
+        for (step, took) in &self.marks {
+            write!(f, " {step} {took:?}")?;
+        }
+        Ok(())
     }
 }
