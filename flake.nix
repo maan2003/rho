@@ -674,9 +674,10 @@
               # dependencies. Registry dependencies need the real APIs of
               # local patches (including iroh and kio for web-transport-iroh),
               # along with their local transitive dependencies.
-              rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
+              rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/pulseaudio-rs $out/vendor/tree-sitter-language
               cp -r --no-preserve=mode,ownership ${vendored "vendor/brush"} $out/vendor/brush
               cp -r --no-preserve=mode,ownership ${vendored "vendor/noq"} $out/vendor/noq
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/pulseaudio-rs"} $out/vendor/pulseaudio-rs
               rm -rf $out/vendor/iroh $out/vendor/moq/rs/kio
               cp -r --no-preserve=mode,ownership ${vendored "vendor/iroh"} $out/vendor/iroh
               cp -r --no-preserve=mode,ownership ${vendored "vendor/moq/rs/kio"} $out/vendor/moq/rs/kio
