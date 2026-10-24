@@ -283,9 +283,10 @@ pub struct Workspace {
     /// The host chosen in the draft (ctrl-tab in the Workdir field), until
     /// the draft becomes an agent.
     draft_host: Option<HostId>,
-    /// Where the last agent from this client was placed: the default for
-    /// the next, since one usually works on one machine at a time.
-    last_placed_host: Option<HostId>,
+    /// Where the last agent from this client was placed, by the host's
+    /// identity: the default for the next, since one usually works on one
+    /// machine at a time. Saved beside the attached hosts.
+    last_placed: Option<rho_agent_hosts::HostKey>,
     /// A surface was opened to be written in and is waiting for the
     /// frame its focus lands in to enter insert. The action goes to the
     /// focused node of the frame already on screen, so dispatching
@@ -923,7 +924,8 @@ impl Workspace {
             _save_notes_on_quit: save_notes_on_quit,
             awaiting_draft_agent: None,
             draft_host: None,
-            last_placed_host: None,
+            last_placed: rho_db::client::shared()
+                .and_then(|db| rho_agent_hosts::saved::load_last_placed(&db)),
             insert_when_shown: false,
             pending_agent_filing: None,
             ready_hosts: HashSet::new(),
@@ -985,6 +987,12 @@ impl Workspace {
         };
         let no_hosts = specs.is_empty();
         for spec in specs {
+            // The command line and the saved set can name one machine
+            // twice; it is attached once, under the first name.
+            if this.hosts.by_key(&spec.target.key()).is_some() {
+                tracing::warn!(host = %spec.name, "this machine is already attached; skipped");
+                continue;
+            }
             this.attach_host(spec, cx);
         }
         this.refresh_draft_host(cx);
@@ -2605,7 +2613,14 @@ impl Workspace {
             }
         };
         self.note_agent_created(host, agent_id);
-        self.last_placed_host = Some(host);
+        if let Some(key) = self.hosts.get(host).map(|entry| entry.target.key())
+            && self.last_placed.as_ref() != Some(&key)
+        {
+            if let Some(db) = rho_db::client::shared() {
+                rho_agent_hosts::saved::save_last_placed(&db, &key);
+            }
+            self.last_placed = Some(key);
+        }
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
             self.write_marks(writes, cx);
@@ -3422,6 +3437,13 @@ impl Workspace {
             let message = format!("attach: host `{}` is already attached", spec.name);
             return self.notice_on(None, &message, StyleClass::StatusError, cx);
         }
+        if let Some(host) = self.hosts.by_key(&spec.target.key()) {
+            let message = format!(
+                "attach: that machine is already attached as `{}`",
+                host.name
+            );
+            return self.notice_on(None, &message, StyleClass::StatusError, cx);
+        }
         let name = spec.name.clone();
         self.attach_host(spec, cx);
         self.refresh_draft_host(cx);
@@ -3958,8 +3980,10 @@ impl Workspace {
         match self.hosts.ids()[..] {
             [only] => Some(only),
             _ => self
-                .last_placed_host
-                .filter(|host| self.hosts.get(*host).is_some()),
+                .last_placed
+                .as_ref()
+                .and_then(|key| self.hosts.by_key(key))
+                .map(|host| host.id),
         }
     }
 

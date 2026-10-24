@@ -6852,3 +6852,38 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
         "the area's host gets it"
     );
 }
+
+/// One machine under two names attaches once: the identity is the
+/// machine, not what it is called.
+#[gpui::test]
+fn one_machine_attaches_once(cx: &mut TestAppContext) {
+    story::reset();
+    cx.update(init_test_app);
+    let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-same.sock"));
+    let specs = vec![
+        HostSpec {
+            name: "fern".to_owned(),
+            target: target.clone(),
+        },
+        HostSpec {
+            name: "fern-again".to_owned(),
+            target: target.clone(),
+        },
+    ];
+    let workspace = cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx));
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.hosts.len(), 1, "attached once");
+            workspace.cmd_host_attach(
+                &format!(
+                    "third=unix:{}",
+                    std::env::temp_dir()
+                        .join("rho-gui-test-same.sock")
+                        .display()
+                ),
+                cx,
+            );
+            assert_eq!(workspace.hosts.len(), 1, "the attach prompt refuses it too");
+        })
+        .unwrap();
+}
