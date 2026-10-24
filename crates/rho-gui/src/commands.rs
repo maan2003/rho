@@ -146,7 +146,11 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .map(|workspace| {
                 let workspace = workspace.read(cx);
                 (
-                    workspace.hosts.workdir_table(),
+                    workspace
+                        .projects()
+                        .into_iter()
+                        .map(|(name, url)| (name, url.to_string()))
+                        .collect::<Vec<_>>(),
                     workspace.live_agent_targets(),
                 )
             })

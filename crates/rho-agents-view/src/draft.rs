@@ -99,6 +99,10 @@ pub struct DraftModel {
     role_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
+    /// The host the agent will run on, named in the Workdir label once
+    /// there is more than one to run on. The host's to say; the draft
+    /// shows it.
+    workdir_host: Option<String>,
     start_target_hints: Vec<(String, String)>,
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
@@ -173,6 +177,7 @@ impl DraftModel {
             role_buffer,
             start_buffer,
             start_mode: StartFieldMode::NewOn,
+            workdir_host: None,
             start_target_hints: Vec::new(),
             body_buffer,
             body_end,
@@ -267,6 +272,19 @@ impl DraftModel {
         self.suppress_draft_activation = false;
     }
 
+    /// Names the host in the Workdir label (`Workdir on fern: `), or
+    /// takes it out.
+    pub fn set_workdir_host(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        if self.workdir_host == host {
+            return;
+        }
+        self.workdir_host = host;
+        for editor in self.live_editors() {
+            self.insert_workdir_label_to(&editor, cx);
+        }
+        cx.notify();
+    }
+
     pub fn role_text(&self, cx: &gpui::App) -> String {
         let buffer = self.role_buffer.read(cx);
         buffer.text_for_range(0..buffer.len()).collect()
@@ -341,6 +359,10 @@ impl DraftModel {
 
     pub fn cursor_in_start_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         self.cursor_in(&self.start_buffer, editor, cx)
+    }
+
+    pub fn cursor_in_workdir_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.workdir_buffer, editor, cx)
     }
 
     pub fn cursor_in_role_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -561,13 +583,13 @@ impl DraftModel {
             return;
         };
         editor.update(cx, |editor, cx| {
+            let label = match &self.workdir_host {
+                Some(host) => format!("Workdir on {host}: "),
+                None => "Workdir: ".to_owned(),
+            };
             editor.splice_inlays(
-                &[],
-                vec![Inlay::custom(
-                    WORKDIR_LABEL_INLAY_ID,
-                    field_start,
-                    "Workdir: ",
-                )],
+                &[InlayId::Custom(WORKDIR_LABEL_INLAY_ID)],
+                vec![Inlay::custom(WORKDIR_LABEL_INLAY_ID, field_start, label)],
                 cx,
             );
         });

@@ -424,7 +424,6 @@ impl Workspace {
         if labels_moved {
             // A label renamed or moved renames every agent filed under it.
             agents = self.registry.known_agents().copied().collect();
-            self.refresh_workdirs();
         }
         self.push_agent_marks(&agents);
         self.sync_note_views(&touched, cx);
@@ -928,9 +927,10 @@ impl Workspace {
     }
 
     /// The repositories labels name, which are where agents work.
-    pub(crate) fn refresh_workdirs(&mut self) {
-        let repositories: Vec<(String, camino::Utf8PathBuf)> = self
-            .attention
+    /// Every label path that names a repository, with its URL: the desk's
+    /// projects. Read from the marks each time, never kept beside them.
+    pub(crate) fn projects(&self) -> Vec<(String, camino::Utf8PathBuf)> {
+        self.attention
             .marks
             .labels()
             .into_iter()
@@ -943,10 +943,16 @@ impl Workspace {
                     .clone()?;
                 Some((path, url.into()))
             })
-            .collect();
-        for host in self.hosts.ids() {
-            self.hosts.set_workdirs(host, repositories.clone());
-        }
+            .collect()
+    }
+
+    /// What the Workdir field shows for a repository: the project's name
+    /// when one carries it, else the URL itself.
+    pub(crate) fn project_label(&self, url: &camino::Utf8Path) -> String {
+        self.projects()
+            .into_iter()
+            .find(|(_, project)| project == url)
+            .map_or_else(|| url.to_string(), |(name, _)| name)
     }
 
     /// `space s s`: the secret phrase, shown so another device can take

@@ -6700,3 +6700,109 @@ fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+/// Two hosts: a project URL places on no host by itself, so the draft asks
+/// for one; the host chosen with ctrl-tab gets the call; once an agent was
+/// placed there, the next draft goes there without asking.
+#[gpui::test]
+fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
+    story::reset();
+    cx.update(init_test_app);
+    let socket = |name: &str| {
+        AttachTarget::Unix(std::env::temp_dir().join(format!("rho-gui-test-{name}.sock")))
+    };
+    let specs = vec![
+        HostSpec {
+            name: "fern".to_owned(),
+            target: socket("fern"),
+        },
+        HostSpec {
+            name: "moss".to_owned(),
+            target: socket("moss"),
+        },
+    ];
+    let workspace = cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx));
+    let (fern, moss) = (HostId(0), HostId(1));
+    let draft = |text: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.new_agent_in_area(None, window, cx);
+            })
+            .expect("open a new-agent draft");
+        let editor = active_editor(workspace, cx);
+        let text = text.to_owned();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                editor.update(cx, |editor, cx| editor.insert(&text, window, cx));
+                workspace.draft_model_for_test().update(cx, |draft, cx| {
+                    draft.set_workdir_text("https://example.com/r.git", cx)
+                });
+            })
+            .expect("write the draft");
+    };
+    let refusal = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .draft_model_for_test()
+                    .read(cx)
+                    .refusal()
+                    .map(str::to_owned)
+            })
+            .unwrap()
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            for host in [fern, moss] {
+                story::feed(workspace, host, ready_with(Vec::new(), 0), window, cx);
+            }
+        })
+        .unwrap();
+    let mut on_fern = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(fern)
+        })
+        .unwrap();
+    let mut on_moss = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(moss)
+        })
+        .unwrap();
+
+    draft("first", &workspace, cx);
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert!(
+        refusal(&workspace, cx).is_some_and(|text| text.contains("which host")),
+        "a URL alone does not say where: {:?}",
+        refusal(&workspace, cx)
+    );
+    assert!(story::calls(&mut on_fern).is_empty() && story::calls(&mut on_moss).is_empty());
+
+    // ctrl-tab twice: fern, then moss.
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.cycle_draft_host_for_test(cx);
+            workspace.cycle_draft_host_for_test(cx);
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert!(story::calls(&mut on_fern).is_empty(), "fern was not chosen");
+    let mut calls = story::calls(&mut on_moss);
+    assert_eq!(calls.len(), 1, "the chosen host gets the one call");
+    let (_, mut stream) = calls.pop().unwrap();
+    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(agent(7)));
+    cx.run_until_parked();
+
+    // Nothing chosen this time: the last placement is the default.
+    draft("second", &workspace, cx);
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    assert!(story::calls(&mut on_fern).is_empty());
+    assert_eq!(
+        story::calls(&mut on_moss).len(),
+        1,
+        "moss is the default now"
+    );
+}

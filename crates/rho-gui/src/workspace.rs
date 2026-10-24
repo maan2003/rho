@@ -32,7 +32,9 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
-use rho_agents_client::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
+use rho_agents_client::create::{
+    Placement, StartBase, Workdir, cycle_agent_role_text, parse_agent_role, parse_start,
+};
 use rho_agents_client::protocol::{AgentCommand, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
@@ -175,7 +177,7 @@ pub(crate) enum ContextId {
     Slack,
 }
 
-pub use rho_agent_hosts::{AttachTarget, HostPath, HostSpec};
+pub use rho_agent_hosts::{AttachTarget, HostSpec};
 
 /// The menu on screen while it is open. Nothing here says where it is
 /// drawn: the desk pins it to the bottom edge of the window and the phone
@@ -278,6 +280,12 @@ pub struct Workspace {
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
+    /// The host chosen in the draft (ctrl-tab in the Workdir field), until
+    /// the draft becomes an agent.
+    draft_host: Option<HostId>,
+    /// Where the last agent from this client was placed: the default for
+    /// the next, since one usually works on one machine at a time.
+    last_placed_host: Option<HostId>,
     /// A surface was opened to be written in and is waiting for the
     /// frame its focus lands in to enter insert. The action goes to the
     /// focused node of the frame already on screen, so dispatching
@@ -914,6 +922,8 @@ impl Workspace {
             chrome_editor,
             _save_notes_on_quit: save_notes_on_quit,
             awaiting_draft_agent: None,
+            draft_host: None,
+            last_placed_host: None,
             insert_when_shown: false,
             pending_agent_filing: None,
             ready_hosts: HashSet::new(),
@@ -977,9 +987,7 @@ impl Workspace {
         for spec in specs {
             this.attach_host(spec, cx);
         }
-        // The marks are on this disk, so Home's first draw already shows
-        // the user's own verdicts.
-        this.refresh_workdirs();
+        this.refresh_draft_host(cx);
         // What the last session could not send shows where it waits.
         for agent_id in this.outbox.agents() {
             this.show_unsent(agent_id, cx);
@@ -1054,7 +1062,6 @@ impl Workspace {
             &gpui_tokio::Tokio::handle(cx),
         );
         self.registry.attach_host(host, spec.name);
-        self.refresh_workdirs();
         self.save_hosts();
         host
     }
@@ -1100,6 +1107,7 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
+        self.refresh_draft_host(cx);
         self.quotas.forget(host);
         self.save_hosts();
         self.agents_client.detach_host(host);
@@ -1981,7 +1989,6 @@ impl Workspace {
                 self.replay_hosts.remove(&host);
                 let first_ready = self.ready_hosts.insert(host);
                 self.prune_contexts();
-                self.refresh_workdirs();
                 self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.selection.active_pane(), ActivePane::Startup) {
@@ -2501,7 +2508,8 @@ impl Workspace {
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
         } else {
-            match rho_agents_client::create::resolve_workdir(&self.hosts, &field) {
+            match rho_agents_client::create::resolve_workdir(&self.projects(), &self.hosts, &field)
+            {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -2518,7 +2526,7 @@ impl Workspace {
                 mode,
                 &target,
                 working_directory,
-                None,
+                self.draft_placement(),
                 self.start_base(&target),
             ) {
                 Ok(start) => start,
@@ -2591,6 +2599,7 @@ impl Workspace {
             }
         };
         self.note_agent_created(host, agent_id);
+        self.last_placed_host = Some(host);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
             self.write_marks(writes, cx);
@@ -2599,10 +2608,9 @@ impl Workspace {
             self.activate_agent(agent_id, cx);
             // The draft became this agent: reset the compose surface and
             // follow the new agent.
-            let label = self
-                .draft_default_workdir()
-                .map(|path| self.hosts.workdir_label(&path))
-                .unwrap_or_default();
+            let label = self.draft_default_label();
+            self.draft_host = None;
+            self.refresh_draft_host(cx);
             self.draft_model.update(cx, |view, cx| {
                 view.set_body_text("", cx);
                 view.clear_attachments(cx);
@@ -3161,9 +3169,6 @@ impl Workspace {
         description: String,
         cx: &mut Context<Self>,
     ) {
-        if !self.require_connected(cx) {
-            return;
-        }
         // A project is a label carrying the URL the agent host clones. A path
         // would have the agent host read the user's checkout, which it no
         // longer does.
@@ -3172,23 +3177,15 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         }
-        let workdir = match rho_agents_client::create::resolve_workdir(&self.hosts, &path) {
-            Ok(workdir) => workdir,
-            Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                return;
-            }
-        };
+        let url = Utf8PathBuf::from(&path);
         // The name the user gave is the label's path, else the
         // repository's own name; the description was the agent host's and has
         // no fact to live in.
         let _ = description;
         let path_name = name.unwrap_or_else(|| {
-            workdir
-                .path
-                .file_name()
+            url.file_name()
                 .map(|name| name.strip_suffix(".git").unwrap_or(name).to_owned())
-                .unwrap_or_else(|| workdir.path.to_string())
+                .unwrap_or_else(|| url.to_string())
         });
         let Some(label) = self.mint_label(&path_name, cx) else {
             return;
@@ -3197,7 +3194,7 @@ impl Workspace {
             vec![
                 rho_dealer::facts::Fact::Repository {
                     label,
-                    url: Some(workdir.path.to_string()),
+                    url: Some(url.to_string()),
                 }
                 .into(),
             ],
@@ -3206,35 +3203,19 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_project_remove(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
+        let project = self
+            .projects()
+            .into_iter()
+            .find(|(name, url)| *name == path || *url == path);
+        let Some(label) = project.and_then(|(name, _)| self.attention.marks.label_at(&name)) else {
+            let message = format!("no registered project `{path}`");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
-        }
-        match self.hosts.registered_workdir(&path) {
-            Some(workdir) => {
-                let Some(name) = self
-                    .hosts
-                    .workdirs()
-                    .iter()
-                    .find(|candidate| {
-                        candidate.host == workdir.host && candidate.path == workdir.path
-                    })
-                    .map(|candidate| candidate.name.clone())
-                else {
-                    return;
-                };
-                let Some(label) = self.attention.marks.label_at(&name) else {
-                    return;
-                };
-                self.write_marks(
-                    vec![rho_dealer::facts::Fact::Repository { label, url: None }.into()],
-                    cx,
-                );
-            }
-            None => {
-                let message = format!("no registered project `{path}`");
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            }
-        }
+        };
+        self.write_marks(
+            vec![rho_dealer::facts::Fact::Repository { label, url: None }.into()],
+            cx,
+        );
     }
 
     pub(crate) fn cmd_open(&mut self, path: Utf8PathBuf, window: &Window, cx: &mut Context<Self>) {
@@ -3358,7 +3339,7 @@ impl Workspace {
     pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
         let host = match self.selection.selected_agent() {
             Some(agent_id) => self.host_of(agent_id),
-            None => self.hosts.primary(),
+            None => self.default_host(),
         };
         let Some(host) = host.filter(|host| self.hosts.is_online(*host)) else {
             self.notice_on(
@@ -3449,6 +3430,7 @@ impl Workspace {
         }
         let name = spec.name.clone();
         self.attach_host(spec, cx);
+        self.refresh_draft_host(cx);
         self.notice_on(
             None,
             &format!("attaching {name}…"),
@@ -3711,6 +3693,7 @@ impl Workspace {
         match working_directory {
             Some(argument) => {
                 let workdir = match rho_agents_client::create::resolve_workdir(
+                    &self.projects(),
                     &self.hosts,
                     argument.as_str(),
                 ) {
@@ -3720,7 +3703,7 @@ impl Workspace {
                         return;
                     }
                 };
-                let label = self.hosts.workdir_label(&workdir);
+                let label = self.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
                     view.seed(&label, true, editor.as_ref(), window, cx)
@@ -3921,6 +3904,14 @@ impl Workspace {
         if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
+            if self
+                .draft_model
+                .read(cx)
+                .cursor_in_workdir_field(&editor, cx)
+            {
+                self.cycle_draft_host(cx);
+                return;
+            }
             self.draft_model.update(cx, |view, cx| {
                 if view.cursor_in_role_field(&editor, cx) {
                     let next = cycle_agent_role_text(&view.role_text(cx));
@@ -3935,10 +3926,8 @@ impl Workspace {
     /// (Re)writes the draft scaffold with the derived default workdir; the
     /// field stays empty when nothing host-side suggests one.
     fn seed_draft(&mut self, force_header: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let label = self
-            .draft_default_workdir()
-            .map(|path| self.hosts.workdir_label(&path))
-            .unwrap_or_default();
+        let label = self.draft_default_label();
+        self.refresh_draft_host(cx);
         let editor = self.focused_draft_editor();
         self.draft_model.update(cx, |view, cx| {
             view.seed(&label, force_header, editor.as_ref(), window, cx)
@@ -3946,12 +3935,73 @@ impl Workspace {
     }
 
     /// Where a new agent works when the draft doesn't say: the first
-    /// registered workdir.
-    fn draft_default_workdir(&self) -> Option<HostPath> {
-        self.hosts.workdirs().first().map(|workdir| HostPath {
-            host: workdir.host,
-            path: workdir.path.clone(),
+    /// project.
+    fn draft_default_workdir(&self) -> Option<Workdir> {
+        self.projects().into_iter().next().map(|(_, url)| Workdir {
+            path: url,
+            host: None,
         })
+    }
+
+    fn draft_default_label(&self) -> String {
+        self.draft_default_workdir()
+            .map(|workdir| self.workdir_label(&workdir))
+            .unwrap_or_default()
+    }
+
+    /// How the Workdir field writes a workdir: a project by its name, a
+    /// path with its host when the path names one.
+    fn workdir_label(&self, workdir: &Workdir) -> String {
+        match workdir.host {
+            Some(host) => format!("{}:{}", self.hosts.host_label(host), workdir.path),
+            None => self.project_label(&workdir.path),
+        }
+    }
+
+    /// The host this client puts work on when nothing says otherwise: the
+    /// only one attached, else the one it last placed an agent on.
+    pub(crate) fn default_host(&self) -> Option<HostId> {
+        match self.hosts.ids()[..] {
+            [only] => Some(only),
+            _ => self
+                .last_placed_host
+                .filter(|host| self.hosts.get(*host).is_some()),
+        }
+    }
+
+    fn draft_placement(&self) -> Placement {
+        Placement {
+            chosen: self
+                .draft_host
+                .filter(|host| self.hosts.get(*host).is_some()),
+            default: self.default_host(),
+        }
+    }
+
+    /// Names the draft's host in its Workdir label once there is more than
+    /// one host to choose from.
+    pub(crate) fn refresh_draft_host(&mut self, cx: &mut Context<Self>) {
+        let label = (self.hosts.len() > 1).then(|| {
+            let placement = self.draft_placement();
+            placement
+                .chosen
+                .or(placement.default)
+                .map_or_else(|| "?".to_owned(), |host| self.hosts.host_label(host))
+        });
+        self.draft_model
+            .update(cx, |draft, cx| draft.set_workdir_host(label, cx));
+    }
+
+    /// Ctrl-tab in the Workdir field: the next attached host.
+    fn cycle_draft_host(&mut self, cx: &mut Context<Self>) {
+        let ids = self.hosts.ids();
+        let placement = self.draft_placement();
+        let current = placement.chosen.or(placement.default);
+        let next = current
+            .and_then(|current| ids.iter().position(|id| *id == current))
+            .map_or(0, |at| (at + 1) % ids.len().max(1));
+        self.draft_host = ids.get(next).copied();
+        self.refresh_draft_host(cx);
     }
 
     /// Records a notice outside the conversation and flashes it in the echo
@@ -4887,6 +4937,11 @@ impl Workspace {
 
     /// Puts the host in this process: the streams its calls open arrive on
     /// the receiver, for the test to answer as the agent host would.
+    #[cfg(test)]
+    pub(crate) fn cycle_draft_host_for_test(&mut self, cx: &mut Context<Self>) {
+        self.cycle_draft_host(cx);
+    }
+
     #[cfg(test)]
     pub(crate) fn host_in_process_for_test(
         &self,
@@ -6220,15 +6275,15 @@ impl Workspace {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_lowercase();
             workspace
-                .hosts
-                .workdir_table()
+                .projects()
                 .into_iter()
-                .filter(|(name, path)| {
-                    name.to_lowercase().contains(&needle) || path.to_lowercase().contains(&needle)
+                .filter(|(name, url)| {
+                    name.to_lowercase().contains(&needle)
+                        || url.as_str().to_lowercase().contains(&needle)
                 })
-                .map(|(name, path)| crate::commands::Candidate {
+                .map(|(name, url)| crate::commands::Candidate {
                     value: name,
-                    description: path,
+                    description: url.to_string(),
                 })
                 .collect()
         });
@@ -6830,16 +6885,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workdir = area
+        let label = area
             .as_ref()
-            .and_then(|area| self.area_workdir(area))
-            .or_else(|| self.only_workdir());
-        let label = workdir
-            .as_ref()
-            .map(|workdir| self.hosts.workdir_label(workdir))
+            .and_then(|area| self.attention.marks.repository_of(area))
+            .or_else(|| match &self.projects()[..] {
+                [(_, only)] => Some(only.to_string()),
+                _ => None,
+            })
+            .map(|url| self.project_label(camino::Utf8Path::new(&url)))
             .unwrap_or_default();
         self.select_agent_inner(None, true, window, cx);
         self.draft_area = area;
+        self.refresh_draft_host(cx);
         let editor = self.focused_draft_editor();
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
@@ -6850,29 +6907,6 @@ impl Workspace {
         });
         // The draft exists to be written in, so it opens ready to type.
         self.enter_insert_when_shown(window, cx);
-    }
-
-    /// The workdir to fall back on when nothing else names one: a single
-    /// registered project is not a choice worth asking about.
-    fn only_workdir(&self) -> Option<HostPath> {
-        match self.hosts.workdirs() {
-            [workdir] => Some(HostPath {
-                host: workdir.host,
-                path: workdir.path.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// The workdir a new thing under an area inherits: the repository of
-    /// the area or the labels it carries. The caller falls back to the
-    /// host's only workdir.
-    fn area_workdir(&self, area: &rho_dealer::NodeId) -> Option<HostPath> {
-        let url = self.attention.marks.repository_of(area)?;
-        Some(HostPath {
-            host: self.hosts.primary()?,
-            path: url.into(),
-        })
     }
 
     /// The usage screen, built once and kept. A series that arrives while

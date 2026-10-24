@@ -30,7 +30,7 @@ pub use connection::{ConnEvent, Connection, HostEvent, Link, spawn};
 #[cfg(feature = "client")]
 pub type Dialer = rho_rpc::Dialer;
 #[cfg(feature = "client")]
-pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
+pub use hosts::{Host, HostStatus, Hosts};
 
 /// Which attached agent host. Assigned in attachment order; agent ids are
 /// already unique across machines, so this says which socket a command goes

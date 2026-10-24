@@ -7,7 +7,7 @@
 //! `NewAgent`, and on which host.
 
 use camino::Utf8PathBuf;
-use rho_agent_hosts::{HostId, HostPath, Hosts};
+use rho_agent_hosts::{HostId, Hosts};
 use rho_agent_types::{AgentRole, EngineerIntelligence, Place};
 
 use crate::protocol::StartMode;
@@ -45,46 +45,69 @@ pub fn is_repository_url(argument: &str) -> bool {
     argument.contains("://") || argument.starts_with("git@")
 }
 
-/// Resolves a workdir argument to a directory on a specific agent host. A
-/// registered project name resolves to its registration; anything else is
-/// a raw host-side path, which may name its host as `fern:/src/rho`.
-/// Paths name directories on the agent host's machine, so the GUI never joins
-/// its own cwd or expands its own home — the agent host expands `~` and
-/// validates.
-pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String> {
-    if let Some(registered) = hosts.registered_workdir(argument) {
-        return Ok(registered);
+/// What the Workdir field names: a repository to clone, which any host
+/// can, or a directory on one machine. Projects are the desk's, not a
+/// host's, so a project name resolves to its URL and says nothing about
+/// where the agent runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workdir {
+    pub path: Utf8PathBuf,
+    /// The host a `<host>:<path>` names: a directory exists on one
+    /// machine only. `None` for a repository, and for a bare path, which
+    /// is read on whichever host the agent is placed.
+    pub host: Option<HostId>,
+}
+
+/// Resolves the Workdir field. `projects` are the desk's `(name, url)`
+/// pairs. A project name resolves to its URL; a URL stands for itself;
+/// `fern:/src/rho` is a path on host `fern`; anything else is a path on
+/// the host the agent is placed on. Paths are the agent host's to expand
+/// and validate, so the GUI never joins its own cwd or home.
+pub fn resolve_workdir(
+    projects: &[(String, Utf8PathBuf)],
+    hosts: &Hosts,
+    argument: &str,
+) -> Result<Workdir, String> {
+    if let Some((_, url)) = projects
+        .iter()
+        .find(|(name, url)| name == argument || url == argument)
+    {
+        return Ok(Workdir {
+            path: url.clone(),
+            host: None,
+        });
     }
     // A Windows-style drive letter is not a thing on an agent host, so a
-    // colon before any separator is unambiguously a host prefix. A URL
-    // (`https://…`, `git@host:path`) is what the agent host clones, not a host.
-    let is_url = is_repository_url(argument);
-    if !is_url
+    // colon before any separator is a host prefix. A URL (`https://…`,
+    // `git@host:path`) is what the agent host clones, not a host.
+    if !is_repository_url(argument)
         && let Some((name, path)) = argument.split_once(':')
         && !name.contains('/')
     {
         let host = hosts
             .by_name(name)
             .ok_or_else(|| format!("no attached host named `{name}`"))?;
-        return Ok(HostPath {
-            host: host.id,
+        return Ok(Workdir {
             path: Utf8PathBuf::from(path),
+            host: Some(host.id),
         });
     }
-    let host = match hosts.len() {
-        0 => return Err("not connected to an agent host".to_owned()),
-        1 => hosts.iter().next().expect("one host").id,
-        _ => {
-            return Err(format!(
-                "`{argument}` does not say which host: write `<host>:{argument}` \
-                 or use a registered project name"
-            ));
-        }
-    };
-    Ok(HostPath {
-        host,
+    Ok(Workdir {
         path: Utf8PathBuf::from(argument),
+        host: None,
     })
+}
+
+/// Where a new agent runs, in the order that decides it. What can only be
+/// on one machine — the agent a start names, a directory a workdir names
+/// with its host — settles it. Otherwise the user's choice in the draft,
+/// then the default the caller derived.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Placement {
+    /// Chosen in the draft (Shift-Tab in the Workdir field).
+    pub chosen: Option<HostId>,
+    /// The caller's default when nothing above settles it.
+    pub default: Option<HostId>,
 }
 
 /// The host a new agent starts on and how it starts there, or the reason
@@ -97,8 +120,8 @@ pub fn parse_start(
     hosts: &Hosts,
     mode: StartFieldMode,
     target: &str,
-    workdir: Option<HostPath>,
-    selected_host: Option<HostId>,
+    workdir: Option<Workdir>,
+    placement: Placement,
     base: StartBase,
 ) -> Result<(HostId, StartMode), String> {
     let require_workdir = || {
@@ -114,37 +137,34 @@ pub fn parse_start(
         StartFieldMode::Here => StartBase::default(),
         StartFieldMode::NewOn | StartFieldMode::Join => base,
     };
-    let base_host = base.host;
-    if let Some(selected) = selected_host {
-        if let Some(workdir) = &workdir
-            && workdir.host != selected
-        {
-            return Err("the selected project belongs to a different host".to_owned());
-        }
-        if let Some(base) = base_host
-            && base != selected
-        {
-            return Err(format!(
-                "`{target}` is on {}, not the selected host {}",
-                hosts.host_label(base),
-                hosts.host_label(selected),
-            ));
-        }
-    }
-    let host = match (base_host, &workdir) {
-        (Some(base), Some(workdir)) if base != workdir.host => {
+    let pinned = workdir.as_ref().and_then(|workdir| workdir.host);
+    let settled = match (base.host, pinned) {
+        (Some(base), Some(pinned)) if base != pinned => {
             return Err(format!(
                 "`{target}` is on {}, but the working directory is on {}: \
                  an agent cannot start from a base on another host",
                 hosts.host_label(base),
-                hosts.host_label(workdir.host),
+                hosts.host_label(pinned),
             ));
         }
-        (Some(base), _) => base,
-        (None, Some(workdir)) => workdir.host,
-        (None, None) => selected_host
-            .or_else(|| hosts.primary())
-            .ok_or_else(|| "not connected to an agent host".to_owned())?,
+        (base, pinned) => base.or(pinned),
+    };
+    let host = match (settled, placement.chosen) {
+        (Some(settled), Some(chosen)) if settled != chosen => {
+            return Err(format!(
+                "this agent can only run on {}, not on the chosen host {}",
+                hosts.host_label(settled),
+                hosts.host_label(chosen),
+            ));
+        }
+        (Some(host), _) | (None, Some(host)) => host,
+        (None, None) => placement.default.ok_or_else(|| {
+            if hosts.is_empty() {
+                "not connected to an agent host".to_owned()
+            } else {
+                "which host? ctrl-tab in the Workdir field chooses one".to_owned()
+            }
+        })?,
     };
     let start = match (mode, target, base.place) {
         (StartFieldMode::NewOn, "", _) => {
@@ -236,6 +256,78 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn hosts() -> Hosts {
+        Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink))
+    }
+
+    fn url(text: &str) -> Workdir {
+        Workdir {
+            path: Utf8PathBuf::from(text),
+            host: None,
+        }
+    }
+
+    /// A project is the desk's: its name gives its URL and no host, so
+    /// the same project works wherever the agent is placed.
+    #[test]
+    fn a_project_resolves_to_its_url_and_no_host() {
+        let projects = vec![(
+            "rho".to_owned(),
+            Utf8PathBuf::from("https://github.com/maan2003/rho"),
+        )];
+        assert_eq!(
+            resolve_workdir(&projects, &hosts(), "rho").unwrap(),
+            url("https://github.com/maan2003/rho")
+        );
+        // A URL nobody registered is still a URL, not a host prefix.
+        assert_eq!(
+            resolve_workdir(&[], &hosts(), "git@github.com:x/y").unwrap(),
+            url("git@github.com:x/y")
+        );
+        assert!(
+            resolve_workdir(&[], &hosts(), "fern:/src/rho")
+                .unwrap_err()
+                .contains("no attached host named `fern`")
+        );
+    }
+
+    /// What settles the host outranks the default, and a choice that
+    /// contradicts it is refused rather than silently overridden.
+    #[test]
+    fn placement_takes_the_agent_base_then_the_choice_then_the_default() {
+        let base_on = |host: u32| StartBase {
+            host: Some(HostId(host)),
+            place: None,
+        };
+        let start = |placement, base| {
+            parse_start(
+                &hosts(),
+                StartFieldMode::NewOn,
+                "origin/main",
+                Some(url("https://x/y")),
+                placement,
+                base,
+            )
+            .map(|(host, _)| host)
+        };
+        let default = |host: u32| Placement {
+            chosen: None,
+            default: Some(HostId(host)),
+        };
+        assert_eq!(start(default(1), StartBase::default()), Ok(HostId(1)));
+        assert_eq!(start(default(1), base_on(2)), Ok(HostId(2)));
+        let chosen = Placement {
+            chosen: Some(HostId(3)),
+            default: Some(HostId(1)),
+        };
+        assert_eq!(start(chosen, StartBase::default()), Ok(HostId(3)));
+        assert!(start(chosen, base_on(2)).is_err());
+        assert_eq!(
+            start(Placement::default(), StartBase::default()),
+            Err("not connected to an agent host".to_owned())
+        );
+    }
+
     #[test]
     fn parses_and_cycles_current_agent_roles() {
         assert_eq!(parse_agent_role("").unwrap(), AgentRole::default());
@@ -265,11 +357,11 @@ mod tests {
             &hosts,
             StartFieldMode::NewOn,
             "eng-1234",
-            Some(HostPath {
-                host: HostId(2),
+            Some(Workdir {
+                host: Some(HostId(2)),
                 path: Utf8PathBuf::from("/src/rho"),
             }),
-            None,
+            Placement::default(),
             StartBase {
                 host: Some(HostId(1)),
                 place: None,
@@ -289,11 +381,11 @@ mod tests {
             &hosts,
             StartFieldMode::Here,
             "eng-1234",
-            Some(HostPath {
-                host: HostId(2),
+            Some(Workdir {
+                host: Some(HostId(2)),
                 path: Utf8PathBuf::from("/src/notes"),
             }),
-            None,
+            Placement::default(),
             StartBase {
                 host: Some(HostId(1)),
                 place: None,
@@ -318,11 +410,14 @@ mod tests {
             &hosts,
             StartFieldMode::NewOn,
             DEFAULT_START,
-            Some(HostPath {
-                host: HostId(7),
+            Some(Workdir {
+                host: None,
                 path: Utf8PathBuf::from("/src/rho"),
             }),
-            None,
+            Placement {
+                chosen: None,
+                default: Some(HostId(7)),
+            },
             StartBase::default(),
         )
         .expect("a workdir and a default base are enough");
@@ -346,7 +441,10 @@ mod tests {
             StartFieldMode::NewOn,
             DEFAULT_START,
             None,
-            Some(HostId(1)),
+            Placement {
+                chosen: Some(HostId(1)),
+                default: None,
+            },
             StartBase::default(),
         )
         .expect_err("nothing says where the agent works");

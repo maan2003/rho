@@ -9,8 +9,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use camino::Utf8PathBuf;
-
 use crate::connection::Connection;
 use crate::{AttachTarget, HostId, HostSink, HostStream};
 
@@ -62,33 +60,10 @@ impl Host {
 
 /// Every attached agent host, in attachment order, and the shared event stream
 /// they write to.
-/// A working directory on a specific agent host. Two machines can both offer
-/// `/home/you/src/rho`, so a bare path never identifies a project once more
-/// than one host is attached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostPath {
-    pub host: HostId,
-    pub path: Utf8PathBuf,
-}
-
-/// A workdir one agent host offers, under the name its store gave it. What
-/// makes it a project is a fact in the store, which is not this crate's;
-/// what this crate knows is which machine it is on and what to call it.
-#[derive(Clone, Debug)]
-pub struct HostWorkdir {
-    pub host: HostId,
-    pub name: String,
-    pub path: Utf8PathBuf,
-}
-
 pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
     events: Arc<dyn HostSink>,
-    /// Registered workdirs from every attached agent host. Fed by whoever reads
-    /// the store; named and qualified here, because what a workdir is
-    /// called depends on how many machines are attached.
-    workdirs: Vec<HostWorkdir>,
 }
 
 impl Hosts {
@@ -99,7 +74,6 @@ impl Hosts {
             hosts: Vec::new(),
             next_id: 0,
             events,
-            workdirs: Vec::new(),
         }
     }
 
@@ -139,7 +113,6 @@ impl Hosts {
     /// belonging to it are the workspace's to clean up.
     pub fn detach(&mut self, host: HostId) -> Option<Host> {
         let index = self.hosts.iter().position(|entry| entry.id == host)?;
-        self.workdirs.retain(|workdir| workdir.host != host);
         Some(self.hosts.remove(index))
     }
 
@@ -165,25 +138,6 @@ impl Hosts {
 
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()
-    }
-
-    /// The host commands fall back to when nothing in the UI names one: the
-    /// first attached host that is answering, else the first attached.
-    pub fn primary(&self) -> Option<HostId> {
-        self.hosts
-            .iter()
-            .find(|host| host.status.is_online())
-            .or_else(|| self.hosts.first())
-            .map(|host| host.id)
-    }
-
-    /// The host that owns a thing with exactly one home, a Slack unit above
-    /// all: the first host configured, answering or not. Unlike `primary`
-    /// this never moves when a host goes quiet, so a unit's cells stay on
-    /// one host instead of splitting across two, and a write made while the
-    /// owner is away is refused where the user can see it.
-    pub fn owner(&self) -> Option<HostId> {
-        self.hosts.first().map(|host| host.id)
     }
 
     pub fn connection(&self, host: HostId) -> Option<&Connection> {
@@ -233,83 +187,5 @@ impl Hosts {
         self.get(host)
             .map(|entry| entry.name.clone())
             .unwrap_or_default()
-    }
-
-    /// Qualifies a host-side name with its host, but only when there is
-    /// more than one host for it to be confused with.
-    pub fn qualify(&self, host: HostId, name: &str) -> String {
-        if self.len() > 1 {
-            format!("{}/{name}", self.host_label(host))
-        } else {
-            name.to_owned()
-        }
-    }
-
-    /// The workdirs one agent host offers. Whoever reads the store hands them
-    /// over; what they are called once more than one machine is attached is
-    /// this crate's answer.
-    pub fn set_workdirs(&mut self, host: HostId, workdirs: Vec<(String, Utf8PathBuf)>) {
-        self.workdirs.retain(|workdir| workdir.host != host);
-        self.workdirs
-            .extend(
-                workdirs
-                    .into_iter()
-                    .map(|(name, path)| HostWorkdir { host, name, path }),
-            );
-    }
-
-    pub fn workdirs(&self) -> &[HostWorkdir] {
-        &self.workdirs
-    }
-
-    pub fn workdir_label(&self, workdir: &HostPath) -> String {
-        let name = self
-            .workdirs
-            .iter()
-            .find(|candidate| candidate.host == workdir.host && candidate.path == workdir.path)
-            .map(|candidate| candidate.name.clone());
-        match name {
-            Some(name) => self.qualify(workdir.host, &name),
-            None if self.len() > 1 => {
-                format!("{}:{}", self.host_label(workdir.host), workdir.path)
-            }
-            None => workdir.path.to_string(),
-        }
-    }
-
-    /// Registered workdirs as the `(name, description)` table the shared
-    /// command layer expects. Names carry their host once more than one is
-    /// attached, since two machines can register the same project name.
-    pub fn workdir_table(&self) -> Vec<(String, String)> {
-        self.workdirs
-            .iter()
-            .map(|workdir| {
-                (
-                    self.qualify(workdir.host, &workdir.name),
-                    workdir.path.to_string(),
-                )
-            })
-            .collect()
-    }
-
-    /// A workdir argument that names a registered project, if exactly one
-    /// does. An ambiguous bare name resolves to nothing rather than to a
-    /// guess about which machine was meant.
-    pub fn registered_workdir(&self, argument: &str) -> Option<HostPath> {
-        let workdir = |candidate: &HostWorkdir| HostPath {
-            host: candidate.host,
-            path: candidate.path.clone(),
-        };
-        if let Some(exact) = self.workdirs.iter().find(|candidate| {
-            self.qualify(candidate.host, &candidate.name) == argument || candidate.path == argument
-        }) {
-            return Some(workdir(exact));
-        }
-        let mut bare = self
-            .workdirs
-            .iter()
-            .filter(|candidate| candidate.name == argument);
-        let first = bare.next()?;
-        bare.next().is_none().then(|| workdir(first))
     }
 }
