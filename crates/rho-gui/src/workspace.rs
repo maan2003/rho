@@ -1407,13 +1407,18 @@ impl Workspace {
         let registry = &self.registry;
         // The name and where it is filed. Home is a glance: the handle is
         // left to the transcript, and only an agent with no name shows it.
+        let hosts = &self.hosts;
         let name = |agent_id| {
-            registry.agent_name_with_labels(
+            let name = registry.agent_name_with_labels(
                 agent_id,
                 registry
                     .agent_display_name(agent_id)
                     .map_or_else(|| registry.agent_id_label(agent_id), str::to_owned),
-            )
+            );
+            match host_note(hosts, registry.host_of_agent(agent_id)) {
+                Some(note) => format!("{name} · {note}"),
+                None => name,
+            }
         };
         let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, name));
         // An agent already shown as a card above is not listed again.
@@ -7518,6 +7523,19 @@ impl Workspace {
 
     fn abnormal_connection_text(&self) -> Option<String> {
         let (name, status) = self.hosts.worst_status()?;
+        // More than one unwell host is a count, not the worst one's name:
+        // naming one would hide the others.
+        let unwell = self
+            .hosts
+            .iter()
+            .filter(|host| host.status != HostStatus::Online)
+            .count();
+        if unwell > 1 {
+            return Some(format!(
+                "{unwell} of {} hosts not connected",
+                self.hosts.len()
+            ));
+        }
         let subject = (self.hosts.len() > 1).then(|| format!("{name} "));
         match status {
             HostStatus::Connecting => Some(format!(
@@ -8690,5 +8708,24 @@ mod tests {
         ] {
             assert_eq!(agent_role_label(role), expected);
         }
+    }
+}
+
+/// What a row says about the host its agent is on: the host's name once
+/// there is more than one to tell apart, and whether it is answering, so
+/// a row whose commands would fail says so before they do.
+pub(crate) fn host_note(hosts: &Hosts, host: Option<HostId>) -> Option<String> {
+    let host = hosts.get(host?)?;
+    let state = match host.status {
+        HostStatus::Connecting => Some("connecting"),
+        HostStatus::Disconnected(_) => Some("offline"),
+        HostStatus::Online | HostStatus::Recovering(_) => None,
+    };
+    let name = (hosts.len() > 1).then_some(host.name.as_str());
+    match (name, state) {
+        (Some(name), Some(state)) => Some(format!("{name} {state}")),
+        (Some(name), None) => Some(name.to_owned()),
+        (None, Some(state)) => Some(state.to_owned()),
+        (None, None) => None,
     }
 }

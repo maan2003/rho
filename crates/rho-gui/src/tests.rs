@@ -6887,3 +6887,58 @@ fn one_machine_attaches_once(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// A row names its agent's host once there are two, and says when that
+/// host is not answering.
+#[gpui::test]
+fn a_row_says_which_host_and_whether_it_answers(cx: &mut TestAppContext) {
+    story::reset();
+    cx.update(init_test_app);
+    let socket = |name: &str| {
+        AttachTarget::Unix(std::env::temp_dir().join(format!("rho-gui-test-note-{name}.sock")))
+    };
+    let specs = vec![
+        HostSpec {
+            name: "fern".to_owned(),
+            target: socket("fern"),
+        },
+        HostSpec {
+            name: "moss".to_owned(),
+            target: socket("moss"),
+        },
+    ];
+    let workspace = cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = |workspace: &Workspace| {
+                crate::workspace::host_note(&workspace.hosts, Some(HostId(1)))
+            };
+            assert_eq!(note(workspace).as_deref(), Some("moss connecting"));
+            story::feed(workspace, HostId(1), ready_with(Vec::new(), 0), window, cx);
+            assert_eq!(note(workspace).as_deref(), Some("moss"));
+            workspace.hosts.set_status(
+                HostId(1),
+                rho_agent_hosts::HostStatus::Disconnected("gone".to_owned()),
+            );
+            assert_eq!(note(workspace).as_deref(), Some("moss offline"));
+        })
+        .unwrap();
+
+    let single = test_workspace(cx);
+    single
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(Vec::new(), 0),
+                window,
+                cx,
+            );
+            assert_eq!(
+                crate::workspace::host_note(&workspace.hosts, Some(HostId::default())),
+                None,
+                "one answering host needs no word"
+            );
+        })
+        .unwrap();
+}
