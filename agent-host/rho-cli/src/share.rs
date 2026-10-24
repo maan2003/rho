@@ -23,15 +23,11 @@ pub(crate) async fn run(args: ShareArgs) -> Result<()> {
         let _ = probe.shutdown().await;
         let link = client::call(&socket, host::IrohPair).await?;
         print_link(&link);
-        println!("The agent host here keeps running. The link works one time, for ten minutes.");
         return Ok(());
     }
     let mut child = start_host(&socket).await?;
     let link = client::call(&socket, host::IrohPair).await?;
     print_link(&link);
-    println!(
-        "This agent host runs until you press Ctrl-C. The link works one time, for ten minutes."
-    );
     // Whatever stops this process stops the host it started: Ctrl-C, a
     // closed terminal, or a kill.
     use tokio::signal::unix::{SignalKind, signal};
@@ -57,16 +53,15 @@ pub(crate) async fn run(args: ShareArgs) -> Result<()> {
     Ok(())
 }
 
+/// The link alone. On a terminal it is also an OSC 8 hyperlink, since no
+/// terminal's own URL detection knows `rho://`.
 fn print_link(link: &str) {
-    println!();
-    if let Ok(code) = qrcode::QrCode::new(link) {
-        let picture = code
-            .render::<qrcode::render::unicode::Dense1x2>()
-            .quiet_zone(true)
-            .build();
-        println!("{picture}");
+    use std::io::IsTerminal as _;
+    if std::io::stdout().is_terminal() {
+        println!("\x1b]8;;{link}\x1b\\{link}\x1b]8;;\x1b\\");
+    } else {
+        println!("{link}");
     }
-    println!("Open this link in rho-gui to pair it with this machine:\n\n  {link}\n");
 }
 
 /// An agent host that listens over iroh, its output in a log beside its
@@ -79,13 +74,26 @@ async fn start_host(socket: &Path) -> Result<tokio::process::Child> {
     }
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("create {}", log_path.display()))?;
-    let mut child = tokio::process::Command::new(&program)
+    let mut child = tokio::process::Command::new(&program);
+    child
         .arg("--socket-path")
         .arg(socket)
         .arg("--iroh")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
+        .stderr(log);
+    // A kill this process cannot see (SIGKILL, a closed terminal that
+    // kills the session) still takes the host with it.
+    // SAFETY: prctl only, which is async-signal-safe, between fork and exec.
+    unsafe {
+        child.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = child
         .spawn()
         .with_context(|| format!("start {}", program.display()))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);

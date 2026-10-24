@@ -15,7 +15,6 @@ clap.workspace = true
 dirs.workspace = true
 libc.workspace = true
 prefix-id.workspace = true
-qrcode = { version = "0.14", default-features = false }
 rho-agent.workspace = true
 rho-agent-types.workspace = true
 rho-rpc.workspace = true
