@@ -78,8 +78,10 @@ rho-shell-view = { workspace = true, features = ["client"] }
 rho-terminal = { workspace = true, features = ["client"] }
 rho-transcript.workspace = true
 image = { version = "0.25", default-features = false }
-rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
+rodio = { git = "https://github.com/RustAudio/rodio", rev = "3ee9745862279ce1d18db593155016e7ce024aeb", default-features = false, features = [
   "playback",
+  # PulseAudio before ALSA: what drv apps and PipeWire desktops offer.
+  "pulseaudio",
   "wav",
 ] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
