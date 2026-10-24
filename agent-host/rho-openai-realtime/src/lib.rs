@@ -37,6 +37,19 @@ pub struct SidebandConfig {
 
 pub struct Sideband {
     socket: Socket,
+    /// The type of the last event received, so a run of one type (audio
+    /// transcript deltas) is one line of the timeline, at its start.
+    last_event: Option<String>,
+}
+
+/// The `tracing` target of voice timeline markers: what happened when in a
+/// call, from the provider's events to the agent's replies.
+pub const TIMELINE: &str = "rho_voice_timeline";
+
+#[derive(Deserialize)]
+struct EventType<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: std::borrow::Cow<'a, str>,
 }
 
 impl Sideband {
@@ -54,7 +67,13 @@ impl Sideband {
             )
             .await
             {
-                Ok(Ok((socket, _))) => return Ok(Self { socket }),
+                Ok(Ok((socket, _))) => {
+                    tracing::info!(target: TIMELINE, attempt, "sideband connected");
+                    return Ok(Self {
+                        socket,
+                        last_event: None,
+                    });
+                }
                 Ok(Err(error)) => failure = Some(anyhow::Error::from(error)),
                 Err(error) => failure = Some(anyhow::Error::from(error)),
             }
@@ -72,7 +91,10 @@ impl Sideband {
                 return Ok(None);
             };
             match message {
-                Message::Text(text) => return ProviderEvent::from_json(text.as_bytes()).map(Some),
+                Message::Text(text) => {
+                    self.mark_received(text.as_bytes());
+                    return ProviderEvent::from_json(text.as_bytes()).map(Some);
+                }
                 Message::Ping(payload) => self.socket.send(Message::Pong(payload)).await?,
                 Message::Pong(_) => {}
                 Message::Close(_) => return Ok(None),
@@ -99,8 +121,21 @@ impl Sideband {
         Ok(())
     }
 
+    fn mark_received(&mut self, bytes: &[u8]) {
+        let kind = serde_json::from_slice::<EventType<'_>>(bytes)
+            .map(|event| event.kind.into_owned())
+            .unwrap_or_else(|_| "<untyped>".to_owned());
+        if self.last_event.as_deref() != Some(kind.as_str()) {
+            tracing::info!(target: TIMELINE, event = %kind, bytes = bytes.len(), "received");
+            self.last_event = Some(kind);
+        }
+    }
+
     async fn send(&mut self, command: &ProviderCommand<'_>) -> anyhow::Result<()> {
         let text = serde_json::to_string(command).context("encode realtime sideband command")?;
+        if let Ok(event) = serde_json::from_str::<EventType<'_>>(&text) {
+            tracing::info!(target: TIMELINE, command = %event.kind, bytes = text.len(), "sent");
+        }
         tokio::time::timeout(SEND_TIMEOUT, self.socket.send(Message::Text(text.into())))
             .await
             .context("timed out sending realtime sideband command")??;

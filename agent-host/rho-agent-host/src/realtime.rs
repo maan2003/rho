@@ -17,7 +17,8 @@ use rho_agent_types::{AgentId, ContentPart};
 use rho_agents_client::protocol::{AgentCommand, UserMessage};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
-    ContextChannel, ProviderEvent, Sideband, SidebandConfig, TranscriptState, call_id_from_location,
+    ContextChannel, ProviderEvent, Sideband, SidebandConfig, TIMELINE, TranscriptState,
+    call_id_from_location,
 };
 use rho_rpc::protocol::{read_frame, write_frame};
 use rho_rtc::protocol::{Opened, RealtimeClientFrame, RealtimeServerFrame};
@@ -61,6 +62,7 @@ where
             return Ok(());
         }
     };
+    tracing::info!(target: TIMELINE, agent = ?agent_id, "voice requested");
     let opened = async {
         let instructions = instructions(&services, agent_id)?;
         let auth = services.inference.auth().await?;
@@ -85,6 +87,7 @@ where
         }
     };
 
+    tracing::info!(target: TIMELINE, "realtime call created");
     write_frame(
         &mut writer,
         &Opened::Answer {
@@ -150,6 +153,7 @@ where
                     else {
                         continue;
                     };
+                    tracing::info!(target: TIMELINE, delegation = id, ?channel, complete, "agent replied");
                     sideband.append_delegation(id, channel, &text).await?;
                     if complete {
                         active = None;
@@ -159,6 +163,7 @@ where
             event = sideband.next_event() => {
                 match event {
                     Ok(Some(ProviderEvent::DelegationCreated { id, text })) => {
+                        tracing::info!(target: TIMELINE, delegation = id, request = %text, "delegation created");
                         let message = thread::delegation(&text, &transcript.take_snapshot());
                         let delivered = crate::agents::handle_agent_command(
                             &services,
@@ -171,6 +176,7 @@ where
                             },
                         )
                         .await;
+                        tracing::info!(target: TIMELINE, delegation = id, ok = delivered.is_ok(), "delegation delivered");
                         match delivered {
                             Ok(()) => active = Some(id),
                             Err(error) => {

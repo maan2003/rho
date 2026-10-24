@@ -19,7 +19,7 @@ use libwebrtc::peer_connection_factory::{
 };
 use libwebrtc::session_description::{SdpType, SessionDescription};
 use rodio::source::UniformSourceIterator;
-use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
+use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate};
 use tokio::sync::{mpsc, oneshot};
 
 use super::*;
