@@ -1,0 +1,39 @@
+[package]
+name = "pulseaudio"
+description = "A native rust implementation of the PulseAudio protocol."
+repository = "https://github.com/colinmarc/pulseaudio-rs"
+edition = "2024"
+version = "0.3.2"
+authors = ["Colin Marc <hi@colinmarc.com>"]
+license = "MIT"
+
+[workspace]
+members = ["patrace"]
+
+[dependencies]
+bitflags = "2"
+byteorder = "1"
+enum-primitive-derive = "0.3"
+futures = "0.3"
+log = "0.4"
+mio = { version = "1", features = ["os-ext", "os-poll", "net"] }
+num-traits = "0.2"
+thiserror = "1"
+
+[dev-dependencies]
+anyhow = "1"
+assert_matches = "1"
+hound = "3"
+indicatif = "0.17"
+mio-timerfd = "0.2"
+pretty_assertions = "1.4"
+rand = "0.9"
+test-log = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+
+[features]
+_integration-tests = []
+
+[patch.crates-io]
+mio-timerfd = { git = "https://github.com/colinmarc/mio-timerfd.git" }
