@@ -193,9 +193,9 @@ a machine that is offline, poll until it answers. Tasks keep running after your 
 
 ## How time works
 
-Your latest exec finishing wakes you immediately. User messages wake you after 2 seconds, agent
-messages after 15 seconds, notify() after 2 seconds, and unreported task failures after 20
-seconds. A message received while you are responding starts waiting when your response ends.
+Your latest exec finishing wakes you immediately. Other events wait from the end of your last
+response: user messages and notify() 2 seconds, agent messages 15 seconds, and unreported task
+failures 20 seconds. An event that arrives later than that wakes you at once.
 Other tasks finishing successfully do not wake you. Every wake carries all pending output.
 
 The check-in comes 120 seconds after your last response. Each response resets it; the latest

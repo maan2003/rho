@@ -41,19 +41,32 @@ pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
     if facts.compaction {
         return Decision::Now(Wake::Compaction);
     }
-    let base = |at: UnixMs| at.max(facts.response_finished.unwrap_or(at));
+    // Each event waits only for the time after the last response: that
+    // time lets the cell the response started finish and go with it. An
+    // event long after the response goes at once.
+    let after_response = |at: UnixMs, wait: Duration| {
+        facts
+            .response_finished
+            .map_or(at, |finished| at.max(finished + wait))
+    };
+    let human = facts
+        .human
+        .map(|at| after_response(at, Duration::from_secs(2)));
     let mut due = Vec::new();
-    if let Some(at) = facts.human {
-        due.push((base(at) + Duration::from_secs(2), Wake::Message));
+    if let Some(at) = human {
+        due.push((at, Wake::Message));
     }
     if facts.prose_silenced {
-        return match facts.human.map(|at| base(at) + Duration::from_secs(2)) {
+        return match human {
             Some(at) if at <= now => Decision::Now(Wake::Message),
             at => Decision::Later(at),
         };
     }
     if let Some(at) = facts.agent {
-        due.push((base(at) + Duration::from_secs(15), Wake::AgentMessage));
+        due.push((
+            after_response(at, Duration::from_secs(15)),
+            Wake::AgentMessage,
+        ));
     }
     if facts.rewound {
         due.push((now, Wake::Rewound));
@@ -62,13 +75,13 @@ pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
         due.push((now, Wake::Prose));
     }
     if let Some(at) = facts.finished {
-        due.push((base(at), Wake::Returned));
+        due.push((after_response(at, Duration::ZERO), Wake::Returned));
     }
     if let Some(at) = facts.notified {
-        due.push((base(at) + Duration::from_secs(2), Wake::Notify));
+        due.push((after_response(at, Duration::from_secs(2)), Wake::Notify));
     }
     if let Some(at) = facts.failure {
-        due.push((base(at) + Duration::from_secs(20), Wake::Failure));
+        due.push((after_response(at, Duration::from_secs(20)), Wake::Failure));
     }
     if let Some(at) = facts.checkin {
         due.push((at, Wake::Checkin));
@@ -113,7 +126,7 @@ mod tests {
                     human: Some(UnixMs(2)),
                     ..facts.clone()
                 },
-                UnixMs(2_002)
+                UnixMs(2)
             ),
             Decision::Now(Wake::Message)
         );
@@ -213,6 +226,58 @@ mod tests {
                 UnixMs(40_000)
             ),
             Decision::Later(None)
+        );
+    }
+
+    #[test]
+    fn events_wait_only_for_the_time_after_a_response() {
+        let idle = Facts {
+            response_finished: Some(UnixMs(10_000)),
+            ..Facts::default()
+        };
+        // Long after the response: at once, not 2 seconds after it came.
+        assert_eq!(
+            decide(
+                &Facts {
+                    human: Some(UnixMs(50_000)),
+                    ..idle.clone()
+                },
+                UnixMs(50_000)
+            ),
+            Decision::Now(Wake::Message)
+        );
+        // Just after the response: when its 2 seconds end, not 2 seconds
+        // after the message.
+        let soon = Facts {
+            human: Some(UnixMs(11_500)),
+            ..idle.clone()
+        };
+        assert_eq!(
+            decide(&soon, UnixMs(11_999)),
+            Decision::Later(Some(UnixMs(12_000)))
+        );
+        assert_eq!(decide(&soon, UnixMs(12_000)), Decision::Now(Wake::Message));
+        // Agent mail long after the response: at once, not 15 seconds on.
+        assert_eq!(
+            decide(
+                &Facts {
+                    agent: Some(UnixMs(50_000)),
+                    ..idle.clone()
+                },
+                UnixMs(50_000)
+            ),
+            Decision::Now(Wake::AgentMessage)
+        );
+        // The same holds with prose silenced.
+        assert_eq!(
+            decide(
+                &Facts {
+                    prose_silenced: true,
+                    ..soon
+                },
+                UnixMs(11_999)
+            ),
+            Decision::Later(Some(UnixMs(12_000)))
         );
     }
 }

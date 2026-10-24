@@ -30,9 +30,13 @@ exec call requests no timed wake. `suppress_tool_wakeups()` suppresses every
 notebook event but not the timer, user input or mail. These controls are
 independent and belong to the latest exec call; a newer call resets both
 to their defaults and older cells cannot override its settings.
-Patience is measured from when the scheduler first saw the event while able
-to act, never from the instant a tool recorded it, and the reason each request went out is recorded with it
-(`WakeFacts` on `Sent` and on Claude `Transcript` rows).
+Patience is counted from the end of the model's last response, not from the
+event: an event waits only for what is left of its patience since then, and
+one that comes later than that goes at once. The patience after a response is
+for the cell that response started, which usually ends soon after and should
+go in the same request. Waiting again from each event only delays it. The
+reason each request went out is recorded with it (`WakeFacts` on `Sent` and on
+Claude `Transcript` rows).
 
 ## Rationale
 
