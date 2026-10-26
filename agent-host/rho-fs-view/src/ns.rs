@@ -72,7 +72,7 @@ impl Layout {
                 .clone()
                 .map(Utf8PathBuf::into_std_path_buf),
         };
-        crate::layout::ExposedBuilder::new(mounts)?.build_in_place(Path::new("/"))?;
+        crate::layout::ExposedBuilder::new(mounts)?.build()?;
         Ok(())
     }
 

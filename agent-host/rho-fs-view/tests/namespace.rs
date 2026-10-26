@@ -38,10 +38,6 @@ fn main() {
         eprintln!("skipping namespace test: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    if !Path::new("/src").is_dir() {
-        eprintln!("skipping namespace test: host has no /src mount stub");
-        return;
-    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -111,8 +107,8 @@ test -S "$RHO_GIT_STORE_SOCKET"
 test -f /src/second/file.txt
 git -C /src/second log -1 --format=%H origin/main >/dev/null
 touch /src/second/written
-if touch {store}/mirror 2>/dev/null; then echo "store is writable"; exit 1; fi
-if mkdir {stores}/x 2>/dev/null; then echo "store root is writable"; exit 1; fi
+if touch {store}/mirror; then echo "store is writable"; exit 1; fi
+if mkdir {stores}/x; then echo "store root is writable"; exit 1; fi
 test ! -e /src/.stores
 "#,
         notes = notes,

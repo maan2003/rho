@@ -121,8 +121,10 @@ paths and per-agent cwd, not host-side view descriptors or path translation.
 Commands inherit the process environment, with explicit command overrides and
 per-directory devshell additions. Normal execution inherits the namespace. Claude launcher children alone clone it to install
 private provider overlays; no generic agent namespace or setup thread is needed.
-The namespace exposes the host filesystem, with the workset mounted at `/src`;
-there is no alternate filesystem mode. An agent whose `Place` has no workset
+The namespace reconstructs the host root from its existing top-level entries,
+with a private `/src` mount point for the workset. It needs no host `/src`
+directory. New top-level host entries are not reflected in that root.
+There is no alternate filesystem mode. An agent whose `Place` has no workset
 works in a host directory and runs in the one host process, which builds no
 namespace and so needs no user namespaces. Claude agents need a workset.
 

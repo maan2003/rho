@@ -5,6 +5,7 @@
 //! and no security boundary is claimed.
 
 use std::ffi::{CString, OsStr};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -28,10 +29,10 @@ pub struct Mounts {
     pub store_socket: Option<PathBuf>,
 }
 
-/// The full host view as the invoking user, plus the workset directory mounted
-/// over the host's permanently empty `/src` stub and the store root made
-/// read-only. Environment, `$HOME`, and every other host path stay exactly as
-/// they are.
+/// The host view as the invoking user, with a namespace-local `/src` for the
+/// workset and the store root made read-only. No host mount stub is needed.
+/// Existing host paths and their submounts remain visible. New top-level host
+/// entries created after construction are not reflected in this private root.
 pub struct ExposedBuilder {
     mounts: Mounts,
 }
@@ -42,18 +43,62 @@ impl ExposedBuilder {
         Ok(Self { mounts })
     }
 
-    /// Mounts the workset directory over `root/src` in the current mount
-    /// namespace without unsharing or changing cwd/environment. The stub
-    /// must exist: an unprivileged mount namespace can only mount over a
-    /// directory that is already there.
-    pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
-        let stub = mount_root(root);
-        ensure!(
-            stub.is_dir(),
-            "host {MOUNT_ROOT} mount stub is missing: {} (deploy it with systemd-tmpfiles: d {MOUNT_ROOT} 0500 root root -)",
-            stub.display()
-        );
-        mount_in_place(&self.mounts, root)
+    /// Reconstructs the host root in the current private mount namespace,
+    /// then mounts the workset at `/src`. Call only in a single-threaded
+    /// process after unsharing user and mount namespaces. Changes root and cwd.
+    pub fn build(&self) -> anyhow::Result<()> {
+        // Like bubblewrap, use two pivots: first move the staging tmpfs out of
+        // the host tree, then build the final root from the detached host root.
+        // Otherwise a recursive bind of /tmp would include our own new root.
+        // Mounting over the existing /tmp creates no host files or directories.
+        let staging = fs::canonicalize("/tmp").context("resolve root staging directory")?;
+        mount_fs(
+            Some(OsStr::new("tmpfs")),
+            &staging,
+            Some("tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=0755"),
+        )
+        .context("mount private root staging tmpfs")?;
+        std::env::set_current_dir(&staging)?;
+        fs::create_dir("newroot")?;
+        fs::create_dir("oldroot")?;
+        bind(Path::new("newroot"), Path::new("newroot"), false)?;
+        pivot_root(&staging, Path::new("oldroot"))?;
+        std::env::set_current_dir("/")?;
+
+        for entry in fs::read_dir("/oldroot")? {
+            let entry = entry?;
+            if entry.file_name() == MOUNT_ROOT.trim_start_matches('/') {
+                continue;
+            }
+            let target = Path::new("/newroot").join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
+            } else {
+                if kind.is_dir() {
+                    fs::create_dir(&target)?;
+                } else {
+                    fs::File::create(&target)?;
+                }
+                bind(&entry.path(), &target, false)?;
+            }
+        }
+        fs::create_dir("/newroot/src")?;
+        unmount(Path::new("/oldroot"))?;
+
+        // Stacking the old staging root on the final root avoids a temporary
+        // put_old directory in the user's workset or any host-backed directory.
+        {
+            let oldroot = fs::File::open("/")?;
+            std::env::set_current_dir("/newroot")?;
+            pivot_root(Path::new("."), Path::new("."))?;
+            cvt(unsafe { libc::fchdir(oldroot.as_raw_fd()) }).context("chdir to staging root")?;
+            unmount(Path::new("."))?;
+            std::env::set_current_dir("/")?;
+        }
+        mount_in_place(&self.mounts, Path::new("/"))
     }
 }
 
@@ -222,6 +267,23 @@ fn mount_fs(
                 .map_or(std::ptr::null(), |s| s.as_ptr().cast()),
         )
     })?;
+    Ok(())
+}
+
+fn pivot_root(new_root: &Path, old_root: &Path) -> anyhow::Result<()> {
+    let new_root = cstring(new_root)?;
+    let old_root = cstring(old_root)?;
+    cvt(unsafe {
+        libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), old_root.as_ptr()) as i32
+    })
+    .context("pivot root")?;
+    Ok(())
+}
+
+fn unmount(path: &Path) -> anyhow::Result<()> {
+    let target = cstring(path)?;
+    cvt(unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) })
+        .with_context(|| format!("detach {}", path.display()))?;
     Ok(())
 }
 
