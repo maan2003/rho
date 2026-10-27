@@ -24,7 +24,8 @@ pub(crate) struct EvalArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Engineer role. high-eng selects GPT-6 Astra; opus-eng and fable-eng
+    /// Engineer role. mini-eng selects GPT-6.1 Terra, high-eng selects
+    /// GPT-6 Astra; opus-eng and fable-eng
     /// run Claude Code and need --claude-accounts. Every role works in the
     /// Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]

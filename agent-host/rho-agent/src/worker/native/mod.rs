@@ -1436,7 +1436,7 @@ fn inference_session(
         .ok_or_else(|| anyhow::anyhow!("Rho runtime stored without a model"))?;
     let billed = match model {
         InferenceModel::Gpt6Astra => crate::log::AgentUsageModel::ASTRA,
-        InferenceModel::Gpt6Luna => crate::log::AgentUsageModel::LUNA,
+        InferenceModel::Gpt61Terra => crate::log::AgentUsageModel::TERRA,
         InferenceModel::Gpt61Sol => crate::log::AgentUsageModel::GPT,
     };
     Ok((inference.session(profile, model), billed.name().to_owned()))

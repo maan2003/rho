@@ -8,7 +8,7 @@ use crate::log::{AGENT_USAGE_BUCKET_MS, AgentRoleSessionProfile as _, ClaudeEffo
 #[test]
 fn canonical_bindings_round_trip() {
     for binding in [
-        SessionBinding::ResponsesLuna(InferenceProfile {
+        SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
         }),
@@ -181,21 +181,21 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
             ..first.clone()
         },
     );
-    let luna_id = write.alloc_agent_id();
+    let terra_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
-        luna_id,
+        terra_id,
         None,
         test_workspace(),
         AgentRole::default(),
-        SessionBinding::ResponsesLuna(InferenceProfile::default()),
+        SessionBinding::ResponsesTerra(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
         },
         crate::log::AgentOrigin::User,
     );
     write.add_agent_usage(
-        luna_id,
+        terra_id,
         &AgentUsageBucket {
             model: AgentUsageModel::UNKNOWN,
             ..first.clone()
@@ -217,7 +217,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     assert_eq!(global[1].1.output_tokens, 40);
     assert_eq!(global[2].0, AgentUsageModel::OPUS);
     assert_eq!(global[2].1.output_tokens, 40);
-    assert_eq!(global[3].0, AgentUsageModel::LUNA);
+    assert_eq!(global[3].0, AgentUsageModel::TERRA);
     assert_eq!(global[4].0, AgentUsageModel::ASTRA);
 }
 
@@ -359,7 +359,7 @@ fn agent_roles_resolve_the_current_model_matrix() {
     let profile = |intelligence| AgentRole::Engineer { intelligence }.session_profile();
     assert_eq!(
         profile(EngineerIntelligence::Mini),
-        SessionBinding::ResponsesLuna(InferenceProfile {
+        SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
         })
@@ -1308,5 +1308,117 @@ async fn prepare_accepts_other_subsystems_before_agent_initialization() {
     assert_eq!(
         db.read().open_table(FORMAT).get(()).unwrap().value(),
         CURRENT_AGENT_DB_FORMAT
+    );
+}
+
+#[test]
+fn terra_binding_keeps_the_live_worker_protocol_and_saved_rows() {
+    #[derive(
+        Debug,
+        PartialEq,
+        senax_encoder::Encode,
+        senax_encoder::Decode,
+        senax_encoder::Pack,
+        senax_encoder::Unpack,
+    )]
+    enum OldBinding {
+        ClaudeFable { effort: ClaudeEffort },
+        ClaudeOpus { effort: ClaudeEffort },
+        ResponsesSol(InferenceProfile),
+        ResponsesLuna(InferenceProfile),
+        ClaudeAdvisor { effort: ClaudeEffort },
+        AdvisorSol(InferenceProfile),
+        ResponsesAstra(InferenceProfile),
+        AdvisorAstra(InferenceProfile),
+    }
+    let profile = InferenceProfile {
+        effort: ReasoningEffort::High,
+        fast_mode: false,
+    };
+    for (old, new) in [
+        (
+            OldBinding::ClaudeFable {
+                effort: ClaudeEffort::Medium,
+            },
+            SessionBinding::ClaudeFable {
+                effort: ClaudeEffort::Medium,
+            },
+        ),
+        (
+            OldBinding::ClaudeOpus {
+                effort: ClaudeEffort::High,
+            },
+            SessionBinding::ClaudeOpus {
+                effort: ClaudeEffort::High,
+            },
+        ),
+        (
+            OldBinding::ResponsesSol(profile),
+            SessionBinding::ResponsesSol(profile),
+        ),
+        (
+            OldBinding::ResponsesLuna(profile),
+            SessionBinding::ResponsesTerra(profile),
+        ),
+        (
+            OldBinding::ClaudeAdvisor {
+                effort: ClaudeEffort::Xhigh,
+            },
+            SessionBinding::ClaudeAdvisor {
+                effort: ClaudeEffort::Xhigh,
+            },
+        ),
+        (
+            OldBinding::AdvisorSol(profile),
+            SessionBinding::AdvisorSol(profile),
+        ),
+        (
+            OldBinding::ResponsesAstra(profile),
+            SessionBinding::ResponsesAstra(profile),
+        ),
+        (
+            OldBinding::AdvisorAstra(profile),
+            SessionBinding::AdvisorAstra(profile),
+        ),
+    ] {
+        let mut old_encoded = bytes::BytesMut::new();
+        let mut new_encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&old, &mut old_encoded).unwrap();
+        senax_encoder::encode_to(&new, &mut new_encoded).unwrap();
+        assert_eq!(
+            old_encoded, new_encoded,
+            "stored and IPC binding identity changed"
+        );
+        assert_eq!(
+            senax_encoder::decode::<OldBinding>(&mut new_encoded.clone()).unwrap(),
+            old
+        );
+        assert_eq!(
+            senax_encoder::decode::<SessionBinding>(&mut old_encoded.clone()).unwrap(),
+            new
+        );
+        let mut old_packed = bytes::BytesMut::new();
+        let mut new_packed = bytes::BytesMut::new();
+        senax_encoder::pack_to(&old, &mut old_packed).unwrap();
+        senax_encoder::pack_to(&new, &mut new_packed).unwrap();
+        assert_eq!(old_packed, new_packed, "packed binding position changed");
+        assert_eq!(
+            senax_encoder::unpack::<OldBinding>(&mut new_packed).unwrap(),
+            old
+        );
+        assert_eq!(
+            senax_encoder::unpack::<SessionBinding>(&mut old_packed).unwrap(),
+            new
+        );
+    }
+    let binding = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::Mini,
+    }
+    .session_profile();
+    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt61Terra));
+    assert_eq!(InferenceModel::Gpt61Terra.as_str(), "gpt-6.1-terra");
+    assert_eq!(
+        crate::log::usage_model_of(&test_agent_runtime(), binding),
+        AgentUsageModel::TERRA
     );
 }

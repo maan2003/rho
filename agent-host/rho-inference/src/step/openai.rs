@@ -1183,7 +1183,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_mode_omits_exec_tool_and_returns_prose() {
+    async fn terra_engineer_sends_xhigh_default_and_receives_exec() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let body = envelope(&mut socket).await;
+            assert_eq!(body["model"], "gpt-6.1-terra");
+            assert_eq!(body["reasoning"]["effort"], "xhigh");
+            assert_eq!(body["service_tier"], "default");
+            assert_eq!(body["input"][0]["tools"][0]["name"], "exec");
+            complete(&mut socket, "terra-exec", false).await;
+        });
+        let policy = Host::new().policy(addr);
+        let session = TestInferenceSession {
+            session: policy.session(
+                InferenceProfile {
+                    effort: ReasoningEffort::Xhigh,
+                    fast_mode: false,
+                },
+                InferenceModel::Gpt61Terra,
+            ),
+            policy,
+        };
+        let step = session.step(&request(), &mut |_| {}).await.unwrap();
+        let call = step.call.unwrap();
+        assert_eq!(call.code, "pass");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn text_mode_uses_terra_omits_exec_tool_and_returns_prose() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1192,6 +1223,7 @@ mod tests {
             let body: Value =
                 serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
                     .unwrap();
+            assert_eq!(body["model"], "gpt-6.1-terra");
             assert_eq!(body["input"][0]["role"], "developer");
             assert_eq!(body["input"].as_array().unwrap().len(), 2);
             assert_eq!(body["input"][1]["content"][0]["text"], "name this");

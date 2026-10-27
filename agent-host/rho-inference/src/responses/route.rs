@@ -147,7 +147,7 @@ impl RouteSelection {
         fast: bool,
         selected: Option<&SelectedAuth>,
     ) -> DialRoute {
-        if model == crate::config::InferenceModel::Gpt6Luna && !fast {
+        if model == crate::config::InferenceModel::Gpt61Terra && !fast {
             let route = self;
             if route.route == DialRoute::Dns
                 || selected.is_some_and(|selected| {
@@ -370,7 +370,7 @@ async fn probe_route(
 
 fn probe_body(prompt_cache_key: uuid::Uuid) -> serde_json::Value {
     json!({
-            "type": "response.create", "generate": false, "model": "gpt-6-luna",
+            "type": "response.create", "generate": false, "model": crate::config::InferenceModel::Gpt61Terra.as_str(),
             "instructions": "", "input": [{"type":"additional_tools","role":"developer","tools":[]}],
             "store": false, "parallel_tool_calls": false, "text": {"verbosity":"low"},
             "reasoning": {"context":"all_turns","effort":"medium","summary":"auto"},
@@ -463,16 +463,16 @@ mod tests {
     }
 
     #[test]
-    fn probe_is_luna_default_without_generation() {
+    fn probe_is_terra_default_without_generation() {
         let body = probe_body(uuid::Uuid::nil());
-        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["model"], "gpt-6.1-terra");
         assert_eq!(body["service_tier"], "default");
         assert_eq!(body["generate"], false);
         assert_eq!(body["input"][0]["tools"], json!([]));
     }
 
     #[test]
-    fn selected_route_is_luna_default_and_account_scoped() {
+    fn selected_route_is_terra_default_and_account_scoped() {
         let routes = RouteSelector::new(None);
         routes.selected.send_replace(RouteSelection {
             revision: 0,
@@ -482,7 +482,7 @@ mod tests {
 
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt6Luna,
+                crate::config::InferenceModel::Gpt61Terra,
                 false,
                 Some(&selected("one", "account-1")),
             ),
@@ -490,7 +490,7 @@ mod tests {
         );
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt6Luna,
+                crate::config::InferenceModel::Gpt61Terra,
                 false,
                 Some(&selected("two", "account-2")),
             ),
@@ -498,7 +498,7 @@ mod tests {
         );
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt6Luna,
+                crate::config::InferenceModel::Gpt61Terra,
                 true,
                 Some(&selected("one", "account-1")),
             ),

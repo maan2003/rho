@@ -28,7 +28,7 @@ impl ReasoningEffort {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InferenceModel {
     Gpt61Sol,
-    Gpt6Luna,
+    Gpt61Terra,
     Gpt6Astra,
 }
 
@@ -36,7 +36,7 @@ impl InferenceModel {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Gpt61Sol => "gpt-6.1-sol",
-            Self::Gpt6Luna => "gpt-6-luna",
+            Self::Gpt61Terra => "gpt-6.1-terra",
             Self::Gpt6Astra => "gpt-6-astra",
         }
     }

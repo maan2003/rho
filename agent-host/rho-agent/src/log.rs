@@ -104,7 +104,7 @@ pub fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentU
     match runtime {
         AgentRuntime::Rho { .. } => match binding.deep_model() {
             Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
-            Some(InferenceModel::Gpt6Luna) => AgentUsageModel::LUNA,
+            Some(InferenceModel::Gpt61Terra) => AgentUsageModel::TERRA,
             _ => AgentUsageModel::GPT,
         },
         AgentRuntime::Claude { .. } => match binding.claude_model() {
@@ -289,7 +289,11 @@ pub enum SessionBinding {
         effort: ClaudeEffort,
     },
     ResponsesSol(InferenceProfile),
-    ResponsesLuna(InferenceProfile),
+    // This slot is shared with live workers from before Terra replaced Luna.
+    // Keep its encoded identity and packed position. Old workers keep their
+    // model until they exit; new workers resolve this slot to Terra.
+    #[senax(rename = "ResponsesLuna")]
+    ResponsesTerra(InferenceProfile),
     /// Fable-backed advisor; distinct so its role survives session pinning.
     ClaudeAdvisor {
         effort: ClaudeEffort,
@@ -314,7 +318,7 @@ impl AgentRoleSessionProfile for AgentRole {
         match self {
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
+            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Xhigh)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
@@ -349,7 +353,7 @@ impl AgentRoleSessionProfile for AgentRole {
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
         match self {
-            Self::ResponsesLuna(_) => AgentRole::Engineer {
+            Self::ResponsesTerra(_) => AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             },
             Self::ResponsesSol(_) => AgentRole::Engineer {
@@ -379,7 +383,7 @@ impl SessionBinding {
     pub fn deep_config(self) -> Option<InferenceProfile> {
         match self {
             Self::ResponsesSol(config)
-            | Self::ResponsesLuna(config)
+            | Self::ResponsesTerra(config)
             | Self::ResponsesAstra(config)
             | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config) => Some(config),
@@ -390,7 +394,7 @@ impl SessionBinding {
     pub fn deep_model(self) -> Option<InferenceModel> {
         match self {
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt61Sol),
-            Self::ResponsesLuna(_) => Some(InferenceModel::Gpt6Luna),
+            Self::ResponsesTerra(_) => Some(InferenceModel::Gpt61Terra),
             Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
@@ -401,7 +405,7 @@ impl SessionBinding {
             Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
             Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
             Self::ResponsesSol(_)
-            | Self::ResponsesLuna(_)
+            | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_) => None,
@@ -415,7 +419,7 @@ impl SessionBinding {
             }
             Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
             Self::ResponsesSol(_)
-            | Self::ResponsesLuna(_)
+            | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_) => None,
