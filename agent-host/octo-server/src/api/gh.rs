@@ -25,6 +25,10 @@ pub fn router() -> Router<Arc<AppState>> {
             "/repos/{owner}/{repo}/pulls/{number}/draft",
             axum::routing::put(set_draft),
         )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}/merge-queue-entry",
+            get(get_merge_queue_entry),
+        )
         .route("/{*path}", any(rest))
         .layer(DefaultBodyLimit::disable())
 }
@@ -576,6 +580,69 @@ async fn set_draft(
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct QueueLookup {
+    repository: Option<QueueRepository>,
+}
+#[derive(Deserialize)]
+struct QueueRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<QueuePull>,
+}
+#[derive(Deserialize)]
+struct QueuePull {
+    #[serde(rename = "mergeQueueEntry")]
+    merge_queue_entry: Option<QueueEntry>,
+}
+#[derive(Deserialize, Serialize)]
+struct QueueEntry {
+    state: String,
+    position: u32,
+    #[serde(rename(deserialize = "enqueuedAt"))]
+    enqueued_at: String,
+    #[serde(rename(deserialize = "estimatedTimeToMerge"))]
+    estimated_time_to_merge: Option<u64>,
+}
+#[derive(Serialize)]
+struct MergeQueueEntry {
+    /// `None` when the pull request is not in its base branch's merge queue.
+    merge_queue_entry: Option<QueueEntry>,
+}
+
+/// Reads where a pull request sits in its merge queue. Enqueueing goes
+/// through the allowlisted REST `pulls.merge_async`; GitHub's REST API has no
+/// read for the queue entry itself.
+async fn get_merge_queue_entry(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, String)>,
+    uri: Uri,
+) -> Response {
+    if uri.query().is_some() || !positive(&number) {
+        return forbidden();
+    }
+    let Ok(number) = number.parse::<i32>() else {
+        return forbidden();
+    };
+    let token = match state.get_token().await {
+        Ok(token) => token,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let lookup = graphql::<QueueLookup>(&state, &token,
+        "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { mergeQueueEntry { state position enqueuedAt estimatedTimeToMerge } } } }",
+        json!({"owner":owner,"repo":repo,"number":number})).await;
+    let data = match lookup {
+        Ok(data) => data,
+        Err(error) => return *error,
+    };
+    let Some(pull) = data.repository.and_then(|repo| repo.pull_request) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(MergeQueueEntry {
+        merge_queue_entry: pull.merge_queue_entry,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -599,7 +666,10 @@ mod tests {
         let mut writes = 0;
         for op in operations() {
             if op.group == "attachments"
-                || matches!(op.name.as_str(), "review_decision" | "set_draft")
+                || matches!(
+                    op.name.as_str(),
+                    "review_decision" | "set_draft" | "merge_queue_entry"
+                )
             {
                 continue;
             }
@@ -1663,6 +1733,91 @@ mod tests {
             );
         }
         assert_eq!(seen.lock().await.len(), 4);
+        task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_entry_reads_fixed_typed_graphql() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let (upstream, upstream_task) = serve(Router::new().route(
+            "/graphql",
+            axum::routing::post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "Bearer host-token-test"
+                    );
+                    let number = body["variables"]["number"].as_i64().unwrap();
+                    captured.lock().await.push(body);
+                    Json(match number {
+                        41 => json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":{
+                            "state":"AWAITING_CHECKS","position":3,
+                            "enqueuedAt":"2026-10-28T09:10:11Z","estimatedTimeToMerge":null,
+                            "enqueuer":{"login":"ignored"}
+                        }}}}}),
+                        42 => json!({"data":{"repository":{"pullRequest":{"mergeQueueEntry":null}}}}),
+                        43 => json!({"data":{"repository":{"pullRequest":null}}}),
+                        _ => json!({"data":null,"errors":[{"type":"NOT_FOUND","message":"host-token-test"}]}),
+                    })
+                }
+            }),
+        ))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        for (number, status, expected) in [
+            (
+                41,
+                StatusCode::OK,
+                Some(json!({"merge_queue_entry":{
+                    "state":"AWAITING_CHECKS","position":3,
+                    "enqueued_at":"2026-10-28T09:10:11Z","estimated_time_to_merge":null
+                }})),
+            ),
+            (42, StatusCode::OK, Some(json!({"merge_queue_entry":null}))),
+            (43, StatusCode::NOT_FOUND, None),
+            (44, StatusCode::BAD_GATEWAY, None),
+        ] {
+            let response = client
+                .get(format!(
+                    "{base}/repos/other/project/pulls/{number}/merge-queue-entry"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{number}");
+            match expected {
+                Some(expected) => {
+                    assert_eq!(response.json::<Value>().await.unwrap(), expected)
+                }
+                None => assert!(
+                    !response.text().await.unwrap().contains("host-token-test"),
+                    "{number}"
+                ),
+            }
+        }
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 4);
+        assert_eq!(
+            seen[0]["variables"],
+            json!({"owner":"other","repo":"project","number":41})
+        );
+        assert!(
+            seen[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("mergeQueueEntry { state position enqueuedAt estimatedTimeToMerge }")
+        );
+        for path in [
+            "repos/other/project/pulls/0/merge-queue-entry",
+            "repos/other/project/pulls/41/merge-queue-entry?jump=true",
+        ] {
+            let response = client.get(format!("{base}/{path}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
         task.abort();
         upstream_task.abort();
     }

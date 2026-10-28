@@ -5456,6 +5456,33 @@
       "param_docs": {
         "draft": "True converts to draft; False marks ready for review."
       }
+    },
+    {
+      "group": "pulls",
+      "name": "merge_queue_entry",
+      "path": "/repos/{owner}/{repo}/pulls/{pull_number}/merge-queue-entry",
+      "verb": "GET",
+      "summary": "Read the pull request's merge queue entry through Octo",
+      "route_params": [
+        "owner",
+        "repo",
+        "pull_number"
+      ],
+      "required_params": [
+        "owner",
+        "pull_number",
+        "repo"
+      ],
+      "param_types": {
+        "owner": "str",
+        "repo": "str",
+        "pull_number": "int"
+      },
+      "param_docs": {
+        "owner": "The account owner of the repository.",
+        "repo": "The repository name.",
+        "pull_number": "The number that identifies the pull request."
+      }
     }
   ]
 }

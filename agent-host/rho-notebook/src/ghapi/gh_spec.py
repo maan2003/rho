@@ -1,4 +1,4 @@
-"""Pinned ghapi 2.1.5 REST metadata plus Octo's review-decision endpoint (Apache-2.0)."""
+"""Pinned ghapi 2.1.5 REST metadata plus Octo's fixed GraphQL-backed endpoints (Apache-2.0)."""
 import json
 from pathlib import Path
 

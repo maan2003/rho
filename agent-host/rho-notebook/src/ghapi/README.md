@@ -6,8 +6,8 @@ Based on [ghapi](https://github.com/AnswerDotAI/ghapi) 2.1.5,
 
 `gh_spec.json` contains complete, unmodified upstream metadata for 133 REST
 operations: 91 reads and 42 writes. It also defines Octo-only
-`pulls.review_decision` and `pulls.set_draft` helpers backed by fixed,
-typed GraphQL operations.
+`pulls.review_decision`, `pulls.set_draft`, and `pulls.merge_queue_entry`
+helpers backed by fixed, typed GraphQL operations.
 
 The selected surface covers PR collaboration, issue/comment workflows,
 issue labels/assignees/field values/dependencies/sub-issues, and reactions
@@ -28,7 +28,9 @@ model.
 
 The selected PR surface includes standard and asynchronous merges. Merge calls
 require specific user approval and project-required reviews/checks; pin the
-reviewed head with `sha`. Head-branch updates and review dismissal remain excluded.
+reviewed head with `sha`. Branches that require a merge queue take
+`merge_async(..., merge_action="merge_queue")`; `pulls.merge_queue_entry`
+reads the queued state and position. Head-branch updates and review dismissal remain excluded.
 Generic GraphQL, Git/ref/content writes,
 repository administration, credential operations, workflow dispatch/deployment,
 issue locking/pinning/suggestion moderation, and label/milestone administration

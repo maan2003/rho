@@ -44,10 +44,23 @@ Pin the reviewed head to prevent a different revision from merging:
 result = await api.pulls.merge(number, sha=reviewed_head_sha, merge_method="squash")
 ```
 Check `result.merged`; an HTTP response alone is not proof of a merge.
-`pulls.merge_async(number, sha=reviewed_head_sha, merge_action="default")`
-supports asynchronous/merge-queue requests. Poll
+
+`pulls.merge` cannot use a merge queue. When the base branch requires one
+(`pulls.merge` returns 405 "Changes must be made through the merge queue"),
+add the PR to the queue under the same approval rules:
+```python
+result = await api.pulls.merge_async(number, sha=reviewed_head_sha,
+                                     merge_action="merge_queue")
+```
+`merge_action="default"` queues when the branch has a queue and merges
+directly otherwise. A `202` returns `status="pending"`; poll
 `pulls.get_merge_async_result(number, result.details.uuid)` while pending.
-`enqueued` means queued, not merged; confirm with `pulls.get(number).merged`.
+`enqueued` means queued, not merged. Follow the queue with
+`(await api.pulls.merge_queue_entry(number)).merge_queue_entry`: `None` when
+not queued, else `.state` (`QUEUED`, `AWAITING_CHECKS`, `MERGEABLE`,
+`UNMERGEABLE`, `LOCKED`), `.position`, `.enqueued_at`, and
+`.estimated_time_to_merge` (seconds or `None`). An entry that disappears means
+merged or dropped; confirm with `pulls.get(number).merged`.
 Do not bypass repository rules or blindly retry a rejected/uncertain merge.
 
 ## CI, logs, and reruns

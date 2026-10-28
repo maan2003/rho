@@ -18,12 +18,12 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
     def test_selected_spec_matches_complete_pinned_upstream_entries(self):
         # Hash independently selected from upstream 81b28a5325b311e9878a676a57fef801093242f6:
         # selected collaboration, repository/code reads, and CI metadata.
-        custom = {("pulls", "review_decision"), ("pulls", "set_draft")}
+        custom = {("pulls", "review_decision"), ("pulls", "set_draft"), ("pulls", "merge_queue_entry")}
         upstream = {**spec, "ops": sorted(
             [o for o in spec["ops"] if (o["group"], o["name"]) not in custom],
             key=lambda o: (o["group"], o["name"]),
         )}
-        self.assertEqual(len(spec["ops"]), 135)
+        self.assertEqual(len(spec["ops"]), 136)
         self.assertEqual(len(upstream["ops"]), 133)
         writes = {(op["group"], op["name"]) for op in upstream["ops"] if op["verb"] != "GET"}
         self.assertEqual(len(writes), 42)
@@ -740,6 +740,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 body = await reader.readexactly(int(headers.get("content-length", 0)))
                 requests.append((method, path, json.loads(body) if body else None))
                 result = ({"review_decision": "APPROVED"} if path.endswith("/review-decision")
+                          else {"merge_queue_entry": {"state": "QUEUED", "position": 2}}
+                          if path.endswith("/merge-queue-entry")
                           else [{"id": 7}] if method == "GET" else {"id": 8})
                 payload = json.dumps(result).encode()
                 writer.write(
@@ -757,6 +759,8 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                         await api.pulls.update(17, title="New title", body="New description")
                         await api.pulls.update(17, base="release/next")
                         self.assertEqual((await api.pulls.review_decision(17)).review_decision, "APPROVED")
+                        entry = (await api.pulls.merge_queue_entry(17, owner="other")).merge_queue_entry
+                        self.assertEqual((entry.state, entry.position), ("QUEUED", 2))
                         await api.issues.list_comments(17, page=2, per_page=5)
                         await api.pulls.list_reviews(17, page=3)
                         await api.pulls.list_review_comments(17, page=4)
@@ -775,6 +779,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     }),
                     ("PATCH", "/repos/acme/widget/pulls/17", {"base": "release/next"}),
                     ("GET", "/repos/acme/widget/pulls/17/review-decision", None),
+                    ("GET", "/repos/other/widget/pulls/17/merge-queue-entry", None),
                     ("GET", "/repos/acme/widget/issues/17/comments?page=2&per_page=5", None),
                     ("GET", "/repos/acme/widget/pulls/17/reviews?page=3", None),
                     ("GET", "/repos/acme/widget/pulls/17/comments?page=4", None),
