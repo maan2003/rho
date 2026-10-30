@@ -17,7 +17,6 @@ pub fn prepare(
     projects: &Path,
     prompt: &Path,
     settings: Option<&Path>,
-    skills: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut sources = vec![
         (account, target.to_owned()),
@@ -26,9 +25,6 @@ pub fn prepare(
     ];
     if let Some(settings) = settings {
         sources.push((settings, target.join("settings.json")));
-    }
-    if let Some(skills) = skills {
-        sources.push((skills, target.join(crate::plugin::SKILLS_FILE)));
     }
     let mounts = sources
         .into_iter()

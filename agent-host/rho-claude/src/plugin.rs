@@ -6,9 +6,10 @@
 use anyhow::{Context as _, Result};
 use camino::Utf8Path;
 
-/// The agent's loaded skill directories, one per line, relative to the
-/// Claude config directory. The hooks module reads them after a compaction.
-pub const SKILLS_FILE: &str = "rho-skills";
+/// The environment variable naming the file that lists the agent's loaded
+/// skill directories, one per line. The hooks module reads it after a
+/// compaction.
+pub const SKILLS_ENV: &str = "RHO_SKILLS_LIST";
 
 const FILES: &[(&str, &str)] = &[
     (

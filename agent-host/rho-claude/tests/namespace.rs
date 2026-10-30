@@ -103,7 +103,6 @@ async fn run() {
             &projects,
             &prompt,
             Some(&settings),
-            None,
         )
         .unwrap();
         children.push((label, command.spawn().unwrap()));
@@ -138,7 +137,6 @@ async fn run() {
         &root.join("one"),
         &projects,
         &root.join("one.md"),
-        None,
         None,
     )
     .unwrap();

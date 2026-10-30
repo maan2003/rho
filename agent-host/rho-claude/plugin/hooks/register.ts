@@ -38,13 +38,14 @@ export function register(on: On): void {
   on('prompt.attachment', { type: 'total_tokens_reminder' }, () => ({ text: null }))
 
   // A compaction drops the transcript that showed the agent its skills.
-  // Rho lists their directories in `rho-skills`; each `SKILL.md` is read
-  // now and follows the summary, as Rho's own runtime does it.
+  // Rho lists their directories in the file `RHO_SKILLS_LIST` names; each
+  // `SKILL.md` is read now and follows the summary, as Rho's own runtime
+  // does it.
   on('session.compact', async ($, e, next) => {
     const result = await next(e)
     if (result.skip !== undefined) return result
-    const home = await $.env.get('CLAUDE_CONFIG_DIR')
-    const dirs = (await $.fs.read(`${home}/rho-skills`)).split('\n').filter(dir => dir !== '')
+    const list = await $.env.get('RHO_SKILLS_LIST')
+    const dirs = (await $.fs.read(list)).split('\n').filter(dir => dir !== '')
     if (dirs.length === 0) return result
     const skills = await Promise.all(dirs.map(async dir => {
       try {

@@ -317,8 +317,8 @@ pub(crate) struct ClaudeLoop {
     /// the same reason as the prompt.
     claude_settings_path: Option<tempfile::TempPath>,
     /// The loaded skills' directories, which Rho's plugin reads after a
-    /// compaction. Rewritten in place on every load, so the mounted file
-    /// stays the same one.
+    /// compaction, at the path `RHO_SKILLS_LIST` gives it. Rewritten in
+    /// place on every load, so a running process reads the new list.
     claude_skills_path: Option<tempfile::TempPath>,
     /// The skills the model loaded, oldest first.
     skills: Vec<crate::log::SkillDir>,
@@ -1625,7 +1625,6 @@ impl ClaudeLoop {
             self.claude.projects().as_std_path(),
             self.claude_prompt_path.as_deref().expect("prompt prepared"),
             self.claude_settings_path.as_deref(),
-            self.claude_skills_path.as_deref(),
         )?;
         self.process = Some(ClaudeCode::spawn_command(command).await?);
         if !self.pending_rewind {
@@ -1674,7 +1673,7 @@ impl ClaudeLoop {
 
     /// Lists the loaded skills' directories, one per line, for Rho's
     /// plugin to read after a compaction.
-    fn write_skills(&mut self) -> anyhow::Result<()> {
+    fn write_skills(&mut self) -> anyhow::Result<Utf8PathBuf> {
         let list: String = self
             .skills
             .iter()
@@ -1685,8 +1684,7 @@ impl ClaudeLoop {
             "rho-claude-skills-",
             "",
             &list,
-        )?;
-        Ok(())
+        )
     }
 
     /// Prepare provider-owned files; only the child launcher mounts them.
@@ -1750,7 +1748,11 @@ impl ClaudeLoop {
                 &text,
             )?;
         }
-        self.write_skills()?;
+        // Rho's plugin reads the list where this process wrote it, as Claude
+        // Code reads the plugin itself; the account directory has no file
+        // to mount it over.
+        let skills = self.write_skills()?;
+        options.set_env(rho_claude::plugin::SKILLS_ENV, skills.as_str());
         self.claude_account = Some(account.to_owned());
         Ok((account_dir, target))
     }
