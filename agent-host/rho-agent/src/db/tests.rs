@@ -1480,3 +1480,57 @@ async fn loaded_skills_are_kept_once_in_load_order() {
     );
     assert!(read.get_agent(child).config.skills.is_empty());
 }
+
+/// A head stored before agents had skills, without the field, still
+/// decodes, with no skills, and one with none is stored as before.
+#[tokio::test]
+async fn a_config_stored_without_skills_decodes() {
+    #[derive(senax_encoder::Encode)]
+    struct Stored {
+        role: AgentRole,
+        binding: SessionBinding,
+        runtime: AgentRuntime,
+        place: rho_agent_types::Place,
+        spawned_by: crate::log::AgentSpawnedBy,
+        spawn_name: Option<String>,
+        created_at: UnixMs,
+        claude_rewind: Option<crate::log::ClaudeRewind>,
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        id,
+        Some("named".into()),
+        test_workspace(),
+        AgentRole::default(),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        AgentRuntime::Rho {
+            prompt_cache_key: PromptCacheKey::generate(),
+        },
+        crate::log::AgentOrigin::User,
+    );
+    write.commit();
+    let config = db.read().get_agent(id).config;
+    let stored = Stored {
+        role: config.role,
+        binding: config.binding.clone(),
+        runtime: config.runtime.clone(),
+        place: config.place.clone(),
+        spawned_by: config.spawned_by,
+        spawn_name: config.spawn_name.clone(),
+        created_at: config.created_at,
+        claude_rewind: config.claude_rewind.clone(),
+    };
+    let bytes = senax_encoder::encode(&stored).unwrap();
+    let decoded: crate::log::AgentConfig = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+    assert_eq!(decoded, config);
+    assert_eq!(
+        senax_encoder::encode(&config).unwrap(),
+        bytes,
+        "a config without skills is stored as before"
+    );
+}

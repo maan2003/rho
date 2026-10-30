@@ -207,7 +207,9 @@ pub struct AgentConfig {
     pub spawn_name: Option<String>,
     pub created_at: UnixMs,
     /// The skills the agent loaded, each once, in the order loaded. They
-    /// are given back to the model after a compaction.
+    /// are given back to the model after a compaction. Heads stored before
+    /// skills existed have none.
+    #[senax(skip_default)]
     pub skills: Vec<SkillDir>,
     /// A message-only Claude rewind whose destination transcript has not yet
     /// been durably materialized and verified. The old runtime remains
