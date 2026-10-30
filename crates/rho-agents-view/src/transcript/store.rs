@@ -76,6 +76,13 @@ impl Transcripts {
         self.store.forget(agent_id);
     }
 
+    /// Erases a durably deleted agent's host-owned history and status.
+    /// Unsent user messages remain available even after deletion.
+    pub fn erase(&mut self, agent_id: AgentId) {
+        self.open.remove(&agent_id);
+        self.store.erase(agent_id);
+    }
+
     /// Opens an agent's transcript from the mirror the client already
     /// holds: the fold, for a reader who opened it before any live frame,
     /// or with the agent host down. The live frame rides on its tail.
@@ -235,6 +242,38 @@ mod tests {
         assert!(!transcripts.is_open(&agent_id));
         assert!(transcripts.state(&agent_id).is_none());
         assert!(transcripts.open_agents().is_empty());
+    }
+
+    #[test]
+    fn deletion_erases_open_history_and_status_without_erasing_unsent_text() {
+        let mut transcripts = Transcripts::default();
+        let agent_id = agent();
+        assert!(transcripts.seed(
+            agent_id,
+            &rows(vec![said("private history", 1), sent(2)], 0)
+        ));
+        transcripts.apply(
+            agent_id,
+            TranscriptFrame::Status(Some("private status".into())),
+        );
+        transcripts.apply(
+            agent_id,
+            TranscriptFrame::Unsent(vec!["sole-copy message".into()]),
+        );
+        transcripts.erase(agent_id);
+        assert!(!transcripts.is_open(&agent_id));
+        assert!(transcripts.state(&agent_id).is_none());
+        assert!(transcripts.open_agents().is_empty());
+
+        assert!(transcripts.seed(agent_id, &rows(vec![said("new history", 3), sent(4)], 0)));
+        let blocks = &transcripts.state(&agent_id).unwrap().blocks;
+        assert!(blocks.iter().any(|block| matches!(&**block,
+            rho_agents_client::state::UiBlock::Unsent { text } if text == "sole-copy message")));
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(&**block, rho_agents_client::state::UiBlock::Status { .. }))
+        );
     }
 
     /// Rows for an agent nobody has open are dropped: the client folds

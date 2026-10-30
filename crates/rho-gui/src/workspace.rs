@@ -557,6 +557,54 @@ impl Workspace {
         self.note_followed();
     }
 
+    /// A durable deletion removes host-owned history, not the user's drafts
+    /// or outbox. Forget every warm surface so back/forward cannot reveal it.
+    fn deleted_agents(
+        &mut self,
+        agents: std::collections::BTreeSet<AgentId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = matches!(
+            self.active_surface().key,
+            SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if agents.contains(&id)
+        );
+        for agent_id in &agents {
+            if let Some(model) = self.models.get(agent_id).cloned() {
+                self.draft_edited(*agent_id, &model, cx);
+            }
+            self.forget_surface(&SurfaceKey::Transcript(*agent_id));
+            self.forget_surface(&SurfaceKey::Activity(*agent_id));
+            self.phone.remove_key(&SurfaceKey::Transcript(*agent_id));
+            self.phone.remove_key(&SurfaceKey::Activity(*agent_id));
+            self.active.remove(*agent_id);
+            self.transcripts.erase(*agent_id);
+            self.models.remove(agent_id);
+            self.activity_models.remove(agent_id);
+        }
+        self.surfaces.values_mut().for_each(|surfaces| {
+            surfaces.retain(|surface| {
+                !matches!(
+                    surface.key,
+                    SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if agents.contains(&id)
+                )
+            });
+        });
+        self.registry.forget_agents(&agents);
+        self.selection.forget(|id| agents.contains(&id));
+        self.forget_contexts(
+            |context| !matches!(context, ContextId::Agent(id) if agents.contains(id)),
+        );
+        if shown || !self.surfaces.contains_key(&self.active_context) {
+            self.active_context = ContextId::Draft;
+            self.open_home(window, cx);
+        }
+        self.note_followed();
+        self.refresh_draft_agent_targets(cx);
+        self.invalidate_dealer_signals(cx);
+        cx.notify();
+    }
+
     /// The agents whose rows the model hands up: the transcripts this
     /// client has open. Everything else it says as a digest.
     pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
@@ -1818,6 +1866,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match msg {
+            rho_agents_client::model::ModelMsg::Deleted { agents } => {
+                self.deleted_agents(agents, window, cx);
+            }
             rho_agents_client::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
@@ -4225,6 +4276,26 @@ impl Workspace {
         self.models.remove(&agent_id);
         self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx)
             .0
+    }
+
+    /// Supplies the disk-mirror rows in tests that deliberately use no
+    /// database.
+    #[cfg(test)]
+    pub(crate) fn seed_transcript_rows_for_test(
+        &mut self,
+        agent_id: AgentId,
+        rows: &[(
+            rho_agent_types::AgentPos,
+            agents::transcript::TranscriptEvent,
+        )],
+    ) {
+        assert!(self.transcripts.seed(agent_id, rows));
+        self.note_followed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saved_agent_draft_for_test(&self, agent_id: AgentId) -> Option<&str> {
+        self.drafts.get(&agent_id).map(String::as_str)
     }
 
     #[cfg(test)]

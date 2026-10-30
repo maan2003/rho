@@ -47,6 +47,7 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
 /// `None` for rows that say nothing a client uses.
 pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<TranscriptEvent> {
     Some(match event {
+        AgentEvent::Deleted { at } => TranscriptEvent::Deleted { at: *at },
         AgentEvent::TitleAttempted { .. } => {
             return None;
         }

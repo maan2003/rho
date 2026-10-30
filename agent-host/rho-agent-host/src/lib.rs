@@ -1297,7 +1297,7 @@ impl Services {
                 .load(resolved)
                 .await?
                 .1
-                .head()
+                .head()?
                 .config
                 .role
                 .handle_prefix();

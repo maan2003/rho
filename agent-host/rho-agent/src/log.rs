@@ -465,6 +465,11 @@ pub struct NativeRecovery {
 /// events on the agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
+    /// All conversation rows were explicitly erased. Kept only so mirrors
+    /// can remove their copies, including after a disconnected period.
+    Deleted {
+        at: UnixMs,
+    },
     /// A row whose fact the log no longer keeps. Rows are rewritten, never
     /// deleted: the journal points at positions.
     Retired {

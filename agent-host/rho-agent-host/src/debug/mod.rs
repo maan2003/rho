@@ -16,9 +16,9 @@ use crate::default_db_path;
 #[derive(Clone, Debug, clap::Args)]
 pub struct DebugArgs {
     /// Source database path. Defaults to rho's normal agent host database: a
-    /// running agent host hands out a snapshot of it, and commands that write
-    /// it need the agent host stopped. A named one is taken to be nobody's and
-    /// is read or written without that check.
+    /// running host supplies reports and handles deletion/compaction itself.
+    /// Other direct writes need the host stopped. A named one is taken to be
+    /// nobody's and is read or written without that check.
     #[arg(long = "db-path")]
     db_path: Option<PathBuf>,
 
@@ -54,15 +54,30 @@ enum DebugCommand {
     /// so nothing pins the pages they freed. The running agent host does it;
     /// a named database is opened directly.
     ForgetSavepoints,
-    /// Rewrite the real database file without the pages nothing refers to
-    /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
-    /// the last migration is done). Stop the agent host first.
-    Compact,
-    /// Delete agents outright: their log, journal entries, subscriptions
-    /// and usage. Takes full agent ids. Stop the agent host first.
+    /// Reclaim unused database space. Needs every savepoint gone (see
+    /// `savepoints`, `drop-stale-savepoints` and `forget-savepoints`).
+    /// The running host compacts its own database. A named --db-path
+    /// is compacted offline instead.
+    Compact {
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+    },
+    /// Permanently delete agents and their transcripts from the database,
+    /// including session-owned Claude files and mirrored GUI transcripts.
+    /// Runs through the host, which stops and drains the named agents.
+    /// Use --socket-path to select a host, not --db-path.
+    #[command(visible_alias = "delete-transcripts")]
     DeleteAgents {
+        /// Full agent ids or handles (eng-… / adv-…).
         #[arg(required = true)]
         agents: Vec<String>,
+        /// Reclaim disk space online after deletion. Other database access
+        /// pauses during compaction. Recovery savepoints must be gone.
+        #[arg(long)]
+        compact: bool,
+        /// Host socket; defaults to $RHO_SOCKET_PATH, then the user's host.
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
     },
     /// Print bytes stored per table and pages allocated overall for the
     /// real database. Stop the agent host first.
@@ -125,10 +140,20 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Rollback => rollback(args.db_path).await,
         DebugCommand::Savepoints => savepoints(args.db_path).await,
         DebugCommand::DropStaleSavepoints => drop_stale_savepoints(args.db_path).await,
-        DebugCommand::Compact => compact(args.db_path),
+        DebugCommand::Compact { socket_path } => compact(args.db_path, socket_path).await,
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
-        DebugCommand::DeleteAgents { agents } => delete_agents(args.db_path, &agents).await,
+        DebugCommand::DeleteAgents {
+            agents,
+            compact,
+            socket_path,
+        } => {
+            anyhow::ensure!(
+                args.db_path.is_none(),
+                "deletion runs through the host; select it with --socket-path, not --db-path"
+            );
+            delete_agents(socket_path, &agents, compact).await
+        }
         DebugCommand::Context => print_report(args.db_path, &claude, DebugReport::Context).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
         DebugCommand::Transcript { agent, max_chars } => {
@@ -778,20 +803,30 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn delete_agents(db_path: Option<PathBuf>, agents: &[String]) -> anyhow::Result<()> {
+async fn delete_agents(
+    socket_path: Option<PathBuf>,
+    agents: &[String],
+    compact: bool,
+) -> anyhow::Result<()> {
     let agents = agents
         .iter()
-        .map(|id| {
-            rho_agent_types::AgentId::from_encoded(id).with_context(|| format!("agent id {id}"))
-        })
+        .map(|id| rho_agent_types::parse_full_handle(id).with_context(|| format!("agent id {id}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let path = db_path
-        .map(Ok)
-        .unwrap_or_else(default_db_path)
-        .context("resolve rho db path")?;
-    let db = RhoDb::open(&path);
-    for (agent_id, rows) in rho_agent::db::delete_agents(&db, &agents).await {
-        println!("{}: deleted {agent_id:?} ({rows} log rows)", path.display());
+    let result = rho_rpc::protocol::client::call(
+        host_socket(socket_path)?,
+        rho_agents_client::protocol::DeleteAgents { agents, compact },
+    )
+    .await
+    .context("ask the running host to delete agents")?;
+    for (id, rows) in result.deleted {
+        println!("deleted {} ({rows} log rows)", id.encoded());
+    }
+    println!(
+        "removed {} Claude session file(s)/directory tree(s)",
+        result.claude_paths_removed
+    );
+    if let Some((before, after)) = result.compacted {
+        println!("database: {before} -> {after} bytes");
     }
     Ok(())
 }
@@ -804,18 +839,25 @@ fn stats(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     RhoDb::print_stats(&path)
 }
 
-fn compact(db_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let path = db_path
-        .map(Ok)
-        .unwrap_or_else(default_db_path)
-        .context("resolve rho db path")?;
+async fn compact(db_path: Option<PathBuf>, socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let (before, after) = RhoDb::compact(&path)?;
+    let (before, after) = match db_path {
+        Some(path) => {
+            anyhow::ensure!(
+                socket_path.is_none(),
+                "--db-path and --socket-path are mutually exclusive"
+            );
+            RhoDb::compact(path)?
+        }
+        None => rho_rpc::protocol::client::call(
+            host_socket(socket_path)?,
+            rho_agent_hosts::protocol::CompactDatabase,
+        )
+        .await
+        .context("ask the running host to compact its database")?,
+    };
     println!(
-        "{}: {} -> {} bytes in {:.1?}",
-        path.display(),
-        before,
-        after,
+        "database: {before} -> {after} bytes in {:.1?}",
         started.elapsed()
     );
     Ok(())
@@ -955,5 +997,35 @@ mod snapshot_tests {
         );
         assert!(leftovers[0].1.as_secs() >= 47 * 60 * 60, "with its age");
         assert!(killed.exists(), "and it is still there afterwards");
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        debug: DebugArgs,
+    }
+
+    #[test]
+    fn delete_transcripts_and_delete_agents_share_one_command() {
+        for name in ["delete-transcripts", "delete-agents"] {
+            let cli = Cli::try_parse_from(["debug", name, "--compact", "eng-abc"]).unwrap();
+            assert!(matches!(
+                cli.debug.command,
+                DebugCommand::DeleteAgents { agents, compact: true, .. } if agents == ["eng-abc"]
+            ));
+        }
+        let cli = Cli::try_parse_from(["debug", "delete-transcripts", "first", "second"]).unwrap();
+        assert!(matches!(
+            cli.debug.command,
+            DebugCommand::DeleteAgents { agents, compact: false, .. } if agents == ["first", "second"]
+        ));
+        assert!(Cli::try_parse_from(["debug", "delete-transcripts", "--compact"]).is_err());
     }
 }

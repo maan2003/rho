@@ -32,6 +32,8 @@ rho_rpc::calls! {
         /// Answered with the new agent's id.
         New(NewAgent) -> AgentId;
         Command(AgentCommand) -> ();
+        /// Stop agents, erase their histories and session-owned Claude files.
+        DeleteAgents(DeleteAgents) -> DeleteAgentsResult;
         // Bulk: an answer that waits behind interactive traffic.
         Visualization(Visualization) -> VisualizationContent, priority None;
         /// Answered with the recorded visualization's id.
@@ -58,6 +60,21 @@ impl rho_rpc::protocol::ProtocolOpen for Open {
             Self::Session => None,
         }
     }
+}
+
+/// Explicit permanent removal. The host owns lifecycle and file cleanup.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct DeleteAgents {
+    pub agents: Vec<AgentId>,
+    pub compact: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct DeleteAgentsResult {
+    pub deleted: Vec<(AgentId, u64)>,
+    pub claude_paths_removed: u64,
+    /// Bytes before and after online compaction, when requested.
+    pub compacted: Option<(u64, u64)>,
 }
 
 /// A recorded visualization.

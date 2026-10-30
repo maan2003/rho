@@ -210,8 +210,13 @@ impl AgentClient {
     pub(crate) fn status_cell(&self) -> &watch::Sender<AgentStatus> {
         &self.0.services.status
     }
-    pub fn head(&self) -> crate::log::AgentHead {
-        self.0.services.db.read().get_agent(self.0.services.agent)
+    pub fn head(&self) -> anyhow::Result<crate::log::AgentHead> {
+        self.0
+            .services
+            .db
+            .read()
+            .try_get_agent(self.0.services.agent)
+            .context("agent was deleted or does not exist")
     }
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
         self.request(Control::Retire).await
@@ -279,7 +284,7 @@ impl AgentClient {
     pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
         use crate::log::AgentRoleSessionProfile as _;
         anyhow::ensure!(
-            self.head().place().workset.is_some()
+            self.head()?.place().workset.is_some()
                 || role.session_profile().claude_model().is_none(),
             "a Claude agent needs a workset"
         );
@@ -291,7 +296,7 @@ impl AgentClient {
     pub fn change_prompt_cache_key(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                self.head().config.runtime,
+                self.head()?.config.runtime,
                 crate::log::AgentRuntime::Rho { .. }
             ),
             "prompt cache keys are only available for Rho agents"

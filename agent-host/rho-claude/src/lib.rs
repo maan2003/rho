@@ -17,10 +17,12 @@ pub mod mcp;
 pub mod namespace;
 pub mod plugin;
 pub mod protocol;
+mod session_files;
 pub mod settings;
 mod transcript;
 
 pub use protocol::{ClaudeEvent, Effort, Model, Session};
+pub use session_files::delete_session_files;
 pub use transcript::*;
 
 const DEFAULT_COMMAND: &str = "claude";

@@ -899,12 +899,25 @@ async fn deleting_an_agent_removes_every_row_it_owns() {
         .into_iter()
         .map(|(_, agent_id, pos, _)| (agent_id, pos.pos))
         .collect::<Vec<_>>();
-    assert_eq!(journal, [(kept, 0), (kept, 1)]);
+    assert_eq!(journal, [(kept, 0), (kept, 1), (doomed, 0)]);
+    assert!(!read.agent_exists(doomed));
+    assert!(matches!(
+        read.agent_event(doomed, AgentEventPos::ZERO),
+        Some(AgentEvent::Deleted { .. })
+    ));
+    assert_eq!(read.journal_head(), Seq(5));
     assert!(read.agent_response_subscribers(doomed).is_empty());
     assert!(read.agent_response_subscribers(kept).is_empty());
     assert!(read.agent_usage(doomed, UnixMs(0)).is_empty());
     assert_eq!(read.agent_usage_total(doomed).requests, 0);
     assert_eq!(read.agent_usage(kept, UnixMs(0)).len(), 1);
+    drop(read);
+    let mut write = db.write().await;
+    write.append_agent_event(kept, &user_event("after deletion"));
+    write.commit();
+    let next = db.read().journal_since(Seq(5), 100);
+    assert_eq!(next.len(), 1);
+    assert_eq!((next[0].0, next[0].1, next[0].2.pos), (Seq(6), kept, 2));
 }
 
 #[tokio::test]

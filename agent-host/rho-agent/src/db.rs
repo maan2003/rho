@@ -173,6 +173,9 @@ pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentHead;
     fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead>;
     fn agent_exists(&self, agent_id: AgentId) -> bool;
+    /// Every Claude session ever owned by this agent, including abandoned
+    /// rewind branches and pending forks.
+    fn agent_claude_sessions(&self, agent_id: AgentId) -> BTreeSet<Uuid>;
     /// Every agent, by the first row of its log; touches one row per agent.
     fn list_agent_ids(&self) -> Vec<AgentId>;
     /// Every agent's fold: the whole store. For conversions and tools.
@@ -386,7 +389,34 @@ impl AgentReadTxnExt for ReadTxn {
     }
 
     fn agent_exists(&self, agent_id: AgentId) -> bool {
-        self.open_table(AGENT_LOG).get((agent_id, 0)).is_some()
+        self.open_table(AGENT_HEADS).get(agent_id).is_some()
+    }
+
+    fn agent_claude_sessions(&self, agent_id: AgentId) -> BTreeSet<Uuid> {
+        let mut sessions = BTreeSet::new();
+        for (_, row) in self.open_table(AGENT_LOG).range(agent_range(agent_id)) {
+            match row.value().into_owned() {
+                AgentEvent::Created {
+                    runtime: AgentRuntime::Claude { session_id },
+                    ..
+                }
+                | AgentEvent::RuntimeRebound {
+                    change: crate::log::RuntimeChange::ClaudeRewound { session_id },
+                    ..
+                } => {
+                    sessions.insert(session_id);
+                }
+                AgentEvent::RuntimeRebound {
+                    change: crate::log::RuntimeChange::ClaudeRewindPending(Some(rewind)),
+                    ..
+                } => {
+                    sessions.insert(rewind.source_session_id);
+                    sessions.insert(rewind.session_id);
+                }
+                _ => {}
+            }
+        }
+        sessions
     }
 
     fn list_agent_ids(&self) -> Vec<AgentId> {
@@ -1117,6 +1147,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             head.user_interacted = true;
             head.pending_notice = None;
         }
+        AgentEvent::Deleted { .. } => panic!("deleted agents have no head to fold"),
         AgentEvent::Retired { .. }
         | AgentEvent::Rewound { .. }
         | AgentEvent::ClaudeOutput { .. }
@@ -1196,70 +1227,106 @@ pub async fn forget_savepoints(db: &rho_db::RhoDb) -> Vec<u64> {
 }
 
 /// Removes every row the named agents own: their log, their journal
-/// entries, their subscriptions and their usage. Keys only; no value is
-/// decoded, so an agent this build can no longer read goes as well as
-/// any other. Returns how many log rows went, per agent.
+/// entries, their subscriptions and their usage. Keeps only a body-free
+/// deletion marker so disconnected mirrors can erase their copies.
+/// Keys only; no value is decoded. Returns erased log rows per agent.
+/// The caller must stop and drain these agents before this transaction.
 pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(AgentId, usize)> {
     let doomed = agents.iter().copied().collect::<BTreeSet<_>>();
     let mut write = db.write().await;
-    let mut deleted = Vec::new();
-    for &agent_id in &doomed {
-        let mut log = write.open_table(AGENT_LOG);
-        let keys = log
-            .range((agent_id, 0)..=(agent_id, u64::MAX))
+    // Deleting a large history walks and rewrites many pages. Keep that
+    // work off the host's async workers while redb still serves readers.
+    tokio::task::spawn_blocking(move || {
+        let mut deleted = Vec::new();
+        let mut seq = write
+            .open_table(JOURNAL)
+            .iter()
+            .next_back()
             .map(|(key, _)| key.value())
+            .unwrap_or(0);
+        let at = UnixMs::now();
+        for &agent_id in &doomed {
+            let mut log = write.open_table(AGENT_LOG);
+            let keys = log
+                .range((agent_id, 0)..=(agent_id, u64::MAX))
+                .map(|(key, _)| key.value())
+                .collect::<Vec<_>>();
+            for key in &keys {
+                log.remove(key);
+            }
+            drop(log);
+            write.open_table(AGENT_HEADS).remove(agent_id);
+            write.open_table(native::NATIVE_CURSORS).remove(agent_id);
+            deleted.push((agent_id, keys.len()));
+
+            let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
+            let keys = usage
+                .range(
+                    AgentUsageKey {
+                        agent_id,
+                        bucket_start_ms: 0,
+                    }..=AgentUsageKey {
+                        agent_id,
+                        bucket_start_ms: u64::MAX,
+                    },
+                )
+                .map(|(key, _)| key.value())
+                .collect::<Vec<_>>();
+            for key in &keys {
+                usage.remove(key);
+            }
+            drop(usage);
+            write.open_table(AGENT_USAGE_TOTALS).remove(agent_id);
+        }
+
+        let mut journal = write.open_table(JOURNAL);
+        let seqs = journal
+            .iter()
+            .filter(|(_, row)| doomed.contains(&row.value().0))
+            .map(|(seq, _)| seq.value())
+            .collect::<Vec<_>>();
+        for seq in &seqs {
+            journal.remove(seq);
+        }
+        drop(journal);
+
+        let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
+        let keys = subscriptions
+            .iter()
+            .map(|(key, _)| key.value())
+            .filter(|key| doomed.contains(&key.target) || doomed.contains(&key.subscriber))
             .collect::<Vec<_>>();
         for key in &keys {
-            log.remove(key);
+            subscriptions.remove(key);
         }
-        drop(log);
-        write.open_table(AGENT_HEADS).remove(agent_id);
-        write.open_table(native::NATIVE_CURSORS).remove(agent_id);
-        deleted.push((agent_id, keys.len()));
-
-        let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
-        let keys = usage
-            .range(
-                AgentUsageKey {
+        drop(subscriptions);
+        for &(agent_id, _) in &deleted {
+            // A body-free marker uses position zero after the entire history is
+            // erased. The journal sequence, not the old log position, orders
+            // it.
+            let event = AgentEvent::Deleted { at };
+            write
+                .open_table(AGENT_LOG)
+                .insert((agent_id, 0), SenValue::borrowed(&event));
+            seq += 1;
+            write.open_table(JOURNAL).insert(seq, (agent_id, 0));
+            if let Some(journal) = write.observer::<Journal>() {
+                let sender = journal.sender();
+                let appended = LogAppended {
+                    seq: Seq(seq),
                     agent_id,
-                    bucket_start_ms: 0,
-                }..=AgentUsageKey {
-                    agent_id,
-                    bucket_start_ms: u64::MAX,
-                },
-            )
-            .map(|(key, _)| key.value())
-            .collect::<Vec<_>>();
-        for key in &keys {
-            usage.remove(key);
+                    pos: AgentEventPos::ZERO.into(),
+                };
+                write.after_commit(move || {
+                    let _ = sender.send(appended);
+                });
+            }
         }
-        drop(usage);
-        write.open_table(AGENT_USAGE_TOTALS).remove(agent_id);
-    }
-
-    let mut journal = write.open_table(JOURNAL);
-    let seqs = journal
-        .iter()
-        .filter(|(_, row)| doomed.contains(&row.value().0))
-        .map(|(seq, _)| seq.value())
-        .collect::<Vec<_>>();
-    for seq in &seqs {
-        journal.remove(seq);
-    }
-    drop(journal);
-
-    let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
-    let keys = subscriptions
-        .iter()
-        .map(|(key, _)| key.value())
-        .filter(|key| doomed.contains(&key.target) || doomed.contains(&key.subscriber))
-        .collect::<Vec<_>>();
-    for key in &keys {
-        subscriptions.remove(key);
-    }
-    drop(subscriptions);
-    write.commit();
-    deleted
+        write.commit();
+        deleted
+    })
+    .await
+    .expect("delete agent rows")
 }
 
 /// Drops every persistent savepoint `prepare` did not record: leftovers

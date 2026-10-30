@@ -207,6 +207,11 @@ pub enum TranscriptEvent {
         text: String,
         at: UnixMs,
     },
+    /// The agent and its earlier history are gone. The journal cursor still
+    /// advances.
+    Deleted {
+        at: UnixMs,
+    },
     ExecObserved {
         id: String,
         milestone: rho_agent_types::ExecMilestone,
@@ -235,7 +240,8 @@ impl TranscriptEvent {
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
             | Self::ClaudeMessage { at, .. }
-            | Self::ExecObserved { at, .. } => *at,
+            | Self::ExecObserved { at, .. }
+            | Self::Deleted { at } => *at,
         }
     }
 }

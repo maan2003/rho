@@ -14059,6 +14059,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "libc",
+ "parking_lot",
  "redb",
  "senax-encoder",
  "tempfile",

@@ -592,6 +592,132 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
 }
 
 #[gpui::test]
+fn durable_deletion_removes_open_conversation_without_losing_draft(cx: &mut TestAppContext) {
+    check_durable_deletion(cx, false);
+}
+
+#[gpui::test]
+fn durable_deletion_removes_open_activity_without_losing_conversation_draft(
+    cx: &mut TestAppContext,
+) {
+    check_durable_deletion(cx, true);
+}
+
+fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
+    let workspace = test_workspace(cx);
+    let (gone, peer) = (agent(701), agent(702));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let ready = ready_with(vec![ui_head(gone), ui_head(peer)], 703);
+            let story::Frame::Many(frames) = &ready else {
+                unreachable!()
+            };
+            let rows = frames
+                .iter()
+                .find_map(|frame| match frame {
+                    story::Frame::Agents(rho_agents_client::stream::AgentFrame::Log {
+                        entries,
+                    }) => Some(
+                        entries
+                            .iter()
+                            .filter(|entry| entry.agent_id == gone)
+                            .map(|entry| (entry.pos, entry.event.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap();
+            story::feed(workspace, HostId::default(), ready, window, cx);
+            // No global database is installed in GUI tests. Supply exactly the
+            // creation rows an opening transcript would read from that mirror.
+            workspace.seed_transcript_rows_for_test(gone, &rows);
+            workspace.select_agent(Some(gone), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::story(
+                    gone,
+                    vec![story::UiStoryEvent::Sent {
+                        text: "deleted transcript secret".into(),
+                        kind: rho_agent_types::SendKind::Ask,
+                        at: UnixMs(10),
+                    }],
+                ),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                rho_agents_client::stream::AgentFrame::Log {
+                    entries: vec![story::entry(
+                        gone,
+                        2,
+                        rho_agents_client::protocol::transcript::TranscriptEvent::Failed {
+                            text: String::new(),
+                            error: "deleted activity secret".into(),
+                            retrying: true,
+                            at: UnixMs(11),
+                        },
+                    )],
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(display_text(&workspace, cx).contains("deleted transcript secret"));
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("sole-copy unfinished draft", window, cx)
+            });
+            if activity {
+                workspace.open_agent_view(rho_agents_view::TranscriptView::Activity, window, cx);
+            }
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let affected_text = if activity {
+        "deleted activity secret"
+    } else {
+        "deleted transcript secret"
+    };
+    assert!(display_text(&workspace, cx).contains(affected_text));
+    workspace.update(cx, |workspace, window, cx| {
+        assert!(workspace.hand(cx).cards.iter().any(|card|
+            card.node == rho_dealer::NodeId::Agent(gone)), "control: agent is dealt before deletion");
+        story::feed(workspace, HostId::default(), story::deleted(gone, UnixMs(20)), window, cx);
+        assert!(!workspace.registry.known_agents().any(|id| *id == gone));
+        assert!(workspace.registry.known_agents().any(|id| *id == peer));
+        assert!(!workspace.followed().contains(&gone));
+        assert!(workspace.open_surfaces_for_test().all(|surface| !matches!(
+            surface.key,
+            crate::pane::SurfaceKey::Transcript(id) | crate::pane::SurfaceKey::Activity(id) if id == gone
+        )));
+        assert_eq!(workspace.current_surface_key_for_test(), crate::pane::SurfaceKey::Home);
+        assert_eq!(workspace.saved_agent_draft_for_test(gone), Some("sole-copy unfinished draft"));
+        assert!(!workspace.hand(cx).cards.iter().any(|card| card.node == rho_dealer::NodeId::Agent(gone)));
+    }).unwrap();
+    cx.run_until_parked();
+    assert!(!display_text(&workspace, cx).contains(affected_text));
+    // Back must not resurrect a warm Conversation or Activity surface.
+    for _ in 0..3 {
+        workspace.update(cx, |workspace, window, cx| {
+            workspace.step_surface_back_for_test(window, cx);
+            assert!(!matches!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Transcript(id) | crate::pane::SurfaceKey::Activity(id) if id == gone
+            ));
+        }).unwrap();
+        cx.run_until_parked();
+        assert!(!display_text(&workspace, cx).contains(affected_text));
+    }
+}
+
+#[gpui::test]
 fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));

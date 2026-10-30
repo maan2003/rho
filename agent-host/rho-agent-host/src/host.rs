@@ -191,6 +191,16 @@ where
             })
             .await
         }
+        Request::CompactDatabase(call) => {
+            respond(
+                writer,
+                call,
+                |_: rho_agent_hosts::protocol::CompactDatabase| async {
+                    services.db.compact_online().await
+                },
+            )
+            .await
+        }
         Request::DebugReport(call) => {
             respond(writer, call, |report: DebugReport| {
                 debug::host_report(&services.db, &services.claude, report)
@@ -269,7 +279,7 @@ async fn shutdown_if_idle(services: &Services) -> anyhow::Result<()> {
         let names = working
             .iter()
             .map(|agent_id| services.pool.agent_handle(*agent_id))
-            .collect::<Vec<_>>()
+            .collect::<anyhow::Result<Vec<_>>>()?
             .join(", ");
         anyhow::bail!("agents still working: {names}");
     }

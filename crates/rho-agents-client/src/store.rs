@@ -342,6 +342,13 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
+    /// Erases host-owned content after durable deletion, while retaining
+    /// the user's unsent messages, which have no other copy.
+    pub fn erase(&mut self, agent_id: AgentId) {
+        self.forget(agent_id);
+        self.status.remove(&agent_id);
+    }
+
     fn layered(&mut self, agent_id: AgentId) -> &mut Layered {
         let unsent = &self.unsent;
         let status = &self.status;
@@ -824,6 +831,34 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["one"]);
+    }
+
+    #[test]
+    fn deletion_erases_status_and_live_content_but_retains_unsent_messages_and_peers() {
+        let mut store = AgentStore::default();
+        let peer = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        store.apply_live(
+            agent(),
+            snapshot("deleted", vec![text("private live text")]),
+        );
+        store.set_status(agent(), Some("private status text".into()));
+        store.set_unsent(agent(), vec!["sole-copy unsent text".into()]);
+        store.apply_live(peer, snapshot("peer", vec![text("peer live text")]));
+        store.set_status(peer, Some("peer status text".into()));
+        let peer_before = store.get(&peer).unwrap().clone();
+
+        store.erase(agent());
+        assert!(store.get(&agent()).is_none());
+        assert!(!store.status.contains_key(&agent()));
+        assert_eq!(store.get(&peer).unwrap(), &peer_before);
+        // Reopening starts with only the unsent words: neither host status nor
+        // an old live response is allowed to reappear.
+        store.set_fold(agent(), empty_state());
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 1);
+        assert!(
+            matches!(&*state.blocks[0], UiBlock::Unsent { text } if text == "sole-copy unsent text")
+        );
     }
 
     #[test]

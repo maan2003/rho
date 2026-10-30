@@ -37,6 +37,8 @@ pub enum ModelMsg {
     /// The agents a run of the log moved, as they now stand. One message
     /// per page once caught up, and one for a whole catch-up.
     Changed { agents: Vec<crate::MirroredAgent> },
+    /// Agents durably deleted by the host, including any cached history.
+    Deleted { agents: BTreeSet<AgentId> },
     /// Rows of an agent the main thread follows, for the fold behind its
     /// transcript. Nothing else carries rows.
     Rows {
@@ -199,7 +201,10 @@ impl Model {
     /// it: the cursor `Follow` will send, and the agents already folded.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
-        let stored = self.stored.get_or_insert_with(crate::cache::load);
+        let stored = self.stored.get_or_insert_with(|| {
+            crate::cache::flush();
+            crate::cache::load()
+        });
         if let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) {
             slot.machine_seed = cursor.machine_seed;
             slot.seq = cursor.seq;
@@ -258,6 +263,12 @@ impl Model {
             }],
             AgentFrame::Log { entries } => self.told(host, entries),
             AgentFrame::Live { agent_id, live } => {
+                // A follow may have captured live state before journal
+                // deletion. Only durable creation makes an
+                // agent eligible for live updates.
+                if !self.agents.contains_key(&agent_id) {
+                    return Vec::new();
+                }
                 if !self.followed.contains(&agent_id) {
                     return match live {
                         Live::Snapshot { state, .. } => vec![ModelEvent {
@@ -344,7 +355,16 @@ impl Model {
         }
         let mut changed = BTreeSet::new();
         let mut rows: BTreeMap<AgentId, Vec<(AgentPos, TranscriptEvent)>> = BTreeMap::new();
+        let mut deleted = BTreeSet::new();
         for entry in &entries {
+            if matches!(entry.event, TranscriptEvent::Deleted { .. }) {
+                self.agents.remove(&entry.agent_id);
+                self.followed.remove(&entry.agent_id);
+                changed.remove(&entry.agent_id);
+                rows.remove(&entry.agent_id);
+                deleted.insert(entry.agent_id);
+                continue;
+            }
             let told = match self.agents.get_mut(&entry.agent_id) {
                 Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
                 // A row for an agent whose creation this client never
@@ -372,7 +392,10 @@ impl Model {
         // been seen through here, never that a row was kept here.
         let kept = entries
             .into_iter()
-            .filter(|entry| self.agents.contains_key(&entry.agent_id))
+            .filter(|entry| {
+                matches!(entry.event, TranscriptEvent::Deleted { .. })
+                    || self.agents.contains_key(&entry.agent_id)
+            })
             .collect::<Vec<_>>();
         let digests = changed
             .iter()
@@ -390,6 +413,10 @@ impl Model {
         let slot = self.hosts.get_mut(&host).expect("the host was just here");
         crate::cache::write_log(&slot.name, slot.machine_seed, page_seq, kept, digests);
         slot.seq = slot.seq.max(page_seq);
+        for agent_id in &deleted {
+            slot.pending.remove(agent_id);
+            slot.pending_rows.remove(agent_id);
+        }
         slot.pending.extend(changed);
         for (agent_id, mut page) in rows {
             slot.pending_rows
@@ -397,18 +424,30 @@ impl Model {
                 .or_default()
                 .append(&mut page);
         }
+        let mut out = Vec::new();
+        if !deleted.is_empty() {
+            // A later attach must not reuse the startup snapshot of a deleted
+            // agent.
+            self.stored = None;
+            out.push(ModelEvent {
+                host,
+                msg: ModelMsg::Deleted { agents: deleted },
+            });
+        }
         if slot.seq < slot.head {
-            return Vec::new();
+            return out;
         }
         let pending = std::mem::take(&mut slot.pending);
         let pending_rows = std::mem::take(&mut slot.pending_rows);
-        let mut out = pending_rows
-            .into_iter()
-            .map(|(agent_id, rows)| ModelEvent {
-                host,
-                msg: ModelMsg::Rows { agent_id, rows },
-            })
-            .collect::<Vec<_>>();
+        out.extend(
+            pending_rows
+                .into_iter()
+                .map(|(agent_id, rows)| ModelEvent {
+                    host,
+                    msg: ModelMsg::Rows { agent_id, rows },
+                })
+                .collect::<Vec<_>>(),
+        );
         let agents = pending
             .into_iter()
             .filter_map(|agent_id| self.agents.get(&agent_id).cloned())
@@ -618,6 +657,124 @@ mod tests {
             .collect()
     }
 
+    fn deleted(seq: u64, agent_id: AgentId) -> LogEntry {
+        LogEntry {
+            seq: Seq(seq),
+            agent_id,
+            pos: AgentPos::ZERO,
+            event: TranscriptEvent::Deleted {
+                at: rho_agent_types::UnixMs(42),
+            },
+        }
+    }
+
+    #[test]
+    fn deletion_clears_followed_history_and_pending_catch_up_without_resetting_peers() {
+        let mut model = Model::new();
+        model.attach(HOST, "local".to_owned());
+        model.ingest(HOST, ready(8));
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1), agent(2)])));
+        assert!(
+            model
+                .ingest(
+                    HOST,
+                    AgentFrame::Log {
+                        entries: vec![
+                            created(1, agent(1)),
+                            presented(2, agent(1), 1, "gone"),
+                            created(3, agent(2)),
+                            presented(4, agent(2), 1, "kept")
+                        ],
+                    }
+                )
+                .is_empty()
+        );
+        let out = model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![deleted(7, agent(1))],
+            },
+        );
+        assert!(
+            matches!(&out[..], [ModelEvent { msg: ModelMsg::Deleted { agents }, .. }]
+            if agents == &BTreeSet::from([agent(1)]))
+        );
+        assert!(!model.agents.contains_key(&agent(1)));
+        assert!(!model.followed.contains(&agent(1)));
+        assert_eq!(model.hosts[&HOST].seq, Seq(7));
+        let out = model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![presented(8, agent(2), 2, "still here")],
+            },
+        );
+        assert_eq!(changed(&out), [agent(2)]);
+        assert!(out.iter().all(
+            |event| !matches!(&event.msg, ModelMsg::Rows { agent_id, .. } if *agent_id == agent(1))
+        ));
+        assert_eq!(
+            model.agents[&agent(2)].digest.title.as_deref(),
+            Some("still here")
+        );
+    }
+
+    #[test]
+    fn reconnect_deletion_removes_an_agent_loaded_from_the_startup_cache() {
+        let id = agent(5);
+        let mirrored = crate::MirroredAgent::new(HOST, id, &created(1, id).event).unwrap();
+        let mut model = Model::new();
+        model.stored = Some(crate::cache::Loaded {
+            hosts: vec![crate::cache::MirroredHost {
+                name: "local".into(),
+                machine_seed: 7,
+                seq: Seq(6),
+            }],
+            agents: vec![(
+                id,
+                crate::cache::MirroredAgent {
+                    host: "local".into(),
+                    snapshot: crate::cache::AgentSnapshot::new(mirrored.identity, mirrored.digest),
+                    verdict: None,
+                },
+            )],
+        });
+        assert!(matches!(&model.attach(HOST, "local".into())[..],
+            [ModelEvent { msg: ModelMsg::Loaded { agents, .. }, .. }] if agents.len() == 1));
+        assert_eq!(model.hosts[&HOST].seq, Seq(6));
+        model.ingest(HOST, ready(7));
+        model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![deleted(7, id)],
+            },
+        );
+        assert!(!model.agents.contains_key(&id));
+        assert_eq!(model.hosts[&HOST].seq, Seq(7));
+        assert!(
+            model.stored.is_none(),
+            "a later attach must reload, not resurrect the startup snapshot"
+        );
+    }
+
+    #[test]
+    fn deletion_alone_advances_a_new_clients_cursor_and_announces_removal() {
+        let mut model = Model::new();
+        model.attach(HOST, "local".to_owned());
+        model.ingest(HOST, ready(12));
+        let out = model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![deleted(12, agent(9))],
+            },
+        );
+        assert_eq!(model.hosts[&HOST].seq, Seq(12));
+        assert!(model.agents.is_empty());
+        assert!(
+            matches!(&out[..], [ModelEvent { msg: ModelMsg::Deleted { agents }, .. }]
+            if agents == &BTreeSet::from([agent(9)]))
+        );
+    }
+
     #[test]
     fn a_catch_up_says_nothing_until_it_reaches_the_head() {
         let mut model = Model::new();
@@ -673,6 +830,12 @@ mod tests {
         let mut model = Model::new();
         model.attach(HOST, "local".to_owned());
         model.ingest(HOST, ready(0));
+        model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![created(1, agent(1)), created(2, agent(2))],
+            },
+        );
         model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
         let snapshot = AgentFrame::Live {
             agent_id: agent(2),
@@ -708,6 +871,35 @@ mod tests {
         assert!(
             matches!(&model.ingest(HOST, live(agent(1)))[0].msg, ModelMsg::Live { agent_id, .. } if *agent_id == agent(1))
         );
+    }
+
+    #[test]
+    fn deletion_discards_a_live_snapshot_captured_before_the_journal_was_read() {
+        let mut model = Model::new();
+        model.attach(HOST, "local".into());
+        model.ingest(HOST, ready(0));
+        model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![created(1, agent(1)), created(2, agent(2))],
+            },
+        );
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
+        assert_eq!(model.ingest(HOST, live(agent(1))).len(), 1);
+        model.ingest(
+            HOST,
+            AgentFrame::Log {
+                entries: vec![deleted(3, agent(1))],
+            },
+        );
+        assert!(model.ingest(HOST, live(agent(1))).is_empty());
+        assert!(
+            model.ingest(HOST, live(agent(9))).is_empty(),
+            "unknown live state cannot create an agent"
+        );
+        assert!(matches!(&model.ingest(HOST, live(agent(2)))[..],
+            [ModelEvent { msg: ModelMsg::Runtime { agent_id, .. }, .. }] if *agent_id == agent(2)));
+        assert!(!model.agents.contains_key(&agent(1)));
     }
 
     #[test]

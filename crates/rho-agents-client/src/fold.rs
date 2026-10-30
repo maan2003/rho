@@ -198,6 +198,7 @@ impl Digest {
             | TranscriptEvent::Received { .. }
             | TranscriptEvent::ClaudeMessage { .. }
             | TranscriptEvent::Created { .. }
+            | TranscriptEvent::Deleted { .. }
             | TranscriptEvent::RoleChanged { .. }
             | TranscriptEvent::Notice { .. }
             | TranscriptEvent::CompactionRequested { .. }
@@ -716,6 +717,7 @@ impl TranscriptFold {
                 }
             }
             TranscriptEvent::Created { .. }
+            | TranscriptEvent::Deleted { .. }
             | TranscriptEvent::RoleChanged { .. }
             | TranscriptEvent::Notice { .. }
             | TranscriptEvent::Presented { .. } => {}

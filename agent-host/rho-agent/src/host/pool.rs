@@ -246,10 +246,22 @@ impl AgentPool {
         self: &Arc<Self>,
         agent: AgentId,
     ) -> anyhow::Result<Arc<crate::host::Process>> {
-        let place = self.db.read().get_agent(agent).config.place;
+        let place = self
+            .db
+            .read()
+            .try_get_agent(agent)
+            .context("agent was deleted or does not exist")?
+            .config
+            .place;
         let slot = self.execution_slot(place.workset).await;
         let _admission = slot.admission.clone().read_owned().await;
-        let place = self.db.read().get_agent(agent).config.place;
+        let place = self
+            .db
+            .read()
+            .try_get_agent(agent)
+            .context("agent was deleted or does not exist")?
+            .config
+            .place;
         self.process(&place).await
     }
 
@@ -607,7 +619,9 @@ impl AgentPool {
         }
         let mut write = self.db.write().await;
         for (agent_id, usage) in &drained {
-            write.add_agent_usage(*agent_id, usage);
+            if crate::db::agent_head_write(&mut write, *agent_id).is_some() {
+                write.add_agent_usage(*agent_id, usage);
+            }
         }
         write.commit();
     }
@@ -806,6 +820,108 @@ impl AgentPool {
         }
     }
 
+    /// Explicit erasure owns the same per-ID locks as activation. Once a
+    /// worker is drained, no stale load may restore it from the deleted log.
+    /// The task completes even if the requesting connection goes away.
+    pub async fn delete_agents(
+        self: &Arc<Self>,
+        ids: Vec<AgentId>,
+        compact: bool,
+    ) -> anyhow::Result<(Vec<(AgentId, usize)>, usize, Option<(u64, u64)>)> {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let ids = ids.into_iter().collect::<std::collections::BTreeSet<_>>();
+            anyhow::ensure!(!ids.is_empty(), "at least one agent is required");
+            if compact {
+                anyhow::ensure!(
+                    crate::db::savepoints(&pool.db).await.is_empty(),
+                    "recovery savepoints prevent compaction; no agents were deleted"
+                );
+            }
+            let mut locks = Vec::new();
+            for &id in &ids {
+                let lock = pool.load_locks.lock().await.entry(id).or_default().clone();
+                locks.push(lock.lock_owned().await);
+            }
+            {
+                let read = pool.db.read();
+                for &id in &ids {
+                    anyhow::ensure!(
+                        read.agent_exists(id),
+                        "agent {} is not in this database; no agents were deleted",
+                        id.encoded()
+                    );
+                }
+            }
+            for &id in &ids {
+                let agent = pool.agents.lock().await.get(&id).cloned();
+                if let Some(agent) = agent {
+                    agent.shutdown().await;
+                    pool.agents.lock().await.remove(&id);
+                }
+            }
+            // Drain first: a last rewind or fork can commit during shutdown.
+            let db = pool.db.clone();
+            let selected = ids.clone();
+            let sessions = tokio::task::spawn_blocking(move || {
+                let read = db.read();
+                selected
+                    .iter()
+                    .flat_map(|id| read.agent_claude_sessions(*id))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .await?;
+            // Keep records if file removal fails, so the same command can
+            // retry all session ids. Some files may already be removed.
+            let files = rho_claude::delete_session_files(&pool.claude, &sessions)
+                .await
+                .context(
+                    "agents stopped; Claude cleanup failed, database histories retained for retry",
+                )?;
+            for &id in &ids {
+                pool.flush_agent_usage(Some(id)).await;
+            }
+            let deleted =
+                crate::db::delete_agents(&pool.db, &ids.iter().copied().collect::<Vec<_>>()).await;
+            pool.recent
+                .lock()
+                .expect("poison")
+                .retain(|id| !ids.contains(id));
+            pool.usage
+                .lock()
+                .await
+                .retain(|(id, _), _| !ids.contains(id));
+            for watcher in pool
+                .statuses
+                .lock()
+                .expect("poison")
+                .iter()
+                .filter_map(|weak| weak.upgrade())
+            {
+                watcher
+                    .unsent
+                    .lock()
+                    .expect("poison")
+                    .retain(|id, _| !ids.contains(id));
+            }
+            drop(locks);
+            let compacted = if compact {
+                Some(
+                    pool.db
+                        .compact_online()
+                        .await
+                        .context("agents and Claude files deleted, but online compaction failed")?,
+                )
+            } else {
+                None
+            };
+            Ok((deleted, files.len(), compacted))
+        })
+        .await?
+    }
+
     pub async fn create(
         self: &Arc<Self>,
         config: AgentRole,
@@ -957,7 +1073,11 @@ impl AgentPool {
             AgentOrigin::User => anyhow::bail!("only an agent can spawn an agent"),
         };
         let (spawner_place, spawner_role) = {
-            let record = self.db.read().get_agent(spawner);
+            let record = self
+                .db
+                .read()
+                .try_get_agent(spawner)
+                .context("spawning agent was deleted or does not exist")?;
             (record.place().clone(), record.config.role)
         };
         let mut place = spawner_place;
@@ -974,14 +1094,14 @@ impl AgentPool {
             self.set_response_subscription(parent, agent_id, true)
                 .await?;
         }
-        let spawner_label = self.agent_handle(spawner);
+        let spawner_label = self.agent_handle(spawner)?;
         agent
             .send_agent_message_accepted(spawner, spawner_label, prompt)
             .await
             .with_context(|| {
                 format!(
                     "created {} but it did not accept its initial task",
-                    self.agent_handle(agent_id)
+                    agent_id.encoded()
                 )
             })?;
         Ok(agent_id)
@@ -1035,10 +1155,13 @@ impl AgentPool {
         let sender_role = {
             let read = self.db.read();
             anyhow::ensure!(read.agent_exists(from), "sender agent no longer exists");
-            read.get_agent(from).config.role
+            read.try_get_agent(from)
+                .context("sender was deleted or does not exist")?
+                .config
+                .role
         };
         let (_, agent, _) = self.load(to).await?;
-        let sender_label = self.agent_handle(from);
+        let sender_label = self.agent_handle(from)?;
         if matches!(sender_role, AgentRole::Advisor { .. }) {
             body.push_str(&format!(
                 "\n\nAdvisor {sender_label} remains available. Use message_agent with this ID \
@@ -1077,19 +1200,26 @@ impl AgentPool {
         agent_id.encoded()[..prefix_len].to_owned()
     }
 
-    pub fn agent_handle(&self, agent_id: AgentId) -> String {
-        // A loaded loop keeps its head; only a cold agent folds its log.
-        let loaded = self
-            .agents
-            .try_lock()
-            .ok()
-            .and_then(|agents| agents.get(&agent_id).map(|agent| agent.head().config.role));
-        let role = loaded.unwrap_or_else(|| self.db.read().get_agent(agent_id).config.role);
-        format!(
-            "{}-{}",
-            role.handle_prefix(),
-            self.agent_id_prefix(agent_id)
-        )
+    /// A retained agent has a role-prefixed handle. An erased agent still
+    /// has its bare identity for references from retained children.
+    pub fn agent_handle(&self, agent_id: AgentId) -> anyhow::Result<String> {
+        let read = self.db.read();
+        if let Some(head) = read.try_get_agent(agent_id) {
+            return Ok(format!(
+                "{}-{}",
+                head.config.role.handle_prefix(),
+                self.agent_id_prefix(agent_id)
+            ));
+        }
+        anyhow::ensure!(
+            matches!(
+                read.agent_event(agent_id, crate::log::AgentEventPos::ZERO),
+                Some(crate::AgentEvent::Deleted { .. })
+            ),
+            "agent {} does not exist",
+            agent_id.encoded()
+        );
+        Ok(agent_id.encoded())
     }
 
     /// Loads a persisted agent if it is not already running. The returned
@@ -1101,7 +1231,13 @@ impl AgentPool {
         let pool = self.clone();
         Box::pin(async move {
             tokio::spawn(async move {
-                let workset = pool.db.read().get_agent(agent_id).place().workset;
+                let workset = pool
+                    .db
+                    .read()
+                    .try_get_agent(agent_id)
+                    .context("agent was deleted or does not exist")?
+                    .place()
+                    .workset;
                 let slot = pool.execution_slot(workset).await;
                 let admission = slot.admission.clone().read_owned().await;
                 let lock = pool
@@ -1112,6 +1248,10 @@ impl AgentPool {
                     .or_insert_with(|| Arc::new(Mutex::new(())))
                     .clone();
                 let loading = lock.lock_owned().await;
+                anyhow::ensure!(
+                    pool.db.read().agent_exists(agent_id),
+                    "agent was deleted or does not exist"
+                );
                 let existing = pool.agents.lock().await.get(&agent_id).cloned();
                 if let Some(agent) = existing {
                     if !agent.stopping() {
@@ -1270,6 +1410,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn online_deletion_drains_workers_erases_old_sessions_and_keeps_other_agents() {
+        use rho_agent_types::{Seq, UnixMs};
+
+        use crate::db::AgentProfileWriteTxnExt as _;
+        use crate::log::{AgentEvent, ClaudeRewind, RuntimeChange};
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _) = test_pool(dir.path()).await;
+        let (doomed, worker) = pool
+            .create(
+                AgentRole::default(),
+                None,
+                StartPlace::new(Place {
+                    workset: None,
+                    cwd: "/src".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let (kept, kept_worker) = pool
+            .create(
+                AgentRole::default(),
+                None,
+                StartPlace::new(Place {
+                    workset: None,
+                    cwd: "/src".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        // Retained history with both the original and a pending/abandoned fork.
+        let original = uuid::Uuid::new_v4();
+        let fork = uuid::Uuid::new_v4();
+        let (claude, shared) = {
+            let mut write = pool.db.write().await;
+            let claude = write.alloc_agent_id();
+            write.create_agent(
+                UnixMs(1),
+                claude,
+                None,
+                Place {
+                    workset: None,
+                    cwd: "/src".into(),
+                },
+                AgentRole::default(),
+                SessionBinding::ClaudeOpus {
+                    effort: crate::log::ClaudeEffort::High,
+                },
+                AgentRuntime::Claude {
+                    session_id: original,
+                },
+                AgentOrigin::User,
+            );
+            write.append_agent_event(
+                claude,
+                &AgentEvent::RuntimeRebound {
+                    change: RuntimeChange::ClaudeRewindPending(Some(ClaudeRewind {
+                        source_session_id: original,
+                        session_id: fork,
+                        resume_at: None,
+                    })),
+                    at: UnixMs(2),
+                },
+            );
+            write.append_agent_event(
+                claude,
+                &AgentEvent::Notice {
+                    text: "erase me".repeat(300_000).into(),
+                    at: UnixMs(3),
+                },
+            );
+            let shared = write.alloc_agent_id(); // unknown id for preflight test
+            write.commit();
+            (claude, shared)
+        };
+        let project = pool.claude.projects().join("-src");
+        std::fs::create_dir_all(&project).unwrap();
+        for session in [original, fork] {
+            std::fs::write(project.join(format!("{session}.jsonl")), "owned").unwrap();
+            std::fs::create_dir_all(project.join(session.to_string()).join("subagents")).unwrap();
+        }
+        let unrelated = project.join(format!("{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&unrelated, "retain").unwrap();
+        let head = pool.db.read().journal_head();
+        let mut feed = crate::journal::feed(&pool.db);
+        assert!(
+            pool.delete_agents(vec![doomed, shared], false)
+                .await
+                .is_err()
+        );
+        assert!(pool.agent_exists(doomed));
+        let savepoint = pool.db.persistent_savepoint(|_, _| {}).await;
+        assert!(pool.delete_agents(vec![doomed], true).await.is_err());
+        assert!(pool.agent_exists(doomed));
+        {
+            let mut write = pool.db.write().await;
+            write.delete_persistent_savepoint(savepoint);
+            write.commit();
+        }
+        let result = pool
+            .delete_agents(vec![doomed, claude, doomed], true)
+            .await
+            .unwrap();
+        assert_eq!(result.0.len(), 2);
+        assert_eq!(result.1, 4);
+        let (before, after) = result.2.unwrap();
+        assert!(after < before, "{before} -> {after}");
+        assert!(worker.stopping());
+        assert!(worker.head().is_err());
+        assert!(!kept_worker.stopping());
+        assert!(pool.get(doomed).await.is_none());
+        assert!(pool.load(doomed).await.is_err());
+        assert!(pool.execution(doomed).await.is_err());
+        assert!(pool.agent_exists(kept));
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "retain");
+        assert!(!project.join(format!("{original}.jsonl")).exists());
+        assert!(!project.join(format!("{fork}.jsonl")).exists());
+        let markers = pool.db.read().journal_since(head, 100);
+        assert_eq!(markers.len(), 2);
+        assert!(
+            markers.iter().all(
+                |(seq, _, _, event)| *seq > head && matches!(event, AgentEvent::Deleted { .. })
+            )
+        );
+        assert!(feed.recv().await.unwrap().seq > head);
+        // Late usage cannot recreate the removed agent's per-agent records.
+        pool.record_agent_usage(
+            doomed,
+            AgentUsageBucket {
+                requests: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        pool.flush_agent_usage(None).await;
+        assert_eq!(pool.db.read().agent_usage_total(doomed).requests, 0);
+        assert!(pool.db.read().journal_head() > Seq(0));
+        kept_worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claude_cleanup_failure_keeps_history_for_an_explicit_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _) = test_pool(dir.path()).await;
+        let session = uuid::Uuid::new_v4();
+        let id = {
+            let mut write = pool.db.write().await;
+            let id = write.alloc_agent_id();
+            write.create_agent(
+                rho_agent_types::UnixMs(1),
+                id,
+                None,
+                Place {
+                    workset: None,
+                    cwd: "/src".into(),
+                },
+                AgentRole::default(),
+                SessionBinding::ClaudeOpus {
+                    effort: crate::log::ClaudeEffort::High,
+                },
+                AgentRuntime::Claude {
+                    session_id: session,
+                },
+                AgentOrigin::User,
+            );
+            write.commit();
+            id
+        };
+        // A malformed session-owned directory is a real I/O error, not
+        // permission dependent (tests can also run as root).
+        std::fs::create_dir_all(pool.claude.config_home()).unwrap();
+        let bad = pool.claude.config_home().join("debug");
+        std::fs::write(&bad, "not a directory").unwrap();
+        let err = pool.delete_agents(vec![id], false).await.unwrap_err();
+        assert!(err.to_string().contains("histories retained for retry"));
+        assert!(pool.agent_exists(id));
+        assert_eq!(
+            pool.db.read().agent_claude_sessions(id),
+            std::collections::BTreeSet::from([session])
+        );
+        std::fs::remove_file(&bad).unwrap();
+        pool.delete_agents(vec![id], false).await.unwrap();
+        assert!(!pool.agent_exists(id));
+    }
+
+    #[tokio::test]
+    async fn deletion_outlives_caller_and_serializes_with_a_waiting_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _) = test_pool(dir.path()).await;
+        let id = {
+            let mut write = pool.db.write().await;
+            let id = crate::db::tests::create(&mut write, None, None);
+            write.commit();
+            id
+        };
+        let lock = pool.load_locks.lock().await.entry(id).or_default().clone();
+        let probe = Arc::downgrade(&lock);
+        let held = lock.lock_owned().await;
+        let requested = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.delete_agents(vec![id], false).await }
+        });
+        // Wait until the deletion task has queued behind this lock.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while probe.strong_count() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion queued on the per-ID lock");
+        requested.abort();
+        let mut feed = crate::journal::feed(&pool.db);
+        let load = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.load(id).await }
+        });
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), feed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(load.await.unwrap().is_err());
+        assert!(!pool.agent_exists(id));
+        assert_eq!(pool.agent_handle(id).unwrap(), id.encoded());
+        assert!(pool.agents.lock().await.get(&id).is_none());
+    }
+
+    #[tokio::test]
     async fn a_connection_holds_each_agents_latest_status_with_bodies_only_while_live() {
         let directory = tempfile::tempdir().unwrap();
         let (pool, _) = test_pool(directory.path()).await;
@@ -1386,7 +1753,10 @@ mod tests {
             !newly_loaded,
             "cancelled caller must not leave an unregistered agent"
         );
-        assert_eq!(agent.head().config.place.cwd, "/src/not-cloned-yet");
+        assert_eq!(
+            agent.head().unwrap().config.place.cwd,
+            "/src/not-cloned-yet"
+        );
         agent.shutdown().await;
     }
 
@@ -1616,7 +1986,7 @@ mod tests {
         .await
         .unwrap();
         let owned = new_agent(before);
-        let owned_handle = pool.agent_handle(owned);
+        let owned_handle = pool.agent_handle(owned).unwrap();
         assert!(output.contains(&owned_handle), "{output}");
         {
             let read = pool.db.read();

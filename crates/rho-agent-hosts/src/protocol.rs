@@ -65,6 +65,8 @@ rho_rpc::calls! {
         Snapshot(Snapshot) -> camino::Utf8PathBuf;
         /// Answered with the ids of the savepoints dropped.
         ForgetSavepoints(ForgetSavepoints) -> Vec<u64>;
+        /// Bytes before and after compaction of the open host database.
+        CompactDatabase(CompactDatabase) -> (u64, u64);
         /// Answered with a file holding the report, in a directory of its
         /// own beside the database; it is the caller's to delete. A report
         /// can outgrow a frame.
@@ -153,6 +155,11 @@ pub struct ShutdownIfIdle;
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct ForgetSavepoints;
 
+/// Reclaim unused pages while the host remains online. Database access
+/// pauses while pages move; recovery savepoints must be removed explicitly.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct CompactDatabase;
+
 /// A read-only `rho debug` report, rendered from the agent host's live
 /// database: copying a large database costs more than reading it.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -222,6 +229,7 @@ mod tests {
             .into(),
             Snapshot.into(),
             ForgetSavepoints.into(),
+            CompactDatabase.into(),
             DebugReport::Transcript {
                 agent: "00img8eiae3n".to_owned(),
                 max_chars: 200,

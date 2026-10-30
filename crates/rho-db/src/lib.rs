@@ -75,7 +75,7 @@ impl<T: Clone> SenValue<'_, T> {
 /// redb-backed rho database handle.
 #[derive(Clone, Debug)]
 pub struct RhoDb {
-    database: Arc<Database>,
+    database: Arc<parking_lot::RwLock<Database>>,
     path: Arc<Path>,
     write_lock: Arc<Mutex<()>>,
     /// One slot for the owning crate's observer of this database. Writers
@@ -103,14 +103,18 @@ pub fn clone_file(source: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::copy(source, dest).map(drop)
 }
 
+type DatabaseRead = Arc<parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, Database>>;
+
 /// Read transaction wrapper. Methods panic on local database errors.
 pub struct ReadTxn {
     inner: redb::ReadTransaction,
+    database: DatabaseRead,
 }
 
 /// Write transaction wrapper. Methods panic on local database errors.
 pub struct WriteTxn {
     inner: redb::WriteTransaction,
+    _database: DatabaseRead,
     _guard: OwnedMutexGuard<()>,
     observer: Arc<OnceLock<Box<dyn Any + Send + Sync>>>,
     /// Run after the commit lands, never before: a reader woken by one of
@@ -121,6 +125,7 @@ pub struct WriteTxn {
 /// Read-only table wrapper. Methods panic on local database errors.
 pub struct ReadTable<K: redb::Key + 'static, V: redb::Value + 'static> {
     inner: redb::ReadOnlyTable<K, V>,
+    _database: DatabaseRead,
 }
 
 /// Mutable table wrapper. Methods panic on local database errors.
@@ -313,7 +318,7 @@ impl RhoDb {
             .expect("open rho-db");
 
         Self {
-            database: Arc::new(database),
+            database: Arc::new(parking_lot::RwLock::new(database)),
             path: path.into(),
             write_lock: Arc::new(Mutex::new(())),
             observer: Arc::new(OnceLock::new()),
@@ -329,7 +334,7 @@ impl RhoDb {
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .expect("open in-memory rho-db");
         Self {
-            database: Arc::new(database),
+            database: Arc::new(parking_lot::RwLock::new(database)),
             path: Path::new("").into(),
             write_lock: Arc::new(Mutex::new(())),
             observer: Arc::new(OnceLock::new()),
@@ -349,7 +354,8 @@ impl RhoDb {
     /// empty quick-repair commit records the allocator state.
     pub async fn settle(&self) -> anyhow::Result<OwnedMutexGuard<()>> {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let mut write = self.database.begin_write()?;
+        let database = self.database.read_arc_recursive();
+        let mut write = database.begin_write()?;
         write.set_quick_repair(true);
         write.commit()?;
         Ok(guard)
@@ -441,17 +447,48 @@ impl RhoDb {
         Ok((before, after))
     }
 
+    /// Compact this open database. Other transactions wait while pages move;
+    /// existing readers (including tables that outlive their transaction)
+    /// finish first. Persistent recovery savepoints must be removed explicitly.
+    pub async fn compact_online(&self) -> anyhow::Result<(u64, u64)> {
+        let writer = self.write_lock.clone().lock_owned().await;
+        let database = self.database.clone();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            let mut database = database.write();
+            let before = std::fs::metadata(&path)?.len();
+            let mut after = before;
+            loop {
+                database.compact()?;
+                let len = std::fs::metadata(&path)?.len();
+                if len >= after {
+                    break;
+                }
+                after = len;
+            }
+            Ok((before, after))
+        })
+        .await?
+    }
+
     pub fn read(&self) -> ReadTxn {
+        // A caller can already hold another read/table. Recursive admission
+        // lets that caller finish even while compaction waits for readers.
+        let database = Arc::new(self.database.read_arc_recursive());
         ReadTxn {
-            inner: self.database.begin_read().expect("begin rho-db read txn"),
+            inner: database.begin_read().expect("begin rho-db read txn"),
+            database,
         }
     }
 
     pub async fn write(&self) -> WriteTxn {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let inner = self.database.begin_write().expect("begin rho-db write txn");
+        let database = Arc::new(self.database.read_arc_recursive());
+        let inner = database.begin_write().expect("begin rho-db write txn");
         WriteTxn {
             inner,
+            _database: database,
             _guard: guard,
             observer: Arc::clone(&self.observer),
             after_commit: Vec::new(),
@@ -469,12 +506,14 @@ impl RhoDb {
 
     pub async fn persistent_savepoint(&self, record: impl FnOnce(&mut WriteTxn, u64)) -> u64 {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let inner = self.database.begin_write().expect("begin rho-db write txn");
+        let database = Arc::new(self.database.read_arc_recursive());
+        let inner = database.begin_write().expect("begin rho-db write txn");
         let id = inner
             .persistent_savepoint()
             .expect("create rho-db persistent savepoint");
         let mut write = WriteTxn {
             inner,
+            _database: database,
             _guard: guard,
             observer: Arc::clone(&self.observer),
             after_commit: Vec::new(),
@@ -499,6 +538,7 @@ impl ReadTxn {
         V: redb::Value + 'static,
     {
         ReadTable {
+            _database: self.database.clone(),
             inner: self
                 .inner
                 .open_table(definition)
@@ -594,12 +634,14 @@ impl WriteTxn {
         let Self {
             inner,
             _guard,
+            _database,
             after_commit,
             ..
         } = self;
         inner.commit().expect("commit rho-db write txn");
         // The write lock is held until the commit lands, so an effect never
         // wakes a reader ahead of the next writer.
+        drop(_database);
         drop(_guard);
         for effect in after_commit {
             effect();
@@ -712,6 +754,62 @@ mod tests {
         name: String,
         #[senax(default)]
         tags: Vec<String>,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_compaction_waits_for_tables_and_keeps_other_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("rho.redb"));
+        let table = TableDefinition::<u64, &[u8]>::new("large");
+        let mut write = db.write().await;
+        write
+            .open_table(table)
+            .insert(1, vec![7u8; 4 * 1024 * 1024].as_slice());
+        write.open_table(table).insert(2, b"keep".as_slice());
+        write.commit();
+        let mut write = db.write().await;
+        write.open_table(table).remove(1);
+        write.commit();
+        let read = db.read();
+        let held_table = read.open_table(table);
+        drop(read); // redb tables may outlive their ReadTxn wrapper.
+        let cloned = db.clone();
+        let mut compact = tokio::spawn(async move { cloned.compact_online().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut compact)
+                .await
+                .is_err(),
+            "compaction must wait, not fail on an active table"
+        );
+        // Nested reads must not deadlock behind the waiting compactor.
+        assert_eq!(db.read().open_table(table).get(2).unwrap().value(), b"keep");
+        drop(held_table);
+        let (before, after) = tokio::time::timeout(std::time::Duration::from_secs(5), compact)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(after < before, "{before} -> {after}");
+        assert_eq!(db.read().open_table(table).get(2).unwrap().value(), b"keep");
+        let mut write = db.write().await;
+        write.open_table(table).insert(3, b"new".as_slice());
+        write.commit();
+        assert_eq!(db.read().open_table(table).get(3).unwrap().value(), b"new");
+    }
+
+    #[tokio::test]
+    async fn online_compaction_does_not_discard_recovery_savepoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("rho.redb"));
+        let id = db.persistent_savepoint(|_, _| {}).await;
+        assert!(
+            db.compact_online()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("savepoint")
+        );
+        assert_eq!(db.write().await.persistent_savepoints(), [id]);
     }
 
     #[test]

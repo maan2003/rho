@@ -58,12 +58,15 @@ impl MultiAgentTools {
         let pool = self.pool()?;
         let spawned_by = pool.db().read().get_agent(self.self_id).config.spawned_by;
         let started_by = match spawned_by {
-            crate::log::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)),
+            crate::log::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)?),
             _ => None,
         };
         Ok(Team {
-            agent: pool.agent_handle(self.self_id),
-            parent: self.parent.map(|parent| pool.agent_handle(parent)),
+            agent: pool.agent_handle(self.self_id)?,
+            parent: self
+                .parent
+                .map(|parent| pool.agent_handle(parent))
+                .transpose()?,
             spawned_by,
             started_by,
         })
@@ -214,7 +217,7 @@ async fn spawn_user_owned_engineer(
     Ok(format!(
         "Spawned user-owned Engineer {} for task \"{}\". It works in {}. It appears in the \
          user's agent list and reports to the user, not to you.",
-        pool.agent_handle(agent_id),
+        pool.agent_handle(agent_id)?,
         task_name,
         cwd,
     ))
@@ -232,7 +235,7 @@ fn ensure_may_interrupt(pool: &AgentPool, sender: AgentId, target: AgentId) -> a
     anyhow::ensure!(
         !user_owned || read.agent_parent(sender) == Some(target),
         "{} is managed by the user; only the user can interrupt it",
-        pool.agent_handle(target)
+        pool.agent_handle(target)?
     );
     Ok(())
 }
@@ -264,7 +267,7 @@ fn resolve_handle(pool: &AgentPool, handle: &str) -> anyhow::Result<AgentId> {
                 .handle_prefix()
                 == prefix,
             "{handle} names {}, whose role prefix differs",
-            pool.agent_handle(agent)
+            pool.agent_handle(agent)?
         );
     }
     Ok(agent)
@@ -287,7 +290,10 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
     }
     pool.deliver_mail(tools.self_id, recipient, args.message)
         .await?;
-    Ok(format!("Message sent to {}.", pool.agent_handle(recipient)))
+    Ok(format!(
+        "Message sent to {}.",
+        pool.agent_handle(recipient)?
+    ))
 }
 
 #[derive(Debug, Encode, Decode)]

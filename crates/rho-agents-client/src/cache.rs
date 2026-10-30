@@ -16,6 +16,7 @@
 //! from the view's own fold of it; anything doubted is thrown away and
 //! asked for again from the start.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -510,9 +511,20 @@ fn apply(
             entries,
             digests,
         } => {
+            let deleted = entries
+                .iter()
+                .filter(|entry| matches!(entry.event, TranscriptEvent::Deleted { .. }))
+                .map(|entry| entry.agent_id)
+                .collect::<BTreeSet<_>>();
+            for agent_id in &deleted {
+                forget_agent(transaction, *agent_id);
+            }
             {
                 let mut events = transaction.open_table(EVENTS);
-                for entry in &entries {
+                for entry in entries
+                    .iter()
+                    .filter(|entry| !deleted.contains(&entry.agent_id))
+                {
                     events.insert(
                         (entry.agent_id, entry.pos.0),
                         SenValue::borrowed(&entry.event),
@@ -521,13 +533,16 @@ fn apply(
             }
             {
                 let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
-                for entry in entries.iter().filter(|e| e.pos == AgentPos::ZERO) {
+                for entry in entries
+                    .iter()
+                    .filter(|e| e.pos == AgentPos::ZERO && !deleted.contains(&e.agent_id))
+                {
                     agent_hosts.insert(entry.agent_id, host.as_str());
                 }
             }
             {
                 let mut table = transaction.open_table(DIGESTS);
-                for (agent_id, snapshot) in &digests {
+                for (agent_id, snapshot) in digests.iter().filter(|(id, _)| !deleted.contains(id)) {
                     table.insert(agent_id, SenValue::borrowed(snapshot));
                 }
             }
@@ -566,38 +581,32 @@ fn apply(
         }
         Write::Reset(host) => {
             transaction.open_table(HOSTS).remove(host.as_str());
-            let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
-            let departed = agent_hosts
+            let departed = transaction
+                .open_table(AGENT_HOSTS)
                 .iter()
                 .filter(|(_, owner)| owner.value() == host)
                 .map(|(key, _)| key.value())
                 .collect::<Vec<_>>();
-            for agent_id in &departed {
-                agent_hosts.remove(agent_id);
-            }
-            drop(agent_hosts);
-            let mut verdicts = transaction.open_table(VERDICTS);
-            for agent_id in &departed {
-                verdicts.remove(agent_id);
-            }
-            drop(verdicts);
-            let mut digests = transaction.open_table(DIGESTS);
-            for agent_id in &departed {
-                digests.remove(agent_id);
-            }
-            drop(digests);
-            let mut events = transaction.open_table(EVENTS);
             for agent_id in departed {
-                let held = events
-                    .range((agent_id, 0)..=(agent_id, u64::MAX))
-                    .map(|(key, _)| key.value())
-                    .collect::<Vec<_>>();
-                for key in held {
-                    events.remove(key);
-                }
+                forget_agent(transaction, agent_id);
             }
         }
         Write::Flush(done) => flushed.push(done),
+    }
+}
+
+/// Only host-owned mirror data goes away. Drafts and outbox have no other copy.
+fn forget_agent(transaction: &mut rho_db::WriteTxn, agent_id: AgentId) {
+    transaction.open_table(AGENT_HOSTS).remove(agent_id);
+    transaction.open_table(VERDICTS).remove(agent_id);
+    transaction.open_table(DIGESTS).remove(agent_id);
+    let mut events = transaction.open_table(EVENTS);
+    let held = events
+        .range((agent_id, 0)..=(agent_id, u64::MAX))
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    for key in held {
+        events.remove(key);
     }
 }
 
@@ -822,6 +831,81 @@ mod tests {
 
         assert_eq!(mirror.read_events(mine), events(&told(mine, 1)));
         assert!(mirror.read_events(agent_id(3)).is_empty());
+    }
+
+    #[test]
+    fn durable_deletion_purges_reconnect_cache_but_keeps_peers_and_sole_copy_text() {
+        // Exercise both one journal page and a tombstone received after
+        // reopening a stale cache. A marker must work without the host
+        // replaying Created.
+        for reconnect in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (gone, peer, other_host) = (agent_id(1), agent_id(2), agent_id(3));
+            let mut mirror = Mirror::open(dir.path()).unwrap();
+            write(&mirror, "local", 7, told(peer, 4));
+            write(&mirror, "remote", 8, told(other_host, 1));
+            let outgoing = Outgoing {
+                at: rho_agent_types::UnixMs(8),
+                content: vec![rho_agent_types::ContentPart::Text {
+                    text: "unsent message".into(),
+                }],
+            };
+            mirror.write_outgoing(gone, 91, Some(outgoing.clone()));
+            mirror.write_draft(gone, "unfinished draft".into());
+            let deletion = LogEntry {
+                seq: Seq(7),
+                agent_id: gone,
+                pos: AgentPos::ZERO,
+                event: TranscriptEvent::Deleted {
+                    at: rho_agent_types::UnixMs(9),
+                },
+            };
+            if reconnect {
+                write(&mirror, "local", 7, told(gone, 1));
+                mirror.flush();
+                drop(mirror);
+                mirror = Mirror::open(dir.path()).unwrap();
+                assert_eq!(mirror.read_events(gone).len(), 3);
+                mirror.write_log("local", 7, Seq(7), vec![deletion], vec![]);
+            } else {
+                let mut page = told(gone, 1);
+                page.push(deletion);
+                // Even a pre-deletion digest in the page must not resurrect it.
+                mirror.write_log(
+                    "local",
+                    7,
+                    Seq(7),
+                    page,
+                    vec![(gone, snapshot(&told(gone, 1)))],
+                );
+            }
+            mirror.flush();
+            drop(mirror);
+            let mirror = Mirror::open(dir.path()).unwrap();
+            let loaded = mirror.load();
+            assert_eq!(
+                loaded
+                    .hosts
+                    .iter()
+                    .find(|host| host.name == "local")
+                    .unwrap()
+                    .seq,
+                Seq(7)
+            );
+            assert_eq!(
+                loaded
+                    .agents
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([peer, other_host])
+            );
+            assert!(mirror.read_events(gone).is_empty());
+            assert_eq!(mirror.read_events(peer), events(&told(peer, 4)));
+            assert_eq!(mirror.read_events(other_host), events(&told(other_host, 1)));
+            assert_eq!(mirror.read_drafts(), [(gone, "unfinished draft".into())]);
+            assert_eq!(mirror.read_outbox(), [(gone, 91, outgoing)]);
+        }
     }
 
     /// Unsent messages are the user's words and nothing else has them:

@@ -225,9 +225,10 @@ impl AgentMap {
     /// The agents named are gone: every table and every index that
     /// mentions one drops it. Costs what departed and a lookup each, not a
     /// pass over the map.
-    fn forget_agents(&mut self, departed: &BTreeSet<AgentId>) {
+    pub fn forget_agents(&mut self, departed: &BTreeSet<AgentId>) {
         for agent_id in departed {
             self.unindex_agent(*agent_id);
+            self.runtime.remove(agent_id);
             self.agents.remove(agent_id);
             self.verdicts.remove(agent_id);
             self.mirror.remove(agent_id);
@@ -1087,6 +1088,26 @@ mod tests {
 
         assert!(map.set_agent_filings([(agent(2), AgentFiling::default())]));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
+    }
+
+    #[test]
+    fn forgetting_one_agent_removes_its_indexes_and_runtime_but_preserves_peers() {
+        let host = HostId::default();
+        let mut map = AgentMap::default();
+        map.tell(host, &log(agent(1), 0, vec![created(10)]));
+        map.tell(host, &log(agent(2), 0, vec![created(20)]));
+        map.set_runtime(
+            agent(1),
+            crate::protocol::transcript::RuntimeState::default(),
+        );
+        let handle = map.agent_id_label(agent(1));
+        let (_, tag) = handle.split_once('/').unwrap_or(("", &handle));
+        map.forget_agents(&BTreeSet::from([agent(1)]));
+        assert_eq!(map.host_agents(host), [agent(2)]);
+        assert_eq!(map.agent_by_tag(host, tag), None);
+        assert!(map.agent_facts(agent(1)).runtime.is_none());
+        assert_eq!(map.next_agent(None, 1), Some(agent(2)));
+        assert_eq!(map.all_mirrored().len(), 1);
     }
 
     /// The indexes are what the screens read, so they must say the same

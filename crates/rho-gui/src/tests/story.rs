@@ -89,7 +89,7 @@ fn known(agent_id: AgentId) -> bool {
     NEXT_POS.with(|next| next.borrow().contains_key(&agent_id))
 }
 
-fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
+pub(super) fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
     let seq = NEXT_SEQ.with(|next| {
         let seq = next.get();
         next.set(seq + 1);
@@ -241,6 +241,13 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> AgentFrame {
         })
         .collect();
     AgentFrame::Log { entries }
+}
+
+/// Deletion is a journal marker at zero even when this client held later rows.
+pub fn deleted(agent_id: AgentId, at: UnixMs) -> AgentFrame {
+    AgentFrame::Log {
+        entries: vec![entry(agent_id, 0, TranscriptEvent::Deleted { at })],
+    }
 }
 
 thread_local! {

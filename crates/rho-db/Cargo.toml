@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 anyhow.workspace = true
 bytes = "1"
 libc = { version = "0.2" }

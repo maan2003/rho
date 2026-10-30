@@ -498,6 +498,27 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     match request {
+        Request::DeleteAgents(call) => {
+            respond(
+                writer,
+                call,
+                |call: rho_agents_client::protocol::DeleteAgents| async move {
+                    let (deleted, files, compacted) = services
+                        .pool
+                        .delete_agents(call.agents, call.compact)
+                        .await?;
+                    Ok(rho_agents_client::protocol::DeleteAgentsResult {
+                        deleted: deleted
+                            .into_iter()
+                            .map(|(id, rows)| (id, rows as u64))
+                            .collect(),
+                        claude_paths_removed: files as u64,
+                        compacted,
+                    })
+                },
+            )
+            .await
+        }
         Request::New(call) => respond(writer, call, |call| new_agent(services, call)).await,
         Request::Command(call) => {
             respond(writer, call, |call| handle_agent_command(services, call)).await
@@ -634,7 +655,7 @@ pub(crate) async fn handle_agent_command(
                 // What Rho has to tell the agent goes ahead of the person's
                 // words, once: the loop's head forgets it as soon as the
                 // message is accepted, the log when the message's row lands.
-                let notice = agent.head().pending_notice;
+                let notice = agent.head()?.pending_notice;
                 if let Some(text) = notice.clone() {
                     content.insert(0, rho_agent_types::ContentPart::Text { text });
                 }
@@ -1100,6 +1121,62 @@ mod tests {
             }
         }
         assert_eq!(reported, [["exec-1"], ["exec-1"]]);
+    }
+
+    #[tokio::test]
+    async fn erased_history_reaches_both_live_and_reconnected_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let id = write.alloc_agent_id();
+        write.append_agent_event(
+            id,
+            &AgentEvent::Created {
+                role: Default::default(),
+                binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
+                runtime: rho_agent::log::AgentRuntime::Rho {
+                    prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                },
+                place: rho_agent_types::Place {
+                    workset: None,
+                    cwd: "/src".into(),
+                },
+                spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
+                spawn_name: None,
+                created_at: UnixMs(0),
+                parent: None,
+            },
+        );
+        write.append_agent_event(
+            id,
+            &AgentEvent::Notice {
+                text: "secret".into(),
+                at: UnixMs(1),
+            },
+        );
+        write.commit();
+        let mut cursor = Seq(0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(send_journal_from(&db, &tx, &mut cursor).await);
+        while rx.try_recv().is_ok() {}
+        let previous = cursor;
+        rho_agent::db::delete_agents(&db, &[id]).await;
+        assert!(send_journal_from(&db, &tx, &mut cursor).await);
+        let live = rx.recv().await.unwrap();
+        let ServerFrame::Log { entries } = &live else {
+            panic!("expected log page")
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent_id, id);
+        assert!(entries[0].seq > previous);
+        assert!(matches!(entries[0].event, TranscriptEvent::Deleted { .. }));
+        // A cold mirror has no creation to fold, but sees the same removal.
+        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
+        assert_eq!(rx.recv().await.unwrap(), live);
+        let bytes = senax_encoder::pack(&live).unwrap();
+        let decoded: ServerFrame = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
+        assert_eq!(decoded, live);
     }
 
     #[test]
