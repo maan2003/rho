@@ -1323,7 +1323,7 @@ async fn a_loaded_skill_comes_back_after_a_compaction() {
     assert!(shown.contains("Verdict v1."), "{shown}");
     assert!(!shown.contains("Your loaded skills"), "{shown}");
     assert_eq!(
-        harness.db.read().get_agent(harness.agent).config.skills,
+        harness.db.read().get_agent(harness.agent).skills,
         [crate::log::SkillDir::new(skill.clone()).unwrap()],
     );
 

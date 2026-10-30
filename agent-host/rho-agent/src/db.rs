@@ -1050,6 +1050,7 @@ fn created_head(event: &AgentEvent<'_>, pos: AgentEventPos) -> AgentHead {
         user_interacted: false,
         pending_notice: None,
         next: pos.next(),
+        skills: Vec::new(),
     }
 }
 
@@ -1101,7 +1102,6 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
         spawned_by: *spawned_by,
         spawn_name: spawn_name.clone(),
         created_at: *created_at,
-        skills: Vec::new(),
         claude_rewind: None,
     }
 }
@@ -1140,8 +1140,8 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             }
         },
         AgentEvent::SkillLoaded { dir, .. } => {
-            if !head.config.skills.contains(dir) {
-                head.config.skills.push(dir.clone());
+            if !head.skills.contains(dir) {
+                head.skills.push(dir.clone());
             }
         }
         AgentEvent::TitleAttempted { .. } => head.title_attempted = true,

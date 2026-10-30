@@ -380,7 +380,7 @@ impl Agent {
         let (session, model_name) = inference_session(&inference, head.config.binding)?;
         let (boundary, recovery, entries) = host.native_history(None).await?;
         let context = context::Context::restore(&entries);
-        let skills = head.config.skills.clone();
+        let skills = head.skills.clone();
         // History starts at the agent's birth, before any skill, or at its
         // latest compaction, which took them out.
         let skills_owed = entries.iter().fold(true, skills_owed_after);

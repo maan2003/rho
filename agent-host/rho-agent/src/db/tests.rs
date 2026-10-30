@@ -1475,26 +1475,25 @@ async fn loaded_skills_are_kept_once_in_load_order() {
 
     let read = db.read();
     assert_eq!(
-        read.get_agent(parent).config.skills,
+        read.get_agent(parent).skills,
         [skill("roboman"), skill("review")]
     );
-    assert!(read.get_agent(child).config.skills.is_empty());
+    assert!(read.get_agent(child).skills.is_empty());
 }
 
 /// A head stored before agents had skills, without the field, still
 /// decodes, with no skills, and one with none is stored as before.
 #[tokio::test]
-async fn a_config_stored_without_skills_decodes() {
+async fn a_head_stored_without_skills_decodes() {
     #[derive(senax_encoder::Encode)]
     struct Stored {
-        role: AgentRole,
-        binding: SessionBinding,
-        runtime: AgentRuntime,
-        place: rho_agent_types::Place,
-        spawned_by: crate::log::AgentSpawnedBy,
-        spawn_name: Option<String>,
-        created_at: UnixMs,
-        claude_rewind: Option<crate::log::ClaudeRewind>,
+        config: crate::log::AgentConfig,
+        title_attempted: bool,
+        generated_title: Option<String>,
+        parent: Option<AgentId>,
+        user_interacted: bool,
+        pending_notice: Option<String>,
+        next: crate::log::AgentEventPos,
     }
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -1514,23 +1513,22 @@ async fn a_config_stored_without_skills_decodes() {
         crate::log::AgentOrigin::User,
     );
     write.commit();
-    let config = db.read().get_agent(id).config;
+    let head = db.read().get_agent(id);
     let stored = Stored {
-        role: config.role,
-        binding: config.binding.clone(),
-        runtime: config.runtime.clone(),
-        place: config.place.clone(),
-        spawned_by: config.spawned_by,
-        spawn_name: config.spawn_name.clone(),
-        created_at: config.created_at,
-        claude_rewind: config.claude_rewind.clone(),
+        config: head.config.clone(),
+        title_attempted: head.title_attempted,
+        generated_title: head.generated_title.clone(),
+        parent: head.parent,
+        user_interacted: head.user_interacted,
+        pending_notice: head.pending_notice.clone(),
+        next: head.next,
     };
     let bytes = senax_encoder::encode(&stored).unwrap();
-    let decoded: crate::log::AgentConfig = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
-    assert_eq!(decoded, config);
+    let decoded: crate::log::AgentHead = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+    assert_eq!(decoded, head);
     assert_eq!(
-        senax_encoder::encode(&config).unwrap(),
+        senax_encoder::encode(&head).unwrap(),
         bytes,
-        "a config without skills is stored as before"
+        "a head without skills is stored as before"
     );
 }

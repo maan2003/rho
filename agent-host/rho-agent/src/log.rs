@@ -206,11 +206,6 @@ pub struct AgentConfig {
     /// agent that has one, and it always beats a generated title.
     pub spawn_name: Option<String>,
     pub created_at: UnixMs,
-    /// The skills the agent loaded, each once, in the order loaded. They
-    /// are given back to the model after a compaction. Heads stored before
-    /// skills existed have none.
-    #[senax(skip_default)]
-    pub skills: Vec<SkillDir>,
     /// A message-only Claude rewind whose destination transcript has not yet
     /// been durably materialized and verified. The old runtime remains
     /// authoritative until then.
@@ -237,6 +232,11 @@ pub struct AgentHead {
     pub pending_notice: Option<String>,
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
+    /// The skills the agent loaded, each once, in the order loaded. They
+    /// are given back to the model after a compaction. Heads stored before
+    /// skills existed have none.
+    #[senax(skip_default)]
+    pub skills: Vec<SkillDir>,
 }
 
 impl AgentHead {

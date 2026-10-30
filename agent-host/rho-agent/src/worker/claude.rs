@@ -107,7 +107,7 @@ impl ClaudeAgent {
             claude_prompt_path: None,
             claude_settings_path: None,
             claude_skills_path: None,
-            skills: head.read().expect("poison").config.skills.clone(),
+            skills: head.read().expect("poison").skills.clone(),
             claude_plugin_dir: None,
             claude_account: None,
             python: None,
