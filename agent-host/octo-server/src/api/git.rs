@@ -219,30 +219,14 @@ fn parse_and_validate_commands(input: &[u8]) -> Result<Option<usize>, AppError> 
         let reference = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("invalid receive-pack command"))?;
-        if !valid_rho_ref(reference) {
+        if !octo_types::agent_pushable_ref(reference) {
             return Err(anyhow::anyhow!(
-                "Octo may only push valid refs below refs/heads/rho/ (requested {reference})"
+                "Octo may only push valid branches other than main and master (requested {reference})"
             )
             .into());
         }
         offset += length;
     }
-}
-
-fn valid_rho_ref(reference: &str) -> bool {
-    let Some(suffix) = reference.strip_prefix("refs/heads/rho/") else {
-        return false;
-    };
-    !suffix.is_empty()
-        && !suffix.starts_with('.')
-        && !suffix.ends_with(['/', '.'])
-        && !suffix.contains("..")
-        && !suffix.contains("@{")
-        && !suffix.contains("//")
-        && !suffix.split('/').any(|part| part.ends_with(".lock"))
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
 }
 
 #[cfg(test)]
@@ -361,32 +345,39 @@ mod tests {
     }
 
     #[test]
-    fn permits_rho_branches() {
+    fn permits_any_branch_but_main_and_master() {
         assert!(parse_and_validate_commands(&packet(
-            "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/rho/test"
+            "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/feature/x"
         ))
         .unwrap()
         .is_some());
     }
 
     #[test]
-    fn rejects_other_refs() {
-        let error = parse_and_validate_commands(&packet(
+    fn rejects_main_master_and_tags_including_deletes() {
+        for command in [
             "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main",
-        ))
-        .unwrap_err();
-        assert!(error.0.to_string().contains("refs/heads/rho/"));
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/master",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000 refs/heads/main",
+            "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/tags/v1",
+        ] {
+            let error = parse_and_validate_commands(&packet(command)).unwrap_err();
+            assert!(
+                error.0.to_string().contains("other than main and master"),
+                "accepted {command}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_invalid_names_within_rho_namespace() {
-        for reference in [
-            "refs/heads/rho/",
-            "refs/heads/rho/../main",
-            "refs/heads/rho/a.lock",
-            "refs/heads/rho/a//b",
-        ] {
-            assert!(!valid_rho_ref(reference), "accepted {reference}");
-        }
+    fn rejects_main_hidden_after_an_allowed_branch() {
+        let first = "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/feature/x\0 report-status\n";
+        let second = "0000000000000000000000000000000000000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n";
+        let input = format!(
+            "{:04x}{first}{:04x}{second}0000",
+            first.len() + 4,
+            second.len() + 4
+        );
+        assert!(parse_and_validate_commands(input.as_bytes()).is_err());
     }
 }

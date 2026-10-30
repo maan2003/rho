@@ -6,7 +6,7 @@ Use the client and approval rules in [the skill](../SKILL.md).
 
 Create a PR with the repository's actual base branch:
 ```python
-pr = await api.pulls.create(head="rho/CHANGE", base="BASE",
+pr = await api.pulls.create(head="BRANCH", base="BASE",
                             title="TITLE", body="BODY", draft=True)
 ```
 Use `draft=False` or omit it for a normal PR. Edit with

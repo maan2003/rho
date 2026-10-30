@@ -709,7 +709,7 @@ fn pushes_use_http(pushes: &[PushCommand]) -> bool {
     !pushes.is_empty()
         && pushes
             .iter()
-            .all(|push| push.destination.starts_with("refs/heads/rho/"))
+            .all(|push| octo_types::agent_pushable_ref(&push.destination))
 }
 
 fn force_leases(
@@ -986,14 +986,26 @@ mod tests {
     }
 
     #[test]
-    fn routes_push_batches_by_destination_namespace() {
-        let (rho, options) =
-            parse_push_batch(&["push HEAD:refs/heads/rho/test".to_owned()]).unwrap();
+    fn routes_push_batches_by_destination_ref() {
+        let (branches, options) = parse_push_batch(&[
+            "push HEAD:refs/heads/feature/x".to_owned(),
+            "push :refs/heads/rho/old".to_owned(),
+        ])
+        .unwrap();
         assert!(!options);
-        assert!(pushes_use_http(&rho));
+        assert!(pushes_use_http(&branches));
+
+        for protected in [
+            "push +HEAD:refs/heads/master",
+            "push :refs/heads/main",
+            "push HEAD:refs/tags/v1",
+        ] {
+            let (pushes, _) = parse_push_batch(&[protected.to_owned()]).unwrap();
+            assert!(!pushes_use_http(&pushes), "routed {protected} over HTTP");
+        }
 
         let (mixed, options) = parse_push_batch(&[
-            "push HEAD:refs/heads/rho/test".to_owned(),
+            "push HEAD:refs/heads/feature/x".to_owned(),
             "push HEAD:refs/heads/main".to_owned(),
             "option unknown value".to_owned(),
         ])

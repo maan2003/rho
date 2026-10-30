@@ -118,6 +118,17 @@ pub fn valid_git_ref(reference: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
 }
 
+/// Whether an agent may push `reference` with the host's GitHub token, without
+/// the user approving the push: any valid branch except `main` and `master`.
+/// Every other ref, including those two branches and all tags, takes the SSH
+/// transport, where the user approves each push.
+pub fn agent_pushable_ref(reference: &str) -> bool {
+    valid_git_ref(reference)
+        && reference
+            .strip_prefix("refs/heads/")
+            .is_some_and(|branch| !matches!(branch, "main" | "master"))
+}
+
 pub fn valid_ssh_repository(host: &str, value: &str) -> bool {
     let value = match host {
         "github.com" => value,
@@ -178,6 +189,35 @@ mod git_tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn agents_push_any_branch_except_main_and_master() {
+        for reference in [
+            "refs/heads/feature/x",
+            "refs/heads/rho/test",
+            "refs/heads/main-fix",
+            "refs/heads/mainline",
+            "refs/heads/feature/main",
+            "refs/heads/Main",
+        ] {
+            assert!(agent_pushable_ref(reference), "refused {reference}");
+        }
+        for reference in [
+            "refs/heads/main",
+            "refs/heads/master",
+            "refs/heads/",
+            "refs/heads/../main",
+            "refs/heads//main",
+            "refs/heads/main.lock",
+            "refs/tags/v1",
+            "refs/notes/commits",
+            "refs/main",
+            "main",
+            "HEAD",
+        ] {
+            assert!(!agent_pushable_ref(reference), "accepted {reference}");
+        }
     }
 
     #[test]

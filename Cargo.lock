@@ -10994,6 +10994,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-util",
+ "octo-types",
  "percent-encoding",
  "reqwest 0.13.5",
  "rustls",
