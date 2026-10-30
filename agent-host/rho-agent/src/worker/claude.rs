@@ -106,6 +106,8 @@ impl ClaudeAgent {
             process: None,
             claude_prompt_path: None,
             claude_settings_path: None,
+            claude_skills_path: None,
+            skills: head.read().expect("poison").config.skills.clone(),
             claude_plugin_dir: None,
             claude_account: None,
             python: None,
@@ -314,6 +316,12 @@ pub(crate) struct ClaudeLoop {
     /// The generated `settings.json` of a Python-mode agent, kept alive for
     /// the same reason as the prompt.
     claude_settings_path: Option<tempfile::TempPath>,
+    /// The loaded skills' directories, which Rho's plugin reads after a
+    /// compaction. Rewritten in place on every load, so the mounted file
+    /// stays the same one.
+    claude_skills_path: Option<tempfile::TempPath>,
+    /// The skills the model loaded, oldest first.
+    skills: Vec<crate::log::SkillDir>,
     /// Rho's Claude Code plugin, written once and loaded by every spawn.
     claude_plugin_dir: Option<tempfile::TempDir>,
     /// The account the running process was spawned on, so a switch is
@@ -1164,6 +1172,17 @@ impl ClaudeLoop {
                 self.awaiting = true;
             }
             Outbound::EndTurn => {}
+            Outbound::LoadSkill(dir) => {
+                if !self.skills.contains(&dir) {
+                    self.skills.push(dir.clone());
+                    self.host
+                        .append(AgentEvent::SkillLoaded { dir, at })
+                        .await?;
+                    if self.claude_skills_path.is_some() {
+                        self.write_skills()?;
+                    }
+                }
+            }
             Outbound::Archive => {
                 self.archived = true;
                 self.entry(Entry::Notice {
@@ -1606,6 +1625,7 @@ impl ClaudeLoop {
             self.claude.projects().as_std_path(),
             self.claude_prompt_path.as_deref().expect("prompt prepared"),
             self.claude_settings_path.as_deref(),
+            self.claude_skills_path.as_deref(),
         )?;
         self.process = Some(ClaudeCode::spawn_command(command).await?);
         if !self.pending_rewind {
@@ -1649,6 +1669,23 @@ impl ClaudeLoop {
         let notebook = rho_notebook::Notebook::new(shell, exports, Arc::clone(&notify))
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
         self.python = Some(python_host::PythonHost::new(notebook, notify));
+        Ok(())
+    }
+
+    /// Lists the loaded skills' directories, one per line, for Rho's
+    /// plugin to read after a compaction.
+    fn write_skills(&mut self) -> anyhow::Result<()> {
+        let list: String = self
+            .skills
+            .iter()
+            .map(|dir| format!("{}\n", dir.as_path()))
+            .collect();
+        write_generated_source(
+            &mut self.claude_skills_path,
+            "rho-claude-skills-",
+            "",
+            &list,
+        )?;
         Ok(())
     }
 
@@ -1713,6 +1750,7 @@ impl ClaudeLoop {
                 &text,
             )?;
         }
+        self.write_skills()?;
         self.claude_account = Some(account.to_owned());
         Ok((account_dir, target))
     }

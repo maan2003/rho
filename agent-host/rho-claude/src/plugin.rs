@@ -1,9 +1,14 @@
 //! Rho's Claude Code plugin, whose source is `plugin/`: a hooks module that
 //! moves the agent's prompt from the first user message into the system
-//! prompt, in place of the Claude Code sections that contradict it.
+//! prompt, in place of the Claude Code sections that contradict it, and
+//! gives the agent its skills back after a compaction.
 
 use anyhow::{Context as _, Result};
 use camino::Utf8Path;
+
+/// The agent's loaded skill directories, one per line, relative to the
+/// Claude config directory. The hooks module reads them after a compaction.
+pub const SKILLS_FILE: &str = "rho-skills";
 
 const FILES: &[(&str, &str)] = &[
     (

@@ -48,7 +48,7 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
 pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<TranscriptEvent> {
     Some(match event {
         AgentEvent::Deleted { at } => TranscriptEvent::Deleted { at: *at },
-        AgentEvent::TitleAttempted { .. } => {
+        AgentEvent::TitleAttempted { .. } | AgentEvent::SkillLoaded { .. } => {
             return None;
         }
         AgentEvent::Titled { title, at } => TranscriptEvent::Presented {

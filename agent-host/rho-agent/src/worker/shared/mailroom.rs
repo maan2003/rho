@@ -34,6 +34,8 @@ pub(crate) enum Outbound {
     Archive,
     /// The current exec ends the model's turn.
     EndTurn,
+    /// The model was shown this skill (`skills.load`).
+    LoadSkill(crate::log::SkillDir),
 }
 
 /// Shared by the notebook's `human` and the agent loop.
@@ -52,8 +54,10 @@ impl Mailroom {
         let human = Arc::clone(self);
         let archive = Arc::clone(self);
         let end_turn = Arc::clone(self);
+        let skills = Arc::clone(self);
         vec![
             Export::build("human", move |py| build(py, "Human", human)),
+            Export::build("skills", move |py| build(py, "Skills", skills)),
             Export::build("archive", move |py| {
                 Py::new(py, Bridge(archive))?.getattr(py, "archive")
             }),
@@ -112,6 +116,18 @@ impl Bridge {
 
     fn end_turn(&self) {
         let _ = self.0.outbox.send(Outbound::EndTurn);
+    }
+
+    /// The skill at `dir` as the model is shown it. Remembered, so the
+    /// agent loop gives it back after a compaction.
+    fn load_skill(&self, dir: String) -> PyResult<String> {
+        let dir = crate::log::SkillDir::new(dir.into())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        dir.read()
+            .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+        let text = dir.render();
+        let _ = self.0.outbox.send(Outbound::LoadSkill(dir));
+        Ok(text)
     }
 }
 
@@ -211,6 +227,25 @@ class Human:
 
     def __repr__(self):
         return "<human>"
+
+
+class Skills:
+    """Skills you load stay with you after a compaction."""
+
+    def __init__(self, bridge):
+        self._bridge = bridge
+
+    def load(self, path):
+        """Show yourself the skill at `path`, its directory or its SKILL.md.
+        rho reads it again and shows it to you after each compaction."""
+        import os, sys
+        path = os.path.abspath(os.fspath(path))
+        if os.path.basename(path) == "SKILL.md":
+            path = os.path.dirname(path)
+        sys.stdout.write(self._bridge.load_skill(path) + "\n")
+
+    def __repr__(self):
+        return "<skills>"
 "#;
 
 #[cfg(test)]

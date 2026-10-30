@@ -115,7 +115,7 @@ impl Report {
             .filter(|n| {
                 !substantive || !matches!(n, RequestNotice::Checkin | RequestNotice::NothingNew)
             })
-            .map(|notice| notice.text().to_owned())
+            .map(|notice| notice.text().into_owned())
             .collect();
         if !rendered.text.is_empty() {
             parts.push(rendered.text);
@@ -137,11 +137,21 @@ pub enum RequestNotice {
     PreviousResponseHadNoExec,
     Checkin,
     NothingNew,
+    /// The agent's loaded skills, read when the request was made: what a
+    /// compaction took out of the context.
+    Skills(Vec<String>),
 }
 
 impl RequestNotice {
-    fn text(&self) -> &'static str {
-        match self {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        let text = match self {
+            Self::Skills(skills) => {
+                return format!(
+                    "Your loaded skills, as they are now. Keep following them:\n\n{}",
+                    skills.join("\n\n")
+                )
+                .into();
+            }
             Self::Restarted => {
                 "rho restarted. Your notebook and everything running in it are gone, and their side effects may remain. Check the current state before carrying on."
             }
@@ -159,7 +169,8 @@ impl RequestNotice {
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
-        }
+        };
+        text.into()
     }
 }
 

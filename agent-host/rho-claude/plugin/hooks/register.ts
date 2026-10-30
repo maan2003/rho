@@ -37,6 +37,27 @@ export function register(on: On): void {
   on('prompt.attachment', { type: 'environment' }, () => ({ text: null }))
   on('prompt.attachment', { type: 'total_tokens_reminder' }, () => ({ text: null }))
 
+  // A compaction drops the transcript that showed the agent its skills.
+  // Rho lists their directories in `rho-skills`; each `SKILL.md` is read
+  // now and follows the summary, as Rho's own runtime does it.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (result.skip !== undefined) return result
+    const home = await $.env.get('CLAUDE_CONFIG_DIR')
+    const dirs = (await $.fs.read(`${home}/rho-skills`)).split('\n').filter(dir => dir !== '')
+    if (dirs.length === 0) return result
+    const skills = await Promise.all(dirs.map(async dir => {
+      try {
+        const text = (await $.fs.read(`${dir}/SKILL.md`)).trimEnd()
+        return `<skill path="${dir}">\n${text}\n</skill>`
+      } catch (error) {
+        return `<skill path="${dir}" error="${String(error)}" />`
+      }
+    }))
+    const text = `Your loaded skills, as they are now. Keep following them:\n\n${skills.join('\n\n')}`
+    return { ...result, messages: [...result.messages, { role: 'user', text, toolUses: [] }] }
+  })
+
   on('prompt.context', async ($, e, next) => {
     const { blocks } = await next(e)
     return {

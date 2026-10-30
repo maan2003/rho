@@ -1101,6 +1101,7 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
         spawned_by: *spawned_by,
         spawn_name: spawn_name.clone(),
         created_at: *created_at,
+        skills: Vec::new(),
         claude_rewind: None,
     }
 }
@@ -1138,6 +1139,11 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 };
             }
         },
+        AgentEvent::SkillLoaded { dir, .. } => {
+            if !head.config.skills.contains(dir) {
+                head.config.skills.push(dir.clone());
+            }
+        }
         AgentEvent::TitleAttempted { .. } => head.title_attempted = true,
         AgentEvent::Titled { title, .. } => {
             head.title_attempted = true;

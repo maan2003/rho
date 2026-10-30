@@ -158,6 +158,39 @@ impl From<rho_agent_types::AgentPos> for AgentEventPos {
     }
 }
 
+/// A skill's directory, the one holding its `SKILL.md`, as the agent that
+/// loaded it names it: absolute, in that agent's view.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct SkillDir(camino::Utf8PathBuf);
+
+impl SkillDir {
+    pub fn new(dir: camino::Utf8PathBuf) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "a skill directory must be absolute: {dir}"
+        );
+        Ok(Self(dir))
+    }
+
+    pub fn as_path(&self) -> &camino::Utf8Path {
+        &self.0
+    }
+
+    /// The skill's text as it is on disk now.
+    pub fn read(&self) -> anyhow::Result<String> {
+        let file = self.0.join("SKILL.md");
+        std::fs::read_to_string(&file).map_err(|error| anyhow::anyhow!("read {file}: {error}"))
+    }
+
+    /// The skill as the model is shown it.
+    pub fn render(&self) -> String {
+        match self.read() {
+            Ok(text) => format!("<skill path=\"{}\">\n{}\n</skill>", self.0, text.trim_end()),
+            Err(error) => format!("<skill path=\"{}\" error=\"{error:#}\" />", self.0),
+        }
+    }
+}
+
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
 /// first and reaches the head through the fold.
@@ -173,6 +206,9 @@ pub struct AgentConfig {
     /// agent that has one, and it always beats a generated title.
     pub spawn_name: Option<String>,
     pub created_at: UnixMs,
+    /// The skills the agent loaded, each once, in the order loaded. They
+    /// are given back to the model after a compaction.
+    pub skills: Vec<SkillDir>,
     /// A message-only Claude rewind whose destination transcript has not yet
     /// been durably materialized and verified. The old runtime remains
     /// authoritative until then.
@@ -532,6 +568,11 @@ pub enum AgentEvent<'a> {
         created_at: rho_agent_types::UnixMs,
         /// The agent that spawned this one.
         parent: Option<AgentId>,
+    },
+    /// The model loaded a skill (`skills.load`) it had not loaded before.
+    SkillLoaded {
+        dir: SkillDir,
+        at: UnixMs,
     },
     RoleChanged {
         role: AgentRole,

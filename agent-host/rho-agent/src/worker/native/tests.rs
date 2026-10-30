@@ -135,6 +135,25 @@ fn told(request: &crate::inference::Request) -> String {
         .join("\n")
 }
 
+/// What a request tells the model that no earlier request did: the input
+/// after its last replayed step.
+fn told_new(request: &crate::inference::Request) -> String {
+    let items = request.items();
+    let start = items
+        .iter()
+        .rposition(|item| matches!(item, Item::Step { .. }))
+        .map_or(0, |last| last + 1);
+    items[start..]
+        .iter()
+        .filter_map(|item| match item {
+            Item::Report { text, .. } => Some(text.as_str()),
+            Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn requests(script: &Scripted, count: usize) -> Vec<crate::inference::Request> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -1272,4 +1291,58 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
         .until("the task to finish", |_| handle.status().settled())
         .await;
     handle.retire().await.unwrap();
+}
+
+/// A loaded skill is shown when loaded, shown again as it reads then after
+/// a compaction, and not repeated on requests in between or after.
+#[tokio::test]
+async fn a_loaded_skill_comes_back_after_a_compaction() {
+    let harness = Harness::new().await;
+    let skill = harness.cwd.join("review");
+    std::fs::create_dir(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\n---\nVerdict v1.\n",
+    )
+    .unwrap();
+    let script = Arc::new(Scripted::new());
+    script
+        // The skill changes on disk right after it is loaded.
+        .then(&format!(
+            "skills.load({:?})\nopen({:?}, 'w').write('---\\nname: review\\n---\\nVerdict v2.\\n')",
+            skill.join("SKILL.md").as_str(),
+            skill.join("SKILL.md").as_str(),
+        ))
+        .then_compaction()
+        .then("end_turn()")
+        .then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "hi").await;
+    let loaded = requests(&script, 2).await;
+    let shown = told_new(&loaded[1]);
+    assert!(shown.contains("Verdict v1."), "{shown}");
+    assert!(!shown.contains("Your loaded skills"), "{shown}");
+    assert_eq!(
+        harness.db.read().get_agent(harness.agent).config.skills,
+        [crate::log::SkillDir::new(skill.clone()).unwrap()],
+    );
+
+    say(&handle, "after").await;
+    let compacted = requests(&script, 3).await;
+    let after = told_new(&compacted[2]);
+    assert!(after.contains("after"), "{after}");
+    assert!(after.contains("Your loaded skills"), "{after}");
+    assert!(after.contains("Verdict v2."), "{after}");
+    assert!(!after.contains("Verdict v1."), "{after}");
+    harness
+        .until("the turn to end", |_| {
+            handle.status().runtime.awaiting_human
+        })
+        .await;
+
+    say(&handle, "again").await;
+    let all = requests(&script, 4).await;
+    let later = told_new(&all[3]);
+    assert!(later.contains("again"), "{later}");
+    assert!(!later.contains("Your loaded skills"), "{later}");
 }

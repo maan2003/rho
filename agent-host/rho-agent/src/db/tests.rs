@@ -1435,3 +1435,48 @@ fn terra_binding_keeps_the_live_worker_protocol_and_saved_rows() {
         AgentUsageModel::TERRA
     );
 }
+
+/// A skill is kept once, in load order, by the agent that loaded it only.
+#[tokio::test]
+async fn loaded_skills_are_kept_once_in_load_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let create = |write: &mut rho_db::WriteTxn, origin| {
+        let id = write.alloc_agent_id();
+        write.create_agent(
+            UnixMs(1),
+            id,
+            None,
+            test_workspace(),
+            AgentRole::default(),
+            SessionBinding::ResponsesSol(InferenceProfile::default()),
+            AgentRuntime::Rho {
+                prompt_cache_key: PromptCacheKey::generate(),
+            },
+            origin,
+        );
+        id
+    };
+    let skill = |name: &str| crate::log::SkillDir::new(format!("/skills/{name}").into()).unwrap();
+    let parent = create(&mut write, crate::log::AgentOrigin::User);
+    for name in ["roboman", "review", "roboman"] {
+        write.append_agent_event(
+            parent,
+            &AgentEvent::SkillLoaded {
+                dir: skill(name),
+                at: UnixMs(2),
+            },
+        );
+    }
+    let child = create(&mut write, crate::log::AgentOrigin::Child { parent });
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.get_agent(parent).config.skills,
+        [skill("roboman"), skill("review")]
+    );
+    assert!(read.get_agent(child).config.skills.is_empty());
+}

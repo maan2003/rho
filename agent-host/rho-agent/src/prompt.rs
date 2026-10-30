@@ -295,7 +295,7 @@ fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> 
         ));
     }
     let mut out = String::from(
-        "## Skills\n\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a path. Short paths can be expanded into absolute paths using the skill roots table.\n\n",
+        "## Skills\n\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a path. Short paths can be expanded into absolute paths using the skill roots table.\n\nTo use a skill, call `skills.load(path)` with its directory or its `SKILL.md`, not a plain file read. It shows you the skill, and shows it to you again after each compaction.\n\n",
     );
     if !roots.is_empty() {
         out.push_str("### Skill roots\n\n");
@@ -371,6 +371,7 @@ mod tests {
             concat!(
                 "## Skills\n\n",
                 "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a path. Short paths can be expanded into absolute paths using the skill roots table.\n\n",
+                "To use a skill, call `skills.load(path)` with its directory or its `SKILL.md`, not a plain file read. It shows you the skill, and shows it to you again after each compaction.\n\n",
                 "### Skill roots\n\n",
                 "- `r0` = `/repo/.agents/skills`\n",
                 "- `r1` = `/opt/shared/skills`\n\n",

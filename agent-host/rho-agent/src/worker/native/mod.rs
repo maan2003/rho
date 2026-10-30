@@ -357,6 +357,11 @@ pub(crate) struct Agent {
     stopped: Option<Stopped>,
     cache_key: CacheKey,
     compaction: crate::entry::CompactionState,
+    /// The skills the model loaded, oldest first.
+    skills: Vec<crate::log::SkillDir>,
+    /// The context lacks the skills: it was compacted since the last
+    /// request. The next request carries them.
+    skills_owed: bool,
 }
 
 impl Agent {
@@ -375,6 +380,10 @@ impl Agent {
         let (session, model_name) = inference_session(&inference, head.config.binding)?;
         let (boundary, recovery, entries) = host.native_history(None).await?;
         let context = context::Context::restore(&entries);
+        let skills = head.config.skills.clone();
+        // History starts at the agent's birth, before any skill, or at its
+        // latest compaction, which took them out.
+        let skills_owed = entries.iter().fold(true, skills_owed_after);
         let (mailroom, outbox) = Mailroom::new();
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let head = Arc::new(RwLock::new(head));
@@ -423,6 +432,8 @@ impl Agent {
             stopped: None,
             cache_key: cache_key(prompt_cache_key),
             compaction: recovery.compaction,
+            skills,
+            skills_owed,
         };
         agent.resume(&entries, recovery.woken);
         agent.publish().await?;
@@ -757,6 +768,7 @@ impl Agent {
         if matches!(entry, Entry::Step { .. }) {
             self.continuation = None;
         }
+        self.skills_owed = skills_owed_after(self.skills_owed, &entry);
         self.compaction.observe(&entry);
         Ok(())
     }
@@ -852,6 +864,16 @@ impl Agent {
             Outbound::EndTurn => {
                 self.progress.ended = true;
                 self.awaiting = true;
+                Ok(())
+            }
+            Outbound::LoadSkill(dir) => {
+                if self.skills.contains(&dir) {
+                    return Ok(());
+                }
+                self.skills.push(dir.clone());
+                self.writer
+                    .append(vec![AgentEvent::SkillLoaded { dir, at }])
+                    .await?;
                 Ok(())
             }
         }
@@ -984,6 +1006,14 @@ impl Agent {
         let messages = std::mem::take(&mut self.unread);
         report.messages = messages.into_iter().map(|(id, _, _)| id).collect();
         let manual_only = why == Wake::Compaction && report.is_empty();
+        if self.skills_owed && !self.skills.is_empty() {
+            report.notices.push(RequestNotice::Skills(
+                self.skills
+                    .iter()
+                    .map(crate::log::SkillDir::render)
+                    .collect(),
+            ));
+        }
         if report.is_empty() && !manual_only {
             report.notices.push(if why == Wake::Checkin {
                 RequestNotice::Checkin
@@ -1456,6 +1486,17 @@ fn blocks(content: Vec<ContentPart>) -> Vec<Block> {
             ContentPart::Image { media_type, data } => Block::Image(Image { media_type, data }),
         })
         .collect()
+}
+
+/// Whether the context still lacks the agent's skills after `entry`: a
+/// request carries them when it is owed them, and a compaction takes them
+/// out again.
+fn skills_owed_after(owed: bool, entry: &Entry) -> bool {
+    match entry {
+        Entry::Step { carry, .. } if carry.has_compaction() => true,
+        Entry::RequestSent { .. } => false,
+        _ => owed,
+    }
 }
 
 fn until(at: UnixMs) -> Duration {
