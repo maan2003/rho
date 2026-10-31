@@ -106,6 +106,11 @@ pub enum NodeIdentity {
         host: u64,
         path: String,
     },
+    /// A mail thread: the agent it is with, and the mail that started it.
+    Mail {
+        agent: String,
+        thread: u64,
+    },
 }
 
 impl From<rho_dealer::NodeId> for NodeIdentity {
@@ -127,6 +132,10 @@ impl From<rho_dealer::NodeId> for NodeIdentity {
                 thread: unit.thread,
             },
             NodeId::PullRequest { repo, number } => Self::PullRequest { repo, number },
+            NodeId::Mail(thread) => Self::Mail {
+                agent: thread.agent.encoded(),
+                thread: thread.thread.0.0,
+            },
         }
     }
 }
@@ -174,8 +183,11 @@ pub struct DealerCardIdentity {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DealerCardKind {
     Note,
+    /// An agent card, which no build deals any more; kept so old journals
+    /// read back.
     Agent,
     Thread,
+    Mail,
 }
 
 #[derive(
@@ -705,8 +717,8 @@ pub enum Event {
         title: String,
         last_user_message_at: u64,
         last_sent_at: Option<u64>,
-        /// The strongest kind the agent put to the user since they last
-        /// wrote: `ask`, `stopped`, `result` or `other`.
+        /// The strongest kind the agent's threads want of the user: `ask`
+        /// or `result`.
         unread: Option<String>,
     },
     /// A menu item run, by its key or by a tap.

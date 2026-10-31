@@ -29,7 +29,7 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
-use rho_agent_types::{AgentId, ContentPart};
+use rho_agent_types::{AgentId, ContentPart, ThreadId};
 use rho_agents_client::create::{Creation, Placement, StartBase, Workdir, parse_start};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
@@ -43,6 +43,7 @@ use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RuntimeCycle, RuntimeCycleGroup,
     TranscriptFrame, TranscriptView,
 };
+use rho_dealer::MailThread;
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -79,7 +80,8 @@ use crate::{
     SlackEditMessage, SlackFindFile, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
     SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch,
     SlackSearchNextPage, SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose,
-    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
+    TaskBoard, ThreadActivity, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
+    VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -238,16 +240,17 @@ pub struct Workspace {
     transcripts: rho_agents_view::Transcripts,
     /// What the user wrote that no host has taken yet.
     outbox: rho_agents_client::outbox::Outbox,
-    /// What the user is writing to each agent, kept on disk as it is
-    /// typed: a restart or an evicted view puts it back.
-    drafts: HashMap<AgentId, String>,
+    /// What the user is writing in each mail thread, kept on disk as it
+    /// is typed: a restart or a dropped view puts it back.
+    drafts: HashMap<MailThread, String>,
     /// Pairing links that came while the user was naming another link's host:
     /// each is asked about once that prompt closes.
     waiting_links: std::collections::VecDeque<String>,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
-    models: HashMap<AgentId, Entity<AgentModel>>,
+    /// The open mail threads' views, each over the thread's mails.
+    threads: HashMap<MailThread, Entity<AgentModel>>,
     activity_models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by host-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
@@ -278,6 +281,12 @@ pub struct Workspace {
     awaiting_draft_agent: Option<HostId>,
     /// The agent a draft became, answered before the directory showed it.
     draft_became: Option<(HostId, AgentId)>,
+    /// The agent a draft became, until the thread its message started is
+    /// heard and opened.
+    first_thread_of: Option<AgentId>,
+    /// The client id of a new mail the user wrote, whose thread opens when
+    /// its host takes it.
+    new_thread_post: Option<u64>,
     /// The host chosen in the draft (ctrl-tab in the Workdir field), until
     /// the draft becomes an agent.
     draft_host: Option<HostId>,
@@ -438,109 +447,194 @@ pub struct Workspace {
 const LINK_NAME_PROMPT: &str = "name host ";
 
 impl Workspace {
-    fn ensure_agent_model(
+    /// A view over a transcript: an agent's activity, or `thread`'s mails.
+    fn new_agent_model(
         &mut self,
         agent_id: AgentId,
-        view: TranscriptView,
+        thread: Option<MailThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AgentModel> {
+        let view = match thread {
+            Some(_) => TranscriptView::Conversation,
+            None => TranscriptView::Activity,
+        };
+        let completions = crate::commands::WorkspaceCompletionProvider::new(
+            cx.entity().downgrade(),
+            None,
+            None,
+            None,
+        );
+        let visualization_client = self
+            .agents_for(agent_id)
+            .unwrap_or_else(AgentsLink::detached);
+        let model = cx.new(|cx| AgentModel::with_view(view, completions, visualization_client, cx));
+        self.agent_model_subscriptions.push(cx.subscribe_in(
+            &model,
+            window,
+            move |workspace, loaded_model, event, window, cx| {
+                match event {
+                    rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                        match thread {
+                            Some(thread)
+                                if workspace.threads.get(&thread) == Some(loaded_model) =>
+                            {
+                                workspace.sync_thread_model(thread, FrameSummary::nothing(), cx);
+                                cx.notify();
+                            }
+                            None if workspace.activity_models.get(agent_id)
+                                == Some(loaded_model) =>
+                            {
+                                workspace.finish_activity_load(*agent_id, cx);
+                                workspace.ensure_duration_timer(cx);
+                                cx.notify();
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Kept even from a view no longer held: the words are the
+                    // user's.
+                    rho_agents_view::agent_view::AgentModelEvent::DraftEdited(_) => {
+                        if let Some(thread) = thread {
+                            workspace.draft_edited(thread, loaded_model, cx);
+                        }
+                    }
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                        if workspace
+                            .active_transcript()
+                            .is_some_and(|(model, _)| model == *loaded_model)
+                        {
+                            workspace.finish_transcript_search(*agent_id, window, cx);
+                        }
+                    }
+                }
+            },
+        ));
+        model
+    }
+
+    fn ensure_activity_model(
+        &mut self,
+        agent_id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<AgentModel>, bool) {
-        let existing = match view {
-            TranscriptView::Conversation => self.models.get(&agent_id),
-            TranscriptView::Activity => self.activity_models.get(&agent_id),
-        };
-        let model = if let Some(model) = existing.cloned() {
-            model
-        } else {
-            let completions = crate::commands::WorkspaceCompletionProvider::new(
-                cx.entity().downgrade(),
-                None,
-                None,
-                None,
-            );
-            let visualization_client = self
-                .agents_for(agent_id)
-                .unwrap_or_else(AgentsLink::detached);
-            let model =
-                cx.new(|cx| AgentModel::with_view(view, completions, visualization_client, cx));
-            // The screen says when its transcript is composed; what that
-            // means for the rest of the shell is decided here.
-            self.agent_model_subscriptions.push(cx.subscribe_in(
-                &model,
-                window,
-                |workspace, loaded_model, event, window, cx| {
-                    match event {
-                        rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
-                            let view = loaded_model.read(cx).view();
-                            let current = match view {
-                                TranscriptView::Conversation => workspace.models.get(agent_id),
-                                TranscriptView::Activity => workspace.activity_models.get(agent_id),
-                            };
-                            if current == Some(loaded_model) {
-                                workspace.finish_initial_agent_load(*agent_id, view, cx);
-                            }
-                        }
-                        rho_agents_view::agent_view::AgentModelEvent::DraftEdited(agent_id) => {
-                            workspace.draft_edited(*agent_id, loaded_model, cx);
-                        }
-                        rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
-                            if workspace
-                                .active_transcript()
-                                .is_some_and(|(model, _)| model == *loaded_model)
-                            {
-                                workspace.finish_transcript_search(*agent_id, window, cx);
-                            }
-                        }
-                    }
-                },
-            ));
-            if view == TranscriptView::Conversation {
-                self.refresh_view_status(&agent_id, &model, cx);
-                if let Some(text) = self.drafts.get(&agent_id) {
-                    model.update(cx, |model, cx| model.set_prompt_text(text, cx));
-                }
-                self.models.insert(agent_id, model.clone());
-            } else {
+        let model = match self.activity_models.get(&agent_id).cloned() {
+            Some(model) => model,
+            None => {
+                let model = self.new_agent_model(agent_id, None, window, cx);
                 self.activity_models.insert(agent_id, model.clone());
+                model
             }
-            model
         };
         let started = self.start_initial_agent_load(agent_id, &model, cx);
-        if view == TranscriptView::Conversation {
-            model.update(cx, |model, cx| {
-                model.preview_editor(window, cx);
-            });
-        }
         (model, started)
     }
 
-    pub(crate) fn finish_initial_agent_load(
+    /// The view of one mail thread, made and loaded from the thread's
+    /// mails if it is not open yet.
+    fn ensure_thread_model(
         &mut self,
-        agent_id: AgentId,
-        view: TranscriptView,
+        thread: MailThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AgentModel> {
+        if let Some(model) = self.threads.get(&thread) {
+            return model.clone();
+        }
+        let model = self.new_agent_model(thread.agent, Some(thread), window, cx);
+        if let Some(text) = self.drafts.get(&thread) {
+            model.update(cx, |model, cx| model.set_prompt_text(text, cx));
+        }
+        self.threads.insert(thread, model.clone());
+        // A thread held with no view is one a test seeded; every other is
+        // read from its mails.
+        if self
+            .transcripts
+            .thread(thread.agent, thread.thread)
+            .is_none()
+        {
+            self.refresh_thread_state(thread);
+        }
+        if let Some(state) = self
+            .transcripts
+            .thread(thread.agent, thread.thread)
+            .cloned()
+        {
+            let labels = self
+                .registry
+                .known_agents()
+                .copied()
+                .map(|id| (id, self.registry.agent_display_label(id)))
+                .collect();
+            model.update(cx, |model, cx| {
+                model.start_initial_load(thread.agent, state, labels, now_ms(), cx)
+            });
+        }
+        model
+    }
+
+    /// Builds a thread's state again from its mails and what waits to be
+    /// sent in it, and answers what moved.
+    fn refresh_thread_state(&mut self, thread: MailThread) -> FrameSummary {
+        let mails = self.agents_client.read_mail(thread.agent);
+        let unsent = self.outbox.texts(thread.agent, thread.thread);
+        let state =
+            rho_agents_client::fold::thread_state(thread.agent, thread.thread, &mails, &unsent);
+        self.transcripts
+            .set_thread(thread.agent, thread.thread, state)
+    }
+
+    fn sync_thread_model(
+        &mut self,
+        thread: MailThread,
+        summary: FrameSummary,
         cx: &mut Context<Self>,
     ) {
-        self.finish_agent_load(agent_id, view, cx);
-        if view == TranscriptView::Conversation
-            && let Some(model) = self.models.get(&agent_id).cloned()
-        {
-            self.refresh_view_status(&agent_id, &model, cx);
+        let (Some(model), Some(state)) = (
+            self.threads.get(&thread).cloned(),
+            self.transcripts.thread(thread.agent, thread.thread),
+        ) else {
+            return;
+        };
+        model.update(cx, |model, cx| {
+            model.sync(
+                state,
+                summary,
+                now_ms(),
+                &|id| self.registry.agent_display_label(id),
+                cx,
+            )
+        });
+    }
+
+    /// Shows what moved in an agent's open threads: a mail heard, or one
+    /// written, sent, or taken.
+    fn refresh_threads(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let open: Vec<MailThread> = self
+            .threads
+            .keys()
+            .filter(|thread| thread.agent == agent_id)
+            .copied()
+            .collect();
+        for thread in open {
+            let summary = self.refresh_thread_state(thread);
+            self.sync_thread_model(thread, summary, cx);
         }
-        if view == TranscriptView::Activity {
-            self.ensure_duration_timer(cx);
+    }
+
+    /// Lets go of an agent's thread views and their state.
+    fn forget_threads(&mut self, agent_id: AgentId) {
+        self.threads.retain(|thread, _| thread.agent != agent_id);
+        for thread in self.transcripts.agent_threads(agent_id) {
+            self.transcripts.forget_thread(agent_id, thread);
         }
-        cx.notify();
     }
 
     /// What the model holds for a host is now all there is of it: the disk
     /// copy read at startup, or nothing after the copy started over.
     /// Whatever this client had of the host goes first.
-    fn loaded(
-        &mut self,
-        host: HostId,
-        agents: Vec<rho_agents_client::MirroredAgent>,
-        verdicts: Vec<(AgentId, rho_agents_client::Verdict)>,
-    ) {
+    fn loaded(&mut self, host: HostId, agents: Vec<rho_agents_client::MirroredAgent>) {
         for agent_id in self.registry.host_agents(host) {
             self.transcripts.forget(agent_id);
             self.active.remove(agent_id);
@@ -549,9 +643,6 @@ impl Workspace {
         self.selection
             .forget(|agent_id| departed.contains(&agent_id));
         self.registry.restore(agents);
-        for (agent_id, verdict) in verdicts {
-            self.registry.set_agent_verdict(agent_id, verdict);
-        }
         self.note_followed();
     }
 
@@ -563,31 +654,41 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shown = matches!(
-            self.active_surface().key,
-            SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if agents.contains(&id)
-        );
+        let gone = |key: &SurfaceKey| {
+            key.transcript_agent()
+                .is_some_and(|id| agents.contains(&id))
+        };
+        let shown = gone(&self.active_surface().key);
+        let keys: HashSet<SurfaceKey> = self
+            .surfaces
+            .values()
+            .flatten()
+            .map(|surface| surface.key.clone())
+            .chain(
+                self.threads
+                    .keys()
+                    .map(|thread| SurfaceKey::Thread(*thread)),
+            )
+            .chain(
+                agents
+                    .iter()
+                    .map(|agent_id| SurfaceKey::Activity(*agent_id)),
+            )
+            .filter(gone)
+            .collect();
+        for key in &keys {
+            self.forget_surface(key);
+            self.phone.remove_key(key);
+        }
         for agent_id in &agents {
-            if let Some(model) = self.models.get(agent_id).cloned() {
-                self.draft_edited(*agent_id, &model, cx);
-            }
-            self.forget_surface(&SurfaceKey::Transcript(*agent_id));
-            self.forget_surface(&SurfaceKey::Activity(*agent_id));
-            self.phone.remove_key(&SurfaceKey::Transcript(*agent_id));
-            self.phone.remove_key(&SurfaceKey::Activity(*agent_id));
             self.active.remove(*agent_id);
-            self.transcripts.erase(*agent_id);
-            self.models.remove(agent_id);
+            self.transcripts.forget(*agent_id);
+            self.forget_threads(*agent_id);
             self.activity_models.remove(agent_id);
         }
-        self.surfaces.values_mut().for_each(|surfaces| {
-            surfaces.retain(|surface| {
-                !matches!(
-                    surface.key,
-                    SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if agents.contains(&id)
-                )
-            });
-        });
+        self.surfaces
+            .values_mut()
+            .for_each(|surfaces| surfaces.retain(|surface| !gone(&surface.key)));
         self.registry.forget_agents(&agents);
         self.selection.forget(|id| agents.contains(&id));
         self.forget_contexts(
@@ -676,20 +777,17 @@ impl Workspace {
         self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
     }
 
+    /// Lands a frame on an agent's transcript; answers what moved and
+    /// whether it made the agent live.
     fn apply_frame_state(
         &mut self,
         agent_id: AgentId,
         frame: TranscriptFrame,
-    ) -> Option<(FrameSummary, Option<u64>, bool, bool)> {
+    ) -> (FrameSummary, bool) {
         let change = self.transcripts.apply(agent_id, frame);
         // Liveness is the map's fact about an agent, not the transcript's.
         let live_changed = change.was_live && self.registry.mark_live(agent_id);
-        Some((
-            change.summary,
-            change.context_before,
-            change.usage_changed,
-            live_changed,
-        ))
+        (change.summary, live_changed)
     }
 
     fn start_initial_agent_load(
@@ -741,31 +839,12 @@ impl Workspace {
         }
     }
 
-    fn finish_agent_load(
-        &mut self,
-        agent_id: AgentId,
-        view: TranscriptView,
-        cx: &mut Context<Self>,
-    ) {
-        let models = match view {
-            TranscriptView::Conversation => &self.models,
-            TranscriptView::Activity => &self.activity_models,
-        };
-        let Some(model) = models.get(&agent_id).cloned() else {
+    /// Shows what moved while an agent's activity loaded.
+    fn finish_activity_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(model) = self.activity_models.get(&agent_id).cloned() else {
             return;
         };
-        // What moved while it loaded.
-        if let Some(state) = self.transcripts.state(&agent_id) {
-            model.update(cx, |model, cx| {
-                model.sync(
-                    state,
-                    FrameSummary::nothing(),
-                    now_ms(),
-                    &|id| self.registry.agent_display_label(id),
-                    cx,
-                )
-            });
-        }
+        self.sync_agent_model(agent_id, &model, FrameSummary::nothing(), false, cx);
     }
 }
 
@@ -978,11 +1057,12 @@ impl Workspace {
             outbox: rho_agents_client::outbox::Outbox::load(),
             drafts: rho_agents_client::cache::read_drafts()
                 .into_iter()
+                .map(|(agent, thread, text)| (MailThread { agent, thread }, text))
                 .collect(),
             waiting_links: Default::default(),
             registry: AgentMap::default(),
             selection: Selection::default(),
-            models: HashMap::new(),
+            threads: HashMap::new(),
             activity_models: HashMap::new(),
             remote_projects: HashMap::new(),
             agents_client,
@@ -994,6 +1074,8 @@ impl Workspace {
             _save_notes_on_quit: save_notes_on_quit,
             awaiting_draft_agent: None,
             draft_became: None,
+            first_thread_of: None,
+            new_thread_post: None,
             draft_host: None,
             last_placed: rho_db::client::shared()
                 .and_then(|db| rho_agent_hosts::saved::load_last_placed(&db)),
@@ -1067,10 +1149,6 @@ impl Workspace {
             this.attach_host(spec, cx);
         }
         this.refresh_draft_host(cx);
-        // What the last session could not send shows where it waits.
-        for agent_id in this.outbox.agents() {
-            this.show_unsent(agent_id, cx);
-        }
         let agents: Vec<AgentId> = this.registry.known_agents().copied().collect();
         this.push_agent_marks(&agents);
         // A cold start lands on Home: what is running, what is next, and
@@ -1204,11 +1282,19 @@ impl Workspace {
             // The agent is gone with its agent host, so its transcript is a
             // place that no longer exists: one call, and no context can
             // land on it again.
-            self.forget_surface(&SurfaceKey::Transcript(agent_id));
+            let threads: Vec<MailThread> = self
+                .threads
+                .keys()
+                .filter(|thread| thread.agent == agent_id)
+                .copied()
+                .collect();
+            for thread in threads {
+                self.forget_surface(&SurfaceKey::Thread(thread));
+            }
             self.forget_surface(&SurfaceKey::Activity(agent_id));
             self.active.remove(agent_id);
             self.transcripts.forget(agent_id);
-            self.models.remove(&agent_id);
+            self.forget_threads(agent_id);
             self.activity_models.remove(&agent_id);
         }
         self.note_followed();
@@ -1369,7 +1455,7 @@ impl Workspace {
             context: warm.context,
             surface: surface.clone(),
         };
-        self.ensure_surface_subscription(&surface.key, cx);
+        self.ensure_surface_subscription(&surface.key);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         rho_journal::record(rho_journal::Event::SurfaceShown {
@@ -1404,10 +1490,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Surface {
-        if let SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) = surface.key
+        if let SurfaceKey::Activity(agent_id) = surface.key
             && !self.active.contains(agent_id)
         {
-            self.activate_agent(agent_id, cx);
+            self.activate_agent(agent_id);
             return self.make_surface(surface.key, window, cx);
         }
         surface
@@ -1504,13 +1590,14 @@ impl Workspace {
                 None => name,
             }
         };
-        let mut rows = crate::home::split_hand(&hand, |card| crate::home::card_title(card, name));
-        // An agent already shown as a card above is not listed again.
+        let mut rows = crate::home::split_hand(&hand, crate::home::card_title);
+        // An agent already shown with a thread as a card above is not
+        // listed again.
         let dealt = rows
             .next
             .iter()
             .filter_map(|row| match row.card {
-                rho_dealer::NodeId::Agent(agent_id) => Some(agent_id),
+                rho_dealer::NodeId::Mail(thread) => Some(thread.agent),
                 _ => None,
             })
             .collect::<std::collections::HashSet<_>>();
@@ -1905,12 +1992,12 @@ impl Workspace {
             rho_agents_client::model::ModelMsg::Deleted { agents } => {
                 self.deleted_agents(agents, window, cx);
             }
-            rho_agents_client::model::ModelMsg::Loaded { agents, verdicts } => {
-                self.loaded(host, agents, verdicts);
+            rho_agents_client::model::ModelMsg::Loaded { agents } => {
+                self.loaded(host, agents);
                 let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
                 self.push_agent_marks(&agents);
                 for agent_id in &agents {
-                    self.show_status(*agent_id, cx);
+                    self.refresh_threads(*agent_id, cx);
                 }
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
@@ -1933,11 +2020,14 @@ impl Workspace {
                         last_sent_at: digest.and_then(|digest| digest.last_sent_at).map(|at| at.0),
                         unread: digest
                             .and_then(|digest| {
-                                digest
-                                    .unread
-                                    .iter()
-                                    .map(|unread| unread.said)
-                                    .min_by_key(|said| said.strength())
+                                let wants = digest
+                                    .threads
+                                    .values()
+                                    .filter_map(|thread| thread.wants.map(|wanting| wanting.said));
+                                wants.reduce(|strongest, said| match said {
+                                    rho_agents_client::Said::Ask => said,
+                                    rho_agents_client::Said::Result => strongest,
+                                })
                             })
                             .map(|said| format!("{said:?}").to_lowercase()),
                     });
@@ -1946,7 +2036,7 @@ impl Workspace {
                 // already have a name.
                 self.push_agent_marks(&changed);
                 for agent_id in &changed {
-                    self.show_status(*agent_id, cx);
+                    self.refresh_threads(*agent_id, cx);
                 }
                 if let Some((host, agent_id)) = self.draft_became
                     && changed.contains(&agent_id)
@@ -1954,13 +2044,22 @@ impl Workspace {
                     self.draft_became = None;
                     self.draft_answered(host, Ok(agent_id), window, cx);
                 }
+                if let Some(agent_id) = self.first_thread_of
+                    && changed.contains(&agent_id)
+                    && let Some(thread) = self.newest_thread(agent_id)
+                {
+                    self.first_thread_of = None;
+                    self.open_thread(thread, window, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 // Status is workspace chrome, not part of the transcript
                 // editor.
-                if matches!(
-                    self.active_surface().key,
-                    SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if changed.contains(&id)
-                ) {
+                if self
+                    .active_surface()
+                    .key
+                    .transcript_agent()
+                    .is_some_and(|id| changed.contains(&id))
+                {
                     cx.notify();
                 }
             }
@@ -2013,11 +2112,11 @@ impl Workspace {
     fn handle_frame_batch(
         &mut self,
         frames: Vec<(AgentId, TranscriptFrame)>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut order = Vec::new();
-        let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>, bool)> = HashMap::new();
+        let mut changes: HashMap<AgentId, FrameSummary> = HashMap::new();
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
@@ -2030,21 +2129,14 @@ impl Workspace {
                 self.invalidate_dealer_signals(cx);
                 self.refresh_home(cx);
             }
-            let Some((summary, old_context, usage_changed, became_live)) =
-                self.apply_frame_state(agent_id, frame)
-            else {
-                continue;
-            };
+            let (summary, became_live) = self.apply_frame_state(agent_id, frame);
             live_changed |= became_live;
             changes
                 .entry(agent_id)
-                .and_modify(|(pending, _, refresh_usage)| {
-                    *pending = pending.merge(summary);
-                    *refresh_usage |= usage_changed;
-                })
+                .and_modify(|pending| *pending = pending.merge(summary))
                 .or_insert_with(|| {
                     order.push(agent_id);
-                    (summary, old_context, usage_changed)
+                    summary
                 });
         }
 
@@ -2052,28 +2144,9 @@ impl Workspace {
             self.refresh_draft_agent_targets(cx);
         }
 
-        for agent_id in &order {
-            let old_context = changes[agent_id].1;
-            let new_context = self.transcripts.context_used(agent_id);
-            if old_context != new_context
-                && let Some(view) = self.models.get(agent_id).cloned()
-            {
-                self.refresh_view_status(agent_id, &view, cx);
-            }
-            if changes[agent_id].2
-                && let Some(view) = self.models.get(agent_id).cloned()
-            {
-                self.refresh_view_status(agent_id, &view, cx);
-            }
-        }
-
         for agent_id in order {
-            let summary = changes[&agent_id].0;
-            let (view, started) =
-                self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx);
-            self.sync_agent_model(agent_id, &view, summary, started, cx);
             if let Some(activity) = self.activity_models.get(&agent_id).cloned() {
-                self.sync_agent_model(agent_id, &activity, summary, false, cx);
+                self.sync_agent_model(agent_id, &activity, changes[&agent_id], false, cx);
             }
         }
 
@@ -2109,8 +2182,7 @@ impl Workspace {
                 // The focus set is this client's to keep; an agent host that
                 // just came up is told it whole.
                 self.send_agent_focus_to(host);
-                self.send_unsent_to(host, cx);
-                self.update_statuses(cx);
+                self.send_unsent_to(host, window, cx);
                 cx.notify();
             }
             ConnEvent::Many(events) => {
@@ -2138,7 +2210,7 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
-                self.send_unsent_to(host, cx);
+                self.send_unsent_to(host, window, cx);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -2166,9 +2238,6 @@ impl Workspace {
                 for agent_id in self.registry.host_agents(host) {
                     if self.transcripts.state(&agent_id).is_some() {
                         let summary = self.transcripts.disconnect(agent_id);
-                        if let Some(view) = self.models.get(&agent_id).cloned() {
-                            self.sync_agent_model(agent_id, &view, summary, false, cx);
-                        }
                         if let Some(view) = self.activity_models.get(&agent_id).cloned() {
                             self.sync_agent_model(agent_id, &view, summary, false, cx);
                         }
@@ -2192,7 +2261,6 @@ impl Workspace {
                 if self.voice.is_on(host) {
                     self.voice.stop();
                 }
-                self.update_statuses(cx);
                 cx.notify();
             }
             ConnEvent::GitTransportApproval {
@@ -2308,18 +2376,30 @@ impl Workspace {
             self.slack_submit(cx);
             return;
         }
-        match self.selection.selected_agent() {
-            Some(agent_id) => {
-                let Some(view) = self.models.get(&agent_id).cloned() else {
-                    return;
-                };
-                let Some(content) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
-                    return;
-                };
-                self.handle_submit(agent_id, content, cx);
-            }
-            None => self.submit_draft(window, cx),
+        let surface = self.active_surface().clone();
+        match surface.key {
+            SurfaceKey::Thread(_) => self.submit_reply(&surface, window, cx),
+            SurfaceKey::Draft => self.submit_draft(window, cx),
+            _ => {}
         }
+    }
+
+    /// Mails what is written in a thread's reply box, in that thread.
+    pub(crate) fn submit_reply(
+        &mut self,
+        surface: &Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (SurfaceKey::Thread(thread), SurfaceView::Transcript { model, .. }) =
+            (&surface.key, &surface.view)
+        else {
+            return;
+        };
+        let Some(content) = model.update(cx, |view, cx| view.take_prompt(cx)) else {
+            return;
+        };
+        self.handle_submit(thread.agent, Some(thread.thread), content, window, cx);
     }
 
     fn shell_interrupt(&mut self, _: &ShellInterrupt, _: &mut Window, cx: &mut Context<Self>) {
@@ -2461,12 +2541,16 @@ impl Workspace {
         }
     }
 
+    /// Mails what the user wrote to an agent: a reply in `thread`, or the
+    /// first mail of a new thread. Answers the client id it is kept under.
     fn handle_submit(
         &mut self,
         agent_id: AgentId,
+        thread: Option<ThreadId>,
         content: Vec<ContentPart>,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         rho_journal::record(rho_journal::Event::AgentMessageSent {
             agent: agent_id.encoded(),
             text: content
@@ -2484,22 +2568,23 @@ impl Workspace {
         });
         // Kept before it is sent: a host that is down, or goes before it
         // answers, gets it again when it is back.
-        self.outbox.push(agent_id, content);
-        self.show_unsent(agent_id, cx);
-        self.send_unsent(agent_id, cx);
+        let id = self.outbox.push(agent_id, thread, content);
+        self.refresh_threads(agent_id, cx);
+        self.send_unsent(agent_id, window, cx);
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
         self.invalidate_dealer_signals(cx);
         cx.notify();
+        id
     }
 
     /// Sends each unsent message for a host's agents that just became
     /// reachable.
-    fn send_unsent_to(&mut self, host: HostId, cx: &mut Context<Self>) {
+    fn send_unsent_to(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
         for agent_id in self.outbox.agents() {
             if self.host_of(agent_id) == Some(host) {
-                self.send_unsent(agent_id, cx);
+                self.send_unsent(agent_id, window, cx);
             }
         }
     }
@@ -2508,7 +2593,7 @@ impl Workspace {
     /// the host is up and no mail of the agent's is already on its way. The
     /// rest goes one by one as each is answered; a retry carries the same
     /// client id, so the host keeps one copy.
-    fn send_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+    fn send_unsent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self
             .host_of(agent_id)
             .filter(|host| self.hosts.is_online(*host))
@@ -2522,13 +2607,28 @@ impl Workspace {
             return;
         };
         let reply = agents.call(command);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let reply = reply.await;
-            this.update(cx, |this, cx| match reply {
-                Ok(_mail) => {
-                    this.outbox.delivered(agent_id);
-                    this.show_unsent(agent_id, cx);
-                    this.send_unsent(agent_id, cx);
+            this.update_in(cx, |this, window, cx| match reply {
+                Ok(mail) => {
+                    let delivered = this.outbox.delivered(agent_id);
+                    this.refresh_threads(agent_id, cx);
+                    // A new mail of the user's starts the thread it is
+                    // the first of, which is where they go next.
+                    if let Some((id, _)) = delivered
+                        && this.new_thread_post == Some(id)
+                    {
+                        this.new_thread_post = None;
+                        this.open_thread(
+                            MailThread {
+                                agent: agent_id,
+                                thread: ThreadId(mail),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    this.send_unsent(agent_id, window, cx);
                 }
                 Err(error) => {
                     this.outbox.failed(agent_id);
@@ -2540,41 +2640,19 @@ impl Workspace {
         .detach();
     }
 
-    /// Keeps what the user is writing to an agent. Every edit goes to the
+    /// Keeps what the user is writing in a thread. Every edit goes to the
     /// writer thread, which folds a burst of them into one commit.
-    fn draft_edited(&mut self, agent_id: AgentId, model: &Entity<AgentModel>, cx: &App) {
+    fn draft_edited(&mut self, thread: MailThread, model: &Entity<AgentModel>, cx: &App) {
         let text = model.read(cx).prompt_text(cx);
-        if self.drafts.get(&agent_id).map_or("", String::as_str) == text {
+        if self.drafts.get(&thread).map_or("", String::as_str) == text {
             return;
         }
         if text.is_empty() {
-            self.drafts.remove(&agent_id);
+            self.drafts.remove(&thread);
         } else {
-            self.drafts.insert(agent_id, text.clone());
+            self.drafts.insert(thread, text.clone());
         }
-        rho_agents_client::cache::write_draft(agent_id, text);
-    }
-
-    fn show_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let texts = self.outbox.texts(agent_id);
-        self.show(agent_id, TranscriptFrame::Unsent(texts), cx);
-    }
-
-    /// The agent's status line, at the end of its transcript.
-    fn show_status(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let text = self.registry.agent_status(agent_id).map(str::to_owned);
-        self.show(agent_id, TranscriptFrame::Status(text), cx);
-    }
-
-    /// Lands a frame the client makes itself on the agent's open views.
-    fn show(&mut self, agent_id: AgentId, frame: TranscriptFrame, cx: &mut Context<Self>) {
-        let summary = self.transcripts.apply(agent_id, frame).summary;
-        if let Some(view) = self.models.get(&agent_id).cloned() {
-            self.sync_agent_model(agent_id, &view, summary, false, cx);
-        }
-        if let Some(view) = self.activity_models.get(&agent_id).cloned() {
-            self.sync_agent_model(agent_id, &view, summary, false, cx);
-        }
+        rho_agents_client::cache::write_draft(thread.agent, thread.thread, text);
     }
 
     /// What the map says about the label in the start field. The map is
@@ -2742,7 +2820,7 @@ impl Workspace {
             self.write_marks(writes, cx);
         }
         if awaited {
-            self.activate_agent(agent_id, cx);
+            self.activate_agent(agent_id);
             // The draft became this agent: reset the compose surface and
             // follow the new agent.
             let label = self.draft_default_label();
@@ -2755,7 +2833,12 @@ impl Workspace {
                 view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
                 view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
             });
+            // The draft's message starts the agent's first thread, which is
+            // where the user goes; until it is heard, the agent's activity.
             self.select_agent(Some(agent_id), window, cx);
+            if self.newest_thread(agent_id).is_none() {
+                self.first_thread_of = Some(agent_id);
+            }
         }
         self.invalidate_dealer_signals(cx);
         cx.notify();
@@ -2771,7 +2854,7 @@ impl Workspace {
         };
         let pane_prompt = matches!(
             self.active_surface().key,
-            SurfaceKey::Draft | SurfaceKey::Transcript(_) | SurfaceKey::SlackConversation(_)
+            SurfaceKey::Draft | SurfaceKey::Thread(_) | SurfaceKey::SlackConversation(_)
         );
         let images = item
             .entries
@@ -2817,7 +2900,7 @@ impl Workspace {
                     true
                 }
                 SurfaceView::Transcript { model, .. }
-                    if matches!(self.active_surface().key, SurfaceKey::Transcript(_)) =>
+                    if matches!(self.active_surface().key, SurfaceKey::Thread(_)) =>
                 {
                     model.update(cx, |model, cx| {
                         model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
@@ -2840,7 +2923,7 @@ impl Workspace {
                 .draft_model
                 .update(cx, |model, cx| model.clear_attachments(cx)),
             SurfaceView::Transcript { model, .. }
-                if matches!(self.active_surface().key, SurfaceKey::Transcript(_)) =>
+                if matches!(self.active_surface().key, SurfaceKey::Thread(_)) =>
             {
                 model.update(cx, |model, cx| model.clear_attachments(cx))
             }
@@ -3879,21 +3962,19 @@ impl Workspace {
     /// Holds an agent whole from here on: its transcript is being looked
     /// at, or about to be. Whoever this pushes past the bound is let go,
     /// unless they are on screen.
-    fn activate_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+    fn activate_agent(&mut self, agent_id: AgentId) {
         let joined = self.active.touch(agent_id);
         let shown = match self
             .history
             .as_ref()
             .map(|history| &history.current().surface.key)
         {
-            Some(SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id)) => {
-                HashSet::from([*agent_id])
-            }
+            Some(SurfaceKey::Activity(agent_id)) => HashSet::from([*agent_id]),
             _ => HashSet::new(),
         };
         let evicted = self.active.evict(|agent_id| shown.contains(&agent_id));
         for agent_id in &evicted {
-            self.release_agent(*agent_id, cx);
+            self.release_agent(*agent_id);
         }
         if joined || !evicted.is_empty() {
             self.send_agent_focus();
@@ -3921,64 +4002,127 @@ impl Workspace {
     /// Lets go of everything held for an agent that left the active set:
     /// its events, its transcript, its live tail, and the view unless a
     /// pane still shows it. The digest stays; the rails read that.
-    fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+    fn release_agent(&mut self, agent_id: AgentId) {
         self.transcripts.forget(agent_id);
         self.note_followed();
         self.registry.mark_not_live(agent_id);
-        if let Some(model) = self.models.get(&agent_id).cloned() {
-            model.update(cx, |model, _| model.clear_preview_editor());
-        }
 
         // Not a death: an evicted agent still exists, and a transcript of
         // it that is still in someone's history is rebuilt on the way back
         // (`warm_surface`). What leaves history is what has gone, not what
         // has been let go of.
-        let shown = self.history.as_ref().is_some_and(|history| {
-            matches!(history.current().surface.key, SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if id == agent_id)
-        });
+        let shown = self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.current().surface.key == SurfaceKey::Activity(agent_id));
         if shown {
             return;
         }
 
         for surfaces in self.surfaces.values_mut() {
-            surfaces.retain(|surface| !matches!(surface.key, SurfaceKey::Transcript(id) | SurfaceKey::Activity(id) if id == agent_id));
+            surfaces.retain(|surface| surface.key != SurfaceKey::Activity(agent_id));
         }
-        self.phone.remove_key(&SurfaceKey::Transcript(agent_id));
         self.phone.remove_key(&SurfaceKey::Activity(agent_id));
-        self.models.remove(&agent_id);
         self.activity_models.remove(&agent_id);
     }
 
-    /// Switch between sibling transcript buffers without replacing the other
-    /// buffer's editor, cursor, or unsent conversation draft.
-    pub(crate) fn open_agent_view(
-        &mut self,
-        view: TranscriptView,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// The selected agent's activity: its tool calls and their output.
+    pub(crate) fn open_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.selection.selected_agent() else {
             self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
             return;
         };
-        self.activate_agent(agent_id, cx);
+        self.activate_agent(agent_id);
         self.active_context = self.context_for_agent(agent_id);
-        let key = match view {
-            TranscriptView::Conversation => SurfaceKey::Transcript(agent_id),
-            TranscriptView::Activity => SurfaceKey::Activity(agent_id),
-        };
-        let surface = self.make_surface(key, window, cx);
+        let surface = self.make_surface(SurfaceKey::Activity(agent_id), window, cx);
         self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         self.ensure_duration_timer(cx);
         cx.notify();
     }
 
+    /// Opens one mail thread, in its agent's context.
+    pub(crate) fn open_thread(
+        &mut self,
+        thread: MailThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection.select_agent(thread.agent);
+        self.active_context = self.context_for_agent(thread.agent);
+        let surface = self.make_surface(SurfaceKey::Thread(thread), window, cx);
+        self.display_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// The thread between the user and an agent that moved last.
+    fn newest_thread(&self, agent_id: AgentId) -> Option<MailThread> {
+        let digest = self.registry.agent_digest(agent_id)?;
+        digest
+            .threads
+            .iter()
+            .max_by_key(|(_, thread)| thread.newest)
+            .map(|(thread, _)| MailThread {
+                agent: agent_id,
+                thread: *thread,
+            })
+    }
+
+    /// A thread's title: the first line of its first mail.
+    fn thread_title(&self, thread: MailThread) -> String {
+        self.registry
+            .agent_digest(thread.agent)
+            .and_then(|digest| digest.threads.get(&thread.thread))
+            .map(|digest| digest.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where opening an agent lands: its newest thread with the user, or
+    /// its activity when there is none.
+    fn agent_surface_key(&self, agent_id: AgentId) -> SurfaceKey {
+        self.newest_thread(agent_id)
+            .map_or(SurfaceKey::Activity(agent_id), SurfaceKey::Thread)
+    }
+
+    /// Asks for the first words of a new thread to the selected agent, and
+    /// opens the thread once its host takes them.
+    pub(crate) fn prompt_new_mail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.selection.selected_agent() else {
+            self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let label = self.registry.agent_display_label(agent_id);
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  text: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let text = text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                let content = vec![ContentPart::Text {
+                    text: text.to_owned(),
+                }];
+                let id = workspace.handle_submit(agent_id, None, content, window, cx);
+                workspace.new_thread_post = Some(id);
+            },
+        );
+        self.open_prompt(
+            format!("mail {label}:"),
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         rho_journal::record(rho_journal::Event::AgentOpened {
             agent_id: agent_id.into(),
         });
-        self.activate_agent(agent_id, cx);
+        self.activate_agent(agent_id);
         self.select_agent(Some(agent_id), window, cx);
     }
 
@@ -4293,17 +4437,16 @@ impl Workspace {
         self.notice_on(agent_id, text, StyleClass::SystemInfo, cx);
     }
 
-    /// The agent's view made again, as after an eviction.
+    /// A thread's view made again, as after it was dropped.
     #[cfg(test)]
-    pub(crate) fn remake_agent_model_for_test(
+    pub(crate) fn remake_thread_model_for_test(
         &mut self,
-        agent_id: AgentId,
+        thread: MailThread,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
-        self.models.remove(&agent_id);
-        self.ensure_agent_model(agent_id, TranscriptView::Conversation, window, cx)
-            .0
+        self.threads.remove(&thread);
+        self.ensure_thread_model(thread, window, cx)
     }
 
     /// Supplies the rows read before, in tests that deliberately use no
@@ -4319,16 +4462,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn saved_agent_draft_for_test(&self, agent_id: AgentId) -> Option<&str> {
-        self.drafts.get(&agent_id).map(String::as_str)
+    pub(crate) fn saved_thread_draft_for_test(&self, thread: MailThread) -> Option<&str> {
+        self.drafts.get(&thread).map(String::as_str)
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_model_for_test(&self, agent_id: AgentId) -> Entity<AgentModel> {
-        self.models
-            .get(&agent_id)
+    pub(crate) fn thread_model_for_test(&self, thread: MailThread) -> Entity<AgentModel> {
+        self.threads
+            .get(&thread)
             .cloned()
-            .expect("an agent model for this agent")
+            .expect("a model for this thread")
     }
 
     #[cfg(test)]
@@ -4366,18 +4509,14 @@ impl Workspace {
         if let Some(agent_id) = agent_id {
             // Selection is the strongest signal: the transcript about to be
             // shown is the newest of the active set.
-            self.activate_agent(agent_id, cx);
-        }
-        if let Some(agent_id) = &agent_id {
-            let view = self.materialize_model(agent_id, TranscriptView::Conversation, window, cx);
-            view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
+            self.activate_agent(agent_id);
         }
         let (context, key) = match agent_id {
             Some(agent_id) => {
                 self.selection.select_agent(agent_id);
                 (
                     self.context_for_agent(agent_id),
-                    SurfaceKey::Transcript(agent_id),
+                    self.agent_surface_key(agent_id),
                 )
             }
             None => {
@@ -4412,12 +4551,13 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
-            SurfaceKey::Transcript(agent_id) => format!(
-                "{} · conversation",
+            SurfaceKey::Thread(thread) => format!(
+                "{} · {}",
                 self.registry.agent_name_with_labels(
-                    *agent_id,
-                    self.registry.agent_display_label(*agent_id)
-                )
+                    thread.agent,
+                    self.registry.agent_display_label(thread.agent)
+                ),
+                self.thread_title(*thread)
             ),
             SurfaceKey::Activity(agent_id) => format!(
                 "{} · activity",
@@ -4460,7 +4600,7 @@ impl Workspace {
             SurfaceKey::Messages => "messages",
             SurfaceKey::Usage => "usage",
             SurfaceKey::Note(_) => "note",
-            SurfaceKey::Transcript(_) => "conversation",
+            SurfaceKey::Thread(_) => "mail",
             SurfaceKey::Activity(_) => "activity",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
@@ -4597,11 +4737,12 @@ impl Workspace {
                 host: 0,
                 node_id: node.clone().into(),
             },
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
-                SurfaceIdentity::Transcript {
-                    agent_id: agent_id.into(),
-                }
-            }
+            SurfaceKey::Thread(rho_dealer::MailThread {
+                agent: agent_id, ..
+            })
+            | SurfaceKey::Activity(agent_id) => SurfaceIdentity::Transcript {
+                agent_id: agent_id.into(),
+            },
             SurfaceKey::File { agent_id, path } => SurfaceIdentity::File {
                 agent_id: agent_id.into(),
                 path: path.to_string(),
@@ -4762,7 +4903,7 @@ impl Workspace {
         method: rho_journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
-        self.ensure_surface_subscription(&surface.key, cx);
+        self.ensure_surface_subscription(&surface.key);
         let list = self.surfaces.entry(self.active_context).or_default();
         match list.iter_mut().find(|s| **s == surface) {
             Some(existing) => *existing = surface.clone(),
@@ -4831,15 +4972,13 @@ impl Workspace {
         }
     }
 
-    fn ensure_surface_subscription(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
+    fn ensure_surface_subscription(&mut self, key: &SurfaceKey) {
         let agent_id = match key {
-            SurfaceKey::Transcript(agent_id)
-            | SurfaceKey::Activity(agent_id)
-            | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
+            SurfaceKey::Activity(agent_id) | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
             _ => None,
         };
         if let Some(agent_id) = agent_id {
-            self.activate_agent(agent_id, cx);
+            self.activate_agent(agent_id);
         }
     }
 
@@ -5064,52 +5203,28 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    fn materialize_model(
+    fn materialize_activity_model(
         &mut self,
-        agent_id: &AgentId,
-        view: TranscriptView,
+        agent_id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
         // Every route to a transcript comes through here, so this is where
         // the story stands in until a frame arrives.
-        let told = self.seed_transcript_from_mirror(*agent_id);
-        let (model, _) = self.ensure_agent_model(*agent_id, view, window, cx);
+        let told = self.seed_transcript_from_mirror(agent_id);
+        let (model, _) = self.ensure_activity_model(agent_id, window, cx);
         // Seeding the store is not showing it: a view that already exists
         // (the agent host answers for every agent on connecting, with nothing
         // loaded) renders what it last synced, which was a blank page.
         if told {
-            self.sync_agent_model(*agent_id, &model, FrameSummary::everything(), false, cx);
+            self.sync_agent_model(agent_id, &model, FrameSummary::everything(), false, cx);
         }
         // A load that finished while another view was current left what
         // moved meanwhile held in the model.
-        if model.read(cx).initial_load_ready()
-            && let Some(state) = self.transcripts.state(agent_id)
-        {
-            model.update(cx, |model, cx| {
-                model.sync(
-                    state,
-                    FrameSummary::nothing(),
-                    now_ms(),
-                    &|id| self.registry.agent_display_label(id),
-                    cx,
-                );
-            });
+        if model.read(cx).initial_load_ready() {
+            self.sync_agent_model(agent_id, &model, FrameSummary::nothing(), false, cx);
         }
         model
-    }
-
-    /// Recomputes the right-prompt status chips for one agent's view.
-    fn refresh_view_status(
-        &self,
-        agent_id: &AgentId,
-        view: &Entity<AgentModel>,
-        cx: &mut Context<Self>,
-    ) {
-        let context_used = self.transcripts.context_used(agent_id);
-        view.update(cx, |view, cx| {
-            view.set_status("", None, None, None, context_used, cx)
-        });
     }
 
     #[cfg(test)]
@@ -5288,17 +5403,6 @@ impl Workspace {
         self.focus_active_surface(window, cx);
     }
 
-    #[cfg(test)]
-    pub(crate) fn live_transcript_for_test(
-        &mut self,
-        agent_id: AgentId,
-        live: rho_agents_client::protocol::transcript::Live,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
-    }
-
     /// A transcript handed in whole, for a test that drives the view
     /// without a mirror to fold. Not an event: `rho-agent-hosts` carries what a
     /// agent host said, and no agent host says this.
@@ -5310,7 +5414,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
+        self.handle_frame_batch(
+            vec![(agent_id, TranscriptFrame::Fold(state.clone()))],
+            window,
+            cx,
+        );
+        // The same blocks as one thread's, so a thread view draws them the
+        // way it draws mail.
+        let thread = Self::test_thread(agent_id);
+        let summary = self
+            .transcripts
+            .set_thread(thread.agent, thread.thread, state);
+        self.sync_thread_model(thread, summary, cx);
+    }
+
+    /// The thread [`Self::seed_transcript_for_test`] seeds.
+    #[cfg(any(test, feature = "walk-support"))]
+    pub(crate) fn test_thread(agent_id: AgentId) -> MailThread {
+        MailThread {
+            agent: agent_id,
+            thread: ThreadId(rho_agent_types::MailId(0)),
+        }
     }
 
     fn scan_browser_pages_for_gc(&mut self, cx: &mut Context<Self>) {
@@ -5379,13 +5503,10 @@ impl Workspace {
     }
 
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
-        if let SurfaceView::Transcript { model, .. } = &self.active_surface().view {
-            return Some(model.clone());
+        match &self.active_surface().view {
+            SurfaceView::Transcript { model, .. } => Some(model.clone()),
+            _ => None,
         }
-        self.selection
-            .selected_agent()
-            .and_then(|agent_id| self.models.get(&agent_id))
-            .cloned()
     }
 
     /// The editor the user is typing into. Terminal surfaces have no editor;
@@ -5466,7 +5587,9 @@ impl Workspace {
     /// focus from it.
     pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = match &self.active_surface().key {
-            SurfaceKey::Transcript(agent_id)
+            SurfaceKey::Thread(rho_dealer::MailThread {
+                agent: agent_id, ..
+            })
             | SurfaceKey::Activity(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
@@ -5492,9 +5615,7 @@ impl Workspace {
         } else {
             window.focus(&handle, cx);
         }
-        if let SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) =
-            self.active_surface().key
-        {
+        if let Some(agent_id) = self.active_surface().key.transcript_agent() {
             self.finish_transcript_search(agent_id, window, cx);
         }
     }
@@ -5527,14 +5648,14 @@ impl Workspace {
                 let node = node.clone();
                 SurfaceView::Note(self.note_view_for(&node, window, cx).editor().clone())
             }
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
-                let agent_id = *agent_id;
-                let view = if matches!(key, SurfaceKey::Activity(_)) {
-                    TranscriptView::Activity
-                } else {
-                    TranscriptView::Conversation
+            SurfaceKey::Thread(_) | SurfaceKey::Activity(_) => {
+                let model = match &key {
+                    SurfaceKey::Thread(thread) => self.ensure_thread_model(*thread, window, cx),
+                    _ => {
+                        let agent_id = key.transcript_agent().expect("an activity names its agent");
+                        self.materialize_activity_model(agent_id, window, cx)
+                    }
                 };
-                let model = self.materialize_model(&agent_id, view, window, cx);
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 // `/` is the buffer's search here as everywhere; nothing
                 // else in this app hosts one, so the surface does.
@@ -5593,7 +5714,9 @@ impl Workspace {
     /// visible surface, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         let selected = match self.active_surface().key.clone() {
-            SurfaceKey::Transcript(agent_id)
+            SurfaceKey::Thread(rho_dealer::MailThread {
+                agent: agent_id, ..
+            })
             | SurfaceKey::Activity(agent_id)
             | SurfaceKey::Shell(agent_id) => {
                 self.selection.select_agent(agent_id);
@@ -5621,7 +5744,7 @@ impl Workspace {
             SurfaceKey::Image { .. } => None,
         };
         if let Some(agent_id) = selected {
-            self.activate_agent(agent_id, cx);
+            self.activate_agent(agent_id);
         }
         cx.notify();
     }
@@ -6149,10 +6272,8 @@ impl Workspace {
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
-            Command::AgentActivity => self.open_agent_view(TranscriptView::Activity, window, cx),
-            Command::AgentConversation => {
-                self.open_agent_view(TranscriptView::Conversation, window, cx)
-            }
+            Command::AgentActivity => self.open_activity(window, cx),
+            Command::NewMail => self.prompt_new_mail(window, cx),
             Command::PullCard => self.pull_card(window, cx),
             Command::CloseAndDeal => self.cmd_close_and_deal(window, cx),
             Command::OpenFile => self.prompt_open_file(window, cx),
@@ -6364,7 +6485,12 @@ impl Workspace {
         else {
             return;
         };
-        let target = self.models.get(&agent).cloned();
+        let target = match &self.active_surface().key {
+            SurfaceKey::Thread(thread) if thread.agent == agent => {
+                self.threads.get(thread).cloned()
+            }
+            _ => None,
+        };
         let task =
             rho_desktop_client::viewer::open(&connection.link(), agent.encoded(), session.clone());
         cx.spawn_in(window, async move |this, cx| match task.await {
@@ -6609,15 +6735,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let surface = match &card.node {
-            rho_dealer::NodeId::Agent(agent_id) => {
-                let agent_id = *agent_id;
+            rho_dealer::NodeId::Mail(thread) => {
+                let thread = *thread;
                 rho_journal::record(rho_journal::Event::AgentOpened {
-                    agent_id: agent_id.into(),
+                    agent_id: thread.agent.into(),
                 });
-                self.selection.select_agent(agent_id);
-                self.active_context = self.context_for_agent(agent_id);
-                self.activate_agent(agent_id, cx);
-                self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
+                self.selection.select_agent(thread.agent);
+                self.active_context = self.context_for_agent(thread.agent);
+                self.make_surface(SurfaceKey::Thread(thread), window, cx)
             }
             // A Slack card is a conversation: the deal view is the
             // conversation surface itself, opened the way `enter` opens
@@ -6838,7 +6963,7 @@ impl Workspace {
 
     pub(crate) fn journal_card_kind(kind: rho_dealer::CardKind) -> rho_journal::DealerCardKind {
         match kind {
-            rho_dealer::CardKind::Agent => rho_journal::DealerCardKind::Agent,
+            rho_dealer::CardKind::Mail => rho_journal::DealerCardKind::Mail,
             rho_dealer::CardKind::Slack => rho_journal::DealerCardKind::Thread,
             rho_dealer::CardKind::Dated => rho_journal::DealerCardKind::Note,
         }
@@ -7822,7 +7947,7 @@ impl Workspace {
                 };
                 let away = !matches!(
                     self.active_surface().key,
-                    SurfaceKey::Transcript(viewed) if viewed == agent
+                    SurfaceKey::Thread(viewed) if viewed.agent == agent
                 );
                 div()
                     .flex()
@@ -7917,10 +8042,7 @@ impl Workspace {
         // An agent surface's state comes from its head, never from the card
         // that dealt it: the card says why the dealer raised the agent, and
         // a running agent has no card at all, which left the line blank.
-        let agent_in_view = match &self.active_surface().key {
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => Some(*agent_id),
-            _ => None,
-        };
+        let agent_in_view = self.active_surface().key.transcript_agent();
         if let Some(card) = self.open_card_in_view(cx)
             && echo.is_none()
             && agent_in_view.is_none()
@@ -7929,18 +8051,20 @@ impl Workspace {
         }
         let path = {
             match &self.active_surface().key {
-                SurfaceKey::Transcript(agent_id) | SurfaceKey::Activity(agent_id) => {
-                    let leaf = self.registry.agent_display_label(*agent_id);
-                    let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
+                key @ (SurfaceKey::Thread(_) | SurfaceKey::Activity(_)) => {
+                    let agent_id = key
+                        .transcript_agent()
+                        .expect("a transcript names its agent");
+                    let leaf = self.registry.agent_display_label(agent_id);
+                    let path = match self.node_context(&rho_dealer::NodeId::Agent(agent_id), cx) {
                         context if context.is_empty() => leaf,
                         context => format!("{context} / {leaf}"),
                     };
-                    // The conversation is what a transcript is; only the
-                    // activity view needs saying.
-                    if matches!(self.active_surface().key, SurfaceKey::Activity(_)) {
-                        format!("{path} · activity")
-                    } else {
-                        path
+                    match key {
+                        SurfaceKey::Thread(thread) => {
+                            format!("{path} / {}", self.thread_title(*thread))
+                        }
+                        _ => format!("{path} · activity"),
                     }
                 }
                 SurfaceKey::Browser(page) => {
@@ -7954,14 +8078,21 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
-        let state = agent_in_view
-            .filter(|_| echo.is_none())
-            .and_then(|agent_id| {
-                crate::attention::agent_state_label(
-                    &self.registry.agent_facts(agent_id),
-                    chrono::Local::now().fixed_offset(),
-                )
-            });
+        // Only the activity says what the runtime is doing: a thread is
+        // mail, and what wants the user is its unread mail.
+        let state = match &self.active_surface().key {
+            SurfaceKey::Activity(agent_id) if echo.is_none() => self
+                .registry
+                .agent_facts(*agent_id)
+                .runtime
+                .and_then(|runtime| {
+                    crate::attention::activity_state_label(
+                        &runtime,
+                        chrono::Local::now().fixed_offset(),
+                    )
+                }),
+            _ => None,
+        };
         let state = state.map(|state| div().text_color(cx.theme().status().warning).child(state));
         let left = echo.map_or_else(
             || self.render_status_path(&Self::truncate_outline_path(&path), cx),
@@ -8097,8 +8228,11 @@ impl Workspace {
                 .id("rho-surface-transcript")
                 // Named because keys are bound to it: a transcript is one of
                 // the two surfaces with a search of its own, so it is one of
-                // the two that has `n`.
-                .key_context("RhoTranscript")
+                // the two that has `n`, and a thread has its activity key.
+                .key_context(match surface.key {
+                    SurfaceKey::Thread(_) => "RhoTranscript RhoThread",
+                    _ => "RhoTranscript",
+                })
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -8152,12 +8286,6 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-        }
-    }
-
-    fn update_statuses(&self, cx: &mut Context<Self>) {
-        for (agent_id, view) in &self.models {
-            self.refresh_view_status(agent_id, view, cx);
         }
     }
 
@@ -8496,6 +8624,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ThreadActivity, window, cx| {
+                this.open_activity(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_shell_view::protocol::PagerAction::Continue, cx);

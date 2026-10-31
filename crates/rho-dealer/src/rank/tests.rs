@@ -38,6 +38,8 @@ struct World {
     made: u64,
     /// The host's newest mail.
     mail: u64,
+    /// The one thread each agent has with the user here.
+    threads: HashMap<AgentId, rho_agent_types::ThreadId>,
     slack: Model,
     ts: u64,
     marks: Marks,
@@ -90,6 +92,7 @@ fn world_in(zone: TimeZone) -> World {
         host,
         made: 0,
         mail: 0,
+        threads: HashMap::new(),
         slack,
         ts: 0,
         marks: Marks::default(),
@@ -131,15 +134,23 @@ impl World {
         self.agents.told(vec![mirrored]);
     }
 
-    /// One mail on the host's log, folded the way the client folds it.
+    /// One mail on the host's log, folded the way the client folds it, in
+    /// the thread of the agent it is from or to.
     fn mail(&mut self, from: Address, to: Address, kind: Option<SendKind>) {
         self.mail += 1;
+        let thread = [from, to]
+            .into_iter()
+            .find_map(|address| match address {
+                Address::Agent(agent_id) => self.threads.get(&agent_id).copied(),
+                Address::User => None,
+            })
+            .expect("mail of an agent the world made");
         let mail = Mail {
             id: MailId(self.mail),
             at: UnixMs(self.ms()),
             from,
             to,
-            thread: rho_agent_types::ThreadId(MailId(self.mail)),
+            thread,
             kind,
             content: vec![ContentPart::Text {
                 text: "update".into(),
@@ -156,18 +167,6 @@ impl World {
         }
     }
 
-    /// What the agent's runtime reports, folded the way the model folds it.
-    fn status(&mut self, node: &NodeId, inference: InferenceState) {
-        let (head, at) = (MailId(self.mail), UnixMs(self.ms()));
-        let state = RuntimeState {
-            inference,
-            ..Default::default()
-        };
-        self.fold(Self::id(node), |mirrored| {
-            mirrored.digest.observe(&state, head, at);
-        });
-    }
-
     /// An agent the user's policy made: user-facing unless it has a parent.
     fn agent_under(&mut self, name: &str, parent: Option<AgentId>) -> NodeId {
         self.made += 1;
@@ -179,7 +178,12 @@ impl World {
         let identity = AgentIdentity::for_test(agent_id, spec_props, UnixMs(self.ms()));
         self.agents
             .told(vec![MirroredAgent::new(self.host, identity)]);
-        let node = NodeId::Agent(agent_id);
+        let thread = rho_agent_types::ThreadId(MailId(1_000 + self.made));
+        self.threads.insert(agent_id, thread);
+        let node = NodeId::Mail(crate::node::MailThread {
+            agent: agent_id,
+            thread,
+        });
         self.names.insert(node.clone(), name.into());
         node
     }
@@ -189,7 +193,7 @@ impl World {
     }
 
     fn id(node: &NodeId) -> AgentId {
-        node.agent().unwrap()
+        node.mail().unwrap().agent
     }
 
     fn sends(&mut self, node: &NodeId, kind: SendKind) {
@@ -209,21 +213,17 @@ impl World {
         self.sends(node, SendKind::Status);
     }
 
-    fn stops(&mut self, node: &NodeId) {
-        self.status(
-            node,
-            InferenceState::Failed {
-                error: "boom".into(),
-            },
-        );
-    }
-
     fn writes_to(&mut self, node: &NodeId) {
         self.mail(Address::User, Address::Agent(Self::id(node)), None);
     }
 
+    /// The newest mail in an agent's thread.
     fn newest(&self, node: &NodeId) -> u64 {
-        self.agents.agent_digest(Self::id(node)).unwrap().newest.0
+        let thread = node.mail().unwrap();
+        self.agents
+            .agent_digest(thread.agent)
+            .and_then(|digest| digest.threads.get(&thread.thread))
+            .map_or(0, |held| held.newest.0)
     }
 
     fn tell(&mut self, fact: Fact) {
@@ -240,7 +240,7 @@ impl World {
     /// How far the user has seen `node`: everything its source has.
     fn seen(&self, node: &NodeId) -> Seen {
         match node {
-            NodeId::Agent(_) => Seen::Agent(self.newest(node)),
+            NodeId::Mail(_) => Seen::Mail(self.newest(node)),
             NodeId::Slack(unit) => self
                 .slack
                 .unit(&model_unit(unit))
@@ -495,16 +495,17 @@ fn a4_a_status_is_no_card() {
 }
 
 #[test]
-fn a5_several_unread_sends_are_one_card_of_the_strongest_from_its_oldest() {
+fn a5_several_unread_sends_are_one_card_of_the_newest_ask_or_result() {
     let mut w = world();
     let a = w.agent("a");
+    w.asks(&a);
+    w.pass(hours(1));
     w.finishes(&a);
     w.pass(hours(1));
-    w.asks(&a);
-    w.pass(hours(1));
     w.sends(&a, SendKind::Fyi);
+    assert_eq!(w.hand(), "a · result · 1.0h ago");
     w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 1.0h");
+    assert_eq!(w.hand(), "a · asks · 0m");
 }
 
 #[test]
@@ -538,41 +539,6 @@ fn a7_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
 }
 
 #[test]
-fn a8_an_agent_that_stopped_on_an_error_asks() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.stops(&a);
-    assert_eq!(w.hand(), "a · stopped · 0m ago");
-    assert!(w.priority(&a).unwrap() >= AGENT_BLOCKED_HEAD_START);
-}
-
-#[test]
-fn a9_an_error_the_host_retries_is_nothing() {
-    let mut w = world();
-    let a = w.agent("a");
-    let at = UnixMs(w.ms());
-    w.status(
-        &a,
-        InferenceState::Retrying {
-            at,
-            error: "overloaded".into(),
-        },
-    );
-    assert_eq!(w.hand(), "");
-    w.stops(&a);
-    assert_eq!(w.hand(), "a · stopped · 0m ago");
-    w.status(
-        &a,
-        InferenceState::Retrying {
-            at,
-            error: "overloaded".into(),
-        },
-    );
-    assert_eq!(w.hand(), "", "retrying again, it is running");
-}
-
-#[test]
 fn a10_an_engineer_started_for_the_user_deals_by_its_own_sends() {
     let mut w = world();
     let parent = w.agent("parent");
@@ -597,7 +563,7 @@ fn a11_an_agent_made_by_an_agent_has_no_card_of_its_own() {
 }
 
 #[test]
-fn a12_running_waiting_or_idle_changes_nothing() {
+fn a12_running_waiting_idle_or_stopped_changes_nothing() {
     let mut w = world();
     let a = w.agent("a");
     let b = w.agent("b");
@@ -611,6 +577,27 @@ fn a12_running_waiting_or_idle_changes_nothing() {
         runtime(&mut w, &a, running, waiting, archived);
         runtime(&mut w, &b, running, waiting, archived);
         assert_eq!(w.hand(), hand);
+    }
+    let at = UnixMs(w.ms());
+    for inference in [
+        InferenceState::Failed {
+            error: "boom".into(),
+        },
+        InferenceState::Retrying {
+            at,
+            error: "overloaded".into(),
+        },
+    ] {
+        for node in [&a, &b] {
+            w.agents.set_runtime(
+                World::id(node),
+                RuntimeState {
+                    inference: inference.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(w.hand(), hand, "a stop or a retry is no mail");
     }
 }
 
@@ -1139,7 +1126,6 @@ enum Step {
     Finishes(usize),
     Asks(usize),
     Works(usize),
-    Stops(usize),
     WritesTo(usize),
     Dm(usize),
     Read(usize),
@@ -1157,7 +1143,6 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
         (0usize..3).prop_map(Step::Finishes),
         (0usize..3).prop_map(Step::Asks),
         (0usize..3).prop_map(Step::Works),
-        (0usize..3).prop_map(Step::Stops),
         (0usize..3).prop_map(Step::WritesTo),
         (0usize..2).prop_map(Step::Dm),
         (0usize..2).prop_map(Step::Read),
@@ -1190,7 +1175,6 @@ proptest::proptest! {
                 Step::Finishes(i) => w.finishes(&agents[i]),
                 Step::Asks(i) => w.asks(&agents[i]),
                 Step::Works(i) => w.works(&agents[i]),
-                Step::Stops(i) => w.stops(&agents[i]),
                 Step::WritesTo(i) => w.writes_to(&agents[i]),
                 Step::Dm(i) => { w.dm(dms[i], ["U1", "U2"][i]); }
                 Step::Read(i) => {
@@ -1221,7 +1205,7 @@ proptest::proptest! {
                 proptest::prop_assert!(!facts.muted());
                 // Z1: nothing snoozed shows, but for an agent's quick reply.
                 if let Some(snooze) = facts.snooze() && at < snooze.until {
-                    proptest::prop_assert!(matches!(card.node, NodeId::Agent(_)));
+                    proptest::prop_assert!(matches!(card.node, NodeId::Mail(_)));
                 }
             }
             // X3: nothing arrives by itself before the next change.

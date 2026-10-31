@@ -16,9 +16,7 @@ use std::rc::Rc;
 use collections::HashSet;
 use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
-use editor::{
-    Editor, EditorMode, EditorRightPrompt, HighlightKey, Inlay, SelectionEffects, SizingBehavior,
-};
+use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
@@ -109,7 +107,6 @@ pub struct AgentModel {
     prompt_end: text::Anchor,
     attachments: Vec<ContentPart>,
     attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
-    status_spans: Vec<(String, gpui::HighlightStyle)>,
     /// What an editor over this transcript completes with. Handed in
     /// rather than reached for: the screen knows there are completions,
     /// not where they come from.
@@ -217,7 +214,6 @@ impl AgentModel {
             prompt_end,
             attachments: Vec::new(),
             attachment_blocks: Vec::new(),
-            status_spans: Vec::new(),
             completions,
             initial_load_started: false,
             initial_load_ready: false,
@@ -429,7 +425,6 @@ impl AgentModel {
             },
         ));
         self.editors.push(editor.downgrade());
-        self.apply_status_to(&editor, cx);
         self.apply_prompt_chrome_to(&editor, cx);
         self.refresh_attachment_blocks(cx);
         if let Some(point) = self.remembered_point {
@@ -790,93 +785,6 @@ impl AgentModel {
         had
     }
 
-    pub fn set_status(
-        &mut self,
-        project_label: &str,
-        workspace_label: Option<&str>,
-        usage_label: Option<&str>,
-        role_label: Option<(&str, style::RoleFamily)>,
-        context_used: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
-        let mut spans = Vec::new();
-        if !project_label.is_empty() {
-            spans.push((project_label.to_owned(), style::cwd_chip_style(cx)));
-        }
-        if let Some(workspace_label) = workspace_label
-            && !workspace_label.is_empty()
-        {
-            if !spans.is_empty() {
-                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
-            }
-            spans.push((workspace_label.to_owned(), style::workspace_chip_style(cx)));
-        }
-        if let Some((role_label, mode_family)) = role_label
-            && !role_label.is_empty()
-        {
-            if !spans.is_empty() {
-                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
-            }
-            spans.push((
-                role_label.to_owned(),
-                style::role_chip_style(mode_family, cx),
-            ));
-        }
-        if let Some(context_used) = context_used {
-            if !spans.is_empty() {
-                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
-            }
-            spans.push((
-                format_token_count(context_used),
-                style::context_chip_style(cx),
-            ));
-        }
-        if let Some(usage_label) = usage_label
-            && !usage_label.is_empty()
-        {
-            if !spans.is_empty() {
-                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
-            }
-            spans.push((usage_label.to_owned(), style::context_chip_style(cx)));
-        }
-        self.status_spans = spans;
-        for editor in self.live_editors() {
-            self.apply_status_to(&editor, cx);
-        }
-    }
-
-    /// The status chips as styled spans; the preview sheet's header
-    /// renders these as real UI outside the editor.
-    pub fn status_spans(&self) -> &[(String, gpui::HighlightStyle)] {
-        &self.status_spans
-    }
-
-    /// The status line as one string, in span order: what a reader sees.
-    pub fn status_span_text(&self) -> String {
-        self.status_spans
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect()
-    }
-
-    fn apply_status_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(self.prompt_end)
-        else {
-            return;
-        };
-        let right_prompt = (!self.status_spans.is_empty()).then(|| EditorRightPrompt {
-            anchor,
-            spans: self.status_spans.clone(),
-        });
-        editor.update(cx, |editor, cx| {
-            editor.set_right_prompt(right_prompt, cx);
-        });
-    }
-
     fn update_prompt_chrome(&mut self, cx: &mut Context<Self>) {
         for editor in self.live_editors() {
             self.apply_prompt_chrome_to(&editor, cx);
@@ -958,44 +866,5 @@ impl AgentModel {
                 cx,
             );
         });
-    }
-}
-
-/// Renders a token count compactly for the status chip: bare below a
-/// thousand, then `k`/`M` with one decimal while a single digit (`9.5k`,
-/// `1.2M`) and whole numbers after (`62k`, `12M`).
-pub(crate) fn format_token_count(tokens: u64) -> String {
-    fn scaled(value: f64, suffix: &str) -> String {
-        if value < 9.95 {
-            format!("{value:.1}{suffix}")
-        } else {
-            format!("{value:.0}{suffix}")
-        }
-    }
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 999_500 {
-        scaled(tokens as f64 / 1_000.0, "k")
-    } else {
-        scaled(tokens as f64 / 1_000_000.0, "M")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_token_count;
-
-    #[test]
-    fn token_counts_render_compactly() {
-        assert_eq!(format_token_count(0), "0");
-        assert_eq!(format_token_count(999), "999");
-        assert_eq!(format_token_count(1_000), "1.0k");
-        assert_eq!(format_token_count(9_400), "9.4k");
-        assert_eq!(format_token_count(9_950), "10k");
-        assert_eq!(format_token_count(62_300), "62k");
-        assert_eq!(format_token_count(999_499), "999k");
-        assert_eq!(format_token_count(999_500), "1.0M");
-        assert_eq!(format_token_count(1_250_000), "1.2M");
-        assert_eq!(format_token_count(12_000_000), "12M");
     }
 }

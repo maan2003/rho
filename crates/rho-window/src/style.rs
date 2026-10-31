@@ -33,12 +33,6 @@ use theme::ActiveTheme as _;
 /// worse deal than a tight row on the few rows that are large.
 pub const USER_MESSAGE_SCALE: f32 = 1.125;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoleFamily {
-    Deep,
-    Fable,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StyleClass {
     Default,
@@ -148,39 +142,6 @@ pub fn agent_message_gutter_color(cx: &App) -> Hsla {
 
 fn agent_message_color(cx: &App) -> Hsla {
     cx.theme().colors().terminal_ansi_cyan.into()
-}
-
-pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(cx.theme().colors().terminal_foreground.into()),
-        ..HighlightStyle::default()
-    }
-}
-
-pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(cx.theme().colors().terminal_ansi_green.into()),
-        ..HighlightStyle::default()
-    }
-}
-
-pub fn context_chip_style(cx: &App) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(cx.theme().colors().text_muted.into()),
-        ..HighlightStyle::default()
-    }
-}
-
-pub fn role_chip_style(family: RoleFamily, cx: &App) -> HighlightStyle {
-    let colors = cx.theme().colors();
-    let color = match family {
-        RoleFamily::Deep => colors.terminal_ansi_cyan,
-        RoleFamily::Fable => colors.terminal_ansi_magenta,
-    };
-    HighlightStyle {
-        color: Some(color.into()),
-        ..HighlightStyle::default()
-    }
 }
 
 /// One editor row of compact media chips below a writable prompt, one

@@ -17,12 +17,13 @@ use rho_slack::model::{Attention, Model, Unit};
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
 use crate::facts::{Snooze, slack_ts_order};
 use crate::marks::Marks;
-use crate::node::{NodeId, SlackUnit};
+use crate::node::{MailThread, NodeId, SlackUnit};
 
 /// What kind of thing a card is, which decides how it opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CardKind {
-    Agent,
+    /// A mail thread with an agent.
+    Mail,
     Slack,
     /// A note, or anything else only the user's own dates bring back.
     Dated,
@@ -213,64 +214,67 @@ fn rank_into(
     let marks = sources.marks;
     let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
 
-    // Agents (A1–A13): the strongest thing an agent put to the user that
-    // they have not read. Only the conversation counts.
+    // Mail threads (A1–A13): a thread whose newest mail is an agent's ask
+    // or result to the user, that the user has not read.
     let agents = sources.agents;
     for agent_id in agents.known_agents().copied() {
-        let node = NodeId::Agent(agent_id);
         if !agents.owned_by_user(agent_id) || agents.host_of_agent(agent_id).is_none() {
             continue;
         }
         let Some(digest) = agents.agent_digest(agent_id) else {
             continue;
         };
-        let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
-        if let Some(trace) = trace.as_deref_mut() {
-            trace.input(&node, "unread", format!("{:?}", digest.unread));
-            trace.input(&node, "seen through", seen.to_string());
-        }
-        let Some(unread) = digest.strongest_unread(rho_agents_client::ConversationPos(seen)) else {
+        // Muting an agent mutes every thread with it.
+        let agent_muted = marks.get(&NodeId::Agent(agent_id)).facts().muted();
+        for (thread, held) in &digest.threads {
+            let node = NodeId::Mail(MailThread {
+                agent: agent_id,
+                thread: *thread,
+            });
+            let seen = marks.get(&node).facts().seen_mail().unwrap_or(0);
             if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&node, "no card: nothing unread".to_owned());
+                trace.input(&node, "thread", format!("{held:?}"));
+                trace.input(&node, "seen through", seen.to_string());
             }
-            continue;
-        };
-        let since = unix(unread.at.0 as i64);
-        let (curve, reason) = match unread.said {
-            Said::Ask => (
-                Curve::Waiting {
-                    head_start: curve::AGENT_BLOCKED_HEAD_START,
-                    since,
-                },
-                "asks · {age}",
-            ),
-            Said::Stopped => (
-                Curve::Waiting {
-                    head_start: curve::AGENT_BLOCKED_HEAD_START,
-                    since,
-                },
-                "stopped · {age} ago",
-            ),
-            Said::Result => (
-                Curve::Fading {
-                    head_start: curve::AGENT_FINISHED_HEAD_START,
-                    since,
-                    gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-                },
-                "result · {age} ago",
-            ),
-        };
-        // The newest unread is where the card's source last moved.
-        let cursor = digest.newest_unread().map_or(0, |newest| newest.pos.0);
-        let mut part = Part::source(curve, reason.to_owned(), cursor.to_string());
-        let spoke = unix(digest.last_user_message_at.0 as i64);
-        if digest.last_user_message_at.0 > 0 {
-            part.bonus = curve::recency_bonus(spoke, at);
-            if since.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
-                part.breaks_snooze_set_by = Some(spoke);
+            let Some(wanting) = held
+                .wants
+                .filter(|wanting| wanting.mail.0 > seen && !agent_muted)
+            else {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.outcome(&node, "no card: nothing unread".to_owned());
+                }
+                continue;
+            };
+            let since = unix(wanting.at.0 as i64);
+            let (curve, reason) = match wanting.said {
+                Said::Ask => (
+                    Curve::Waiting {
+                        head_start: curve::AGENT_BLOCKED_HEAD_START,
+                        since,
+                    },
+                    "asks · {age}",
+                ),
+                Said::Result => (
+                    Curve::Fading {
+                        head_start: curve::AGENT_FINISHED_HEAD_START,
+                        since,
+                        gone_days: curve::AGENT_FINISHED_GONE_DAYS,
+                    },
+                    "result · {age} ago",
+                ),
+            };
+            // The mail that wants the user is where the card's source last
+            // moved.
+            let mut part = Part::source(curve, reason.to_owned(), wanting.mail.0.to_string());
+            if let Some(wrote) = held.user_wrote_at {
+                let spoke = unix(wrote.0 as i64);
+                part.bonus = curve::recency_bonus(spoke, at);
+                if since.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
+                    part.breaks_snooze_set_by = Some(spoke);
+                }
             }
+            parts.entry(node).or_default().push(part);
         }
-        parts.entry(node).or_default().push(part);
     }
 
     // Slack (S1–S6): whatever Slack itself is badging.
@@ -523,7 +527,7 @@ fn rank_into(
             skip.map(|(skipped, _)| skipped),
             Card {
                 kind: match node {
-                    NodeId::Agent(_) => CardKind::Agent,
+                    NodeId::Mail(_) => CardKind::Mail,
                     NodeId::Slack(_) => CardKind::Slack,
                     _ => CardKind::Dated,
                 },
@@ -552,9 +556,9 @@ fn rank_into(
             (None, None) => b
                 .priority
                 .total_cmp(&a.priority)
-                // An agent wins an exact tie: it is the user's own work coming
+                // Mail wins an exact tie: it is the user's own work coming
                 // back.
-                .then_with(|| (b.kind == CardKind::Agent).cmp(&(a.kind == CardKind::Agent)))
+                .then_with(|| (b.kind == CardKind::Mail).cmp(&(a.kind == CardKind::Mail)))
                 .then_with(|| a.node.cmp(&b.node)),
         },
     );
@@ -601,6 +605,11 @@ pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String 
             .unwrap_or_default()
             .trim()
             .to_owned(),
+        NodeId::Mail(MailThread { agent, thread }) => sources
+            .agents
+            .agent_digest(*agent)
+            .and_then(|digest| digest.threads.get(thread))
+            .map_or_else(|| "mail".to_owned(), |held| held.title.clone()),
         NodeId::Slack(unit) => {
             let Some(slack) = sources.slack else {
                 return unit.channel.clone();
@@ -634,6 +643,9 @@ pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String 
 pub fn context(sources: &Sources<'_>, node: &NodeId) -> String {
     if let (NodeId::Slack(unit), Some(slack)) = (node, sources.slack) {
         return slack.model.label(&model_unit(unit).channel);
+    }
+    if let NodeId::Mail(MailThread { agent, .. }) = node {
+        return sources.agents.agent_display_label(*agent);
     }
     let marks = sources.marks;
     marks

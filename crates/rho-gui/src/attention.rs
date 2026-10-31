@@ -430,19 +430,14 @@ impl Workspace {
         self.invalidate_dealer_signals(cx);
     }
 
-    /// Hands the agents map what the user said about each agent: how far
-    /// it is handled, whether it is muted, its name and its labels.
+    /// Hands the agents map what the user said about each agent: whether
+    /// it is muted, its name and its labels.
     pub(crate) fn push_agent_marks(&mut self, agents: &[AgentId]) {
         let mut filings = Vec::with_capacity(agents.len());
         for agent_id in agents {
             let node = NodeId::Agent(*agent_id);
             let marks = self.attention.marks.get(&node);
             let said = marks.facts();
-            let handled = said.seen_agent().unwrap_or(0);
-            let verdict = rho_agents_client::Verdict {
-                handled_through: rho_agents_client::ConversationPos(handled),
-                muted: said.muted(),
-            };
             filings.push((
                 *agent_id,
                 rho_agents_client::AgentFiling {
@@ -456,9 +451,6 @@ impl Workspace {
                     name: marks.name.clone(),
                 },
             ));
-            if self.registry.set_agent_verdict(*agent_id, verdict) {
-                self.agents_client.set_verdict(*agent_id, verdict);
-            }
         }
         self.registry.set_agent_filings(filings);
     }
@@ -564,7 +556,7 @@ impl Workspace {
             return card;
         }
         let kind = match node {
-            NodeId::Agent(_) => CardKind::Agent,
+            NodeId::Mail(_) => CardKind::Mail,
             NodeId::Slack(_) => CardKind::Slack,
             _ => CardKind::Dated,
         };
@@ -627,9 +619,10 @@ impl Workspace {
     /// How far the user has seen `node`: everything its source has now.
     pub(crate) fn seen(&self, node: &NodeId, cx: &gpui::App) -> Seen {
         match node {
-            NodeId::Agent(agent_id) => Seen::Agent(
+            NodeId::Mail(thread) => Seen::Mail(
                 self.registry
-                    .agent_digest(*agent_id)
+                    .agent_digest(thread.agent)
+                    .and_then(|digest| digest.threads.get(&thread.thread))
                     .map_or(0, |digest| digest.newest.0),
             ),
             NodeId::Slack(unit) => self
@@ -1040,85 +1033,25 @@ impl Workspace {
     }
 }
 
-/// What an agent is doing, for the status line, as its host says now.
-pub(crate) fn agent_state_label(
-    facts: &rho_agents_client::AgentFacts,
+/// What an agent's runtime is doing that explains its activity: a reply
+/// streaming, a retry pending, or a failure. Whether the agent wants the
+/// user is its threads' to say, so nothing here does.
+pub(crate) fn activity_state_label(
+    runtime: &rho_agents_client::protocol::transcript::RuntimeState,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
-    let label = runtime_state_label(facts, now)?;
-    // Fixes since reach it only when its workset restarts.
-    Some(
-        if facts.runtime.as_ref().is_some_and(|runtime| runtime.stale) {
-            format!("{label} · old build")
-        } else {
-            label
-        },
-    )
-}
-
-fn runtime_state_label(
-    facts: &rho_agents_client::AgentFacts,
-    now: chrono::DateTime<chrono::FixedOffset>,
-) -> Option<String> {
-    // Only the host knows what an agent is doing; unheard is unsaid.
-    let runtime = facts.runtime.as_ref()?;
-    if runtime.awaiting_human {
-        let mut label = "waiting on you".to_owned();
-        match &runtime.inference {
-            rho_agents_client::protocol::transcript::InferenceState::Retrying { at, .. } => label
-                .push_str(&format!(
-                    " · retrying in {}",
-                    crate::home::elapsed_label(now.timestamp_millis(), at.0 as i64)
-                )),
-            rho_agents_client::protocol::transcript::InferenceState::Responding => {
-                label.push_str(" · responding")
-            }
-            rho_agents_client::protocol::transcript::InferenceState::Failed { .. } => {
-                label.push_str(" · errored")
-            }
-            rho_agents_client::protocol::transcript::InferenceState::Idle if runtime.archived => {
-                label.push_str(" · archived")
-            }
-            _ => {}
-        }
-        return Some(label);
-    }
-    if matches!(
-        runtime.inference,
-        rho_agents_client::protocol::transcript::InferenceState::Responding
-    ) {
-        return Some("responding".to_owned());
-    }
-    if let rho_agents_client::protocol::transcript::InferenceState::Retrying { at, .. } =
-        &runtime.inference
-    {
-        return Some(format!(
+    use rho_agents_client::protocol::transcript::InferenceState;
+    let doing = match &runtime.inference {
+        InferenceState::Responding => Some("responding".to_owned()),
+        InferenceState::Retrying { at, .. } => Some(format!(
             "retrying in {}",
             crate::home::elapsed_label(now.timestamp_millis(), at.0 as i64)
-        ));
-    }
-    if matches!(
-        runtime.inference,
-        rho_agents_client::protocol::transcript::InferenceState::Failed { .. }
-    ) {
-        return Some("errored".to_owned());
-    }
-    if runtime.archived {
-        return Some("archived".to_owned());
-    }
-    if let Some(checkin) = runtime.checkin_at {
-        let now_ms = now.timestamp_millis();
-        return Some(if checkin.0 as i64 > now_ms {
-            format!(
-                "next check-in in {}",
-                crate::home::elapsed_label(now_ms, checkin.0 as i64)
-            )
-        } else {
-            format!(
-                "check-in due · {} ago",
-                crate::home::elapsed_label(checkin.0 as i64, now_ms)
-            )
-        });
-    }
-    Some("idle".to_owned())
+        )),
+        InferenceState::Failed { .. } => Some("errored".to_owned()),
+        InferenceState::Idle => None,
+    };
+    // Fixes since reach it only when its workset restarts.
+    let build = runtime.stale.then(|| "old build".to_owned());
+    let words: Vec<String> = doing.into_iter().chain(build).collect();
+    (!words.is_empty()).then(|| words.join(" · "))
 }

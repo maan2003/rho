@@ -284,7 +284,6 @@ impl Workspace {
                 self.phone.feed_surface = None;
                 cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
             }
-            self.update_statuses(cx);
             // Deferred: adjusting fonts and settings notifies observers,
             // which must not reenter the draw that detected the transition.
             cx.defer(|cx| {
@@ -308,7 +307,6 @@ impl Workspace {
             self.phone.flick = None;
             self.phone.drag_offset = Pixels::ZERO;
             self.phone.snap = None;
-            self.update_statuses(cx);
             cx.defer(|cx| {
                 theme_settings::reset_buffer_font_size(cx);
                 theme_settings::reset_ui_font_size(cx);
@@ -330,7 +328,7 @@ impl Workspace {
             let Some(surface) = this.phone_surface() else {
                 return;
             };
-            if !matches!(surface.key, super::SurfaceKey::Transcript(_)) {
+            if !matches!(surface.key, super::SurfaceKey::Thread(_)) {
                 return;
             }
             let super::SurfaceView::Transcript { model, editor } = &surface.view else {
@@ -1081,7 +1079,7 @@ impl Workspace {
             matches!(
                 surface.key,
                 super::SurfaceKey::Draft
-                    | super::SurfaceKey::Transcript(_)
+                    | super::SurfaceKey::Thread(_)
                     | super::SurfaceKey::SlackConversation(_)
             )
         }) {
@@ -1126,9 +1124,8 @@ impl Workspace {
             return;
         };
         match surface.key {
-            super::SurfaceKey::Draft | super::SurfaceKey::Transcript(_) => {
-                self.submit_prompt(&crate::SubmitPrompt, window, cx)
-            }
+            super::SurfaceKey::Draft => self.submit_prompt(&crate::SubmitPrompt, window, cx),
+            super::SurfaceKey::Thread(_) => self.submit_reply(&surface, window, cx),
             super::SurfaceKey::SlackConversation(_) => {
                 let super::SurfaceView::SlackConversation(view) = surface.view else {
                     return;

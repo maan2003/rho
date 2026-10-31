@@ -41,7 +41,7 @@ use camino::Utf8PathBuf;
 use rho_agent_hosts::HostId;
 use rho_agent_types::AgentId;
 
-use crate::fold::{AgentIdentity, Digest, MirroredAgent, Verdict};
+use crate::fold::{AgentIdentity, Digest, MirroredAgent};
 use crate::now_ms;
 use crate::protocol::rho2::SpecView;
 
@@ -78,8 +78,8 @@ pub struct AgentFiling {
 /// itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
-    /// What its host says it is doing now: idle when its connected host
-    /// says nothing of it, `None` while no host is connected to say.
+    /// What its host last said it is doing, `None` while it has said
+    /// nothing.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
     pub last_user_message_at: rho_agent_types::UnixMs,
 }
@@ -96,15 +96,8 @@ type OrderKey = i64;
 #[derive(Default)]
 pub struct AgentMap {
     agents: BTreeMap<AgentId, AgentLife>,
-    /// What the user said about each agent; attention is derived from
-    /// this and the digest, never stored.
-    verdicts: BTreeMap<AgentId, Verdict>,
     /// Ephemeral snapshots, never part of the mirror or persisted filing.
     runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
-    /// Hosts whose stream said `Hello` and has not dropped since. Such a
-    /// host tells the status of every agent it has loaded, so one of its
-    /// agents it says nothing of is not loaded: idle.
-    connected_hosts: BTreeSet<HostId>,
     /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: muted agents, their labels,
@@ -150,7 +143,6 @@ impl AgentMap {
     /// goes with it. Returns the agents that departed, so the window can
     /// move the point off one it was in.
     pub fn detach_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
-        self.connected_hosts.remove(&host);
         if self.hosts.remove(&host).is_none() {
             return BTreeSet::new();
         }
@@ -189,7 +181,6 @@ impl AgentMap {
     /// What a host's agents stream says of it when it opens. The agents
     /// come by the directory, not here.
     pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
-        self.connected_hosts.insert(host);
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
@@ -211,7 +202,6 @@ impl AgentMap {
             self.unindex_agent(*agent_id);
             self.runtime.remove(agent_id);
             self.agents.remove(agent_id);
-            self.verdicts.remove(agent_id);
             self.mirror.remove(agent_id);
             self.filing.remove(agent_id);
             self.last_active.remove(agent_id);
@@ -457,27 +447,6 @@ impl AgentMap {
         }
     }
 
-    /// What the user last said about this agent. Returns whether it is
-    /// new, so the caller writes it down only then.
-    pub fn set_agent_verdict(&mut self, agent_id: AgentId, verdict: Verdict) -> bool {
-        if self.verdicts.get(&agent_id) == Some(&verdict) {
-            return false;
-        }
-        self.verdicts.insert(agent_id, verdict);
-        true
-    }
-
-    pub fn agent_verdict(&self, agent_id: AgentId) -> Verdict {
-        self.verdicts.get(&agent_id).copied().unwrap_or_default()
-    }
-    /// The agent's status line: its newest status, until any later
-    /// message from either side.
-    pub fn agent_status(&self, agent_id: AgentId) -> Option<&str> {
-        self.agent_digest(agent_id)?
-            .status
-            .as_ref()
-            .map(|(_, text)| text.as_str())
-    }
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
             .insert(agent_id, rho_agent_types::UnixMs(now_ms()));
@@ -607,11 +576,7 @@ impl AgentMap {
             return AgentFacts::default();
         };
         AgentFacts {
-            runtime: self.runtime.get(&agent_id).cloned().or_else(|| {
-                self.host_of_agent(agent_id)
-                    .is_some_and(|host| self.connected_hosts.contains(&host))
-                    .then(crate::protocol::transcript::RuntimeState::default)
-            }),
+            runtime: self.runtime.get(&agent_id).cloned(),
             last_user_message_at: digest.last_user_message_at,
         }
     }
@@ -684,7 +649,6 @@ impl AgentMap {
     }
 
     pub fn clear_host_runtime(&mut self, host: HostId) {
-        self.connected_hosts.remove(&host);
         let agents = self.by_host.get(&host).cloned().unwrap_or_default();
         for agent_id in agents {
             self.runtime.remove(&agent_id);
@@ -762,7 +726,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::fold::ConversationPos;
     use crate::protocol::rho2::AgentEntry;
     use crate::protocol::transcript::RuntimeKind;
 
@@ -823,12 +786,9 @@ mod tests {
         map.told(vec![named(1, None, 1)]);
         // No host has said anything yet.
         assert!(map.agent_facts(agent(1)).runtime.is_none());
-        // A connected host that says nothing of an agent has not loaded it.
+        // A connected host that says nothing of an agent says nothing.
         map.set_host_data(host, 0, 1);
-        assert_eq!(
-            map.agent_facts(agent(1)).runtime,
-            Some(RuntimeState::default())
-        );
+        assert!(map.agent_facts(agent(1)).runtime.is_none());
         map.set_runtime(
             agent(1),
             RuntimeState {
@@ -891,21 +851,8 @@ mod tests {
         assert!(!registry.set_agent_filings(filings));
     }
 
-    #[test]
-    fn a_verdict_said_twice_changes_nothing_the_second_time() {
-        let mut registry = AgentMap::default();
-        registry.mark_known(agent(1));
-        let handled = Verdict {
-            handled_through: ConversationPos(3),
-            muted: false,
-        };
-        assert!(registry.set_agent_verdict(agent(1), handled));
-        assert!(!registry.set_agent_verdict(agent(1), handled));
-        assert_eq!(registry.agent_verdict(agent(1)), handled);
-    }
-
-    /// What the rails read is the fold of the agent's mail: its status
-    /// line, and what it put to the user.
+    /// What the rails read is the fold of the agent's mail: the threads it
+    /// has with the user, and what each wants.
     #[test]
     fn the_mail_is_what_the_rails_read() {
         let host = HostId::default();
@@ -914,14 +861,17 @@ mod tests {
         let mut mirrored = named(1, None, 1);
         mirrored.tell(&to_user(1, agent(1), SendKind::Status, "reading"));
         assert_eq!(registry.told(vec![mirrored.clone()]), [agent(1)]);
-        assert_eq!(registry.agent_status(agent(1)), Some("reading"));
-        assert!(registry.agent_digest(agent(1)).unwrap().unread.is_empty());
+        assert!(
+            registry.agent_digest(agent(1)).unwrap().threads.is_empty(),
+            "a status is no thread"
+        );
         assert_eq!(registry.host_of_agent(agent(1)), Some(host));
 
         mirrored.tell(&to_user(2, agent(1), SendKind::Ask, "which one?"));
         registry.told(vec![mirrored]);
-        assert_eq!(registry.agent_status(agent(1)), None, "a send hides it");
-        assert_eq!(registry.agent_digest(agent(1)).unwrap().unread.len(), 1);
+        let digest = registry.agent_digest(agent(1)).unwrap();
+        assert_eq!(digest.threads.len(), 1);
+        assert!(digest.threads.values().all(|thread| thread.wants.is_some()));
 
         registry.reset_host(host);
         assert_eq!(registry.all_mirrored().len(), 0);

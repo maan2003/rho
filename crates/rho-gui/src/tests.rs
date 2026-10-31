@@ -592,14 +592,12 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
 }
 
 #[gpui::test]
-fn durable_deletion_removes_open_conversation_without_losing_draft(cx: &mut TestAppContext) {
+fn durable_deletion_removes_open_thread_without_losing_draft(cx: &mut TestAppContext) {
     check_durable_deletion(cx, false);
 }
 
 #[gpui::test]
-fn durable_deletion_removes_open_activity_without_losing_conversation_draft(
-    cx: &mut TestAppContext,
-) {
+fn durable_deletion_removes_open_activity_without_losing_thread_draft(cx: &mut TestAppContext) {
     check_durable_deletion(cx, true);
 }
 
@@ -650,51 +648,94 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
         })
         .unwrap();
     cx.run_until_parked();
-    assert!(display_text(&workspace, cx).contains("deleted transcript secret"));
+    // The ask is a thread the dealer holds out; the user opens it and
+    // starts a reply that only this client has.
+    let card = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .hand(cx)
+                .cards
+                .into_iter()
+                .find(|card| matches!(card.node, rho_dealer::NodeId::Mail(thread) if thread.agent == gone))
+                .expect("control: the agent's thread is dealt before deletion")
+        })
+        .unwrap();
+    let rho_dealer::NodeId::Mail(thread) = card.node.clone() else {
+        unreachable!("found as a mail card");
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.open_card(card, window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
     let editor = active_editor(&workspace, cx);
     workspace
         .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Thread(thread)
+            );
             editor.update(cx, |editor, cx| {
                 editor.insert("sole-copy unfinished draft", window, cx)
             });
             if activity {
-                workspace.open_agent_view(rho_agents_view::TranscriptView::Activity, window, cx);
+                workspace.open_activity(window, cx);
             }
         })
         .unwrap();
     cx.run_until_parked();
-    let affected_text = if activity {
-        "deleted activity secret"
-    } else {
-        "deleted transcript secret"
-    };
-    assert!(display_text(&workspace, cx).contains(affected_text));
-    workspace.update(cx, |workspace, window, cx| {
-        assert!(workspace.hand(cx).cards.iter().any(|card|
-            card.node == rho_dealer::NodeId::Agent(gone)), "control: agent is dealt before deletion");
-        story::feed(workspace, HostId::default(), story::deleted(story::own_workset(gone)), window, cx);
-        assert!(!workspace.registry.known_agents().any(|id| *id == gone));
-        assert!(workspace.registry.known_agents().any(|id| *id == peer));
-        assert!(!workspace.followed().contains(&gone));
-        assert!(workspace.open_surfaces_for_test().all(|surface| !matches!(
-            surface.key,
-            crate::pane::SurfaceKey::Transcript(id) | crate::pane::SurfaceKey::Activity(id) if id == gone
-        )));
-        assert_eq!(workspace.current_surface_key_for_test(), crate::pane::SurfaceKey::Home);
-        assert_eq!(workspace.saved_agent_draft_for_test(gone), Some("sole-copy unfinished draft"));
-        assert!(!workspace.hand(cx).cards.iter().any(|card| card.node == rho_dealer::NodeId::Agent(gone)));
-    }).unwrap();
+    let affected_text = "deleted activity secret";
+    if activity {
+        assert!(display_text(&workspace, cx).contains(affected_text));
+    }
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::deleted(story::own_workset(gone)),
+                window,
+                cx,
+            );
+            assert!(!workspace.registry.known_agents().any(|id| *id == gone));
+            assert!(workspace.registry.known_agents().any(|id| *id == peer));
+            assert!(!workspace.followed().contains(&gone));
+            assert!(
+                workspace
+                    .open_surfaces_for_test()
+                    .all(|surface| surface.key.transcript_agent() != Some(gone))
+            );
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Home
+            );
+            assert_eq!(
+                workspace.saved_thread_draft_for_test(thread),
+                Some("sole-copy unfinished draft")
+            );
+            assert!(
+                !workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == rho_dealer::NodeId::Mail(thread))
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
     assert!(!display_text(&workspace, cx).contains(affected_text));
-    // Back must not resurrect a warm Conversation or Activity surface.
+    // Back must not resurrect a warm thread or Activity surface.
     for _ in 0..3 {
-        workspace.update(cx, |workspace, window, cx| {
-            workspace.step_surface_back_for_test(window, cx);
-            assert!(!matches!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Transcript(id) | crate::pane::SurfaceKey::Activity(id) if id == gone
-            ));
-        }).unwrap();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.step_surface_back_for_test(window, cx);
+                assert_ne!(
+                    workspace.current_surface_key_for_test().transcript_agent(),
+                    Some(gone)
+                );
+            })
+            .unwrap();
         cx.run_until_parked();
         assert!(!display_text(&workspace, cx).contains(affected_text));
     }
@@ -810,18 +851,23 @@ fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -
 fn open_activity(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.open_agent_view(rho_agents_view::TranscriptView::Activity, window, cx);
+            workspace.open_activity(window, cx)
         })
         .expect("open Activity");
     cx.run_until_parked();
 }
 
+/// Back to the thread the frames were seeded as.
 fn open_conversation(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.open_agent_view(rho_agents_view::TranscriptView::Conversation, window, cx);
+            let agent_id = workspace
+                .selection
+                .selected_agent()
+                .expect("an agent is selected");
+            workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
         })
-        .expect("open Conversation");
+        .expect("open the thread");
     cx.run_until_parked();
 }
 
@@ -1091,54 +1137,6 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_agents_status_line_sits_above_the_draft(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let agent_id = agent(1);
-    let say = |status: &str, workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        let status = status.to_owned();
-        workspace
-            .update(cx, |workspace, window, cx| {
-                story::feed(
-                    workspace,
-                    HostId::default(),
-                    ready_with(
-                        vec![story::UiAgentHead {
-                            status: Some(status),
-                            ..ui_head(agent_id)
-                        }],
-                        2,
-                    ),
-                    window,
-                    cx,
-                );
-            })
-            .unwrap();
-        cx.run_until_parked();
-    };
-    // Said before the transcript opens, and shown when it does.
-    say("reading tests", &workspace, cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent_id,
-        state(vec![user("question")], vec![assistant("answer", None)]),
-    );
-    let text = display_text(&workspace, cx);
-    assert!(
-        text.contains("answer\n\nreading tests\n\nWrite a message…"),
-        "{text:?}"
-    );
-    // A new status replaces the old one rather than adding a line.
-    say("fixing the build", &workspace, cx);
-    let text = display_text(&workspace, cx);
-    assert!(
-        text.contains("answer\n\nfixing the build\n\nWrite a message…")
-            && !text.contains("reading tests"),
-        "{text:?}"
-    );
-}
-
-#[gpui::test]
 fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
@@ -1240,7 +1238,11 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     let remade = |cx: &mut TestAppContext| {
         workspace
             .update(cx, |workspace, window, cx| {
-                let model = workspace.remake_agent_model_for_test(agent_id, window, cx);
+                let model = workspace.remake_thread_model_for_test(
+                    Workspace::test_thread(agent_id),
+                    window,
+                    cx,
+                );
                 model.read(cx).prompt_text(cx)
             })
             .unwrap()
@@ -1251,10 +1253,87 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     assert_eq!(remade(cx), "", "a sent draft is not written again");
 }
 
-/// Messages written while their host is down wait in the transcript as
+/// A new mail to an agent starts a thread: it is posted with no thread,
+/// and the thread its host names it the first of is where the user lands.
+#[gpui::test]
+fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
+    use rho_agent_hosts::connection::ConnEvent;
+    use rho_agents_client::protocol::rho2::Request;
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let agent_id = agent(751);
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 752),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::Frame::from(ConnEvent::Ready),
+                window,
+                cx,
+            );
+            // An agent with one thread already: the new mail is not in it.
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(5)),
+                window,
+                cx,
+            );
+            workspace.select_agent(Some(agent_id), window, cx);
+            workspace.prompt_new_mail(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_input(*workspace, "a fresh topic");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "one mail");
+    let (call, mut stream) = calls.pop().unwrap();
+    let Request::PostMail(post) = call else {
+        panic!("expected mail: {call:?}");
+    };
+    assert_eq!(post.to, agent_id);
+    assert_eq!(post.thread, None, "a new mail starts a thread");
+    assert_eq!(
+        rho_agent_types::transcript::text_content(&post.content),
+        "a fresh topic"
+    );
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(60)),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .current_surface_key_for_test())
+            .unwrap(),
+        crate::pane::SurfaceKey::Thread(rho_dealer::MailThread {
+            agent: agent_id,
+            thread: rho_agent_types::ThreadId(rho_agent_types::MailId(60)),
+        }),
+        "the thread the mail started, not the one the agent had"
+    );
+}
+
+/// Replies written while their host is down wait in their thread as
 /// unsent and go one by one, in order, when the host is back. A send the
 /// host fails keeps them, and the next try is the same mail under the same
-/// client id; only an answer takes one off the transcript.
+/// client id; only an answer takes one off the thread.
 ///
 /// The question the user answered stays a card until the host's mail log
 /// has the answer, and the log is what reads it: the answer heard again
@@ -1280,21 +1359,28 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
             .unwrap();
         cx.run_until_parked();
     };
-    let dealt = |cx: &mut TestAppContext| {
+    let card = |cx: &mut TestAppContext| {
         workspace
             .update(cx, |workspace, _, cx| {
-                workspace
-                    .hand(cx)
-                    .cards
-                    .iter()
-                    .any(|card| card.node == rho_dealer::NodeId::Agent(agent_id))
+                workspace.hand(cx).cards.into_iter().find(|card| {
+                    matches!(card.node, rho_dealer::NodeId::Mail(thread) if thread.agent == agent_id)
+                })
             })
             .unwrap()
     };
+    let dealt = |cx: &mut TestAppContext| card(cx).is_some();
     feed(cx, ready_with(vec![ui_head(agent_id)], 732));
     feed(cx, story_wanting(agent_id, UnixMs(5)).into());
-    assert!(dealt(cx), "control: the question is a card");
-    feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
+    let question = card(cx).expect("control: the question is a card");
+    let rho_dealer::NodeId::Mail(thread) = question.node.clone() else {
+        unreachable!("found as a mail card");
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.open_card(question, window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
     feed(cx, ConnEvent::Disconnected("gone".into()).into());
 
     let editor = active_editor(&workspace, cx);
@@ -1327,6 +1413,7 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
             panic!("expected mail: {call:?}");
         };
         assert_eq!(post.to, agent_id);
+        assert_eq!(post.thread, Some(thread.thread), "a reply is in its thread");
         let text = rho_agent_types::transcript::text_content(&post.content);
         (text, post.client_id, stream)
     };
@@ -2379,7 +2466,7 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
                 workspace
                     .buffer_table()
                     .iter()
-                    .any(|(name, kind)| name.contains("conversation") && kind == "conversation")
+                    .any(|(_, kind)| kind == "mail")
             );
             assert_eq!(
                 workspace.active_agent_model().unwrap().read(cx).view(),
@@ -2420,20 +2507,21 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
     assert!(display_text(&workspace, cx).contains("unsent draft"));
     assert!(!display_text(&workspace, cx).contains("$ echo"));
 
+    // One key in a thread's normal mode is its agent's activity.
+    cx.simulate_keystrokes(*workspace, "escape ctrl-a");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .current_surface_key_for_test())
+            .unwrap(),
+        crate::pane::SurfaceKey::Activity(agent(1))
+    );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.open_menu(crate::transient::agent_menu(), window, cx);
+            workspace.step_surface_back_for_test(window, cx);
         })
-        .expect("open agent menu again");
-    cx.simulate_keystrokes(*workspace, "a");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_menu(crate::transient::agent_menu(), window, cx);
-        })
-        .expect("open agent menu from Activity");
-    cx.simulate_keystrokes(*workspace, "m");
-    cx.run_until_parked();
+        .expect("back to the thread");
     assert_eq!(active_editor(&workspace, cx), conversation);
     assert!(display_text(&workspace, cx).contains("unsent draft"));
 
@@ -2448,10 +2536,10 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
             workspace.close_current_surface(window, cx);
             assert_eq!(
                 workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Transcript(agent(1))
+                crate::pane::SurfaceKey::Thread(Workspace::test_thread(agent(1)))
             );
         })
-        .expect("close Activity without closing Conversation");
+        .expect("close Activity without closing the thread");
     open_activity(&workspace, cx);
     let reopened = workspace
         .update(cx, |workspace, _, _| {
@@ -3194,155 +3282,6 @@ fn upload_gui_telemetry_action_reports_when_no_host_is_connected(cx: &mut TestAp
     );
 }
 
-/// Restore flow: the agent's first frame is a snapshot that already carries
-/// `context_used` (agent host loaded it from the event log / transcript). The
-/// status chips must show it without any live turn happening.
-#[gpui::test]
-fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        UiAgentState {
-            exec_timings: Default::default(),
-            blocks: vec![
-                Arc::new(user("go")),
-                Arc::new(assistant("done", Some(UiMessagePhase::FinalAnswer))),
-            ],
-            status: UiAgentStatus::Idle,
-            runtime: None,
-            context_used: Some(194_816),
-            usage: Default::default(),
-        },
-    );
-    let spans = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .active_agent_model()
-                .expect("agent view")
-                .read(cx)
-                .status_span_text()
-        })
-        .expect("read spans");
-    assert!(
-        spans.contains("195k"),
-        "restored context chip missing from status spans: {spans:?}"
-    );
-}
-
-#[gpui::test]
-fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        UiAgentState {
-            exec_timings: Default::default(),
-            blocks: vec![Arc::new(user("go"))],
-            status: UiAgentStatus::Idle,
-            runtime: None,
-            context_used: Some(62_300),
-            usage: Default::default(),
-        },
-    );
-    feed_edit(&workspace, cx, agent(1), |state| {
-        state.usage = rho_agents_client::state::UiAgentUsage {
-            provider: "fable".to_owned(),
-            total: rho_agents_client::protocol::AgentUsageBucket {
-                input_tokens: 1_000_000,
-                cache_read_tokens: 1_000_000,
-                cache_write_tokens: 1_000_000,
-                output_tokens: 1_000_000,
-                ..Default::default()
-            },
-        }
-    });
-
-    let spans = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .active_agent_model()
-                .expect("agent view")
-                .read(cx)
-                .status_span_text()
-        })
-        .expect("read spans");
-    assert_eq!(spans, "62k", "transcript row keeps only context usage");
-}
-
-#[gpui::test]
-fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let agent_id = agent(1);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        name: Some("worker".to_owned()),
-                        cwd: Some("/src/rho".to_owned()),
-                        ..ui_head(agent_id)
-                    }],
-                    100,
-                ),
-                window,
-                cx,
-            );
-        })
-        .expect("register managed-workspace agent");
-    feed_frame(
-        &workspace,
-        cx,
-        agent_id,
-        UiAgentState {
-            exec_timings: Default::default(),
-            blocks: vec![Arc::new(user("go"))],
-            status: UiAgentStatus::Idle,
-            runtime: None,
-            context_used: Some(62_300),
-            usage: rho_agents_client::state::UiAgentUsage {
-                provider: "fable".to_owned(),
-                total: rho_agents_client::protocol::AgentUsageBucket {
-                    input_tokens: 1_000_000,
-                    ..Default::default()
-                },
-            },
-        },
-    );
-
-    let status = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_agent_model()
-                    .expect("agent view")
-                    .read(cx)
-                    .status_span_text()
-            })
-            .expect("read status")
-    };
-    assert!(!status(cx).contains("ws-"), "desktop hides workspace id");
-
-    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
-    cx.run_until_parked();
-    let phone = status(cx);
-    assert!(!phone.contains("ws-"), "phone status: {phone:?}");
-    assert!(!phone.contains("eng"), "phone hides role ids: {phone:?}");
-    assert!(phone.contains("62k"), "phone keeps tokens: {phone:?}");
-    assert!(!phone.contains('$'), "phone hides cost: {phone:?}");
-
-    cx.simulate_window_resize(*workspace, size(px(1200.), px(800.)));
-    cx.run_until_parked();
-    assert!(
-        !status(cx).contains("ws-"),
-        "desktop keeps workspace ids hidden after leaving phone mode"
-    );
-}
-
 /// `KeyBinding::new` panics at startup on unparseable keystrokes; the
 /// terminal escape chord is the only binding with a non-alphanumeric key.
 #[test]
@@ -3564,7 +3503,7 @@ fn uncomposed_blocks(
     workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .agent_model_for_test(agent_id)
+                .thread_model_for_test(Workspace::test_thread(agent_id))
                 .read(cx)
                 .uncomposed_blocks()
         })
@@ -3580,7 +3519,7 @@ fn gap_marker_block(
     workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .agent_model_for_test(agent_id)
+                .thread_model_for_test(Workspace::test_thread(agent_id))
                 .read(cx)
                 .gap_marker_block()
         })
@@ -3596,7 +3535,7 @@ fn transcript_point_block(
     workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .agent_model_for_test(agent_id)
+                .thread_model_for_test(Workspace::test_thread(agent_id))
                 .read(cx)
                 .store_point(&editor, cx)
                 .map(|point| point.block)
@@ -3717,7 +3656,7 @@ fn visualization_blocks(
     workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .agent_model_for_test(agent_id)
+                .thread_model_for_test(Workspace::test_thread(agent_id))
                 .read(cx)
                 .visualization_blocks()
                 .into_iter()
@@ -3842,9 +3781,9 @@ fn returning_to_a_transcript_returns_to_the_block_it_was_left_on(cx: &mut TestAp
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.open_agent(agent(1), window, cx);
+            workspace.open_thread(Workspace::test_thread(agent(1)), window, cx);
         })
-        .expect("open the transcript again");
+        .expect("open the thread again");
     cx.run_until_parked();
 
     assert_eq!(
@@ -5161,6 +5100,20 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::Ag
     )
 }
 
+/// The card of the agent's thread the dealer holds out, if any.
+fn dealt_thread(
+    workspace: &mut Workspace,
+    agent_id: AgentId,
+    cx: &mut gpui::Context<Workspace>,
+) -> Option<rho_dealer::NodeId> {
+    workspace
+        .hand(cx)
+        .cards
+        .into_iter()
+        .map(|card| card.node)
+        .find(|node| matches!(node, rho_dealer::NodeId::Mail(thread) if thread.agent == agent_id))
+}
+
 #[gpui::test]
 fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -5657,7 +5610,7 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
     let editor = active_editor(&workspace, cx);
     let model = workspace
         .update(cx, |workspace, _, _cx| {
-            workspace.agent_model_for_test(agent(1))
+            workspace.thread_model_for_test(Workspace::test_thread(agent(1)))
         })
         .expect("the agent's model");
     workspace
@@ -5977,10 +5930,11 @@ fn feed_frame(
         .update(cx, |workspace, window, cx| {
             // Transcript rendering tests use a selected agent explicitly;
             // production startup no longer derives selection from a frame.
-            if workspace.is_startup_pane() {
-                workspace.select_agent(Some(agent_id), window, cx);
-            }
+            let open = workspace.is_startup_pane();
             workspace.seed_transcript_for_test(agent_id, state, window, cx);
+            if open {
+                workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
+            }
         })
         .expect("update workspace");
     cx.run_until_parked();
@@ -5994,13 +5948,15 @@ fn feed_frames(
     let frames = frames.into_iter().collect::<Vec<_>>();
     workspace
         .update(cx, |workspace, window, cx| {
-            if workspace.is_startup_pane()
-                && let Some((agent_id, _)) = frames.first()
-            {
-                workspace.select_agent(Some(*agent_id), window, cx);
-            }
+            let open = workspace
+                .is_startup_pane()
+                .then(|| frames.first().map(|(agent_id, _)| *agent_id))
+                .flatten();
             for (agent_id, state) in frames {
                 workspace.seed_transcript_for_test(agent_id, state, window, cx);
+            }
+            if let Some(agent_id) = open {
+                workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
             }
         })
         .expect("update workspace");
@@ -6096,13 +6052,12 @@ fn long_working_text() -> String {
     "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n".to_owned()
 }
 
-/// A done verdict records the story position, not only a local hidden card.
-/// Undo takes that exact ledger mark back and the same story asks again.
+/// A done verdict records the mail it saw, not only a local hidden card.
+/// Undo takes that exact ledger mark back and the same thread asks again.
 #[gpui::test]
-fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAppContext) {
+fn thread_done_writes_its_mail_cursor_and_undo_restores_the_hand(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(701);
-    let node = rho_dealer::NodeId::Agent(agent_id);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(
@@ -6119,13 +6074,7 @@ fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAp
                 window,
                 cx,
             );
-            assert!(
-                workspace
-                    .hand(cx)
-                    .cards
-                    .iter()
-                    .any(|card| card.node == node)
-            );
+            let node = dealt_thread(workspace, agent_id, cx).expect("the ask is dealt");
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
@@ -6138,7 +6087,7 @@ fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAp
                     .marks
                     .get(&node)
                     .facts()
-                    .seen_agent()
+                    .seen_mail()
                     .is_some_and(|pos| pos > 0)
             );
             assert!(
@@ -6150,7 +6099,7 @@ fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAp
             );
             workspace.undo_verdict(window, cx);
             assert_eq!(
-                workspace.attention.marks.get(&node).facts().seen_agent(),
+                workspace.attention.marks.get(&node).facts().seen_mail(),
                 None
             );
             assert!(
@@ -6165,11 +6114,10 @@ fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext) {
+fn a_future_snooze_hides_a_thread_until_the_mark_ripens(cx: &mut TestAppContext) {
     use rho_dealer::NodeId;
     let workspace = test_workspace(cx);
     let agent_id = agent(703);
-    let node = NodeId::Agent(agent_id);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(
@@ -6186,13 +6134,7 @@ fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext)
                 window,
                 cx,
             );
-            assert!(
-                workspace
-                    .hand(cx)
-                    .cards
-                    .iter()
-                    .any(|card| card.node == node)
-            );
+            let node: NodeId = dealt_thread(workspace, agent_id, cx).expect("the ask is dealt");
             workspace.write_marks(
                 vec![said(
                     &node,
@@ -6231,7 +6173,6 @@ fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut TestAppContext) {
-    use rho_dealer::NodeId;
     let workspace = test_workspace(cx);
     let (first, second, other) = (agent(711), agent(712), agent(713));
     workspace
@@ -6260,14 +6201,12 @@ fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut Test
                     .map(|card| card.node)
                     .collect::<Vec<_>>()
             };
-            for agent_id in [second, first] {
-                workspace.take_verdict(
-                    &NodeId::Agent(agent_id),
-                    crate::attention::Verdict::Pile("ask ada".into()),
-                    cx,
-                );
+            let [first, second, other] = [first, second, other]
+                .map(|agent_id| dealt_thread(workspace, agent_id, cx).expect("each ask is dealt"));
+            for node in [&second, &first] {
+                workspace.take_verdict(node, crate::attention::Verdict::Pile("ask ada".into()), cx);
             }
-            assert_eq!(dealt(workspace, cx), vec![NodeId::Agent(other)]);
+            assert_eq!(dealt(workspace, cx), vec![other]);
 
             workspace.attention.open_pile = Some(crate::attention::OpenPile {
                 name: Some("ask ada".into()),
@@ -6276,13 +6215,13 @@ fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut Test
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(NodeId::Agent(second)),
+                Some(second),
                 "the pile deals the card put on it first, not the hand's top"
             );
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(NodeId::Agent(first))
+                Some(first)
             );
             workspace.pull_card(window, cx);
             assert!(workspace.attention.open_pile.is_none(), "the pile ran out");
