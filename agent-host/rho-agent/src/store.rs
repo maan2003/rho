@@ -572,5 +572,6 @@ pub fn wake_of(from: Address) -> InputWake {
     }
 }
 
+pub(crate) mod from_main;
 #[cfg(test)]
 mod tests;

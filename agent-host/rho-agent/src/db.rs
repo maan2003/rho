@@ -52,6 +52,8 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 /// The stamp of the rho2 store. Older stores are not migrated yet: they
 /// refuse to open ([ARCH-rho2](../specs/ARCH-rho2.md), Status).
 const CURRENT_AGENT_DB_FORMAT: &str = "rho2-1";
+#[cfg(test)]
+pub(crate) const CURRENT_FORMAT: &str = CURRENT_AGENT_DB_FORMAT;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -385,6 +387,26 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
+    if stored.as_deref() == Some(crate::store::from_main::MAIN_FORMAT) {
+        // Temporary (`temp-migration`): `rho debug rollback` puts the store
+        // back from this savepoint.
+        let hop = format!(
+            "{}->{CURRENT_AGENT_DB_FORMAT}",
+            crate::store::from_main::MAIN_FORMAT
+        );
+        db.persistent_savepoint(|write, id| {
+            write.open_table(RECOVERY).insert(hop, id);
+        })
+        .await;
+        let mut write = db.write().await;
+        crate::store::from_main::migrate(&mut write);
+        write
+            .open_table(FORMAT)
+            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
+        write.init_agent_tables();
+        write.commit();
+        return;
+    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
