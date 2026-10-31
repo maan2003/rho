@@ -3,6 +3,7 @@
 pub mod application;
 pub(crate) mod attention;
 pub(crate) mod browser;
+pub(crate) mod chat_migration;
 pub(crate) mod chime;
 pub(crate) mod commands;
 pub(crate) mod create;

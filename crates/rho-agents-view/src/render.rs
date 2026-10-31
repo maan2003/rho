@@ -8,7 +8,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{Address, AgentId, Mention, MentionKind};
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
@@ -153,6 +153,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
             BlockKind::QueuedUser
         }
         UiBlock::AgentMessage { .. } => BlockKind::User,
+        UiBlock::ChatMessage { from, .. } => match from {
+            Address::User => BlockKind::User,
+            Address::Agent(_) => BlockKind::Response { working: false },
+        },
     }
 }
 
@@ -173,8 +177,38 @@ pub fn block_visible(block: &UiBlock) -> bool {
         | UiBlock::AgentMessage { text, .. }
         | UiBlock::QueuedMessage { text, .. }
         | UiBlock::Unsent { text }
-        | UiBlock::Status { text } => !text.is_empty(),
+        | UiBlock::Status { text }
+        | UiBlock::ChatMessage { text, .. } => !text.is_empty(),
     }
+}
+
+/// Who a chat message is from and whom it mentions, as its header line
+/// says it: `eng-x · asks you · fyi for eng-y`. Empty for the user's own
+/// message that mentions nobody.
+pub fn chat_header(
+    from: Address,
+    mentions: &[Mention],
+    agent_label: &impl Fn(AgentId) -> String,
+) -> String {
+    let mut parts = Vec::new();
+    if let Address::Agent(sender) = from {
+        parts.push(agent_label(sender));
+    }
+    for mention in mentions {
+        let to = match mention.to {
+            Address::User => "you".to_owned(),
+            Address::Agent(agent) => agent_label(agent),
+        };
+        parts.push(match mention.kind {
+            MentionKind::Ask => format!("asks {to}"),
+            MentionKind::Result => format!("result for {to}"),
+            MentionKind::Fyi => format!("fyi for {to}"),
+        });
+    }
+    if from == Address::User && !parts.is_empty() {
+        parts.insert(0, "you".to_owned());
+    }
+    parts.join(" · ")
 }
 
 /// Separator inserted before a block, given the previous visible block's kind.
@@ -426,6 +460,35 @@ pub fn render_block_with_agent_labels(
             });
             spans.push(Span::new("", StyleClass::SystemInfo));
             spans.push(Span::new("\n\n", StyleClass::Default));
+        }
+        UiBlock::ChatMessage {
+            from,
+            mentions,
+            text,
+        } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            let header = chat_header(*from, mentions, agent_label);
+            if !header.is_empty() {
+                spans.push(Span::new(format!("{header}\n"), StyleClass::AgentLabel));
+            }
+            match from {
+                // The user's own words, as they were typed.
+                Address::User => {
+                    gutter_span = Some(spans.len());
+                    spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+                }
+                Address::Agent(_) => {
+                    markdown = true;
+                    let mut text = text.clone();
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    spans.push(Span::new(text, StyleClass::Default));
+                }
+            }
         }
         UiBlock::Status { text } => {
             if text.is_empty() {
@@ -784,6 +847,51 @@ mod tests {
     use rho_agent_types::UnixMs;
 
     use super::*;
+
+    /// A topic's message says who wrote it and whom it mentions, by
+    /// name: the user's own message by itself, an agent's under its name,
+    /// and each mention with its kind and who it is for.
+    #[test]
+    fn a_chat_message_names_its_sender_and_mentions() {
+        let a = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let b = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let label = |agent: AgentId| if agent == a { "Ann" } else { "Bob" }.to_owned();
+        let rendered = |from, mentions: Vec<Mention>| {
+            text_of(
+                &render_block_with_agent_labels(
+                    &UiBlock::ChatMessage {
+                        from,
+                        mentions,
+                        text: "words".into(),
+                    },
+                    None,
+                    0,
+                    &label,
+                )
+                .spans,
+            )
+        };
+        let mention = |to, kind| Mention { to, kind };
+        assert_eq!(rendered(Address::User, Vec::new()), "words\n\n");
+        assert_eq!(
+            rendered(
+                Address::Agent(a),
+                vec![
+                    mention(Address::User, MentionKind::Ask),
+                    mention(Address::Agent(b), MentionKind::Fyi),
+                ],
+            ),
+            "Ann · asks you · fyi for Bob\nwords\n"
+        );
+        assert_eq!(
+            rendered(
+                Address::User,
+                vec![mention(Address::Agent(b), MentionKind::Result)]
+            ),
+            "you · result for Bob\nwords\n\n"
+        );
+        assert_eq!(rendered(Address::Agent(b), Vec::new()), "Bob\nwords\n");
+    }
 
     fn tool(status: UiToolStatus) -> UiTool {
         UiTool {

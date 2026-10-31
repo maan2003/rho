@@ -15,10 +15,10 @@ use clap::Args as ClapArgs;
 use rho_agent_types::{
     Address, AgentId, ContentPart, InputWake, MailId, ThreadId, WorksetId, WorksetKind, Wpos,
 };
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
 use rho_agents_client::protocol::worksets::{
     ClientFrame, CreateWorkset, LogEvent, PostMail, ServerFrame,
 };
-use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
 use rho_agents_client::snippets;
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_rpc::protocol::client::Client;

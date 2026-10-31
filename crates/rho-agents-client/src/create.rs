@@ -8,7 +8,7 @@
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, Hosts};
-use rho_agent_types::{ContentPart, WorksetId, WorksetKind};
+use rho_agent_types::{WorksetId, WorksetKind};
 
 use crate::protocol::worksets::{CreateWorkset, Eval};
 use crate::snippets::{self, Runtime};
@@ -63,24 +63,21 @@ pub enum Creation {
 }
 
 impl Start {
-    /// The call that starts it, with the user's first message, which the
-    /// host mails to the agent the code creates.
-    pub fn creation(&self, runtime: &Runtime, message: Option<Vec<ContentPart>>) -> Creation {
+    /// The call that starts it. The user's first message starts a topic
+    /// with the agent once the host answers which agent it made.
+    pub fn creation(&self, runtime: &Runtime) -> Creation {
         match self {
             Self::NewOn { repo, rev } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Isolated,
                 code: snippets::new_agent_on(repo, rev, runtime),
-                message,
             }),
             Self::Here { cwd } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Host { cwd: cwd.clone() },
                 code: snippets::new_agent_in(cwd, runtime),
-                message,
             }),
             Self::Join { workset, cwd } => Creation::Eval(Eval {
                 workset: *workset,
                 code: snippets::new_agent_in(cwd, runtime),
-                message,
             }),
         }
     }
@@ -437,32 +434,26 @@ mod tests {
     }
 
     /// Each start is the call it needs: a new workset of the right kind, or
-    /// code in the workset the agent joins, and the message rides beside
-    /// the code, never in it.
+    /// code in the workset the agent joins.
     #[test]
     fn each_start_is_the_call_it_needs() {
         let runtime = Runtime::parse("sol-high").unwrap();
-        let message = Some(vec![ContentPart::Text {
-            text: "print('pwned')".into(),
-        }]);
         let workset: WorksetId = "0123456789ab".parse().unwrap();
         let joined = Start::Join {
             workset,
             cwd: "/src/rho".into(),
         }
-        .creation(&runtime, message.clone());
+        .creation(&runtime);
         let Creation::Eval(eval) = joined else {
             panic!("joining is code in the workset joined: {joined:?}");
         };
         assert_eq!(eval.workset, workset);
         assert!(eval.code.contains("new_agent(cwd=\"/src/rho\""));
-        assert_eq!(eval.message, message);
-        assert!(!eval.code.contains("pwned"), "the message is not code");
 
         let Creation::Workset(here) = (Start::Here {
             cwd: "/home/me".into(),
         })
-        .creation(&runtime, None) else {
+        .creation(&runtime) else {
             panic!("in place is a workset of its own");
         };
         assert_eq!(
@@ -475,7 +466,7 @@ mod tests {
             repo: "https://x/y".into(),
             rev: "main".into(),
         })
-        .creation(&runtime, None) else {
+        .creation(&runtime) else {
             panic!("a new clone is a workset of its own");
         };
         assert_eq!(fresh.kind, WorksetKind::Isolated);

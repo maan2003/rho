@@ -6,8 +6,8 @@
 //! reader is shown.
 //!
 //! The surface is one keyed transcript: a row is an item keyed by the card
-//! it stands for or the agent it watches, so a score change, an agent's new
-//! output line, or a card crossing the line edits that row and leaves the
+//! it stands for or the topic it lists, so a score change, a topic's new
+//! message, or a card crossing the line edits that row and leaves the
 //! cursor, the scroll, and every other row alone.
 
 use std::collections::HashSet;
@@ -18,7 +18,6 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use rho_agent_types::AgentId;
 use rho_dealer::curve::age_label;
 use rho_dealer::{Card, CardKind, NodeId};
 use rho_transcript::{Item, Transcript};
@@ -45,12 +44,15 @@ pub(crate) struct HomeRow {
     pub skipped: bool,
 }
 
-/// One agent that said something lately, by name and how long ago.
+/// One topic that moved lately, by name and how long ago. A topic with a
+/// mention the user has not seen but that wants nothing of them, an fyi,
+/// is unread: it is here and not a card.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecentRow {
-    pub agent_id: AgentId,
+    pub topic: NodeId,
     pub name: String,
     pub label: String,
+    pub unread: bool,
 }
 
 /// One pile the user put cards on: Enter deals from it.
@@ -68,7 +70,7 @@ pub(crate) struct PileRow {
 pub(crate) struct HomeRows {
     /// The top of the queue above the cutoff: a preview, not the queue.
     pub next: Vec<HomeRow>,
-    /// The agents that sent lately, newest first, but for those already in
+    /// The topics that moved lately, newest first, but for those already in
     /// `next`. Folded until opened: what wants the reader is a card above.
     pub recent: Vec<RecentRow>,
     /// Every pile, all of them: a pile nobody sees is where cards go to die.
@@ -96,14 +98,14 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
     }
 }
 
-/// What a card is called on a Home row. A mail or Slack thread is who it
-/// is with and what it is about, and anything else is its title.
+/// What a card is called on a Home row. A topic or Slack thread is where
+/// it is and what it is about, and anything else is its title.
 pub(crate) fn card_title(card: &Card) -> String {
     let title = card.title.lines().next().unwrap_or_default();
     match card.kind {
-        CardKind::Mail | CardKind::Slack if card.context.is_empty() => title.to_owned(),
-        CardKind::Mail | CardKind::Slack if title.is_empty() => card.context.clone(),
-        CardKind::Mail | CardKind::Slack => format!("{} › {title}", card.context),
+        CardKind::Topic | CardKind::Slack if card.context.is_empty() => title.to_owned(),
+        CardKind::Topic | CardKind::Slack if title.is_empty() => card.context.clone(),
+        CardKind::Topic | CardKind::Slack => format!("{} › {title}", card.context),
         CardKind::Dated => title.to_owned(),
     }
 }
@@ -118,7 +120,6 @@ pub(crate) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HomeTarget {
     Card(NodeId),
-    Agent(AgentId),
     /// The recent heading: Enter folds or unfolds it.
     Recent,
     /// A pile, dealt from on Enter; `None` is everything snoozed.
@@ -133,7 +134,7 @@ pub(crate) enum HomeTarget {
 enum HomeKey {
     Section(&'static str),
     Card(NodeId),
-    Agent(AgentId),
+    Recent(NodeId),
     Pile(Option<String>),
     Empty,
 }
@@ -468,13 +469,17 @@ fn card_line(
 }
 
 fn recent_line(row: &RecentRow, column: usize) -> Item<HomeKey, HomeClass, HomeTarget> {
+    let label = match row.unread {
+        true => format!("unread · {}", row.label),
+        false => row.label.clone(),
+    };
     let (text, styles) = columns(&[
         (row.name.as_str(), HomeClass::Title, column),
-        (row.label.as_str(), HomeClass::Muted, 0),
+        (label.as_str(), HomeClass::Muted, 0),
     ]);
-    Item::new(HomeKey::Agent(row.agent_id), text)
+    Item::new(HomeKey::Recent(row.topic.clone()), text)
         .with_styles(styles)
-        .with_lines(vec![HomeTarget::Agent(row.agent_id)])
+        .with_lines(vec![HomeTarget::Card(row.topic.clone())])
 }
 
 /// Lays out one row: two leading spaces, then each cell padded to its
@@ -557,28 +562,28 @@ mod tests {
         assert_eq!(rows.next[0].title, "#design › can you look at the deploy?");
         assert_eq!(rows.next[0].label, "needs reply · 1.9h");
 
-        let mail = Card {
-            kind: CardKind::Mail,
-            context: "eng-b8os".to_owned(),
+        let topic = Card {
+            kind: CardKind::Topic,
+            context: "rho".to_owned(),
             title: "is the deploy green?".to_owned(),
             ..card("", 1.0)
         };
         assert_eq!(
-            card_title(&mail),
-            "eng-b8os › is the deploy green?",
-            "a mail row is the agent and the thread, as a Slack row is"
+            card_title(&topic),
+            "rho › is the deploy green?",
+            "a topic row is its stream and its name, as a Slack row is"
         );
     }
 
     #[test]
     fn a_card_row_is_one_line_cut_to_fit() {
-        let mail = Card {
-            kind: CardKind::Mail,
-            context: "eng-b8os".to_owned(),
+        let topic = Card {
+            kind: CardKind::Topic,
+            context: "rho".to_owned(),
             title: "is the deploy green?\nsecond line".to_owned(),
             ..card("", 1.0)
         };
-        assert_eq!(card_title(&mail), "eng-b8os › is the deploy green?");
+        assert_eq!(card_title(&topic), "rho › is the deploy green?");
 
         let row = |title: &str| HomeRow {
             card: NodeId::Note(uuid::Uuid::nil()),

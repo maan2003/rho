@@ -1,7 +1,7 @@
-//! The fold: what a client makes of mail, the directory, and the workset
-//! rows it reads.
+//! The fold: what a client makes of the directory, chat messages, and the
+//! workset rows it reads.
 //!
-//! The host sends facts: the mail log, the directory's whole entries, and a
+//! The host sends facts: the chat log, the directory's whole entries, and a
 //! workset's rows when a transcript is open. Everything a rail or a
 //! transcript shows is folded from them here, on the client, so the wire
 //! carries facts and never conclusions.
@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rho_agent_types::{
-    Address, AgentId, Mail, MailId, Place, SendKind, ThreadId, UnixMs, WorksetKind, Wpos, props,
+    Address, AgentId, Message, MessageId, Place, UnixMs, WorksetKind, Wpos, props,
 };
 
 use crate::HostId;
@@ -18,15 +18,6 @@ use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
 use crate::protocol::worksets::{AgentEntry, LogEvent};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
-
-/// What the agent put to the user that wants an answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Said {
-    /// Mail asking for something the work needs.
-    Ask,
-    /// Mail delivering what the user asked for.
-    Result,
-}
 
 /// What an agent is: its directory entry and the kind of workset it is
 /// in. Never what has happened to it; that is the [`Digest`].
@@ -62,9 +53,9 @@ impl AgentIdentity {
         AgentId::from_encoded(self.prop(props::PARENT)?).ok()
     }
 
-    /// Whether the agent belongs in the user's list and the dealer.
+    /// Whether the user manages the agent: one no other agent made.
     pub fn user_facing(&self) -> bool {
-        self.prop(props::USER_FACING) == Some("true")
+        self.parent().is_none()
     }
 
     /// The prefix of the agent's label: `adv` for an advisor, `eng` for
@@ -105,7 +96,7 @@ impl AgentIdentity {
 
 impl AgentIdentity {
     /// An agent of an isolated workset with these props, on the default
-    /// runtime: what a test that folds mail into an agent starts from.
+    /// runtime: what a test that folds messages into an agent starts from.
     pub fn for_test(agent: AgentId, props: rho_agent_types::Props, created_at: UnixMs) -> Self {
         Self {
             entry: AgentEntry {
@@ -128,109 +119,29 @@ impl AgentIdentity {
 /// prefix reads it.
 pub const PRESET: &str = "preset";
 
-/// What the rails read of an agent, folded from its mail. Only the
-/// conversation with the user counts: what the agent says to other agents,
-/// and whether it is running, do not.
+/// What the rails read of an agent, folded from the messages it posted or
+/// received. Only messages count: whether it is running does not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Digest {
-    /// One past the newest mail folded; older mail is a replay.
-    mail_next: MailId,
     pub last_active: UnixMs,
     pub last_user_message_at: UnixMs,
     pub last_user_message_text: String,
-    /// When it last sent the user anything but a status.
-    pub last_sent_at: Option<UnixMs>,
-    /// Its threads with the user, by the mail that started each.
-    pub threads: std::collections::BTreeMap<ThreadId, ThreadDigest>,
-}
-
-/// A thread of mail between the user and an agent, as a card reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadDigest {
-    /// The first line of the mail that started it.
-    pub title: String,
-    /// The newest mail in it. A status is not: it says what the agent is
-    /// doing, not something said in the thread.
-    pub newest: MailId,
-    /// The agent's newest ask or result to the user since the user last
-    /// wrote in it. An fyi or a status neither is one nor hides one.
-    pub wants: Option<Wanting>,
-    /// When the user last wrote in it.
-    pub user_wrote_at: Option<UnixMs>,
-}
-
-/// A mail that wants the user: what it says, which mail, and when.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Wanting {
-    pub said: Said,
-    pub mail: MailId,
-    pub at: UnixMs,
 }
 
 impl Digest {
-    /// Folds one mail of `agent`'s. Mail already held is skipped, so a
-    /// replayed page is harmless; returns whether anything was new.
-    pub fn tell(&mut self, agent: AgentId, mail: &Mail) -> bool {
-        if mail.id < self.mail_next {
-            return false;
-        }
-        self.mail_next = mail.id.next();
-        self.last_active = self.last_active.max(mail.at);
-        let me = Address::Agent(agent);
-        self.thread_tell(me, mail);
-        if mail.from == Address::User && mail.to == me {
-            self.last_user_message_at = mail.at;
-            self.last_user_message_text = one_line(&text(mail));
-        } else if mail.from == me && mail.to == Address::User && mail.kind != Some(SendKind::Status)
-        {
-            self.last_sent_at = Some(mail.at);
-        }
-        true
-    }
-
-    /// Folds one mail into its thread, if the thread is between the user
-    /// and the agent.
-    fn thread_tell(&mut self, me: Address, mail: &Mail) {
-        let from_user = mail.from == Address::User && mail.to == me;
-        let to_user = mail.from == me && mail.to == Address::User;
-        if !(from_user || to_user) || mail.kind == Some(SendKind::Status) {
-            return;
-        }
-        let thread = self
-            .threads
-            .entry(mail.thread)
-            .or_insert_with(|| ThreadDigest {
-                // The root names the thread; a thread first heard of after
-                // its root is named by what was heard.
-                title: one_line(&text(mail)),
-                newest: mail.id,
-                wants: None,
-                user_wrote_at: None,
-            });
-        if mail.id == mail.thread.0 {
-            thread.title = one_line(&text(mail));
-        }
-        thread.newest = mail.id;
-        let said = match mail.kind {
-            Some(SendKind::Ask) => Some(Said::Ask),
-            Some(SendKind::Result) => Some(Said::Result),
-            Some(SendKind::Fyi | SendKind::Status) | None => None,
-        };
-        if from_user {
-            thread.wants = None;
-            thread.user_wrote_at = Some(mail.at);
-        } else if let Some(said) = said {
-            thread.wants = Some(Wanting {
-                said,
-                mail: mail.id,
-                at: mail.at,
-            });
+    /// Folds one message the agent posted or received. The chat fold hands
+    /// each message over once ([`crate::chat::HostChat::tell`]).
+    pub fn tell(&mut self, message: &Message) {
+        self.last_active = self.last_active.max(message.at);
+        if message.from == Address::User {
+            self.last_user_message_at = message.at;
+            self.last_user_message_text = one_line(&text(message));
         }
     }
 }
 
-fn text(mail: &Mail) -> String {
-    rho_agent_types::transcript::text_content(&mail.content)
+fn text(message: &Message) -> String {
+    rho_agent_types::transcript::text_content(&message.content)
 }
 
 /// One agent as the client holds it.
@@ -242,18 +153,13 @@ pub struct MirroredAgent {
 }
 
 impl MirroredAgent {
-    /// An agent the directory named, before any of its mail.
+    /// An agent the directory named, before any of its messages.
     pub fn new(host: HostId, identity: AgentIdentity) -> Self {
         Self {
             host,
             identity,
             digest: Digest::default(),
         }
-    }
-
-    /// Folds one of its mail; returns whether it was new.
-    pub fn tell(&mut self, mail: &Mail) -> bool {
-        self.digest.tell(self.agent_id(), mail)
     }
 
     pub fn agent_id(&self) -> AgentId {
@@ -278,82 +184,47 @@ pub fn one_line(text: &str) -> String {
 }
 
 /// One thing a transcript is folded from: a row of the agent's workset log
-/// that is about it, or a mail from or to it.
+/// that is about it, or a message it posted or received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptRow {
     Log(Wpos, LogEvent),
-    Mail(Mail),
+    Message(Message),
 }
 
 impl TranscriptRow {
     pub fn at(&self) -> UnixMs {
         match self {
             Self::Log(_, event) => event.at(),
-            Self::Mail(mail) => mail.at,
+            Self::Message(message) => message.at,
         }
     }
 }
 
-/// An agent's workset rows and its mail as one transcript, in time order:
+/// An agent's workset rows and its messages as one transcript, in time order:
 /// each is in its own order already, and the two meet where their clocks
 /// say. Rows about other agents are left out.
 pub fn interleave(
     agent: AgentId,
     rows: impl IntoIterator<Item = (Wpos, LogEvent)>,
-    mails: impl IntoIterator<Item = Mail>,
+    messages: impl IntoIterator<Item = Message>,
 ) -> Vec<TranscriptRow> {
     let mut rows = rows
         .into_iter()
         .filter(|(_, event)| event.agent() == Some(agent))
         .map(|(pos, event)| TranscriptRow::Log(pos, event))
         .peekable();
-    let mut mails = mails.into_iter().map(TranscriptRow::Mail).peekable();
+    let mut messages = messages.into_iter().map(TranscriptRow::Message).peekable();
     let mut merged = Vec::new();
     loop {
-        let next = match (rows.peek(), mails.peek()) {
-            (Some(row), Some(mail)) if mail.at() < row.at() => mails.next(),
+        let next = match (rows.peek(), messages.peek()) {
+            (Some(row), Some(message)) if message.at() < row.at() => messages.next(),
             (Some(_), _) => rows.next(),
-            (None, _) => mails.next(),
+            (None, _) => messages.next(),
         };
         match next {
             Some(row) => merged.push(row),
             None => return merged,
         }
-    }
-}
-
-/// One mail thread between the user and an agent, as its mails were
-/// written, oldest first, then what the user wrote in it that no host has
-/// taken yet. A status is the agent's status line, not something said in
-/// the thread.
-pub fn thread_state(
-    agent: AgentId,
-    thread: ThreadId,
-    mails: &[Mail],
-    unsent: &[String],
-) -> UiAgentState {
-    let me = Address::Agent(agent);
-    let said = mails
-        .iter()
-        .filter(|mail| mail.thread == thread && mail.kind != Some(SendKind::Status))
-        .filter_map(|mail| match (mail.from, mail.to) {
-            (Address::User, to) if to == me => Some(UiBlock::UserMessage { text: text(mail) }),
-            (from, Address::User) if from == me => Some(UiBlock::MessageSent {
-                to: None,
-                text: text(mail),
-            }),
-            _ => None,
-        });
-    let waiting = unsent
-        .iter()
-        .map(|text| UiBlock::Unsent { text: text.clone() });
-    UiAgentState {
-        exec_timings: Arc::default(),
-        blocks: said.chain(waiting).map(Arc::new).collect(),
-        status: UiAgentStatus::Idle,
-        runtime: None,
-        context_used: None,
-        usage: UiAgentUsage::default(),
     }
 }
 
@@ -373,23 +244,25 @@ pub struct TranscriptFold {
     timing_events: Vec<(Wpos, String, rho_agent_types::ExecMilestone, UnixMs)>,
     /// One past the newest row folded.
     next: Wpos,
-    /// One past the newest mail folded.
-    mail_next: MailId,
+    /// The newest message folded.
+    message_newest: Option<MessageId>,
     /// Shared with every state handed out, so a row costs the blocks it
     /// adds or changes and a state is a list of pointers.
     blocks: Vec<Arc<UiBlock>>,
     /// The row each block came from, so a rewind drops exactly what was
-    /// told after it. `None` for mail, which no rewind takes back.
+    /// told after it. `None` for a message, which no rewind takes back.
     told_at: Vec<Option<Wpos>>,
     /// Inputs no request has carried yet; drawn after the blocks.
     queue: Vec<(Wpos, Waiting, UiBlock)>,
-    /// Mail to the agent that no input has handed it yet; drawn last.
-    mailbox: Vec<(MailId, UiBlock)>,
-    /// Mail an input has handed over, so mail heard after its input is
-    /// not shown waiting.
-    handed: BTreeSet<MailId>,
-    /// Who wrote each mail to the agent, for the input that hands it over.
-    senders: HashMap<MailId, Address>,
+    /// Messages the agent received that no input has handed it yet; drawn
+    /// last.
+    mailbox: Vec<(MessageId, UiBlock)>,
+    /// Messages an input has handed over, so a message heard after its
+    /// input is not shown waiting.
+    handed: BTreeSet<MessageId>,
+    /// Who wrote each message the agent received, for the input that
+    /// hands it over.
+    senders: HashMap<MessageId, Address>,
     /// The agent stopped on an error and nobody has written since.
     errored: bool,
     /// What the last reply said the context holds, and where it said it.
@@ -422,7 +295,7 @@ impl TranscriptFold {
             exec_timings: Arc::default(),
             timing_events: Vec::new(),
             next: Wpos::ZERO,
-            mail_next: MailId::default(),
+            message_newest: None,
             blocks: Vec::new(),
             told_at: Vec::new(),
             queue: Vec::new(),
@@ -468,7 +341,8 @@ impl TranscriptFold {
     }
 
     /// The composed transcript from one index on: the folded blocks, then
-    /// the inputs no request has carried yet, then mail not yet handed over.
+    /// the inputs no request has carried yet, then messages not yet handed
+    /// over.
     fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
         if from < self.blocks.len() {
             self.blocks[from..]
@@ -548,14 +422,17 @@ impl TranscriptFold {
         let mut compaction = false;
         for (_, waiting, queued) in std::mem::take(&mut self.queue) {
             compaction |= waiting == Waiting::Compaction;
-            // Delivered mail is still mail: a rewind of the turn it started
-            // does not unsay what was written.
-            self.push((waiting != Waiting::Mail).then_some(pos), delivered(queued));
+            // A delivered message is still a message: a rewind of the turn
+            // it started does not unsay what was written.
+            self.push(
+                (waiting != Waiting::Message).then_some(pos),
+                delivered(queued),
+            );
         }
         compaction
     }
 
-    /// Folds one row. Rows and mail already held are skipped, as are rows
+    /// Folds one row. Rows and messages already held are skipped, as are rows
     /// about another agent, so a repeated page is harmless; returns
     /// whether anything was new.
     pub fn tell(&mut self, row: &TranscriptRow) -> bool {
@@ -567,50 +444,43 @@ impl TranscriptFold {
                 self.next = pos.next();
                 self.tell_row(*pos, event);
             }
-            TranscriptRow::Mail(mail) => {
-                if mail.id < self.mail_next {
+            TranscriptRow::Message(message) => {
+                if self.message_newest >= Some(message.id) {
                     return false;
                 }
-                self.mail_next = mail.id.next();
-                self.tell_mail(mail);
+                self.message_newest = Some(message.id);
+                self.tell_message(message);
             }
         }
         true
     }
 
-    fn tell_mail(&mut self, mail: &Mail) {
-        let me = Address::Agent(self.agent);
-        if mail.from == me {
-            // A status is the status line, not a message.
-            if mail.kind == Some(SendKind::Status) && mail.to == Address::User {
-                return;
-            }
-            let to = match mail.to {
-                Address::User => None,
-                Address::Agent(agent) => Some(agent),
-            };
+    /// A message the agent posted, or one it received: the model hands a
+    /// transcript only those.
+    fn tell_message(&mut self, message: &Message) {
+        if message.from == Address::Agent(self.agent) {
             self.push(
                 None,
                 UiBlock::MessageSent {
-                    to,
-                    text: text(mail),
+                    to: None,
+                    text: text(message),
                 },
             );
-        } else if mail.to == me {
-            self.senders.insert(mail.id, mail.from);
-            if self.handed.contains(&mail.id) {
-                return;
-            }
-            self.errored = false;
-            self.touch(self.queue_end() + self.mailbox.len());
-            self.mailbox.push((
-                mail.id,
-                UiBlock::QueuedMessage {
-                    text: text(mail),
-                    sender: sender(mail.from),
-                },
-            ));
+            return;
         }
+        self.senders.insert(message.id, message.from);
+        if self.handed.contains(&message.id) {
+            return;
+        }
+        self.errored = false;
+        self.touch(self.queue_end() + self.mailbox.len());
+        self.mailbox.push((
+            message.id,
+            UiBlock::QueuedMessage {
+                text: text(message),
+                sender: sender(message.from),
+            },
+        ));
     }
 
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
@@ -634,13 +504,13 @@ impl TranscriptFold {
                     tool.timing = self.exec_timings[id];
                 }
             }
-            LogEvent::Input { mail, text, .. } => {
+            LogEvent::Input { message, text, .. } => {
                 self.errored = false;
-                let block = match mail {
+                let block = match message {
                     Some(id) => {
                         self.handed.insert(*id);
-                        // The mail as its sender wrote it; the row's text is
-                        // what the policy made of it for the model.
+                        // The message as its sender wrote it; the row's text
+                        // is what the policy made of it for the model.
                         match self.mailbox.iter().position(|(waiting, _)| waiting == id) {
                             Some(index) => {
                                 self.touch(self.queue_end() + index);
@@ -652,14 +522,14 @@ impl TranscriptFold {
                             },
                         }
                     }
-                    // Not mail: what the policy has to tell the agent.
+                    // No message: what the policy has to tell the agent.
                     None => UiBlock::Notice { text: text.clone() },
                 };
                 self.touch(self.queue_end());
                 self.queue.push((
                     pos,
-                    match mail {
-                        Some(_) => Waiting::Mail,
+                    match message {
+                        Some(_) => Waiting::Message,
                         None => Waiting::Input,
                     },
                     block,
@@ -806,7 +676,7 @@ impl TranscriptFold {
                 }
             }
             // A rewind is told rather than unwritten, so the reader is the
-            // one that hides what it undid. Mail stays: it was sent.
+            // one that hides what it undid. Messages stay: they were sent.
             LogEvent::Rewound { to, .. } => {
                 self.timing_events.retain(|(pos, ..)| pos < to);
                 let timings = Arc::make_mut(&mut self.exec_timings);
@@ -883,8 +753,8 @@ fn sender(from: Address) -> Option<AgentId> {
 enum Waiting {
     /// What the policy has to tell the agent.
     Input,
-    /// An input that hands over mail.
-    Mail,
+    /// An input that hands over a message.
+    Message,
     /// A request to compact the context.
     Compaction,
 }
@@ -929,10 +799,10 @@ mod tests {
         )
     }
 
-    fn input(text: &str, mail: Option<u64>, at: u64) -> LogEvent {
+    fn input(text: &str, message: Option<u64>, at: u64) -> LogEvent {
         LogEvent::Input {
             agent: me(),
-            mail: mail.map(MailId),
+            message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
             text: text.to_owned(),
             wake: rho_agent_types::InputWake::Person,
             at: UnixMs(at),
@@ -959,26 +829,31 @@ mod tests {
         }
     }
 
-    fn mail(id: u64, from: Address, to: Address, kind: Option<SendKind>, at: u64) -> Mail {
-        Mail {
-            id: MailId(id),
+    fn message(id: u64, from: Address, at: u64) -> Message {
+        Message {
+            id: MessageId(rho_agent_types::ChatSeq(id)),
             at: UnixMs(at),
+            topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(1)),
             from,
-            to,
-            thread: rho_agent_types::ThreadId(MailId(id)),
-            kind,
+            mentions: Vec::new(),
             content: vec![rho_agent_types::ContentPart::Text {
-                text: format!("mail {id}"),
+                text: format!("message {id}"),
             }],
         }
     }
 
-    fn to_user(id: u64, kind: SendKind, at: u64) -> Mail {
-        mail(id, Address::Agent(me()), Address::User, Some(kind), at)
+    fn to_user(id: u64, kind: rho_agent_types::MentionKind, at: u64) -> Message {
+        Message {
+            mentions: vec![rho_agent_types::Mention {
+                to: Address::User,
+                kind,
+            }],
+            ..message(id, Address::Agent(me()), at)
+        }
     }
 
-    fn from_user(id: u64, at: u64) -> Mail {
-        mail(id, Address::User, Address::Agent(me()), None, at)
+    fn from_user(id: u64, at: u64) -> Message {
+        message(id, Address::User, at)
     }
 
     fn only_tool(state: &UiAgentState) -> &UiTool {
@@ -1191,31 +1066,25 @@ mod tests {
         assert!(merged.is_empty());
     }
 
-    /// Mail to the agent waits until an input hands it over, then reads as
-    /// the mail does, from whoever wrote it, and is never shown twice;
-    /// what the agent mails out is in its transcript, except a status.
+    /// A message the agent received waits until an input hands it over,
+    /// then reads as it was written, from whoever wrote it, and is never
+    /// shown twice; what the agent posts is in its transcript.
     #[test]
-    fn mail_waits_until_an_input_hands_it_over() {
+    fn a_message_waits_until_an_input_hands_it_over() {
         let peer = agent(2);
         let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Mail(mail(
-            3,
-            Address::Agent(peer),
-            Address::Agent(me()),
-            None,
-            1,
-        )));
-        fold.tell(&TranscriptRow::Mail(from_user(4, 2)));
+        fold.tell(&TranscriptRow::Message(message(3, Address::Agent(peer), 1)));
+        fold.tell(&TranscriptRow::Message(from_user(4, 2)));
         let state = fold.state();
         assert_eq!(state.blocks.len(), 2, "both wait");
         assert!(matches!(&*state.blocks[0],
             UiBlock::QueuedMessage { sender: Some(sender), .. } if *sender == peer));
 
-        // The policy wraps the mail for the model; the reader sees the
-        // mail as it was written.
+        // The policy wraps the message for the model; the reader sees the
+        // message as it was written.
         fold.tell(&TranscriptRow::Log(
             Wpos(0),
-            input("Message from eng-peer:\nmail 3", Some(3), 3),
+            input("Message from eng-peer:\nmessage 3", Some(3), 3),
         ));
         fold.tell(&TranscriptRow::Log(Wpos(1), sent_row(4)));
         let state = fold.state();
@@ -1223,43 +1092,50 @@ mod tests {
             *state.blocks[0],
             UiBlock::AgentMessage {
                 sender: peer,
-                text: "mail 3".into()
+                text: "message 3".into()
             }
         );
-        assert_eq!(state.blocks.len(), 2, "the user's mail still waits, once");
+        assert_eq!(
+            state.blocks.len(),
+            2,
+            "the user's message still waits, once"
+        );
         assert!(matches!(&*state.blocks[1],
-            UiBlock::QueuedMessage { sender: None, text } if text == "mail 4"));
+            UiBlock::QueuedMessage { sender: None, text } if text == "message 4"));
 
-        fold.tell(&TranscriptRow::Mail(to_user(5, SendKind::Status, 5)));
-        fold.tell(&TranscriptRow::Mail(to_user(6, SendKind::Ask, 6)));
+        fold.tell(&TranscriptRow::Message(to_user(
+            6,
+            rho_agent_types::MentionKind::Ask,
+            6,
+        )));
         let state = fold.state();
-        assert_eq!(state.blocks.len(), 3, "a status is not a message");
+        assert_eq!(state.blocks.len(), 3);
         assert!(matches!(&*state.blocks[1],
-            UiBlock::MessageSent { to: None, text } if text == "mail 6"));
+            UiBlock::MessageSent { to: None, text } if text == "message 6"));
         assert!(
             matches!(&*state.blocks[2], UiBlock::QueuedMessage { .. }),
-            "waiting mail stays last"
+            "a waiting message stays last"
         );
     }
 
-    /// An input may be heard before the mail it hands over: the mail then
-    /// never waits.
+    /// An input may be heard before the message it hands over: the message
+    /// then never waits.
     #[test]
-    fn mail_heard_after_its_input_does_not_wait() {
+    fn a_message_heard_after_its_input_does_not_wait() {
         let mut fold = TranscriptFold::new(me(), &[]);
         fold.tell(&TranscriptRow::Log(Wpos(0), input("hello", Some(9), 2)));
-        fold.tell(&TranscriptRow::Mail(from_user(9, 1)));
+        fold.tell(&TranscriptRow::Message(from_user(9, 1)));
         let state = fold.state();
         assert_eq!(state.blocks.len(), 1);
         assert!(
-            !fold.tell(&TranscriptRow::Mail(from_user(9, 1))),
+            !fold.tell(&TranscriptRow::Message(from_user(9, 1))),
             "a replay"
         );
     }
 
-    /// A rewind takes back rows, not mail: what was mailed was sent.
+    /// A rewind takes back rows, not messages: what was posted was sent.
     #[test]
-    fn a_rewind_hides_rows_but_not_mail() {
+    fn a_rewind_hides_rows_but_not_messages() {
         let rows = interleave(
             me(),
             [
@@ -1290,9 +1166,12 @@ mod tests {
                     },
                 ),
             ],
-            [to_user(7, SendKind::Result, 3)],
+            [to_user(7, rho_agent_types::MentionKind::Result, 3)],
         );
-        assert!(matches!(rows[2], TranscriptRow::Mail(_)), "merged by time");
+        assert!(
+            matches!(rows[2], TranscriptRow::Message(_)),
+            "merged by time"
+        );
         let state = transcript(me(), &rows);
         assert_eq!(
             state.blocks,
@@ -1302,20 +1181,20 @@ mod tests {
                 }),
                 Arc::new(UiBlock::MessageSent {
                     to: None,
-                    text: "mail 7".to_owned()
+                    text: "message 7".to_owned()
                 }),
             ]
         );
     }
 
-    /// The user's mail an input handed over stays when the turn it started
-    /// is rewound; the input's own notice and the reply go.
+    /// The user's message an input handed over stays when the turn it
+    /// started is rewound; the input's own notice and the reply go.
     #[test]
-    fn a_rewind_keeps_the_mail_its_inputs_handed_over() {
+    fn a_rewind_keeps_the_messages_its_inputs_handed_over() {
         let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Mail(from_user(1, 1)));
+        fold.tell(&TranscriptRow::Message(from_user(1, 1)));
         let rows = [
-            input("Message from the user:\nmail 1", Some(1), 2),
+            input("Message from the user:\nmessage 1", Some(1), 2),
             sent_row(3),
             replied(
                 vec![Item::Text {
@@ -1340,7 +1219,7 @@ mod tests {
         assert_eq!(
             fold.state().blocks,
             vec![Arc::new(UiBlock::UserMessage {
-                text: "mail 1".to_owned()
+                text: "message 1".to_owned()
             })]
         );
     }
@@ -1462,137 +1341,16 @@ mod tests {
         assert_eq!(timing.boundary_at, None);
     }
 
-    fn digest(mails: &[Mail]) -> Digest {
+    /// What the user last wrote to the agent is what the rails find it
+    /// by; what the agent posts moves only when it was last active.
+    #[test]
+    fn a_digest_keeps_what_the_user_last_wrote() {
         let mut digest = Digest::default();
-        for mail in mails {
-            digest.tell(me(), mail);
-        }
-        digest
-    }
-
-    /// A thread is named by its root and wants the user only while its
-    /// newest mail is the agent's ask or result to them. A status does not
-    /// move it; mail between agents is no thread of the user's.
-    #[test]
-    fn a_thread_wants_the_user_while_its_newest_mail_asks_or_answers() {
-        let in_thread = |mut mail: Mail, root: u64| {
-            mail.thread = ThreadId(MailId(root));
-            mail
-        };
-        let peer = Address::Agent(agent(2));
-        let mut digest = digest(&[
-            from_user(1, 1),
-            in_thread(to_user(2, SendKind::Ask, 2), 1),
-            to_user(3, SendKind::Result, 3),
-            in_thread(to_user(4, SendKind::Status, 4), 1),
-            mail(5, Address::Agent(me()), peer, Some(SendKind::Ask), 5),
-        ]);
-        assert_eq!(
-            digest.threads.keys().copied().collect::<Vec<_>>(),
-            [ThreadId(MailId(1)), ThreadId(MailId(3))]
-        );
-        let wants = |digest: &Digest, root| {
-            digest.threads[&ThreadId(MailId(root))]
-                .wants
-                .map(|wanting| (wanting.said, wanting.mail))
-        };
-        let first = &digest.threads[&ThreadId(MailId(1))];
-        assert_eq!(first.title, "mail 1");
-        assert_eq!(first.newest, MailId(2), "a status is not in it");
-        assert_eq!(first.user_wrote_at, Some(UnixMs(1)));
-        assert_eq!(wants(&digest, 1), Some((Said::Ask, MailId(2))));
-        assert_eq!(digest.threads[&ThreadId(MailId(3))].user_wrote_at, None);
-        assert_eq!(wants(&digest, 3), Some((Said::Result, MailId(3))));
-
-        digest.tell(me(), &in_thread(from_user(6, 6), 3));
-        digest.tell(me(), &in_thread(to_user(7, SendKind::Fyi, 7), 1));
-        digest.tell(me(), &in_thread(to_user(8, SendKind::Result, 8), 1));
-        assert_eq!(wants(&digest, 3), None, "the user answered");
-        assert_eq!(
-            wants(&digest, 1),
-            Some((Said::Result, MailId(8))),
-            "the newest ask or result, past an fyi"
-        );
-        digest.tell(me(), &in_thread(to_user(9, SendKind::Fyi, 9), 1));
-        assert_eq!(
-            wants(&digest, 1),
-            Some((Said::Result, MailId(8))),
-            "an fyi hides nothing"
-        );
-        assert_eq!(digest.threads[&ThreadId(MailId(1))].newest, MailId(9));
-    }
-
-    /// A thread shows its own mails as written, and what waits to be sent
-    /// after them; another thread's mail, a status, and mail between
-    /// agents are not in it.
-    #[test]
-    fn a_thread_shows_its_mails_as_written_then_what_waits() {
-        let in_thread = |mut mail: Mail, root: u64| {
-            mail.thread = ThreadId(MailId(root));
-            mail
-        };
-        let peer = Address::Agent(agent(2));
-        let mails = [
-            from_user(1, 1),
-            in_thread(to_user(2, SendKind::Ask, 2), 1),
-            to_user(3, SendKind::Result, 3),
-            in_thread(to_user(4, SendKind::Status, 4), 1),
-            in_thread(mail(5, Address::Agent(me()), peer, None, 5), 1),
-            in_thread(to_user(6, SendKind::Fyi, 6), 1),
-        ];
-        let state = thread_state(me(), ThreadId(MailId(1)), &mails, &["later".to_owned()]);
-        let sent = |text: &str| UiBlock::MessageSent {
-            to: None,
-            text: text.into(),
-        };
-        assert_eq!(
-            state
-                .blocks
-                .iter()
-                .map(|block| (**block).clone())
-                .collect::<Vec<_>>(),
-            [
-                UiBlock::UserMessage {
-                    text: "mail 1".into()
-                },
-                sent("mail 2"),
-                sent("mail 6"),
-                UiBlock::Unsent {
-                    text: "later".into()
-                },
-            ]
-        );
-    }
-
-    /// A status is not a send: it says what the agent is doing.
-    #[test]
-    fn a_status_is_not_a_send() {
-        let mut digest = digest(&[to_user(1, SendKind::Status, 1)]);
-        assert_eq!(digest.last_sent_at, None, "a status is not a send");
-        digest.tell(me(), &to_user(2, SendKind::Fyi, 2));
-        assert_eq!(digest.last_sent_at, Some(UnixMs(2)));
-    }
-
-    /// The same mail heard again (a reconnect replays the log from a
-    /// cursor) is not news: a thread the user answered stays answered.
-    #[test]
-    fn a_replay_is_not_news() {
-        let mut digest = digest(&[to_user(1, SendKind::Ask, 1)]);
-        let mut answer = from_user(2, 2);
-        answer.thread = ThreadId(MailId(1));
-        assert!(digest.tell(me(), &answer));
-        assert_eq!(digest.last_user_message_text, "mail 2");
-        let mut result = to_user(3, SendKind::Result, 3);
-        result.thread = ThreadId(MailId(1));
-        assert!(digest.tell(me(), &result));
-        assert!(!digest.tell(me(), &answer), "a replay is not news");
-        assert_eq!(
-            digest.threads[&ThreadId(MailId(1))]
-                .wants
-                .map(|wanting| wanting.mail),
-            Some(MailId(3)),
-            "the result after the answer is still owed"
-        );
+        digest.tell(&from_user(1, 1));
+        digest.tell(&to_user(2, rho_agent_types::MentionKind::Ask, 5));
+        assert_eq!(digest.last_user_message_text, "message 1");
+        assert_eq!(digest.last_user_message_at, UnixMs(1));
+        assert_eq!(digest.last_active, UnixMs(5));
     }
 
     #[test]
@@ -1615,7 +1373,7 @@ mod tests {
         };
         let bare = identity(&entry, WorksetKind::Isolated);
         assert_eq!(bare.name(), None);
-        assert!(!bare.user_facing());
+        assert!(bare.user_facing(), "no agent made it");
         assert_eq!(bare.handle_prefix(), "eng");
         assert_eq!(bare.place().cwd, "/src");
         assert_eq!(bare.place().workset, Some(entry.workset));
@@ -1624,7 +1382,6 @@ mod tests {
             (props::TITLE, "a title"),
             (props::NAME, " "),
             (props::PARENT, &parent.encoded()),
-            (props::USER_FACING, "true"),
             (props::CWD, "/src/rho"),
             (PRESET, "advisor"),
         ] {
@@ -1638,7 +1395,7 @@ mod tests {
         );
         assert_eq!(full.name(), Some("a title"), "a blank name is no name");
         assert_eq!(full.parent(), Some(parent));
-        assert!(full.user_facing());
+        assert!(!full.user_facing(), "another agent made it");
         assert_eq!(full.handle_prefix(), "adv");
         assert_eq!(full.place().cwd, "/src/rho");
         assert_eq!(full.place().workset, None, "a host workset is the host");

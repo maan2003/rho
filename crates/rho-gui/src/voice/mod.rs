@@ -15,7 +15,7 @@
 pub(crate) mod rtc;
 
 use rho_agent_hosts::HostId;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, TopicId};
 
 /// A session that is actually running.
 struct Running {
@@ -50,9 +50,9 @@ pub(crate) struct Voice {
     /// A session that ends on its own is started again; one the user ended
     /// is not.
     wanted: bool,
-    /// The agent the user talks to, and the agent host running the session.
-    /// The session is torn down with that host.
-    target: Option<(HostId, AgentId)>,
+    /// The agent the user talks to, the topic they talk in, and the agent
+    /// host running the session. The session is torn down with that host.
+    target: Option<(HostId, AgentId, TopicId)>,
 }
 
 impl Voice {
@@ -68,20 +68,20 @@ impl Voice {
 
     /// The agent the session talks to and the agent host it is on, if
     /// there is one.
-    pub(crate) fn target(&self) -> Option<(HostId, AgentId)> {
+    pub(crate) fn target(&self) -> Option<(HostId, AgentId, TopicId)> {
         self.target
     }
 
     /// Whether voice is running on this host, so a host going away knows
     /// whether it is taking the session with it.
     pub(crate) fn is_on(&self, host: HostId) -> bool {
-        self.target.is_some_and(|(on, _)| on == host)
+        self.target.is_some_and(|(on, ..)| on == host)
     }
 
     /// The agent a session the user wants talks to, and how it is.
     /// `None` once the user has ended it, even while it is still stopping.
     pub(crate) fn shown(&self) -> Option<(AgentId, Shown)> {
-        let (_, agent) = self.target.filter(|_| self.wanted)?;
+        let (_, agent, _) = self.target.filter(|_| self.wanted)?;
         let connected = self.running.as_ref().is_some_and(|it| it.connected);
         Some((
             agent,
@@ -121,11 +121,11 @@ impl Voice {
         self.muted = false;
     }
 
-    /// The user has asked for a session with `agent` on `host`. Recorded
-    /// before the session exists, and kept if it fails to start: which agent
-    /// voice belongs to is the ask, not the outcome.
-    pub(crate) fn wants(&mut self, host: HostId, agent: AgentId) {
-        self.target = Some((host, agent));
+    /// The user has asked for a session with `agent` in `topic` on `host`.
+    /// Recorded before the session exists, and kept if it fails to start:
+    /// which agent voice belongs to is the ask, not the outcome.
+    pub(crate) fn wants(&mut self, host: HostId, agent: AgentId, topic: TopicId) {
+        self.target = Some((host, agent, topic));
         self.wanted = true;
     }
 

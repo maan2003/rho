@@ -111,6 +111,12 @@ pub enum NodeIdentity {
         agent: String,
         thread: u64,
     },
+    /// A chat topic: its host's database seed, and the event that started
+    /// it there.
+    Topic {
+        machine_seed: u64,
+        topic: u64,
+    },
 }
 
 impl From<rho_dealer::NodeId> for NodeIdentity {
@@ -134,7 +140,11 @@ impl From<rho_dealer::NodeId> for NodeIdentity {
             NodeId::PullRequest { repo, number } => Self::PullRequest { repo, number },
             NodeId::Mail(thread) => Self::Mail {
                 agent: thread.agent.encoded(),
-                thread: thread.thread.0.0,
+                thread: thread.thread,
+            },
+            NodeId::Topic(topic) => Self::Topic {
+                machine_seed: topic.machine_seed,
+                topic: topic.topic.0.0,
             },
         }
     }
@@ -187,7 +197,10 @@ pub enum DealerCardKind {
     /// read back.
     Agent,
     Thread,
+    /// A mail thread card, which no build deals any more; kept so old
+    /// journals read back.
     Mail,
+    Topic,
 }
 
 #[derive(
@@ -298,6 +311,11 @@ pub enum SurfaceIdentity {
     },
     SlackInventory {
         name: String,
+    },
+    /// One topic, by its host's database and its id there.
+    Topic {
+        machine_seed: u64,
+        topic: u64,
     },
 }
 
@@ -716,9 +734,10 @@ pub enum Event {
         agent: String,
         title: String,
         last_user_message_at: u64,
+        /// Written by builds before chat; `None` since: an agent sends to
+        /// topics, and what wants the user is a topic's.
         last_sent_at: Option<u64>,
-        /// The strongest kind the agent's threads want of the user: `ask`
-        /// or `result`.
+        /// Written by builds before chat; `None` since, as `last_sent_at`.
         unread: Option<String>,
     },
     /// A menu item run, by its key or by a tap.

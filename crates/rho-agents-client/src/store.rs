@@ -754,13 +754,12 @@ mod tests {
         );
 
         let mut fold = TranscriptFold::new(agent(), &[]);
-        fold.tell(&TranscriptRow::Mail(rho_agent_types::Mail {
-            id: rho_agent_types::MailId(1),
+        fold.tell(&TranscriptRow::Message(rho_agent_types::Message {
+            id: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
             at: UnixMs(1),
+            topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(1)),
             from: rho_agent_types::Address::Agent(agent()),
-            to: rho_agent_types::Address::User,
-            thread: rho_agent_types::ThreadId(rho_agent_types::MailId(1)),
-            kind: Some(rho_agent_types::SendKind::Result),
+            mentions: Vec::new(),
             content: vec![rho_agent_types::ContentPart::Text {
                 text: "other cell".into(),
             }],

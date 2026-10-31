@@ -196,9 +196,13 @@ pub enum Seen {
     Slack(String),
     /// A note or a label: there is nothing more to see.
     Whole,
-    /// A mail thread, through this mail. Last: entries decode by variant
-    /// order.
+    /// A mail thread, through this mail: what thread cards read before
+    /// topics replaced them. Nothing reads it; it stays so older entries
+    /// still decode.
     Mail(u64),
+    /// A chat topic, through this message. Last: entries decode by variant
+    /// order.
+    Topic(u64),
 }
 
 /// A snooze in force or past: when it was said and when it ends.
@@ -245,11 +249,11 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// The newest mail of a thread the user had seen when done with it.
-    pub fn seen_mail(self) -> Option<u64> {
+    /// The newest message of a topic the user had seen when done with it.
+    pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
-                Seen::Mail(id) => Some(*id),
+                Seen::Topic(id) => Some(*id),
                 _ => None,
             })
             .max()
@@ -415,12 +419,12 @@ mod tests {
                 minute,
                 Fact::Settled {
                     node: agent(),
-                    seen: Seen::Mail(pos),
+                    seen: Seen::Topic(pos),
                 },
             )
         };
         let entries = [settled(0, 812), settled(1, 800)];
-        assert_eq!(Facts(&entries).seen_mail(), Some(812));
+        assert_eq!(Facts(&entries).seen_topic(), Some(812));
     }
 
     #[test]
@@ -432,7 +436,7 @@ mod tests {
                 Fact::Todo {
                     node: node.clone(),
                     start: None,
-                    seen: Seen::Mail(3),
+                    seen: Seen::Topic(3),
                 },
             ),
             entry(
@@ -446,7 +450,7 @@ mod tests {
                 2,
                 Fact::Settled {
                     node,
-                    seen: Seen::Mail(4),
+                    seen: Seen::Topic(4),
                 },
             ),
         ];
@@ -454,7 +458,7 @@ mod tests {
         assert_eq!(facts.todo(), None);
         assert_eq!(facts.snooze(), None);
         assert_eq!(facts.snoozes(), 1, "every snooze is kept");
-        assert_eq!(facts.seen_mail(), Some(4));
+        assert_eq!(facts.seen_topic(), Some(4));
     }
 
     #[test]

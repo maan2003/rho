@@ -1,12 +1,12 @@
 //! What a host says about agents, in the words the tests use: heads for the
-//! directory, stories for the mail, and the frames each stands for.
+//! directory, stories for the chat, and the frames each stands for.
 
 use std::cell::{Cell, RefCell};
 
 use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
-    Address, AgentId, ContentPart, Mail, MailId, Props, SendKind, UnixMs, WorksetId, WorksetKind,
-    props,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, MentionKind, Props,
+    StreamId, TopicId, UnixMs, WorksetId, WorksetKind, props,
 };
 use rho_agents_client::protocol::worksets::{
     self, AgentEntry, ServerFrame, SpecView, WorksetEntry,
@@ -17,7 +17,7 @@ use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agents_client::protocol::transcript::RuntimeKind;
 
-/// What the directory says about one agent, and the status it last mailed
+/// What the directory says about one agent, and the status it last told
 /// the user. Tests build these; the helpers below turn each into frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiAgentHead {
@@ -28,13 +28,13 @@ pub struct UiAgentHead {
     pub kind: WorksetKind,
     /// The policy's preset: `advisor` labels it `adv-`.
     pub preset: Option<String>,
-    pub user_facing: bool,
     pub parent: Option<AgentId>,
     pub name: Option<String>,
     pub title: Option<String>,
     /// The directory its label shows.
     pub cwd: Option<String>,
-    /// What the agent last told the user it is doing, as a status mail.
+    /// What the agent last told the user it is doing, as a message that
+    /// mentions nobody.
     pub status: Option<String>,
     pub created_at: UnixMs,
 }
@@ -55,10 +55,6 @@ impl UiAgentHead {
         set(props::TITLE, self.title.clone());
         set(props::CWD, self.cwd.clone());
         set(props::PARENT, self.parent.map(|parent| parent.encoded()));
-        set(
-            props::USER_FACING,
-            self.user_facing.then(|| "true".to_owned()),
-        );
         set("preset", self.preset.clone());
         AgentEntry {
             agent: self.agent_id,
@@ -85,28 +81,30 @@ pub fn own_workset(agent_id: AgentId) -> WorksetId {
     WorksetId(bytes)
 }
 
-/// The story events tests tell: mail between the user and an agent.
+/// The story events tests tell: messages between the user and an agent,
+/// in the topic between them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiStoryEvent {
     UserMessage {
         text: String,
         at: UnixMs,
     },
-    /// The agent sent the user something of this kind.
+    /// The agent told the user something: mentioning them with `kind`, or
+    /// with `None` a status that mentions nobody.
     Sent {
         text: String,
-        kind: SendKind,
+        kind: Option<MentionKind>,
         at: UnixMs,
     },
 }
 
 thread_local! {
-    /// The newest mail handed out, so every mail a test tells lands past
-    /// the last: the model skips mail behind its cursor.
-    static MAIL_HEAD: Cell<u64> = const { Cell::new(0) };
-    /// The thread of the newest mail between the user and each agent:
-    /// where the next mail between them goes, as on a host.
-    static THREADS: RefCell<std::collections::HashMap<AgentId, rho_agent_types::ThreadId>> =
+    /// The newest chat event handed out, so every record a test tells
+    /// lands past the last: the model skips records behind its cursor.
+    static CHAT_HEAD: Cell<u64> = const { Cell::new(STREAM.0) };
+    /// The topic between the user and each agent: where the next message
+    /// between them goes.
+    static TOPICS: RefCell<std::collections::HashMap<AgentId, TopicId>> =
         RefCell::new(std::collections::HashMap::new());
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
@@ -114,47 +112,87 @@ thread_local! {
         RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// Forgets every mail id handed out, for a test starting fresh.
+/// The event that made the default stream, first in every host's log.
+const STREAM: ChatSeq = StreamId::DEFAULT.0;
+
+/// Forgets every chat event handed out, for a test starting fresh.
 pub fn reset() {
-    MAIL_HEAD.with(|head| head.set(0));
-    THREADS.with(|threads| threads.borrow_mut().clear());
+    CHAT_HEAD.with(|head| head.set(STREAM.0));
+    TOPICS.with(|topics| topics.borrow_mut().clear());
 }
 
-fn mail(from: Address, to: Address, kind: Option<SendKind>, text: String, at: UnixMs) -> Mail {
-    let id = MAIL_HEAD.with(|head| {
+fn record(at: UnixMs, event: ChatEvent) -> ChatRecord {
+    let seq = CHAT_HEAD.with(|head| {
         head.set(head.get() + 1);
-        MailId(head.get())
+        ChatSeq(head.get())
     });
-    let agent = match (from, to) {
-        (Address::Agent(agent), _) | (_, Address::Agent(agent)) => Some(agent),
-        _ => None,
-    };
-    let thread = THREADS.with(|threads| {
-        let mut threads = threads.borrow_mut();
-        match agent {
-            Some(agent) => *threads
-                .entry(agent)
-                .or_insert(rho_agent_types::ThreadId(id)),
-            None => rho_agent_types::ThreadId(id),
-        }
-    });
-    Mail {
-        id,
-        at,
-        from,
-        to,
-        thread,
-        kind,
-        content: vec![ContentPart::Text { text }],
-    }
+    ChatRecord { seq, at, event }
 }
 
-fn status_mail(head: &UiAgentHead) -> Option<Mail> {
-    head.status.as_ref().map(|status| {
-        mail(
+/// The topic between the user and `agent_id`, and the event that started
+/// it if this is its first message.
+pub fn topic_of(agent_id: AgentId, name: &str, at: UnixMs) -> (TopicId, Option<ChatRecord>) {
+    if let Some(topic) = TOPICS.with(|topics| topics.borrow().get(&agent_id).copied()) {
+        return (topic, None);
+    }
+    let started = record(
+        at,
+        ChatEvent::TopicStarted {
+            stream: StreamId::DEFAULT,
+            name: name.to_owned(),
+            by: Address::User,
+            agents: vec![agent_id],
+        },
+    );
+    let topic = TopicId(started.seq);
+    TOPICS.with(|topics| topics.borrow_mut().insert(agent_id, topic));
+    (topic, Some(started))
+}
+
+/// A message between the user and an agent in the topic between them,
+/// with the event that started the topic first if it is new.
+fn message(
+    agent_id: AgentId,
+    from: Address,
+    kind: Option<MentionKind>,
+    text: String,
+    at: UnixMs,
+) -> Vec<ChatRecord> {
+    let (topic, started) = topic_of(
+        agent_id,
+        rho_agents_client::chat::default_topic_name(&text).as_str(),
+        at,
+    );
+    let mentions = match from {
+        Address::Agent(_) => kind
+            .map(|kind| Mention {
+                to: Address::User,
+                kind,
+            })
+            .into_iter()
+            .collect(),
+        Address::User => Vec::new(),
+    };
+    started
+        .into_iter()
+        .chain([record(
+            at,
+            ChatEvent::Posted {
+                topic,
+                from,
+                mentions,
+                content: vec![ContentPart::Text { text }],
+            },
+        )])
+        .collect()
+}
+
+fn status_message(head: &UiAgentHead) -> Vec<ChatRecord> {
+    head.status.as_ref().map_or_else(Vec::new, |status| {
+        message(
+            head.agent_id,
             Address::Agent(head.agent_id),
-            Address::User,
-            Some(SendKind::Status),
+            None,
             status.clone(),
             head.created_at,
         )
@@ -164,17 +202,18 @@ fn status_mail(head: &UiAgentHead) -> Option<Mail> {
 /// A head told again, or told late: its directory entry and its status.
 pub fn head_frames(head: UiAgentHead) -> Frame {
     let mut frames = vec![AgentFrame::Server(ServerFrame::Agent(head.entry())).into()];
-    if let Some(status) = status_mail(&head) {
-        frames.push(mails(vec![status]).into());
+    let status = status_message(&head);
+    if !status.is_empty() {
+        frames.push(chat(status).into());
     }
     Frame::Many(frames)
 }
 
 /// `Ready`, then an agents stream opening on the directory these heads
-/// stand for and the mail that says their status. A head for an agent
+/// stand for and the messages that say their status. A head for an agent
 /// this client already holds says what it says now.
 pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
-    let statuses = heads.iter().filter_map(status_mail).collect::<Vec<_>>();
+    let statuses = heads.iter().flat_map(status_message).collect::<Vec<_>>();
     let mut worksets = Vec::<WorksetEntry>::new();
     for head in &heads {
         if !worksets.iter().any(|entry| entry.workset == head.workset()) {
@@ -186,14 +225,14 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
         }
     }
     let agents = heads.iter().map(UiAgentHead::entry).collect();
-    // The head is the newest mail handed out: a client that has heard
-    // every mail so far is caught up.
-    let mail_head = MAIL_HEAD.with(|head| MailId(head.get()));
-    let mut frames = vec![
+    // The head is the newest event handed out: a client that has heard
+    // every one so far is caught up.
+    let chat_head = CHAT_HEAD.with(|head| ChatSeq(head.get()));
+    let frames = vec![
         ConnEvent::Ready.into(),
         AgentFrame::Server(ServerFrame::Hello {
             machine_seed: 0,
-            mail_head,
+            chat_head,
             agent_counter,
         })
         .into(),
@@ -206,10 +245,9 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
         })
         .into(),
         AgentFrame::Server(ServerFrame::Directory { worksets, agents }).into(),
+        // A host's log starts with its default stream.
+        chat(statuses).into(),
     ];
-    if !statuses.is_empty() {
-        frames.push(mails(statuses).into());
-    }
     Frame::Many(frames)
 }
 
@@ -235,36 +273,38 @@ pub fn answer<T: Packer + Unpacker>(stream: &mut rho_rpc::Stream, answer: Answer
     futures::executor::block_on(write_frame(stream, &answer)).expect("answer the call");
 }
 
-/// The user's mail to an agent, past the last mail told.
-pub fn from_user(agent_id: AgentId, text: &str, at: UnixMs) -> Mail {
-    mail(
-        Address::User,
-        Address::Agent(agent_id),
-        None,
-        text.to_owned(),
-        at,
-    )
+/// The user's message to an agent, past the last event told.
+pub fn from_user(agent_id: AgentId, text: &str, at: UnixMs) -> Vec<ChatRecord> {
+    message(agent_id, Address::User, None, text.to_owned(), at)
 }
 
-/// Mail in the host's log, as the mail follow hands it.
-pub fn mails(mails: Vec<Mail>) -> AgentFrame {
-    AgentFrame::Server(ServerFrame::Mail { mails })
+/// Records of the host's chat log, as the chat follow hands them, after
+/// the event that made the default stream: a host's log starts with it.
+pub fn chat(records: Vec<ChatRecord>) -> AgentFrame {
+    let stream = ChatRecord {
+        seq: STREAM,
+        at: UnixMs(0),
+        event: ChatEvent::StreamCreated {
+            name: "rho".to_owned(),
+        },
+    };
+    AgentFrame::Server(ServerFrame::Chat {
+        records: std::iter::once(stream).chain(records).collect(),
+    })
 }
 
-/// A run of one agent's story: mail between it and the user, each past
-/// the last mail told.
+/// A run of one agent's story: messages between it and the user in the
+/// topic between them, each past the last event told.
 pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> AgentFrame {
     let agent = Address::Agent(agent_id);
-    mails(
+    chat(
         events
             .into_iter()
-            .map(|event| match event {
+            .flat_map(|event| match event {
                 UiStoryEvent::UserMessage { text, at } => {
-                    mail(Address::User, agent, None, text, at)
+                    message(agent_id, Address::User, None, text, at)
                 }
-                UiStoryEvent::Sent { text, kind, at } => {
-                    mail(agent, Address::User, Some(kind), text, at)
-                }
+                UiStoryEvent::Sent { text, kind, at } => message(agent_id, agent, kind, text, at),
             })
             .collect(),
     )

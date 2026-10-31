@@ -19,13 +19,14 @@ struct RealtimeChannel {
 pub(crate) fn start(
     link: &rho_agent_hosts::Link,
     agent_id: rho_agent_types::AgentId,
+    topic: rho_agent_types::TopicId,
     stop: tokio::sync::oneshot::Receiver<()>,
     input_muted: tokio::sync::watch::Receiver<bool>,
     connected: tokio::sync::oneshot::Sender<()>,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(move |dialer| {
         run(
-            move |offer_sdp| dial(dialer, offer_sdp, agent_id),
+            move |offer_sdp| dial(dialer, offer_sdp, agent_id, topic),
             stop,
             input_muted,
             connected,
@@ -37,6 +38,7 @@ async fn dial(
     dialer: rho_agent_hosts::Dialer,
     offer_sdp: String,
     agent_id: rho_agent_types::AgentId,
+    topic: rho_agent_types::TopicId,
 ) -> anyhow::Result<RealtimeChannel> {
     // Interactive streams outrank the sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
@@ -45,6 +47,7 @@ async fn dial(
         &rho_rtc::protocol::Open {
             offer_sdp,
             agent_id,
+            topic,
         },
     )
     .await?;
