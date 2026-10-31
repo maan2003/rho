@@ -10,7 +10,7 @@ rather than ones this crate chose:
   the same id is not accepted — so anything the agent has to say about a call
   after that point must be a `ToolUpdate`.
 - Tool output must sit adjacent to the call it answers. A drain therefore emits
-  tool results and updates ahead of mail and user messages regardless of the
+  tool results and updates ahead of agent and user messages regardless of the
   order things actually arrived in.
 - A compaction trigger must be the final input item, so a queued compaction is
   stable-sorted to the back of a drain and history records the order the request

@@ -12,7 +12,7 @@ does not introduce a separate preparation exchange or hold fresh input.
 ## Rationale
 
 Pushing wakes one request per source, so a round of parallel tool calls, a typed
-message and a peer's mail become four requests instead of one.
+message and a peer's message become four requests instead of one.
 
 Pulling also puts the summarising where the knowledge is: a tool asked for its
 output after five minutes hands back the relevant tail plus a count of what it
