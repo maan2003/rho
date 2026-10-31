@@ -1525,6 +1525,17 @@ mod tests {
             Some(Said::Result),
             "mail after the stop is new"
         );
+        let retrying = RuntimeState {
+            inference: InferenceState::Retrying {
+                at: UnixMs(6),
+                error: "overloaded".into(),
+            },
+            running_tasks: 0,
+            awaiting_human: false,
+            checkin_at: None,
+            archived: false,
+            stale: false,
+        };
         assert!(
             digest.observe(&retrying, MailId(12), UnixMs(5)),
             "a retry ends it"
