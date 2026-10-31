@@ -55,8 +55,9 @@ before ([DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sou
 ## Mail
 
 Mail is how people and agents talk: one host-wide append-only log of
-`Mail { from, to, re, kind, content }` between addresses (`User`, or an
-agent). It lives on the host because the GUI is often offline and mail crosses
+`Mail { from, to, thread, kind, content }` between addresses (`User`, or an
+agent). A thread is named by the mail that started it (`ThreadId`); policy
+answers in the thread of the newest mail between sender and recipient. It lives on the host because the GUI is often offline and mail crosses
 worksets, and it survives workset deletion. Agents post with `rho.mail.send`;
 policy Python pulls each agent's mailbox and hands mail to the agent as an
 `Input` that names it. The delivery position is derived from those rows, so the
