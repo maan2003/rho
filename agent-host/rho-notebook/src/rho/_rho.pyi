@@ -84,6 +84,11 @@ def delivered(agent: str) -> int:
     """The newest mail id handed to the agent by `input`, or 0."""
 def cancel(agent: str) -> None: ...
 def compact(agent: str) -> None: ...
+def rewind(agent: str, turns: int) -> None:
+    """Branch the agent's history before its `turns`-th last input from the
+    user. The notebook stays."""
+def new_cache_key(agent: str) -> None:
+    """Give a native agent a fresh prompt cache key (an `AgentChanged`)."""
 
 # -- mail --------------------------------------------------------------------
 
