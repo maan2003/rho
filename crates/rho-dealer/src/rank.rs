@@ -229,7 +229,7 @@ fn rank_into(
             trace.input(&node, "unread", format!("{:?}", digest.unread));
             trace.input(&node, "seen through", seen.to_string());
         }
-        let Some(unread) = digest.strongest_unread(rho_agent_types::AgentPos(seen)) else {
+        let Some(unread) = digest.strongest_unread(rho_agents_client::ConversationPos(seen)) else {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.outcome(&node, "no card: nothing unread".to_owned());
             }
@@ -261,7 +261,7 @@ fn rank_into(
             ),
         };
         // The newest unread is where the card's source last moved.
-        let cursor = digest.unread.last().map_or(0, |newest| newest.pos.0);
+        let cursor = digest.newest_unread().map_or(0, |newest| newest.pos.0);
         let mut part = Part::source(curve, reason.to_owned(), cursor.to_string());
         let spoke = unix(digest.last_user_message_at.0 as i64);
         if digest.last_user_message_at.0 > 0 {

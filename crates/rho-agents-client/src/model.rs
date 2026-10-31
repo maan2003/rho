@@ -21,7 +21,7 @@ use rho_agent_types::{Address, AgentId, Mail, MailId, UnixMs, WorksetId, Workset
 
 use crate::fold::{AgentIdentity, Digest, MirroredAgent, TranscriptRow};
 use crate::protocol::rho2::{AgentEntry, ClientFrame, LogEvent, ServerFrame, WorksetEntry};
-use crate::protocol::transcript::{InferenceState, Live, RuntimeState};
+use crate::protocol::transcript::{Live, RuntimeState};
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
 use crate::{HostId, Verdict};
 
@@ -649,10 +649,7 @@ impl Model {
         let Some(agent) = self.agents.get_mut(&agent_id) else {
             return Vec::new();
         };
-        let moved = match state.inference {
-            InferenceState::Failed { .. } => agent.digest.stopped(head, UnixMs::now()),
-            _ => agent.digest.running(),
-        };
+        let moved = agent.digest.observe(&state, head, UnixMs::now());
         let mut out = Vec::new();
         if moved {
             self.store(&[agent_id]);
@@ -849,7 +846,7 @@ mod tests {
     use super::*;
     use crate::fold::Said;
     use crate::protocol::rho2::SpecView;
-    use crate::protocol::transcript::RuntimeKind;
+    use crate::protocol::transcript::{InferenceState, RuntimeKind};
     use crate::stream::AgentStream;
 
     const HOST: HostId = HostId(0);

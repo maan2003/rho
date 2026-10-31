@@ -16,7 +16,9 @@ use rho_agent_types::{
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::rho2::{AgentEntry, LogEvent};
-use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
+use crate::protocol::transcript::{
+    InferenceState, RuntimeKind, RuntimeState, Speaker, ToolOutcome, ToolStatus,
+};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// A place in an agent's conversation with the user, which is how far the
@@ -255,10 +257,23 @@ impl Digest {
         true
     }
 
+    /// What the agent's runtime is doing, seen while `head` was the host's
+    /// newest mail: a failure that will not retry is a stop put to the
+    /// user, anything else (a retry among it) ends one. Returns whether
+    /// anything changed.
+    pub fn observe(&mut self, state: &RuntimeState, head: MailId, at: UnixMs) -> bool {
+        match state.inference {
+            InferenceState::Failed { .. } => self.stopped(head, at),
+            InferenceState::Idle | InferenceState::Responding | InferenceState::Retrying { .. } => {
+                self.running()
+            }
+        }
+    }
+
     /// The agent's runtime stopped on an error while `head` was the host's
     /// newest mail. A stop already held is the same stop, told again by a
     /// reconnect; returns whether anything changed.
-    pub fn stopped(&mut self, head: MailId, at: UnixMs) -> bool {
+    fn stopped(&mut self, head: MailId, at: UnixMs) -> bool {
         if self.stop().is_some() {
             return false;
         }
@@ -281,7 +296,7 @@ impl Digest {
     }
 
     /// The runtime is not stopped: whatever stop was held is over.
-    pub fn running(&mut self) -> bool {
+    fn running(&mut self) -> bool {
         let before = self.unread.len();
         self.unread.retain(|unread| unread.said != Said::Stopped);
         before != self.unread.len()
@@ -1510,7 +1525,10 @@ mod tests {
             Some(Said::Result),
             "mail after the stop is new"
         );
-        assert!(digest.running());
+        assert!(
+            digest.observe(&retrying, MailId(12), UnixMs(5)),
+            "a retry ends it"
+        );
         assert!(digest.stop().is_none());
     }
 
