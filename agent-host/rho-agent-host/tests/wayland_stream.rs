@@ -249,7 +249,7 @@ layout { background-color "#315b97"; }
 
 /// A new isolated workset with one agent on a clone of `repo`, made by
 /// the default policy's `new_agent`, which prints its id. `message` is
-/// the user's first mail to it.
+/// the user's first message to it, in a new topic.
 async fn create_agent(
     socket_path: &std::path::Path,
     repo: &std::path::Path,
@@ -263,11 +263,6 @@ async fn create_agent(
                 "print(new_agent(repo={}, runtime={{\"kind\": \"native\", \"model\": \"sol\", \"effort\": \"medium\"}}), end=\"\")",
                 rho_agents_client::snippets::py_str(repo.to_str().unwrap())
             ),
-            message: message.map(|text| {
-                vec![rho_agent_types::ContentPart::Text {
-                    text: text.to_owned(),
-                }]
-            }),
         },
     )
     .await?;
@@ -276,7 +271,21 @@ async fn create_agent(
         "creation code failed: {:?}",
         created.result.error
     );
-    Ok(rho_agent_types::AgentId::from_encoded(
-        created.result.output.trim(),
-    )?)
+    let agent = rho_agent_types::AgentId::from_encoded(created.result.output.trim())?;
+    if let Some(text) = message {
+        rho_rpc::protocol::client::call(
+            socket_path,
+            rho_agents_client::protocol::worksets::StartTopic {
+                client_id: uuid::Uuid::new_v4().as_u64_pair().0,
+                stream: rho_agent_types::StreamId::DEFAULT,
+                name: text.to_owned(),
+                agents: vec![agent],
+                content: vec![rho_agent_types::ContentPart::Text {
+                    text: text.to_owned(),
+                }],
+            },
+        )
+        .await?;
+    }
+    Ok(agent)
 }

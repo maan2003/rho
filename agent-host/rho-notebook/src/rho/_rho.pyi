@@ -3,7 +3,7 @@
 This module is built into the workset process. The `rho` package wraps it;
 policy code imports `rho`, not `_rho`. Every function runs in the workset
 process and acts on its own workset only. Agent ids are their encoded text
-(for example "x4cvbixbtifu"); mail addresses are "user" or an agent id.
+(for example "x4cvbixbtifu"); a chat address is "user" or an agent id.
 
 Blocking calls release the GIL. Calls marked async return awaitables that
 run on the asyncio loop of the caller's thread.
@@ -30,14 +30,21 @@ class Spec(TypedDict):
     runtime: Runtime
     props: dict[str, str]
 
-class MailRecord(TypedDict):
+MentionKind = Literal["ask", "result", "fyi"]
+
+class MessageRecord(TypedDict):
     id: int
     at: int  # unix ms
+    topic: int
     sender: str  # "user" or an agent id
-    to: str
-    thread: int  # the id of the mail that started its thread
-    kind: Literal["ask", "result", "status", "fyi"] | None
+    mentions: list[tuple[str, MentionKind]]  # (address, kind)
     text: str
+
+class TopicRecord(TypedDict):
+    id: int
+    name: str
+    stream: str  # its stream's name
+    agents: list[str]  # the agents that receive its messages
 
 class AgentsFile(TypedDict):
     path: str
@@ -77,11 +84,12 @@ def agents() -> dict[str, Spec]:
 def set_spec(agent: str, spec: Spec) -> None:
     """Log `AgentChanged` with the whole new spec. A model change keeps the
     cache key and the Claude session."""
-def input(agent: str, text: str, *, wake: Wake, mail: int | None = None) -> None:
+def input(agent: str, text: str, *, wake: Wake, message: int | None = None) -> None:
     """Queue an input for the agent. Its loop logs the `Input` row; this
-    returns once that row is durable. `mail` names the mail it hands over."""
+    returns once that row is durable. `message` names the chat message it
+    hands over."""
 def delivered(agent: str) -> int:
-    """The newest mail id handed to the agent by `input`, or 0."""
+    """The newest message id handed to the agent by `input`, or 0."""
 def cancel(agent: str) -> None: ...
 def compact(agent: str) -> None: ...
 def rewind(agent: str, turns: int) -> None:
@@ -90,28 +98,41 @@ def rewind(agent: str, turns: int) -> None:
 def new_cache_key(agent: str) -> None:
     """Give a native agent a fresh prompt cache key (an `AgentChanged`)."""
 
-# -- mail --------------------------------------------------------------------
+# -- chat --------------------------------------------------------------------
+#
+# The host's chat: streams of topics of messages. Every id is the position of
+# the event that made it in the host's chat log. A message reaches every
+# agent of its topic and every agent it mentions, never its sender; posting
+# makes the sender one of the topic's agents. Messages from the user come
+# only from the GUI, so Python cannot forge them.
 
-def send_mail(
+def post(
     sender: str,
-    to: str,
+    topic: int,
     text: str,
     *,
-    kind: Literal["ask", "result", "status", "fyi"] | None = None,
-    thread: int | None = None,
+    mentions: list[tuple[str, MentionKind]] | None = None,
 ) -> int:
-    """Append a mail to the host's mail log; returns its id once durable.
-    `sender` must be an agent of this workset: mail from the user comes only
-    from the GUI (`CreateWorkset.message` and `Eval.message` are mailed by the
-    host to the first agent that code creates), so Python cannot forge it. A mail to "user" needs a
-    `kind`; the text must pass the STE check, or this raises ValueError
-    with the findings. `thread` names a thread by the id of its first mail;
-    None starts a new one, and a mail that starts no thread raises
-    ValueError."""
-def newest_mail_between(a: str, b: str) -> MailRecord | None:
-    """The newest mail from `a` to `b` or from `b` to `a`."""
-async def inbox(address: str, after: int) -> list[MailRecord]:
-    """Mail to `address` newer than `after`, waiting until there is some."""
+    """Post in `topic` as `sender`, an agent of this workset; returns the
+    message id once durable. A message that mentions "user" must pass the
+    STE check, or this raises ValueError with the findings."""
+def start_topic(
+    sender: str,
+    stream: str,
+    name: str,
+    text: str,
+    *,
+    agents: list[str] = [],
+    mentions: list[tuple[str, MentionKind]] | None = None,
+) -> int:
+    """Start a topic named `name` in the stream named `stream`, with `text`
+    as its first message and `agents` receiving it; returns the topic id."""
+def join(topic: int, agent: str) -> None:
+    """Make `agent` one of the topic's agents from now on."""
+def topic(id: int) -> TopicRecord | None: ...
+async def inbox(agent: str, after: int) -> list[MessageRecord]:
+    """What `agent` receives after message `after`, waiting until there is
+    some."""
 
 # -- inside an agent's notebook ----------------------------------------------
 

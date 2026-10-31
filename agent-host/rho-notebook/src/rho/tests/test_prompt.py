@@ -17,20 +17,24 @@ from rho.prompt import render, template
 
 GPT, CLAUDE = "gpt", "claude"
 
-#: Every change from the Rust templates: the model talks through `mail`.
+#: Every change from the Rust templates: the model talks through `chat`.
 CHANGES = [
-    ('human.send and continue', 'mail.send and continue'),
-    ('human.send(text, *, kind)  Send the user a message.', 'mail.send(to, text, *, kind=None)  Send mail to "user" or to an agent. Mail to the user needs a kind.'),
-    ('Every send has a kind.', 'Every mail to the user has a kind.'),
-    ('human.send\nrejects a sentence', 'mail.send\nrejects one with a sentence'),
-    ('it reports back to you with agents.message,', 'it reports back to you with mail.send,'),
-    ('Use `agents.message` to send findings', 'Use `mail.send` to send findings'),
-    ('agents.message(*, agent_id: str, message: str) -> Awaitable[str]', 'mail.send(to: str, text: str) -> Awaitable[str]'),
-    ('send it with agents.message, not your code', 'send it with mail.send, not your code'),
-    ('agents.message(*, agent_id: str, message: str) → Awaitable[str]', 'mail.send(to: str, text: str) → Awaitable[str]'),
-    ('through `agents.message`.', 'through `mail.send`.'),
-    ('Use `agents.message` when a known agent', 'Use `mail.send` when a known agent'),
-    ('result with agents.message —', 'result with mail.send —'),
+    ('not change the active task, answer briefly with human.send and continue the work.', 'not change the active task, answer briefly with chat.post and continue the work.'),
+    ('human.send(text, *, kind)  Send the user a message.', 'chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. Mention "user" with a kind to reach the user.\nchat.start(name, text, *, agents=()) → int  Start a topic for a new subject; returns its id.'),
+    ('Every send has a kind. Ask yourself: does the user need to read this now?', 'Every message arrives after its topic, for example `[#12 rho › Fix the flaky test]`. Answer in\nthat topic: `chat.post(12, text)`. A message reaches the user only when it mentions them with a\nkind. Ask yourself: does the user need to read this now?'),
+    ('   follow-through is still pending. They\'ll read it the next time they open the conversation.\n4. "status": no, and it\'s passing: "on it", "tests running". Your next message replaces it, and\n   it isn\'t kept.', '   follow-through is still pending. They\'ll read it the next time they open the topic.\n\nPost passing progress, such as "on it" or "tests running", without a mention.'),
+    ("later as agent mail, not as this call's return value.", "later as a message in a new topic, not as this call's return value."),
+    ('identity; it reports back to you with agents.message, which arrives as agent mail.', 'identity and the topic it starts with you; it reports back to you in that topic.'),
+    ('Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.', "Use `chat.post` in an agent's topic to send findings, questions, or a scoped next action to it."),
+    ('agents.message(*, agent_id: str, message: str) -> Awaitable[str]', 'chat.post(topic: int, text: str) -> Awaitable[str]'),
+    ('Write "ask", "result" and "fyi" messages in Simplified Technical English (ASD-STE100). human.send\nrejects a sentence of more than 25 words, a contraction, a semicolon, or an -ing verb after a', 'Write messages that mention the user in Simplified Technical English (ASD-STE100). chat.post\nrejects one with a sentence of more than 25 words, a contraction, a semicolon, or an -ing verb after a'),
+    ('a quoted word or example in a code span. A rejected send raises ValueError with the findings and stops the rest of the cell. Rewrite the', 'a quoted word or example in a code span. A rejected post raises ValueError with the findings and stops the rest of the cell. Rewrite the'),
+    ('send it with agents.message, not your code, output, or reasoning.', 'post it with chat.post, not your code, output, or reasoning.'),
+    ('agents.message(*, agent_id: str, message: str) → Awaitable[str]', 'chat.post(topic: int, text: str) → Awaitable[str]'),
+    ('You can exchange follow-up messages with the requesting Engineer through `agents.message`. Ask a', 'You can exchange follow-up messages with the requesting Engineer with `chat.post` in your topic. Ask a'),
+    ('Advisors cannot spawn subagents. Use `agents.message` when a known agent has context you cannot', 'Advisors cannot spawn subagents. Use `chat.post` when a known agent has context you cannot'),
+    ('Send the requesting Engineer one self-contained and focused result with agents.message — a clear', 'Send the requesting Engineer one self-contained and focused result with chat.post — a clear'),
+    ('status request does not change the active task, answer briefly with human.send and continue the', 'status request does not change the active task, answer briefly with chat.post and continue the'),
 ]
 
 #: sha256 of each Rust template at d03660c6.
@@ -50,7 +54,7 @@ def between(text, start, end):
 
 
 class Templates(unittest.TestCase):
-    def test_templates_differ_from_the_rust_ones_only_by_the_mail_changes(self):
+    def test_templates_differ_from_the_rust_ones_only_by_the_chat_changes(self):
         root = pathlib.Path(prompt.__file__).with_name("prompt")
         for name, digest in ORIGINALS.items():
             text = (root / name).read_text(encoding="utf-8")
@@ -89,17 +93,17 @@ class Templates(unittest.TestCase):
         collaboration = between(text, "## Working with other agents", "## Working with the user")
         self.assertTrue(collaboration.startswith("\n\nTEAM_SENTINEL\n\n"))
         self.assertLess(collaboration.index("### Advisor"), collaboration.index("### Engineers"))
-        self.assertLess(collaboration.index("mail.send(to: str, text: str)"), collaboration.index("### Briefing and integrating work"))
+        self.assertLess(collaboration.index("chat.post(topic: int, text: str)"), collaboration.index("### Briefing and integrating work"))
         for needle in ["agents.spawn_new_advisor(msg: str)", "agents.spawn_new_engineer(*, task_name:",
                        "task_name is a short kebab-case label", "agents.cancel(",
                        "loads applicable AGENTS.md guidance and the skill catalogue",
                        "Without an explicit request, do NOT consult the Advisor for:"]:
             self.assertIn(needle, collaboration)
-        self.assertIn('mail.send(to, text, *, kind=None)  Send mail to "user" or to an agent. Mail to the user needs a kind.', text)
-        self.assertIn("Every mail to the user has a kind.", text)
-        self.assertIn("answer briefly with mail.send and continue the work", text)
-        self.assertIn("(ASD-STE100). mail.send\nrejects one with a sentence of more than 25 words", text)
-        self.assertIn("it reports back to you with mail.send, which arrives as agent mail", text)
+        self.assertIn('chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. Mention "user" with a kind to reach the user.', text)
+        self.assertIn("A message reaches the user only when it mentions them with a\nkind.", text)
+        self.assertIn("answer briefly with chat.post and continue the work", text)
+        self.assertIn("(ASD-STE100). chat.post\nrejects one with a sentence of more than 25 words", text)
+        self.assertIn("it reports back to you in that topic", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)
         self.assertIn("def papercut(", text)
         self.assertTrue(text.endswith("WORKSPACE_SENTINEL"))
@@ -109,9 +113,9 @@ class Templates(unittest.TestCase):
     def test_advisor_prompt_has_only_its_capabilities(self):
         text = gpt("advisor", "TEAM_SENTINEL\n\n")
         self.assertIn("## Working with other agents\n\nTEAM_SENTINEL\n\n", text)
-        self.assertIn("focused result with mail.send", text)
-        self.assertIn("mail.send(to: str, text: str) → Awaitable[str]", text)
-        self.assertIn("Use `mail.send` when a known agent has context", text)
+        self.assertIn("focused result with chat.post", text)
+        self.assertIn("chat.post(topic: int, text: str) → Awaitable[str]", text)
+        self.assertIn("Use `chat.post` when a known agent has context", text)
         for forbidden in ["spawn_new_advisor", "spawn_new_engineer", "agents.cancel(*", "human.",
                           "archive()", "## Diagrams", "agents.message"]:
             self.assertNotIn(forbidden, text)
@@ -125,7 +129,7 @@ class Templates(unittest.TestCase):
             "## How time works", "## The notebook", "## Working with other agents",
             "## Reporting to your parent",
         ])
-        self.assertIn("Your parent agent sees only what you\nsend it with mail.send, not your code", text)
+        self.assertIn("Your parent agent sees only what you\npost it with chat.post, not your code", text)
         for forbidden in ["human.", "archive()", "spawn_new_advisor", "spawn_new_engineer", "agents.message"]:
             self.assertNotIn(forbidden, text)
 
@@ -136,7 +140,7 @@ class Templates(unittest.TestCase):
             communication = text.split("# Working with other agents", 1)[1]
             for rule in ["send findings, questions, or a scoped next action", "say whether another reply is needed",
                          "Stop exchanging messages when\nthe requested work is complete",
-                         "do not create acknowledgment loops", "Use `mail.send` to send findings"]:
+                         "do not create acknowledgment loops", "Use `chat.post` in an agent's topic to send findings"]:
                 self.assertIn(rule, communication)
         for text in [gpt("advisor"), claude_t("advisor")]:
             self.assertNotIn("When to use an Engineer:", text)
@@ -224,12 +228,12 @@ class Instructions(unittest.TestCase):
         return rho.agent(add_agent(self.state, runtime, cwd=self.cwd, **props))
 
     def test_a_direct_native_engineer_gets_the_gpt_engineer_prompt_whole(self):
-        agent = self.agent(native(), preset="engineer", user_facing="true")
+        agent = self.agent(native(), preset="engineer")
         team = (
             f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
             "\n\nYou were started directly and own the user\'s technical outcome."
-            "\n\nYou will receive agent messages in this format:\n```\nMessage Type: MESSAGE\nSender: <agent id>\nPayload:\n<payload text>\n```"
-            "\n\nUse `mail.send` for bidirectional communication with any known agent.\n\n"
+            "\n\nYou will receive agent messages in this format, after the topic they are in:\n```\n[#<topic id> <stream> › <topic name>]\nMessage Type: MESSAGE\nSender: <agent id>\nPayload:\n<payload text>\n```"
+            "\n\nAnswer an agent in its topic with `chat.post(topic, text)`.\n\n"
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -252,7 +256,7 @@ class Instructions(unittest.TestCase):
         for runtime in [native(), claude()]:
             child = self.agent(runtime, preset="child", parent=parent.id)
             text = prompt.instructions(child)
-            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with mail.send.", text)
+            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent in that topic with chat.post.", text)
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
             for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
                               "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
@@ -265,8 +269,8 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(advisor)
             self.assertIn(
                 f"Your agent id is adv-{advisor.id}; your parent agent is eng-{parent.id}."
-                "\n\nMessages from your parent define your task. Report to your parent with mail.send."
-                "\n\nComplete your independent analysis and send it to your parent with mail.send. "
+                "\n\nMessages from your parent define your task. Report to your parent in that topic with chat.post."
+                "\n\nComplete your independent analysis and post it to your parent in your topic with chat.post. "
                 "Ask a known agent for context the same way, and end your turn when blocked on a reply.\n",
                 text,
             )
@@ -275,14 +279,14 @@ class Instructions(unittest.TestCase):
 
     def test_only_agents_the_user_manages_may_start_engineers_for_the_user(self):
         signature = "agents.spawn_user_owned_engineer(*, task_name:"
-        direct = self.agent(claude(), preset="engineer", user_facing="true")
-        owned = self.agent(claude(), preset="engineer", user_facing="true", started_by=direct.id)
+        direct = self.agent(claude(), preset="engineer")
+        owned = self.agent(claude(), preset="engineer", started_by=direct.id)
         for agent in [direct, owned]:
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
-            self.assertIn("mail.send(to, text, *, kind=None)", text)
-        note = (f"Engineer eng-{direct.id} started you for the user; ask it with mail.send if you need "
+            self.assertIn("chat.post(topic, text, *, mention=None, kind=None)", text)
+        note = (f"Engineer eng-{direct.id} started you for the user; ask it in your topic with chat.post if you need "
                 "more context. You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))
         self.assertNotIn("started you for the user", prompt.instructions(direct))

@@ -10,7 +10,7 @@ use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::entry::Entry;
 use rho_agent::log::TranscriptLine;
 use rho_agent::record::{ClaudeRow, Event};
-use rho_agent::store::{Appended, StoreRead as _};
+use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
 use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::snippets;
 use rho_fs_view::{UserEnvironment, Worksets};
@@ -225,7 +225,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 &rho_agent::host::pool::workset_root(&kind),
                 &role_runtime(&args.role),
             );
-            let (workset, evaluated) = pool.create_workset(kind, code, None).await?;
+            let (workset, evaluated) = pool.create_workset(kind, code).await?;
             if let Some(error) = evaluated.error {
                 anyhow::bail!("creating the evaluation agent failed: {error}");
             }
@@ -262,10 +262,12 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     let client_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
-    pool.post_user_mail(
+    let name = prompt.lines().next().unwrap_or("Evaluation").to_owned();
+    pool.start_user_topic(
         client_id,
-        id,
-        None,
+        rho_agent_types::StreamId::DEFAULT,
+        name,
+        vec![id],
         vec![ContentPart::Text { text: prompt }],
     )
     .await?;
@@ -385,7 +387,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     Ok(())
 }
 
-/// What the run has seen of its workset's rows and mail.
+/// What the run has seen of its workset's rows and chat.
 struct Watch<'a> {
     args: &'a EvalArgs,
     db: &'a rho_db::RhoDb,
@@ -413,20 +415,20 @@ impl Watch<'_> {
                     _ => Ok(None),
                 }
             }
-            Appended::Mail(mail) => {
-                let Some(mail) = self.db.read().mail(mail) else {
+            Appended::Chat(seq) => {
+                let Some(message) = self.db.read().message(rho_agent_types::MessageId(seq)) else {
                     return Ok(None);
                 };
-                let Address::Agent(from) = mail.from else {
+                let Address::Agent(from) = message.from else {
                     return Ok(None);
                 };
-                // Agents it spawns are part of the run: their mail counts.
+                // Agents it spawns are part of the run: their messages count.
                 if self.db.read().agent(from).map(|head| head.workset) != Some(self.workset) {
                     return Ok(None);
                 }
-                let text = text_of(&mail.content);
+                let text = text_of(&message.content);
                 let agent = format!("{from:?}");
-                if from == self.id && mail.to == Address::User {
+                if from == self.id && message.mentions(Address::User).is_some() {
                     if !self.final_answer.is_empty() {
                         self.final_answer.push('\n');
                     }
@@ -434,7 +436,7 @@ impl Watch<'_> {
                     emit(json!({"type":"message", "agent":agent, "text":text}))?;
                 } else {
                     emit(
-                        json!({"type":"message", "agent":agent, "to":format!("{:?}", mail.to), "text":text}),
+                        json!({"type":"message", "agent":agent, "topic":message.topic.0.0, "text":text}),
                     )?;
                 }
                 Ok(None)

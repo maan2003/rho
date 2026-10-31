@@ -1,4 +1,4 @@
-"""The tools the default policy puts in an agent's notebook: `mail`,
+"""The tools the default policy puts in an agent's notebook: `chat`,
 `agents` and `skills`. Rust adds `web`, `view_image`, `papercut`,
 `end_turn` and `archive`.
 
@@ -12,7 +12,7 @@ import os
 import _rho
 
 from . import agents as rho_agents
-from . import mail as rho_mail
+from . import chat as rho_chat
 from . import skills as rho_skills
 from .prompt import label
 
@@ -77,40 +77,63 @@ def _spawner_of(props: dict) -> str | None:
     return props.get("parent") or props.get("started_by")
 
 
-class Mail:
-    """Mail to the user or to another agent. A mail goes on in the thread of
-    the newest mail between the agent and its recipient."""
+class Chat:
+    """Posting in the host's chat. Every message is in a topic; it reaches
+    the topic's agents and the agents it mentions. The user is reached by a
+    mention."""
 
     def __init__(self, agent: str):
         self._agent = agent
 
-    def send(self, to, text, *, kind=None):
-        """Send `text` to "user" or to an agent id. Mail to the user needs a
-        kind: "ask", "result", "fyi" or "status"."""
+    def _mentions(self, mention, kind):
+        if mention is None:
+            if kind is not None:
+                raise ValueError("a kind goes with a mention: mention=\"user\"")
+            return []
+        if kind not in rho_chat.KINDS:
+            raise ValueError('a mention needs kind: "ask", "result" or "fyi"')
+        handles = [mention] if isinstance(mention, str) else list(mention)
+        mentions = []
+        for handle in handles:
+            if handle == rho_chat.USER:
+                props = rho_agents.Agent(self._agent).props
+                if props.get("preset") != "engineer":
+                    parent = props.get("parent")
+                    raise ValueError(f"you report to your parent agent {label(parent)}; post in your topic without a mention")
+                mentions.append((rho_chat.USER, kind))
+                continue
+            agent = resolve(str(handle))
+            if agent == self._agent:
+                raise ValueError("cannot mention yourself")
+            mentions.append((agent, kind))
+        return mentions
+
+    def post(self, topic, text, *, mention=None, kind=None):
+        """Post `text` in `topic`, the id each message arrives with. To reach
+        the user, mention "user" with a kind: "ask", "result" or "fyi"."""
         text = str(text)
         if not text.strip():
             raise ValueError("a message needs text")
-        if to == rho_mail.USER:
-            props = rho_agents.Agent(self._agent).props
-            if props.get("user_facing") != "true":
-                parent = props.get("parent")
-                raise ValueError(
-                    f"you report to your parent agent {label(parent)}; mail it instead"
-                    if parent
-                    else "only an agent the user manages can mail the user"
-                )
-            if kind is None:
-                raise ValueError('mail to the user needs kind: "ask", "result", "fyi" or "status"')
-            rho_mail.send(self._agent, to, text, kind=kind, thread=rho_mail.thread_with(self._agent, to))
+        mentions = self._mentions(mention, kind)
+        rho_chat.post(self._agent, int(topic), text, mentions)
+        if any(address == rho_chat.USER for address, _ in mentions):
             return Reply("")
-        recipient = resolve(str(to))
-        if recipient == self._agent:
-            raise ValueError("cannot send a message to yourself")
-        rho_mail.send(self._agent, recipient, text, kind=kind, thread=rho_mail.thread_with(self._agent, recipient))
-        return report(f"Message sent to {label(recipient)}.")
+        return report(f"Posted in #{int(topic)}.")
+
+    def start(self, name, text, *, agents=(), mention=None, kind=None):
+        """Start a topic named `name` with `text` as its first message, for a
+        new subject. `agents` receive its messages; returns its id."""
+        text = str(text)
+        if not text.strip():
+            raise ValueError("a message needs text")
+        mentions = self._mentions(mention, kind)
+        members = [resolve(str(agent)) for agent in agents]
+        topic = rho_chat.start(self._agent, str(name), text, agents=members, mentions=mentions)
+        print(f"Started topic #{topic}.")
+        return topic
 
     def __repr__(self):
-        return "<mail>"
+        return "<chat>"
 
 
 class Agents:
@@ -131,11 +154,14 @@ class Agents:
                 raise RuntimeError(f"spawn depth limit ({MAX_SPAWN_DEPTH}) reached")
             cursor = _spawner_of(known[cursor]["props"])
 
-    def _spawn(self, runtime, props, prompt):
+    def _spawn(self, runtime, props, name, prompt, mentions=()):
+        """Create an agent and brief it in a new topic with this one. The
+        topic is the agent's `topic` prop, where a failure is told."""
         self._check_depth()
         agent = rho_agents.create(runtime, props)
-        rho_mail.send(self._agent, agent.id, prompt)
-        return agent
+        topic = rho_chat.start(self._agent, name, prompt, agents=[self._agent, agent.id], mentions=mentions)
+        agent.set_props({**props, "topic": str(topic)})
+        return agent, topic
 
     def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
         """Start an Engineer on `prompt`, in `workdir` or your directory."""
@@ -144,24 +170,24 @@ class Agents:
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
         props = {"name": task_name, "preset": "child", "parent": me.id, "cwd": cwd}
-        child = self._spawn(engineer_runtime(me.runtime), props, prompt)
+        child, topic = self._spawn(engineer_runtime(me.runtime), props, task_name, prompt)
         return report(
-            f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
-            f"results will arrive as mail from that Engineer. It works in {cwd}. Use mail.send "
-            "to follow up."
+            f'Spawned agent {label(child.id)} for task "{task_name}" in topic #{topic}. It is '
+            f"working now; its results will arrive in that topic. It works in {cwd}. Post in "
+            f"#{topic} to follow up."
         )
 
     def spawn_new_advisor(self, msg):
-        """Ask an independent Advisor; its findings arrive as mail."""
+        """Ask an independent Advisor; its findings arrive in a new topic."""
         if not str(msg).strip():
             raise ValueError("message must not be empty")
         me = self._me()
         # The Advisor reads what the asker sees: the same directory.
         props = {"name": "advisor", "preset": "advisor", "parent": me.id, "cwd": me.props["cwd"]}
-        advisor = self._spawn(advisor_runtime(me.runtime), props, msg)
+        advisor, topic = self._spawn(advisor_runtime(me.runtime), props, "Advisor: " + _first_line(msg), msg)
         return report(
-            f"Advisor {label(advisor.id)} is considering the question. Its answer will arrive "
-            "as mail."
+            f"Advisor {label(advisor.id)} is considering the question in topic #{topic}. Its "
+            "answer will arrive in that topic."
         )
 
     def cancel(self, *, agent_id):
@@ -193,8 +219,8 @@ class UserAgents(Agents):
     """An Engineer the user manages may also start Engineers for the user."""
 
     def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None):
-        """Start an Engineer the user manages as its own thread; it reports
-        to the user, not to you."""
+        """Start an Engineer the user manages; it reports to the user, not to
+        you. The user learns of it by a mention of its topic."""
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         me = self._me()
@@ -203,14 +229,22 @@ class UserAgents(Agents):
             "name": task_name,
             "preset": "engineer",
             "started_by": me.id,
-            "user_facing": "true",
             "cwd": cwd,
         }
-        agent = self._spawn(engineer_runtime(me.runtime), props, prompt)
+        agent, topic = self._spawn(engineer_runtime(me.runtime), props, task_name, prompt, mentions=[(rho_chat.USER, "fyi")])
         return report(
-            f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}". It works in '
-            f"{cwd}. It appears in the user's agent list and reports to the user, not to you."
+            f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}" in topic '
+            f"#{topic}. It works in {cwd}. It reports to the user, not to you."
         )
+
+
+#: The longest topic name a tool makes from a message.
+TOPIC_NAME_CHARS = 60
+
+
+def _first_line(text):
+    line = next((line.strip() for line in str(text).splitlines() if line.strip()), "")
+    return line if len(line) <= TOPIC_NAME_CHARS else line[: TOPIC_NAME_CHARS - 1] + "…"
 
 
 def _workdir(workdir):
@@ -243,7 +277,7 @@ class Skills:
 def exports(agent) -> dict:
     """The tools for `agent`, by global name. Advisors start no agents."""
     preset = agent.props["preset"]
-    tools = {"mail": Mail(agent.id), "skills": Skills(agent.id)}
+    tools = {"chat": Chat(agent.id), "skills": Skills(agent.id)}
     if preset == "engineer":
         tools["agents"] = UserAgents(agent.id)
     elif preset == "child":

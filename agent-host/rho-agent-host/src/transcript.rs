@@ -73,14 +73,14 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
         },
         Event::Input {
             agent,
-            mail,
+            message,
             content,
             wake,
         } => {
             let text = content_text(content);
             LogEvent::Input {
                 agent: *agent,
-                mail: *mail,
+                message: *message,
                 // A spoken request reads as what was asked, not as the
                 // markup the agent is handed.
                 text: match wake {

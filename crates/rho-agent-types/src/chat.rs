@@ -45,6 +45,11 @@ chat_id!(
     /// A topic, named by the event that started it.
     TopicId
 );
+
+impl StreamId {
+    /// Every host's first chat event creates this stream, named `rho`.
+    pub const DEFAULT: Self = Self(ChatSeq(1));
+}
 chat_id!(
     /// A message, named by the event that posted it.
     MessageId

@@ -12,8 +12,10 @@ class State:
     def __init__(self):
         self.kind = "isolated"
         self.agents = {}
-        self.mails = []
-        self.inputs = []  # (agent, text, wake, mail)
+        self.events = 1  # the chat log's newest seq: 1 is the default stream
+        self.topics = {}  # id -> TopicRecord
+        self.messages = []  # MessageRecord, in order
+        self.inputs = []  # (agent, text, wake, message)
         self.calls = []  # (name, args)
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
@@ -67,16 +69,16 @@ def set_spec(agent, spec):
         STATE.agents[agent] = copy.deepcopy(spec)
 
 
-def input(agent, text, *, wake, mail=None):
+def input(agent, text, *, wake, message=None):
     assert wake in ("person", "agent", "quiet"), wake
     with STATE.lock:
         assert agent in STATE.agents, agent
-        STATE.inputs.append((agent, text, wake, mail))
+        STATE.inputs.append((agent, text, wake, message))
 
 
 def delivered(agent):
     with STATE.lock:
-        return max((mail for a, _, _, mail in STATE.inputs if a == agent and mail is not None), default=0)
+        return max((message for a, _, _, message in STATE.inputs if a == agent and message is not None), default=0)
 
 
 def cancel(agent):
@@ -95,39 +97,84 @@ def new_cache_key(agent):
     STATE.calls.append(("new_cache_key", (agent,)))
 
 
-def send_mail(sender, to, text, *, kind=None, thread=None):
+def _post(sender, topic, text, mentions):
+    """With the lock held."""
+    if topic not in STATE.topics:
+        raise ValueError(f"no topic {topic}")
+    if not text.strip():
+        raise ValueError("a message needs text")
+    for address, kind in mentions:
+        assert kind in ("ask", "result", "fyi"), kind
+        assert address == "user" or address in STATE.agents, address
+    agents = STATE.topics[topic]["agents"]
+    if sender != "user" and sender not in agents:
+        agents.append(sender)
+    STATE.events += 1
+    STATE.messages.append({"id": STATE.events, "at": 0, "topic": topic, "sender": sender, "mentions": list(mentions), "text": text})
+    return STATE.events
+
+
+def _start(sender, stream, name, text, agents, mentions):
+    assert stream == "rho", stream
+    if not name.strip():
+        raise ValueError("a topic needs a name")
+    STATE.events += 1
+    topic = STATE.events
+    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "agents": list(dict.fromkeys(agents))}
+    _post(sender, topic, text, mentions)
+    return topic
+
+
+def post(sender, topic, text, *, mentions=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        if to == "user" and kind is None:
-            raise ValueError("a mail to the user needs a kind")
-        if thread is not None and not any(m["id"] == thread == m["thread"] for m in STATE.mails):
-            raise ValueError(f"no mail thread {thread}")
-        id = len(STATE.mails) + 1
-        STATE.mails.append({"id": id, "at": 0, "sender": sender, "to": to, "thread": thread or id, "kind": kind, "text": text})
-        return id
+        return _post(sender, topic, text, mentions or [])
 
 
-def newest_mail_between(a, b):
+def start_topic(sender, stream, name, text, *, agents=[], mentions=None):
     with STATE.lock:
-        for m in reversed(STATE.mails):
-            if {m["sender"], m["to"]} == {a, b}:
-                return dict(m)
-        return None
+        if sender not in STATE.agents:
+            raise ValueError(f"{sender} is not an agent of this workset")
+        return _start(sender, stream, name, text, agents, mentions or [])
 
 
-def post_user_mail(to, text, thread=None):
-    """What the host does with the GUI's PostMail."""
+def join(topic, agent):
     with STATE.lock:
-        id = len(STATE.mails) + 1
-        STATE.mails.append({"id": id, "at": 0, "sender": "user", "to": to, "thread": thread or id, "kind": None, "text": text})
-        return id
+        agents = STATE.topics[topic]["agents"]
+        if agent not in agents:
+            agents.append(agent)
 
 
-async def inbox(address, after):
+def topic(id):
+    with STATE.lock:
+        found = STATE.topics.get(id)
+        return copy.deepcopy(found)
+
+
+def post_user(topic, text):
+    """What the host does with the GUI's Post."""
+    with STATE.lock:
+        return _post("user", topic, text, [])
+
+
+def start_user_topic(name, text, agents):
+    """What the host does with the GUI's StartTopic."""
+    with STATE.lock:
+        return _start("user", "rho", name, text, agents, [])
+
+
+def _receives(agent, message):
+    if message["sender"] == agent:
+        return False
+    mentioned = any(address == agent for address, _ in message["mentions"])
+    return mentioned or agent in STATE.topics[message["topic"]]["agents"]
+
+
+async def inbox(agent, after):
     while True:
         with STATE.lock:
-            found = [dict(m) for m in STATE.mails if m["to"] == address and m["id"] > after]
+            found = [copy.deepcopy(m) for m in STATE.messages if m["id"] > after and _receives(agent, m)]
         if found:
             return found
         await asyncio.sleep(0.005)

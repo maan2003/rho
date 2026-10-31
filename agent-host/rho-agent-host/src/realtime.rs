@@ -11,8 +11,8 @@ mod thread;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent::store::{Appended, StoreRead as _};
-use rho_agent_types::{AgentId, ContentPart, MailId};
+use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
+use rho_agent_types::{AgentId, ContentPart, Message, TopicId};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
     ContextChannel, ProviderEvent, Sideband, SidebandConfig, TIMELINE, TranscriptState,
@@ -29,8 +29,8 @@ use crate::Services;
 /// The live model's instructions, adapted from the ChatGPT app's voice
 /// prompt. The thread's startup context is appended.
 const INSTRUCTIONS: &str = include_str!("realtime/voice.md");
-/// How far back in the mail log the startup context looks for turns.
-const CONTEXT_SCAN_BACK: u64 = 2_000;
+/// How many of the topic's newest messages the startup context reads.
+const CONTEXT_MESSAGES: usize = 200;
 const MAX_SDP_BYTES: usize = 256 * 1024;
 const SIGNALING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CALL_URL: &str =
@@ -42,6 +42,7 @@ pub(crate) async fn serve<R, W>(
     mut writer: W,
     offer_sdp: String,
     agent_id: AgentId,
+    topic: TopicId,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -62,7 +63,7 @@ where
     };
     tracing::info!(target: TIMELINE, agent = ?agent_id, "voice requested");
     let opened = async {
-        let instructions = instructions(&services, agent_id)?;
+        let instructions = instructions(&services, agent_id, topic)?;
         let auth = services.inference.auth().await?;
         let credential = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
@@ -116,9 +117,10 @@ where
 
     write_frame(&mut writer, &RealtimeServerFrame::SidebandReady).await?;
 
-    // Replies are what the agent mails the user from here on, and a stop.
+    // Replies are what the agent posts in the topic from here on, and a
+    // stop.
     let mut feed = rho_agent::store::feed(services.pool.db());
-    let mut cursor = services.pool.db().read().mail_head();
+    let mut cursor = services.pool.db().read().chat_head();
     // The request the agent's messages answer: the latest one, until the
     // agent completes it.
     let mut active: Option<String> = None;
@@ -140,12 +142,18 @@ where
                         }
                     }
                     Ok(Appended::WorksetDeleted(_)) => continue,
-                    Ok(Appended::Mail(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let mails = services.pool.db().read().mail_since(cursor, usize::MAX);
-                        if let Some(last) = mails.last() {
-                            cursor = last.id;
+                    Ok(Appended::Chat(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let records = services.pool.db().read().chat_since(cursor, usize::MAX);
+                        if let Some(last) = records.last() {
+                            cursor = last.seq;
                         }
-                        told.extend(mails.iter().filter_map(|mail| thread::reply(mail, agent_id)));
+                        told.extend(
+                            records
+                                .iter()
+                                .filter_map(Message::from_record)
+                                .filter(|message| message.topic == topic)
+                                .filter_map(|message| thread::reply(&message, agent_id)),
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -167,10 +175,9 @@ where
                         let message = thread::delegation(&text, &transcript.take_snapshot());
                         let delivered = services
                             .pool
-                            .post_user_mail(
+                            .post_user(
                                 uuid::Uuid::new_v4().as_u64_pair().0,
-                                agent_id,
-                                None,
+                                topic,
                                 vec![ContentPart::Text { text: message }],
                             )
                             .await;
@@ -230,19 +237,24 @@ where
     result
 }
 
-/// The live model's instructions with the agent's thread appended: its
-/// latest mail with the user.
-fn instructions(services: &Services, agent_id: AgentId) -> anyhow::Result<String> {
+/// The live model's instructions with the topic's latest turns appended.
+fn instructions(services: &Services, agent_id: AgentId, topic: TopicId) -> anyhow::Result<String> {
     let read = services.pool.db().read();
     anyhow::ensure!(
         read.agent(agent_id).is_some(),
         "voice is attached to an agent this host does not have"
     );
-    let head = read.mail_head();
+    let head = read
+        .topic(topic)
+        .context("voice is attached to a topic this host does not have")?;
+    anyhow::ensure!(
+        head.agents.contains(&agent_id),
+        "voice talks to an agent of its topic"
+    );
     let said = read
-        .mail_since(MailId(head.0.saturating_sub(CONTEXT_SCAN_BACK)), usize::MAX)
-        .into_iter()
-        .filter_map(|mail| thread::Said::of(&mail, agent_id))
+        .topic_messages(topic, CONTEXT_MESSAGES)
+        .iter()
+        .filter_map(|message| thread::Said::of(message, agent_id))
         .collect::<Vec<_>>();
     Ok(match thread::startup_context(said) {
         Some(context) => format!("{INSTRUCTIONS}\n{context}"),

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rho_agent::record::Runtime;
-use rho_agent::store::StoreRead as _;
+use rho_agent::store::{ChatRead as _, StoreRead as _};
 use rho_agent_hosts::protocol::DebugReport;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -98,13 +98,14 @@ enum DebugCommand {
         socket_path: Option<PathBuf>,
         /// Python run once in the new workset's namespace.
         code: String,
-        /// The user's first mail, to the first agent `code` creates.
+        /// The user's first message, in a new topic of the default stream
+        /// with the first agent `code` creates.
         message: Option<String>,
     },
-    /// Mail an agent, as the user would, on a running agent host.
-    SendMessage {
-        /// Full agent id, as in `$RHO_AGENT_ID`.
-        agent: String,
+    /// Post in a topic, as the user would, on a running agent host.
+    Post {
+        /// The topic's id.
+        topic: u64,
         /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
         /// user's agent host.
         #[arg(long = "socket-path")]
@@ -158,12 +159,23 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                     None => rho_agent_types::WorksetKind::Isolated,
                 },
                 code,
-                message: message.map(|text| vec![rho_agent_types::ContentPart::Text { text }]),
             };
-            let created = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            let socket = host_socket(socket_path)?;
+            let created = rho_rpc::protocol::client::call(socket.clone(), call).await?;
             println!("workset {}", created.workset);
             if let Some(agent) = created.result.agent {
                 println!("agent {}", agent.encoded());
+                if let Some(text) = message {
+                    let call = rho_agents_client::protocol::worksets::StartTopic {
+                        client_id: uuid::Uuid::new_v4().as_u64_pair().0,
+                        stream: rho_agent_types::StreamId::DEFAULT,
+                        name: text.lines().next().unwrap_or_default().to_owned(),
+                        agents: vec![agent],
+                        content: vec![rho_agent_types::ContentPart::Text { text }],
+                    };
+                    let topic = rho_rpc::protocol::client::call(socket, call).await?;
+                    println!("topic {}", topic.0.0);
+                }
             }
             print!("{}", created.result.output);
             if let Some(error) = created.result.error {
@@ -171,21 +183,18 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        DebugCommand::SendMessage {
-            agent,
+        DebugCommand::Post {
+            topic,
             socket_path,
             text,
         } => {
-            let to = rho_agent_types::parse_full_handle(&agent)
-                .with_context(|| format!("agent id {agent}"))?;
-            let call = rho_agents_client::protocol::worksets::PostMail {
+            let call = rho_agents_client::protocol::worksets::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
-                to,
-                thread: None,
+                topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(topic)),
                 content: vec![rho_agent_types::ContentPart::Text { text }],
             };
             let id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
-            println!("mail {}", id.0);
+            println!("message {}", id.0.0);
             Ok(())
         }
     }
@@ -627,7 +636,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             rows += page.len();
         }
     }
-    let mails = read.mail_head().0;
+    let chat = read.chat_head().0;
 
     let mut output = String::new();
     writeln!(output, "source: {}", snapshot.source.display())?;
@@ -635,7 +644,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "worksets decoded: {}", worksets.len())?;
     writeln!(output, "rows decoded: {rows}")?;
-    writeln!(output, "mails: {mails}")?;
+    writeln!(output, "chat events: {chat}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }

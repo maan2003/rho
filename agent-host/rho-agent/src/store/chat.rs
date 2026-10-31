@@ -27,7 +27,7 @@ const INBOX: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("chat_in
 /// logged once: the seq of the event the post made.
 const CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("chat_client_ids");
 
-/// The stream every host has from its first start.
+/// The name of [`StreamId::DEFAULT`].
 pub const DEFAULT_STREAM: &str = "rho";
 
 /// A topic as the log has made it.
@@ -58,6 +58,8 @@ pub trait ChatRead {
     fn stream_named(&self, name: &str) -> Option<StreamId>;
     /// What `agent` receives after `after`, in order.
     fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message>;
+    /// A topic's `newest` latest messages, oldest first.
+    fn topic_messages(&self, topic: TopicId, newest: usize) -> Vec<Message>;
 }
 
 impl ChatRead for ReadTxn {
@@ -109,6 +111,23 @@ impl ChatRead for ReadTxn {
             .map(|seq| {
                 self.message(MessageId(ChatSeq(seq)))
                     .expect("an inbox names a message")
+            })
+            .collect()
+    }
+
+    fn topic_messages(&self, topic: TopicId, newest: usize) -> Vec<Message> {
+        let mut seqs: Vec<u64> = self
+            .open_table(TOPIC_MESSAGES)
+            .range((topic.0.0, 0)..=(topic.0.0, u64::MAX))
+            .rev()
+            .take(newest)
+            .map(|(key, _)| key.value().1)
+            .collect();
+        seqs.reverse();
+        seqs.into_iter()
+            .map(|seq| {
+                self.message(MessageId(ChatSeq(seq)))
+                    .expect("a topic names its messages")
             })
             .collect()
     }
@@ -182,8 +201,10 @@ impl ChatWrite for WriteTxn {
         self.open_table(INBOX);
         self.open_table(CLIENT_IDS);
         if self.open_table(CHAT_LOG).iter().next().is_none() {
-            self.create_stream(UnixMs::now(), DEFAULT_STREAM.to_owned())
+            let stream = self
+                .create_stream(UnixMs::now(), DEFAULT_STREAM.to_owned())
                 .expect("an empty chat has no streams");
+            assert_eq!(stream, StreamId::DEFAULT);
         }
     }
 

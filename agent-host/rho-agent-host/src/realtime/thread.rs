@@ -1,13 +1,12 @@
-//! The agent thread a voice session belongs to, in the shapes the Codex
-//! client gives the live model: the thread's latest turns as startup
-//! context, each spoken request as a `<realtime_delegation>` message to the
-//! agent, and each message the agent sends the user as a `[STATUS]` or
-//! `[COMPLETE]` reply.
+//! The topic a voice session belongs to, in the shapes the Codex client
+//! gives the live model: the topic's latest turns as startup context, each
+//! spoken request as a `<realtime_delegation>` message to the agent, and
+//! each message the agent posts as a `[STATUS]` or `[COMPLETE]` reply.
 //!
 //! The formats and budgets follow `codex-rs` (`realtime_context.rs`,
 //! `context/realtime_delegation.rs`), so the model sees what it is tuned on.
 
-use rho_agent_types::{Address, AgentId, Mail, SendKind};
+use rho_agent_types::{Address, AgentId, MentionKind, Message};
 use rho_openai_realtime::ContextChannel;
 
 use crate::transcript::content_text;
@@ -29,17 +28,15 @@ pub(super) enum Said {
 }
 
 impl Said {
-    /// What a mail says in the conversation between the user and `agent`,
-    /// if it is a part of it.
-    pub(super) fn of(mail: &Mail, agent: AgentId) -> Option<Self> {
-        match (mail.from, mail.to) {
-            (Address::User, Address::Agent(to)) if to == agent => {
-                Some(Self::User(content_text(&mail.content)))
+    /// What a message of the topic says in the conversation between the
+    /// user and `agent`, if it is a part of it.
+    pub(super) fn of(message: &Message, agent: AgentId) -> Option<Self> {
+        match message.from {
+            Address::User => Some(Self::User(content_text(&message.content))),
+            Address::Agent(from) if from == agent => {
+                Some(Self::Agent(content_text(&message.content)))
             }
-            (Address::Agent(from), Address::User) if from == agent => {
-                Some(Self::Agent(content_text(&mail.content)))
-            }
-            _ => None,
+            Address::Agent(_) => None,
         }
     }
 }
@@ -127,16 +124,19 @@ pub(crate) fn shown_to_reader(text: &str) -> Option<String> {
     Some(format!("{}🎤 {}", &text[..start], input.trim()))
 }
 
-/// What the live model is told of a mail `agent` sent the user, on which
-/// channel, and whether it ends the request. Progress is a `[STATUS]` the
-/// model may keep to itself; a result or a question is the `[COMPLETE]`
-/// answer.
-pub(super) fn reply(mail: &Mail, agent: AgentId) -> Option<(ContextChannel, String, bool)> {
-    if mail.from != Address::Agent(agent) || mail.to != Address::User {
+/// What the live model is told of a message `agent` posted in the topic,
+/// on which channel, and whether it ends the request. Progress is a
+/// `[STATUS]` the model may keep to itself; a message that mentions the
+/// user with a result or a question is the `[COMPLETE]` answer.
+pub(super) fn reply(message: &Message, agent: AgentId) -> Option<(ContextChannel, String, bool)> {
+    if message.from != Address::Agent(agent) {
         return None;
     }
-    let complete = matches!(mail.kind, Some(SendKind::Result | SendKind::Ask));
-    Some(told(&content_text(&mail.content), complete))
+    let complete = matches!(
+        message.mentions(Address::User),
+        Some(MentionKind::Result | MentionKind::Ask)
+    );
+    Some(told(&content_text(&message.content), complete))
 }
 
 /// What the live model is told when the agent stopped on an error: the
@@ -220,7 +220,9 @@ fn escape_bounded(text: &str, retain: Retain) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ContentPart, MailId, UnixMs};
+    use rho_agent_types::{
+        AgentIdDomain, ChatSeq, ContentPart, Mention, MessageId, TopicId, UnixMs,
+    };
 
     use super::*;
 
@@ -228,22 +230,28 @@ mod tests {
         AgentId::from_counter(counter, &AgentIdDomain(0)).unwrap()
     }
 
-    fn mail(from: Address, to: Address, kind: Option<SendKind>, text: &str) -> Mail {
-        Mail {
-            id: MailId(1),
+    fn message(from: Address, mentions: Vec<Mention>, text: &str) -> Message {
+        Message {
+            id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
+            topic: TopicId(ChatSeq(2)),
             from,
-            to,
-            thread: rho_agent_types::ThreadId(MailId(1)),
-            kind,
+            mentions,
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
         }
     }
 
-    fn sent(kind: SendKind, text: &str) -> Mail {
-        mail(Address::Agent(agent(1)), Address::User, Some(kind), text)
+    fn mention(to: Address, kind: MentionKind) -> Vec<Mention> {
+        vec![Mention { to, kind }]
+    }
+
+    /// What agent 1 posts mentioning the user with `kind`, or without a
+    /// mention.
+    fn sent(kind: Option<MentionKind>, text: &str) -> Message {
+        let mentions = kind.map_or_else(Vec::new, |kind| mention(Address::User, kind));
+        message(Address::Agent(agent(1)), mentions, text)
     }
 
     fn channel_name(channel: ContextChannel) -> &'static str {
@@ -324,12 +332,27 @@ mod tests {
     }
 
     #[test]
-    fn the_send_kind_picks_the_channel_and_whether_the_request_is_done() {
+    fn the_mention_of_the_user_picks_the_channel_and_whether_the_request_is_done() {
         let cases = [
-            (SendKind::Status, "commentary", "[STATUS] looking", false),
-            (SendKind::Fyi, "commentary", "[STATUS] looking", false),
-            (SendKind::Result, "speakable", "[COMPLETE] looking", true),
-            (SendKind::Ask, "speakable", "[COMPLETE] looking", true),
+            (None, "commentary", "[STATUS] looking", false),
+            (
+                Some(MentionKind::Fyi),
+                "commentary",
+                "[STATUS] looking",
+                false,
+            ),
+            (
+                Some(MentionKind::Result),
+                "speakable",
+                "[COMPLETE] looking",
+                true,
+            ),
+            (
+                Some(MentionKind::Ask),
+                "speakable",
+                "[COMPLETE] looking",
+                true,
+            ),
         ];
         for (kind, channel, text, complete) in cases {
             let (got_channel, got_text, got_complete) =
@@ -340,16 +363,18 @@ mod tests {
                 "{kind:?}"
             );
         }
-        // Mail to another agent, or from another agent, is not this
-        // agent's answer to the user.
-        let to_agent = mail(
+        // A result that mentions another agent, not the user, does not end
+        // the request; another agent's message is not this agent's answer.
+        let to_agent = message(
             Address::Agent(agent(1)),
-            Address::Agent(agent(7)),
-            Some(SendKind::Result),
+            mention(Address::Agent(agent(7)), MentionKind::Result),
             "x",
         );
-        assert_eq!(reply(&to_agent, agent(1)), None);
-        assert_eq!(reply(&sent(SendKind::Result, "x"), agent(7)), None);
+        assert_eq!(
+            reply(&to_agent, agent(1)).map(|(_, _, done)| done),
+            Some(false)
+        );
+        assert_eq!(reply(&sent(Some(MentionKind::Result), "x"), agent(7)), None);
         let (channel, text, complete) = stopped("quota");
         assert_eq!(
             (channel_name(channel), text.as_str(), complete),
@@ -358,31 +383,23 @@ mod tests {
     }
 
     #[test]
-    fn the_thread_is_the_mail_between_the_user_and_this_agent() {
-        let me = Address::Agent(agent(1));
+    fn the_conversation_is_the_users_messages_and_this_agents() {
         let other = Address::Agent(agent(2));
         assert_eq!(
-            Said::of(&mail(Address::User, me, None, "ask"), agent(1)),
+            Said::of(&message(Address::User, vec![], "ask"), agent(1)),
             Some(Said::User("ask".to_owned()))
         );
         assert_eq!(
-            Said::of(
-                &mail(me, Address::User, Some(SendKind::Result), "done"),
-                agent(1)
-            ),
+            Said::of(&sent(Some(MentionKind::Result), "done"), agent(1)),
             Some(Said::Agent("done".to_owned()))
         );
-        assert_eq!(
-            Said::of(&mail(Address::User, other, None, "x"), agent(1)),
-            None
-        );
-        assert_eq!(Said::of(&mail(other, me, None, "x"), agent(1)), None);
+        assert_eq!(Said::of(&message(other, vec![], "x"), agent(1)), None);
     }
 
     #[test]
     fn a_long_reply_is_cut_to_two_thousand_tokens() {
         let text = format!("HEAD{}TAIL", "ü".repeat(20_000));
-        let (_, reply, _) = reply(&sent(SendKind::Result, &text), agent(1)).unwrap();
+        let (_, reply, _) = reply(&sent(Some(MentionKind::Result), &text), agent(1)).unwrap();
         assert!(reply.starts_with("[COMPLETE] HEAD") && reply.ends_with("TAIL"));
         assert!(reply.len() <= REPLY_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN + 20);
     }

@@ -1311,8 +1311,9 @@ where
             let rho_rtc::protocol::Open {
                 offer_sdp,
                 agent_id,
+                topic,
             } = open.unpack()?;
-            realtime::serve(services, reader, writer, offer_sdp, agent_id).await
+            realtime::serve(services, reader, writer, offer_sdp, agent_id, topic).await
         }
         Protocol::Workspace => anyhow::bail!("the workspace file protocol is no longer served"),
     }

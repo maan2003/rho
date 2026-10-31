@@ -1,5 +1,5 @@
 //! The agents part of the agent host, and the parts about one agent's workset:
-//! its terminals and shells. The session carries the directory, the mail,
+//! its terminals and shells. The session carries the directory, the chat,
 //! the rows of the worksets a client follows, the live tails and the quota;
 //! requests, terminals and shells are streams of their own.
 
@@ -10,12 +10,12 @@ use std::sync::atomic::Ordering;
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::record::{Event, Record};
-use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
-use rho_agent_types::{AgentId, MailId, WorksetId, WorksetKind, Wpos};
+use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, WorksetHead};
+use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
     AgentEntry, Cancel, ClientFrame, CreateWorkset, CreatedWorkset, DeleteWorksets, Eval,
-    EvalResult, LogEvent, Open, PostMail, Request, ServerFrame, WorksetEntry, WorksetLog,
+    EvalResult, LogEvent, Open, Post, Request, ServerFrame, StartTopic, WorksetEntry, WorksetLog,
     WorksetLogPage,
 };
 use rho_agents_client::protocol::{
@@ -149,7 +149,7 @@ impl Drop for Attached {
     }
 }
 
-/// How many rows or mails travel in one frame while a client is catching
+/// How many rows or chat events travel in one frame while a client is catching
 /// up, so a cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
@@ -158,13 +158,13 @@ const QUOTA_REFRESH: std::time::Duration = std::time::Duration::from_secs(10 * 6
 
 /// What a client asks the session's follower for.
 enum Follow {
-    Mail(MailId),
+    Chat(ChatSeq),
     Worksets(Vec<(WorksetId, Wpos)>),
     Focus(HashSet<AgentId>),
 }
 
 /// A client's session: `Hello`, the directory, then whatever the client
-/// follows (the mail, some worksets' rows, the live tails of the agents it
+/// follows (the chat, some worksets' rows, the live tails of the agents it
 /// looks at) as it lands, beside the auth state and the quota. A stream of
 /// its own, so a catch-up queues behind nothing and holds nothing up.
 async fn serve_session<R, W>(
@@ -190,13 +190,13 @@ where
     // between is lost; positions drop what is told twice.
     let feed = rho_agent::store::feed(&services.db);
     let statuses = services.pool.watch_statuses().await;
-    let (mail_head, agent_counter) = {
+    let (chat_head, agent_counter) = {
         let read = services.db.read();
-        (read.mail_head(), read.last_agent_counter())
+        (read.chat_head(), read.last_agent_counter())
     };
     let _ = outgoing_tx.send(ServerFrame::Hello {
         machine_seed: services.machine_seed,
-        mail_head,
+        chat_head,
         agent_counter,
     });
     let _ = outgoing_tx.send(directory(&services.db));
@@ -265,8 +265,8 @@ where
                 Err(error) => break Err(error),
             };
         match frame {
-            ClientFrame::FollowMail { since } => {
-                let _ = follow_tx.send(Follow::Mail(since));
+            ClientFrame::FollowChat { since } => {
+                let _ = follow_tx.send(Follow::Chat(since));
             }
             ClientFrame::FollowWorksets { from } => {
                 let _ = follow_tx.send(Follow::Worksets(from));
@@ -343,7 +343,7 @@ fn agent_entry(agent: AgentId, head: &AgentHead) -> AgentEntry {
 /// directory says.
 fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
     match appended {
-        Appended::Mail(_) => None,
+        Appended::Chat(_) => None,
         Appended::WorksetDeleted(workset) => Some(ServerFrame::WorksetDeleted { workset }),
         Appended::Row { workset, pos } => {
             let read = db.read();
@@ -361,7 +361,7 @@ fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
 }
 
 /// The session's one pipe for everything that follows the store: directory
-/// changes, then mail and rows past what the client holds, then the
+/// changes, then chat and rows past what the client holds, then the
 /// statuses, which arrive after the rows they reflect commit. Rows are read
 /// from the store, never from the feed: an append only says something
 /// landed. A lagged feed sends the directory whole.
@@ -375,7 +375,7 @@ async fn follow(
     statuses: Arc<rho_agent::host::pool::Statuses>,
     mut asks: mpsc::UnboundedReceiver<Follow>,
 ) {
-    let mut mail: Option<MailId> = None;
+    let mut chat: Option<ChatSeq> = None;
     let mut worksets: HashMap<WorksetId, Wpos> = HashMap::new();
     let mut focus: HashSet<AgentId> = HashSet::new();
     let mut befores = Befores::new();
@@ -383,8 +383,8 @@ async fn follow(
         // Taken before the rows are read: an agent's status arrives after
         // the rows it reflects commit, so they go out first.
         let changed = statuses.take();
-        if let Some(sent) = mail.as_mut()
-            && !send_mail_from(&services.db, &outgoing_tx, sent).await
+        if let Some(sent) = chat.as_mut()
+            && !send_chat_from(&services.db, &outgoing_tx, sent).await
         {
             return;
         }
@@ -446,7 +446,7 @@ async fn follow(
             () = statuses.changed() => {}
             ask = asks.recv() => match ask {
                 None => return,
-                Some(Follow::Mail(since)) => mail = Some(since),
+                Some(Follow::Chat(since)) => chat = Some(since),
                 Some(Follow::Worksets(from)) => {
                     // A workset already followed goes on from what this
                     // stream sent: rows past the client's position are on
@@ -465,20 +465,20 @@ async fn follow(
     }
 }
 
-/// Pages the mail out from after `sent`, moving it as it goes. False when
+/// Pages the chat out from after `sent`, moving it as it goes. False when
 /// the connection is gone.
-async fn send_mail_from(
+async fn send_chat_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<ServerFrame>,
-    sent: &mut MailId,
+    sent: &mut ChatSeq,
 ) -> bool {
     loop {
-        let mails = db.read().mail_since(*sent, LOG_PAGE);
-        let Some(last) = mails.last() else {
+        let records = db.read().chat_since(*sent, LOG_PAGE);
+        let Some(last) = records.last() else {
             return true;
         };
-        *sent = last.id;
-        if outgoing_tx.send(ServerFrame::Mail { mails }).is_err() {
+        *sent = last.seq;
+        if outgoing_tx.send(ServerFrame::Chat { records }).is_err() {
             return false;
         }
         // Catching up must never starve the connection's own traffic.
@@ -604,66 +604,57 @@ where
 {
     match request {
         Request::CreateWorkset(call) => {
-            respond(
-                writer,
-                call,
-                |CreateWorkset {
-                     kind,
-                     code,
-                     mut message,
-                 }| async move {
-                    if let Some(message) = message.as_mut() {
-                        prepare_image_content(message).await?;
-                    }
-                    let kind = match kind {
-                        WorksetKind::Host { cwd } => WorksetKind::Host {
-                            cwd: crate::expand_home(&cwd).unwrap_or(cwd),
-                        },
-                        kind => kind,
-                    };
-                    let (workset, evaluated) =
-                        services.pool.create_workset(kind, code, message).await?;
-                    Ok(CreatedWorkset {
-                        workset,
-                        result: eval_result(evaluated),
-                    })
-                },
-            )
+            respond(writer, call, |CreateWorkset { kind, code }| async move {
+                let kind = match kind {
+                    WorksetKind::Host { cwd } => WorksetKind::Host {
+                        cwd: crate::expand_home(&cwd).unwrap_or(cwd),
+                    },
+                    kind => kind,
+                };
+                let (workset, evaluated) = services.pool.create_workset(kind, code).await?;
+                Ok(CreatedWorkset {
+                    workset,
+                    result: eval_result(evaluated),
+                })
+            })
             .await
         }
         Request::Eval(call) => {
+            respond(writer, call, |Eval { workset, code }| async move {
+                Ok(eval_result(services.pool.eval(workset, code).await?))
+            })
+            .await
+        }
+        Request::Post(call) => {
             respond(
                 writer,
                 call,
-                |Eval {
-                     workset,
-                     code,
-                     mut message,
+                |Post {
+                     client_id,
+                     topic,
+                     mut content,
                  }| async move {
-                    if let Some(message) = message.as_mut() {
-                        prepare_image_content(message).await?;
-                    }
-                    Ok(eval_result(
-                        services.pool.eval(workset, code, message).await?,
-                    ))
+                    prepare_image_content(&mut content).await?;
+                    services.pool.post_user(client_id, topic, content).await
                 },
             )
             .await
         }
-        Request::PostMail(call) => {
+        Request::StartTopic(call) => {
             respond(
                 writer,
                 call,
-                |PostMail {
+                |StartTopic {
                      client_id,
-                     to,
-                     thread,
+                     stream,
+                     name,
+                     agents,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .post_user_mail(client_id, to, thread, content)
+                        .start_user_topic(client_id, stream, name, agents, content)
                         .await
                 },
             )
@@ -1176,13 +1167,13 @@ mod tests {
                 Event::Native { entry, .. } => Event::Native { agent, entry },
                 Event::Rewound { to, .. } => Event::Rewound { agent, to },
                 Event::Input {
-                    mail,
+                    message,
                     content,
                     wake,
                     ..
                 } => Event::Input {
                     agent,
-                    mail,
+                    message,
                     content,
                     wake,
                 },
@@ -1288,7 +1279,7 @@ mod tests {
                         &rho_agent_types::AgentIdDomain(0),
                     )
                     .unwrap(),
-                    mail: Some(rho_agent_types::MailId(3)),
+                    message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(3))),
                     content: vec![rho_agent_types::ContentPart::Text {
                         text: spoken.to_owned(),
                     }],
@@ -1327,7 +1318,7 @@ mod tests {
                     Wpos(2),
                     LogEvent::Input {
                         agent,
-                        mail: Some(rho_agent_types::MailId(3)),
+                        message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(3))),
                         text: "🎤 fix <b>".into(),
                         wake: InputWake::Person,
                         at: UnixMs(1),

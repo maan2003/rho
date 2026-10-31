@@ -26,7 +26,7 @@ def run(call):
 class Tools(WorksetCase):
     def seed(self, state):
         self.tmp = tempfile.mkdtemp()
-        self.root = add_agent(state, native("terra", "xhigh"), preset="engineer", user_facing="true", cwd=self.tmp)
+        self.root = add_agent(state, native("terra", "xhigh"), preset="engineer", cwd=self.tmp)
 
     def notebook(self, agent_id):
         ns = {}
@@ -41,7 +41,7 @@ class Tools(WorksetCase):
     def test_on_notebook_gives_tools_by_preset_and_enters_the_directory(self):
         ns, cwd = self.notebook(self.root)
         self.assertEqual(cwd, os.path.realpath(self.tmp))
-        self.assertEqual(sorted(ns), ["agents", "mail", "skills"])
+        self.assertEqual(sorted(ns), ["agents", "chat", "skills"])
         self.assertTrue(hasattr(ns["agents"], "spawn_user_owned_engineer"))
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(child)
@@ -49,20 +49,22 @@ class Tools(WorksetCase):
         self.assertTrue(hasattr(ns["agents"], "spawn_new_engineer"))
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(advisor)
-        self.assertEqual(sorted(ns), ["mail", "skills"])
+        self.assertEqual(sorted(ns), ["chat", "skills"])
 
     def test_spawn_new_engineer(self):
         ns, _ = self.notebook(self.root)
         work = tempfile.mkdtemp()
         printed, reply = run(lambda: ns["agents"].spawn_new_engineer(task_name="fix-it", prompt="Fix it.", workdir=work))
         [child] = [id for id in self.state.agents if id != self.root]
+        [topic] = self.state.topics
         self.assertEqual(self.state.agents[child], {
             "runtime": native("terra", "xhigh"),
-            "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
+            "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work, "topic": str(topic)},
         })
-        self.assertEqual(self.state.mails[-1]["sender"], self.root)
-        self.assertEqual((self.state.mails[-1]["to"], self.state.mails[-1]["text"]), (child, "Fix it."))
-        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as mail from that Engineer. It works in {work}. Use mail.send to follow up.')
+        self.assertEqual(self.state.topics[topic], {"id": topic, "name": "fix-it", "stream": "rho", "agents": [self.root, child]})
+        [brief] = self.state.messages
+        self.assertEqual((brief["topic"], brief["sender"], brief["text"], brief["mentions"]), (topic, self.root, "Fix it.", []))
+        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it" in topic #{topic}. It is working now; its results will arrive in that topic. It works in {work}. Post in #{topic} to follow up.')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
         # The child gets its brief through delivery.
@@ -90,21 +92,26 @@ class Tools(WorksetCase):
         ns, _ = self.notebook(self.root)
         _, reply = run(lambda: ns["agents"].spawn_new_advisor("Is this right?"))
         [adv] = [id for id in self.state.agents if id != self.root]
+        [topic] = self.state.topics
         self.assertEqual(self.state.agents[adv], {
             "runtime": native("sol", "xhigh"),
-            "props": {"name": "advisor", "preset": "advisor", "parent": self.root, "cwd": self.tmp},
+            "props": {"name": "advisor", "preset": "advisor", "parent": self.root, "cwd": self.tmp, "topic": str(topic)},
         })
-        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive as mail.")
+        self.assertEqual(self.state.topics[topic]["name"], "Advisor: Is this right?")
+        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question in topic #{topic}. Its answer will arrive in that topic.")
 
     def test_spawn_user_owned_engineer(self):
         ns, _ = self.notebook(self.root)
         _, reply = run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="side", prompt="Do the side thing."))
         [owned] = [id for id in self.state.agents if id != self.root]
+        [topic] = self.state.topics
         self.assertEqual(self.state.agents[owned]["props"], {
-            "name": "side", "preset": "engineer", "started_by": self.root, "user_facing": "true", "cwd": self.tmp,
+            "name": "side", "preset": "engineer", "started_by": self.root, "cwd": self.tmp, "topic": str(topic),
         })
         self.assertNotIn("parent", self.state.agents[owned]["props"])
-        self.assertIn("It appears in the user\'s agent list and reports to the user, not to you.", reply)
+        # The user learns of it by a mention that makes no card.
+        self.assertEqual(self.state.messages[-1]["mentions"], [("user", "fyi")])
+        self.assertIn("It reports to the user, not to you.", reply)
         # Its starter may not interrupt it; its own child may.
         with self.assertRaisesRegex(ValueError, "managed by the user"):
             ns["agents"].cancel(agent_id=f"eng-{owned}")
@@ -139,46 +146,50 @@ class Tools(WorksetCase):
             ns["agents"].spawn_new_engineer(task_name="deeper", prompt="p")
         self.assertEqual(len(self.state.agents), before)
 
-    def test_mail_goes_on_in_the_thread_of_the_newest_mail_between(self):
+    def test_a_post_goes_in_the_topic_it_names_and_reaches_whom_it_mentions(self):
         ns, _ = self.notebook(self.root)
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        first = fake_rho.post_user_mail(self.root, "Do it.")
-        run(lambda: ns["mail"].send("user", "On it.", kind="status"))
-        run(lambda: ns["mail"].send(f"eng-{child}", "Help."))
-        run(lambda: ns["mail"].send("user", "Done.", kind="result"))
-        other = fake_rho.post_user_mail(self.root, "Something else.")
-        run(lambda: ns["mail"].send("user", "Also done.", kind="result"))
-        run(lambda: ns["mail"].send(f"eng-{child}", "More help."))
-        threads = [(m["to"], m["text"], m["thread"]) for m in self.state.mails if m["sender"] == self.root]
-        self.assertEqual(
-            threads,
-            [
-                ("user", "On it.", first),
-                (child, "Help.", 3),
-                ("user", "Done.", first),
-                ("user", "Also done.", other),
-                (child, "More help.", 3),
-            ],
-        )
+        first = fake_rho.start_user_topic("Do it", "Do it.", [self.root])
+        other = fake_rho.start_user_topic("Else", "Something else.", [self.root])
+        printed, reply = run(lambda: ns["chat"].post(first, "On it."))
+        self.assertEqual((printed, reply), (f"Posted in #{first}.\n", f"Posted in #{first}."))
+        printed, reply = run(lambda: ns["chat"].post(first, "Done.", mention="user", kind="result"))
+        self.assertEqual((printed, reply), ("", ""))
+        run(lambda: ns["chat"].post(other, "Also done.", mention=["user", f"eng-{child}"], kind="ask"))
+        posted = [(m["topic"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
+        self.assertEqual(posted, [
+            (first, "On it.", []),
+            (first, "Done.", [("user", "result")]),
+            (other, "Also done.", [("user", "ask"), (child, "ask")]),
+        ])
+        # A mention reaches an agent outside the topic.
+        self.assertTrue(fake_rho._receives(child, self.state.messages[-1]))
+        self.assertFalse(any(fake_rho._receives(child, m) for m in self.state.messages[:-1]))
 
-    def test_mail_rules(self):
+    def test_chat_rules(self):
         ns, _ = self.notebook(self.root)
+        topic = fake_rho.start_user_topic("Do it", "Do it.", [self.root])
+        chat = ns["chat"]
         with self.assertRaisesRegex(ValueError, "needs kind"):
-            ns["mail"].send("user", "Done.")
-        printed, _ = run(lambda: ns["mail"].send("user", "Done.", kind="result"))
-        self.assertEqual(printed, "")
-        self.assertEqual(self.state.mails[-1], {"id": 1, "at": 0, "sender": self.root, "to": "user", "thread": 1, "kind": "result", "text": "Done."})
+            chat.post(topic, "Done.", mention="user")
+        with self.assertRaisesRegex(ValueError, "needs kind"):
+            chat.post(topic, "Done.", mention="user", kind="status")
+        with self.assertRaisesRegex(ValueError, "goes with a mention"):
+            chat.post(topic, "Done.", kind="result")
         with self.assertRaisesRegex(ValueError, "yourself"):
-            ns["mail"].send(f"eng-{self.root}", "hi")
+            chat.post(topic, "hi", mention=f"eng-{self.root}", kind="fyi")
+        with self.assertRaisesRegex(ValueError, "no topic 99"):
+            chat.post(99, "hi")
+        with self.assertRaisesRegex(ValueError, "needs text"):
+            chat.post(topic, " ")
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        printed, reply = run(lambda: ns["mail"].send(f"eng-{child}", "More."))
-        self.assertEqual(reply, f"Message sent to eng-{child}.")
-        self.assertEqual(self.state.mails[-1]["to"], child)
         cns, _ = self.notebook(child)
         with self.assertRaisesRegex(ValueError, f"parent agent eng-{self.root}"):
-            cns["mail"].send("user", "Hi.", kind="fyi")
-        with self.assertRaisesRegex(ValueError, "needs text"):
-            cns["mail"].send(self.root, " ")
+            cns["chat"].post(topic, "Hi.", mention="user", kind="fyi")
+        self.assertEqual(len(self.state.messages), 1, "nothing refused was posted")
+        printed, started = run(lambda: chat.start("side", "Look.", agents=[f"eng-{child}"]))
+        self.assertEqual(printed, f"Started topic #{started}.\n")
+        self.assertEqual(self.state.topics[started]["agents"], [child, self.root])
 
     def test_skills_load_keeps_only_skills_that_ask_and_compaction_rereads_them(self):
         ns, _ = self.notebook(self.root)
@@ -216,14 +227,17 @@ class Tools(WorksetCase):
         self.assertFalse(skills.keeps_after_compaction("rho-keep-after-compaction: true\n"))
         self.assertTrue(skills.keeps_after_compaction("\ufeff---\r\nmetadata:\r\n  rho-keep-after-compaction: true\r\n---  \r\nBody."))
 
-    def test_a_failed_child_tells_its_parent(self):
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+    def test_a_failed_child_tells_its_parent_in_its_topic(self):
+        ns, _ = self.notebook(self.root)
+        run(lambda: ns["agents"].spawn_new_engineer(task_name="fix-it", prompt="Fix it."))
+        [child] = [id for id in self.state.agents if id != self.root]
+        [topic] = self.state.topics
         rho._hook("on_turn_end", child, {"reason": "end_turn", "error": None}, timeout=5)
         rho._hook("on_turn_end", self.root, {"reason": "failed", "error": "boom"}, timeout=5)
-        self.assertEqual(self.state.mails, [])
+        self.assertEqual(len(self.state.messages), 1)
         rho._hook("on_turn_end", child, {"reason": "failed", "error": "quota"}, timeout=5)
-        self.assertEqual([(m["sender"], m["to"], m["text"]) for m in self.state.mails],
-                         [(child, self.root, "Agent hit an error and stopped: quota")])
+        self.assertEqual([(m["topic"], m["sender"], m["text"]) for m in self.state.messages[1:]],
+                         [(topic, child, "Agent hit an error and stopped: quota")])
 
 
 async def _await(reply):
@@ -248,9 +262,9 @@ class NewAgent(WorksetCase):
         self.assertEqual(self.state.calls, [("clone", ("https://github.com/org/proj.git", cwd, "abc"))])
         self.assertEqual(self.state.agents[id], {
             "runtime": claude(),
-            "props": {"preset": "engineer", "user_facing": "true", "cwd": cwd},
+            "props": {"preset": "engineer", "cwd": cwd},
         })
-        self.assertEqual(self.state.mails, [])
+        self.assertEqual(self.state.messages, [])
 
     def test_ssh_urls_name_the_directory(self):
         rho._eval(f"new_agent(repo=\'git@github.com:org/tool.git\', runtime={native()!r})")

@@ -9,7 +9,7 @@ import traceback
 
 import _rho
 
-from . import agents, hooks, mail, prompt, skills, tools, workset
+from . import agents, chat, hooks, prompt, skills, tools, workset
 
 #: Seconds before a failed delivery is tried again.
 RETRY_SECONDS = 5
@@ -39,16 +39,11 @@ def on_compaction(agent) -> list[str]:
 
 
 def on_turn_end(agent, outcome) -> None:
-    """A child that failed tells its parent; whatever else it has to say it
-    mails itself."""
-    parent = agent.props.get("parent")
-    if outcome["reason"] == "failed" and parent is not None:
-        mail.send(
-            agent.id,
-            parent,
-            f"Agent hit an error and stopped: {outcome['error']}",
-            thread=mail.thread_with(agent.id, parent),
-        )
+    """A child that failed tells its parent, in the topic it was started
+    in; whatever else it has to say it posts itself."""
+    topic = agent.props.get("topic")
+    if outcome["reason"] == "failed" and agent.props.get("parent") is not None and topic is not None:
+        chat.post(agent.id, int(topic), f"Agent hit an error and stopped: {outcome['error']}")
 
 
 async def on_agent(agent) -> None:
@@ -56,39 +51,39 @@ async def on_agent(agent) -> None:
 
 
 async def deliver(agent) -> None:
-    """Hand the agent its mail, in order, forever. It resumes after the
-    newest mail the agent's log says it was handed."""
+    """Hand the agent what it receives, in order, forever. It resumes after
+    the newest message the agent's log says it was handed."""
     while True:
         try:
             after = _rho.delivered(agent.id)
             while True:
-                for record in await mail.inbox(agent.id, after):
-                    wake = "person" if record["sender"] == mail.USER else "agent"
-                    await asyncio.to_thread(agent.input, render(record), wake=wake, mail=record["id"])
+                for record in await chat.inbox(agent.id, after):
+                    wake = "person" if record["sender"] == chat.USER else "agent"
+                    await asyncio.to_thread(agent.input, render(record), wake=wake, message=record["id"])
                     after = record["id"]
         except Exception:
-            print(f"rho: delivering mail to {agent.id}:", file=sys.stderr)
+            print(f"rho: delivering messages to {agent.id}:", file=sys.stderr)
             traceback.print_exc()
             await asyncio.sleep(RETRY_SECONDS)
 
 
 def render(record: dict) -> str:
-    """A mail as the model reads it."""
+    """A message as the model reads it: its topic first, so the model knows
+    where to answer."""
+    topic = chat.topic(record["topic"])
+    where = f"[#{record['topic']} {topic['stream']} › {topic['name']}]"
     sender = record["sender"]
-    if sender == mail.USER:
-        return f"Message from the user:\n{record['text']}"
+    if sender == chat.USER:
+        return f"{where} Message from the user:\n{record['text']}"
     label = prompt.label(sender)
-    text = f"Message Type: MESSAGE\nSender: {label}\nPayload:\n{record['text']}"
-    if label.startswith("adv-"):
-        text += f"\n\nAdvisor {label} remains available. Use mail.send with this ID to continue."
-    return text
+    return f"{where}\nMessage Type: MESSAGE\nSender: {label}\nPayload:\n{record['text']}"
 
 
 def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer") -> str:
     """Create an agent the user manages; returns its id. With `repo`, clone
     it at `rev` into the workset as the directory its URL names, and work
-    there; otherwise work in `cwd`, or the workset's root. The host mails it
-    the user's first message."""
+    there; otherwise work in `cwd`, or the workset's root. The GUI then
+    starts a topic with it."""
     if preset not in ("engineer", "advisor"):
         raise ValueError(f'preset is "engineer" or "advisor", not {preset!r}')
     if repo is not None:
@@ -103,5 +98,5 @@ def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None,
         cwd = workset.root
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise ValueError(f"cwd is not an absolute directory: {cwd}")
-    props = {"preset": preset, "user_facing": "true", "cwd": cwd}
+    props = {"preset": preset, "cwd": cwd}
     return agents.create(runtime, props).id
