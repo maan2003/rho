@@ -102,10 +102,10 @@ pub fn cycle_runtime(current: &str) -> &'static str {
 }
 
 /// The first agent of a new isolated workset, on a clone of `repo` at
-/// `rev` (empty: the remote's default branch). Prints its id.
+/// `rev` (empty: the remote's default branch).
 pub fn new_agent_on(repo: &Utf8Path, rev: &str, runtime: &Runtime) -> String {
     format!(
-        "print(new_agent(repo={}, rev={}, runtime={}))\n",
+        "new_agent(repo={}, rev={}, runtime={})\n",
         py_str(repo.as_str()),
         py_str(rev),
         runtime.python()
@@ -113,11 +113,10 @@ pub fn new_agent_on(repo: &Utf8Path, rev: &str, runtime: &Runtime) -> String {
 }
 
 /// An agent working in `cwd` of the workset the code runs in: the first
-/// of a host workset, or another beside an agent already there. Prints
-/// its id.
+/// of a host workset, or another beside an agent already there.
 pub fn new_agent_in(cwd: &Utf8Path, runtime: &Runtime) -> String {
     format!(
-        "print(new_agent(cwd={}, runtime={}))\n",
+        "new_agent(cwd={}, runtime={})\n",
         py_str(cwd.as_str()),
         runtime.python()
     )
@@ -228,8 +227,8 @@ mod tests {
         let runtime = Runtime::parse("opus-high").unwrap();
         assert_eq!(
             new_agent_on("https://x/\"y\"".into(), "", &runtime),
-            "print(new_agent(repo=\"https://x/\\\"y\\\"\", rev=\"\", \
-             runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"}))\n"
+            "new_agent(repo=\"https://x/\\\"y\\\"\", rev=\"\", \
+             runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"})\n"
         );
         let id = AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
         assert_eq!(
