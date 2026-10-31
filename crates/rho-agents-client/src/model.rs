@@ -40,11 +40,16 @@ pub enum ModelMsg {
     /// Agents gone from their host's directory, and their copy with them.
     Deleted { agents: BTreeSet<AgentId> },
     /// Rows and mail of an agent the main thread follows, for the fold
-    /// behind its transcript. Nothing else carries rows.
+    /// behind its transcript, once its workset's log is read: what came
+    /// before is [`ModelMsg::Read`].
     Rows {
         agent_id: AgentId,
         rows: Vec<TranscriptRow>,
     },
+    /// A followed agent's workset log is read to its end and on disk, with
+    /// its mail. The transcript is the disk copy now, in time order; told
+    /// as rows, the log's past would land after mail newer than it.
+    Read { agent_id: AgentId },
     /// What an agent's runtime is doing, for every agent.
     Runtime {
         agent_id: AgentId,
@@ -335,24 +340,41 @@ impl Model {
             },
             AgentFrame::Log { workset, page } => {
                 let done = page.next.is_none();
-                let out = self.rows(host, workset, page.rows);
+                let mut out = self.rows(host, workset, page.rows);
                 if done {
+                    out.extend(self.read_ended(host, workset));
                     let slot = self.hosts.get_mut(&host).expect("the host is here");
-                    if let Some(reading) = slot.worksets.get_mut(&workset) {
-                        reading.reading = false;
-                        slot.follow_worksets();
-                    }
+                    slot.follow_worksets();
                 }
                 out
             }
-            AgentFrame::LogFailed { workset } => {
-                let slot = self.hosts.get_mut(&host).expect("the host is here");
-                if let Some(reading) = slot.worksets.get_mut(&workset) {
-                    reading.reading = false;
-                }
-                Vec::new()
-            }
+            // What was read is on disk; the transcript is that much.
+            AgentFrame::LogFailed { workset } => self.read_ended(host, workset),
         }
+    }
+
+    /// A workset's log read to its end, or as far as it could be: each
+    /// followed agent in it is its disk copy now.
+    fn read_ended(&mut self, host: HostId, workset: WorksetId) -> Vec<ModelEvent> {
+        let slot = self.hosts.get_mut(&host).expect("the host is here");
+        let Some(reading) = slot.worksets.get_mut(&workset) else {
+            return Vec::new();
+        };
+        reading.reading = false;
+        self.followed
+            .iter()
+            .filter(|agent_id| {
+                self.agents.get(agent_id).is_some_and(|agent| {
+                    agent.host == host && agent.identity.entry.workset == workset
+                })
+            })
+            .map(|agent_id| ModelEvent {
+                host,
+                msg: ModelMsg::Read {
+                    agent_id: *agent_id,
+                },
+            })
+            .collect()
     }
 
     /// An agents stream that has opened: how far the host's mail runs, and
@@ -620,7 +642,14 @@ impl Model {
                 if named {
                     slot.pending.insert(agent_id);
                 }
-                if self.followed.contains(&agent_id) {
+                // An agent whose log is being read hears its mail with the
+                // read's end.
+                let read_pending = self
+                    .agents
+                    .get(&agent_id)
+                    .and_then(|agent| slot.worksets.get(&agent.identity.entry.workset))
+                    .is_some_and(|reading| reading.reading);
+                if self.followed.contains(&agent_id) && !read_pending {
                     rows.entry(agent_id)
                         .or_default()
                         .push(TranscriptRow::Mail(mail.clone()));
@@ -681,6 +710,12 @@ impl Model {
             return Vec::new();
         };
         reading.next = reading.next.max(last.next());
+        let held = reading.reading;
+        crate::cache::write_rows(workset, rows.clone());
+        // The log's past goes to disk only: the read's end hands it whole.
+        if held {
+            return Vec::new();
+        }
         let mut handed: BTreeMap<AgentId, Vec<TranscriptRow>> = BTreeMap::new();
         for (pos, event) in &rows {
             if let Some(agent_id) = event.agent().filter(|agent| self.followed.contains(agent)) {
@@ -690,7 +725,6 @@ impl Model {
                     .push(TranscriptRow::Log(*pos, event.clone()));
             }
         }
-        crate::cache::write_rows(workset, rows);
         handed
             .into_iter()
             .map(|(agent_id, rows)| ModelEvent {
@@ -1032,8 +1066,8 @@ mod tests {
     }
 
     /// Following an agent reads its workset's log to the end, then asks the
-    /// host to push it from there; rows go up for the followed agent only,
-    /// with its mail.
+    /// host to push it from there; the read's end hands the transcript, and
+    /// rows go up after it for the followed agent only, with its mail.
     #[test]
     fn a_followed_agent_is_read_then_followed() {
         let mut model = model();
@@ -1068,24 +1102,39 @@ mod tests {
             wake: rho_agent_types::InputWake::Quiet,
             at: UnixMs(at),
         };
+        let handed = |out: &[ModelEvent]| {
+            out.iter()
+                .filter_map(|event| match &event.msg {
+                    ModelMsg::Rows { agent_id, rows } => Some((*agent_id, rows.len())),
+                    ModelMsg::Read { agent_id } => Some((*agent_id, usize::MAX)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let page = |rows, next| AgentFrame::Log {
+            workset: workset(1),
+            page: crate::protocol::rho2::WorksetLogPage { rows, next },
+        };
+        // The log's past and the mail heard meanwhile go to disk, not up:
+        // told as rows, the past would land after the newer mail.
         let out = model.ingest(
             HOST,
-            AgentFrame::Log {
-                workset: workset(1),
-                page: crate::protocol::rho2::WorksetLogPage {
-                    rows: vec![(Wpos(0), input(agent(1), 1)), (Wpos(1), input(agent(2), 2))],
-                    next: None,
-                },
-            },
+            page(vec![(Wpos(0), input(agent(1), 1))], Some(Wpos(1))),
         );
-        let handed = out
-            .iter()
-            .filter_map(|event| match &event.msg {
-                ModelMsg::Rows { agent_id, rows } => Some((*agent_id, rows.len())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(handed, [(agent(1), 1)]);
+        assert_eq!(handed(&out), []);
+        let out = model.ingest(HOST, mails(vec![asks(1, agent(1))]));
+        assert_eq!(
+            handed(&out),
+            [],
+            "mail of an agent being read waits for the read"
+        );
+        assert!(said(&stream).is_empty(), "the follow waits for the read");
+        let out = model.ingest(HOST, page(vec![(Wpos(1), input(agent(2), 2))], None));
+        assert_eq!(
+            handed(&out),
+            [(agent(1), usize::MAX)],
+            "the read's end hands the followed agent its disk copy, and nobody else"
+        );
         assert_eq!(
             said(&stream),
             [format!(
@@ -1094,17 +1143,27 @@ mod tests {
             )]
         );
 
-        let out = model.ingest(HOST, mails(vec![asks(1, agent(1)), asks(2, agent(2))]));
+        // Followed now: what comes goes up as it comes, for its agent only.
+        let out = model.ingest(
+            HOST,
+            ServerFrame::Rows {
+                workset: workset(1),
+                rows: vec![(Wpos(2), input(agent(2), 3)), (Wpos(3), input(agent(1), 4))],
+            }
+            .into(),
+        );
+        assert_eq!(handed(&out), [(agent(1), 1)]);
+        let out = model.ingest(HOST, mails(vec![asks(2, agent(2)), asks(3, agent(1))]));
         assert!(matches!(&out[0].msg, ModelMsg::Rows { agent_id, rows }
-            if *agent_id == agent(1) && matches!(&rows[..], [TranscriptRow::Mail(mail)] if mail.id == MailId(1))));
+            if *agent_id == agent(1) && matches!(&rows[..], [TranscriptRow::Mail(mail)] if mail.id == MailId(3))));
 
         // A new stream reads again from where the copy stands.
-        model.ingest(HOST, hello(2));
+        model.ingest(HOST, hello(3));
         assert_eq!(
             said(&stream),
             [
-                "FollowMail { since: MailId(2) }".to_owned(),
-                "ReadLog 010101010101 2".to_owned(),
+                "FollowMail { since: MailId(3) }".to_owned(),
+                "ReadLog 010101010101 4".to_owned(),
                 "FollowWorksets { from: [] }".to_owned(),
             ]
         );

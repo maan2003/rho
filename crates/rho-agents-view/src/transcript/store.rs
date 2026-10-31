@@ -103,6 +103,19 @@ impl Transcripts {
         true
     }
 
+    /// An open transcript folded again from everything read of it, when
+    /// its log's past has been read: the rows came after mail newer than
+    /// them, so they are put in time order with it rather than appended.
+    /// Answers the state to land as a [`TranscriptFrame::Fold`]; nothing
+    /// for an agent not open.
+    pub fn reread(&mut self, agent_id: AgentId, rows: &[TranscriptRow]) -> Option<UiAgentState> {
+        let fold = self.open.get_mut(&agent_id)?;
+        *fold = TranscriptFold::new(agent_id, rows);
+        // Handed whole; the rows told after this append to it.
+        fold.delta();
+        Some(fold.state())
+    }
+
     /// Rows and mail of an agent whose transcript is open, folded into the
     /// copy behind it. Positions and mail already held are skipped, so what
     /// the reader's own open read already picked up costs nothing. Answers
@@ -318,6 +331,42 @@ mod tests {
                 .any(|block| matches!(&**block, rho_agents_client::state::UiBlock::Status { .. }))
         );
         assert_eq!(texts(&transcripts), ["new history"]);
+    }
+
+    /// The log's past read after newer mail lands before it, in time
+    /// order, when the transcript is read again whole.
+    #[test]
+    fn a_reread_puts_the_past_before_newer_mail() {
+        let mut transcripts = Transcripts::default();
+        let agent_id = agent();
+        let first = turn(0, 0, "first", 1);
+        let second = turn(1, 2, "second", 5);
+        // Opened with the mail on disk and none of the rows yet.
+        assert!(transcripts.seed(agent_id, &[first[0].clone(), second[0].clone()]));
+        let all = rho_agents_client::fold::interleave(
+            agent_id,
+            [&first[1..], &second[1..]]
+                .concat()
+                .into_iter()
+                .map(|row| match row {
+                    TranscriptRow::Log(pos, event) => (pos, event),
+                    TranscriptRow::Mail(_) => unreachable!(),
+                }),
+            [first[0].clone(), second[0].clone()]
+                .into_iter()
+                .map(|row| match row {
+                    TranscriptRow::Mail(mail) => mail,
+                    TranscriptRow::Log(..) => unreachable!(),
+                }),
+        );
+        let state = transcripts.reread(agent_id, &all).expect("open");
+        transcripts.apply(agent_id, TranscriptFrame::Fold(state));
+        assert_eq!(texts(&transcripts), ["first", "second"]);
+        assert!(
+            transcripts.refold(agent_id, &second).is_none(),
+            "what the reread held is not told again"
+        );
+        assert!(transcripts.reread(other(), &all).is_none(), "not open");
     }
 
     /// Rows for an agent nobody has open are dropped: the client folds
