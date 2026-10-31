@@ -1353,6 +1353,281 @@ mod tests {
         );
     }
 
+    /// A workset shaped like a migrated one: many agents' rows merged by
+    /// time, a few agents active at once. Returns the workset, its agents
+    /// and the agent with the most rows.
+    async fn crowded_workset(
+        db: &rho_db::RhoDb,
+        agents: usize,
+        rows: usize,
+    ) -> (WorksetId, Vec<rho_agent_types::AgentId>) {
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let mut ids = Vec::new();
+        {
+            let mut write = db.write().await;
+            write.init_agent_tables();
+            write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
+            write.commit();
+        }
+        let cell = "x = 1\n".repeat(60);
+        let mut written = 0usize;
+        let mut created = 0usize;
+        // Agent `i` is active over rows [i * span, i * span + 4 * span).
+        let span = rows / agents;
+        while written < rows {
+            let mut write = db.write().await;
+            for _ in 0..10_000 {
+                if written >= rows {
+                    break;
+                }
+                while created < agents && created * span <= written {
+                    let agent = write.alloc_agent_id();
+                    write
+                        .append(
+                            workset,
+                            &Record {
+                                at: UnixMs(0),
+                                event: Event::AgentCreated {
+                                    agent,
+                                    spec: AgentSpec {
+                                        runtime: Runtime::Native {
+                                            model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                            profile: Default::default(),
+                                            cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                                        },
+                                        props: [("name".to_owned(), format!("crowded-{created}"))]
+                                            .into_iter()
+                                            .collect(),
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                    ids.push(agent);
+                    created += 1;
+                }
+                let active: Vec<_> = (0..created)
+                    .filter(|i| written < i * span + 4 * span)
+                    .collect();
+                let agent = ids[active[written % active.len()]];
+                let entry = match (written / active.len()) % 3 {
+                    0 => Entry::RequestSent {
+                        why: rho_agent::entry::Wake::Notify,
+                        report: Report::default(),
+                        compact: false,
+                    },
+                    _ => Entry::Step {
+                        exec: None,
+                        prose: String::new(),
+                        carry: rho_agent::inference::Carry::new(
+                            serde_json::json!({"items": [{
+                                "type": "custom_tool_call", "name": "exec",
+                                "call_id": format!("c{written}"), "input": cell
+                            }]}),
+                            vec![rho_agent::inference::Call::new(
+                                format!("c{written}"),
+                                cell.clone(),
+                            )],
+                            false,
+                        ),
+                        usage: None,
+                    },
+                };
+                write
+                    .append(
+                        workset,
+                        &Record {
+                            at: UnixMs(1),
+                            event: Event::Native { agent, entry },
+                        },
+                    )
+                    .unwrap();
+                written += 1;
+            }
+            write.commit();
+        }
+        (workset, ids)
+    }
+
+    /// Not a test: times reading a crowded workset the way the Activity
+    /// view does. `cargo test --release -p rho-agent-host --lib
+    /// crowded_workset_log -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn crowded_workset_log() {
+        // `RHO_BENCH_DB` keeps the store, for a host to serve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("RHO_BENCH_DB")
+            .map_or_else(|| dir.path().join("rho.redb"), std::path::PathBuf::from);
+        let db = rho_db::RhoDb::open(path);
+        let started = std::time::Instant::now();
+        let (workset, agents) = crowded_workset(&db, 66, 330_000).await;
+        eprintln!("built {} agents in {:?}", agents.len(), started.elapsed());
+
+        let started = std::time::Instant::now();
+        let mut from = Wpos::ZERO;
+        let (mut pages, mut rows) = (0, 0);
+        loop {
+            let page = workset_log_page(&db, WorksetLog { workset, from }).unwrap();
+            pages += 1;
+            rows += page.rows.len();
+            match page.next {
+                Some(next) => from = next,
+                None => break,
+            }
+        }
+        eprintln!(
+            "whole workset: {pages} pages, {rows} rows in {:?}",
+            started.elapsed()
+        );
+
+        // Where a page's time goes: reading it, and each agent's state
+        // before it.
+        let read = db.read();
+        let mid = Wpos(165_000);
+        let started = std::time::Instant::now();
+        let page = rho_agent::store::StoreRead::workset_rows(&read, workset, mid, super::LOG_PAGE);
+        eprintln!("read one page: {:?}", started.elapsed());
+        let on_page: std::collections::HashSet<_> =
+            page.iter().filter_map(|(_, r)| r.event.agent()).collect();
+        let started = std::time::Instant::now();
+        for agent in &on_page {
+            crate::transcript::before_at(&read, *agent, mid);
+        }
+        eprintln!(
+            "before_at for the page's {} agents: {:?}",
+            on_page.len(),
+            started.elapsed()
+        );
+    }
+
+    /// What `before_at` answered by walking the whole workset forwards, as
+    /// it did before the agent's rows were indexed: the reference.
+    fn before_by_scan(
+        read: &rho_db::ReadTxn,
+        agent: rho_agent_types::AgentId,
+        pos: Wpos,
+    ) -> crate::transcript::Before {
+        use rho_agent::store::StoreRead as _;
+        let head = read.agent(agent).unwrap();
+        let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
+        for (row, record) in read.workset_rows(head.workset, head.created, usize::MAX) {
+            if row >= pos {
+                break;
+            }
+            if record.event.agent() != Some(agent) {
+                continue;
+            }
+            if let Event::Rewound { to, .. } = &record.event {
+                let keep = kept.partition_point(|(kept, _)| kept < to);
+                kept.truncate(keep);
+            }
+            kept.push((row, record));
+        }
+        let mut before = crate::transcript::Before::default();
+        for (_, record) in &kept {
+            before.observe(&record.event);
+        }
+        before
+    }
+
+    /// Three agents' steps, requests, inputs and rewinds (rewinds of
+    /// rewinds among them), interleaved: the state before every row, read
+    /// newest first from the agent's own rows, is the forward fold's.
+    #[tokio::test]
+    async fn before_at_is_the_forward_fold_of_the_agents_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
+        let mut agents = Vec::new();
+        let mut rows: Vec<Vec<Wpos>> = Vec::new();
+        for _ in 0..3 {
+            let agent = write.alloc_agent_id();
+            let pos = write
+                .append(
+                    workset,
+                    &Record {
+                        at: UnixMs(0),
+                        event: Event::AgentCreated {
+                            agent,
+                            spec: AgentSpec {
+                                runtime: Runtime::Native {
+                                    model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                    profile: Default::default(),
+                                    cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                                },
+                                props: Default::default(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            agents.push(agent);
+            rows.push(vec![pos]);
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for n in 0..600 {
+            let which = next(3);
+            let agent = agents[which];
+            let event = match next(7) {
+                0 | 1 => native(step(&format!("exec-{n}"))),
+                2 | 3 => native(request()),
+                4 | 5 => Event::Input {
+                    agent,
+                    mail: None,
+                    content: Vec::new(),
+                    wake: InputWake::Person,
+                },
+                _ if rows[which].len() > 1 => {
+                    let to = rows[which][1 + next(rows[which].len() - 1)];
+                    Event::Rewound { agent, to }
+                }
+                _ => native(request()),
+            };
+            let event = match event {
+                Event::Native { entry, .. } => Event::Native { agent, entry },
+                event => event,
+            };
+            let pos = write
+                .append(
+                    workset,
+                    &Record {
+                        at: UnixMs(1),
+                        event,
+                    },
+                )
+                .unwrap();
+            rows[which].push(pos);
+        }
+        write.commit();
+        let read = db.read();
+        let end = rho_agent::store::StoreRead::workset(&read, workset)
+            .unwrap()
+            .next;
+        for agent in &agents {
+            for pos in 0..=end.0 {
+                let pos = Wpos(pos);
+                let fast = crate::transcript::before_at(&read, *agent, pos);
+                let scan = before_by_scan(&read, *agent, pos);
+                assert_eq!(
+                    (fast.carry, fast.inputs),
+                    (scan.carry, scan.inputs),
+                    "agent {} before {pos:?}",
+                    agent.encoded()
+                );
+            }
+        }
+    }
+
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
         let result = rho_agent_types::transcript::ToolResult {

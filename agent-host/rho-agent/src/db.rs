@@ -52,7 +52,10 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)). A store from before
 /// worksets is migrated ([`crate::store::from_main`]).
-const CURRENT_AGENT_DB_FORMAT: &str = "c3e81f5a";
+const CURRENT_AGENT_DB_FORMAT: &str = "07cffbcb";
+/// Temporary (`temp-migration`): the workset store before each agent's rows
+/// were indexed ([`crate::store::agent_rows`]).
+const BEFORE_AGENT_ROWS_FORMAT: &str = "c3e81f5a";
 #[cfg(test)]
 pub(crate) const CURRENT_FORMAT: &str = CURRENT_AGENT_DB_FORMAT;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
@@ -409,6 +412,13 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         return;
     }
     let mut write = db.write().await;
+    if stored.as_deref() == Some(BEFORE_AGENT_ROWS_FORMAT) {
+        // Temporary (`temp-migration`): index the rows already logged.
+        crate::store::agent_rows::fill(&mut write);
+        write
+            .open_table(FORMAT)
+            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
+    }
     write.init_agent_tables();
     write.commit();
 }
