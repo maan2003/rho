@@ -679,7 +679,7 @@ fn openai_turn(
         }
     } else if state.config.scenario == Scenario::ReasoningCompaction && !has_compaction {
         append_reasoning(&mut events, request_number, 0);
-        append_compaction(&mut events, state, request_number, 1);
+        append_compaction(&mut events, state, request_number, topic, 1);
         // A call returning after the compaction wakes the model once more,
         // so the next request must replay the compacted provider boundary.
         if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
@@ -693,7 +693,7 @@ fn openai_turn(
             );
         }
     } else if asks_compaction {
-        append_compaction(&mut events, state, request_number, 0);
+        append_compaction(&mut events, state, request_number, topic, 0);
     } else if state.config.scenario == Scenario::ReasoningCompaction && has_compaction {
         append_finish(
             &mut events,
@@ -793,15 +793,18 @@ fn request_tools(request: &OpenAiRequest) -> Vec<ProviderTool> {
         .collect()
 }
 
+/// The compacted context keeps the topic it answers in, as a real model's
+/// summary would: [`newest_topic`] reads it back from the next request.
 fn append_compaction(
     events: &mut Vec<Value>,
     state: &AppState,
     request_number: u64,
+    topic: u64,
     output_index: usize,
 ) {
     let id = format!("cmp_{request_number}");
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"compaction","id":id}}));
-    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"compaction","id":id,"encrypted_content":format!("fake-compaction-{}-{request_number}",state.config.seed)}}));
+    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"compaction","id":id,"encrypted_content":format!("fake-compaction-{}-{request_number} [#{topic} ]",state.config.seed)}}));
 }
 
 fn append_finish(
