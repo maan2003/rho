@@ -449,7 +449,10 @@ mod tests {
                 "def f():\n    return {'a': 'mail.send('user', \\\"fake\\\")'}\nmail.send('user', 'real",
                 Some("real"),
             ),
-            ("mail.send('user', 'old')\nmail.send('user', 'new", Some("new")),
+            (
+                "mail.send('user', 'old')\nmail.send('user', 'new",
+                Some("new"),
+            ),
             ("mail.send('user', 'done', kind='result')", Some("done")),
             (
                 "end_turn()\nfor item in items:\n    print(item)\nmail.send('user', \"After work",
@@ -512,7 +515,10 @@ mod tests {
             ("mail.send('user', name + 'suffix'", None),
             ("mail.send('user', 'Hi ' * 0", None),
             ("mail.send('user', 'Hi ' + name)", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + 'there' + name)", Some("Hi there")),
+            (
+                "mail.send('user', 'Hi ' + 'there' + name)",
+                Some("Hi there"),
+            ),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -533,7 +539,10 @@ mod tests {
             ("mail.send('user', \"foo\"\n \"bar", Some("foobar")),
             ("mail.send('user', \"foo\" f\"bar {name", Some("foobar ")),
             ("mail.send('user', \"foo\" r\"\\n", Some("foo\\n")),
-            ("mail.send('user', \"foo\" + \"bar\" \"baz", Some("foobarbaz")),
+            (
+                "mail.send('user', \"foo\" + \"bar\" \"baz",
+                Some("foobarbaz"),
+            ),
             ("mail.send('user', \"foo\" \"bar\")", Some("foobar")),
             ("mail.send('user', \"foo\" name", None),
             ("mail.send('user', \"foo\" b\"bar", None),
@@ -560,12 +569,18 @@ mod tests {
             ("mail.send('user', f\"Hello {{name}}", Some("Hello {name}")),
             ("mail.send('user', f\"Hello {name", Some("Hello ")),
             ("mail.send('user', f\"Hello {", Some("Hello ")),
-            ("mail.send('user', f\"Hello {{name}} {name", Some("Hello {name} ")),
+            (
+                "mail.send('user', f\"Hello {{name}} {name",
+                Some("Hello {name} "),
+            ),
             ("mail.send('user', f\"Hello {name} later", Some("Hello ")),
             ("mail.send('user', f\"Hello {name} later\"", Some("Hello ")),
             ("print(1)\nmail.send('user', f\"Hello {name", Some("Hello ")),
             ("mail.send('user', f\"Hello {name} later\")", Some("Hello ")),
-            ("mail.send('user', f\"Hello {name} later\")\nx = 2", Some("Hello ")),
+            (
+                "mail.send('user', f\"Hello {name} later\")\nx = 2",
+                Some("Hello "),
+            ),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -693,8 +708,7 @@ mod tests {
 
     #[test]
     fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
-        let source =
-            "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
+        let source = "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
         let arguments = serde_json::json!({"source": source}).to_string();
         let mut visible = false;
         for (i, _) in arguments

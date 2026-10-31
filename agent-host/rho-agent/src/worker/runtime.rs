@@ -281,9 +281,10 @@ pub(crate) async fn run(
                     W::Eval { id, code } => {
                         let sender = sender.clone();
                         tasks.spawn(async move {
-                            let (output, error) = super::python::eval(code)
-                                .await
-                                .unwrap_or_else(|error| (String::new(), Some(format!("{error:#}"))));
+                            let (output, error) =
+                                super::python::eval(code).await.unwrap_or_else(|error| {
+                                    (String::new(), Some(format!("{error:#}")))
+                                });
                             let _ = sender
                                 .send(
                                     Port::Workset,

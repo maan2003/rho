@@ -409,7 +409,10 @@ async fn follow(
                     response: status.response.clone(),
                     draft: status.draft.clone(),
                 };
-                if outgoing_tx.send(ServerFrame::Live { agent_id, live }).is_err() {
+                if outgoing_tx
+                    .send(ServerFrame::Live { agent_id, live })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -503,7 +506,11 @@ async fn send_rows_from(
             .iter()
             .filter_map(|(pos, record)| Some((*pos, strip_row(db, befores, *pos, record)?)))
             .collect::<Vec<_>>();
-        if !rows.is_empty() && outgoing_tx.send(ServerFrame::Rows { workset, rows }).is_err() {
+        if !rows.is_empty()
+            && outgoing_tx
+                .send(ServerFrame::Rows { workset, rows })
+                .is_err()
+        {
             return false;
         }
         tokio::task::yield_now().await;
@@ -1008,7 +1015,6 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-
 /// A request's tool results whole, or a response as the transcript draws
 /// it. Rows a rewind hid still answer; the client asked for one it holds.
 fn detail(
@@ -1185,7 +1191,13 @@ mod tests {
             };
             positions.push(
                 write
-                    .append(workset, &Record { at: UnixMs(1), event })
+                    .append(
+                        workset,
+                        &Record {
+                            at: UnixMs(1),
+                            event,
+                        },
+                    )
                     .unwrap(),
             );
         }
@@ -1195,7 +1207,8 @@ mod tests {
 
     fn native(entry: Entry) -> Event<'static> {
         Event::Native {
-            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap(),
+            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                .unwrap(),
             entry,
         }
     }
@@ -1216,8 +1229,11 @@ mod tests {
                 native(step("exec-2")),
                 native(request()),
                 Event::Rewound {
-                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
-                        .unwrap(),
+                    agent: rho_agent_types::AgentId::from_counter(
+                        1,
+                        &rho_agent_types::AgentIdDomain(0),
+                    )
+                    .unwrap(),
                     to: Wpos(4),
                 },
                 native(request()),
@@ -1261,13 +1277,17 @@ mod tests {
     async fn rows_are_told_in_the_readers_words() {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let spoken = "<realtime_delegation>\n  <input>fix &lt;b&gt;</input>\n</realtime_delegation>";
+        let spoken =
+            "<realtime_delegation>\n  <input>fix &lt;b&gt;</input>\n</realtime_delegation>";
         let (workset, agent, _) = workset(
             &db,
             vec![
                 Event::Input {
-                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
-                        .unwrap(),
+                    agent: rho_agent_types::AgentId::from_counter(
+                        1,
+                        &rho_agent_types::AgentIdDomain(0),
+                    )
+                    .unwrap(),
                     mail: Some(rho_agent_types::MailId(3)),
                     content: vec![rho_agent_types::ContentPart::Text {
                         text: spoken.to_owned(),
@@ -1281,8 +1301,11 @@ mod tests {
                     notice: Notice::Stopped("quota".into()),
                 }),
                 Event::Claude {
-                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
-                        .unwrap(),
+                    agent: rho_agent_types::AgentId::from_counter(
+                        1,
+                        &rho_agent_types::AgentIdDomain(0),
+                    )
+                    .unwrap(),
                     row: ClaudeRow::Notice(Notice::Stopped("auth".into())),
                 },
             ],

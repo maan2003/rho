@@ -8,7 +8,7 @@
 
 use redb::TableDefinition;
 use rho_agent_types::{
-    AgentId, Address, ContentPart, InputWake, Mail, MailId, SendKind, UnixMs, WorksetId,
+    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, UnixMs, WorksetId,
     WorksetKind, Wpos,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};

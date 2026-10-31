@@ -97,7 +97,11 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     }
 
     // Create an agent on a clone of the temp repository.
-    let agent_id = tokio::time::timeout(Duration::from_secs(30), create_agent(&socket_path, &repo_dir, None)).await??;
+    let agent_id = tokio::time::timeout(
+        Duration::from_secs(30),
+        create_agent(&socket_path, &repo_dir, None),
+    )
+    .await??;
 
     // Attaching before anything was created must be refused.
     let refused = open_terminal(&socket_path, agent_id, false).await;
@@ -241,5 +245,7 @@ async fn create_agent(
         "creation code failed: {:?}",
         created.result.error
     );
-    Ok(rho_agent_types::AgentId::from_encoded(created.result.output.trim())?)
+    Ok(rho_agent_types::AgentId::from_encoded(
+        created.result.output.trim(),
+    )?)
 }

@@ -92,8 +92,6 @@ pub(crate) fn ste_findings(text: &str) -> Vec<String> {
         .collect()
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::ste_findings;

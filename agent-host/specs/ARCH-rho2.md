@@ -65,6 +65,9 @@ host's Slack server as Python, as before.
 
 ## GUI sync
 
-The GUI syncs the mail log from a sequence number and receives the agent
-directory as whole heads. It reads workset logs on demand, and follows one live
-while a transcript is open. There is no global journal of every row.
+The GUI syncs the mail log from the newest mail it holds and receives the
+directory of worksets and agents as whole entries. It names the worksets it
+follows, each from the position it holds, and the host pushes their later rows
+in order, never repeated or skipped. It pages older rows on demand and fetches
+row bodies (tool output, whole responses) only when shown. Live streaming
+frames come only for the agents it focuses.

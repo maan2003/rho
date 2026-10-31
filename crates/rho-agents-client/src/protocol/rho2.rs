@@ -233,7 +233,8 @@ pub struct AgentEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct SpecView {
     pub runtime: RuntimeKind,
-    /// The model, by the name usage is priced under.
+    /// The model by the name policy Python gives it: `sol`, `opus`.
+    /// The same name selects it in `set_runtime`.
     pub model: String,
     pub effort: String,
     pub props: Props,

@@ -897,7 +897,12 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
             .await
             .unwrap();
         agent
-            .wake_with(Wake::Message, instructions.clone(), Report::default())
+            .wake_with(
+                Wake::Message,
+                instructions.clone(),
+                Report::default(),
+                false,
+            )
             .await
             .unwrap();
         assert!(
@@ -920,7 +925,12 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            agent.wake_with(Wake::Message, instructions.clone(), Report::default()),
+            agent.wake_with(
+                Wake::Message,
+                instructions.clone(),
+                Report::default(),
+                false
+            ),
             control
         )
     })
@@ -932,7 +942,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         "concurrent compaction must remain pending"
     );
     agent
-        .wake_with(Wake::Message, instructions, Report::default())
+        .wake_with(Wake::Message, instructions, Report::default(), false)
         .await
         .unwrap();
     assert!(agent.context.input().is_empty());
@@ -966,7 +976,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         ..Report::default()
     };
     agent
-        .wake_with(Wake::Notify, "system".into(), first)
+        .wake_with(Wake::Notify, "system".into(), first, false)
         .await
         .unwrap();
     assert!(agent.backoff.is_some());
@@ -980,7 +990,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         ..Report::default()
     };
     agent
-        .wake_with(Wake::Notify, "system".into(), second)
+        .wake_with(Wake::Notify, "system".into(), second, false)
         .await
         .unwrap();
     agent.flush().await.unwrap();
@@ -1152,6 +1162,49 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
 
 /// A loaded skill is shown when loaded, shown again as it reads then after
 /// a compaction, and not repeated on requests in between or after.
+
+/// Compacting an agent that ended its turn starts no turn: the cell that
+/// ended it goes to the model with the next input, after the compaction.
+#[tokio::test]
+async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('cell-output-77')\nend_turn()")
+        .then_compaction()
+        .then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "hi").await;
+    harness
+        .until("the wait", |_| handle.status().runtime.awaiting_human)
+        .await;
+
+    handle.compact();
+    harness
+        .until("the compaction", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+        })
+        .await;
+    let compaction = &script.requests()[1];
+    assert!(
+        !told_new(compaction).contains("cell-output-77"),
+        "the compaction carries nothing to answer"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(script.requests().len(), 2, "no turn after the compaction");
+    assert!(
+        handle.status().runtime.awaiting_human,
+        "still waiting on the user"
+    );
+
+    say(&handle, "next").await;
+    let all = requests(&script, 3).await;
+    let next = told_new(&all[2]);
+    assert!(next.contains("next"), "{next}");
+    assert!(next.contains("cell-output-77"), "{next}");
+}
 
 /// A compaction owes the model what policy gives back: the texts are quiet
 /// inputs logged after the compaction and before the next request, which

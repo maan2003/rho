@@ -263,10 +263,9 @@ fn stopped_at(
     match record.event {
         Event::Native {
             agent,
-            entry:
-                Entry::Notice {
-                    notice: Notice::Stopped(error),
-                },
+            entry: Entry::Notice {
+                notice: Notice::Stopped(error),
+            },
         }
         | Event::Claude {
             agent,

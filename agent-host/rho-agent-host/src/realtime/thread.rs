@@ -8,9 +8,9 @@
 //! `context/realtime_delegation.rs`), so the model sees what it is tuned on.
 
 use rho_agent_types::{Address, AgentId, Mail, SendKind};
+use rho_openai_realtime::ContextChannel;
 
 use crate::transcript::content_text;
-use rho_openai_realtime::ContextChannel;
 
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 const THREAD_TOKEN_BUDGET: usize = 1_200;
@@ -366,10 +366,16 @@ mod tests {
             Some(Said::User("ask".to_owned()))
         );
         assert_eq!(
-            Said::of(&mail(me, Address::User, Some(SendKind::Result), "done"), agent(1)),
+            Said::of(
+                &mail(me, Address::User, Some(SendKind::Result), "done"),
+                agent(1)
+            ),
             Some(Said::Agent("done".to_owned()))
         );
-        assert_eq!(Said::of(&mail(Address::User, other, None, "x"), agent(1)), None);
+        assert_eq!(
+            Said::of(&mail(Address::User, other, None, "x"), agent(1)),
+            None
+        );
         assert_eq!(Said::of(&mail(other, me, None, "x"), agent(1)), None);
     }
 

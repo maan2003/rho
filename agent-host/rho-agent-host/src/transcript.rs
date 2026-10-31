@@ -3,7 +3,6 @@
 //! transcript is a pure function of the log. The runtimes write their own
 //! rows; this is the one place they become the client's words.
 
-use rho_agent::db::usage_model_of;
 use rho_agent::entry::{Entry, Notice, Report};
 use rho_agent::log::{AgentUsageBucket, TranscriptLine};
 use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
@@ -14,23 +13,13 @@ use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind
 
 /// An agent's spec as a reader needs it.
 pub fn spec_view(spec: &AgentSpec) -> SpecView {
-    let (runtime, effort) = match &spec.runtime {
-        Runtime::Native { profile, .. } => (RuntimeKind::Rho, profile.effort.as_str()),
-        Runtime::Claude { effort, .. } => (
-            RuntimeKind::Claude,
-            match effort {
-                rho_claude::Effort::Low => "low",
-                rho_claude::Effort::Medium => "medium",
-                rho_claude::Effort::High => "high",
-                rho_claude::Effort::Xhigh => "xhigh",
-                rho_claude::Effort::Max => "max",
-            },
-        ),
-    };
     SpecView {
-        runtime,
-        model: usage_model_of(&spec.runtime).name().to_owned(),
-        effort: effort.to_owned(),
+        runtime: match &spec.runtime {
+            Runtime::Native { .. } => RuntimeKind::Rho,
+            Runtime::Claude { .. } => RuntimeKind::Claude,
+        },
+        model: spec.runtime.model_name().to_owned(),
+        effort: spec.runtime.effort_name().to_owned(),
         props: spec.props.clone(),
     }
 }
@@ -281,7 +270,6 @@ pub(crate) fn report_results(
     rho_inference::transcript::report_results(report, before.inputs, before.carry.as_ref())
 }
 
-
 /// A step's visible items: the prose it wrote, then its calls.
 pub(crate) fn step_items(calls: &[rho_agent::inference::Call]) -> Vec<Item> {
     calls
@@ -377,4 +365,3 @@ fn join(parts: &[AStr]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-

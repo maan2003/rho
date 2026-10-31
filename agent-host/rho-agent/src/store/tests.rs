@@ -1,6 +1,8 @@
 //! The store's folds, against a disposable database.
 
-use rho_agent_types::{Address, ContentPart, InputWake, MailId, UnixMs, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{
+    Address, ContentPart, InputWake, MailId, UnixMs, WorksetId, WorksetKind, Wpos,
+};
 use rho_db::RhoDb;
 
 use super::*;
@@ -84,7 +86,10 @@ async fn agents_fold_only_their_own_rows_and_rewinds_hide_only_theirs() {
             ws,
             &Record {
                 at: UnixMs(9),
-                event: Event::Rewound { agent: a, to: a_input },
+                event: Event::Rewound {
+                    agent: a,
+                    to: a_input,
+                },
             },
         )
         .unwrap();
@@ -93,10 +98,18 @@ async fn agents_fold_only_their_own_rows_and_rewinds_hide_only_theirs() {
     let read = db.read();
     assert_eq!(read.workset(ws).unwrap().agents, vec![a, b]);
     assert_eq!(read.workset(ws).unwrap().next, rewound.next());
-    let a_rows: Vec<Wpos> = read.agent_rows(a, Wpos::ZERO).into_iter().map(|(p, _)| p).collect();
+    let a_rows: Vec<Wpos> = read
+        .agent_rows(a, Wpos::ZERO)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
     assert_eq!(a_rows, vec![Wpos(1), rewound]);
     assert!(!a_rows.contains(&a_later));
-    let b_rows: Vec<Wpos> = read.agent_rows(b, Wpos::ZERO).into_iter().map(|(p, _)| p).collect();
+    let b_rows: Vec<Wpos> = read
+        .agent_rows(b, Wpos::ZERO)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
     assert_eq!(b_rows, vec![Wpos(2), b_input]);
     // Delivery is the newest mail an input handed over, rewound or not:
     // mail once handed over is not handed over again.
@@ -192,7 +205,12 @@ async fn mail_is_dense_logged_once_per_client_id_and_outlives_its_workset() {
     let ws = WorksetId([4; 6]);
     let a = agent(1);
     let mut write = db.write().await;
-    write.create_workset(ws, UnixMs(1), WorksetKind::Host { cwd: "/tmp".into() }, String::new());
+    write.create_workset(
+        ws,
+        UnixMs(1),
+        WorksetKind::Host { cwd: "/tmp".into() },
+        String::new(),
+    );
     write
         .append(
             ws,
@@ -226,12 +244,18 @@ async fn mail_is_dense_logged_once_per_client_id_and_outlives_its_workset() {
         None,
     );
     let second = write.post_mail(UnixMs(6), to_a("two"), Some(78));
-    assert_eq!((first, again, other, second), (MailId(1), MailId(1), MailId(2), MailId(3)));
+    assert_eq!(
+        (first, again, other, second),
+        (MailId(1), MailId(1), MailId(2), MailId(3))
+    );
     assert!(write.delete_workset(ws));
     write.commit();
     let read = db.read();
     assert_eq!(
-        read.inbox(Address::Agent(a), MailId(0)).iter().map(|m| m.id).collect::<Vec<_>>(),
+        read.inbox(Address::Agent(a), MailId(0))
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
         vec![MailId(1), MailId(3)]
     );
     assert_eq!(read.inbox(Address::Agent(a), MailId(1)).len(), 1);
