@@ -49,8 +49,8 @@ rho_rpc::calls! {
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
         DeleteWorksets(DeleteWorksets) -> ();
-        /// Bulk: one workset's rows from `from`, a page at a time.
-        WorksetLog(WorksetLog) -> WorksetLogPage, priority None;
+        /// Bulk: one agent's rows from `from`, a page at a time.
+        AgentLog(AgentLog) -> AgentLogPage, priority None;
         // Bulk: an answer that waits behind interactive traffic.
         Visualization(super::Visualization) -> super::VisualizationContent, priority None;
         /// Answered with the recorded visualization's id.
@@ -126,16 +126,26 @@ pub struct DeleteWorksets {
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct WorksetLog {
-    pub workset: WorksetId,
+pub struct AgentLog {
+    pub agent: AgentId,
     pub from: Wpos,
 }
 
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
-pub struct WorksetLogPage {
+pub struct AgentLogPage {
+    /// The agent's rows, in order. Its workset's other rows are not here.
     pub rows: Vec<(Wpos, LogEvent)>,
-    /// Where the next page starts; `None` once the log is read to its end.
-    pub next: Option<Wpos>,
+    pub next: LogNext,
+}
+
+/// Where an [`AgentLog`] read goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pack, Unpack)]
+pub enum LogNext {
+    /// The next page starts here.
+    Page(Wpos),
+    /// The agent's log is read to its end, and its workset's next row goes
+    /// here: following the workset from here misses none of its rows.
+    Follow(Wpos),
 }
 
 /// What a client says on its session.

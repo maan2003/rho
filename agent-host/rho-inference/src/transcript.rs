@@ -1,7 +1,7 @@
 //! Read-only provider interpretation for transcript and export consumers.
 use rho_agent::entry::{Entry, Report};
 use rho_agent::inference::{Carry, Image};
-use rho_agent::record::{ClaudeRow, Event, Record};
+use rho_agent::record::{ClaudeRow, Event};
 use rho_agent::store::StoreRead as _;
 use rho_agent_types::Wpos;
 
@@ -77,35 +77,57 @@ impl Before {
 
 /// The agent's state just before `pos`: its visible rows before it, folded.
 /// A rewind before `pos` hides what it took back; one after does not.
+///
+/// Read newest first, from the agent's own rows, and only as far back as
+/// the answer needs: its newest standing step, and whether an input came
+/// after its newest request. A rewind takes back the agent's rows from its
+/// `to` up to itself, whether or not a later rewind took it back too, so
+/// a row is hidden when any rewind after it starts at or before it.
 pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: Wpos) -> Before {
-    let Some(head) = read.agent(agent) else {
-        return Before::default();
-    };
-    let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
-    let mut from = head.created;
-    while from < pos {
-        let page = read.workset_rows(head.workset, from, 4096);
-        let Some((last, _)) = page.last() else {
+    const PAGE: usize = 64;
+    let mut carry: Option<Option<Carry>> = None;
+    let mut inputs: Option<bool> = None;
+    let mut hidden_from = pos;
+    let mut before = pos;
+    while carry.is_none() || inputs.is_none() {
+        let page = read.agent_log_before(agent, before, PAGE);
+        let Some((oldest, _)) = page.last() else {
             break;
         };
-        from = last.next();
+        before = *oldest;
         for (row, record) in page {
-            if row >= pos {
-                break;
+            if let Event::Rewound { to, .. } = &record.event {
+                hidden_from = hidden_from.min(*to);
             }
-            if record.event.agent() != Some(agent) {
+            if row >= hidden_from {
                 continue;
             }
-            if let Event::Rewound { to, .. } = &record.event {
-                let keep = kept.partition_point(|(kept, _)| kept < to);
-                kept.truncate(keep);
+            match &record.event {
+                Event::Input { .. } => {
+                    inputs.get_or_insert(true);
+                }
+                Event::Native {
+                    entry: Entry::Step { carry: step, .. },
+                    ..
+                } => {
+                    carry.get_or_insert_with(|| Some(step.clone()));
+                }
+                Event::Native {
+                    entry: Entry::RequestSent { .. },
+                    ..
+                }
+                | Event::Claude {
+                    row: ClaudeRow::RequestSent { .. },
+                    ..
+                } => {
+                    inputs.get_or_insert(false);
+                }
+                _ => {}
             }
-            kept.push((row, record));
         }
     }
-    let mut before = Before::default();
-    for (_, record) in &kept {
-        before.observe(&record.event);
+    Before {
+        carry: carry.flatten(),
+        inputs: inputs.unwrap_or(false),
     }
-    before
 }

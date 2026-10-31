@@ -80,8 +80,7 @@ use crate::{
     SlackEditMessage, SlackFindFile, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
     SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch,
     SlackSearchNextPage, SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose,
-    TaskBoard, ThreadActivity, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
-    VoiceToggle,
+    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -722,10 +721,11 @@ impl Workspace {
         if self.transcripts.is_open(&agent_id) {
             return false;
         }
-        let Some(workset) = self.registry.agent_workset(agent_id) else {
+        // An agent no host has named is not opened.
+        if self.registry.agent_workset(agent_id).is_none() {
             return false;
-        };
-        let rows = self.agents_client.read_transcript(agent_id, workset);
+        }
+        let rows = self.agents_client.read_transcript(agent_id);
         if !self.transcripts.seed(agent_id, &rows) {
             return false;
         }
@@ -767,10 +767,7 @@ impl Workspace {
         if !self.transcripts.is_open(&agent_id) {
             return;
         }
-        let Some(workset) = self.registry.agent_workset(agent_id) else {
-            return;
-        };
-        let rows = self.agents_client.read_transcript(agent_id, workset);
+        let rows = self.agents_client.read_transcript(agent_id);
         let Some(state) = self.transcripts.reread(agent_id, &rows) else {
             return;
         };
@@ -8624,9 +8621,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ThreadActivity, window, cx| {
-                this.open_activity(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_shell_view::protocol::PagerAction::Continue, cx);
