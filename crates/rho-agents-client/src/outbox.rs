@@ -100,6 +100,15 @@ impl Outbox {
         id
     }
 
+    /// A message carried from `main`'s outbox, already on disk under its
+    /// old id; it waits in the order it was written.
+    pub fn adopt(&mut self, machine_seed: u64, id: u64, outgoing: Outgoing) {
+        let at = self
+            .waiting
+            .partition_point(|(_, _, waiting)| waiting.at <= outgoing.at);
+        self.waiting.insert(at, (machine_seed, id, outgoing));
+    }
+
     /// The host's oldest unsent message, to post now, unless a post is
     /// already on its way.
     pub fn next(&mut self, machine_seed: u64) -> Option<Sending> {

@@ -25,6 +25,8 @@ pub mod find;
 #[cfg(feature = "client")]
 pub mod fold;
 #[cfg(feature = "client")]
+pub mod from_main;
+#[cfg(feature = "client")]
 pub mod map;
 #[cfg(feature = "client")]
 pub mod model;

@@ -157,6 +157,10 @@ struct HostModel {
     pending: BTreeSet<AgentId>,
     /// Streams and topics moved since the main thread last heard.
     pending_chat: HostChat,
+    /// The main thread has heard that the chat caught up since the stream
+    /// opened. It hears so once even when nothing moved: an empty catch-up
+    /// still says the chat it holds is the host's whole chat.
+    chat_told: bool,
     /// The kind of each workset of the directory.
     kinds: BTreeMap<WorksetId, WorksetKind>,
     /// Messages of agents the directory has not named (yet).
@@ -183,6 +187,7 @@ impl HostModel {
             chat: HostChat::default(),
             pending: BTreeSet::new(),
             pending_chat: HostChat::default(),
+            chat_told: false,
             kinds: BTreeMap::new(),
             strays: BTreeMap::new(),
             agents: BTreeMap::new(),
@@ -484,6 +489,7 @@ impl Model {
         let slot = self.hosts.get_mut(&host).expect("the host is here");
         slot.chat_head = chat_head;
         slot.open = true;
+        slot.chat_told = false;
         // A host whose database is not the one this client copied, or
         // whose chat log is shorter than the copy: the copy starts over.
         let started_over = slot.machine_seed != machine_seed || slot.chat_held > chat_head;
@@ -829,7 +835,8 @@ impl Model {
         }
         let mut out = Vec::new();
         let moved = std::mem::take(&mut slot.pending_chat);
-        if moved != HostChat::default() {
+        if moved != HostChat::default() || !slot.chat_told {
+            slot.chat_told = true;
             out.push(ModelEvent {
                 host,
                 msg: ModelMsg::Chat { moved },
@@ -1138,6 +1145,28 @@ mod tests {
             });
         }
         said
+    }
+
+    /// A catch-up that moved nothing still says the chat caught up, once
+    /// a stream: what the client holds is then the host's whole chat.
+    #[test]
+    fn a_catch_up_says_once_that_the_chat_is_whole_even_when_nothing_moved() {
+        let told = |events: &[ModelEvent]| {
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, ModelMsg::Chat { .. }))
+                .count()
+        };
+        let mut model = model();
+        model.ingest(HOST, hello(2));
+        model.ingest(HOST, chat(topic_with(&[agent(1)])));
+        // Again, with the copy at the head: nothing moves.
+        model.ingest(HOST, hello(2));
+        let out = model.ingest(HOST, directory(&[(agent(1), workset(1))]));
+        assert_eq!(told(&out), 1, "the directory finds the chat whole");
+        assert_eq!(topics_moved(&out), Vec::<TopicId>::new());
+        let again = model.ingest(HOST, directory(&[(agent(1), workset(1))]));
+        assert_eq!(told(&again), 0, "and says so once");
     }
 
     #[test]

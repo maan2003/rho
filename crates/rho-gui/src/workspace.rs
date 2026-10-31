@@ -242,6 +242,9 @@ pub struct Workspace {
     /// What the user is writing in each topic, kept on disk as it is
     /// typed: a restart or a dropped view puts it back.
     drafts: HashMap<HostTopic, String>,
+    /// Temporary: the user's words a GUI that ran `main` kept by agent,
+    /// until each agent's host has told its chat.
+    from_main: rho_agents_client::from_main::Leftovers,
     /// Every host's streams and topics, as the model folded them.
     pub(crate) chat: rho_agents_client::ChatMap,
     /// Pairing links that came while the user was naming another link's host:
@@ -648,6 +651,53 @@ impl Workspace {
 
     /// Settles the topics a migrated host made of conversations the user
     /// had already handled (`chat_migration`). Temporary, with it.
+    /// Temporary: carries what the user was writing to agents under
+    /// `main` into their topics, as each host's chat arrives.
+    fn carry_from_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.from_main.is_empty() {
+            return;
+        }
+        let carried = rho_agents_client::from_main::carry(
+            &self.chat,
+            |agent| self.host_of(agent),
+            &self.from_main,
+        );
+        if carried.is_empty() {
+            return;
+        }
+        tracing::info!(
+            drafts = carried.drafts.len(),
+            unsent = carried.outbox.len(),
+            "carried the user's words from main into topics"
+        );
+        self.from_main.without(&carried);
+        let mut topics = Vec::new();
+        for (_, topic, text) in &carried.drafts {
+            let text = match self.drafts.get(topic) {
+                Some(held) if !held.is_empty() => format!("{text}\n\n{held}"),
+                _ => text.clone(),
+            };
+            self.drafts.insert(*topic, text);
+            topics.push(*topic);
+        }
+        let mut hosts = Vec::new();
+        for (agent, _, machine_seed, id, outgoing) in &carried.outbox {
+            if let Destination::Topic(topic) = outgoing.to {
+                topics.push(HostTopic {
+                    machine_seed: *machine_seed,
+                    topic,
+                });
+            }
+            self.outbox.adopt(*machine_seed, *id, outgoing.clone());
+            hosts.extend(self.host_of(*agent));
+        }
+        rho_agents_client::cache::carry_from_main(carried);
+        self.refresh_topics(topics, cx);
+        for host in hosts {
+            self.send_unsent(host, window, cx);
+        }
+    }
+
     pub(crate) fn settle_migrated_topics(&mut self, cx: &mut Context<Self>) {
         let facts = crate::chat_migration::settle_migrated(&self.chat, &self.attention.marks);
         if facts.is_empty() {
@@ -1090,6 +1140,7 @@ impl Workspace {
             drafts: rho_agents_client::cache::read_drafts()
                 .into_iter()
                 .collect(),
+            from_main: rho_agents_client::cache::read_main_leftovers(),
             chat: rho_agents_client::ChatMap::default(),
             waiting_links: Default::default(),
             registry: AgentMap::default(),
@@ -1606,48 +1657,64 @@ impl Workspace {
         view.update(cx, |view, cx| view.set_rows(rows, cx));
     }
 
+    /// The topics the user is in, as Home lists them under its cards:
+    /// when each last spoke to the user or the user to it, and whether a
+    /// mention is unread. A status that mentions nobody does not make a
+    /// topic recent; one the user started is, before anyone answers. Not
+    /// one gone with its agents, as its card is, nor one the user put
+    /// away: a mute and a snooze are not cursors.
+    fn recent_topics(
+        &self,
+        now: jiff::Timestamp,
+    ) -> Vec<(rho_agent_types::UnixMs, HostTopic, HostId, bool)> {
+        self.chat
+            .topics()
+            .filter_map(|(topic, host, held)| {
+                let at = held
+                    .mentions
+                    .last()
+                    .map(|mention| mention.at)
+                    .max(held.user_wrote.map(|(_, at)| at))?;
+                if !held
+                    .agents
+                    .keys()
+                    .any(|agent| self.registry.agent_workset(*agent).is_some())
+                {
+                    return None;
+                }
+                let node = rho_dealer::NodeId::Topic(topic);
+                let facts = self.attention.marks.get(&node);
+                let facts = facts.facts();
+                if facts.put_away(now) {
+                    return None;
+                }
+                let seen = held.seen(
+                    facts
+                        .seen_topic()
+                        .map(|seen| rho_agent_types::MessageId(rho_agent_types::ChatSeq(seen))),
+                );
+                let unread = held.unseen(seen).next().is_some();
+                Some((at, topic, host, unread))
+            })
+            .collect()
+    }
+
     fn home_rows(&mut self, cx: &gpui::App) -> crate::home::HomeRows {
         let now = jiff::Timestamp::now();
         let hand = self.hand(cx).cards;
         let mut rows = crate::home::split_hand(&hand, crate::home::card_title);
-        // A topic already shown as a card above is not listed again. Nor
-        // one the user put away: a mute and a snooze are not cursors, and a
-        // list that ignored them would keep showing what the reader asked
-        // not to see.
+        // A topic already shown as a card above is not listed again.
         let dealt = rows
             .next
             .iter()
             .map(|row| row.card.clone())
             .collect::<std::collections::HashSet<_>>();
-        let mut recent =
-            self.chat
-                .topics()
-                .filter_map(|(topic, host, held)| {
-                    let node = rho_dealer::NodeId::Topic(topic);
-                    // A topic is recent by what it last said to the user: a
-                    // status that mentions nobody does not make it so.
-                    let at = held.mentions.last()?.at;
-                    // Gone with its agents, as its card is.
-                    if !held
-                        .agents
-                        .keys()
-                        .any(|agent| self.registry.agent_workset(*agent).is_some())
-                    {
-                        return None;
-                    }
-                    let facts = self.attention.marks.get(&node);
-                    let facts = facts.facts();
-                    if dealt.contains(&node) || facts.put_away(now) {
-                        return None;
-                    }
-                    let seen =
-                        held.seen(facts.seen_topic().map(|seen| {
-                            rho_agent_types::MessageId(rho_agent_types::ChatSeq(seen))
-                        }));
-                    let unread = held.unseen(seen).next().is_some();
-                    Some((at, node, host, unread))
-                })
-                .collect::<Vec<_>>();
+        let mut recent = self
+            .recent_topics(now)
+            .into_iter()
+            .filter(|recent| !dealt.contains(&rho_dealer::NodeId::Topic(recent.1)))
+            .map(|(at, topic, host, unread)| (at, rho_dealer::NodeId::Topic(topic), host, unread))
+            .collect::<Vec<_>>();
         recent.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         rows.recent = recent
             .into_iter()
@@ -2044,6 +2111,8 @@ impl Workspace {
                 if changed.is_empty() {
                     return;
                 }
+                // An agent's host is known from here on.
+                self.carry_from_main(window, cx);
                 for agent_id in &changed {
                     rho_journal::record(rho_journal::Event::AgentChanged {
                         agent: agent_id.encoded(),
@@ -2090,6 +2159,7 @@ impl Workspace {
                     self.topic_to_open = None;
                     self.open_topic(topic, window, cx);
                 }
+                self.carry_from_main(window, cx);
                 self.settle_migrated_topics(cx);
                 self.invalidate_dealer_signals(cx);
                 self.refresh_home(cx);
@@ -4545,6 +4615,14 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn carry_from_main_for_test(
+        &mut self,
+        leftovers: rho_agents_client::from_main::Leftovers,
+    ) {
+        self.from_main = leftovers;
+    }
+
+    #[cfg(test)]
     pub(crate) fn saved_topic_draft_for_test(&self, topic: HostTopic) -> Option<&str> {
         self.drafts.get(&topic).map(String::as_str)
     }
@@ -4717,7 +4795,23 @@ impl Workspace {
                 ),
             );
         }
+        // And the topics Home lists, newest first, wherever they were last
+        // open: the picker reaches what Home does.
+        for topic in self.picker_topics() {
+            let key = SurfaceKey::Topic(topic);
+            if !list.is_some_and(|list| list.iter().any(|surface| surface.key == key)) {
+                rows.push((self.surface_name(&key), Self::surface_kind(&key).to_owned()));
+            }
+        }
         rows
+    }
+
+    /// The topics the buffer picker offers beyond the context's surfaces:
+    /// Home's recent ones, newest first.
+    fn picker_topics(&self) -> Vec<HostTopic> {
+        let mut recent = self.recent_topics(jiff::Timestamp::now());
+        recent.sort_by_key(|(at, ..)| std::cmp::Reverse(*at));
+        recent.into_iter().map(|(_, topic, ..)| topic).collect()
     }
 
     /// Resolves a `:buffer`/`:close` argument: exact name first, then a
@@ -4752,6 +4846,15 @@ impl Workspace {
             // shown Home: opening it is what makes it that context's.
             if name == self.surface_name(&SurfaceKey::Home) {
                 self.open_home(window, cx);
+                return;
+            }
+            // A topic the picker offered that is open in no surface here.
+            if let Some(topic) = self
+                .picker_topics()
+                .into_iter()
+                .find(|topic| self.topic_title(*topic) == name)
+            {
+                self.open_topic(topic, window, cx);
                 return;
             }
             self.notice_on(
