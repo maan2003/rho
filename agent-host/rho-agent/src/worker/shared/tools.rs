@@ -187,4 +187,3 @@ impl Papercut {
         ask(py, &self.agent_host, "papercut", call)
     }
 }
-

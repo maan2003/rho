@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, MailId, WorksetId, WorksetKind, Wpos,
+    Address, AgentId, ContentPart, InputWake, MailId, ThreadId, WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::rho2::{
     ClientFrame, CreateWorkset, LogEvent, PostMail, ServerFrame,
@@ -244,6 +244,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
     let mut next_client_id = 0u64;
     let mut last_mail = MailId(0);
+    let mut user_threads: HashMap<AgentId, ThreadId> = HashMap::new();
     let quiesce_deadline = deadline
         + if matches!(
             args.scenario,
@@ -321,7 +322,10 @@ async fn run_async(args: Args) -> Result<()> {
                 worksets.insert(workset, Wpos::ZERO);
                 client
                     .send(&ClientFrame::FollowWorksets {
-                        from: worksets.iter().map(|(workset, next)| (*workset, *next)).collect(),
+                        from: worksets
+                            .iter()
+                            .map(|(workset, next)| (*workset, *next))
+                            .collect(),
                     })
                     .await?;
             }
@@ -351,7 +355,7 @@ async fn run_async(args: Args) -> Result<()> {
                             next_client_id
                         },
                         to: agent_id,
-                        re: None,
+                        thread: None,
                         content: prompt(0, *cycle),
                     });
                 }
@@ -366,10 +370,24 @@ async fn run_async(args: Args) -> Result<()> {
                     );
                     last_mail = mail.id;
                     match (mail.from, mail.to) {
-                        (Address::User, Address::Agent(_)) => {
+                        (Address::User, Address::Agent(agent)) => {
+                            ensure!(
+                                mail.thread == ThreadId(mail.id),
+                                "a mail posted without a thread did not start one: {mail:?}"
+                            );
+                            user_threads.insert(agent, mail.thread);
                             posted.insert(mail.id);
                         }
-                        (Address::Agent(_), Address::User) => {
+                        (Address::Agent(agent), Address::User) => {
+                            // Policy goes on in the thread of the newest mail
+                            // between the two; mail arrives in log order.
+                            ensure!(
+                                user_threads.get(&agent) == Some(&mail.thread),
+                                "agent {} answered in thread {:?}, not {:?}",
+                                agent.encoded(),
+                                mail.thread,
+                                user_threads.get(&agent)
+                            );
                             let text = content_text(&mail.content);
                             ensure!(!text.trim().is_empty(), "empty user-facing message");
                             messages_sent += 1;
@@ -409,7 +427,10 @@ async fn run_async(args: Args) -> Result<()> {
                             ..
                         } => {
                             let mail = mail.context("an input that is not mail")?;
-                            ensure!(wake == InputWake::Person, "unexpected peer input in isolated proof");
+                            ensure!(
+                                wake == InputWake::Person,
+                                "unexpected peer input in isolated proof"
+                            );
                             ensure!(!text.is_empty(), "empty user input");
                             ensure!(
                                 received.insert((agent, mail)),
@@ -572,10 +593,7 @@ async fn run_async(args: Args) -> Result<()> {
     let final_head = Streams::open(connect(&socket).await?, &socket)
         .await?
         .mail_head;
-    ensure!(
-        last_mail <= final_head,
-        "mail seen beyond the durable head"
-    );
+    ensure!(last_mail <= final_head, "mail seen beyond the durable head");
 
     let metrics: FakeMetrics = reqwest::get(format!(
         "{}/metrics",

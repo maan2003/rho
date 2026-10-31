@@ -1,9 +1,9 @@
 //! The agent host's worksets and the agents loaded in them.
 //!
-//! The pool owns one process per workset ([ARCH-rho2](../../specs/ARCH-rho2.md)),
-//! the id → loaded-agent map, and the answers to each workset's `_rho`
-//! calls. The store is the truth about worksets, agents and mail; the pool
-//! holds only what runs.
+//! The pool owns one process per workset
+//! ([ARCH-rho2](../../specs/ARCH-rho2.md)), the id → loaded-agent map, and the
+//! answers to each workset's `_rho` calls. The store is the truth about
+//! worksets, agents and mail; the pool holds only what runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -736,7 +736,6 @@ impl AgentPool {
         }
     }
 
-
     /// A new workset, its first row, and its process running `code`. With a
     /// `message`, the first agent the code creates gets it as mail from the
     /// user.
@@ -829,7 +828,7 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         to: AgentId,
-        re: Option<MailId>,
+        thread: Option<rho_agent_types::ThreadId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MailId> {
         let workset = self.workset_of(to)?;
@@ -838,22 +837,22 @@ impl AgentPool {
                 NewMail {
                     from: Address::User,
                     to: Address::Agent(to),
-                    re,
+                    thread,
                     kind: None,
                     content,
                 },
                 Some(client_id),
             )
-            .await;
+            .await?;
         self.wake_workset(workset);
         Ok(id)
     }
 
-    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> MailId {
+    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> anyhow::Result<MailId> {
         let mut write = self.db.write().await;
-        let id = write.post_mail(UnixMs::now(), mail, client_id);
+        let id = write.post_mail(UnixMs::now(), mail, client_id)?;
         write.commit();
-        id
+        Ok(id)
     }
 
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
@@ -899,7 +898,13 @@ impl AgentPool {
             .unwrap_or_default();
         let mut locks = Vec::new();
         for &agent in &agents {
-            let lock = self.load_locks.lock().await.entry(agent).or_default().clone();
+            let lock = self
+                .load_locks
+                .lock()
+                .await
+                .entry(agent)
+                .or_default()
+                .clone();
             locks.push(lock.lock_owned().await);
         }
         for &agent in &agents {
@@ -1031,17 +1036,19 @@ impl AgentPool {
                     }
                 };
                 if let Some(content) = first {
-                    write.post_mail(
-                        UnixMs::now(),
-                        NewMail {
-                            from: Address::User,
-                            to: Address::Agent(agent),
-                            re: None,
-                            kind: None,
-                            content,
-                        },
-                        None,
-                    );
+                    write
+                        .post_mail(
+                            UnixMs::now(),
+                            NewMail {
+                                from: Address::User,
+                                to: Address::Agent(agent),
+                                thread: None,
+                                kind: None,
+                                content,
+                            },
+                            None,
+                        )
+                        .expect("a new thread names no mail");
                 }
                 write.commit();
                 PyReply::Agent(agent)
@@ -1060,7 +1067,8 @@ impl AgentPool {
             PyRequest::SetSpec { agent, spec } => {
                 let current = self.own_agent(workset, agent)?;
                 anyhow::ensure!(
-                    std::mem::discriminant(&current.runtime) == std::mem::discriminant(&spec.runtime),
+                    std::mem::discriminant(&current.runtime)
+                        == std::mem::discriminant(&spec.runtime),
                     "an agent keeps its runtime kind"
                 );
                 {
@@ -1089,14 +1097,20 @@ impl AgentPool {
             }
             PyRequest::Delivered(agent) => {
                 self.own_agent(workset, agent)?;
-                PyReply::Mail(self.db.read().agent(agent).context("agent was deleted")?.delivered)
+                PyReply::Mail(
+                    self.db
+                        .read()
+                        .agent(agent)
+                        .context("agent was deleted")?
+                        .delivered,
+                )
             }
             PyRequest::SendMail {
                 sender,
                 to,
                 content,
                 kind,
-                re,
+                thread,
             } => {
                 self.own_agent(workset, sender)?;
                 let recipient = match to {
@@ -1108,13 +1122,13 @@ impl AgentPool {
                         NewMail {
                             from: Address::Agent(sender),
                             to,
-                            re,
+                            thread,
                             kind,
                             content,
                         },
                         None,
                     )
-                    .await;
+                    .await?;
                 if let Some(recipient) = recipient
                     && recipient != workset
                 {
@@ -1123,8 +1137,16 @@ impl AgentPool {
                 PyReply::Mail(id)
             }
             PyRequest::Inbox { address, after } => PyReply::Mails(self.inbox(address, after).await),
+            PyRequest::NewestMailBetween(a, b) => {
+                PyReply::NewestMail(self.db.read().newest_between(a, b))
+            }
             PyRequest::Clone { url, dest, rev } => {
-                let kind = self.db.read().workset(workset).context("workset was deleted")?.kind;
+                let kind = self
+                    .db
+                    .read()
+                    .workset(workset)
+                    .context("workset was deleted")?
+                    .kind;
                 anyhow::ensure!(
                     kind == WorksetKind::Isolated,
                     "clone works in an isolated workset only"
@@ -1134,7 +1156,10 @@ impl AgentPool {
                     .ok()
                     .filter(|name| name.components().count() == 1)
                     .with_context(|| {
-                        format!("clone into a directory directly in {}", rho_fs_view::MOUNT_ROOT)
+                        format!(
+                            "clone into a directory directly in {}",
+                            rho_fs_view::MOUNT_ROOT
+                        )
                     })?
                     .to_string();
                 let directory = self.worksets.open_workset(workset).await?;

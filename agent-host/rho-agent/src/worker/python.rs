@@ -16,7 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, WorksetId,
+    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, ThreadId, WorksetId,
 };
 use tokio::sync::oneshot;
 
@@ -33,9 +33,7 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How `_rho` reaches the agent host: over the workset port, or a test's
 /// stand-in.
 pub(crate) type HostCall = Arc<
-    dyn Fn(PyRequest) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>>
-        + Send
-        + Sync,
+    dyn Fn(PyRequest) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>> + Send + Sync,
 >;
 
 /// The workset process's link to the agent host for `_rho`.
@@ -231,18 +229,29 @@ async fn hook<T: Send + 'static>(
 
 /// `hooks.instructions`: the model's instructions for its next request.
 pub(crate) async fn instructions(agent: AgentId) -> anyhow::Result<String> {
-    hook("instructions", agent, |_| Ok(Vec::new()), |value| value.extract()).await
+    hook(
+        "instructions",
+        agent,
+        |_| Ok(Vec::new()),
+        |value| value.extract(),
+    )
+    .await
 }
 
 /// `hooks.on_compaction`: what the model is given back after its context
 /// was compacted, as quiet inputs.
 pub(crate) async fn on_compaction(agent: AgentId) -> anyhow::Result<Vec<String>> {
-    hook("on_compaction", agent, |_| Ok(Vec::new()), |value| {
-        if value.is_none() {
-            return Ok(Vec::new());
-        }
-        value.extract()
-    })
+    hook(
+        "on_compaction",
+        agent,
+        |_| Ok(Vec::new()),
+        |value| {
+            if value.is_none() {
+                return Ok(Vec::new());
+            }
+            value.extract()
+        },
+    )
     .await
 }
 
@@ -299,9 +308,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     let module = PyModule::new(py, "_rho")?;
     module.add(
         "_current",
-        py.import("contextvars")?
-            .getattr("ContextVar")?
-            .call(("rho_current_agent",), Some(&[("default", py.None())].into_py_dict(py)?))?,
+        py.import("contextvars")?.getattr("ContextVar")?.call(
+            ("rho_current_agent",),
+            Some(&[("default", py.None())].into_py_dict(py)?),
+        )?,
     )?;
     module.add_function(pyo3::wrap_pyfunction!(workset_id, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(workset_kind, &module)?)?;
@@ -319,6 +329,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(newest_mail_between, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
     Ok(module)
 }
@@ -516,6 +527,17 @@ fn delivered(py: Python<'_>, agent: &str) -> PyResult<u64> {
 }
 
 #[pyfunction]
+fn newest_mail_between(py: Python<'_>, a: &str, b: &str) -> PyResult<Option<Py<PyAny>>> {
+    let request = PyRequest::NewestMailBetween(address(a)?, address(b)?);
+    match PyHost::block(py, request)? {
+        PyReply::NewestMail(mail) => mail
+            .map(|mail| Ok(mail_to_py(py, &mail)?.into_any().unbind()))
+            .transpose(),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
 fn cancel(py: Python<'_>, agent: &str) -> PyResult<()> {
     control(py, agent, Control::Cancel)
 }
@@ -536,14 +558,14 @@ fn new_cache_key(py: Python<'_>, agent: &str) -> PyResult<()> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (sender, to, text, *, kind = None, re = None))]
+#[pyo3(signature = (sender, to, text, *, kind = None, thread = None))]
 fn send_mail(
     py: Python<'_>,
     sender: &str,
     to: &str,
     text: String,
     kind: Option<&str>,
-    re: Option<u64>,
+    thread: Option<u64>,
 ) -> PyResult<u64> {
     let sender = agent_id(sender)?;
     let to = address(to)?;
@@ -581,7 +603,7 @@ fn send_mail(
         to,
         content: vec![ContentPart::Text { text }],
         kind,
-        re: re.map(MailId),
+        thread: thread.map(|thread| ThreadId(MailId(thread))),
     };
     match PyHost::block(py, request)? {
         PyReply::Mail(id) => Ok(id.0),
@@ -595,7 +617,7 @@ fn mail_to_py<'py>(py: Python<'py>, mail: &Mail) -> PyResult<Bound<'py, PyDict>>
     out.set_item("at", mail.at.0)?;
     out.set_item("sender", address_text(mail.from))?;
     out.set_item("to", address_text(mail.to))?;
-    out.set_item("re", mail.re.map(|re| re.0))?;
+    out.set_item("thread", mail.thread.0.0)?;
     out.set_item(
         "kind",
         mail.kind.map(|kind| match kind {
@@ -642,7 +664,10 @@ fn inbox(py: Python<'_>, address: &str, after: u64) -> PyResult<Py<PyAny>> {
                     .or_else(|_| define_settle(py))?;
                 let (value, error) = match outcome {
                     Ok(value) => (value, py.None().into_bound(py)),
-                    Err(error) => (py.None().into_bound(py), error.into_value(py).into_bound(py).into_any()),
+                    Err(error) => (
+                        py.None().into_bound(py),
+                        error.into_value(py).into_bound(py).into_any(),
+                    ),
                 };
                 event_loop
                     .bind(py)
@@ -680,41 +705,17 @@ fn current_agent(py: Python<'_>) -> PyResult<Option<String>> {
 
 fn runtime_to_py<'py>(py: Python<'py>, runtime: &Runtime) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
-    match runtime {
-        Runtime::Native { model, profile, .. } => {
-            out.set_item("kind", "native")?;
-            out.set_item(
-                "model",
-                match model {
-                    InferenceModel::Gpt61Sol => "sol",
-                    InferenceModel::Gpt61Terra => "terra",
-                    InferenceModel::Gpt6Astra => "astra",
-                },
-            )?;
-            out.set_item("effort", profile.effort.as_str())?;
-            out.set_item("fast", profile.fast_mode)?;
-        }
-        Runtime::Claude { model, effort, .. } => {
-            out.set_item("kind", "claude")?;
-            out.set_item(
-                "model",
-                match model {
-                    rho_claude::Model::Fable => "fable",
-                    rho_claude::Model::Opus => "opus",
-                    rho_claude::Model::Sonnet => "sonnet",
-                },
-            )?;
-            out.set_item(
-                "effort",
-                match effort {
-                    rho_claude::Effort::Low => "low",
-                    rho_claude::Effort::Medium => "medium",
-                    rho_claude::Effort::High => "high",
-                    rho_claude::Effort::Xhigh => "xhigh",
-                    rho_claude::Effort::Max => "max",
-                },
-            )?;
-        }
+    out.set_item(
+        "kind",
+        match runtime {
+            Runtime::Native { .. } => "native",
+            Runtime::Claude { .. } => "claude",
+        },
+    )?;
+    out.set_item("model", runtime.model_name())?;
+    out.set_item("effort", runtime.effort_name())?;
+    if let Runtime::Native { profile, .. } = runtime {
+        out.set_item("fast", profile.fast_mode)?;
     }
     Ok(out)
 }
@@ -726,7 +727,10 @@ fn spec_to_py<'py>(py: Python<'py>, spec: &AgentSpec) -> PyResult<Bound<'py, PyD
     Ok(out)
 }
 
-fn item<'py, T: for<'a> pyo3::FromPyObject<'a, 'py>>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
+fn item<'py, T: for<'a> pyo3::FromPyObject<'a, 'py>>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<T>
 where
     for<'a> <T as pyo3::FromPyObject<'a, 'py>>::Error: Into<PyErr>,
 {
@@ -761,7 +765,11 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
                 "medium" => ReasoningEffort::Medium,
                 "high" => ReasoningEffort::High,
                 "xhigh" => ReasoningEffort::Xhigh,
-                _ => return Err(PyValueError::new_err(format!("no native effort {effort:?}"))),
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "no native effort {effort:?}"
+                    )));
+                }
             };
             let fast_mode = match runtime.get_item("fast")? {
                 Some(fast) => fast.extract()?,
@@ -790,7 +798,11 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
                 "high" => rho_claude::Effort::High,
                 "xhigh" => rho_claude::Effort::Xhigh,
                 "max" => rho_claude::Effort::Max,
-                _ => return Err(PyValueError::new_err(format!("no Claude effort {effort:?}"))),
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "no Claude effort {effort:?}"
+                    )));
+                }
             };
             let session_id = match current.map(|current| &current.runtime) {
                 Some(Runtime::Claude { session_id, .. }) => *session_id,

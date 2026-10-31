@@ -99,7 +99,6 @@ pub(crate) fn services_pair(
     client.host()
 }
 
-
 /// The policy every test notebook gets: fixed instructions, a `human`
 /// whose sends are mail to the user, and a fixed text after a compaction.
 const TEST_POLICY: &str = r#"
@@ -130,10 +129,7 @@ static AGENTS: std::sync::LazyLock<
 pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
     use crate::ipc::workset::{PyReply, PyRequest};
     use crate::store::{NewMail, StoreRead as _, StoreWrite as _};
-    AGENTS
-        .lock()
-        .expect("poison")
-        .insert(agent, db.clone());
+    AGENTS.lock().expect("poison").insert(agent, db.clone());
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     STARTED.get_or_init(|| {
         // Its own runtime: a test's ends with the test.
@@ -174,7 +170,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         to,
                         content,
                         kind,
-                        re,
+                        thread,
                     } => {
                         let db = db(sender)?;
                         let mut write = db.write().await;
@@ -183,14 +179,19 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                             NewMail {
                                 from: rho_agent_types::Address::Agent(sender),
                                 to,
-                                re,
+                                thread,
                                 kind,
                                 content,
                             },
                             None,
                         );
-                        write.commit();
-                        PyReply::Mail(id)
+                        match id {
+                            Ok(id) => {
+                                write.commit();
+                                PyReply::Mail(id)
+                            }
+                            Err(error) => PyReply::Error(format!("{error:#}")),
+                        }
                     }
                     _ => PyReply::Error("tests answer only agents and mail".into()),
                 })

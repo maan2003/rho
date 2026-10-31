@@ -64,7 +64,7 @@ impl Outbox {
         Some(PostMail {
             client_id: *id,
             to: agent_id,
-            re: None,
+            thread: None,
             content: outgoing.content.clone(),
         })
     }

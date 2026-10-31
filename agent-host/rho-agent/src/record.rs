@@ -113,6 +113,38 @@ pub enum Runtime {
     },
 }
 
+impl Runtime {
+    /// The model by the name policy Python gives it.
+    pub fn model_name(&self) -> &'static str {
+        match self {
+            Self::Native { model, .. } => match model {
+                InferenceModel::Gpt61Sol => "sol",
+                InferenceModel::Gpt61Terra => "terra",
+                InferenceModel::Gpt6Astra => "astra",
+            },
+            Self::Claude { model, .. } => match model {
+                rho_claude::Model::Fable => "fable",
+                rho_claude::Model::Opus => "opus",
+                rho_claude::Model::Sonnet => "sonnet",
+            },
+        }
+    }
+
+    /// The reasoning effort by the name policy Python gives it.
+    pub fn effort_name(&self) -> &'static str {
+        match self {
+            Self::Native { profile, .. } => profile.effort.as_str(),
+            Self::Claude { effort, .. } => match effort {
+                rho_claude::Effort::Low => "low",
+                rho_claude::Effort::Medium => "medium",
+                rho_claude::Effort::High => "high",
+                rho_claude::Effort::Xhigh => "xhigh",
+                rho_claude::Effort::Max => "max",
+            },
+        }
+    }
+}
+
 /// The Claude runtime's rows.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum ClaudeRow {

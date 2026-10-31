@@ -57,6 +57,13 @@ impl MailId {
     }
 }
 
+/// A mail thread, named by the mail that started it. Every mail is in
+/// exactly one; a new mail without one starts its own.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
+)]
+pub struct ThreadId(pub MailId);
+
 /// One mail, as the mail log keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Mail {
@@ -64,8 +71,7 @@ pub struct Mail {
     pub at: UnixMs,
     pub from: Address,
     pub to: Address,
-    /// The mail this one answers.
-    pub re: Option<MailId>,
+    pub thread: ThreadId,
     /// What a mail to the user is for; the dealer ranks on it.
     pub kind: Option<SendKind>,
     pub content: Vec<ContentPart>,

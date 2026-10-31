@@ -10,9 +10,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use crate::ipc::protocol::{self, Message, Reply, Request};
 use crate::record::{ClaudeRow, Event, Record};
 use crate::store::{StoreRead as _, StoreWrite as _};
-use crate::ipc::protocol::{self, Message, Reply, Request};
 
 struct Controls {
     closed: bool,

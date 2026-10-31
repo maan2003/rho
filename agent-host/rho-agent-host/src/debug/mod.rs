@@ -181,7 +181,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             let call = rho_agents_client::protocol::rho2::PostMail {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 to,
-                re: None,
+                thread: None,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
             };
             let id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;

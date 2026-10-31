@@ -6,9 +6,9 @@ mod image_tool;
 pub mod native;
 pub(crate) mod python;
 mod runtime;
-mod ste;
 pub(crate) mod shared;
 pub mod shell;
+mod ste;
 pub mod terminal;
 mod workset;
 

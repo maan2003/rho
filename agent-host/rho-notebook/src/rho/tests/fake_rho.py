@@ -95,22 +95,32 @@ def new_cache_key(agent):
     STATE.calls.append(("new_cache_key", (agent,)))
 
 
-def send_mail(sender, to, text, *, kind=None, re=None):
+def send_mail(sender, to, text, *, kind=None, thread=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
         if to == "user" and kind is None:
             raise ValueError("a mail to the user needs a kind")
+        if thread is not None and not any(m["id"] == thread == m["thread"] for m in STATE.mails):
+            raise ValueError(f"no mail thread {thread}")
         id = len(STATE.mails) + 1
-        STATE.mails.append({"id": id, "at": 0, "sender": sender, "to": to, "re": re, "kind": kind, "text": text})
+        STATE.mails.append({"id": id, "at": 0, "sender": sender, "to": to, "thread": thread or id, "kind": kind, "text": text})
         return id
 
 
-def post_user_mail(to, text):
+def newest_mail_between(a, b):
+    with STATE.lock:
+        for m in reversed(STATE.mails):
+            if {m["sender"], m["to"]} == {a, b}:
+                return dict(m)
+        return None
+
+
+def post_user_mail(to, text, thread=None):
     """What the host does with the GUI's PostMail."""
     with STATE.lock:
         id = len(STATE.mails) + 1
-        STATE.mails.append({"id": id, "at": 0, "sender": "user", "to": to, "re": None, "kind": None, "text": text})
+        STATE.mails.append({"id": id, "at": 0, "sender": "user", "to": to, "thread": thread or id, "kind": None, "text": text})
         return id
 
 

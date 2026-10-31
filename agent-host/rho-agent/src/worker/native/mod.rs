@@ -27,8 +27,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::entry::{Entry, Notice, Report, RequestNotice, ResponseUsage, Wake};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
-    CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey,
-    Request, Response, Step,
+    CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey, Request,
+    Response, Step,
 };
 use crate::record::{Event, Record, Runtime};
 use crate::store::AgentHead;
@@ -657,7 +657,8 @@ impl Agent {
 
     async fn compact(&mut self) -> anyhow::Result<()> {
         if !self.archived && !self.compaction.pending {
-            self.append(Entry::CompactionTrigger { manual: true }).await?;
+            self.append(Entry::CompactionTrigger { manual: true })
+                .await?;
         }
         Ok(())
     }
@@ -864,6 +865,19 @@ impl Agent {
             })
             .await?;
         }
+        // A compaction asked of an agent with nothing in flight carries
+        // nothing it must answer, so it starts no turn: what the next
+        // request would tell (the cell that ended the turn, a restart)
+        // waits for that request.
+        let quiet = why == Wake::Compaction
+            && (self.progress.ended || self.progress.last_response.is_none())
+            && self.unread.is_empty()
+            && !self.context.has_queued();
+        if quiet {
+            return self
+                .wake_with(why, instructions, Report::default(), true)
+                .await;
+        }
         let mut report = Report::default();
         if self.restarted {
             self.append(Entry::Notice {
@@ -892,7 +906,7 @@ impl Agent {
         {
             report.notebook = output;
         }
-        self.wake_with(why, instructions, report).await
+        self.wake_with(why, instructions, report, false).await
     }
 
     async fn wake_with(
@@ -900,8 +914,9 @@ impl Agent {
         why: Wake,
         instructions: Arc<str>,
         mut report: Report,
+        quiet: bool,
     ) -> anyhow::Result<()> {
-        if self.cell.is_some() {
+        if self.cell.is_some() && !quiet {
             self.progress.told_returned = true;
         }
         self.unread.clear();
@@ -929,9 +944,11 @@ impl Agent {
             compact: self.compaction.pending,
         })
         .await?;
-        self.restarted = false;
-        self.rewound = false;
-        self.progress.ended = false;
+        if !quiet {
+            self.restarted = false;
+            self.rewound = false;
+            self.progress.ended = false;
+        }
         if let Some(notebook) = &self.notebook {
             notebook.reset_checkin();
         }
@@ -1146,7 +1163,12 @@ impl Agent {
 
     /// The user wrote to an archived agent while it was responding.
     async fn revive_if_written(&mut self) -> anyhow::Result<()> {
-        if self.archived && self.unread.iter().any(|(wake, _)| *wake == InputWake::Person) {
+        if self.archived
+            && self
+                .unread
+                .iter()
+                .any(|(wake, _)| *wake == InputWake::Person)
+        {
             self.fresh_notebook().await?;
         }
         Ok(())

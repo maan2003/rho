@@ -226,7 +226,10 @@ struct Activity {
     gaps: std::collections::VecDeque<u64>,
 }
 
-type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>)>;
+/// Per response: the tools it was offered, and the tool outputs its
+/// context held, so a continuation that sends only its suffix still counts
+/// every output of the chain.
+type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>, usize)>;
 
 #[derive(Clone)]
 struct AppState {
@@ -584,7 +587,7 @@ fn openai_turn(
         .input
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"));
-    let output_count = request
+    let mut output_count = request
         .input
         .iter()
         .filter(|item| {
@@ -597,16 +600,19 @@ fn openai_turn(
     let mut tools = request_tools(request);
     {
         let mut remembered = state.response_tools.lock().unwrap();
-        if tools.is_empty()
-            && let Some(previous) = &request.previous_response_id
-            && let Some((_, inherited)) = remembered.iter().find(|(id, _)| id == previous)
+        if let Some(previous) = &request.previous_response_id
+            && let Some((_, inherited, outputs)) =
+                remembered.iter().find(|(id, _, _)| id == previous)
         {
-            tools = inherited.clone();
+            if tools.is_empty() {
+                tools = inherited.clone();
+            }
+            output_count += outputs;
         }
         if remembered.len() == 256 {
             remembered.pop_front();
         }
-        remembered.push_back((response_id.clone(), tools.clone()));
+        remembered.push_back((response_id.clone(), tools.clone(), output_count));
     }
     if state.config.scenario == Scenario::RealToolRounds && (!tools.is_empty() || has_tool_result) {
         let outputs: Vec<_> = request

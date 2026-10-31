@@ -123,7 +123,7 @@ fn mail(from: Address, to: Address, kind: Option<SendKind>, text: String, at: Un
         at,
         from,
         to,
-        re: None,
+        thread: rho_agent_types::ThreadId(id),
         kind,
         content: vec![ContentPart::Text { text }],
     }

@@ -105,7 +105,11 @@ async fn work_outlives_reexec(
         assert!(status.success());
     }
     wait_for_socket(socket_path).await?;
-    let agent_id = tokio::time::timeout(Duration::from_secs(60), create_agent(socket_path, &repo_dir, None)).await??;
+    let agent_id = tokio::time::timeout(
+        Duration::from_secs(60),
+        create_agent(socket_path, &repo_dir, None),
+    )
+    .await??;
 
     // State only the running shell holds: a variable, and a job that is
     // still sleeping when the agent host re-executes.
@@ -341,5 +345,7 @@ async fn create_agent(
         "creation code failed: {:?}",
         created.result.error
     );
-    Ok(rho_agent_types::AgentId::from_encoded(created.result.output.trim())?)
+    Ok(rho_agent_types::AgentId::from_encoded(
+        created.result.output.trim(),
+    )?)
 }

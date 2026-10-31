@@ -69,8 +69,10 @@ pub(crate) enum PyRequest {
         to: rho_agent_types::Address,
         content: Vec<rho_agent_types::ContentPart>,
         kind: Option<rho_agent_types::SendKind>,
-        re: Option<rho_agent_types::MailId>,
+        thread: Option<rho_agent_types::ThreadId>,
     },
+    /// The newest mail between two addresses, either way.
+    NewestMailBetween(rho_agent_types::Address, rho_agent_types::Address),
     /// Mail to `address` after `after`, answered once there is some.
     Inbox {
         address: rho_agent_types::Address,
@@ -90,6 +92,7 @@ pub(crate) enum PyReply {
     Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
     Mail(rho_agent_types::MailId),
     Mails(Vec<rho_agent_types::Mail>),
+    NewestMail(Option<rho_agent_types::Mail>),
     Models(Vec<crate::record::Runtime>),
     Done,
     Error(String),
@@ -98,16 +101,35 @@ pub(crate) enum PyReply {
 #[derive(Encode, Decode)]
 pub(crate) enum Message {
     Policy(Vec<u8>),
-    Action { id: u64, action: Action },
-    Attach { id: u64, port: Port, attach: Attach },
-    Reply { id: u64, body: Reply },
+    Action {
+        id: u64,
+        action: Action,
+    },
+    Attach {
+        id: u64,
+        port: Port,
+        attach: Attach,
+    },
+    Reply {
+        id: u64,
+        body: Reply,
+    },
     Detach(Port),
     /// Worker to host: a `_rho` call.
-    Python { id: u64, request: PyRequest },
+    Python {
+        id: u64,
+        request: PyRequest,
+    },
     /// Host to worker: the answer to a `Python` call.
-    PythonReply { id: u64, body: PyReply },
+    PythonReply {
+        id: u64,
+        body: PyReply,
+    },
     /// Host to worker: run code in the workset namespace.
-    Eval { id: u64, code: String },
+    Eval {
+        id: u64,
+        code: String,
+    },
     /// Worker to host: what an `Eval` printed, and its traceback.
     Evaluated {
         id: u64,

@@ -139,13 +139,35 @@ class Tools(WorksetCase):
             ns["agents"].spawn_new_engineer(task_name="deeper", prompt="p")
         self.assertEqual(len(self.state.agents), before)
 
+    def test_mail_goes_on_in_the_thread_of_the_newest_mail_between(self):
+        ns, _ = self.notebook(self.root)
+        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        first = fake_rho.post_user_mail(self.root, "Do it.")
+        run(lambda: ns["mail"].send("user", "On it.", kind="status"))
+        run(lambda: ns["mail"].send(f"eng-{child}", "Help."))
+        run(lambda: ns["mail"].send("user", "Done.", kind="result"))
+        other = fake_rho.post_user_mail(self.root, "Something else.")
+        run(lambda: ns["mail"].send("user", "Also done.", kind="result"))
+        run(lambda: ns["mail"].send(f"eng-{child}", "More help."))
+        threads = [(m["to"], m["text"], m["thread"]) for m in self.state.mails if m["sender"] == self.root]
+        self.assertEqual(
+            threads,
+            [
+                ("user", "On it.", first),
+                (child, "Help.", 3),
+                ("user", "Done.", first),
+                ("user", "Also done.", other),
+                (child, "More help.", 3),
+            ],
+        )
+
     def test_mail_rules(self):
         ns, _ = self.notebook(self.root)
         with self.assertRaisesRegex(ValueError, "needs kind"):
             ns["mail"].send("user", "Done.")
         printed, _ = run(lambda: ns["mail"].send("user", "Done.", kind="result"))
         self.assertEqual(printed, "")
-        self.assertEqual(self.state.mails[-1], {"id": 1, "at": 0, "sender": self.root, "to": "user", "re": None, "kind": "result", "text": "Done."})
+        self.assertEqual(self.state.mails[-1], {"id": 1, "at": 0, "sender": self.root, "to": "user", "thread": 1, "kind": "result", "text": "Done."})
         with self.assertRaisesRegex(ValueError, "yourself"):
             ns["mail"].send(f"eng-{self.root}", "hi")
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)

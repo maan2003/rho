@@ -22,15 +22,14 @@ mod testing;
 pub mod worker;
 pub use host::{Process as WorksetProcess, WorksetClient};
 pub use ipc::workset::{Action as WorksetAction, Attach as WorksetAttach, Reply as WorksetReply};
-pub use worker::worker_main;
-
 pub use log::{
-    ClaudeOutputBatch, InputKind, QueuedInput, TranscriptCall,
-    TranscriptLine, WakeEvent, WakeFacts, WakeKind, WakeTrigger,
+    ClaudeOutputBatch, InputKind, QueuedInput, TranscriptCall, TranscriptLine, WakeEvent,
+    WakeFacts, WakeKind, WakeTrigger,
 };
 pub use rho_agents_client::protocol::transcript::{
     InferenceState, RuntimeState, StreamingResponse,
 };
+pub use worker::worker_main;
 
 /// Replaceable live state. Neither runtime occupancy nor partial responses
 /// belong in durable history.
@@ -91,4 +90,3 @@ impl InputQueues {
         self.items.retain(pred);
     }
 }
-

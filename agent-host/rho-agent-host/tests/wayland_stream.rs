@@ -276,5 +276,7 @@ async fn create_agent(
         "creation code failed: {:?}",
         created.result.error
     );
-    Ok(rho_agent_types::AgentId::from_encoded(created.result.output.trim())?)
+    Ok(rho_agent_types::AgentId::from_encoded(
+        created.result.output.trim(),
+    )?)
 }

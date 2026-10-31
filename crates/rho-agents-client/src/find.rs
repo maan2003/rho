@@ -71,7 +71,7 @@ mod tests {
             at: UnixMs(id),
             from,
             to,
-            re: None,
+            thread: rho_agent_types::ThreadId(MailId(id)),
             kind,
             content: vec![ContentPart::Text { text: text.into() }],
         }

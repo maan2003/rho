@@ -208,7 +208,10 @@ mod tests {
     #[test]
     fn a_request_delivers_every_input_before_it_and_none_after() {
         let mut context = Context::restore(&[received("first"), received("second")]);
-        assert!(users(&context.input()).is_empty(), "nothing is delivered before a request");
+        assert!(
+            users(&context.input()).is_empty(),
+            "nothing is delivered before a request"
+        );
         context.observe(&attempt("old", vec![]));
         assert_eq!(users(&context.input()), ["first", "second"]);
         // An input after the request waits for the next one, even before a
