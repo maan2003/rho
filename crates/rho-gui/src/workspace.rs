@@ -681,7 +681,7 @@ impl Workspace {
             topics.push(*topic);
         }
         let mut hosts = Vec::new();
-        for (agent, _, machine_seed, id, outgoing) in &carried.outbox {
+        for (agent, machine_seed, id, outgoing) in &carried.outbox {
             if let Destination::Topic(topic) = outgoing.to {
                 topics.push(HostTopic {
                     machine_seed: *machine_seed,
@@ -2678,6 +2678,8 @@ impl Workspace {
                 .map(|topic| topic.agents_in_order())
                 .unwrap_or_default(),
             Destination::NewTopic { agents, .. } => agents.clone(),
+            // Only carried from `main`'s outbox, never written here.
+            Destination::AfterStart(_) => Vec::new(),
         };
         for agent_id in &agents {
             rho_journal::record(rho_journal::Event::AgentMessageSent {
@@ -2696,7 +2698,7 @@ impl Workspace {
                 machine_seed,
                 topic: *topic,
             }),
-            Destination::NewTopic { .. } => None,
+            Destination::NewTopic { .. } | Destination::AfterStart(_) => None,
         };
         let id = self.outbox.push(machine_seed, to, content);
         self.refresh_topics(topic, cx);
@@ -2744,7 +2746,7 @@ impl Workspace {
                         machine_seed,
                         topic,
                     };
-                    let delivered = this.outbox.delivered(machine_seed);
+                    let delivered = this.outbox.delivered(machine_seed, topic.topic);
                     this.refresh_topics([topic], cx);
                     // A topic the user started is where they go next.
                     if let Some((id, _)) = delivered

@@ -42,9 +42,9 @@ impl Leftovers {
 pub struct Carried {
     /// An agent's draft, now its topic's.
     pub drafts: Vec<(AgentId, HostTopic, String)>,
-    /// An agent's unsent messages, by the ids `main` gave them, now one
-    /// message to its host under the first of them.
-    pub outbox: Vec<(AgentId, Vec<u64>, u64, u64, ChatOutgoing)>,
+    /// An agent's unsent messages, each to its host's database under the
+    /// id `main` gave it, oldest first.
+    pub outbox: Vec<(AgentId, u64, u64, ChatOutgoing)>,
 }
 
 impl Carried {
@@ -74,9 +74,11 @@ pub fn user_topic(chat: &HostChat, agent: AgentId) -> Option<TopicId> {
 /// What can be carried now. An agent's words wait until its host is known
 /// and has told its whole chat, so a topic not heard of yet is never taken
 /// for one that does not exist. A draft goes to the agent's topic with the
-/// user; unsent messages are posted there, or start one with the agent
-/// when there is none. An agent's messages go as one, so they start one
-/// topic, not one each.
+/// user. Unsent messages go one by one under the ids `main` gave them,
+/// since the host may have taken the first and not the rest, and it
+/// answers an id it has with the message it logged: each is posted in the
+/// agent's topic with the user, or, when there is none, the first starts
+/// one with the agent and the rest follow it there.
 pub fn carry(
     chat: &ChatMap,
     host_of: impl Fn(AgentId) -> Option<HostId>,
@@ -103,32 +105,32 @@ pub fn carry(
         let Some((machine_seed, topic)) = told(*agent) else {
             continue;
         };
-        let Some((first_id, first)) = unsent.first() else {
-            continue;
-        };
-        let content = unsent
-            .iter()
-            .flat_map(|(_, outgoing)| outgoing.content.iter().cloned())
-            .collect::<Vec<_>>();
-        let to = match topic {
-            Some(topic) => Destination::Topic(topic),
-            None => Destination::NewTopic {
-                stream: StreamId::DEFAULT,
-                name: default_topic_name(&rho_agent_types::transcript::text_content(&content)),
-                agents: vec![*agent],
-            },
-        };
-        carried.outbox.push((
-            *agent,
-            unsent.iter().map(|(id, _)| *id).collect(),
-            machine_seed,
-            *first_id,
-            ChatOutgoing {
-                at: first.at,
-                content,
-                to,
-            },
-        ));
+        let mut to = topic.map(Destination::Topic);
+        for (id, outgoing) in unsent {
+            let destination = match &to {
+                Some(to) => to.clone(),
+                None => {
+                    to = Some(Destination::AfterStart(*id));
+                    Destination::NewTopic {
+                        stream: StreamId::DEFAULT,
+                        name: default_topic_name(&rho_agent_types::transcript::text_content(
+                            &outgoing.content,
+                        )),
+                        agents: vec![*agent],
+                    }
+                }
+            };
+            carried.outbox.push((
+                *agent,
+                machine_seed,
+                *id,
+                ChatOutgoing {
+                    at: outgoing.at,
+                    content: outgoing.content.clone(),
+                    to: destination,
+                },
+            ));
+        }
     }
     carried
 }
@@ -253,9 +255,10 @@ mod tests {
         assert!(carried.outbox.is_empty());
     }
 
-    /// Unsent messages are posted in the agent's topic with the user, an
-    /// agent's together under its first id, oldest first. An agent with
-    /// no such topic gets one started with it alone.
+    /// Unsent messages are posted one by one in the agent's topic with the
+    /// user, oldest first, each under its own id: the host may have taken
+    /// the first and not the second. An agent with no such topic starts one
+    /// with its first message, and the rest follow it there.
     #[test]
     fn unsent_messages_are_posted_in_the_agents_topic_with_the_user() {
         let message = |at, words: &str| Outgoing {
@@ -270,44 +273,48 @@ mod tests {
                     vec![(11, message(100, "one a")), (12, message(101, "one b"))],
                 ),
                 (agent(2), vec![(21, message(102, "two"))]),
-                (agent(3), vec![(31, message(103, "three"))]),
+                (
+                    agent(3),
+                    vec![(31, message(103, "three a")), (32, message(104, "three b"))],
+                ),
             ]
             .into(),
         };
-        let carried = carry(&migrated(true), on_host, &leftovers);
-        let posted = |agent: AgentId| {
-            carried
-                .outbox
-                .iter()
-                .find(|(of, ..)| *of == agent)
-                .cloned()
-                .expect("carried")
+        let mut carried = carry(&migrated(true), on_host, &leftovers);
+        carried.outbox.sort_by_key(|(_, _, id, _)| *id);
+        let sent = |at, words: &str, to| ChatOutgoing {
+            at: UnixMs(at),
+            content: text(words),
+            to,
         };
+        let topic = |seq| Destination::Topic(TopicId(ChatSeq(seq)));
         assert_eq!(
-            posted(agent(1)),
-            (
-                agent(1),
-                vec![11, 12],
-                SEED,
-                11,
-                ChatOutgoing {
-                    at: UnixMs(100),
-                    content: [text("one a"), text("one b")].concat(),
-                    to: Destination::Topic(TopicId(ChatSeq(4))),
-                }
-            )
-        );
-        assert_eq!(
-            posted(agent(2)).4.to,
-            Destination::Topic(TopicId(ChatSeq(3)))
-        );
-        assert_eq!(
-            posted(agent(3)).4.to,
-            Destination::NewTopic {
-                stream: StreamId::DEFAULT,
-                name: "three".into(),
-                agents: vec![agent(3)],
-            }
+            carried.outbox,
+            vec![
+                (agent(1), SEED, 11, sent(100, "one a", topic(4))),
+                (agent(1), SEED, 12, sent(101, "one b", topic(4))),
+                (agent(2), SEED, 21, sent(102, "two", topic(3))),
+                (
+                    agent(3),
+                    SEED,
+                    31,
+                    sent(
+                        103,
+                        "three a",
+                        Destination::NewTopic {
+                            stream: StreamId::DEFAULT,
+                            name: "three a".into(),
+                            agents: vec![agent(3)],
+                        }
+                    )
+                ),
+                (
+                    agent(3),
+                    SEED,
+                    32,
+                    sent(104, "three b", Destination::AfterStart(31))
+                ),
+            ]
         );
     }
 

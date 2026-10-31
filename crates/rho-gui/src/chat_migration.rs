@@ -77,7 +77,7 @@ pub(crate) fn settle_migrated(chat: &ChatMap, marks: &Marks) -> Vec<Fact> {
                 ..
             } => Fact::Todo {
                 node,
-                start: start.clone(),
+                start: *start,
                 seen,
             },
             _ => Fact::Settled { node, seen },

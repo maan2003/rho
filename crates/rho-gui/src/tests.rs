@@ -5982,7 +5982,6 @@ fn a_topic_the_user_started_is_recent_before_anyone_answers(cx: &mut TestAppCont
 /// agent's, not crossed.
 #[gpui::test]
 fn the_users_words_from_main_land_in_each_agents_topic(cx: &mut TestAppContext) {
-    use rho_agent_hosts::connection::ConnEvent;
     use rho_agents_client::from_main::{Leftovers, Outgoing};
     use rho_agents_client::protocol::worksets::Request;
 

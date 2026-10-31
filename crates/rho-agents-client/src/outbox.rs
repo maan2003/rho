@@ -26,6 +26,9 @@ pub enum Destination {
         name: String,
         agents: Vec<AgentId>,
     },
+    /// The topic the message under this client id starts, once its host
+    /// has said which: a message written after it in the same new topic.
+    AfterStart(u64),
 }
 
 /// One message on disk until its host takes it.
@@ -44,8 +47,9 @@ pub enum Sending {
 }
 
 impl Outgoing {
-    fn call(&self, client_id: u64) -> Sending {
-        match &self.to {
+    /// The call, once where it goes is known.
+    fn call(&self, client_id: u64) -> Option<Sending> {
+        Some(match &self.to {
             Destination::Topic(topic) => Sending::Post(Post {
                 client_id,
                 topic: *topic,
@@ -62,7 +66,8 @@ impl Outgoing {
                 agents: agents.clone(),
                 content: self.content.clone(),
             }),
-        }
+            Destination::AfterStart(_) => return None,
+        })
     }
 }
 
@@ -119,13 +124,17 @@ impl Outbox {
             .waiting
             .iter()
             .find(|(host, ..)| *host == machine_seed)?;
+        // A message after a start waits for it: the start is older, so it
+        // has gone and said where by the time this is the oldest.
+        let call = outgoing.call(*id)?;
         self.sending.insert(machine_seed, *id);
-        Some(outgoing.call(*id))
+        Some(call)
     }
 
-    /// The host logged what was on its way. Answers its client id and
-    /// what it was.
-    pub fn delivered(&mut self, machine_seed: u64) -> Option<(u64, Outgoing)> {
+    /// The host logged what was on its way, in `topic`. Answers its
+    /// client id and what it was. The messages that follow a start now go
+    /// to the topic it started.
+    pub fn delivered(&mut self, machine_seed: u64, topic: TopicId) -> Option<(u64, Outgoing)> {
         let sent = self.sending.remove(&machine_seed)?;
         let at = self
             .waiting
@@ -133,6 +142,12 @@ impl Outbox {
             .position(|(host, id, _)| *host == machine_seed && *id == sent)?;
         let (_, id, outgoing) = self.waiting.remove(at);
         crate::cache::write_outgoing(machine_seed, sent, None);
+        for (host, follower, waiting) in &mut self.waiting {
+            if *host == machine_seed && waiting.to == Destination::AfterStart(id) {
+                waiting.to = Destination::Topic(topic);
+                crate::cache::retarget_outgoing(machine_seed, *follower, waiting.clone());
+            }
+        }
         Some((id, outgoing))
     }
 
@@ -232,7 +247,7 @@ mod tests {
             "posted again under the same id"
         );
         assert_eq!(
-            outbox.delivered(a).map(|(id, _)| id),
+            outbox.delivered(a, topic(4)).map(|(id, _)| id),
             Some(first),
             "what was delivered is the post that went"
         );
@@ -242,12 +257,12 @@ mod tests {
             "the topic of a's host"
         );
         assert_eq!(sent(outbox.next(a)), (second, "a2".to_owned()));
-        outbox.delivered(a);
+        outbox.delivered(a, topic(4));
         assert!(outbox.texts(in_topic(a)).is_empty());
         assert!(outbox.next(a).is_none());
         assert_eq!(outbox.hosts(), [b]);
         assert!(matches!(
-            outbox.delivered(b),
+            outbox.delivered(b, topic(9)),
             Some((
                 _,
                 Outgoing {
@@ -256,6 +271,59 @@ mod tests {
                 }
             ))
         ));
-        assert!(outbox.delivered(b).is_none(), "nothing more was on its way");
+        assert!(
+            outbox.delivered(b, topic(9)).is_none(),
+            "nothing more was on its way"
+        );
+    }
+
+    /// A message after a start waits for it, then goes to the topic the
+    /// host says the start made, under its own id.
+    #[test]
+    fn a_message_after_a_start_follows_it_into_its_topic() {
+        let host = 1;
+        let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let mut outbox = Outbox::default();
+        outbox.adopt(
+            host,
+            32,
+            Outgoing {
+                at: UnixMs(2),
+                content: text("second"),
+                to: Destination::AfterStart(31),
+            },
+        );
+        outbox.adopt(
+            host,
+            31,
+            Outgoing {
+                at: UnixMs(1),
+                content: text("first"),
+                to: Destination::NewTopic {
+                    stream: StreamId::DEFAULT,
+                    name: "first".into(),
+                    agents: vec![agent],
+                },
+            },
+        );
+        let start = outbox.next(host);
+        assert!(
+            matches!(&start, Some(Sending::StartTopic(start)) if start.client_id == 31),
+            "{start:?}"
+        );
+        outbox.failed(host);
+        assert!(
+            matches!(outbox.next(host), Some(Sending::StartTopic(_))),
+            "a failed start goes again before what follows it"
+        );
+        outbox.delivered(host, topic(60));
+        assert_eq!(
+            outbox.next(host),
+            Some(Sending::Post(Post {
+                client_id: 32,
+                topic: topic(60),
+                content: text("second"),
+            }))
+        );
     }
 }

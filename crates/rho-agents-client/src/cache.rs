@@ -180,6 +180,8 @@ enum Write {
     /// A message kept until its host takes it, or `None` once it has.
     /// A new one in a topic was the topic's draft, which goes with it.
     Outgoing(u64, u64, Option<Outgoing>),
+    /// A message kept, told where it now goes; no draft goes with it.
+    Retarget(u64, u64, Outgoing),
     /// A topic's draft as it stands; empty drops it.
     Draft(HostTopic, String),
     /// `main`'s words carried into topics, and gone from `main`'s tables.
@@ -559,6 +561,11 @@ fn apply(
                     .remove((machine_seed, topic.0.0));
             }
         }
+        Write::Retarget(machine_seed, id, outgoing) => {
+            transaction
+                .open_table(OUTBOX)
+                .insert((machine_seed, id), SenValue::borrowed(&outgoing));
+        }
         Write::Outgoing(machine_seed, id, None) => {
             transaction.open_table(OUTBOX).remove((machine_seed, id));
         }
@@ -643,7 +650,7 @@ fn carry(transaction: &mut rho_db::WriteTxn, carried: &from_main::Carried) {
     }
     {
         let mut outbox = transaction.open_table(OUTBOX);
-        for (_, _, machine_seed, id, outgoing) in &carried.outbox {
+        for (_, machine_seed, id, outgoing) in &carried.outbox {
             outbox.insert((*machine_seed, *id), SenValue::borrowed(outgoing));
         }
     }
@@ -655,10 +662,8 @@ fn carry(transaction: &mut rho_db::WriteTxn, carried: &from_main::Carried) {
     }
     {
         let mut outbox = transaction.open_table(MAIN_OUTBOX);
-        for (agent, ids, ..) in &carried.outbox {
-            for id in ids {
-                outbox.remove((*agent, *id));
-            }
+        for (agent, _, id, _) in &carried.outbox {
+            outbox.remove((*agent, *id));
         }
     }
     drop_if_empty(transaction, MAIN_DRAFTS);
@@ -828,6 +833,10 @@ pub fn write_rows(agent: AgentId, rows: Vec<(Wpos, LogEvent)>) {
 
 pub fn write_outgoing(machine_seed: u64, id: u64, outgoing: Option<Outgoing>) {
     send(Write::Outgoing(machine_seed, id, outgoing));
+}
+
+pub fn retarget_outgoing(machine_seed: u64, id: u64, outgoing: Outgoing) {
+    send(Write::Retarget(machine_seed, id, outgoing));
 }
 
 pub fn write_draft(topic: HostTopic, text: String) {
@@ -1157,17 +1166,20 @@ mod tests {
         mirror.send(Write::Draft(in_topic(4), "written since".into()));
         let carried_a = from_main::Carried {
             drafts: vec![(a, in_topic(4), "to a".into())],
-            outbox: vec![(
-                a,
-                vec![2, 1],
-                9,
-                2,
-                Outgoing {
-                    at: UnixMs(10),
-                    content: words("both"),
-                    to: Destination::Topic(topic(4)),
-                },
-            )],
+            outbox: [(2, 10), (1, 20)]
+                .map(|(id, at)| {
+                    (
+                        a,
+                        9,
+                        id,
+                        Outgoing {
+                            at: UnixMs(at),
+                            content: words(&format!("message {id}")),
+                            to: Destination::Topic(topic(4)),
+                        },
+                    )
+                })
+                .into(),
         };
         mirror.send(Write::Carry(carried_a));
         mirror.flush();
@@ -1184,13 +1196,12 @@ mod tests {
                 .into_iter()
                 .map(|(seed, id, _)| (seed, id))
                 .collect::<Vec<_>>(),
-            [(9, 2)]
+            [(9, 1), (9, 2)]
         );
         mirror.send(Write::Carry(from_main::Carried {
             drafts: vec![(b, in_topic(5), "to b".into())],
             outbox: vec![(
                 b,
-                vec![3],
                 9,
                 3,
                 Outgoing {
