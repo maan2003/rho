@@ -160,7 +160,7 @@ pub(crate) async fn run(
     // and each notebook until `hooks.on_notebook` moves it.
     std::env::set_current_dir(&startup.root)?;
     super::python::start(
-        super::python::PyHost::new(
+        super::python::PyHost::over(
             requests.clone(),
             tokio::runtime::Handle::current(),
             startup.workset,

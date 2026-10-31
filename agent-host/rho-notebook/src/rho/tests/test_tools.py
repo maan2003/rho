@@ -176,7 +176,7 @@ class Tools(WorksetCase):
         self.assertEqual(self.state.agents[self.root]["props"]["skills"], keep)
         with open(os.path.join(keep, "SKILL.md"), "w") as file:
             file.write("Verdict v2.\n")
-        self.assertEqual(rho._hook("on_compaction", self.root, timeout=5), [f'<skill path="{keep}">\nVerdict v2.\n</skill>'])
+        self.assertEqual(rho._hook("on_compaction", self.root, timeout=5), [f'Your loaded skills, as they are now. Keep following them:\n\n<skill path="{keep}">\nVerdict v2.\n</skill>'])
         with self.assertRaisesRegex(ValueError, "read .*missing/SKILL.md"):
             ns["skills"].load(os.path.join(self.tmp, "missing"))
 

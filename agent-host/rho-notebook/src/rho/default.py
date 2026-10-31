@@ -31,8 +31,11 @@ def on_notebook(agent, ns) -> None:
 
 
 def on_compaction(agent) -> list[str]:
-    """The skills the agent keeps, as they read now."""
-    return [skills.render(directory) for directory in skills.kept(agent)]
+    """The skills the agent keeps, as they read now, in one text."""
+    kept = [skills.render(directory) for directory in skills.kept(agent)]
+    if not kept:
+        return []
+    return ["Your loaded skills, as they are now. Keep following them:\n\n" + "\n\n".join(kept)]
 
 
 def on_turn_end(agent, outcome) -> None:

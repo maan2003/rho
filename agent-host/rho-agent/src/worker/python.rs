@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -30,51 +30,66 @@ use crate::record::{AgentSpec, Runtime};
 /// How long a hook may take before the loop goes on without it.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How `_rho` reaches the agent host: over the workset port, or a test's
+/// stand-in.
+pub(crate) type HostCall = Arc<
+    dyn Fn(PyRequest) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>>
+        + Send
+        + Sync,
+>;
+
 /// The workset process's link to the agent host for `_rho`.
 pub(crate) struct PyHost {
-    pub sender: Sender,
+    pub call: HostCall,
     pub runtime: tokio::runtime::Handle,
     pub workset: WorksetId,
     pub isolated: bool,
-    pending: Mutex<HashMap<u64, oneshot::Sender<PyReply>>>,
-    next: AtomicU64,
 }
 
 static HOST: OnceLock<PyHost> = OnceLock::new();
 
+/// `_rho` calls waiting for the host's answer, by id.
+static PENDING: LazyLock<Mutex<HashMap<u64, oneshot::Sender<PyReply>>>> =
+    LazyLock::new(Mutex::default);
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
 impl PyHost {
-    pub fn new(
+    /// `_rho` over the workset port: each call a `Python` message, each
+    /// answer a `PythonReply` handed to [`replied`].
+    pub fn over(
         sender: Sender,
         runtime: tokio::runtime::Handle,
         workset: WorksetId,
         isolated: bool,
     ) -> Self {
+        let call: HostCall = Arc::new(move |request| {
+            let sender = sender.clone();
+            Box::pin(async move {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                let (reply, answer) = oneshot::channel();
+                PENDING.lock().expect("poison").insert(id, reply);
+                let sent = sender
+                    .send(Port::Workset, encode(&Message::Python { id, request })?)
+                    .await;
+                if let Err(error) = sent {
+                    PENDING.lock().expect("poison").remove(&id);
+                    return Err(error.into());
+                }
+                answer
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the agent host went away"))
+            })
+        });
         Self {
-            sender,
+            call,
             runtime,
             workset,
             isolated,
-            pending: Mutex::default(),
-            next: AtomicU64::new(1),
         }
     }
 
     async fn call(&self, request: PyRequest) -> anyhow::Result<PyReply> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        self.pending.lock().expect("poison").insert(id, reply);
-        let sent = self
-            .sender
-            .send(Port::Workset, encode(&Message::Python { id, request })?)
-            .await;
-        if let Err(error) = sent {
-            self.pending.lock().expect("poison").remove(&id);
-            return Err(error.into());
-        }
-        match answer
-            .await
-            .map_err(|_| anyhow::anyhow!("the agent host went away"))?
-        {
+        match (self.call)(request).await? {
             PyReply::Error(error) => Err(anyhow::anyhow!(error)),
             reply => Ok(reply),
         }
@@ -95,9 +110,7 @@ fn host() -> PyResult<&'static PyHost> {
 
 /// The host answered the `_rho` call `id`.
 pub(crate) fn replied(id: u64, body: PyReply) {
-    if let Some(host) = HOST.get()
-        && let Some(reply) = host.pending.lock().expect("poison").remove(&id)
-    {
+    if let Some(reply) = PENDING.lock().expect("poison").remove(&id) {
         let _ = reply.send(body);
     }
 }
@@ -145,7 +158,23 @@ pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::
                 });
             }
         })?;
-    Ok(())
+    // Hooks run on the workset loop: wait until it exists, not until
+    // init.py is done, which may take long and may call back into the host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let running = Python::attach(|py| -> PyResult<bool> {
+            Ok(!py.import("rho._boot")?.getattr("_loop")?.is_none())
+        })
+        .map_err(|error| anyhow::anyhow!("start the workset loop: {error}"))?;
+        if running {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the workset loop did not start"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn traceback(py: Python<'_>, error: &PyErr) -> String {

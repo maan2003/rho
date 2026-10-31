@@ -418,35 +418,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_controls_have_no_interrupt_lane_and_cancel_stays_explicit() {
-        let user = Message::Control {
+    fn input_controls_round_trip_and_cancel_stays_explicit() {
+        let input = Message::Control {
             id: 1,
-            body: Control::User {
-                id: crate::entry::MessageId(5),
+            body: Control::Input {
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: "queue this".into(),
                 }],
+                wake: rho_agent_types::InputWake::Agent,
+                mail: Some(rho_agent_types::MailId(7)),
             },
         };
-        let decoded = decode(&encode(&user).unwrap()).unwrap();
-        assert!(
-            matches!(decoded, Message::Control { id: 1, body: Control::User { content, .. } }
-            if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this"))
-        );
-        let mail = Message::Control {
-            id: 2,
-            body: Control::Mail {
-                sender: rho_agent_types::AgentId::from_counter(
-                    1,
-                    &rho_agent_types::AgentIdDomain(1),
-                )
-                .unwrap(),
-                label: "engineer".into(),
-                body: "next check-in".into(),
-            },
-        };
-        assert!(matches!(decode(&encode(&mail).unwrap()).unwrap(),
-            Message::Control { id: 2, body: Control::Mail { body, .. } } if body == "next check-in"));
+        let decoded = decode(&encode(&input).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::Control { id: 1, body: Control::Input { content, wake: rho_agent_types::InputWake::Agent, mail: Some(rho_agent_types::MailId(7)) } }
+            if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this")
+        ));
         let cancel = Message::Control {
             id: 3,
             body: Control::Cancel,
@@ -508,41 +496,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_snapshot_is_fetched_once_and_survives_service_disconnect() {
-        let (client, mut server) = crate::testing::pair();
-        let host = client.host();
-        let request = tokio::spawn({
-            let host = host.clone();
-            async move { host.team().await }
-        });
-        let Message::Request {
-            id,
-            body: Request::Team,
-        } = server.read().await.unwrap()
-        else {
-            panic!()
-        };
-        server
-            .write(&Message::Reply {
-                id,
-                body: Reply::Team(Some(crate::multi_agent_tools::Team {
-                    agent: "eng-once".into(),
-                    parent: Some("eng-parent".into()),
-                    spawned_by: crate::log::AgentSpawnedBy::Engineer,
-                    started_by: None,
-                })),
-            })
-            .await
-            .unwrap();
-        assert_eq!(request.await.unwrap().unwrap().unwrap().agent, "eng-once");
-        drop(server);
-        host.closed().await;
-        let identity = host.team().await.unwrap().unwrap();
-        assert_eq!(identity.agent, "eng-once");
-        assert_eq!(identity.parent.as_deref(), Some("eng-parent"));
-    }
-
-    #[tokio::test]
     async fn cancelled_call_releases_its_waiter_and_late_reply_is_ignored() {
         let (client, mut server) = crate::testing::pair();
         let host = client.host();
@@ -584,16 +537,23 @@ mod tests {
     async fn large_canonical_append_crosses_frames_without_partial_delivery() {
         let (client, mut server) = crate::testing::pair();
         let count = 64 * 1024 * 1024 + 137;
+        let agent =
+            rho_agent_types::AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
         let sending = tokio::spawn(async move {
             client
                 .write(&Message::Request {
                     id: 19,
-                    body: Request::Append(AgentEvent::Entry(crate::entry::Entry::Received {
-                        at: rho_agent_types::UnixMs(1),
-                        id: crate::entry::MessageId(37),
-                        from: crate::entry::Party::Human,
-                        body: vec![crate::entry::Block::Text("a".repeat(count))],
-                    })),
+                    body: Request::Append(Record {
+                        at: UnixMs(1),
+                        event: Event::Input {
+                            agent,
+                            mail: Some(rho_agent_types::MailId(37)),
+                            content: vec![rho_agent_types::ContentPart::Text {
+                                text: "a".repeat(count),
+                            }],
+                            wake: rho_agent_types::InputWake::Person,
+                        },
+                    }),
                 })
                 .await
                 .unwrap();
@@ -602,16 +562,20 @@ mod tests {
         let Message::Request {
             id: 19,
             body:
-                Request::Append(AgentEvent::Entry(crate::entry::Entry::Received {
-                    id: crate::entry::MessageId(37),
-                    body,
+                Request::Append(Record {
+                    event:
+                        Event::Input {
+                            mail: Some(rho_agent_types::MailId(37)),
+                            content,
+                            ..
+                        },
                     ..
-                })),
+                }),
         } = server.read().await.unwrap()
         else {
             panic!("wrong logical message")
         };
-        let crate::entry::Block::Text(text) = &body[0] else {
+        let [rho_agent_types::ContentPart::Text { text }] = &content[..] else {
             panic!("wrong message body")
         };
         assert_eq!(text.len(), count);

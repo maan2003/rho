@@ -793,6 +793,10 @@ mod tests {
     use super::*;
     use crate::ipc::protocol::{Message, Request};
 
+    fn no_python() -> PythonHandler {
+        Arc::new(|_| Box::pin(async { workset::PyReply::Error("no Python here".into()) }))
+    }
+
     fn frame(message: &Message<'_>) -> Bytes {
         protocol::encode(message).unwrap()
     }
@@ -839,6 +843,7 @@ mod tests {
             1,
             Default::default(),
             false,
+            no_python(),
         )
         .await
         .unwrap();
@@ -862,7 +867,7 @@ mod tests {
         worker.send(port, answer(9)).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(routed.try_recv().is_err(), "nothing more is read");
-        let handed = old.hand(None).await.unwrap();
+        let handed = old.hand(rho_agent_types::WorksetId([1; 6])).await.unwrap();
 
         let new = Process::connect(
             &inference,
@@ -873,6 +878,7 @@ mod tests {
             handed.next,
             Default::default(),
             false,
+            no_python(),
         )
         .await
         .unwrap();

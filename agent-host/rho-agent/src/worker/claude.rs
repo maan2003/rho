@@ -804,9 +804,10 @@ impl ClaudeLoop {
         self.claude_row(ClaudeRow::RequestSent {
             why,
             report: Report {
-                notebook: output
-                    .as_ref()
-                    .map_or_else(rho_notebook::Report::default, crate::ClaudeOutputBatch::report),
+                notebook: output.as_ref().map_or_else(
+                    rho_notebook::Report::default,
+                    crate::ClaudeOutputBatch::report,
+                ),
                 ..Default::default()
             },
         })
@@ -1701,7 +1702,9 @@ impl ClaudeLoop {
                         return Ok(());
                     }
                     let lead = if correction {
-                        Some("Your last response had no exec call. Text outside a call reaches nobody.")
+                        Some(
+                            "Your last response had no exec call. Text outside a call reaches nobody.",
+                        )
                     } else if !output {
                         Some("Check-in: nothing new.")
                     } else {
@@ -2309,18 +2312,20 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Option
         .map(|(index, _)| index)
         .collect();
     let index = *people.get(people.len().saturating_sub(turns as usize))?;
-    let echo = rows[index..].iter().find_map(|(_, record)| match &record.event {
-        Event::Claude {
-            row:
-                ClaudeRow::Transcript {
-                    uuid,
-                    line: TranscriptLine::User { .. },
-                    ..
-                },
-            ..
-        } => Some(*uuid),
-        _ => None,
-    });
+    let echo = rows[index..]
+        .iter()
+        .find_map(|(_, record)| match &record.event {
+            Event::Claude {
+                row:
+                    ClaudeRow::Transcript {
+                        uuid,
+                        line: TranscriptLine::User { .. },
+                        ..
+                    },
+                ..
+            } => Some(*uuid),
+            _ => None,
+        });
     Some((rows[index].0, echo))
 }
 
@@ -2538,7 +2543,6 @@ mod tests {
         write.commit();
         let host = crate::testing::services_pair(
             db.clone(),
-            crate::inference::testing::accounts(),
             agent_id,
             std::sync::Weak::new(),
         );
@@ -2728,7 +2732,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn notebook_wait_keeps_partial_response_but_is_not_model_inference() {
         let temp = tempfile::tempdir().unwrap();
@@ -2790,7 +2793,6 @@ mod tests {
         python.shutdown().await.unwrap();
     }
 
-
     #[test]
     fn rewrites_claude_prompt_without_replacing_bind_source() {
         let mut path = None;
@@ -2807,7 +2809,6 @@ mod tests {
             text: text.to_owned(),
         }])
     }
-
 }
 
 /// How long each step of taking a message in took, for the log: the time
