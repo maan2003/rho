@@ -138,14 +138,12 @@ pub(crate) enum Command {
     SecretPhrase,
     // The agent under the point.
     AgentCancel,
-    AgentRole,
+    AgentRuntime,
     VerdictName,
     AgentCompact,
     AgentRewind,
     AgentRewindMany,
-    AgentContinue,
     AgentCacheKey,
-    AgentRestartWorkset,
     // The phone.
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
@@ -584,7 +582,7 @@ pub(crate) fn agent_menu() -> Menu {
             "cancel turn",
             MenuAction::Command(Command::AgentCancel),
         )
-        .item("r", "role…", MenuAction::Command(Command::AgentRole))
+        .item("r", "model…", MenuAction::Command(Command::AgentRuntime))
         .item("k", "compact", MenuAction::Command(Command::AgentCompact))
         .item(
             "w",
@@ -597,19 +595,9 @@ pub(crate) fn agent_menu() -> Menu {
             MenuAction::Command(Command::AgentRewindMany),
         )
         .item(
-            "shift-c",
-            "continue turn",
-            MenuAction::Command(Command::AgentContinue),
-        )
-        .item(
             "shift-k",
             "new prompt cache key",
             MenuAction::Command(Command::AgentCacheKey),
-        )
-        .item(
-            "shift-r",
-            "restart workset",
-            MenuAction::Command(Command::AgentRestartWorkset),
         )
 }
 

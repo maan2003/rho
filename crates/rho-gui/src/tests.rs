@@ -609,28 +609,10 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
     workspace
         .update(cx, |workspace, window, cx| {
             let ready = ready_with(vec![ui_head(gone), ui_head(peer)], 703);
-            let story::Frame::Many(frames) = &ready else {
-                unreachable!()
-            };
-            let rows = frames
-                .iter()
-                .find_map(|frame| match frame {
-                    story::Frame::Agents(rho_agents_client::stream::AgentFrame::Log {
-                        entries,
-                    }) => Some(
-                        entries
-                            .iter()
-                            .filter(|entry| entry.agent_id == gone)
-                            .map(|entry| (entry.pos, entry.event.clone()))
-                            .collect::<Vec<_>>(),
-                    ),
-                    _ => None,
-                })
-                .unwrap();
             story::feed(workspace, HostId::default(), ready, window, cx);
-            // No global database is installed in GUI tests. Supply exactly the
-            // creation rows an opening transcript would read from that mirror.
-            workspace.seed_transcript_rows_for_test(gone, &rows);
+            // No global database is installed in GUI tests: nothing of the
+            // workset was read before, so the transcript opens empty.
+            workspace.seed_transcript_rows_for_test(gone, &[]);
             workspace.select_agent(Some(gone), window, cx);
             story::feed(
                 workspace,
@@ -649,18 +631,19 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
             story::feed(
                 workspace,
                 HostId::default(),
-                rho_agents_client::stream::AgentFrame::Log {
-                    entries: vec![story::entry(
-                        gone,
-                        2,
-                        rho_agents_client::protocol::transcript::TranscriptEvent::Failed {
+                story::rows(
+                    story::own_workset(gone),
+                    vec![(
+                        rho_agent_types::Wpos(0),
+                        rho_agents_client::protocol::rho2::LogEvent::Failed {
+                            agent: gone,
                             text: String::new(),
                             error: "deleted activity secret".into(),
                             retrying: true,
                             at: UnixMs(11),
                         },
                     )],
-                },
+                ),
                 window,
                 cx,
             );
@@ -689,7 +672,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
     workspace.update(cx, |workspace, window, cx| {
         assert!(workspace.hand(cx).cards.iter().any(|card|
             card.node == rho_dealer::NodeId::Agent(gone)), "control: agent is dealt before deletion");
-        story::feed(workspace, HostId::default(), story::deleted(gone, UnixMs(20)), window, cx);
+        story::feed(workspace, HostId::default(), story::deleted(story::own_workset(gone)), window, cx);
         assert!(!workspace.registry.known_agents().any(|id| *id == gone));
         assert!(workspace.registry.known_agents().any(|id| *id == peer));
         assert!(!workspace.followed().contains(&gone));
@@ -1230,10 +1213,6 @@ fn queued_human_and_peer_messages_change_to_delivered_blocks(cx: &mut TestAppCon
     assert!(!delivered.contains("(queued)"), "{delivered:?}");
 }
 
-/// Messages written while their host is down wait in the transcript as
-/// unsent and go together, in order, when the host is back. A send the
-/// host fails keeps them, and the next try is the same messages under the
-/// same ids; only an answer takes them off the transcript.
 #[gpui::test]
 fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -1272,10 +1251,19 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     assert_eq!(remade(cx), "", "a sent draft is not written again");
 }
 
+/// Messages written while their host is down wait in the transcript as
+/// unsent and go one by one, in order, when the host is back. A send the
+/// host fails keeps them, and the next try is the same mail under the same
+/// client id; only an answer takes one off the transcript.
+///
+/// The question the user answered stays a card until the host's mail log
+/// has the answer, and the log is what reads it: the answer heard again
+/// (the host replaying what this client already holds) reads nothing the
+/// agent asked since.
 #[gpui::test]
-fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAppContext) {
+fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
-    use rho_agents_client::protocol::{AgentCommand, Request};
+    use rho_agents_client::protocol::rho2::Request;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(731);
@@ -1292,7 +1280,20 @@ fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAp
             .unwrap();
         cx.run_until_parked();
     };
+    let dealt = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == rho_dealer::NodeId::Agent(agent_id))
+            })
+            .unwrap()
+    };
     feed(cx, ready_with(vec![ui_head(agent_id)], 732));
+    feed(cx, story_wanting(agent_id, UnixMs(5)).into());
+    assert!(dealt(cx), "control: the question is a card");
     feed_frame(&workspace, cx, agent_id, state(vec![user("hi")], vec![]));
     feed(cx, ConnEvent::Disconnected("gone".into()).into());
 
@@ -1310,8 +1311,9 @@ fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAp
         story::calls(&mut host).is_empty(),
         "nothing goes to a host that is down"
     );
+    let shown = |cx: &mut TestAppContext| display_text(&workspace, cx);
     let unsent = |cx: &mut TestAppContext| {
-        let shown = display_text(&workspace, cx);
+        let shown = shown(cx);
         assert!(shown.contains("while away (unsent)"), "{shown:?}");
         assert!(shown.contains("and again (unsent)"), "{shown:?}");
     };
@@ -1319,45 +1321,76 @@ fn messages_written_offline_wait_and_go_together_under_their_ids(cx: &mut TestAp
 
     let mut sent = || {
         let mut calls = story::calls(&mut host);
-        assert_eq!(calls.len(), 1, "both messages go in one call");
+        assert_eq!(calls.len(), 1, "one mail at a time");
         let (call, stream) = calls.pop().unwrap();
-        let Request::Command(AgentCommand::Send {
-            agent_id: to,
-            messages,
-        }) = call
-        else {
-            panic!("expected a send: {call:?}");
+        let Request::PostMail(post) = call else {
+            panic!("expected mail: {call:?}");
         };
-        assert_eq!(to, agent_id);
-        let texts: Vec<_> = messages
-            .iter()
-            .map(|message| rho_agent_types::transcript::text_content(&message.content))
-            .collect();
-        assert_eq!(texts, ["while away", "and again"], "in the order written");
-        let ids: Vec<u64> = messages.iter().map(|message| message.id).collect();
-        (ids, stream)
+        assert_eq!(post.to, agent_id);
+        let text = rho_agent_types::transcript::text_content(&post.content);
+        (text, post.client_id, stream)
     };
     feed(cx, ConnEvent::Ready.into());
-    let (first, mut stream) = sent();
+    let (text, first, mut stream) = sent();
+    assert_eq!(text, "while away", "the oldest first");
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::<()>::Failed {
+        rho_rpc::protocol::Answer::<rho_agent_types::MailId>::Failed {
             reason: "worker restarting".into(),
         },
     );
     cx.run_until_parked();
     unsent(cx);
+    assert!(dealt(cx), "a mail the host refused answers nothing");
 
     feed(cx, ConnEvent::Recovered.into());
-    let (again, mut stream) = sent();
+    let (text, again, mut stream) = sent();
     assert_eq!(
-        again, first,
-        "the same messages, so the host logs each once"
+        (text.as_str(), again),
+        ("while away", first),
+        "the same mail, so the host logs it once"
     );
-    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(()));
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(90)),
+    );
     cx.run_until_parked();
-    let shown = display_text(&workspace, cx);
-    assert!(!shown.contains("(unsent)"), "{shown:?}");
+    let (text, next, mut stream) = sent();
+    assert_eq!(
+        text, "and again",
+        "the next goes once the first is answered"
+    );
+    assert_ne!(next, first, "another mail, another id");
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(91)),
+    );
+    cx.run_until_parked();
+    let shown_now = shown(cx);
+    assert!(!shown_now.contains("(unsent)"), "{shown_now:?}");
+
+    // The host's log has the answer: what the agent asked before it is read.
+    let answer = story::from_user(agent_id, "while away", UnixMs(6));
+    feed(cx, story::mails(vec![answer.clone()]).into());
+    assert!(!dealt(cx), "the answer reads the question");
+    feed(
+        cx,
+        story::story(
+            agent_id,
+            vec![story::UiStoryEvent::Sent {
+                text: "and now?".into(),
+                kind: rho_agent_types::SendKind::Ask,
+                at: UnixMs(7),
+            }],
+        )
+        .into(),
+    );
+    assert!(dealt(cx), "a new question after the answer is owed");
+    feed(cx, story::mails(vec![answer]).into());
+    assert!(
+        dealt(cx),
+        "the answer heard again is the same mail and reads nothing new"
+    );
 }
 
 #[gpui::test]
@@ -3214,8 +3247,6 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_agent_types::Place;
-
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
     workspace
@@ -3225,11 +3256,8 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
-                        spawn_name: Some("worker".to_owned()),
-                        place: Place {
-                            workset: Some("0123456789ab".parse().unwrap()),
-                            cwd: "/src/rho".into(),
-                        },
+                        name: Some("worker".to_owned()),
+                        cwd: Some("/src/rho".to_owned()),
                         ..ui_head(agent_id)
                     }],
                     100,
@@ -5056,20 +5084,31 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
     });
 }
 
+/// A new workset's answer: its code made `agent_id` and mailed it the
+/// draft.
+fn created(agent_id: AgentId) -> rho_agents_client::protocol::rho2::CreatedWorkset {
+    rho_agents_client::protocol::rho2::CreatedWorkset {
+        workset: story::own_workset(agent_id),
+        result: rho_agents_client::protocol::rho2::EvalResult {
+            output: String::new(),
+            error: None,
+            agent: Some(agent_id),
+        },
+    }
+}
+
 fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
     story::UiAgentHead {
         agent_id,
-        story_pos: story::UiStoryPos(0),
-        role: rho_agent_types::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
-        place: rho_agent_types::Place {
-            workset: Some("0123456789ab".parse().unwrap()),
-            cwd: "/src/tmp".into(),
-        },
-        spawned_by: story::UiSpawnedBy::Direct,
+        workset: None,
+        kind: rho_agent_types::WorksetKind::Isolated,
+        preset: None,
+        user_facing: true,
         parent: None,
-        spawn_name: None,
-        generated_title: None,
+        name: None,
+        title: None,
+        cwd: Some("/src/tmp".to_owned()),
         status: None,
         created_at: UnixMs(1),
     }
@@ -5266,12 +5305,15 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     assert_eq!(calls.len(), 1, "the draft makes one call");
     let (call, mut stream) = calls.pop().unwrap();
     assert!(
-        matches!(call, rho_agents_client::protocol::Request::New(_)),
+        matches!(
+            call,
+            rho_agents_client::protocol::rho2::Request::CreateWorkset(_)
+        ),
         "the draft asked for a new agent: {call:?}"
     );
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::<AgentId>::Failed {
+        rho_rpc::protocol::Answer::<rho_agents_client::protocol::rho2::CreatedWorkset>::Failed {
             reason: "create workspace: no such repository".to_owned(),
         },
     );
@@ -5311,7 +5353,7 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
         })
         .expect("type the first message");
 
-    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycle);
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(
@@ -5348,13 +5390,13 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         .expect("open a new-agent draft");
 
     // From the body, backwards is the start row, then the role row.
-    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_start_field_for_test(cx));
         })
         .expect("start row");
-    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_role_field_for_test(cx));
@@ -5388,7 +5430,7 @@ fn enter_in_a_draft_field_routes_to_the_drafts_submit(cx: &mut TestAppContext) {
 /// Clearing a header row leaves nothing behind and keeps what is typed
 /// next in that row. Vim's own `cc` stops at the row's buffer boundary: it
 /// cleared nothing, and the path typed after it was split between the
-/// workdir and the role.
+/// workdir and the model.
 #[gpui::test]
 fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
@@ -5408,7 +5450,7 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
-    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycle);
     cx.dispatch_action(*workspace, rho_agents_view::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
     cx.run_until_parked();
@@ -5417,7 +5459,11 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .update(cx, |workspace, _, cx| {
             let draft = workspace.draft_model_for_test().read(cx);
             assert_eq!(draft.workdir_text(cx), "ok", "the row holds what was typed");
-            assert_eq!(draft.role_text(cx), "med-eng", "the row below is untouched");
+            assert_eq!(
+                draft.runtime_text(cx),
+                rho_agents_client::snippets::DEFAULT_RUNTIME,
+                "the row below is untouched"
+            );
         })
         .expect("read the rows");
 }
@@ -5723,14 +5769,14 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
                 ready_with(
                     vec![
                         story::UiAgentHead {
-                            generated_title: Some("flaky-ci".to_owned()),
+                            title: Some("flaky-ci".to_owned()),
                             // A status is not a send the reader is owed, so it
                             // does not make the agent recent.
                             status: Some("reading tests".to_owned()),
                             ..ui_head(agent_id)
                         },
                         story::UiAgentHead {
-                            generated_title: Some("old-docs".to_owned()),
+                            title: Some("old-docs".to_owned()),
                             ..ui_head(old)
                         },
                     ],
@@ -6918,7 +6964,23 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
     let mut calls = story::calls(&mut on_moss);
     assert_eq!(calls.len(), 1, "the chosen host gets the one call");
     let (_, mut stream) = calls.pop().unwrap();
-    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(agent(7)));
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(created(agent(7))),
+    );
+    cx.run_until_parked();
+    // The answer can come before the directory shows the agent.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                moss,
+                story::head_frames(ui_head(agent(7))),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
 
     // Nothing chosen this time: the last placement is the default.

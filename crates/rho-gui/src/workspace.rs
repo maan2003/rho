@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
-use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::channel::mpsc::UnboundedReceiver;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::prelude::*;
 use gpui::{
     App, ClipboardEntry, Context, Entity, Focusable as _, Point, Task, TouchEvent, TouchId,
@@ -29,23 +29,19 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
-#[cfg(test)]
-use rho_agent_types::AdvisorIntelligence;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence};
-use rho_agents_client::create::{
-    Placement, StartBase, Workdir, cycle_agent_role_text, parse_agent_role, parse_start,
-};
-use rho_agents_client::protocol::{AgentCommand, NewAgent};
+use rho_agent_types::{AgentId, ContentPart};
+use rho_agents_client::create::{Creation, Placement, StartBase, Workdir, parse_start};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
+use rho_agents_client::snippets::{self, Runtime};
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
 use rho_agents_view::draft::DraftModel;
 use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
-    DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
-    TranscriptView,
+    DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RuntimeCycle, RuntimeCycleGroup,
+    TranscriptFrame, TranscriptView,
 };
 use rho_window::style::StyleClass;
 use settings::Settings as _;
@@ -280,6 +276,8 @@ pub struct Workspace {
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
+    /// The agent a draft became, answered before the directory showed it.
+    draft_became: Option<(HostId, AgentId)>,
     /// The host chosen in the draft (ctrl-tab in the Workdir field), until
     /// the draft becomes an agent.
     draft_host: Option<HostId>,
@@ -615,19 +613,19 @@ impl Workspace {
         self.agents_client.follow(self.followed());
     }
 
-    fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
-        self.registry.note_agent_created(host, agent_id);
-    }
-
-    /// Shows an agent's transcript from the mirror the client already
-    /// holds: the fold, for a reader who opened it before any live frame,
-    /// or with the agent host down. The live frame rides on its tail.
+    /// Shows an agent's transcript from what the client already holds of
+    /// it: the rows of its workset read before and its mail, for a reader
+    /// who opened it before any live frame, or with the agent host down.
+    /// Following it reads the rest. The live frame rides on its tail.
     fn seed_transcript_from_mirror(&mut self, agent_id: AgentId) -> bool {
         if self.transcripts.is_open(&agent_id) {
             return false;
         }
-        let events = self.agents_client.read_rows(agent_id);
-        if !self.transcripts.seed(agent_id, &events) {
+        let Some(workset) = self.registry.agent_workset(agent_id) else {
+            return false;
+        };
+        let rows = self.agents_client.read_transcript(agent_id, workset);
+        if !self.transcripts.seed(agent_id, &rows) {
             return false;
         }
         self.note_followed();
@@ -640,10 +638,7 @@ impl Workspace {
     fn refold_open_transcript(
         &mut self,
         agent_id: AgentId,
-        rows: &[(
-            rho_agent_types::AgentPos,
-            rho_agents_client::protocol::transcript::TranscriptEvent,
-        )],
+        rows: &[rho_agents_client::fold::TranscriptRow],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -806,7 +801,7 @@ impl Workspace {
                         crate::commands::WorkspaceCompletionProvider::new(
                             workspace.clone(),
                             Some(fields.workdir),
-                            Some(fields.role),
+                            Some(fields.runtime),
                             Some(fields.start),
                         ),
                     ));
@@ -971,6 +966,7 @@ impl Workspace {
             chrome_editor,
             _save_notes_on_quit: save_notes_on_quit,
             awaiting_draft_agent: None,
+            draft_became: None,
             draft_host: None,
             last_placed: rho_db::client::shared()
                 .and_then(|db| rho_agent_hosts::saved::load_last_placed(&db)),
@@ -1222,13 +1218,26 @@ impl Workspace {
         Some(self.hosts.connection(self.host_of(agent_id)?)?.link())
     }
 
-    /// Routes an agent-scoped command to the agent host that owns the agent.
-    /// Commands for an agent whose host is unknown or gone are dropped: the
-    /// agent host that could act on it is not there to hear them.
-    fn send_to_agent(&self, agent_id: AgentId, command: AgentCommand, cx: &mut Context<Self>) {
-        if let Some(host) = self.host_of(agent_id) {
-            self.call(host, command, cx, |_, (), _| {});
-        }
+    /// Runs a snippet in the agent's workset on its host. What the code
+    /// raised is a notice; an agent whose host is unknown or gone is
+    /// dropped, as the host that could act on it is not there to hear it.
+    fn eval_for_agent(&self, agent_id: AgentId, code: String, cx: &mut Context<Self>) {
+        let (Some(host), Some(workset)) = (
+            self.host_of(agent_id),
+            self.registry.agent_workset(agent_id),
+        ) else {
+            return;
+        };
+        let eval = agents::rho2::Eval {
+            workset,
+            code,
+            message: None,
+        };
+        self.call(host, eval, cx, move |this, result, cx| {
+            if let Some(error) = result.error {
+                this.report_refusal(host, &error, cx);
+            }
+        });
     }
 
     /// Makes one call of a host's agents. `on_reply` hears the answer; a
@@ -1912,6 +1921,12 @@ impl Workspace {
                 for agent_id in &changed {
                     self.show_status(*agent_id, cx);
                 }
+                if let Some((host, agent_id)) = self.draft_became
+                    && changed.contains(&agent_id)
+                {
+                    self.draft_became = None;
+                    self.draft_answered(host, Ok(agent_id), window, cx);
+                }
                 self.invalidate_dealer_signals(cx);
                 // Status is workspace chrome, not part of the transcript
                 // editor.
@@ -1949,16 +1964,6 @@ impl Workspace {
                     let active = self.quotas.active_namespaces(&self.hosts);
                     view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
                 }
-                cx.notify();
-            }
-            rho_agents_client::model::ModelMsg::AgentCreated {
-                agent_id,
-                agent_counter,
-            } => {
-                let machine_seed = self.registry.host_machine_seed(host);
-                self.registry
-                    .set_host_data(host, machine_seed, agent_counter);
-                self.note_agent_created(host, agent_id);
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::QuotaUsage { summaries } => {
@@ -2146,6 +2151,7 @@ impl Workspace {
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                 }
+                self.draft_became.take_if(|(waiting, _)| *waiting == host);
                 if self.voice.is_on(host) {
                     self.voice.stop();
                 }
@@ -2461,9 +2467,10 @@ impl Workspace {
         }
     }
 
-    /// Hands everything unsent to the agent to its host in one call, if the
-    /// host is up and no call of the agent's is already on its way. What is
-    /// written meanwhile goes when that call is answered.
+    /// Mails the oldest unsent message to the agent through its host, if
+    /// the host is up and no mail of the agent's is already on its way. The
+    /// rest goes one by one as each is answered; a retry carries the same
+    /// client id, so the host keeps one copy.
     fn send_unsent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let Some(host) = self
             .host_of(agent_id)
@@ -2481,7 +2488,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             this.update(cx, |this, cx| match reply {
-                Ok(()) => {
+                Ok(_mail) => {
                     this.outbox.delivered(agent_id);
                     this.show_unsent(agent_id, cx);
                     this.send_unsent(agent_id, cx);
@@ -2539,7 +2546,12 @@ impl Workspace {
         let agent = self.registry.agent_by_label(target);
         StartBase {
             host: agent.and_then(|agent_id| self.host_of(agent_id)),
-            place: agent.and_then(|agent_id| self.registry.agent_place(agent_id).cloned()),
+            agent: agent.and_then(|agent_id| {
+                Some((
+                    self.registry.agent_workset(agent_id)?,
+                    self.registry.working_directory(agent_id)?,
+                ))
+            }),
         }
     }
 
@@ -2606,8 +2618,8 @@ impl Workspace {
                 }
             }
         };
-        let role = match parse_agent_role(self.draft_model.read(cx).role_text(cx).trim()) {
-            Ok(role) => role,
+        let runtime = match Runtime::parse(self.draft_model.read(cx).runtime_text(cx).trim()) {
+            Ok(runtime) => runtime,
             Err(message) => {
                 self.refuse_draft(&message, cx);
                 return;
@@ -2620,13 +2632,24 @@ impl Workspace {
         let Some(agents) = self.agents(host) else {
             return;
         };
-        let reply = agents.call(NewAgent {
-            role,
-            start,
-            content: Some(content),
-        });
+        // Either way the host answers with how the code ran and the agent
+        // it mailed the message to: the agent the draft became.
+        let reply = match start.creation(&runtime, Some(content)) {
+            Creation::Workset(create) => {
+                let reply = agents.call(create);
+                async move { reply.await.map(|created| created.result) }.boxed_local()
+            }
+            Creation::Eval(eval) => agents.call(eval).boxed_local(),
+        };
         cx.spawn_in(window, async move |this, cx| {
-            let reply = reply.await;
+            let reply = reply.await.and_then(|result| {
+                if let Some(error) = result.error {
+                    anyhow::bail!("{error}");
+                }
+                result
+                    .agent
+                    .ok_or_else(|| anyhow::anyhow!("the creation code made no agent"))
+            });
             this.update_in(cx, |this, window, cx| {
                 this.draft_answered(host, reply, window, cx)
             })
@@ -2644,6 +2667,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The answer and the directory come on separate streams: an agent
+        // the directory has not shown yet is opened when it does.
+        if let Ok(agent_id) = &reply
+            && self.registry.agent_workset(*agent_id).is_none()
+        {
+            self.draft_became = Some((host, *agent_id));
+            return;
+        }
         let awaited = self.awaiting_draft_agent == Some(host);
         if awaited {
             self.awaiting_draft_agent = None;
@@ -2668,7 +2699,6 @@ impl Workspace {
                 return;
             }
         };
-        self.note_agent_created(host, agent_id);
         self.remember_placement(host);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
@@ -2685,7 +2715,7 @@ impl Workspace {
                 view.set_body_text("", cx);
                 view.clear_attachments(cx);
                 view.set_workdir_text(&label, cx);
-                view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+                view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
                 view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
             });
             self.select_agent(Some(agent_id), window, cx);
@@ -2819,7 +2849,10 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, AgentCommand::Cancel { agent_id }, cx);
+            if let Some(host) = self.host_of(agent_id) {
+                let cancel = agents::rho2::Cancel { agent: agent_id };
+                self.call(host, cancel, cx, |_, (), _| {});
+            }
         }
     }
 
@@ -2828,16 +2861,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, AgentCommand::Rewind { agent_id, turns }, cx);
-        }
-    }
-
-    pub(crate) fn cmd_continue_turn(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.subject_agent_or_notice("continue", window, cx) {
-            if !self.require_agent_online(agent_id, cx) {
-                return;
-            }
-            self.send_to_agent(agent_id, AgentCommand::Continue { agent_id }, cx);
+            self.eval_for_agent(agent_id, snippets::rewind(agent_id, turns), cx);
         }
     }
 
@@ -2846,7 +2870,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, AgentCommand::Compact { agent_id }, cx);
+            self.eval_for_agent(agent_id, snippets::compact(agent_id), cx);
             self.notice_on(
                 Some(&agent_id),
                 "compacting context",
@@ -2862,11 +2886,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(
-                agent_id,
-                AgentCommand::ChangePromptCacheKey { agent_id },
-                cx,
-            );
+            self.eval_for_agent(agent_id, snippets::new_cache_key(agent_id), cx);
             self.notice_on(
                 Some(&agent_id),
                 "changed prompt cache key",
@@ -2876,108 +2896,79 @@ impl Workspace {
         }
     }
 
-    /// Restarts the agent's workset process on its host's current build,
-    /// ending whatever runs there.
-    pub(crate) fn cmd_restart_workset(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.subject_agent_or_notice("restart-workset", window, cx) {
-            if !self.require_agent_online(agent_id, cx) {
-                return;
-            }
-            self.send_to_agent(agent_id, AgentCommand::RestartWorkset { agent_id }, cx);
-            self.notice_on(
-                Some(&agent_id),
-                "restarting workset",
-                StyleClass::SystemInfo,
-                cx,
-            );
-        }
-    }
-
-    pub(crate) fn cmd_change_agent_role(
+    pub(crate) fn cmd_change_agent_runtime(
         &mut self,
-        intelligence: EngineerIntelligence,
+        runtime: Runtime,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.subject_agent_or_notice("change-role", window, cx) else {
+        let Some(agent_id) = self.subject_agent_or_notice("change-model", window, cx) else {
             return;
         };
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        self.send_to_agent(
-            agent_id,
-            AgentCommand::ChangeRole {
-                agent_id,
-                role: AgentRole::Engineer { intelligence },
-            },
-            cx,
-        );
+        self.eval_for_agent(agent_id, snippets::set_runtime(agent_id, &runtime), cx);
     }
 
-    pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.subject_agent_or_notice("change-role", window, cx) else {
+    /// Offers the runtimes of the agent's own kind: its history is in that
+    /// kind's form, so the model and effort change and the kind stays.
+    pub(crate) fn prompt_change_agent_runtime(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.subject_agent_or_notice("change-model", window, cx) else {
             return;
         };
-        let Some(role) = self.registry.agent_role(agent_id) else {
+        let Some(spec) = self.registry.agent_spec(agent_id) else {
             return;
         };
-        let roles: &[&str] = match role {
-            AgentRole::Engineer {
-                intelligence:
-                    EngineerIntelligence::Mini
-                    | EngineerIntelligence::Medium
-                    | EngineerIntelligence::High,
-            } => &["mini-eng", "med-eng", "high-eng"],
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium1 | EngineerIntelligence::High1,
-            } => &["med1-eng", "high1-eng"],
-            _ => {
-                self.notice_on(
-                    Some(&agent_id),
-                    "role changes are not available for this agent",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            }
-        };
+        let kind = spec.runtime;
+        let current = format!("{}-{}", spec.model, spec.effort);
         let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_ascii_lowercase();
-            roles
+            snippets::RUNTIMES
                 .iter()
-                .filter(|role| role.contains(&needle))
-                .map(|role| crate::commands::Candidate {
-                    value: (*role).to_owned(),
-                    description: "engineer role".to_owned(),
+                .filter_map(|label| Runtime::parse(label).ok())
+                .filter(|runtime| runtime.kind == kind)
+                .map(|runtime| runtime.label())
+                .filter(|label| label.contains(&needle))
+                .map(|label| crate::commands::Candidate {
+                    description: if label == current {
+                        "current".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    value: label,
                 })
                 .collect()
         });
         let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let intelligence = match input.trim().to_ascii_lowercase().as_str() {
-                    "mini-eng" => Some(EngineerIntelligence::Mini),
-                    "med-eng" => Some(EngineerIntelligence::Medium),
-                    "high-eng" => Some(EngineerIntelligence::High),
-                    "med1-eng" => Some(EngineerIntelligence::Medium1),
-                    "high1-eng" => Some(EngineerIntelligence::High1),
-                    _ => None,
-                };
-                match intelligence {
-                    Some(intelligence) => workspace.cmd_change_agent_role(intelligence, window, cx),
-                    None => workspace.notice_on(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                match Runtime::parse(&input) {
+                    Ok(runtime) if runtime.kind == kind => {
+                        workspace.cmd_change_agent_runtime(runtime, window, cx)
+                    }
+                    Ok(_) => workspace.notice_on(
                         None,
-                        "change-role: choose a listed engineer role",
+                        "change-model: an agent keeps its runtime kind",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                    Err(message) => workspace.notice_on(
+                        None,
+                        &format!("change-model: {message}"),
                         StyleClass::SystemInfo,
                         cx,
                     ),
                 }
             },
         );
-        self.open_prompt("role:", complete, on_submit, window, cx);
+        self.open_prompt("model:", complete, on_submit, window, cx);
     }
 
     /// `space a n`: what the user calls this agent. The runtime titles an
@@ -3283,7 +3274,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_place(agent_id).cloned() else {
+        let Some(workspace) = self.registry.agent_place(agent_id) else {
             self.notice_on(
                 None,
                 "open: agent has no workspace",
@@ -4040,9 +4031,9 @@ impl Workspace {
                 return;
             }
             self.draft_model.update(cx, |view, cx| {
-                if view.cursor_in_role_field(&editor, cx) {
-                    let next = cycle_agent_role_text(&view.role_text(cx));
-                    view.set_role_text(next, cx);
+                if view.cursor_in_runtime_field(&editor, cx) {
+                    let next = snippets::cycle_runtime(&view.runtime_text(cx));
+                    view.set_runtime_text(next, cx);
                 } else if view.cursor_in_start_field(&editor, cx) {
                     view.cycle_start_mode(cx);
                 }
@@ -4278,16 +4269,13 @@ impl Workspace {
             .0
     }
 
-    /// Supplies the disk-mirror rows in tests that deliberately use no
+    /// Supplies the rows read before, in tests that deliberately use no
     /// database.
     #[cfg(test)]
     pub(crate) fn seed_transcript_rows_for_test(
         &mut self,
         agent_id: AgentId,
-        rows: &[(
-            rho_agent_types::AgentPos,
-            agents::transcript::TranscriptEvent,
-        )],
+        rows: &[rho_agents_client::fold::TranscriptRow],
     ) {
         assert!(self.transcripts.seed(agent_id, rows));
         self.note_followed();
@@ -6189,14 +6177,12 @@ impl Workspace {
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
             Command::Version => self.cmd_version(cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
-            Command::AgentRole => self.prompt_change_agent_role(window, cx),
+            Command::AgentRuntime => self.prompt_change_agent_runtime(window, cx),
             Command::VerdictName => self.cmd_verdict_name(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
             Command::AgentRewind => self.cmd_rewind(1, window, cx),
             Command::AgentRewindMany => self.prompt_rewind(window, cx),
-            Command::AgentContinue => self.cmd_continue_turn(window, cx),
             Command::AgentCacheKey => self.cmd_change_prompt_cache_key(window, cx),
-            Command::AgentRestartWorkset => self.cmd_restart_workset(window, cx),
             Command::PhoneSnoozeAhead(unit, count) => {
                 self.phone_verdict_with(
                     rho_journal::PhoneVerdict::Defer,
@@ -7166,7 +7152,7 @@ impl Workspace {
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
-            view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+            view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
             view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
@@ -7322,8 +7308,11 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn cursor_in_draft_role_field_for_test(&self, cx: &mut Context<Self>) -> bool {
-        self.focused_draft_editor()
-            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_role_field(&editor, cx))
+        self.focused_draft_editor().is_some_and(|editor| {
+            self.draft_model
+                .read(cx)
+                .cursor_in_runtime_field(&editor, cx)
+        })
     }
 
     #[cfg(test)]
@@ -8225,27 +8214,6 @@ impl Workspace {
     }
 }
 
-/// How a role reads in the chips a transcript shows. Only the tests ask
-/// for it as a string; the chips themselves are styled from the family.
-#[cfg(test)]
-fn agent_role_label(config: AgentRole) -> String {
-    match config {
-        AgentRole::Advisor { intelligence } => match intelligence {
-            AdvisorIntelligence::Low => "low-adv",
-            AdvisorIntelligence::Medium => "med-adv",
-            AdvisorIntelligence::Medium1 => "med1-adv",
-        },
-        AgentRole::Engineer { intelligence } => match intelligence {
-            EngineerIntelligence::Mini => "mini-eng",
-            EngineerIntelligence::Medium => "med-eng",
-            EngineerIntelligence::High => "high-eng",
-            EngineerIntelligence::Medium1 => "med1-eng",
-            EngineerIntelligence::High1 => "high1-eng",
-        },
-    }
-    .to_owned()
-}
-
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(desktop) = self.desktop.clone() {
@@ -8613,10 +8581,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UploadGuiTelemetry, _window, cx| {
                 this.cmd_upload_gui_telemetry(cx);
             }))
-            .on_action(cx.listener(|this, _: &RoleCycle, window, cx| {
+            .on_action(cx.listener(|this, _: &RuntimeCycle, window, cx| {
                 this.cycle_draft_field(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
+            .on_action(cx.listener(|this, _: &RuntimeCycleGroup, window, cx| {
                 this.cycle_draft_group(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DraftValueCycle, _window, cx| {
@@ -8779,62 +8747,6 @@ pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
         _ => return None,
     };
     minutes.checked_mul(60 * 1000)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_current_agent_roles() {
-        for (role, expected) in [
-            (AgentRole::default(), "med-eng"),
-            (
-                AgentRole::Engineer {
-                    intelligence: EngineerIntelligence::Mini,
-                },
-                "mini-eng",
-            ),
-            (
-                AgentRole::Engineer {
-                    intelligence: EngineerIntelligence::High,
-                },
-                "high-eng",
-            ),
-            (
-                AgentRole::Engineer {
-                    intelligence: EngineerIntelligence::Medium1,
-                },
-                "med1-eng",
-            ),
-            (
-                AgentRole::Engineer {
-                    intelligence: EngineerIntelligence::High1,
-                },
-                "high1-eng",
-            ),
-            (
-                AgentRole::Advisor {
-                    intelligence: AdvisorIntelligence::Low,
-                },
-                "low-adv",
-            ),
-            (
-                AgentRole::Advisor {
-                    intelligence: AdvisorIntelligence::Medium,
-                },
-                "med-adv",
-            ),
-            (
-                AgentRole::Advisor {
-                    intelligence: AdvisorIntelligence::Medium1,
-                },
-                "med1-adv",
-            ),
-        ] {
-            assert_eq!(agent_role_label(role), expected);
-        }
-    }
 }
 
 /// What a row says about the host its agent is on: the host's name once

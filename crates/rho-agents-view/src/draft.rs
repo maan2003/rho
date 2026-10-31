@@ -606,7 +606,11 @@ impl DraftModel {
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
-                vec![Inlay::custom(RUNTIME_LABEL_INLAY_ID, field_start, "Model: ")],
+                vec![Inlay::custom(
+                    RUNTIME_LABEL_INLAY_ID,
+                    field_start,
+                    "Model: ",
+                )],
                 cx,
             );
         });

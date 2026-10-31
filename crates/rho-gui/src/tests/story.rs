@@ -1,45 +1,89 @@
-//! What the old `Ready` and story said about an agent, in the words the
-//! tests still use, and the log rows each stands for now.
+//! What a host says about agents, in the words the tests use: heads for the
+//! directory, stories for the mail, and the frames each stands for.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, Seq, UnixMs,
+    Address, AgentId, ContentPart, Mail, MailId, Props, SendKind, UnixMs, WorksetId, WorksetKind,
+    props,
 };
-use rho_agents_client::protocol as agents;
-use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
+use rho_agents_client::protocol::rho2::{self, AgentEntry, ServerFrame, SpecView, WorksetEntry};
 use rho_agents_client::stream::AgentFrame;
 use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
 use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agents_client::protocol::transcript::RuntimeKind;
-pub type UiSpawnedBy = rho_agents_client::protocol::transcript::SpawnedBy;
 
-/// A position in an agent's story, as the old `Ready` named it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UiStoryPos(pub u64);
-
-/// What the old `Ready` said about one agent. Tests build these; the helper
-/// below turns each into the log rows that say the same thing.
+/// What the directory says about one agent, and the status it last mailed
+/// the user. Tests build these; the helpers below turn each into frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiAgentHead {
     pub agent_id: AgentId,
-    pub story_pos: UiStoryPos,
-    pub role: AgentRole,
     pub runtime_kind: UiRuntimeKind,
-    pub place: Place,
-    pub spawned_by: UiSpawnedBy,
+    /// The workset it is in; `None` is a workset of its own.
+    pub workset: Option<WorksetId>,
+    pub kind: WorksetKind,
+    /// The policy's preset: `advisor` labels it `adv-`.
+    pub preset: Option<String>,
+    pub user_facing: bool,
     pub parent: Option<AgentId>,
-    pub spawn_name: Option<String>,
-    pub generated_title: Option<String>,
-    /// What the agent last told the user it is doing, as a status send.
+    pub name: Option<String>,
+    pub title: Option<String>,
+    /// The directory its label shows.
+    pub cwd: Option<String>,
+    /// What the agent last told the user it is doing, as a status mail.
     pub status: Option<String>,
     pub created_at: UnixMs,
 }
 
-/// The story events tests tell, in the old story's words.
+impl UiAgentHead {
+    pub fn workset(&self) -> WorksetId {
+        self.workset.unwrap_or_else(|| own_workset(self.agent_id))
+    }
+
+    fn entry(&self) -> AgentEntry {
+        let mut said = Props::new();
+        let mut set = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                said.insert(key.to_owned(), value);
+            }
+        };
+        set(props::NAME, self.name.clone());
+        set(props::TITLE, self.title.clone());
+        set(props::CWD, self.cwd.clone());
+        set(props::PARENT, self.parent.map(|parent| parent.encoded()));
+        set(
+            props::USER_FACING,
+            self.user_facing.then(|| "true".to_owned()),
+        );
+        set("preset", self.preset.clone());
+        AgentEntry {
+            agent: self.agent_id,
+            workset: self.workset(),
+            spec: SpecView {
+                runtime: self.runtime_kind,
+                model: "test-model".to_owned(),
+                effort: "medium".to_owned(),
+                props: said,
+            },
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// The workset an agent has to itself: one per agent, so deleting it takes
+/// that agent alone.
+pub fn own_workset(agent_id: AgentId) -> WorksetId {
+    let encoded = agent_id.encoded();
+    let mut bytes = [0u8; 6];
+    for (at, byte) in encoded.bytes().enumerate() {
+        bytes[at % 6] = bytes[at % 6].wrapping_mul(31).wrapping_add(byte);
+    }
+    WorksetId(bytes)
+}
+
+/// The story events tests tell: mail between the user and an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiStoryEvent {
     UserMessage {
@@ -54,159 +98,99 @@ pub enum UiStoryEvent {
     },
 }
 
-impl UiStoryEvent {
-    fn mirror(self) -> TranscriptEvent {
-        match self {
-            Self::UserMessage { text, at } => TranscriptEvent::Message {
-                from: None,
-                text,
-                at,
-            },
-            Self::Sent { text, kind, at } => TranscriptEvent::MessageSent {
-                to: None,
-                text,
-                kind,
-                at,
-            },
-        }
-    }
-}
-
 thread_local! {
-    /// Where each agent's log stands, so every row a test tells lands past
-    /// the last: the fold ignores rows behind its newest.
-    static NEXT_POS: RefCell<HashMap<AgentId, u64>> = RefCell::new(HashMap::new());
-    static NEXT_SEQ: Cell<u64> = const { Cell::new(1) };
+    /// The newest mail handed out, so every mail a test tells lands past
+    /// the last: the model skips mail behind its cursor.
+    static MAIL_HEAD: Cell<u64> = const { Cell::new(0) };
+    /// The model this test drives. One per test thread, so a test's own
+    /// fold and cursor are its own.
+    static MODEL: RefCell<(rho_agents_client::model::Model, std::collections::HashSet<rho_agents_client::HostId>)> =
+        RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// Forgets every position and seq handed out, for a test starting fresh.
+/// Forgets every mail id handed out, for a test starting fresh.
 pub fn reset() {
-    NEXT_POS.with(|next| next.borrow_mut().clear());
-    NEXT_SEQ.with(|next| next.set(1));
+    MAIL_HEAD.with(|head| head.set(0));
 }
 
-fn known(agent_id: AgentId) -> bool {
-    NEXT_POS.with(|next| next.borrow().contains_key(&agent_id))
-}
-
-pub(super) fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
-    let seq = NEXT_SEQ.with(|next| {
-        let seq = next.get();
-        next.set(seq + 1);
-        Seq(seq)
+fn mail(from: Address, to: Address, kind: Option<SendKind>, text: String, at: UnixMs) -> Mail {
+    let id = MAIL_HEAD.with(|head| {
+        head.set(head.get() + 1);
+        MailId(head.get())
     });
-    NEXT_POS.with(|next| {
-        let mut next = next.borrow_mut();
-        let slot = next.entry(agent_id).or_default();
-        *slot = (*slot).max(pos + 1);
-    });
-    LogEntry {
-        seq,
-        agent_id,
-        pos: AgentPos(pos),
-        event,
+    Mail {
+        id,
+        at,
+        from,
+        to,
+        re: None,
+        kind,
+        content: vec![ContentPart::Text { text }],
     }
 }
 
-/// The rows that say what a head said: creation at row zero, then the
-/// title and the status, the last of them at the head's position.
-/// A head told again for an agent already known is what it says now, as
-/// rows past the last.
-pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
-    let agent_id = head.agent_id;
-    if known(agent_id) {
-        let mut events = Vec::new();
-        events.extend(presented(&head));
-        return events
-            .into_iter()
-            .map(|event| {
-                let pos = NEXT_POS.with(|next| next.borrow()[&agent_id]);
-                entry(agent_id, pos, event)
-            })
-            .collect();
-    }
-    let shown = presented(&head);
-    let mut events = vec![TranscriptEvent::Created {
-        role: head.role,
-        runtime: head.runtime_kind,
-        place: head.place,
-        spawned_by: head.spawned_by,
-        spawn_name: head.spawn_name,
-        parent: head.parent,
-        model: "test-model".to_owned(),
-        at: head.created_at,
-    }];
-    let created_at = head.created_at;
-    events.extend(shown);
-    let told = events.len() as u64;
-    if head.story_pos.0 >= told {
-        // The head stood past what these rows say; a row that changes
-        // nothing carries the position.
-        events.push(TranscriptEvent::Presented {
-            title: PresentationField::Unchanged,
-            at: created_at,
-        });
-    }
-    let last = events.len() - 1;
-    events
-        .into_iter()
-        .enumerate()
-        .map(|(index, event)| {
-            let pos = if index == last {
-                (index as u64).max(head.story_pos.0)
-            } else {
-                index as u64
-            };
-            entry(agent_id, pos, event)
-        })
-        .collect()
+fn status_mail(head: &UiAgentHead) -> Option<Mail> {
+    head.status.as_ref().map(|status| {
+        mail(
+            Address::Agent(head.agent_id),
+            Address::User,
+            Some(SendKind::Status),
+            status.clone(),
+            head.created_at,
+        )
+    })
 }
 
-/// The title and the status a head carries, as rows.
-fn presented(head: &UiAgentHead) -> Vec<TranscriptEvent> {
-    let mut events = Vec::new();
-    if let Some(title) = &head.generated_title {
-        events.push(TranscriptEvent::Presented {
-            title: PresentationField::Set(title.clone()),
-            at: head.created_at,
-        });
+/// A head told again, or told late: its directory entry and its status.
+pub fn head_frames(head: UiAgentHead) -> Frame {
+    let mut frames = vec![AgentFrame::Server(ServerFrame::Agent(head.entry())).into()];
+    if let Some(status) = status_mail(&head) {
+        frames.push(mails(vec![status]).into());
     }
-    if let Some(status) = &head.status {
-        events.push(TranscriptEvent::MessageSent {
-            to: None,
-            text: status.clone(),
-            kind: SendKind::Status,
-            at: head.created_at,
-        });
-    }
-    events
+    Frame::Many(frames)
 }
 
-/// `Ready`, then an agents stream opening on the log rows these heads stand
-/// for.
+/// `Ready`, then an agents stream opening on the directory these heads
+/// stand for and the mail that says their status. A head for an agent
+/// this client already holds says what it says now.
 pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
-    let entries = heads.into_iter().flat_map(head_entries).collect();
-    // The head is the newest row handed out: a client that has heard every
-    // row so far is caught up.
-    let journal_head = NEXT_SEQ.with(|next| Seq(next.get() - 1));
-    Frame::Many(vec![
-        ConnEvent::Ready.into(),
-        AgentFrame::JournalHead {
-            machine_seed: 0,
-            journal_head,
-            agent_counter,
+    let statuses = heads.iter().filter_map(status_mail).collect::<Vec<_>>();
+    let mut worksets = Vec::<WorksetEntry>::new();
+    for head in &heads {
+        if !worksets.iter().any(|entry| entry.workset == head.workset()) {
+            worksets.push(WorksetEntry {
+                workset: head.workset(),
+                kind: head.kind.clone(),
+                created_at: head.created_at,
+            });
         }
+    }
+    let agents = heads.iter().map(UiAgentHead::entry).collect();
+    // The head is the newest mail handed out: a client that has heard
+    // every mail so far is caught up.
+    let mail_head = MAIL_HEAD.with(|head| MailId(head.get()));
+    let mut frames = vec![
+        ConnEvent::Ready.into(),
+        AgentFrame::Server(ServerFrame::Hello {
+            machine_seed: 0,
+            mail_head,
+            agent_counter,
+        })
         .into(),
-        AgentFrame::Auth {
+        AgentFrame::Server(ServerFrame::Auth {
             auth: rho_agents_client::protocol::AuthState {
                 namespaces: Vec::new(),
                 disabled_namespaces: Vec::new(),
                 active_namespace: None,
             },
-        }
+        })
         .into(),
-        AgentFrame::Log { entries }.into(),
-    ])
+        AgentFrame::Server(ServerFrame::Directory { worksets, agents }).into(),
+    ];
+    if !statuses.is_empty() {
+        frames.push(mails(statuses).into());
+    }
+    Frame::Many(frames)
 }
 
 /// The calls a host in this process has been asked so far
@@ -214,12 +198,12 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
 /// the stream to answer it on.
 pub fn calls(
     streams: &mut tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>,
-) -> Vec<(agents::Request, rho_rpc::Stream)> {
+) -> Vec<(rho2::Request, rho_rpc::Stream)> {
     let mut calls = Vec::new();
     while let Ok(mut stream) = streams.try_recv() {
         let open = futures::executor::block_on(read_frame::<_, Open>(&mut stream))
             .expect("a stream opens by saying what it is for");
-        if let Ok(agents::Open::Request(request)) = open.unpack() {
+        if let Ok(rho2::Open::Request(request)) = open.unpack() {
             calls.push((request, stream));
         }
     }
@@ -231,30 +215,49 @@ pub fn answer<T: Packer + Unpacker>(stream: &mut rho_rpc::Stream, answer: Answer
     futures::executor::block_on(write_frame(stream, &answer)).expect("answer the call");
 }
 
-/// A run of one agent's story, each row past the last one told.
+/// The user's mail to an agent, past the last mail told.
+pub fn from_user(agent_id: AgentId, text: &str, at: UnixMs) -> Mail {
+    mail(
+        Address::User,
+        Address::Agent(agent_id),
+        None,
+        text.to_owned(),
+        at,
+    )
+}
+
+/// Mail in the host's log, as the mail follow hands it.
+pub fn mails(mails: Vec<Mail>) -> AgentFrame {
+    AgentFrame::Server(ServerFrame::Mail { mails })
+}
+
+/// A run of one agent's story: mail between it and the user, each past
+/// the last mail told.
 pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> AgentFrame {
-    let entries = events
-        .into_iter()
-        .map(|event| {
-            let pos = NEXT_POS.with(|next| next.borrow().get(&agent_id).copied().unwrap_or(1));
-            entry(agent_id, pos, event.mirror())
-        })
-        .collect();
-    AgentFrame::Log { entries }
+    let agent = Address::Agent(agent_id);
+    mails(
+        events
+            .into_iter()
+            .map(|event| match event {
+                UiStoryEvent::UserMessage { text, at } => {
+                    mail(Address::User, agent, None, text, at)
+                }
+                UiStoryEvent::Sent { text, kind, at } => {
+                    mail(agent, Address::User, Some(kind), text, at)
+                }
+            })
+            .collect(),
+    )
 }
 
-/// Deletion is a journal marker at zero even when this client held later rows.
-pub fn deleted(agent_id: AgentId, at: UnixMs) -> AgentFrame {
-    AgentFrame::Log {
-        entries: vec![entry(agent_id, 0, TranscriptEvent::Deleted { at })],
-    }
+/// Deleting an agent is deleting the workset it is in.
+pub fn deleted(workset: WorksetId) -> AgentFrame {
+    AgentFrame::Server(ServerFrame::WorksetDeleted { workset })
 }
 
-thread_local! {
-    /// The model this test drives. One per test thread, so a test's own
-    /// fold and cursor are its own.
-    static MODEL: RefCell<(rho_agents_client::model::Model, std::collections::HashSet<rho_agents_client::HostId>)> =
-        RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
+/// Rows of a followed workset, as the host pushes them.
+pub fn rows(workset: WorksetId, rows: Vec<(rho_agent_types::Wpos, rho2::LogEvent)>) -> AgentFrame {
+    AgentFrame::Server(ServerFrame::Rows { workset, rows })
 }
 
 /// What a host says, on any of its streams.

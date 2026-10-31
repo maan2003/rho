@@ -1,8 +1,8 @@
 //! The transcripts this client holds open.
 //!
 //! An agent's transcript is two things joined: the fold of its workset rows
-//! and its mail, and the runtime's live tail. Both land in one rendered state per
-//! agent, which is what a screen draws. Which agents are held open is the
+//! and its mail, and the runtime's live tail. Both land in one rendered state
+//! per agent, which is what a screen draws. Which agents are held open is the
 //! same question as which agents this client asks the model thread for
 //! rows about, so it is answered here.
 
@@ -237,7 +237,10 @@ mod tests {
         let delta = transcripts
             .refold(agent_id, &turn(1, 2, "second", 2))
             .expect("the telling moved rows");
-        assert_eq!(delta.from, held, "the transcript is appended to, not remade");
+        assert_eq!(
+            delta.from, held,
+            "the transcript is appended to, not remade"
+        );
 
         transcripts.apply(agent_id, TranscriptFrame::Folded(delta));
         assert_eq!(texts(&transcripts), ["first", "second"]);
@@ -322,7 +325,11 @@ mod tests {
     #[test]
     fn rows_for_a_closed_transcript_cost_nothing() {
         let mut transcripts = Transcripts::default();
-        assert!(transcripts.refold(agent(), &turn(0, 0, "first", 1)).is_none());
+        assert!(
+            transcripts
+                .refold(agent(), &turn(0, 0, "first", 1))
+                .is_none()
+        );
         assert!(transcripts.state(&agent()).is_none());
     }
 }
