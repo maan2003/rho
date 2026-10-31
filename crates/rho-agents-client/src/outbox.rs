@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{AgentId, ContentPart, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, ThreadId, UnixMs};
 
 use crate::protocol::rho2::PostMail;
 
@@ -19,6 +19,9 @@ use crate::protocol::rho2::PostMail;
 pub struct Outgoing {
     pub at: UnixMs,
     pub content: Vec<ContentPart>,
+    /// The thread it answers in; `None` starts a new one.
+    #[senax(default)]
+    pub thread: Option<ThreadId>,
 }
 
 #[derive(Default)]
@@ -42,11 +45,17 @@ impl Outbox {
     }
 
     /// Keeps a message the user wrote, on disk before anything is sent.
-    pub fn push(&mut self, agent_id: AgentId, content: Vec<ContentPart>) -> u64 {
+    pub fn push(
+        &mut self,
+        agent_id: AgentId,
+        thread: Option<ThreadId>,
+        content: Vec<ContentPart>,
+    ) -> u64 {
         let id = rand::random();
         let outgoing = Outgoing {
             at: UnixMs::now(),
             content,
+            thread,
         };
         crate::cache::write_outgoing(agent_id, id, Some(outgoing.clone()));
         self.waiting.push((agent_id, id, outgoing));
@@ -64,19 +73,22 @@ impl Outbox {
         Some(PostMail {
             client_id: *id,
             to: agent_id,
-            thread: None,
+            thread: outgoing.thread,
             content: outgoing.content.clone(),
         })
     }
 
     /// The host logged what was on its way: it is the agent's mail now.
-    pub fn delivered(&mut self, agent_id: AgentId) {
-        let Some(sent) = self.sending.remove(&agent_id) else {
-            return;
-        };
-        self.waiting
-            .retain(|(to, id, _)| *to != agent_id || *id != sent);
+    /// Answers its client id and what it was.
+    pub fn delivered(&mut self, agent_id: AgentId) -> Option<(u64, Outgoing)> {
+        let sent = self.sending.remove(&agent_id)?;
+        let at = self
+            .waiting
+            .iter()
+            .position(|(to, id, _)| *to == agent_id && *id == sent)?;
+        let (_, id, outgoing) = self.waiting.remove(at);
         crate::cache::write_outgoing(agent_id, sent, None);
+        Some((id, outgoing))
     }
 
     /// The post failed; the message waits for the next try.
@@ -84,11 +96,12 @@ impl Outbox {
         self.sending.remove(&agent_id);
     }
 
-    /// The text of an agent's unsent messages, oldest first.
-    pub fn texts(&self, agent_id: AgentId) -> Vec<String> {
+    /// The text of the unsent messages in one of an agent's threads,
+    /// oldest first.
+    pub fn texts(&self, agent_id: AgentId, thread: ThreadId) -> Vec<String> {
         self.waiting
             .iter()
-            .filter(|(to, ..)| *to == agent_id)
+            .filter(|(to, _, outgoing)| *to == agent_id && outgoing.thread == Some(thread))
             .map(|(_, _, outgoing)| rho_agent_types::transcript::text_content(&outgoing.content))
             .collect()
     }
@@ -113,6 +126,10 @@ mod tests {
         AgentId::from_counter(n, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
+    fn thread() -> ThreadId {
+        ThreadId(rho_agent_types::MailId(1))
+    }
+
     fn text(text: &str) -> Vec<ContentPart> {
         vec![ContentPart::Text { text: text.into() }]
     }
@@ -132,14 +149,16 @@ mod tests {
     fn an_agents_messages_go_one_at_a_time_in_order() {
         let (a, b) = (agent(1), agent(2));
         let mut outbox = Outbox::default();
-        let first = outbox.push(a, text("a1"));
-        outbox.push(b, text("b1"));
-        let second = outbox.push(a, text("a2"));
+        let first = outbox.push(a, Some(thread()), text("a1"));
+        outbox.push(b, None, text("b1"));
+        let second = outbox.push(a, Some(thread()), text("a2"));
         assert_eq!(outbox.agents(), [a, b]);
 
         assert_eq!(sent(outbox.next(a)), (first, "a1".to_owned()));
         assert!(outbox.next(a).is_none(), "one post at a time");
-        assert_eq!(sent(outbox.next(b)).1, "b1", "another agent is not held up");
+        let to_b = outbox.next(b).expect("a post");
+        assert_eq!(to_b.thread, None, "a new thread");
+        assert_eq!(sent(Some(to_b)).1, "b1", "another agent is not held up");
 
         outbox.failed(a);
         assert_eq!(
@@ -147,12 +166,22 @@ mod tests {
             (first, "a1".to_owned()),
             "posted again under the same id"
         );
-        outbox.delivered(a);
-        assert_eq!(outbox.texts(a), ["a2"]);
+        assert_eq!(
+            outbox.delivered(a).map(|(id, _)| id),
+            Some(first),
+            "what was delivered is the post that went"
+        );
+        assert_eq!(outbox.texts(a, thread()), ["a2"]);
         assert_eq!(sent(outbox.next(a)), (second, "a2".to_owned()));
         outbox.delivered(a);
-        assert!(outbox.texts(a).is_empty());
+        assert!(outbox.texts(a, thread()).is_empty());
         assert!(outbox.next(a).is_none());
         assert_eq!(outbox.agents(), [b]);
+        assert_eq!(
+            outbox.delivered(b).map(|(_, outgoing)| outgoing.thread),
+            Some(None),
+            "a delivered new thread says it was one"
+        );
+        assert!(outbox.delivered(b).is_none(), "nothing more was on its way");
     }
 }

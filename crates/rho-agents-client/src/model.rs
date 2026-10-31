@@ -17,23 +17,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_hosts::HostStream;
-use rho_agent_types::{Address, AgentId, Mail, MailId, UnixMs, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{Address, AgentId, Mail, MailId, WorksetId, WorksetKind, Wpos};
 
+use crate::HostId;
 use crate::fold::{AgentIdentity, Digest, MirroredAgent, TranscriptRow};
 use crate::protocol::rho2::{AgentEntry, ClientFrame, LogEvent, ServerFrame, WorksetEntry};
 use crate::protocol::transcript::{Live, RuntimeState};
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
-use crate::{HostId, Verdict};
 
 /// What the main thread hears from the model.
 pub enum ModelMsg {
     /// Every agent this client holds for a host, from the disk copy or
     /// after the copy started over. What the main thread had for the host
     /// is gone; this is what there is instead.
-    Loaded {
-        agents: Vec<MirroredAgent>,
-        verdicts: Vec<(AgentId, Verdict)>,
-    },
+    Loaded { agents: Vec<MirroredAgent> },
     /// Agents the directory or their mail moved, as they now stand. One
     /// message per frame once caught up, and one for a whole catch-up.
     Changed { agents: Vec<MirroredAgent> },
@@ -259,12 +256,10 @@ impl Model {
             slot.mail_head = cursor.mail;
         }
         let mut agents = Vec::new();
-        let mut verdicts = Vec::new();
         for loaded in &stored.agents {
             if loaded.host != name {
                 continue;
             }
-            let agent_id = loaded.identity.agent_id();
             slot.kinds
                 .insert(loaded.identity.entry.workset, loaded.identity.kind.clone());
             agents.push(MirroredAgent {
@@ -272,20 +267,17 @@ impl Model {
                 identity: loaded.identity.clone(),
                 digest: loaded.digest.clone(),
             });
-            if let Some(verdict) = loaded.verdict {
-                verdicts.push((agent_id, verdict));
-            }
         }
         self.hosts.insert(host, slot);
         for agent in &agents {
             self.agents.insert(agent.agent_id(), agent.clone());
         }
-        if agents.is_empty() && verdicts.is_empty() {
+        if agents.is_empty() {
             return Vec::new();
         }
         vec![ModelEvent {
             host,
-            msg: ModelMsg::Loaded { agents, verdicts },
+            msg: ModelMsg::Loaded { agents },
         }]
     }
 
@@ -333,7 +325,10 @@ impl Model {
                     }
                     event(ModelMsg::Live { agent_id, live })
                 }
-                ServerFrame::Status { agent_id, state } => self.status(host, agent_id, state),
+                ServerFrame::Status { agent_id, state } => vec![ModelEvent {
+                    host,
+                    msg: ModelMsg::Runtime { agent_id, state },
+                }],
                 // Nothing here asks for a detail body: the transcript
                 // draws a call's line and never its output.
                 ServerFrame::Detail { .. } => Vec::new(),
@@ -400,10 +395,7 @@ impl Model {
             self.agents.retain(|_, agent| agent.host != host);
             out.push(ModelEvent {
                 host,
-                msg: ModelMsg::Loaded {
-                    agents: Vec::new(),
-                    verdicts: Vec::new(),
-                },
+                msg: ModelMsg::Loaded { agents: Vec::new() },
             });
         }
         let slot = self.hosts.get_mut(&host).expect("the host is here");
@@ -600,7 +592,6 @@ impl Model {
                         crate::cache::StoredAgent {
                             host: host.name.clone(),
                             identity: agent.identity.clone(),
-                            stop: agent.digest.stop(),
                         },
                     ))
                 })
@@ -617,7 +608,6 @@ impl Model {
         };
         let slot = self.hosts.get_mut(&host).expect("the host is here");
         let mut rows: BTreeMap<AgentId, Vec<TranscriptRow>> = BTreeMap::new();
-        let mut stops_moved = Vec::new();
         for mail in &mails {
             let parties = [mail.from, mail.to]
                 .into_iter()
@@ -632,12 +622,8 @@ impl Model {
                     Some(agent) => &mut agent.digest,
                     None => slot.strays.entry(agent_id).or_default(),
                 };
-                let stop = digest.stop();
                 if !digest.tell(agent_id, mail) {
                     continue;
-                }
-                if digest.stop() != stop {
-                    stops_moved.push(agent_id);
                 }
                 if named {
                     slot.pending.insert(agent_id);
@@ -658,7 +644,6 @@ impl Model {
         }
         slot.mail = slot.mail.max(through);
         crate::cache::write_mail(&slot.name, slot.mail, mails);
-        self.store(&stops_moved);
         let mut out = rows
             .into_iter()
             .map(|(agent_id, rows)| ModelEvent {
@@ -667,29 +652,6 @@ impl Model {
             })
             .collect::<Vec<_>>();
         out.extend(self.announce(host));
-        out
-    }
-
-    /// What an agent's runtime is doing: a stop is put to the user, and
-    /// anything else ends one.
-    fn status(&mut self, host: HostId, agent_id: AgentId, state: RuntimeState) -> Vec<ModelEvent> {
-        let slot = self.hosts.get(&host).expect("the host is here");
-        let head = slot.mail.max(slot.mail_head);
-        let Some(agent) = self.agents.get_mut(&agent_id) else {
-            return Vec::new();
-        };
-        let moved = agent.digest.observe(&state, head, UnixMs::now());
-        let mut out = Vec::new();
-        if moved {
-            self.store(&[agent_id]);
-            let slot = self.hosts.get_mut(&host).expect("the host is here");
-            slot.pending.insert(agent_id);
-            out.extend(self.announce(host));
-        }
-        out.push(ModelEvent {
-            host,
-            msg: ModelMsg::Runtime { agent_id, state },
-        });
         out
     }
 
@@ -831,6 +793,13 @@ impl AgentsClient {
         self.command(ModelCommand::Follow(agents));
     }
 
+    /// The mail the disk copy holds of an agent's, oldest first. The copy
+    /// may trail what was just heard by a queued write; this waits for it.
+    pub fn read_mail(&self, agent_id: AgentId) -> Vec<rho_agent_types::Mail> {
+        crate::cache::flush();
+        crate::cache::read_mail(agent_id)
+    }
+
     /// Everything the disk copy holds of an agent's transcript: its
     /// workset's rows about it and its mail, in time order. The copy may
     /// trail what was just heard by a queued write; this waits for it.
@@ -841,11 +810,6 @@ impl AgentsClient {
             crate::cache::read_rows(workset),
             crate::cache::read_mail(agent_id),
         )
-    }
-
-    /// The user's verdict on an agent, kept with the copy.
-    pub fn set_verdict(&self, agent_id: AgentId, verdict: Verdict) {
-        crate::cache::write_verdict(agent_id, verdict);
     }
 
     fn command(&self, command: ModelCommand) {
@@ -875,12 +839,12 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{ContentPart, SendKind};
+    use rho_agent_types::{ContentPart, SendKind, UnixMs};
 
     use super::*;
     use crate::fold::Said;
     use crate::protocol::rho2::SpecView;
-    use crate::protocol::transcript::{InferenceState, RuntimeKind};
+    use crate::protocol::transcript::RuntimeKind;
     use crate::stream::AgentStream;
 
     const HOST: HostId = HostId(0);
@@ -952,6 +916,16 @@ mod tests {
         ServerFrame::Mail { mails }.into()
     }
 
+    /// What the agent's threads want of the user, by thread.
+    fn wants(model: &Model, agent_id: AgentId) -> Vec<Said> {
+        model.agents[&agent_id]
+            .digest
+            .threads
+            .values()
+            .filter_map(|thread| thread.wants.map(|wanting| wanting.said))
+            .collect()
+    }
+
     fn asks(id: u64, agent_id: AgentId) -> Mail {
         mail(
             id,
@@ -1013,7 +987,7 @@ mod tests {
             vec![agent(1), agent(2)],
             "the page that reaches the head names everything the catch-up moved"
         );
-        assert_eq!(model.agents[&agent(1)].digest.unread.len(), 1);
+        assert_eq!(wants(&model, agent(1)), [Said::Ask]);
     }
 
     /// Mail heard before the directory names its agent is kept for it.
@@ -1024,7 +998,7 @@ mod tests {
         model.ingest(HOST, mails(vec![asks(1, agent(1))]));
         let out = model.ingest(HOST, ServerFrame::Agent(entry(agent(1), workset(1))).into());
         assert_eq!(changed(&out), [agent(1)]);
-        assert_eq!(model.agents[&agent(1)].digest.unread.len(), 1);
+        assert_eq!(wants(&model, agent(1)), [Said::Ask]);
     }
 
     /// The directory is whole: an agent it no longer names is gone, and so
@@ -1169,50 +1143,6 @@ mod tests {
         );
     }
 
-    /// A stop is put to the user once, however often the host repeats it,
-    /// and ends when the runtime runs again.
-    #[test]
-    fn a_status_that_failed_is_a_stop() {
-        let mut model = model();
-        model.ingest(HOST, hello(0));
-        model.ingest(HOST, directory(&[(agent(1), workset(1))]));
-        let failed = || -> AgentFrame {
-            ServerFrame::Status {
-                agent_id: agent(1),
-                state: RuntimeState {
-                    inference: InferenceState::Failed {
-                        error: "quota".into(),
-                    },
-                    ..Default::default()
-                },
-            }
-            .into()
-        };
-        let out = model.ingest(HOST, failed());
-        assert_eq!(changed(&out), [agent(1)]);
-        assert!(matches!(
-            out.last().map(|event| &event.msg),
-            Some(ModelMsg::Runtime { .. })
-        ));
-        assert_eq!(
-            model.agents[&agent(1)]
-                .digest
-                .strongest_unread(Default::default())
-                .map(|unread| unread.said),
-            Some(Said::Stopped)
-        );
-        assert!(
-            changed(&model.ingest(HOST, failed())).is_empty(),
-            "the same stop"
-        );
-        let running = ServerFrame::Status {
-            agent_id: agent(1),
-            state: RuntimeState::default(),
-        };
-        assert_eq!(changed(&model.ingest(HOST, running.into())), [agent(1)]);
-        assert!(model.agents[&agent(1)].digest.unread.is_empty());
-    }
-
     /// A reconnect that replays mail already held moves nothing: the
     /// user's reply read the ask once, and the result after it stays owed.
     #[test]
@@ -1220,21 +1150,23 @@ mod tests {
         let mut model = model();
         model.ingest(HOST, hello(0));
         model.ingest(HOST, directory(&[(agent(1), workset(1))]));
+        let in_first = |mut mail: Mail| {
+            mail.thread = rho_agent_types::ThreadId(MailId(1));
+            mail
+        };
         let page = vec![
             asks(1, agent(1)),
-            mail(2, Address::User, Address::Agent(agent(1)), None),
-            mail(
+            in_first(mail(2, Address::User, Address::Agent(agent(1)), None)),
+            in_first(mail(
                 3,
                 Address::Agent(agent(1)),
                 Address::User,
                 Some(SendKind::Result),
-            ),
+            )),
         ];
         model.ingest(HOST, mails(page.clone()));
         assert!(changed(&model.ingest(HOST, mails(page))).is_empty());
-        let unread = &model.agents[&agent(1)].digest.unread;
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread[0].said, Said::Result);
+        assert_eq!(wants(&model, agent(1)), [Said::Result]);
     }
 
     /// A host on another database starts the copy over.

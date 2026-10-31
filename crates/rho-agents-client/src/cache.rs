@@ -9,18 +9,17 @@
 //! only for the rows after them.
 //!
 //! It is a copy, never a source, except for what the user said that no
-//! host has: their verdicts, their unsent mail and their drafts. Anything
+//! host has: their unsent mail and their drafts. Anything
 //! else doubted is thrown away and asked for again from the start.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_types::{Address, AgentId, Mail, MailId, WorksetId, Wpos};
+use rho_agent_types::{Address, AgentId, Mail, MailId, ThreadId, WorksetId, Wpos};
 use rho_db::{RhoDb, Sen, SenValue};
 
-use crate::Verdict;
-use crate::fold::{AgentIdentity, Digest, Unread};
+use crate::fold::{AgentIdentity, Digest};
 use crate::outbox::Outgoing;
 use crate::protocol::rho2::LogEvent;
 
@@ -29,8 +28,7 @@ use crate::protocol::rho2::LogEvent;
 /// mean nothing across a restart. The seed says which database the cursor
 /// counts in; an agent host with another one starts the copy over.
 const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_host_v1");
-/// The directory as each host last told it, with the stop the client last
-/// saw of each agent.
+/// The directory as each host last told it.
 const AGENTS: TableDefinition<AgentId, Sen<StoredAgent>> = TableDefinition::new("gui_agent_v1");
 /// Every mail, under each agent it is from or to, in log order: a range
 /// read gives one agent's conversation and nothing else. Mail between two
@@ -39,25 +37,21 @@ const MAIL: TableDefinition<(AgentId, u64), Sen<Mail>> = TableDefinition::new("g
 /// The rows of each workset whose transcript was opened, by position.
 const ROWS: TableDefinition<([u8; 6], u64), Sen<LogEvent>> =
     TableDefinition::new("gui_workset_rows_v1");
-/// What the user last said about an agent, so Home ranks the same way on
-/// the first frame as it did before the restart: attention is derived
-/// from this and the digest. The store overwrites it as soon as the GUI
-/// has it again.
-const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
-    TableDefinition::new("gui_agent_verdict_v2");
 /// What the user wrote that no host has taken yet, by agent and the id
 /// the client gave it. The user's own words, with no copy anywhere else:
 /// never dropped to be asked for again.
 const OUTBOX: TableDefinition<(AgentId, u64), Sen<Outgoing>> =
     TableDefinition::new("gui_agent_outbox_v1");
-/// What the user is writing to each agent and has not sent. Sending moves
-/// it to the outbox in the same write, so a message is never in both or
-/// in neither.
-const DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_draft_v1");
+/// What the user is writing in each mail thread and has not sent, by agent
+/// and thread id. Sending moves it to the outbox in the same write, so a
+/// message is never in both or in neither.
+const DRAFTS: TableDefinition<(AgentId, u64), &str> = TableDefinition::new("gui_thread_draft_v1");
 
 /// Tables nothing reads: the per-agent journal mirror rho2 replaced, and
 /// its retired formats. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 36] = [
+const RETIRED_TABLES: [&str; 37] = [
+    // A copy of the dealer's marks per agent, which only agent cards read.
+    "gui_agent_verdict_v2",
     "gui_mirror_host_v10",
     "gui_mirror_events_v10",
     "gui_agent_digest_v7",
@@ -119,19 +113,15 @@ pub struct StoredAgent {
     /// The host's name.
     pub host: String,
     pub identity: AgentIdentity,
-    /// The stop the client last saw and the user has not answered, which
-    /// no mail records.
-    pub stop: Option<Unread>,
 }
 
-/// One agent as the copy holds it: whose it is, what it is, what its mail
-/// folds to, and what the user last said about it.
+/// One agent as the copy holds it: whose it is, what it is, and what its
+/// mail folds to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedAgent {
     pub host: String,
     pub identity: AgentIdentity,
     pub digest: Digest,
-    pub verdict: Option<Verdict>,
 }
 
 #[derive(Default)]
@@ -163,12 +153,11 @@ enum Write {
     },
     /// A workset gone from its host, with its rows.
     ForgetWorkset(WorksetId),
-    Verdict(AgentId, Verdict),
     /// A message kept until its host takes it, or `None` once it has.
-    /// A new one was the agent's draft, which goes with it.
+    /// A new one was its thread's draft, which goes with it.
     Outgoing(AgentId, u64, Option<Outgoing>),
-    /// An agent's draft as it stands; empty drops it.
-    Draft(AgentId, String),
+    /// A thread's draft as it stands; empty drops it.
+    Draft(AgentId, ThreadId, String),
     /// Everything heard from a host, gone: its agent host has another
     /// database.
     Reset(String),
@@ -217,7 +206,6 @@ impl Mirror {
             open_or_rebuild(&mut write, AGENTS);
             open_or_rebuild(&mut write, MAIL);
             open_or_rebuild(&mut write, ROWS);
-            write.open_table(VERDICTS);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
             for table in RETIRED_TABLES {
@@ -255,7 +243,6 @@ impl Mirror {
                 }
             })
             .collect();
-        let verdicts = read.open_table(VERDICTS);
         let mail = read.open_table(MAIL);
         let agents = read
             .open_table(AGENTS)
@@ -267,16 +254,10 @@ impl Mirror {
                 for (_, mail) in mail.range((agent_id, 0)..=(agent_id, u64::MAX)) {
                     digest.tell(agent_id, &mail.value().into_owned());
                 }
-                if let Some(stop) = stored.stop {
-                    digest.restore_stop(stop);
-                }
                 LoadedAgent {
                     host: stored.host,
                     identity: stored.identity,
                     digest,
-                    verdict: verdicts
-                        .get(agent_id)
-                        .map(|value| value.value().into_owned()),
                 }
             })
             .collect();
@@ -313,12 +294,15 @@ impl Mirror {
             .map_or(Wpos::ZERO, |(key, _)| Wpos(key.value().1).next())
     }
 
-    pub fn read_drafts(&self) -> Vec<(AgentId, String)> {
+    pub fn read_drafts(&self) -> Vec<(AgentId, ThreadId, String)> {
         self.db
             .read()
             .open_table(DRAFTS)
             .iter()
-            .map(|(key, value)| (key.value(), value.value().to_owned()))
+            .map(|(key, value)| {
+                let (agent_id, thread) = key.value();
+                (agent_id, ThreadId(MailId(thread)), value.value().to_owned())
+            })
             .collect()
     }
 
@@ -458,26 +442,25 @@ fn apply(
             }
         }
         Write::ForgetWorkset(workset) => drop_rows(transaction, workset),
-        Write::Verdict(agent_id, verdict) => {
-            transaction
-                .open_table(VERDICTS)
-                .insert(agent_id, SenValue::borrowed(&verdict));
-        }
         Write::Outgoing(agent_id, id, Some(outgoing)) => {
             transaction
                 .open_table(OUTBOX)
                 .insert((agent_id, id), SenValue::borrowed(&outgoing));
-            transaction.open_table(DRAFTS).remove(agent_id);
+            if let Some(thread) = outgoing.thread {
+                transaction
+                    .open_table(DRAFTS)
+                    .remove((agent_id, thread.0.0));
+            }
         }
         Write::Outgoing(agent_id, id, None) => {
             transaction.open_table(OUTBOX).remove((agent_id, id));
         }
-        Write::Draft(agent_id, text) => {
+        Write::Draft(agent_id, thread, text) => {
             let mut table = transaction.open_table(DRAFTS);
             if text.is_empty() {
-                table.remove(agent_id);
+                table.remove((agent_id, thread.0.0));
             } else {
-                table.insert(agent_id, text.as_str());
+                table.insert((agent_id, thread.0.0), text.as_str());
             }
         }
         Write::Reset(host) => {
@@ -500,7 +483,6 @@ fn apply(
 /// Only host-owned copies go away. Drafts and outbox have no other copy.
 fn forget_agent(transaction: &mut rho_db::WriteTxn, agent_id: AgentId) {
     transaction.open_table(AGENTS).remove(agent_id);
-    transaction.open_table(VERDICTS).remove(agent_id);
     let mut mail = transaction.open_table(MAIL);
     let held = mail
         .range((agent_id, 0)..=(agent_id, u64::MAX))
@@ -647,19 +629,15 @@ pub fn forget_workset(workset: WorksetId) {
     send(Write::ForgetWorkset(workset));
 }
 
-pub fn write_verdict(agent_id: AgentId, verdict: Verdict) {
-    send(Write::Verdict(agent_id, verdict));
-}
-
 pub fn write_outgoing(agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
     send(Write::Outgoing(agent_id, id, outgoing));
 }
 
-pub fn write_draft(agent_id: AgentId, text: String) {
-    send(Write::Draft(agent_id, text));
+pub fn write_draft(agent_id: AgentId, thread: ThreadId, text: String) {
+    send(Write::Draft(agent_id, thread, text));
 }
 
-pub fn read_drafts() -> Vec<(AgentId, String)> {
+pub fn read_drafts() -> Vec<(AgentId, ThreadId, String)> {
     read(Mirror::read_drafts)
 }
 
@@ -711,7 +689,6 @@ mod tests {
                 },
                 kind: rho_agent_types::WorksetKind::Isolated,
             },
-            stop: None,
         }
     }
 
@@ -752,14 +729,8 @@ mod tests {
                 host: "fern".into(),
                 machine_seed: 9,
             });
-            let mut with_stop = stored(a, "fern", workset(1));
-            with_stop.stop = Some(Unread {
-                pos: crate::fold::ConversationPos::of_stop(MailId(5)),
-                at: UnixMs(6),
-                said: Said::Stopped,
-            });
             mirror.send(Write::Agents(vec![
-                (a, with_stop),
+                (a, stored(a, "fern", workset(1))),
                 (b, stored(b, "fern", workset(1))),
             ]));
             mirror.send(Write::Mail {
@@ -794,13 +765,16 @@ mod tests {
                 .map(|loaded| loaded.digest.clone())
                 .expect("the agent is held")
         };
-        let saids = digest_of(a)
-            .unread
-            .iter()
-            .map(|unread| unread.said)
+        let wants = digest_of(a)
+            .threads
+            .values()
+            .filter_map(|thread| thread.wants.map(|wanting| wanting.said))
             .collect::<Vec<_>>();
-        assert_eq!(saids, [Said::Ask, Said::Stopped], "its mail and its stop");
-        assert!(digest_of(b).unread.is_empty());
+        assert_eq!(wants, [Said::Ask], "its mail to the user, folded");
+        assert!(
+            digest_of(b).threads.is_empty(),
+            "mail between agents is no thread"
+        );
         assert_eq!(mirror.read_mail(a).len(), 2);
         assert_eq!(
             mirror.read_mail(b).len(),
@@ -846,6 +820,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "kept".into(),
                 }],
+                thread: None,
             }),
         ));
         mirror.send(Write::Reset("fern".into()));

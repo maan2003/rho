@@ -652,6 +652,7 @@ fn tool_status_label(status: UiToolStatus) -> &'static str {
         UiToolStatus::Reported => "reported",
         UiToolStatus::Error => "error",
         UiToolStatus::Cancelled => "cancelled",
+        UiToolStatus::Ended => "ended",
     }
 }
 
@@ -662,6 +663,7 @@ fn tool_status_class(status: UiToolStatus) -> StyleClass {
         UiToolStatus::Reported => StyleClass::SystemInfo,
         UiToolStatus::Error => StyleClass::StatusError,
         UiToolStatus::Cancelled => StyleClass::StatusCancelled,
+        UiToolStatus::Ended => StyleClass::SystemInfo,
     }
 }
 

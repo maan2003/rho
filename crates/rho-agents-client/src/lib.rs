@@ -50,8 +50,7 @@ pub use create::{Creation, Start, StartBase, StartFieldMode};
 pub use find::AgentHit;
 #[cfg(feature = "client")]
 pub use fold::{
-    AgentIdentity, ConversationPos, Digest, MirroredAgent, Said, TranscriptFold, TranscriptRow,
-    Unread, Verdict, one_line, transcript,
+    AgentIdentity, Digest, MirroredAgent, Said, TranscriptFold, TranscriptRow, one_line, transcript,
 };
 #[cfg(feature = "client")]
 pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};

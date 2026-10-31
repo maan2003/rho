@@ -102,6 +102,10 @@ thread_local! {
     /// The newest mail handed out, so every mail a test tells lands past
     /// the last: the model skips mail behind its cursor.
     static MAIL_HEAD: Cell<u64> = const { Cell::new(0) };
+    /// The thread of the newest mail between the user and each agent:
+    /// where the next mail between them goes, as on a host.
+    static THREADS: RefCell<std::collections::HashMap<AgentId, rho_agent_types::ThreadId>> =
+        RefCell::new(std::collections::HashMap::new());
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
     static MODEL: RefCell<(rho_agents_client::model::Model, std::collections::HashSet<rho_agents_client::HostId>)> =
@@ -111,6 +115,7 @@ thread_local! {
 /// Forgets every mail id handed out, for a test starting fresh.
 pub fn reset() {
     MAIL_HEAD.with(|head| head.set(0));
+    THREADS.with(|threads| threads.borrow_mut().clear());
 }
 
 fn mail(from: Address, to: Address, kind: Option<SendKind>, text: String, at: UnixMs) -> Mail {
@@ -118,12 +123,25 @@ fn mail(from: Address, to: Address, kind: Option<SendKind>, text: String, at: Un
         head.set(head.get() + 1);
         MailId(head.get())
     });
+    let agent = match (from, to) {
+        (Address::Agent(agent), _) | (_, Address::Agent(agent)) => Some(agent),
+        _ => None,
+    };
+    let thread = THREADS.with(|threads| {
+        let mut threads = threads.borrow_mut();
+        match agent {
+            Some(agent) => *threads
+                .entry(agent)
+                .or_insert(rho_agent_types::ThreadId(id)),
+            None => rho_agent_types::ThreadId(id),
+        }
+    });
     Mail {
         id,
         at,
         from,
         to,
-        thread: rho_agent_types::ThreadId(id),
+        thread,
         kind,
         content: vec![ContentPart::Text { text }],
     }

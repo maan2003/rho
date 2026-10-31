@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, ThreadId};
 use rho_agents_client::TranscriptFold;
 use rho_agents_client::fold::TranscriptRow;
 use rho_agents_client::state::UiAgentState;
@@ -23,19 +23,13 @@ pub enum TranscriptFrame {
     Fold(UiAgentState),
     /// The rows one telling of the mirror moved.
     Folded(rho_agents_client::fold::FoldDelta),
-    /// What the user wrote that no host has taken yet, whole.
-    Unsent(Vec<String>),
-    /// What the agent says it is doing, if anything.
-    Status(Option<String>),
+    /// What the agent's runtime is doing, as its host tells every agent's.
+    Runtime(rho_agents_client::protocol::transcript::RuntimeState),
 }
 
 /// What a frame did, for a caller deciding what to redraw.
 pub struct FrameChange {
     pub summary: FrameSummary,
-    /// The context figure before the frame, to compare against the one
-    /// after; a status line only changes when this does.
-    pub context_before: Option<u64>,
-    pub usage_changed: bool,
     /// The frame came from the runtime, so the agent is live.
     pub was_live: bool,
 }
@@ -47,17 +41,13 @@ pub struct Transcripts {
     /// The transcript fold of every agent held open, in memory, so a row
     /// folds into it without waiting on the disk copy.
     open: HashMap<AgentId, TranscriptFold>,
+    /// The mail threads held open, each as its mails make it.
+    threads: HashMap<(AgentId, ThreadId), UiAgentState>,
 }
 
 impl Transcripts {
     pub fn state(&self, agent_id: &AgentId) -> Option<&UiAgentState> {
         self.store.get(agent_id)
-    }
-
-    pub fn context_used(&self, agent_id: &AgentId) -> Option<u64> {
-        self.store
-            .get(agent_id)
-            .and_then(|state| state.context_used)
     }
 
     pub fn is_open(&self, agent_id: &AgentId) -> bool {
@@ -70,17 +60,43 @@ impl Transcripts {
         self.open.keys().copied().collect()
     }
 
+    /// A mail thread as it stands now, and what moved since it was last
+    /// set: everything, the first time.
+    pub fn set_thread(
+        &mut self,
+        agent_id: AgentId,
+        thread: ThreadId,
+        state: UiAgentState,
+    ) -> FrameSummary {
+        let summary = match self.threads.get(&(agent_id, thread)) {
+            Some(held) => rho_agents_client::store::summarize(&held.blocks, &state.blocks),
+            None => FrameSummary::everything(),
+        };
+        self.threads.insert((agent_id, thread), state);
+        summary
+    }
+
+    pub fn thread(&self, agent_id: AgentId, thread: ThreadId) -> Option<&UiAgentState> {
+        self.threads.get(&(agent_id, thread))
+    }
+
+    /// The threads held open of one agent.
+    pub fn agent_threads(&self, agent_id: AgentId) -> Vec<ThreadId> {
+        self.threads
+            .keys()
+            .filter(|(agent, _)| *agent == agent_id)
+            .map(|(_, thread)| *thread)
+            .collect()
+    }
+
+    pub fn forget_thread(&mut self, agent_id: AgentId, thread: ThreadId) {
+        self.threads.remove(&(agent_id, thread));
+    }
+
     /// Lets go of one agent's transcript, held state and all.
     pub fn forget(&mut self, agent_id: AgentId) {
         self.open.remove(&agent_id);
         self.store.forget(agent_id);
-    }
-
-    /// Erases a durably deleted agent's host-owned history and status.
-    /// Unsent user messages remain available even after deletion.
-    pub fn erase(&mut self, agent_id: AgentId) {
-        self.open.remove(&agent_id);
-        self.store.erase(agent_id);
     }
 
     /// Opens an agent's transcript from what the client has read of it:
@@ -143,23 +159,13 @@ impl Transcripts {
 
     /// Lands one frame on an agent's rendered state.
     pub fn apply(&mut self, agent_id: AgentId, frame: TranscriptFrame) -> FrameChange {
-        let context_before = self.context_used(&agent_id);
-        let usage_before = self.store.get(&agent_id).map(|state| state.usage.clone());
         let (summary, was_live) = match frame {
             TranscriptFrame::Live(live) => (self.store.apply_live(agent_id, live), true),
             TranscriptFrame::Fold(state) => (self.store.set_fold(agent_id, state), false),
             TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
-            TranscriptFrame::Unsent(texts) => (self.store.set_unsent(agent_id, texts), false),
-            TranscriptFrame::Status(text) => (self.store.set_status(agent_id, text), false),
+            TranscriptFrame::Runtime(state) => (self.store.set_runtime(agent_id, state), false),
         };
-        let usage_changed =
-            usage_before.as_ref() != self.store.get(&agent_id).map(|state| &state.usage);
-        FrameChange {
-            summary,
-            context_before,
-            usage_changed,
-            was_live,
-        }
+        FrameChange { summary, was_live }
     }
 }
 
@@ -301,36 +307,6 @@ mod tests {
         assert!(!transcripts.is_open(&agent_id));
         assert!(transcripts.state(&agent_id).is_none());
         assert!(transcripts.open_agents().is_empty());
-    }
-
-    #[test]
-    fn deletion_erases_open_history_and_status_without_erasing_unsent_text() {
-        let mut transcripts = Transcripts::default();
-        let agent_id = agent();
-        assert!(transcripts.seed(agent_id, &turn(0, 0, "private history", 1)));
-        transcripts.apply(
-            agent_id,
-            TranscriptFrame::Status(Some("private status".into())),
-        );
-        transcripts.apply(
-            agent_id,
-            TranscriptFrame::Unsent(vec!["sole-copy message".into()]),
-        );
-        transcripts.erase(agent_id);
-        assert!(!transcripts.is_open(&agent_id));
-        assert!(transcripts.state(&agent_id).is_none());
-        assert!(transcripts.open_agents().is_empty());
-
-        assert!(transcripts.seed(agent_id, &turn(0, 0, "new history", 3)));
-        let blocks = &transcripts.state(&agent_id).unwrap().blocks;
-        assert!(blocks.iter().any(|block| matches!(&**block,
-            rho_agents_client::state::UiBlock::Unsent { text } if text == "sole-copy message")));
-        assert!(
-            !blocks
-                .iter()
-                .any(|block| matches!(&**block, rho_agents_client::state::UiBlock::Status { .. }))
-        );
-        assert_eq!(texts(&transcripts), ["new history"]);
     }
 
     /// The log's past read after newer mail lands before it, in time

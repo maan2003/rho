@@ -1,6 +1,6 @@
 //! What a node is called, in memory and in ledger keys.
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, MailId, ThreadId};
 
 /// What Slack calls a place a conversation happens: a direct or group
 /// conversation, a channel, or a followed thread.
@@ -12,6 +12,14 @@ pub struct SlackUnit {
     pub thread: Option<String>,
 }
 
+/// A mail thread between the user and an agent: the agent, which names
+/// the host its mail ids belong to, and the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MailThread {
+    pub agent: AgentId,
+    pub thread: ThreadId,
+}
+
 /// A thing in the user's world. Notes and labels are made by rho; every
 /// other node exists because its source says so.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,6 +29,7 @@ pub enum NodeId {
     Agent(AgentId),
     Slack(SlackUnit),
     PullRequest { repo: String, number: u64 },
+    Mail(MailThread),
 }
 
 impl NodeId {
@@ -36,6 +45,9 @@ impl NodeId {
                 None => format!("slack:{}/{}", unit.workspace, unit.channel),
             },
             Self::PullRequest { repo, number } => format!("pr:{repo}#{number}"),
+            Self::Mail(MailThread { agent, thread }) => {
+                format!("mail:{}/{}", agent.encoded(), thread.0.0)
+            }
         }
     }
 
@@ -64,6 +76,13 @@ impl NodeId {
                     number: number.parse().ok()?,
                 }
             }
+            "mail" => {
+                let (agent, thread) = rest.split_once('/')?;
+                Self::Mail(MailThread {
+                    agent: AgentId::from_encoded(agent).ok()?,
+                    thread: ThreadId(MailId(thread.parse().ok()?)),
+                })
+            }
             _ => return None,
         })
     }
@@ -75,6 +94,13 @@ impl NodeId {
     pub fn agent(&self) -> Option<AgentId> {
         match self {
             Self::Agent(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub fn mail(&self) -> Option<MailThread> {
+        match self {
+            Self::Mail(thread) => Some(*thread),
             _ => None,
         }
     }
@@ -131,6 +157,10 @@ mod tests {
                 repo: "maan2003/rho".into(),
                 number: 42,
             },
+            NodeId::Mail(MailThread {
+                agent: AgentId::from_encoded("00jvj4xuk96p").unwrap(),
+                thread: ThreadId(MailId(17)),
+            }),
         ];
         for node in nodes {
             assert!(!node.key().contains('|'));

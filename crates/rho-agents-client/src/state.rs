@@ -132,6 +132,9 @@ pub enum UiToolStatus {
     Reported,
     Error,
     Cancelled,
+    /// Its agent stopped working before any report closed it: not
+    /// running. The report comes with the agent's next request.
+    Ended,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

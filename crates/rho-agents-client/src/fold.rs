@@ -10,90 +10,22 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rho_agent_types::{
-    Address, AgentId, Mail, MailId, Place, SendKind, UnixMs, WorksetKind, Wpos, props,
+    Address, AgentId, Mail, MailId, Place, SendKind, ThreadId, UnixMs, WorksetKind, Wpos, props,
 };
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::rho2::{AgentEntry, LogEvent};
-use crate::protocol::transcript::{
-    InferenceState, RuntimeKind, RuntimeState, Speaker, ToolOutcome, ToolStatus,
-};
+use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
-/// A place in an agent's conversation with the user, which is how far the
-/// user has dealt with it. Mail `m` sits at `2m`. A stop has no mail id, so
-/// it sits half a step after the host's newest mail when it was seen:
-/// after everything said before it, and before anything said later.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-pub struct ConversationPos(pub u64);
-
-impl ConversationPos {
-    pub fn of_mail(mail: MailId) -> Self {
-        Self(mail.0.checked_mul(2).expect("mail log overflow"))
-    }
-
-    /// A stop seen while `head` was the host's newest mail.
-    pub fn of_stop(head: MailId) -> Self {
-        Self(Self::of_mail(head).0 + 1)
-    }
-
-    pub fn next(self) -> Self {
-        Self(self.0.checked_add(1).expect("conversation overflow"))
-    }
-}
-
-/// What the user last said about an agent: how far they have dealt with
-/// its conversation, and whether they muted it. The only facts attention
-/// needs that the host does not carry; kept by the client.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-pub struct Verdict {
-    /// One past the newest place the user has dealt with.
-    pub handled_through: ConversationPos,
-    pub muted: bool,
-}
-
-/// What the agent put to the user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+/// What the agent put to the user that wants an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Said {
     /// Mail asking for something the work needs.
     Ask,
-    /// The agent stopped on an error: as much an ask as a question.
-    Stopped,
     /// Mail delivering what the user asked for.
     Result,
-}
-
-impl Said {
-    /// How hard it pulls on the user: lower is stronger. A stop pulls as
-    /// hard as a question.
-    pub fn strength(self) -> u8 {
-        match self {
-            Self::Ask | Self::Stopped => 0,
-            Self::Result => 1,
-        }
-    }
-}
-
-/// One thing the agent put to the user since they last wrote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-pub struct Unread {
-    pub pos: ConversationPos,
-    pub at: UnixMs,
-    pub said: Said,
 }
 
 /// What an agent is: its directory entry and the kind of workset it is
@@ -196,25 +128,43 @@ impl AgentIdentity {
 /// prefix reads it.
 pub const PRESET: &str = "preset";
 
-/// What the rails read of an agent, folded from its mail and its runtime's
-/// status. Only the conversation with the user counts: what the agent says
-/// to other agents, and whether it is running, do not.
+/// What the rails read of an agent, folded from its mail. Only the
+/// conversation with the user counts: what the agent says to other agents,
+/// and whether it is running, do not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Digest {
-    /// One past the newest place folded.
-    pub newest: ConversationPos,
     /// One past the newest mail folded; older mail is a replay.
     mail_next: MailId,
-    /// The agent's newest status and the mail that said it, until any
-    /// later mail from either side hides it.
-    pub status: Option<(MailId, String)>,
     pub last_active: UnixMs,
     pub last_user_message_at: UnixMs,
     pub last_user_message_text: String,
     /// When it last sent the user anything but a status.
     pub last_sent_at: Option<UnixMs>,
-    /// What it put to the user since they last wrote, oldest first.
-    pub unread: Vec<Unread>,
+    /// Its threads with the user, by the mail that started each.
+    pub threads: std::collections::BTreeMap<ThreadId, ThreadDigest>,
+}
+
+/// A thread of mail between the user and an agent, as a card reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadDigest {
+    /// The first line of the mail that started it.
+    pub title: String,
+    /// The newest mail in it. A status is not: it says what the agent is
+    /// doing, not something said in the thread.
+    pub newest: MailId,
+    /// The agent's newest ask or result to the user since the user last
+    /// wrote in it. An fyi or a status neither is one nor hides one.
+    pub wants: Option<Wanting>,
+    /// When the user last wrote in it.
+    pub user_wrote_at: Option<UnixMs>,
+}
+
+/// A mail that wants the user: what it says, which mail, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wanting {
+    pub said: Said,
+    pub mail: MailId,
+    pub at: UnixMs,
 }
 
 impl Digest {
@@ -225,112 +175,57 @@ impl Digest {
             return false;
         }
         self.mail_next = mail.id.next();
-        let pos = ConversationPos::of_mail(mail.id);
-        self.newest = self.newest.max(pos.next());
         self.last_active = self.last_active.max(mail.at);
         let me = Address::Agent(agent);
+        self.thread_tell(me, mail);
         if mail.from == Address::User && mail.to == me {
-            self.user_spoke(mail.at, &text(mail));
-        } else if mail.from == me && mail.to == Address::User {
-            match mail.kind {
-                Some(SendKind::Status) => self.status = Some((mail.id, text(mail))),
-                kind => {
-                    let said = match kind {
-                        Some(SendKind::Ask) => Some(Said::Ask),
-                        Some(SendKind::Result) => Some(Said::Result),
-                        // Kept in the conversation, but nothing the user
-                        // is owed.
-                        Some(SendKind::Fyi | SendKind::Status) | None => None,
-                    };
-                    if let Some(said) = said {
-                        self.unread.push(Unread {
-                            pos,
-                            at: mail.at,
-                            said,
-                        });
-                    }
-                    self.status = None;
-                    self.last_sent_at = Some(mail.at);
-                }
-            }
+            self.last_user_message_at = mail.at;
+            self.last_user_message_text = one_line(&text(mail));
+        } else if mail.from == me && mail.to == Address::User && mail.kind != Some(SendKind::Status)
+        {
+            self.last_sent_at = Some(mail.at);
         }
         true
     }
 
-    /// What the agent's runtime is doing, seen while `head` was the host's
-    /// newest mail: a failure that will not retry is a stop put to the
-    /// user, anything else (a retry among it) ends one. Returns whether
-    /// anything changed.
-    pub fn observe(&mut self, state: &RuntimeState, head: MailId, at: UnixMs) -> bool {
-        match state.inference {
-            InferenceState::Failed { .. } => self.stopped(head, at),
-            InferenceState::Idle | InferenceState::Responding | InferenceState::Retrying { .. } => {
-                self.running()
-            }
+    /// Folds one mail into its thread, if the thread is between the user
+    /// and the agent.
+    fn thread_tell(&mut self, me: Address, mail: &Mail) {
+        let from_user = mail.from == Address::User && mail.to == me;
+        let to_user = mail.from == me && mail.to == Address::User;
+        if !(from_user || to_user) || mail.kind == Some(SendKind::Status) {
+            return;
         }
-    }
-
-    /// The agent's runtime stopped on an error while `head` was the host's
-    /// newest mail. A stop already held is the same stop, told again by a
-    /// reconnect; returns whether anything changed.
-    fn stopped(&mut self, head: MailId, at: UnixMs) -> bool {
-        if self.stop().is_some() {
-            return false;
+        let thread = self
+            .threads
+            .entry(mail.thread)
+            .or_insert_with(|| ThreadDigest {
+                // The root names the thread; a thread first heard of after
+                // its root is named by what was heard.
+                title: one_line(&text(mail)),
+                newest: mail.id,
+                wants: None,
+                user_wrote_at: None,
+            });
+        if mail.id == mail.thread.0 {
+            thread.title = one_line(&text(mail));
         }
-        let pos = ConversationPos::of_stop(head);
-        self.newest = self.newest.max(pos.next());
-        self.unread.push(Unread {
-            pos,
-            at,
-            said: Said::Stopped,
-        });
-        true
-    }
-
-    /// A stop the copy kept across a restart.
-    pub fn restore_stop(&mut self, stop: Unread) {
-        if self.stop().is_none() {
-            self.newest = self.newest.max(stop.pos.next());
-            self.unread.push(stop);
+        thread.newest = mail.id;
+        let said = match mail.kind {
+            Some(SendKind::Ask) => Some(Said::Ask),
+            Some(SendKind::Result) => Some(Said::Result),
+            Some(SendKind::Fyi | SendKind::Status) | None => None,
+        };
+        if from_user {
+            thread.wants = None;
+            thread.user_wrote_at = Some(mail.at);
+        } else if let Some(said) = said {
+            thread.wants = Some(Wanting {
+                said,
+                mail: mail.id,
+                at: mail.at,
+            });
         }
-    }
-
-    /// The runtime is not stopped: whatever stop was held is over.
-    fn running(&mut self) -> bool {
-        let before = self.unread.len();
-        self.unread.retain(|unread| unread.said != Said::Stopped);
-        before != self.unread.len()
-    }
-
-    /// The stop the user has not dealt with by writing, if any.
-    pub fn stop(&self) -> Option<Unread> {
-        self.unread
-            .iter()
-            .find(|unread| unread.said == Said::Stopped)
-            .copied()
-    }
-
-    /// The strongest thing the agent put to the user past `seen`, counted
-    /// from the oldest of that kind (`rho-dealer/cases.md`, A5).
-    pub fn strongest_unread(&self, seen: ConversationPos) -> Option<Unread> {
-        self.unread
-            .iter()
-            .filter(|unread| unread.pos >= seen)
-            .min_by_key(|unread| (unread.said.strength(), unread.pos))
-            .copied()
-    }
-
-    /// The newest thing put to the user: where the card's source last moved.
-    pub fn newest_unread(&self) -> Option<Unread> {
-        self.unread.iter().max_by_key(|unread| unread.pos).copied()
-    }
-
-    /// Writing reads everything before it.
-    fn user_spoke(&mut self, at: UnixMs, text: &str) {
-        self.last_user_message_at = at;
-        self.last_user_message_text = one_line(text);
-        self.status = None;
-        self.unread.clear();
     }
 }
 
@@ -424,6 +319,41 @@ pub fn interleave(
             Some(row) => merged.push(row),
             None => return merged,
         }
+    }
+}
+
+/// One mail thread between the user and an agent, as its mails were
+/// written, oldest first, then what the user wrote in it that no host has
+/// taken yet. A status is the agent's status line, not something said in
+/// the thread.
+pub fn thread_state(
+    agent: AgentId,
+    thread: ThreadId,
+    mails: &[Mail],
+    unsent: &[String],
+) -> UiAgentState {
+    let me = Address::Agent(agent);
+    let said = mails
+        .iter()
+        .filter(|mail| mail.thread == thread && mail.kind != Some(SendKind::Status))
+        .filter_map(|mail| match (mail.from, mail.to) {
+            (Address::User, to) if to == me => Some(UiBlock::UserMessage { text: text(mail) }),
+            (from, Address::User) if from == me => Some(UiBlock::MessageSent {
+                to: None,
+                text: text(mail),
+            }),
+            _ => None,
+        });
+    let waiting = unsent
+        .iter()
+        .map(|text| UiBlock::Unsent { text: text.clone() });
+    UiAgentState {
+        exec_timings: Arc::default(),
+        blocks: said.chain(waiting).map(Arc::new).collect(),
+        status: UiAgentStatus::Idle,
+        runtime: None,
+        context_used: None,
+        usage: UiAgentUsage::default(),
     }
 }
 
@@ -1540,107 +1470,129 @@ mod tests {
         digest
     }
 
-    /// The card counts from the oldest unread of the strongest kind
-    /// (`rho-dealer/cases.md`, A5); a status, an fyi and mail between
-    /// agents are never owed to the user.
+    /// A thread is named by its root and wants the user only while its
+    /// newest mail is the agent's ask or result to them. A status does not
+    /// move it; mail between agents is no thread of the user's.
     #[test]
-    fn the_strongest_unread_counts_from_its_oldest() {
-        let peer = Address::Agent(agent(2));
-        let digest = digest(&[
-            from_user(1, 1),
-            to_user(2, SendKind::Result, 2),
-            to_user(3, SendKind::Status, 3),
-            to_user(4, SendKind::Fyi, 4),
-            mail(5, Address::Agent(me()), peer, Some(SendKind::Ask), 5),
-            to_user(6, SendKind::Ask, 6),
-            to_user(7, SendKind::Ask, 7),
-        ]);
-        let strongest = |seen| {
-            digest
-                .strongest_unread(seen)
-                .map(|unread| (unread.said, unread.pos))
+    fn a_thread_wants_the_user_while_its_newest_mail_asks_or_answers() {
+        let in_thread = |mut mail: Mail, root: u64| {
+            mail.thread = ThreadId(MailId(root));
+            mail
         };
-        let at = |id| ConversationPos::of_mail(MailId(id));
-        assert_eq!(strongest(ConversationPos(0)), Some((Said::Ask, at(6))));
-        assert_eq!(strongest(at(7)), Some((Said::Ask, at(7))));
-        assert_eq!(strongest(digest.newest), None);
+        let peer = Address::Agent(agent(2));
+        let mut digest = digest(&[
+            from_user(1, 1),
+            in_thread(to_user(2, SendKind::Ask, 2), 1),
+            to_user(3, SendKind::Result, 3),
+            in_thread(to_user(4, SendKind::Status, 4), 1),
+            mail(5, Address::Agent(me()), peer, Some(SendKind::Ask), 5),
+        ]);
         assert_eq!(
-            digest.unread.len(),
-            3,
-            "a status, an fyi and agent mail are no card"
+            digest.threads.keys().copied().collect::<Vec<_>>(),
+            [ThreadId(MailId(1)), ThreadId(MailId(3))]
         );
-        assert_eq!(digest.last_sent_at, Some(UnixMs(7)));
+        let wants = |digest: &Digest, root| {
+            digest.threads[&ThreadId(MailId(root))]
+                .wants
+                .map(|wanting| (wanting.said, wanting.mail))
+        };
+        let first = &digest.threads[&ThreadId(MailId(1))];
+        assert_eq!(first.title, "mail 1");
+        assert_eq!(first.newest, MailId(2), "a status is not in it");
+        assert_eq!(first.user_wrote_at, Some(UnixMs(1)));
+        assert_eq!(wants(&digest, 1), Some((Said::Ask, MailId(2))));
+        assert_eq!(digest.threads[&ThreadId(MailId(3))].user_wrote_at, None);
+        assert_eq!(wants(&digest, 3), Some((Said::Result, MailId(3))));
+
+        digest.tell(me(), &in_thread(from_user(6, 6), 3));
+        digest.tell(me(), &in_thread(to_user(7, SendKind::Fyi, 7), 1));
+        digest.tell(me(), &in_thread(to_user(8, SendKind::Result, 8), 1));
+        assert_eq!(wants(&digest, 3), None, "the user answered");
+        assert_eq!(
+            wants(&digest, 1),
+            Some((Said::Result, MailId(8))),
+            "the newest ask or result, past an fyi"
+        );
+        digest.tell(me(), &in_thread(to_user(9, SendKind::Fyi, 9), 1));
+        assert_eq!(
+            wants(&digest, 1),
+            Some((Said::Result, MailId(8))),
+            "an fyi hides nothing"
+        );
+        assert_eq!(digest.threads[&ThreadId(MailId(1))].newest, MailId(9));
     }
 
-    /// A status is the status line until any later mail to the user.
+    /// A thread shows its own mails as written, and what waits to be sent
+    /// after them; another thread's mail, a status, and mail between
+    /// agents are not in it.
     #[test]
-    fn a_status_is_never_unread() {
+    fn a_thread_shows_its_mails_as_written_then_what_waits() {
+        let in_thread = |mut mail: Mail, root: u64| {
+            mail.thread = ThreadId(MailId(root));
+            mail
+        };
+        let peer = Address::Agent(agent(2));
+        let mails = [
+            from_user(1, 1),
+            in_thread(to_user(2, SendKind::Ask, 2), 1),
+            to_user(3, SendKind::Result, 3),
+            in_thread(to_user(4, SendKind::Status, 4), 1),
+            in_thread(mail(5, Address::Agent(me()), peer, None, 5), 1),
+            in_thread(to_user(6, SendKind::Fyi, 6), 1),
+        ];
+        let state = thread_state(me(), ThreadId(MailId(1)), &mails, &["later".to_owned()]);
+        let sent = |text: &str| UiBlock::MessageSent {
+            to: None,
+            text: text.into(),
+        };
+        assert_eq!(
+            state
+                .blocks
+                .iter()
+                .map(|block| (**block).clone())
+                .collect::<Vec<_>>(),
+            [
+                UiBlock::UserMessage {
+                    text: "mail 1".into()
+                },
+                sent("mail 2"),
+                sent("mail 6"),
+                UiBlock::Unsent {
+                    text: "later".into()
+                },
+            ]
+        );
+    }
+
+    /// A status is not a send: it says what the agent is doing.
+    #[test]
+    fn a_status_is_not_a_send() {
         let mut digest = digest(&[to_user(1, SendKind::Status, 1)]);
-        assert!(digest.unread.is_empty());
-        assert_eq!(digest.status, Some((MailId(1), "mail 1".into())));
         assert_eq!(digest.last_sent_at, None, "a status is not a send");
         digest.tell(me(), &to_user(2, SendKind::Fyi, 2));
-        assert_eq!(digest.status, None);
-        assert!(digest.unread.is_empty());
+        assert_eq!(digest.last_sent_at, Some(UnixMs(2)));
     }
 
-    /// The user writing reads everything before it, once: the same mail
-    /// heard again (a reconnect replays the log from a cursor) does not
-    /// read what the agent said after it.
+    /// The same mail heard again (a reconnect replays the log from a
+    /// cursor) is not news: a thread the user answered stays answered.
     #[test]
-    fn writing_reads_what_came_before_it_and_a_replay_reads_nothing() {
-        let mut digest = digest(&[to_user(1, SendKind::Ask, 1), from_user(2, 2)]);
-        assert!(
-            digest.unread.is_empty(),
-            "writing reads everything before it"
-        );
+    fn a_replay_is_not_news() {
+        let mut digest = digest(&[to_user(1, SendKind::Ask, 1)]);
+        let mut answer = from_user(2, 2);
+        answer.thread = ThreadId(MailId(1));
+        assert!(digest.tell(me(), &answer));
         assert_eq!(digest.last_user_message_text, "mail 2");
-        assert!(digest.tell(me(), &to_user(3, SendKind::Result, 3)));
-        assert!(!digest.tell(me(), &from_user(2, 2)), "a replay is not news");
-        assert_eq!(digest.unread.len(), 1, "the result after it is still owed");
-        assert_eq!(digest.newest, ConversationPos::of_mail(MailId(3)).next());
-    }
-
-    /// A stop sits after the mail before it and before the mail after it,
-    /// so dealing with the conversation up to a stop deals with the stop,
-    /// and mail after a dealt-with stop is owed again.
-    #[test]
-    fn a_stop_is_ordered_between_the_mail_around_it() {
-        let mut digest = digest(&[to_user(4, SendKind::Result, 1)]);
-        let seen_mail = digest.newest;
-        assert!(digest.stopped(MailId(9), UnixMs(2)));
-        assert!(
-            !digest.stopped(MailId(12), UnixMs(3)),
-            "told again by a reconnect"
-        );
-        let stop = digest
-            .strongest_unread(seen_mail)
-            .expect("the stop is owed");
-        assert_eq!(stop.said, Said::Stopped);
-        let seen_stop = digest.newest;
-        assert_eq!(digest.strongest_unread(seen_stop), None);
-        digest.tell(me(), &to_user(10, SendKind::Result, 4));
+        let mut result = to_user(3, SendKind::Result, 3);
+        result.thread = ThreadId(MailId(1));
+        assert!(digest.tell(me(), &result));
+        assert!(!digest.tell(me(), &answer), "a replay is not news");
         assert_eq!(
-            digest.strongest_unread(seen_stop).map(|unread| unread.said),
-            Some(Said::Result),
-            "mail after the stop is new"
+            digest.threads[&ThreadId(MailId(1))]
+                .wants
+                .map(|wanting| wanting.mail),
+            Some(MailId(3)),
+            "the result after the answer is still owed"
         );
-        let retrying = RuntimeState {
-            inference: InferenceState::Retrying {
-                at: UnixMs(6),
-                error: "overloaded".into(),
-            },
-            running_tasks: 0,
-            awaiting_human: false,
-            checkin_at: None,
-            archived: false,
-            stale: false,
-        };
-        assert!(
-            digest.observe(&retrying, MailId(12), UnixMs(5)),
-            "a retry ends it"
-        );
-        assert!(digest.stop().is_none());
     }
 
     #[test]

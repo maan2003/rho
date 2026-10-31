@@ -9,12 +9,15 @@ Home shows three sections: **next**, every card by priority until it fades
 below the floor, **recent**, the user's agents by their latest send, folded, and **piles**, what the
 user put away, which they open to be dealt from it.
 
-## Agents
+## Mail threads
 
-An agent reaches the user only through their conversation: its sends, the
-user's messages, and the host's notices about it. Its mail with other
-agents is never unread, and whether it is running never ranks. Every send names its kind,
-picked by whether the user needs to read it now:
+An agent reaches the user only through mail, and mail comes in threads:
+a thread is named by the mail that started it, and an agent answers in the
+thread of the newest mail between it and the user. Each thread between
+the user and one of their agents is a node; the agent itself is never a
+card. Its mail with other agents is never unread, and whether it is
+running never ranks. Every send names its kind, picked by whether the
+user needs to read it now:
 
 ```
 1. Yes: it asks them for something the work needs: a decision, an
@@ -27,24 +30,24 @@ picked by whether the user needs to read it now:
 4. No, and it is passing: "on it", "86% done".                  → status
 ```
 
-The user reads a conversation explicitly: a done, or a message of their
-own, reads it through to its end. Opening it reads nothing.
+The user reads a thread explicitly: a done, or a message of their own in
+it, reads it through to its end. Opening it reads nothing. A card is
+titled by the first line of the thread's first mail, and its context is
+the agent.
 
 | # | History and facts | Card |
 |---|---|---|
 | A1 | An unread ask | "asks", rises |
 | A2 | An unread result | "result", below an ask, fades, gone after ~3 days |
-| A3 | An fyi | nothing; it stays in the conversation, where the user reads it |
-| A4 | A status | nothing; it is the agent's status line until any later message, from either side, hides it |
-| A5 | Several unread sends | one card, of the strongest kind, counting from its oldest unread send |
+| A3 | An fyi | nothing, and it hides no ask or result before it; it stays in the thread, where the user reads it |
+| A4 | A status | nothing, and it hides nothing; it is in no thread |
+| A5 | Several unread sends | one card, of the newest ask or result, counting from it |
 | A6 | Read | nothing until a newer ask or result |
-| A7 | The user wrote within the hour before the send | a bonus, fading over the hour |
-| A8 | Its runtime reports it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask, until the runtime runs again or the user writes |
-| A9 | Its runtime retries an error by itself | nothing |
+| A7 | The user wrote in the thread within the hour before the send | a bonus, fading over the hour |
 | A10 | An engineer another agent started for the user | its brief, mail from that agent, is context, never unread; it deals by its own sends |
 | A11 | Made by another agent for its own work | nothing; it belongs to that agent |
-| A12 | Running, waiting, or idle | changes nothing |
-| A13 | Muted, or its host is gone | nothing |
+| A12 | Its runtime running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not mail |
+| A13 | The thread or its agent muted, or its host gone | nothing |
 
 ## Snoozes
 
@@ -53,7 +56,7 @@ own, reads it through to its end. Opening it reads nothing.
 | Z1 | Snoozed | nothing until it ends |
 | Z2 | Snooze ends, the node still wants the user | its own card, its wait counting from the snooze's end |
 | Z3 | Snooze ends, the node wants nothing | nothing |
-| Z4 | Snoozed, then the user wrote to the agent | the snooze holds, but a reply within 1h of the user's message comes through |
+| Z4 | Snoozed, then the user wrote in the thread | the snooze holds, but a reply within 1h of the user's message comes through |
 | Z5 | Snoozed, then the other side wrote | a direct message, or a thread of 3 people or fewer: a small bump per message when it comes back; nothing for other threads and agents |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
 
@@ -72,8 +75,8 @@ own, reads it through to its end. Opening it reads nothing.
 | T1 | Todo | low, never fades, rises slowly, stays until done |
 | T2 | Todo with a start date | nothing until then, then as T1 |
 | T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
-| T4 | Todo on an agent | as T1, whatever the agent is doing |
-| T5 | Todo on an agent, then the user writes to it | the todo stays; only done clears it |
+| T4 | Todo on a mail thread | as T1, whatever the agent is doing |
+| T5 | Todo on a mail thread, then the user writes in it | the todo stays; only done clears it |
 | T6 | Done or muted | takes back the todo, the deadline and the snooze |
 
 ## Slack

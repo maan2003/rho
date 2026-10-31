@@ -96,16 +96,14 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
     }
 }
 
-/// What a card is called on a Home row. An agent is its tag, a Slack card
-/// is its conversation and what it is about, and anything else is its
-/// title.
-pub(crate) fn card_title(card: &Card, agent_tag: impl Fn(AgentId) -> String) -> String {
-    match (card.kind, &card.node) {
-        (CardKind::Agent, NodeId::Agent(agent_id)) => agent_tag(*agent_id),
-        (CardKind::Slack, _) if card.context.is_empty() => card.title.clone(),
-        (CardKind::Slack, _) if card.title.is_empty() => card.context.clone(),
-        (CardKind::Slack, _) => format!("{} › {}", card.context, card.title),
-        _ => card.title.clone(),
+/// What a card is called on a Home row. A mail or Slack thread is who it
+/// is with and what it is about, and anything else is its title.
+pub(crate) fn card_title(card: &Card) -> String {
+    match card.kind {
+        CardKind::Mail | CardKind::Slack if card.context.is_empty() => card.title.clone(),
+        CardKind::Mail | CardKind::Slack if card.title.is_empty() => card.context.clone(),
+        CardKind::Mail | CardKind::Slack => format!("{} › {}", card.context, card.title),
+        CardKind::Dated => card.title.clone(),
     }
 }
 
@@ -512,24 +510,20 @@ mod tests {
             skipped: false,
             ..card("", 2.0)
         };
-        let rows = split_hand(std::slice::from_ref(&thread), |card| {
-            card_title(card, |_| unreachable!())
-        });
+        let rows = split_hand(std::slice::from_ref(&thread), card_title);
         assert_eq!(rows.next[0].title, "#design › can you look at the deploy?");
         assert_eq!(rows.next[0].label, "needs reply · 1.9h");
 
-        let agent = Card {
-            node: NodeId::Agent(
-                AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap(),
-            ),
-            kind: CardKind::Agent,
-            title: "slack polish".to_owned(),
+        let mail = Card {
+            kind: CardKind::Mail,
+            context: "eng-b8os".to_owned(),
+            title: "is the deploy green?".to_owned(),
             ..card("", 1.0)
         };
         assert_eq!(
-            card_title(&agent, |_| "eng-b8os".to_owned()),
-            "eng-b8os",
-            "an agent row is the agent, not where it is filed"
+            card_title(&mail),
+            "eng-b8os › is the deploy green?",
+            "a mail row is the agent and the thread, as a Slack row is"
         );
     }
 

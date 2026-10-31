@@ -68,13 +68,10 @@ impl FrameSummary {
     }
 }
 
-/// One agent's transcript: the fold, the live tail, what the user has not
-/// yet sent, the agent's status line, and the four composed.
+/// One agent's transcript: the fold, the live tail, and the two composed.
 struct Layered {
     fold: UiAgentState,
     tail: Tail,
-    unsent: Vec<Arc<UiBlock>>,
-    status: Option<Arc<UiBlock>>,
     state: UiAgentState,
     committed_tools: std::collections::HashSet<String>,
 }
@@ -92,6 +89,26 @@ impl Layered {
             .collect();
     }
 
+    /// Whether the agent says it is working; one that says nothing is not.
+    fn working(&self) -> bool {
+        self.tail
+            .runtime
+            .as_ref()
+            .is_some_and(RuntimeState::is_working)
+    }
+
+    /// The first call of the fold that no report has closed, or the end
+    /// of the fold: where the blocks that change with `working` start.
+    fn first_open_call(&self) -> usize {
+        self.fold
+            .blocks
+            .iter()
+            .position(|block| {
+                matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
+            })
+            .unwrap_or(self.fold.blocks.len())
+    }
+
     /// Composes from one index on, leaving the blocks before it as the
     /// pointers they already were.
     fn compose_from(&mut self, from: usize) {
@@ -99,9 +116,20 @@ impl Layered {
             .min(self.state.blocks.len())
             .min(self.fold.blocks.len());
         self.state.blocks.truncate(from);
+        let working = self.working();
         self.state
             .blocks
-            .extend(self.fold.blocks[from..].iter().cloned());
+            .extend(self.fold.blocks[from..].iter().map(|block| match &**block {
+                // A call no report has closed runs only while its agent
+                // says it is working.
+                UiBlock::Tool(tool) if tool.status == UiToolStatus::Running && !working => {
+                    Arc::new(UiBlock::Tool(UiTool {
+                        status: UiToolStatus::Ended,
+                        ..tool.clone()
+                    }))
+                }
+                _ => block.clone(),
+            }));
         self.state.blocks.extend(self.tail.response.iter().flat_map(|response| &response.items)
             .filter(|item| !matches!(item, Item::ToolCall { id, .. } if self.committed_tools.contains(id)))
             .map(|item| {
@@ -116,8 +144,6 @@ impl Layered {
                 .blocks
                 .push(Arc::new(UiBlock::MessageDraft { text: text.clone() }));
         }
-        self.state.blocks.extend(self.unsent.iter().cloned());
-        self.state.blocks.extend(self.status.iter().cloned());
         self.state.status = match self.tail.runtime.as_ref() {
             Some(RuntimeState {
                 inference: InferenceState::Responding,
@@ -203,10 +229,6 @@ pub fn block(item: &Item) -> UiBlock {
 #[derive(Default)]
 pub struct AgentStore {
     states: HashMap<AgentId, Layered>,
-    /// Kept apart from `states` so a transcript forgotten and opened
-    /// again still shows what waits to be sent.
-    unsent: HashMap<AgentId, Vec<Arc<UiBlock>>>,
-    status: HashMap<AgentId, Arc<UiBlock>>,
 }
 
 impl AgentStore {
@@ -263,46 +285,15 @@ impl AgentStore {
         summary
     }
 
+    /// What the agent's runtime says it is doing, on its own: the status
+    /// every agent's host sends, not only the focused ones'.
+    pub fn set_runtime(&mut self, agent_id: AgentId, state: RuntimeState) -> FrameSummary {
+        self.change(agent_id, true, |layered| layered.tail.runtime = Some(state))
+    }
+
     /// One change to what the runtime has past the mirror.
     pub fn apply_live(&mut self, agent_id: AgentId, live: Live) -> FrameSummary {
         self.change(agent_id, true, |layered| layered.tail.apply(live))
-    }
-
-    /// What the user wrote that no host has taken yet, oldest first.
-    pub fn set_unsent(&mut self, agent_id: AgentId, texts: Vec<String>) -> FrameSummary {
-        let unsent: Vec<_> = texts
-            .into_iter()
-            .map(|text| Arc::new(UiBlock::Unsent { text }))
-            .collect();
-        if unsent.is_empty() {
-            self.unsent.remove(&agent_id);
-        } else {
-            self.unsent.insert(agent_id, unsent.clone());
-        }
-        // A transcript not yet open picks them up when it opens; opening
-        // one here would pass for a transcript with nothing else in it.
-        if !self.states.contains_key(&agent_id) {
-            return FrameSummary::nothing();
-        }
-        self.change(agent_id, true, |layered| layered.unsent = unsent)
-    }
-
-    /// What the agent says it is doing, or `None` once it stops saying.
-    pub fn set_status(&mut self, agent_id: AgentId, text: Option<String>) -> FrameSummary {
-        let status = text
-            .filter(|text| !text.is_empty())
-            .map(|text| Arc::new(UiBlock::Status { text }));
-        if self.status.get(&agent_id) == status.as_ref() {
-            return FrameSummary::nothing();
-        }
-        match &status {
-            Some(block) => self.status.insert(agent_id, block.clone()),
-            None => self.status.remove(&agent_id),
-        };
-        if !self.states.contains_key(&agent_id) {
-            return FrameSummary::nothing();
-        }
-        self.change(agent_id, true, |layered| layered.status = status)
     }
 
     /// Drop ephemeral status and response when transport is lost.
@@ -324,21 +315,10 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
-    /// Erases host-owned content after durable deletion, while retaining
-    /// the user's unsent messages, which have no other copy.
-    pub fn erase(&mut self, agent_id: AgentId) {
-        self.forget(agent_id);
-        self.status.remove(&agent_id);
-    }
-
     fn layered(&mut self, agent_id: AgentId) -> &mut Layered {
-        let unsent = &self.unsent;
-        let status = &self.status;
         self.states.entry(agent_id).or_insert_with(|| Layered {
             fold: empty_state(),
             tail: Tail::default(),
-            unsent: unsent.get(&agent_id).cloned().unwrap_or_default(),
-            status: status.get(&agent_id).cloned(),
             state: empty_state(),
             committed_tools: Default::default(),
         })
@@ -351,18 +331,22 @@ impl AgentStore {
         change: impl FnOnce(&mut Layered),
     ) -> FrameSummary {
         let layered = self.layered(agent_id);
+        let was_working = layered.working();
+        change(layered);
         // The durable prefix cannot change on a live update. Keep its Arc
         // pointers in place and compare only the old and new live suffix:
         // O(tail blocks + their payload), independent of loaded history.
         // A replacement snapshot still has to materialize its whole tail.
-        let from = if tail_only {
-            layered.fold.blocks.len()
-        } else {
-            0
-        };
+        // The calls no report has closed are drawn as the agent's work
+        // says, so they change when it starts or stops.
+        let from = match tail_only {
+            true if layered.working() == was_working => layered.fold.blocks.len(),
+            true => layered.first_open_call(),
+            false => 0,
+        }
+        .min(layered.state.blocks.len());
         let old_status = layered.state.status;
         let old_tail = layered.state.blocks.split_off(from);
-        change(layered);
         layered.compose_from(from);
         let mut summary = summarize(&old_tail, &layered.state.blocks[from..]);
         if let Some(index) = &mut summary.first_changed_block {
@@ -418,7 +402,7 @@ fn empty_state() -> UiAgentState {
 /// What changed between two block lists: the first index that differs,
 /// and whether it is one block growing in place. Blocks the fold kept
 /// are the same pointer on both sides, which `Arc`'s equality sees first.
-fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
+pub fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
     let shared = old.len().min(new.len());
     let first_changed = (0..shared).find(|index| old[*index] != new[*index]);
     let first_changed = match first_changed {
@@ -516,40 +500,6 @@ mod tests {
             .collect()
     }
 
-    /// Unsent messages trail everything, the agent's own queue included,
-    /// and are still there when a forgotten transcript opens again; setting
-    /// them opens no transcript by itself.
-    #[test]
-    fn unsent_messages_trail_the_transcript_and_outlive_forgetting_it() {
-        let mut store = AgentStore::default();
-        store.set_unsent(agent(), vec!["later".into()]);
-        assert!(store.get(&agent()).is_none(), "no transcript is opened");
-
-        let mut fold = empty_state();
-        fold.blocks
-            .push(Arc::new(UiBlock::UserMessage { text: "hi".into() }));
-        let queued = UiBlock::QueuedMessage {
-            text: "queued".into(),
-            sender: None,
-        };
-        let mut queued_fold = fold.clone();
-        queued_fold.blocks.push(Arc::new(queued.clone()));
-        store.set_fold(agent(), queued_fold);
-        let unsent = UiBlock::Unsent {
-            text: "later".into(),
-        };
-        let said = UiBlock::UserMessage { text: "hi".into() };
-        assert_eq!(blocks(&store), [said.clone(), queued, unsent.clone()]);
-
-        store.forget(agent());
-        store.set_fold(agent(), fold);
-        assert_eq!(blocks(&store), [said.clone(), unsent]);
-
-        let summary = store.set_unsent(agent(), Vec::new());
-        assert_eq!(summary.first_changed_block, Some(1));
-        assert_eq!(blocks(&store), [said]);
-    }
-
     #[test]
     fn snapshots_replace_shrinking_or_new_responses_and_repeat_idempotently() {
         let mut store = AgentStore::default();
@@ -608,6 +558,74 @@ mod tests {
             }
         );
         assert_eq!(store.get(&agent()).unwrap().blocks.len(), 1_000);
+    }
+
+    /// A call no report has closed runs only while the agent says it is
+    /// working: a turn's last call is reported in the next request, so it
+    /// stays open after the agent is done.
+    #[test]
+    fn an_open_call_runs_only_while_its_agent_works() {
+        let mut store = AgentStore::default();
+        let call = |id: &str, status| {
+            Arc::new(UiBlock::Tool(UiTool {
+                status,
+                ..match block(&Item::ToolCall {
+                    id: id.into(),
+                    name: "exec".into(),
+                    arguments: "end_turn()".into(),
+                    format: ArgumentsFormat::Text,
+                }) {
+                    UiBlock::Tool(tool) => tool,
+                    _ => unreachable!(),
+                }
+            }))
+        };
+        let statuses = |store: &AgentStore| {
+            store
+                .get(&agent())
+                .unwrap()
+                .blocks
+                .iter()
+                .filter_map(|block| match &**block {
+                    UiBlock::Tool(tool) => Some(tool.status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut fold = empty_state();
+        fold.blocks = vec![
+            call("reported", UiToolStatus::Reported),
+            Arc::new(UiBlock::Notice { text: "a".into() }),
+            call("open", UiToolStatus::Running),
+        ];
+        store.set_fold(agent(), fold);
+        // Nothing said: not working.
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Ended]
+        );
+        let working = RuntimeState {
+            running_tasks: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            store.set_runtime(agent(), working).first_changed_block,
+            Some(2)
+        );
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Running]
+        );
+        assert_eq!(
+            store
+                .set_runtime(agent(), RuntimeState::default())
+                .first_changed_block,
+            Some(2)
+        );
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Ended]
+        );
     }
 
     #[test]
@@ -810,34 +828,6 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["one"]);
-    }
-
-    #[test]
-    fn deletion_erases_status_and_live_content_but_retains_unsent_messages_and_peers() {
-        let mut store = AgentStore::default();
-        let peer = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        store.apply_live(
-            agent(),
-            snapshot("deleted", vec![text("private live text")]),
-        );
-        store.set_status(agent(), Some("private status text".into()));
-        store.set_unsent(agent(), vec!["sole-copy unsent text".into()]);
-        store.apply_live(peer, snapshot("peer", vec![text("peer live text")]));
-        store.set_status(peer, Some("peer status text".into()));
-        let peer_before = store.get(&peer).unwrap().clone();
-
-        store.erase(agent());
-        assert!(store.get(&agent()).is_none());
-        assert!(!store.status.contains_key(&agent()));
-        assert_eq!(store.get(&peer).unwrap(), &peer_before);
-        // Reopening starts with only the unsent words: neither host status nor
-        // an old live response is allowed to reappear.
-        store.set_fold(agent(), empty_state());
-        let state = store.get(&agent()).unwrap();
-        assert_eq!(state.blocks.len(), 1);
-        assert!(
-            matches!(&*state.blocks[0], UiBlock::Unsent { text } if text == "sole-copy unsent text")
-        );
     }
 
     #[test]
