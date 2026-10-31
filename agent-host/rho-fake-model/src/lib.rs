@@ -226,10 +226,11 @@ struct Activity {
     gaps: std::collections::VecDeque<u64>,
 }
 
-/// Per response: the tools it was offered, and the tool outputs its
-/// context held, so a continuation that sends only its suffix still counts
-/// every output of the chain.
-type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>, usize)>;
+/// Per response: the tools it was offered, the tool outputs its context
+/// held, and the topic of its newest message, so a continuation that sends
+/// only its suffix still counts every output of the chain and answers in
+/// its topic.
+type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>, usize, Option<u64>)>;
 
 #[derive(Clone)]
 struct AppState {
@@ -598,22 +599,26 @@ fn openai_turn(
         })
         .count();
     let mut tools = request_tools(request);
+    let mut topic = newest_topic(request);
     {
         let mut remembered = state.response_tools.lock().unwrap();
         if let Some(previous) = &request.previous_response_id
-            && let Some((_, inherited, outputs)) =
-                remembered.iter().find(|(id, _, _)| id == previous)
+            && let Some((_, inherited, outputs, inherited_topic)) =
+                remembered.iter().find(|(id, ..)| id == previous)
         {
             if tools.is_empty() {
                 tools = inherited.clone();
             }
             output_count += outputs;
+            topic = topic.or(*inherited_topic);
         }
         if remembered.len() == 256 {
             remembered.pop_front();
         }
-        remembered.push_back((response_id.clone(), tools.clone(), output_count));
+        remembered.push_back((response_id.clone(), tools.clone(), output_count, topic));
     }
+    // A chain without a message answers in topic 0, which policy refuses.
+    let topic = topic.unwrap_or(0);
     if state.config.scenario == Scenario::RealToolRounds && (!tools.is_empty() || has_tool_result) {
         let outputs: Vec<_> = request
             .input
@@ -662,7 +667,15 @@ fn openai_turn(
             let tool = tools.iter().find(|tool| tool.name == "exec").unwrap();
             append_tool_call(&mut events, state, request_number, 0, tool, Some(source));
         } else {
-            append_finish(&mut events, state, request_number, request, &tools, 0);
+            append_finish(
+                &mut events,
+                state,
+                request_number,
+                request,
+                &tools,
+                topic,
+                0,
+            );
         }
     } else if state.config.scenario == Scenario::ReasoningCompaction && !has_compaction {
         append_reasoning(&mut events, request_number, 0);
@@ -682,7 +695,15 @@ fn openai_turn(
     } else if asks_compaction {
         append_compaction(&mut events, state, request_number, 0);
     } else if state.config.scenario == Scenario::ReasoningCompaction && has_compaction {
-        append_finish(&mut events, state, request_number, request, &tools, 0);
+        append_finish(
+            &mut events,
+            state,
+            request_number,
+            request,
+            &tools,
+            topic,
+            0,
+        );
     } else if matches!(
         state.config.scenario,
         Scenario::HugeToolOutput | Scenario::FortyToolCalls
@@ -712,6 +733,7 @@ fn openai_turn(
             request_number,
             request,
             &tools,
+            topic,
             usize::from(state.config.scenario == Scenario::StreamCut),
         );
     } else if !tools.is_empty()
@@ -730,27 +752,31 @@ fn openai_turn(
         append_tool_call(&mut events, state, request_number, 1, tool, None);
     } else {
         append_reasoning(&mut events, request_number, 0);
-        append_finish(&mut events, state, request_number, request, &tools, 1);
+        append_finish(
+            &mut events,
+            state,
+            request_number,
+            request,
+            &tools,
+            topic,
+            1,
+        );
     }
     events.push(json!({"type":"response.completed","response":{"id":response_id,"usage":{"input_tokens":request.input.len() * 31 + 17,"input_tokens_details":{"cached_tokens":if request.previous_response_id.is_some(){19}else{0}},"output_tokens":events.len() * 7 + 3}}}));
     events
 }
 
-/// The topic of the newest message in the request: policy heads each
-/// delivered message with `[#<topic> `. A request without one answers in
-/// topic 0, which the policy refuses.
-fn reply_topic(request: &OpenAiRequest) -> u64 {
+/// The topic of the newest message in the request's own input: policy heads
+/// each delivered message with `[#<topic> `.
+fn newest_topic(request: &OpenAiRequest) -> Option<u64> {
     let input = serde_json::to_string(&request.input).unwrap_or_default();
-    input
-        .rmatch_indices("[#")
-        .find_map(|(at, _)| {
-            let digits: String = input[at + 2..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse().ok()
-        })
-        .unwrap_or(0)
+    input.rmatch_indices("[#").find_map(|(at, _)| {
+        let digits: String = input[at + 2..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 fn request_tools(request: &OpenAiRequest) -> Vec<ProviderTool> {
@@ -784,11 +810,11 @@ fn append_finish(
     request_number: u64,
     request: &OpenAiRequest,
     tools: &[ProviderTool],
+    topic: u64,
     output_index: usize,
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let topic = reply_topic(request);
         let source =
             format!("chat.post({topic}, {text:?}, mention=\"user\", kind=\"result\")\nend_turn()");
         append_tool_call(

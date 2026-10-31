@@ -213,7 +213,7 @@ async fn run_async(args: Args) -> Result<()> {
         1
     };
     let submitted = Instant::now();
-    for index in 0..agent_count {
+    for _ in 0..agent_count {
         client.create(CreateWorkset {
             kind: WorksetKind::Isolated,
             code: snippets::new_agent_on(&repo, "HEAD", &runtime),
@@ -287,7 +287,13 @@ async fn run_async(args: Args) -> Result<()> {
         }
         ensure!(
             Instant::now() < quiesce_deadline,
-            "agents did not quiesce after the drive window"
+            "agents did not quiesce after the drive window: {} agents, {} responding, \
+             {} awaiting, {} details pending, {} messages to the user",
+            agents.len(),
+            responding.len(),
+            awaiting.len(),
+            pending_details.len(),
+            messages_sent
         );
         let event_timeout = if matches!(
             args.scenario,
@@ -691,7 +697,7 @@ async fn run_async(args: Args) -> Result<()> {
     .err();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} reported_calls={} messages_sent={} delivered={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} report_reply_p50_ms={} report_reply_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} mail_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} reported_calls={} messages_sent={} delivered={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} report_reply_p50_ms={} report_reply_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} chat_head={}",
         args.scenario.as_str(),
         agent_count,
         args.seconds,

@@ -185,6 +185,12 @@ async fn agents_terminal_and_shell_share_workset_process() {
 /// A native runtime the fake endpoint answers, for `new_agent`.
 const RUNTIME: &str = r#"{"kind": "native", "model": "sol", "effort": "medium"}"#;
 
+/// A fresh name for each message the user posts.
+fn client_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A new isolated workset whose creation code is `code`, with `RUNTIME`
 /// defined: its id, its directory, and the agents the code made.
 async fn create(
@@ -196,18 +202,24 @@ async fn create(
         .create_workset(
             WorksetKind::Isolated,
             format!("RUNTIME = {RUNTIME}\n{code}"),
-            message.map(|text| {
-                vec![rho_agent_types::ContentPart::Text {
-                    text: text.to_owned(),
-                }]
-            }),
         )
         .await
         .unwrap();
     assert_eq!(evaluated.error, None, "{}", evaluated.output);
     let agents = pool.db().read().workset(id).unwrap().agents;
-    if message.is_some() {
-        assert_eq!(evaluated.agent, agents.first().copied());
+    assert_eq!(evaluated.agent, agents.first().copied());
+    if let Some(text) = message {
+        pool.start_user_topic(
+            client_id(),
+            rho_agent_types::StreamId::DEFAULT,
+            "test".to_owned(),
+            agents.clone(),
+            vec![rho_agent_types::ContentPart::Text {
+                text: text.to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
     }
     let workset = pool.worksets().open_workset(id).await.unwrap();
     (id, workset, agents)
@@ -398,10 +410,11 @@ async fn streaming_crash() {
         1,
         "load replayed interrupted execution"
     );
-    pool.post_user_mail(
-        7,
-        id,
-        None,
+    pool.start_user_topic(
+        client_id(),
+        rho_agent_types::StreamId::DEFAULT,
+        "inspect".to_owned(),
+        vec![id],
         vec![rho_agent_types::ContentPart::Text {
             text: "inspect fresh globals".into(),
         }],

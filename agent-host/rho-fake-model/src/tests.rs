@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{
-    FakeModel, FakeModelConfig, OpenAiRequest, Scenario, TerminalOutcome, reply_topic,
+    FakeModel, FakeModelConfig, OpenAiRequest, Scenario, TerminalOutcome, newest_topic,
     synthetic_result_bytes,
 };
 
@@ -445,13 +445,13 @@ fn request_timing_counts_overlap_once_and_closes_cancelled_requests() {
 }
 
 #[test]
-fn a_reply_goes_in_the_topic_of_the_newest_message() {
+fn the_topic_is_that_of_the_newest_message() {
     let request: OpenAiRequest = serde_json::from_value(json!({"input":[
         {"role":"user","content":[{"type":"input_text","text":"[#3 rho › first] Message from the user:\nhi"}]},
         {"role":"user","content":[{"type":"input_text","text":"[#12 rho › second] Message from the user:\nmore [# not a topic"}]},
     ]}))
     .unwrap();
-    assert_eq!(reply_topic(&request), 12);
+    assert_eq!(newest_topic(&request), Some(12));
     let none: OpenAiRequest = serde_json::from_value(json!({"input":[]})).unwrap();
-    assert_eq!(reply_topic(&none), 0);
+    assert_eq!(newest_topic(&none), None);
 }

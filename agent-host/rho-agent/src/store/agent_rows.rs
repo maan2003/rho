@@ -7,7 +7,6 @@ use redb::TableDefinition;
 use rho_agent_types::{AgentId, Wpos};
 use rho_db::{ReadTxn, WriteTxn};
 
-use super::WORKSET_LOG;
 use crate::record::Record;
 
 /// `(agent, wpos)` for every row of the agent in its workset's log.
