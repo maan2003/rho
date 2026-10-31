@@ -1183,7 +1183,10 @@ async fn probe_async(name: &str) -> Result<()> {
                     };
                     replies += 1;
                     let completed_reply = !items.iter().any(|item| {
-                        matches!(item, rho_agents_client::protocol::transcript::Item::ToolCall { .. })
+                        matches!(
+                            item,
+                            rho_agents_client::protocol::transcript::Item::ToolCall { .. }
+                        )
                     });
                     if completed_reply {
                         let model: FakeModel = serde_json::from_str(

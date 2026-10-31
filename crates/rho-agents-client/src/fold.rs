@@ -1035,7 +1035,7 @@ mod tests {
             at: UnixMs(at),
             from,
             to,
-            re: None,
+            thread: rho_agent_types::ThreadId(MailId(id)),
             kind,
             content: vec![rho_agent_types::ContentPart::Text {
                 text: format!("mail {id}"),

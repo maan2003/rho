@@ -828,7 +828,7 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         to: AgentId,
-        re: Option<MailId>,
+        thread: Option<rho_agent_types::ThreadId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MailId> {
         let workset = self.workset_of(to)?;
@@ -837,22 +837,22 @@ impl AgentPool {
                 NewMail {
                     from: Address::User,
                     to: Address::Agent(to),
-                    re,
+                    thread,
                     kind: None,
                     content,
                 },
                 Some(client_id),
             )
-            .await;
+            .await?;
         self.wake_workset(workset);
         Ok(id)
     }
 
-    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> MailId {
+    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> anyhow::Result<MailId> {
         let mut write = self.db.write().await;
-        let id = write.post_mail(UnixMs::now(), mail, client_id);
+        let id = write.post_mail(UnixMs::now(), mail, client_id)?;
         write.commit();
-        id
+        Ok(id)
     }
 
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
@@ -1036,17 +1036,19 @@ impl AgentPool {
                     }
                 };
                 if let Some(content) = first {
-                    write.post_mail(
-                        UnixMs::now(),
-                        NewMail {
-                            from: Address::User,
-                            to: Address::Agent(agent),
-                            re: None,
-                            kind: None,
-                            content,
-                        },
-                        None,
-                    );
+                    write
+                        .post_mail(
+                            UnixMs::now(),
+                            NewMail {
+                                from: Address::User,
+                                to: Address::Agent(agent),
+                                thread: None,
+                                kind: None,
+                                content,
+                            },
+                            None,
+                        )
+                        .expect("a new thread names no mail");
                 }
                 write.commit();
                 PyReply::Agent(agent)
@@ -1108,7 +1110,7 @@ impl AgentPool {
                 to,
                 content,
                 kind,
-                re,
+                thread,
             } => {
                 self.own_agent(workset, sender)?;
                 let recipient = match to {
@@ -1120,13 +1122,13 @@ impl AgentPool {
                         NewMail {
                             from: Address::Agent(sender),
                             to,
-                            re,
+                            thread,
                             kind,
                             content,
                         },
                         None,
                     )
-                    .await;
+                    .await?;
                 if let Some(recipient) = recipient
                     && recipient != workset
                 {
@@ -1135,6 +1137,9 @@ impl AgentPool {
                 PyReply::Mail(id)
             }
             PyRequest::Inbox { address, after } => PyReply::Mails(self.inbox(address, after).await),
+            PyRequest::NewestMailBetween(a, b) => {
+                PyReply::NewestMail(self.db.read().newest_between(a, b))
+            }
             PyRequest::Clone { url, dest, rev } => {
                 let kind = self
                     .db

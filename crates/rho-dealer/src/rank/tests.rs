@@ -139,7 +139,7 @@ impl World {
             at: UnixMs(self.ms()),
             from,
             to,
-            re: None,
+            thread: rho_agent_types::ThreadId(MailId(self.mail)),
             kind,
             content: vec![ContentPart::Text {
                 text: "update".into(),

@@ -170,7 +170,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         to,
                         content,
                         kind,
-                        re,
+                        thread,
                     } => {
                         let db = db(sender)?;
                         let mut write = db.write().await;
@@ -179,14 +179,19 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                             NewMail {
                                 from: rho_agent_types::Address::Agent(sender),
                                 to,
-                                re,
+                                thread,
                                 kind,
                                 content,
                             },
                             None,
                         );
-                        write.commit();
-                        PyReply::Mail(id)
+                        match id {
+                            Ok(id) => {
+                                write.commit();
+                                PyReply::Mail(id)
+                            }
+                            Err(error) => PyReply::Error(format!("{error:#}")),
+                        }
                     }
                     _ => PyReply::Error("tests answer only agents and mail".into()),
                 })

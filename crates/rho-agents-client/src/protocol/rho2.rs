@@ -7,8 +7,8 @@
 //! it looks at. Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, InputWake, Mail, MailId, Props, SendKind, UnixMs,
-    WorksetId, WorksetKind, Wpos,
+    AgentId, ContentPart, ExecMilestone, InputWake, Mail, MailId, Props, SendKind, ThreadId,
+    UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -105,7 +105,8 @@ pub struct PostMail {
     /// answer is logged once.
     pub client_id: u64,
     pub to: AgentId,
-    pub re: Option<MailId>,
+    /// The thread to post in; `None` starts one.
+    pub thread: Option<ThreadId>,
     pub content: Vec<ContentPart>,
 }
 
@@ -412,7 +413,7 @@ mod tests {
                 at: UnixMs(5),
                 from: Address::Agent(agent_id),
                 to: Address::User,
-                re: Some(MailId(2)),
+                thread: ThreadId(MailId(2)),
                 kind: Some(SendKind::Ask),
                 content: vec![ContentPart::Text {
                     text: "which branch?".into(),
@@ -450,7 +451,7 @@ mod tests {
             Request::from(PostMail {
                 client_id: 7,
                 to: agent,
-                re: None,
+                thread: None,
                 content: vec![ContentPart::Image {
                     media_type: "image/gif".to_owned(),
                     data: vec![1, 2, 3],

@@ -8,7 +8,7 @@
 
 use redb::TableDefinition;
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, UnixMs, WorksetId,
+    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, ThreadId, UnixMs, WorksetId,
     WorksetKind, Wpos,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
@@ -200,6 +200,8 @@ pub trait StoreRead {
     fn mail(&self, id: MailId) -> Option<Mail>;
     /// Mail to `to` after `after`, in order.
     fn inbox(&self, to: Address, after: MailId) -> Vec<Mail>;
+    /// The newest mail between `a` and `b`, in either direction.
+    fn newest_between(&self, a: Address, b: Address) -> Option<Mail>;
 }
 
 impl StoreRead for ReadTxn {
@@ -294,6 +296,14 @@ impl StoreRead for ReadTxn {
             .filter(|mail| mail.to == to)
             .collect()
     }
+
+    fn newest_between(&self, a: Address, b: Address) -> Option<Mail> {
+        self.open_table(MAIL_LOG)
+            .iter()
+            .rev()
+            .map(|(_, mail)| mail.value().into_owned())
+            .find(|mail| (mail.from, mail.to) == (a, b) || (mail.from, mail.to) == (b, a))
+    }
 }
 
 /// A mail as its sender gives it.
@@ -301,7 +311,8 @@ impl StoreRead for ReadTxn {
 pub struct NewMail {
     pub from: Address,
     pub to: Address,
-    pub re: Option<MailId>,
+    /// The thread to post in; `None` starts one.
+    pub thread: Option<ThreadId>,
     pub kind: Option<SendKind>,
     pub content: Vec<ContentPart>,
 }
@@ -314,7 +325,13 @@ pub trait StoreWrite {
     fn append(&mut self, workset: WorksetId, record: &Record<'_>) -> anyhow::Result<Wpos>;
     /// Append a mail; with `client_id`, a mail already posted under that id
     /// is returned instead of a second one.
-    fn post_mail(&mut self, at: UnixMs, mail: NewMail, client_id: Option<u64>) -> MailId;
+    /// Fails when `thread` names no mail.
+    fn post_mail(
+        &mut self,
+        at: UnixMs,
+        mail: NewMail,
+        client_id: Option<u64>,
+    ) -> anyhow::Result<MailId>;
     /// Remove a workset's log and heads. Mail stays.
     fn delete_workset(&mut self, workset: WorksetId) -> bool;
     /// An agent's head, read inside this transaction.
@@ -430,11 +447,16 @@ impl StoreWrite for WriteTxn {
         Ok(pos)
     }
 
-    fn post_mail(&mut self, at: UnixMs, mail: NewMail, client_id: Option<u64>) -> MailId {
+    fn post_mail(
+        &mut self,
+        at: UnixMs,
+        mail: NewMail,
+        client_id: Option<u64>,
+    ) -> anyhow::Result<MailId> {
         if let Some(client_id) = client_id
             && let Some(id) = self.open_table(MAIL_CLIENT_IDS).get(client_id)
         {
-            return MailId(id.value());
+            return Ok(MailId(id.value()));
         }
         let id = {
             let log = self.open_table(MAIL_LOG);
@@ -445,16 +467,29 @@ impl StoreWrite for WriteTxn {
         let NewMail {
             from,
             to,
-            re,
+            thread,
             kind,
             content,
         } = mail;
+        let thread = match thread {
+            None => ThreadId(id),
+            Some(thread) => {
+                anyhow::ensure!(
+                    self.open_table(MAIL_LOG)
+                        .get(thread.0.0)
+                        .is_some_and(|first| first.value().into_owned().thread == thread),
+                    "no mail thread {}",
+                    thread.0.0
+                );
+                thread
+            }
+        };
         let mail = Mail {
             id,
             at,
             from,
             to,
-            re,
+            thread,
             kind,
             content,
         };
@@ -464,7 +499,7 @@ impl StoreWrite for WriteTxn {
             self.open_table(MAIL_CLIENT_IDS).insert(client_id, id.0);
         }
         tell(self, Appended::Mail(id));
-        id
+        Ok(id)
     }
 
     fn agent_head(&mut self, agent: AgentId) -> Option<AgentHead> {

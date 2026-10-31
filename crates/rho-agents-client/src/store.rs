@@ -741,7 +741,7 @@ mod tests {
             at: UnixMs(1),
             from: rho_agent_types::Address::Agent(agent()),
             to: rho_agent_types::Address::User,
-            re: None,
+            thread: rho_agent_types::ThreadId(rho_agent_types::MailId(1)),
             kind: Some(rho_agent_types::SendKind::Result),
             content: vec![rho_agent_types::ContentPart::Text {
                 text: "other cell".into(),

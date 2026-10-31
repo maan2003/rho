@@ -7,7 +7,7 @@ import rho
 
 
 def mail(state, id, sender, to, text):
-    state.mails.append({"id": id, "at": 0, "sender": sender, "to": to, "re": None, "kind": None, "text": text})
+    state.mails.append({"id": id, "at": 0, "sender": sender, "to": to, "thread": id, "kind": None, "text": text})
 
 
 class Delivery(WorksetCase):

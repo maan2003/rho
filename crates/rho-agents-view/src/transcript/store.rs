@@ -187,7 +187,7 @@ mod tests {
                 at: UnixMs(at),
                 from: Address::User,
                 to: Address::Agent(agent()),
-                re: None,
+                thread: rho_agent_types::ThreadId(MailId(mail)),
                 kind: None,
                 content: vec![ContentPart::Text {
                     text: text.to_owned(),

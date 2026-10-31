@@ -805,7 +805,7 @@ mod tests {
             at: UnixMs(id),
             from: Address::Agent(from),
             to: Address::User,
-            re: None,
+            thread: rho_agent_types::ThreadId(MailId(id)),
             kind: Some(kind),
             content: vec![ContentPart::Text { text: text.into() }],
         }

@@ -657,13 +657,13 @@ where
                 |PostMail {
                      client_id,
                      to,
-                     re,
+                     thread,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .post_user_mail(client_id, to, re, content)
+                        .post_user_mail(client_id, to, thread, content)
                         .await
                 },
             )

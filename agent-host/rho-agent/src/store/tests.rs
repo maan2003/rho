@@ -1,7 +1,7 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ContentPart, InputWake, MailId, UnixMs, WorksetId, WorksetKind, Wpos,
+    Address, ContentPart, InputWake, MailId, ThreadId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
 
@@ -226,40 +226,91 @@ async fn mail_is_dense_logged_once_per_client_id_and_outlives_its_workset() {
     let to_a = |text: &str| NewMail {
         from: Address::User,
         to: Address::Agent(a),
-        re: None,
+        thread: None,
         kind: None,
         content: vec![ContentPart::Text { text: text.into() }],
     };
-    let first = write.post_mail(UnixMs(3), to_a("one"), Some(77));
-    let again = write.post_mail(UnixMs(4), to_a("one, resent"), Some(77));
-    let other = write.post_mail(
-        UnixMs(5),
-        NewMail {
-            from: Address::Agent(a),
-            to: Address::User,
-            re: Some(first),
-            kind: Some(rho_agent_types::SendKind::Result),
-            content: vec![],
-        },
-        None,
-    );
-    let second = write.post_mail(UnixMs(6), to_a("two"), Some(78));
+    let first = write.post_mail(UnixMs(3), to_a("one"), Some(77)).unwrap();
+    let again = write
+        .post_mail(UnixMs(4), to_a("one, resent"), Some(77))
+        .unwrap();
+    let other = write
+        .post_mail(
+            UnixMs(5),
+            NewMail {
+                from: Address::Agent(a),
+                to: Address::User,
+                thread: Some(ThreadId(first)),
+                kind: Some(rho_agent_types::SendKind::Result),
+                content: vec![],
+            },
+            None,
+        )
+        .unwrap();
+    let second = write.post_mail(UnixMs(6), to_a("two"), Some(78)).unwrap();
     assert_eq!(
         (first, again, other, second),
         (MailId(1), MailId(1), MailId(2), MailId(3))
     );
+    // A thread is named by its first mail only: a later mail of it, or a
+    // mail nobody wrote, names none, and the refused mail takes no id.
+    let in_thread = write
+        .post_mail(
+            UnixMs(7),
+            NewMail {
+                thread: Some(ThreadId(first)),
+                ..to_a("three")
+            },
+            None,
+        )
+        .unwrap();
+    for named in [other, MailId(99)] {
+        assert!(
+            write
+                .post_mail(
+                    UnixMs(8),
+                    NewMail {
+                        thread: Some(ThreadId(named)),
+                        ..to_a("nowhere")
+                    },
+                    None,
+                )
+                .is_err(),
+            "{named:?} names no thread"
+        );
+    }
     assert!(write.delete_workset(ws));
     write.commit();
     let read = db.read();
+    let mail = |id| read.mail(id).unwrap();
+    assert_eq!(
+        (
+            mail(first).thread,
+            mail(other).thread,
+            mail(second).thread,
+            mail(in_thread).thread
+        ),
+        (
+            ThreadId(first),
+            ThreadId(first),
+            ThreadId(second),
+            ThreadId(first)
+        )
+    );
+    assert_eq!(read.mail_head(), in_thread, "the refused mail took no id");
+    assert_eq!(
+        read.newest_between(Address::User, Address::Agent(a))
+            .map(|m| m.id),
+        Some(in_thread)
+    );
     assert_eq!(
         read.inbox(Address::Agent(a), MailId(0))
             .iter()
             .map(|m| m.id)
             .collect::<Vec<_>>(),
-        vec![MailId(1), MailId(3)]
+        vec![MailId(1), MailId(3), MailId(4)]
     );
-    assert_eq!(read.inbox(Address::Agent(a), MailId(1)).len(), 1);
-    assert_eq!(read.mail_head(), MailId(3));
+    assert_eq!(read.inbox(Address::Agent(a), MailId(1)).len(), 2);
     assert!(read.workset(ws).is_none());
     assert!(read.agent(a).is_none());
     assert!(read.workset_rows(ws, Wpos::ZERO, 10).is_empty());

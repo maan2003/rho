@@ -16,7 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, WorksetId,
+    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, ThreadId, WorksetId,
 };
 use tokio::sync::oneshot;
 
@@ -329,6 +329,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(newest_mail_between, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
     Ok(module)
 }
@@ -526,6 +527,17 @@ fn delivered(py: Python<'_>, agent: &str) -> PyResult<u64> {
 }
 
 #[pyfunction]
+fn newest_mail_between(py: Python<'_>, a: &str, b: &str) -> PyResult<Option<Py<PyAny>>> {
+    let request = PyRequest::NewestMailBetween(address(a)?, address(b)?);
+    match PyHost::block(py, request)? {
+        PyReply::NewestMail(mail) => mail
+            .map(|mail| Ok(mail_to_py(py, &mail)?.into_any().unbind()))
+            .transpose(),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
 fn cancel(py: Python<'_>, agent: &str) -> PyResult<()> {
     control(py, agent, Control::Cancel)
 }
@@ -546,14 +558,14 @@ fn new_cache_key(py: Python<'_>, agent: &str) -> PyResult<()> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (sender, to, text, *, kind = None, re = None))]
+#[pyo3(signature = (sender, to, text, *, kind = None, thread = None))]
 fn send_mail(
     py: Python<'_>,
     sender: &str,
     to: &str,
     text: String,
     kind: Option<&str>,
-    re: Option<u64>,
+    thread: Option<u64>,
 ) -> PyResult<u64> {
     let sender = agent_id(sender)?;
     let to = address(to)?;
@@ -591,7 +603,7 @@ fn send_mail(
         to,
         content: vec![ContentPart::Text { text }],
         kind,
-        re: re.map(MailId),
+        thread: thread.map(|thread| ThreadId(MailId(thread))),
     };
     match PyHost::block(py, request)? {
         PyReply::Mail(id) => Ok(id.0),
@@ -605,7 +617,7 @@ fn mail_to_py<'py>(py: Python<'py>, mail: &Mail) -> PyResult<Bound<'py, PyDict>>
     out.set_item("at", mail.at.0)?;
     out.set_item("sender", address_text(mail.from))?;
     out.set_item("to", address_text(mail.to))?;
-    out.set_item("re", mail.re.map(|re| re.0))?;
+    out.set_item("thread", mail.thread.0.0)?;
     out.set_item(
         "kind",
         mail.kind.map(|kind| match kind {

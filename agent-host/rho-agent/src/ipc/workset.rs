@@ -69,8 +69,10 @@ pub(crate) enum PyRequest {
         to: rho_agent_types::Address,
         content: Vec<rho_agent_types::ContentPart>,
         kind: Option<rho_agent_types::SendKind>,
-        re: Option<rho_agent_types::MailId>,
+        thread: Option<rho_agent_types::ThreadId>,
     },
+    /// The newest mail between two addresses, either way.
+    NewestMailBetween(rho_agent_types::Address, rho_agent_types::Address),
     /// Mail to `address` after `after`, answered once there is some.
     Inbox {
         address: rho_agent_types::Address,
@@ -90,6 +92,7 @@ pub(crate) enum PyReply {
     Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
     Mail(rho_agent_types::MailId),
     Mails(Vec<rho_agent_types::Mail>),
+    NewestMail(Option<rho_agent_types::Mail>),
     Models(Vec<crate::record::Runtime>),
     Done,
     Error(String),

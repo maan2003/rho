@@ -78,7 +78,8 @@ def _spawner_of(props: dict) -> str | None:
 
 
 class Mail:
-    """Mail to the user or to another agent."""
+    """Mail to the user or to another agent. A mail goes on in the thread of
+    the newest mail between the agent and its recipient."""
 
     def __init__(self, agent: str):
         self._agent = agent
@@ -100,12 +101,12 @@ class Mail:
                 )
             if kind is None:
                 raise ValueError('mail to the user needs kind: "ask", "result", "fyi" or "status"')
-            rho_mail.send(self._agent, to, text, kind=kind)
+            rho_mail.send(self._agent, to, text, kind=kind, thread=rho_mail.thread_with(self._agent, to))
             return Reply("")
         recipient = resolve(str(to))
         if recipient == self._agent:
             raise ValueError("cannot send a message to yourself")
-        rho_mail.send(self._agent, recipient, text, kind=kind)
+        rho_mail.send(self._agent, recipient, text, kind=kind, thread=rho_mail.thread_with(self._agent, recipient))
         return report(f"Message sent to {label(recipient)}.")
 
     def __repr__(self):

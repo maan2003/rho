@@ -43,7 +43,12 @@ def on_turn_end(agent, outcome) -> None:
     mails itself."""
     parent = agent.props.get("parent")
     if outcome["reason"] == "failed" and parent is not None:
-        mail.send(agent.id, parent, f"Agent hit an error and stopped: {outcome['error']}")
+        mail.send(
+            agent.id,
+            parent,
+            f"Agent hit an error and stopped: {outcome['error']}",
+            thread=mail.thread_with(agent.id, parent),
+        )
 
 
 async def on_agent(agent) -> None:

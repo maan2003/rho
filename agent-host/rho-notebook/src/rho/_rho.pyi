@@ -35,7 +35,7 @@ class MailRecord(TypedDict):
     at: int  # unix ms
     sender: str  # "user" or an agent id
     to: str
-    re: int | None
+    thread: int  # the id of the mail that started its thread
     kind: Literal["ask", "result", "status", "fyi"] | None
     text: str
 
@@ -98,14 +98,18 @@ def send_mail(
     text: str,
     *,
     kind: Literal["ask", "result", "status", "fyi"] | None = None,
-    re: int | None = None,
+    thread: int | None = None,
 ) -> int:
     """Append a mail to the host's mail log; returns its id once durable.
     `sender` must be an agent of this workset: mail from the user comes only
     from the GUI (`CreateWorkset.message` and `Eval.message` are mailed by the
     host to the first agent that code creates), so Python cannot forge it. A mail to "user" needs a
     `kind`; the text must pass the STE check, or this raises ValueError
-    with the findings."""
+    with the findings. `thread` names a thread by the id of its first mail;
+    None starts a new one, and a mail that starts no thread raises
+    ValueError."""
+def newest_mail_between(a: str, b: str) -> MailRecord | None:
+    """The newest mail from `a` to `b` or from `b` to `a`."""
 async def inbox(address: str, after: int) -> list[MailRecord]:
     """Mail to `address` newer than `after`, waiting until there is some."""
 

@@ -234,7 +234,7 @@ mod tests {
             at: UnixMs(1),
             from,
             to,
-            re: None,
+            thread: rho_agent_types::ThreadId(MailId(1)),
             kind,
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
