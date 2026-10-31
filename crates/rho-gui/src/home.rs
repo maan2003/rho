@@ -99,11 +99,12 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
 /// What a card is called on a Home row. A mail or Slack thread is who it
 /// is with and what it is about, and anything else is its title.
 pub(crate) fn card_title(card: &Card) -> String {
+    let title = card.title.lines().next().unwrap_or_default();
     match card.kind {
-        CardKind::Mail | CardKind::Slack if card.context.is_empty() => card.title.clone(),
-        CardKind::Mail | CardKind::Slack if card.title.is_empty() => card.context.clone(),
-        CardKind::Mail | CardKind::Slack => format!("{} › {}", card.context, card.title),
-        CardKind::Dated => card.title.clone(),
+        CardKind::Mail | CardKind::Slack if card.context.is_empty() => title.to_owned(),
+        CardKind::Mail | CardKind::Slack if title.is_empty() => card.context.clone(),
+        CardKind::Mail | CardKind::Slack => format!("{} › {title}", card.context),
+        CardKind::Dated => title.to_owned(),
     }
 }
 
@@ -187,6 +188,9 @@ pub struct HomeView {
     editor: Entity<Editor>,
     rows: HomeRows,
     recent_open: bool,
+    /// How many characters fit on one row, as the window last measured it;
+    /// a card's title is cut to leave its row one line.
+    width: usize,
 }
 
 impl HomeView {
@@ -223,11 +227,13 @@ impl HomeView {
             editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             editor
         });
+        let width = row_width(&editor, window, cx);
         let mut view = Self {
             transcript: Transcript::new(buffer),
             editor,
             rows: HomeRows::default(),
             recent_open: false,
+            width,
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // A Home nobody has told anything yet still answers the question.
@@ -318,7 +324,7 @@ impl HomeView {
             items.push(section("next"));
             let column = column_of(self.rows.next.iter().map(|row| row.title.as_str()));
             for row in &self.rows.next {
-                items.push(card_line(row, column, HomeClass::Title));
+                items.push(card_line(row, column, self.width, HomeClass::Title));
             }
         }
         if !self.rows.recent.is_empty() {
@@ -393,6 +399,30 @@ impl HomeView {
     }
 }
 
+/// `text` in at most `room` characters, ending in an ellipsis when cut.
+fn cut(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(room.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// How many characters of Home's text fit across the window. Measured on
+/// `0`, the font's average width, less two for the editor's gutter.
+fn row_width(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> usize {
+    let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+    let font_size = style.text.font_size.to_pixels(window.rem_size());
+    let font_id = window.text_system().resolve_font(&style.text.font());
+    let advance = window
+        .text_system()
+        .ch_advance(font_id, font_size)
+        .expect("the editor's font resolves");
+    let columns = f32::from(window.viewport_size().width) / f32::from(advance);
+    (columns as usize).saturating_sub(2)
+}
+
 fn column_of<'a>(titles: impl Iterator<Item = &'a str>) -> usize {
     /// Past this a title is left to run into its own state words rather
     /// than pushing every row on the screen sideways.
@@ -416,6 +446,7 @@ fn line(key: HomeKey, text: &str, class: HomeClass) -> Item<HomeKey, HomeClass, 
 fn card_line(
     row: &HomeRow,
     column: usize,
+    width: usize,
     title_class: HomeClass,
 ) -> Item<HomeKey, HomeClass, HomeTarget> {
     let label = match (row.skipped, row.label.is_empty()) {
@@ -423,8 +454,12 @@ fn card_line(
         (true, true) => "skipped".to_owned(),
         (true, false) => format!("{} · skipped", row.label),
     };
+    // The lead, the gap before the label and the label are what the row
+    // keeps; the title has the rest.
+    let room = width.saturating_sub(4 + label.chars().count());
+    let title = cut(&row.title, room);
     let (text, styles) = columns(&[
-        (row.title.as_str(), title_class, column),
+        (title.as_str(), title_class, column.min(room)),
         (label.as_str(), HomeClass::Label, 0),
     ]);
     Item::new(HomeKey::Card(row.card.clone()), text)
@@ -464,7 +499,15 @@ fn columns(cells: &[(&str, HomeClass, usize)]) -> (String, Vec<(HomeClass, Range
 }
 
 impl gpui::Render for HomeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One measure per frame, and a relayout only when it changes: a
+        // narrower window cuts the titles shorter.
+        let width = row_width(&self.editor, window, cx);
+        if width != self.width {
+            self.width = width;
+            let items = self.items();
+            self.reconcile(items, cx);
+        }
         div()
             .key_context("RhoHome")
             .size_full()
@@ -524,6 +567,36 @@ mod tests {
             card_title(&mail),
             "eng-b8os › is the deploy green?",
             "a mail row is the agent and the thread, as a Slack row is"
+        );
+    }
+
+    #[test]
+    fn a_card_row_is_one_line_cut_to_fit() {
+        let mail = Card {
+            kind: CardKind::Mail,
+            context: "eng-b8os".to_owned(),
+            title: "is the deploy green?\nsecond line".to_owned(),
+            ..card("", 1.0)
+        };
+        assert_eq!(card_title(&mail), "eng-b8os › is the deploy green?");
+
+        let row = |title: &str| HomeRow {
+            card: NodeId::Note(uuid::Uuid::nil()),
+            title: title.to_owned(),
+            label: "asks · 2d".to_owned(),
+            skipped: false,
+        };
+        // 30 across: 2 lead, 2 gap and 9 of label leave 17 for the title.
+        let long = row("abcdefghijklmnopqrstuvwxyz");
+        let text = card_line(&long, 40, 30, HomeClass::Title).text;
+        assert_eq!(text, "  abcdefghijklmnop…  asks · 2d\n");
+        assert_eq!(text.trim_end().chars().count(), 30);
+
+        let short = row("abc");
+        let text = card_line(&short, 3, 30, HomeClass::Title).text;
+        assert_eq!(
+            text, "  abc  asks · 2d\n",
+            "a title that fits is left whole"
         );
     }
 
