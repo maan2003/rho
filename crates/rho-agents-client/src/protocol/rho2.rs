@@ -139,7 +139,9 @@ pub enum ClientFrame {
     /// (zero for none). The host sends every later mail, then each new one.
     FollowMail { since: MailId },
     /// The worksets whose rows this client wants pushed as they land, each
-    /// from the position it holds. Replaces the set wholesale.
+    /// from the position it holds. Replaces the set wholesale; a workset
+    /// this stream already follows goes on from the rows it sent, so none
+    /// is sent twice.
     FollowWorksets { from: Vec<(WorksetId, Wpos)> },
     /// The agents whose live frames this client wants. Replaces the set.
     Focus { agent_ids: Vec<AgentId> },

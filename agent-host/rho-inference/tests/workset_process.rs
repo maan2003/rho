@@ -2,28 +2,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_agent::host::pool::AgentPool;
-use rho_agent::{StartPlace, WorksetAction, WorksetAttach, WorksetReply};
+use rho_agent::store::StoreRead as _;
+use rho_agent::{WorksetAction, WorksetAttach, WorksetReply};
+use rho_agent_types::{AgentId, WorksetId, WorksetKind};
 use rho_terminal::protocol::{TermClientFrame, TermServerFrame};
 
 #[tokio::test]
 async fn agents_terminal_and_shell_share_workset_process() {
-    let (_directory, pool, workset, place) = fixture("http://127.0.0.1:1").await;
-    let (first, a) = pool
-        .create(
-            Default::default(),
-            Some("first".into()),
-            StartPlace::new(place.clone()),
-        )
-        .await
-        .unwrap();
-    let (second, b) = pool
-        .create(
-            Default::default(),
-            Some("second".into()),
-            StartPlace::new(place),
-        )
-        .await
-        .unwrap();
+    let (_directory, pool) = fixture("http://127.0.0.1:1").await;
+    let (id, workset, agents) = create(
+        &pool,
+        "new_agent(runtime=RUNTIME)\nnew_agent(runtime=RUNTIME)\n",
+        None,
+    )
+    .await;
+    let [first, second] = agents[..] else {
+        panic!("two agents, not {agents:?}")
+    };
+    assert_eq!(pool.db().read().agent(first).unwrap().workset, id);
     let process = pool.execution(first).await.unwrap();
     assert!(Arc::ptr_eq(
         &process,
@@ -182,20 +178,42 @@ async fn agents_terminal_and_shell_share_workset_process() {
         .unwrap();
     drop(ui);
     let _ = relay.await.unwrap();
-    drop(a);
-    drop(b);
     replacement.shutdown().await;
     assert!(!std::path::Path::new(&format!("/proc/{terminal_pid}")).exists());
 }
 
-async fn fixture(
-    endpoint: &str,
-) -> (
-    tempfile::TempDir,
-    Arc<AgentPool>,
-    rho_fs_view::Workset,
-    rho_agent_types::Place,
-) {
+/// A native runtime the fake endpoint answers, for `new_agent`.
+const RUNTIME: &str = r#"{"kind": "native", "model": "sol", "effort": "medium"}"#;
+
+/// A new isolated workset whose creation code is `code`, with `RUNTIME`
+/// defined: its id, its directory, and the agents the code made.
+async fn create(
+    pool: &Arc<AgentPool>,
+    code: &str,
+    message: Option<&str>,
+) -> (WorksetId, rho_fs_view::Workset, Vec<AgentId>) {
+    let (id, evaluated) = pool
+        .create_workset(
+            WorksetKind::Isolated,
+            format!("RUNTIME = {RUNTIME}\n{code}"),
+            message.map(|text| {
+                vec![rho_agent_types::ContentPart::Text {
+                    text: text.to_owned(),
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evaluated.error, None, "{}", evaluated.output);
+    let agents = pool.db().read().workset(id).unwrap().agents;
+    if message.is_some() {
+        assert_eq!(evaluated.agent, agents.first().copied());
+    }
+    let workset = pool.worksets().open_workset(id).await.unwrap();
+    (id, workset, agents)
+}
+
+async fn fixture(endpoint: &str) -> (tempfile::TempDir, Arc<AgentPool>) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_rho-agent-worker"));
@@ -218,11 +236,6 @@ async fn fixture(
     )
     .await
     .unwrap();
-    let workset = worksets.create().await.unwrap();
-    let place = rho_agent_types::Place {
-        workset: Some(workset.id()),
-        cwd: "/src".into(),
-    };
     let db = rho_db::RhoDb::open(root.join("agents.redb"));
     let inference = rho_inference::Accounts::new_with_config(
         db.clone(),
@@ -230,6 +243,7 @@ async fn fixture(
     )
     .await
     .unwrap();
+    // No init.py: the default policy.
     let pool = AgentPool::new(
         db,
         Arc::new(inference),
@@ -237,9 +251,10 @@ async fn fixture(
         rho_claude::accounts::ClaudePaths::at(
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
         ),
+        None,
     )
     .await;
-    (directory, pool, workset, place)
+    (directory, pool)
 }
 
 #[test]
@@ -290,10 +305,8 @@ async fn streaming_crash() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::{SinkExt as _, StreamExt as _};
-    use rho_agent::db::AgentReadTxnExt as _;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (_directory, pool, workset, place) =
-        fixture(&format!("http://{}", listener.local_addr().unwrap())).await;
+    let (_directory, pool) = fixture(&format!("http://{}", listener.local_addr().unwrap())).await;
     let db = pool.db().clone();
     let requests = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -332,15 +345,9 @@ async fn streaming_crash() {
             }
         }
     });
-    let (id, agent) = pool
-        .create(
-            Default::default(),
-            Some("recovery-test".into()),
-            StartPlace::new(place),
-        )
-        .await
-        .unwrap();
-    agent.send_user_message("run".into());
+    let (_, workset, agents) = create(&pool, "new_agent(runtime=RUNTIME)\n", Some("run")).await;
+    let id = agents[0];
+    let (_, agent, _) = pool.load(id).await.unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("side-effect").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -352,49 +359,36 @@ async fn streaming_crash() {
         .unwrap()
         .parse()
         .unwrap();
-    let locked = db.write().await;
-    let pending = tokio::spawn({
-        let agent = agent.clone();
-        async move {
-            agent
-                .send_user_content_accepted(
-                    rho_agent::entry::MessageId::new(),
-                    vec![rho_agent_types::ContentPart::Text {
-                        text: "blocked".into(),
-                    }],
-                )
-                .await
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(!pending.is_finished());
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(worker).unwrap(),
         rustix::process::Signal::KILL,
     )
     .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), pending)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
-    );
-    drop(locked);
+    // The pool notices the process is gone before it loads the agent again.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::path::Path::new(&format!("/proc/{worker}")).exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let (_, replacement, _) = pool.load(id).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(workset.root().join("side-effect")).unwrap(),
         "written"
     );
     // The cut-off response left no step: its code ran, but only as streamed.
+    let created = db.read().agent(id).unwrap().created;
     assert!(
         !db.read()
-            .agent_event_records(id)
-            .1
+            .agent_rows(id, created)
             .iter()
-            .any(|(_, event)| matches!(
-                event,
-                rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { .. })
+            .any(|(_, record)| matches!(
+                record.event,
+                rho_agent::record::Event::Native {
+                    entry: rho_agent::entry::Entry::Step { .. },
+                    ..
+                }
             ))
     );
     // Coming up is not a wake, and the interrupted code never runs again.
@@ -404,7 +398,16 @@ async fn streaming_crash() {
         1,
         "load replayed interrupted execution"
     );
-    replacement.send_user_message("inspect fresh globals".into());
+    pool.post_user_mail(
+        7,
+        id,
+        None,
+        vec![rho_agent_types::ContentPart::Text {
+            text: "inspect fresh globals".into(),
+        }],
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("recovered").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;

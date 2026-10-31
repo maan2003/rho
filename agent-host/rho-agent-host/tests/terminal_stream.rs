@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use rho_agent_types::AgentId;
-use rho_agents_client::protocol::{NewAgent, StartMode};
 use rho_rpc::protocol::{Opened, read_frame, write_frame, write_open};
 use rho_terminal::protocol as term;
 use rho_terminal::protocol::{
@@ -98,21 +97,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     }
 
     // Create an agent on a clone of the temp repository.
-    let agent_id = tokio::time::timeout(
-        Duration::from_secs(30),
-        rho_rpc::protocol::client::call(
-            &socket_path,
-            NewAgent {
-                role: Default::default(),
-                start: StartMode::NewOn {
-                    repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
-                    revset: "@".to_owned(),
-                },
-                content: None,
-            },
-        ),
-    )
-    .await??;
+    let agent_id = tokio::time::timeout(Duration::from_secs(30), create_agent(&socket_path, &repo_dir, None)).await??;
 
     // Attaching before anything was created must be refused.
     let refused = open_terminal(&socket_path, agent_id, false).await;
@@ -225,4 +210,36 @@ async fn wait_for_line(stream: &mut rho_rpc::Stream, needle: &str) -> anyhow::Re
         }
     })
     .await?
+}
+
+/// A new isolated workset with one agent on a clone of `repo`, made by
+/// the default policy's `new_agent`, which prints its id. `message` is
+/// the user's first mail to it.
+async fn create_agent(
+    socket_path: &std::path::Path,
+    repo: &std::path::Path,
+    message: Option<&str>,
+) -> anyhow::Result<rho_agent_types::AgentId> {
+    let created = rho_rpc::protocol::client::call(
+        socket_path,
+        rho_agents_client::protocol::rho2::CreateWorkset {
+            kind: rho_agent_types::WorksetKind::Isolated,
+            code: format!(
+                "print(new_agent(repo={}, runtime={{\"kind\": \"native\", \"model\": \"sol\", \"effort\": \"medium\"}}), end=\"\")",
+                rho_agents_client::snippets::py_str(repo.to_str().unwrap())
+            ),
+            message: message.map(|text| {
+                vec![rho_agent_types::ContentPart::Text {
+                    text: text.to_owned(),
+                }]
+            }),
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        created.result.error.is_none(),
+        "creation code failed: {:?}",
+        created.result.error
+    );
+    Ok(rho_agent_types::AgentId::from_encoded(created.result.output.trim())?)
 }

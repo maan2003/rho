@@ -99,9 +99,14 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 async fn run_async(args: Args) -> Result<()> {
-    let root = tempfile::Builder::new()
+    let mut root = tempfile::Builder::new()
         .prefix("rho-fake-model-proof-")
         .tempdir()?;
+    // Kept for a post-mortem when asked.
+    if std::env::var_os("RHO_QA_KEEP").is_some() {
+        root.disable_cleanup(true);
+        eprintln!("PROOF_ROOT {}", root.path().display());
+    }
     let home = root.path().join("home");
     let runtime = root.path().join("runtime");
     let state = root.path().join("state");
@@ -237,6 +242,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut clarifying = 0u64;
 
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
+    let mut next_client_id = 0u64;
     let mut last_mail = MailId(0);
     let quiesce_deadline = deadline
         + if matches!(
@@ -286,7 +292,13 @@ async fn run_async(args: Args) -> Result<()> {
             .await
             .with_context(|| {
                 format!(
-                    "agent host session stalled: {}",
+                    "agent host session stalled with {} agents created, rows read to {worksets:?}, \
+                     {} responding, {} awaiting, {} details pending, {} mails to the user: {}",
+                    agents.len(),
+                    responding.len(),
+                    awaiting.len(),
+                    pending_details.len(),
+                    messages_sent,
                     fs::read_to_string(root.path().join("agent host.stderr.log"))
                         .unwrap_or_default()
                 )
@@ -304,11 +316,12 @@ async fn run_async(args: Args) -> Result<()> {
                     agents.len() <= agent_count,
                     "agent host created more than {agent_count} agents"
                 );
-                // Followed from its start: the rows so far come first.
+                // Followed from its start, and every other one from where
+                // this proof stands: the set is replaced whole.
                 worksets.insert(workset, Wpos::ZERO);
                 client
                     .send(&ClientFrame::FollowWorksets {
-                        from: worksets.keys().map(|workset| (*workset, Wpos::ZERO)).collect(),
+                        from: worksets.iter().map(|(workset, next)| (*workset, *next)).collect(),
                     })
                     .await?;
             }
@@ -332,7 +345,11 @@ async fn run_async(args: Args) -> Result<()> {
                     let cycle = cycles.entry(agent_id).or_default();
                     *cycle += 1;
                     client.post(PostMail {
-                        client_id: (agents.len() as u64) << 32 | *cycle,
+                        // One name per mail: the host logs a name once.
+                        client_id: {
+                            next_client_id += 1;
+                            next_client_id
+                        },
                         to: agent_id,
                         re: None,
                         content: prompt(0, *cycle),

@@ -28,9 +28,8 @@ use crate::store::{NewMail, StoreRead as _, StoreWrite as _};
 /// that is settled and nobody is looking at is dropped; its log is the
 /// whole of it, so nothing is lost.
 pub const MAX_LOADED: usize = 100;
-const ID_LABEL_HEADROOM: u64 = 200;
 /// How long a `_rho.inbox` call waits for mail before it answers with none.
-/// It holds its request open, so a host handoff waits for it this long.
+/// A handoff answers it at once instead.
 const INBOX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
@@ -69,6 +68,10 @@ pub struct AgentPool {
     /// The user's message the running `Eval` of a workset carries: the
     /// first agent its code creates gets it as mail.
     first_mail: std::sync::Mutex<HashMap<WorksetId, FirstMail>>,
+    /// A handoff is waiting for every request to be answered: a long
+    /// `inbox` wait answers empty at once, and Python asks again of the
+    /// next host.
+    handing: tokio::sync::watch::Sender<bool>,
 }
 
 /// One GUI connection's statuses still to send: the latest of each loaded
@@ -142,6 +145,7 @@ impl AgentPool {
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             first_mail: std::sync::Mutex::default(),
+            handing: tokio::sync::watch::Sender::new(false),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -301,6 +305,7 @@ impl AgentPool {
                 processes.iter().map(|(_, process)| process.stop_requests()),
             )
             .await?;
+            self.handing.send_replace(true);
             idle().await;
             futures::future::try_join_all(
                 processes.iter().map(|(_, process)| process.stop_reading()),
@@ -317,6 +322,7 @@ impl AgentPool {
         .context("workset processes did not settle")
         .flatten();
         if handed.is_err() {
+            self.handing.send_replace(false);
             for (_, process) in &processes {
                 process.resume();
             }
@@ -326,6 +332,7 @@ impl AgentPool {
 
     /// Undoes a [`AgentPool::hand_over`] whose exec failed.
     pub async fn resume(&self) {
+        self.handing.send_replace(false);
         for process in self.executions().await {
             process.resume();
         }
@@ -1145,6 +1152,9 @@ impl AgentPool {
         let mut feed = crate::store::feed(&self.db);
         let deadline = tokio::time::sleep(INBOX_WAIT);
         tokio::pin!(deadline);
+        let mut handing = self.handing.subscribe();
+        let handing = handing.wait_for(|handing| *handing);
+        tokio::pin!(handing);
         loop {
             let mails = self.db.read().inbox(address, after);
             if !mails.is_empty() {
@@ -1159,6 +1169,7 @@ impl AgentPool {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return Vec::new(),
                     },
                     () = &mut deadline => return Vec::new(),
+                    _ = &mut handing => return Vec::new(),
                 }
             }
         }

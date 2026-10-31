@@ -89,71 +89,8 @@ impl Drop for Process {
 }
 
 impl Process {
-    #[cfg(test)]
-    pub(crate) fn fail_agent_service(&self, agent: rho_agent_types::AgentId) {
-        self.agents.lock().expect("poison").remove(&agent);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_stop_send(&self) {
-        self.sender.close();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_agent_route(
-        &self,
-        agent: rho_agent_types::AgentId,
-    ) -> (
-        AgentRoute,
-        mpsc::UnboundedReceiver<(transport::Packet, Arc<()>)>,
-    ) {
-        let (send, receive) = mpsc::unbounded_channel();
-        let previous = self
-            .agents
-            .lock()
-            .expect("poison")
-            .insert(agent, send)
-            .unwrap();
-        (previous, receive)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn restore_agent_route(
-        &self,
-        agent: rho_agent_types::AgentId,
-        route: AgentRoute,
-        blocked: &mut mpsc::UnboundedReceiver<(transport::Packet, Arc<()>)>,
-    ) {
-        let mut agents = self.agents.lock().expect("poison");
-        while let Ok(packet) = blocked.try_recv() {
-            route.send(packet).unwrap();
-        }
-        agents.insert(agent, route);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_shutdown_reply(&self, agent: rho_agent_types::AgentId) {
-        self.agents.lock().expect("poison")[&agent]
-            .send((
-                transport::Packet::for_test(
-                    transport::Port::Agent(agent),
-                    protocol::encode(&protocol::Message::Stopped {
-                        error: Some("test cleanup failed".into()),
-                    })
-                    .unwrap(),
-                ),
-                self.inflight.clone(),
-            ))
-            .unwrap();
-    }
-
     pub(crate) fn stale(&self) -> bool {
         self.stale.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn make_stale(&self) {
-        self.stale.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn action(&self, action: workset::Action) -> anyhow::Result<workset::Reply> {

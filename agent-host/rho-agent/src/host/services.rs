@@ -395,7 +395,6 @@ impl Services {
             }
             Request::ClaudePendingOutput => Reply::ClaudePendingOutput(self.pending_output()?),
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
-            Request::UsageTotal => Reply::Usage(self.db.read().agent_usage_total(self.agent)),
         };
         Ok(reply)
     }

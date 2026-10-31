@@ -368,17 +368,6 @@ impl HostClient {
         self.change(Request::Usage(usage)).await
     }
 
-    pub(crate) async fn usage_total(&self) -> Result<AgentUsageBucket, StoreError> {
-        match self
-            .request(Request::UsageTotal)
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::Usage(usage) => Ok(usage),
-            _ => Err(StoreError(anyhow::anyhow!("unexpected usage reply"))),
-        }
-    }
-
     pub(crate) async fn claude_pending_output(
         &self,
     ) -> Result<Option<crate::ClaudeOutputBatch>, StoreError> {

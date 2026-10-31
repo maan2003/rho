@@ -586,12 +586,6 @@ impl Agent {
                 || self.progress.last_response.is_none())
     }
 
-    fn cell_running(&self) -> bool {
-        self.cell
-            .as_ref()
-            .is_some_and(|latest| latest.cell.facts().finished.is_none())
-    }
-
     async fn new_cache_key(&mut self) -> anyhow::Result<()> {
         let mut spec = self.head.read().expect("poison").spec.clone();
         let Runtime::Native { cache_key: key, .. } = &mut spec.runtime else {

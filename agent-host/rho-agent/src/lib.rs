@@ -25,7 +25,7 @@ pub use ipc::workset::{Action as WorksetAction, Attach as WorksetAttach, Reply a
 pub use worker::worker_main;
 
 pub use log::{
-    AgentEvent, ClaudeOutputBatch, InputKind, QueuedInput, RuntimeChange, TranscriptCall,
+    ClaudeOutputBatch, InputKind, QueuedInput, TranscriptCall,
     TranscriptLine, WakeEvent, WakeFacts, WakeKind, WakeTrigger,
 };
 pub use rho_agents_client::protocol::transcript::{

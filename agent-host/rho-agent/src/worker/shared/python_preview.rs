@@ -1,4 +1,5 @@
-//! Recover the literal prefix of a live Python `human.send` call.
+//! Recover the literal prefix of a live Python `mail.send("user", …)` call:
+//! the mail to the user the model is writing.
 //! This is presentation only: the notebook remains the authority on actual
 //! sends.
 
@@ -162,8 +163,11 @@ fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usiz
     }
 }
 
+/// The notebook's mail tool; its first argument names the recipient.
+const SEND: &str = "mail.send";
+
 fn last_send(node: Node<'_>, source: &str) -> Option<usize> {
-    let mut latest = (node.kind() == "attribute" && &source[node.byte_range()] == "human.send")
+    let mut latest = (node.kind() == "attribute" && &source[node.byte_range()] == SEND)
         .then_some(node.start_byte());
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -304,17 +308,20 @@ fn send_string<'a>(
         && node.parent()?.parent()?.kind() == "module"
         && node
             .child_by_field_name("function")
-            .is_some_and(|callee| &source[callee.byte_range()] == "human.send")
+            .is_some_and(|callee| &source[callee.byte_range()] == SEND)
     {
         let args = node.child_by_field_name("arguments")?;
-        // The text, then only keywords (`kind=`).
+        // To the user, the text, then only keywords (`kind=`).
         let mut cursor = args.walk();
         let keywords_only = args
             .named_children(&mut cursor)
-            .skip(1)
+            .skip(2)
             .all(|child| child.kind() == "keyword_argument");
-        if args.named_child_count() >= 1 && keywords_only {
-            let arg = args.named_child(0)?;
+        let to_user = args
+            .named_child(0)
+            .is_some_and(|to| matches!(&source[to.byte_range()], "\"user\"" | "'user'"));
+        if args.named_child_count() >= 2 && to_user && keywords_only {
+            let arg = args.named_child(1)?;
             if !arg.has_error() {
                 if synthetic_boundary.is_some()
                     && arg.kind() == "string"
@@ -435,17 +442,17 @@ mod tests {
             .unwrap();
         for (source, expected) in [
             (
-                "import os\nx = {'a': [1, 2]}\nhuman.send(\"Hel",
+                "import os\nx = {'a': [1, 2]}\nmail.send('user', \"Hel",
                 Some("Hel"),
             ),
             (
-                "def f():\n    return {'a': 'human.send(\\\"fake\\\")'}\nhuman.send('real",
+                "def f():\n    return {'a': 'mail.send('user', \\\"fake\\\")'}\nmail.send('user', 'real",
                 Some("real"),
             ),
-            ("human.send('old')\nhuman.send('new", Some("new")),
-            ("human.send('done', kind='result')", Some("done")),
+            ("mail.send('user', 'old')\nmail.send('user', 'new", Some("new")),
+            ("mail.send('user', 'done', kind='result')", Some("done")),
             (
-                "end_turn()\nfor item in items:\n    print(item)\nhuman.send(\"After work",
+                "end_turn()\nfor item in items:\n    print(item)\nmail.send('user', \"After work",
                 Some("After work"),
             ),
         ] {
@@ -464,18 +471,21 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for source in [
-            "human.send(value)",
-            "human.send('text', value)",
-            "human.send('old')\nhuman.send(name + 'suffix",
-            "# human.send('comment",
-            "print('human.send(\\\"string')",
-            "x =\nhuman.send('invalid prior line", // The tree makes this an assignment RHS.
-            "async def work():\n    x = await other(3)\n    if x:\n        human.send(\"nested",
-            "if False:\n    human.send('untaken",
-            "if False: human.send('inline branch",
-            "for item in items:\n    human.send('loop body",
-            "def f():\n    human.send('function body",
-            "class C:\n    human.send('class body",
+            "mail.send('user', value)",
+            "mail.send('eng-abc', 'to an agent",
+            "mail.send('user', 'old')\nmail.send(peer, 'to an agent",
+            "mail.send(to, 'unknown recipient",
+            "mail.send('user', 'text', value)",
+            "mail.send('user', 'old')\nmail.send('user', name + 'suffix",
+            "# mail.send('user', 'comment",
+            "print('mail.send('user', \\\"string')",
+            "x =\nmail.send('user', 'invalid prior line", // The tree makes this an assignment RHS.
+            "async def work():\n    x = await other(3)\n    if x:\n        mail.send('user', \"nested",
+            "if False:\n    mail.send('user', 'untaken",
+            "if False: mail.send('user', 'inline branch",
+            "for item in items:\n    mail.send('user', 'loop body",
+            "def f():\n    mail.send('user', 'function body",
+            "class C:\n    mail.send('user', 'class body",
         ] {
             assert_eq!(preview(&mut parser, source), None, "{source:?}");
         }
@@ -488,21 +498,21 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("human.send('Hi ' + name", Some("Hi ")),
-            ("human.send('Hi ' +", Some("Hi ")),
-            ("human.send('Hi ' + 'there'", Some("Hi there")),
-            ("human.send('Hi ' + 'the", Some("Hi the")),
-            ("human.send('' + 'Hello", Some("Hello")),
-            ("human.send('Hi ' + '\\x0", Some("Hi ")),
-            ("human.send('Hi ' + f'{name}", Some("Hi ")),
-            ("human.send('Hi ' + b'bytes", Some("Hi ")),
-            ("human.send('Hi ' + 'there' + name", Some("Hi there")),
-            ("human.send('Hi ' + name + 'later'", Some("Hi ")),
-            ("human.send('Hi ' + str(name)", Some("Hi ")),
-            ("human.send(name + 'suffix'", None),
-            ("human.send('Hi ' * 0", None),
-            ("human.send('Hi ' + name)", Some("Hi ")),
-            ("human.send('Hi ' + 'there' + name)", Some("Hi there")),
+            ("mail.send('user', 'Hi ' + name", Some("Hi ")),
+            ("mail.send('user', 'Hi ' +", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + 'there'", Some("Hi there")),
+            ("mail.send('user', 'Hi ' + 'the", Some("Hi the")),
+            ("mail.send('user', '' + 'Hello", Some("Hello")),
+            ("mail.send('user', 'Hi ' + '\\x0", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + f'{name}", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + b'bytes", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + 'there' + name", Some("Hi there")),
+            ("mail.send('user', 'Hi ' + name + 'later'", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + str(name)", Some("Hi ")),
+            ("mail.send('user', name + 'suffix'", None),
+            ("mail.send('user', 'Hi ' * 0", None),
+            ("mail.send('user', 'Hi ' + name)", Some("Hi ")),
+            ("mail.send('user', 'Hi ' + 'there' + name)", Some("Hi there")),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -519,14 +529,14 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("human.send(\"foo\" \"bar", Some("foobar")),
-            ("human.send(\"foo\"\n \"bar", Some("foobar")),
-            ("human.send(\"foo\" f\"bar {name", Some("foobar ")),
-            ("human.send(\"foo\" r\"\\n", Some("foo\\n")),
-            ("human.send(\"foo\" + \"bar\" \"baz", Some("foobarbaz")),
-            ("human.send(\"foo\" \"bar\")", Some("foobar")),
-            ("human.send(\"foo\" name", None),
-            ("human.send(\"foo\" b\"bar", None),
+            ("mail.send('user', \"foo\" \"bar", Some("foobar")),
+            ("mail.send('user', \"foo\"\n \"bar", Some("foobar")),
+            ("mail.send('user', \"foo\" f\"bar {name", Some("foobar ")),
+            ("mail.send('user', \"foo\" r\"\\n", Some("foo\\n")),
+            ("mail.send('user', \"foo\" + \"bar\" \"baz", Some("foobarbaz")),
+            ("mail.send('user', \"foo\" \"bar\")", Some("foobar")),
+            ("mail.send('user', \"foo\" name", None),
+            ("mail.send('user', \"foo\" b\"bar", None),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -543,19 +553,19 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("human.send(\"Line\\nnext\\x21", Some("Line\nnext!")),
-            ("human.send('''α\nbeta", Some("α\nbeta")),
-            ("human.send(\"pending\\u00", Some("pending")),
-            ("human.send(\"pending\\", Some("pending")),
-            ("human.send(f\"Hello {{name}}", Some("Hello {name}")),
-            ("human.send(f\"Hello {name", Some("Hello ")),
-            ("human.send(f\"Hello {", Some("Hello ")),
-            ("human.send(f\"Hello {{name}} {name", Some("Hello {name} ")),
-            ("human.send(f\"Hello {name} later", Some("Hello ")),
-            ("human.send(f\"Hello {name} later\"", Some("Hello ")),
-            ("print(1)\nhuman.send(f\"Hello {name", Some("Hello ")),
-            ("human.send(f\"Hello {name} later\")", Some("Hello ")),
-            ("human.send(f\"Hello {name} later\")\nx = 2", Some("Hello ")),
+            ("mail.send('user', \"Line\\nnext\\x21", Some("Line\nnext!")),
+            ("mail.send('user', '''α\nbeta", Some("α\nbeta")),
+            ("mail.send('user', \"pending\\u00", Some("pending")),
+            ("mail.send('user', \"pending\\", Some("pending")),
+            ("mail.send('user', f\"Hello {{name}}", Some("Hello {name}")),
+            ("mail.send('user', f\"Hello {name", Some("Hello ")),
+            ("mail.send('user', f\"Hello {", Some("Hello ")),
+            ("mail.send('user', f\"Hello {{name}} {name", Some("Hello {name} ")),
+            ("mail.send('user', f\"Hello {name} later", Some("Hello ")),
+            ("mail.send('user', f\"Hello {name} later\"", Some("Hello ")),
+            ("print(1)\nmail.send('user', f\"Hello {name", Some("Hello ")),
+            ("mail.send('user', f\"Hello {name} later\")", Some("Hello ")),
+            ("mail.send('user', f\"Hello {name} later\")\nx = 2", Some("Hello ")),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -568,10 +578,10 @@ mod tests {
     #[test]
     fn all_prefixes_after_visible_text_keep_draft() {
         let cases = [
-            "import asyncio\nawait asyncio.sleep(10)\nhuman.send(\"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\")",
-            "human.send('Hello, world!')",
-            "human.send(\"One line\\nThe next!\")",
-            "human.send('first' + ' second' + ' third')",
+            "import asyncio\nawait asyncio.sleep(10)\nmail.send('user', \"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\")",
+            "mail.send('user', 'Hello, world!')",
+            "mail.send('user', \"One line\\nThe next!\")",
+            "mail.send('user', 'first' + ' second' + ' third')",
         ];
         let mut parser = Parser::new();
         parser
@@ -598,31 +608,31 @@ mod tests {
     fn multiline_triple_quoted_prefixes_keep_their_known_text() {
         let cases = [
             (
-                "human.send(\"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\")",
+                "mail.send('user', \"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\")",
                 "First line\n\nSecond line with \"quotes\" and α.",
             ),
             (
-                "human.send(\n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n)",
+                "mail.send('user', \n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n)",
                 "\nFirst line\nSecond line\n",
             ),
             (
-                "human.send('''First line\nSecond line with 'quotes'.''')",
+                "mail.send('user', '''First line\nSecond line with 'quotes'.''')",
                 "First line\nSecond line with 'quotes'.",
             ),
             (
-                "human.send(f\"\"\"First line\nSecond line {name}!\"\"\")",
+                "mail.send('user', f\"\"\"First line\nSecond line {name}!\"\"\")",
                 "First line\nSecond line ",
             ),
             (
-                "human.send(r\"\"\"First line\nSecond line\\n\"\"\")",
+                "mail.send('user', r\"\"\"First line\nSecond line\\n\"\"\")",
                 "First line\nSecond line\\n",
             ),
             (
-                "human.send(\"\"\"First line\"\"\" + \"\"\"Second line\"\"\")",
+                "mail.send('user', \"\"\"First line\"\"\" + \"\"\"Second line\"\"\")",
                 "First lineSecond line",
             ),
             (
-                "human.send(\"\"\"Before (\"A Python\"). After.\"\"\")",
+                "mail.send('user', \"\"\"Before (\"A Python\"). After.\"\"\")",
                 "Before (\"A Python\"). After.",
             ),
         ];
@@ -666,12 +676,12 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for source in [
-            "human.send(\"\"\"Hello\"",
-            "human.send(\"\"\"Hello\"\"",
-            "human.send(\"\"\"Hello\"\"\")",
-            "human.send('''Hello'",
-            "human.send('''Hello''",
-            "human.send('''Hello''')",
+            "mail.send('user', \"\"\"Hello\"",
+            "mail.send('user', \"\"\"Hello\"\"",
+            "mail.send('user', \"\"\"Hello\"\"\")",
+            "mail.send('user', '''Hello'",
+            "mail.send('user', '''Hello''",
+            "mail.send('user', '''Hello''')",
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -684,7 +694,7 @@ mod tests {
     #[test]
     fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
         let source =
-            "human.send(\"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
+            "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
         let arguments = serde_json::json!({"source": source}).to_string();
         let mut visible = false;
         for (i, _) in arguments

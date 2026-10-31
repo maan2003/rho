@@ -445,7 +445,15 @@ async fn follow(
                 None => return,
                 Some(Follow::Mail(since)) => mail = Some(since),
                 Some(Follow::Worksets(from)) => {
-                    worksets = from.into_iter().collect();
+                    // A workset already followed goes on from what this
+                    // stream sent: rows past the client's position are on
+                    // their way to it, and are never sent twice.
+                    worksets = from
+                        .into_iter()
+                        .map(|(workset, from)| {
+                            (workset, worksets.get(&workset).map_or(from, |sent| from.max(*sent)))
+                        })
+                        .collect();
                     befores.clear();
                 }
                 Some(Follow::Focus(agents)) => focus = agents,
@@ -1086,5 +1094,257 @@ fn detail_result(
         status: ToolStatus::Reported,
         output: result.body.recorded_output().to_owned(),
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_agent::db::AgentWriteTxnExt as _;
+    use rho_agent::entry::{Entry, Notice, Report, RequestNotice};
+    use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
+    use rho_agent::store::StoreWrite as _;
+    use rho_agent_types::{InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
+    use rho_agents_client::protocol::rho2::{LogEvent, WorksetLog};
+
+    use super::{detail, detail_result, workset_log_page};
+
+    fn step(id: &str) -> Entry {
+        Entry::Step {
+            exec: None,
+            prose: String::new(),
+            carry: rho_agent::inference::Carry::new(
+                serde_json::json!({"items": [{
+                    "type": "custom_tool_call", "name": "exec", "call_id": id, "input": "cell"
+                }]}),
+                vec![rho_agent::inference::Call::new(id, "cell".into())],
+                false,
+            ),
+            usage: None,
+        }
+    }
+
+    fn request() -> Entry {
+        Entry::RequestSent {
+            why: rho_agent::entry::Wake::Notify,
+            report: Report {
+                notices: vec![RequestNotice::Restarted],
+                ..Default::default()
+            },
+            compact: false,
+        }
+    }
+
+    /// A workset with one native agent and its rows, as the loop writes
+    /// them. Returns the workset, the agent and each row's position.
+    async fn workset(
+        db: &rho_db::RhoDb,
+        rows: Vec<Event<'static>>,
+    ) -> (WorksetId, rho_agent_types::AgentId, Vec<Wpos>) {
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent = write.alloc_agent_id();
+        write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(0),
+                    event: Event::AgentCreated {
+                        agent,
+                        spec: AgentSpec {
+                            runtime: Runtime::Native {
+                                model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                profile: Default::default(),
+                                cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        let mut positions = Vec::new();
+        for event in rows {
+            let event = match event {
+                Event::Native { entry, .. } => Event::Native { agent, entry },
+                Event::Rewound { to, .. } => Event::Rewound { agent, to },
+                Event::Input {
+                    mail,
+                    content,
+                    wake,
+                    ..
+                } => Event::Input {
+                    agent,
+                    mail,
+                    content,
+                    wake,
+                },
+                Event::Claude { row, .. } => Event::Claude { agent, row },
+                event => event,
+            };
+            positions.push(
+                write
+                    .append(workset, &Record { at: UnixMs(1), event })
+                    .unwrap(),
+            );
+        }
+        write.commit();
+        (workset, agent, positions)
+    }
+
+    fn native(entry: Entry) -> Event<'static> {
+        Event::Native {
+            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap(),
+            entry,
+        }
+    }
+
+    /// The report names the calls of the step it answers: the newest one
+    /// still standing, read from the store when the page starts mid-way,
+    /// and after a rewind that took the newer step back.
+    #[tokio::test]
+    async fn a_request_after_a_rewind_reports_the_step_still_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        // Rows 2..=5; the rewind at 6 takes back row 4 (exec-2) and on.
+        let (workset, _, positions) = workset(
+            &db,
+            vec![
+                native(step("exec-1")),
+                native(request()),
+                native(step("exec-2")),
+                native(request()),
+                Event::Rewound {
+                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                        .unwrap(),
+                    to: Wpos(4),
+                },
+                native(request()),
+            ],
+        )
+        .await;
+        assert_eq!(positions[2], Wpos(4));
+        let reports = |from| {
+            workset_log_page(&db, WorksetLog { workset, from })
+                .unwrap()
+                .rows
+                .into_iter()
+                .filter_map(|(pos, event)| match event {
+                    LogEvent::NotebookReport { calls, .. } => Some((pos.0, calls)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (3, vec!["exec-1".to_owned()]),
+            (5, vec!["exec-2".to_owned()]),
+            (7, vec!["exec-1".to_owned()]),
+        ];
+        assert_eq!(reports(Wpos::ZERO), expected);
+        // A page that starts after the steps reads them back from the store.
+        assert_eq!(reports(Wpos(5)), expected[1..]);
+        assert_eq!(reports(Wpos(7)), expected[2..]);
+        // The detail of the last report is read the same way.
+        let rho_agents_client::protocol::transcript::DetailBody::Results(results) =
+            detail(&db, workset, Wpos(7))
+        else {
+            panic!("a report's detail is its results")
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "exec-1");
+    }
+
+    /// Rows that say nothing a reader uses are left behind; a stop is told
+    /// whichever runtime wrote it; a user's spoken request reads as asked.
+    #[tokio::test]
+    async fn rows_are_told_in_the_readers_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let spoken = "<realtime_delegation>\n  <input>fix &lt;b&gt;</input>\n</realtime_delegation>";
+        let (workset, agent, _) = workset(
+            &db,
+            vec![
+                Event::Input {
+                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                        .unwrap(),
+                    mail: Some(rho_agent_types::MailId(3)),
+                    content: vec![rho_agent_types::ContentPart::Text {
+                        text: spoken.to_owned(),
+                    }],
+                    wake: InputWake::Person,
+                },
+                native(Entry::Notice {
+                    notice: Notice::Restarted,
+                }),
+                native(Entry::Notice {
+                    notice: Notice::Stopped("quota".into()),
+                }),
+                Event::Claude {
+                    agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                        .unwrap(),
+                    row: ClaudeRow::Notice(Notice::Stopped("auth".into())),
+                },
+            ],
+        )
+        .await;
+        let rows = workset_log_page(
+            &db,
+            WorksetLog {
+                workset,
+                from: Wpos(2),
+            },
+        )
+        .unwrap()
+        .rows;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    Wpos(2),
+                    LogEvent::Input {
+                        agent,
+                        mail: Some(rho_agent_types::MailId(3)),
+                        text: "🎤 fix <b>".into(),
+                        wake: InputWake::Person,
+                        at: UnixMs(1),
+                    }
+                ),
+                (
+                    Wpos(4),
+                    LogEvent::Stopped {
+                        agent,
+                        error: "quota".into(),
+                        at: UnixMs(1),
+                    }
+                ),
+                (
+                    Wpos(5),
+                    LogEvent::Stopped {
+                        agent,
+                        error: "auth".into(),
+                        at: UnixMs(1),
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_detail_reads_the_complete_host_record() {
+        let result = rho_agent_types::transcript::ToolResult {
+            call_id: rho_agent_types::transcript::ExecId::try_from("call-1").unwrap(),
+            tool_type: rho_agent_types::transcript::ToolType::Custom,
+            body: rho_agent_types::transcript::ToolOutput {
+                output: std::sync::Arc::new("bounded model view".to_owned()),
+                full_output: Some(std::sync::Arc::new("complete host record".to_owned())),
+                images: std::sync::Arc::new(Vec::new()),
+                status: rho_agent_types::ToolOutputStatus::Success,
+            },
+            started_at: rho_agent_types::UnixMs(1),
+            finished_at: rho_agent_types::UnixMs(2),
+        };
+
+        assert_eq!(detail_result(&result).output, "complete host record");
     }
 }

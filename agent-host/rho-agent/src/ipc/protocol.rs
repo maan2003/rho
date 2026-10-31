@@ -66,7 +66,6 @@ pub(crate) enum Request<'a> {
     AppendBatch(Vec<Record<'static>>),
     ClaudeAccount,
     ClaudePendingOutput,
-    UsageTotal,
 }
 
 #[derive(Encode, Decode)]
