@@ -1,14 +1,14 @@
 //! Private agent messages shared by the host and worker.
 use std::io;
 
-use rho_agent_types::{ContentPart, InputWake, MailId, Wpos};
+use rho_agent_types::{ContentPart, InputWake, MessageId, Wpos};
 use senax_encoder::{Decode, Encode};
 
 use crate::log::AgentUsageBucket;
 use crate::record::Record;
 use crate::store::{AgentHead, NativeCursor};
 
-pub(crate) const VERSION: u32 = 25;
+pub(crate) const VERSION: u32 = 26;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host
@@ -22,7 +22,7 @@ pub(crate) enum Control {
     Input {
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
     },
     TellTail,
     Compact,

@@ -64,19 +64,31 @@ pub(crate) enum PyRequest {
         control: crate::ipc::protocol::Control,
     },
     Delivered(rho_agent_types::AgentId),
-    SendMail {
+    /// A message from an agent.
+    Post {
         sender: rho_agent_types::AgentId,
-        to: rho_agent_types::Address,
+        topic: rho_agent_types::TopicId,
+        mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
-        kind: Option<rho_agent_types::SendKind>,
-        thread: Option<rho_agent_types::ThreadId>,
     },
-    /// The newest mail between two addresses, either way.
-    NewestMailBetween(rho_agent_types::Address, rho_agent_types::Address),
-    /// Mail to `address` after `after`, answered once there is some.
+    /// A topic an agent starts, with its first message.
+    StartTopic {
+        sender: rho_agent_types::AgentId,
+        stream: String,
+        name: String,
+        agents: Vec<rho_agent_types::AgentId>,
+        mentions: Vec<rho_agent_types::Mention>,
+        content: Vec<rho_agent_types::ContentPart>,
+    },
+    Join {
+        topic: rho_agent_types::TopicId,
+        agent: rho_agent_types::AgentId,
+    },
+    Topic(rho_agent_types::TopicId),
+    /// What `agent` receives after `after`, answered once there is some.
     Inbox {
-        address: rho_agent_types::Address,
-        after: rho_agent_types::MailId,
+        agent: rho_agent_types::AgentId,
+        after: rho_agent_types::ChatSeq,
     },
     Clone {
         url: String,
@@ -90,9 +102,10 @@ pub(crate) enum PyRequest {
 pub(crate) enum PyReply {
     Agent(rho_agent_types::AgentId),
     Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
-    Mail(rho_agent_types::MailId),
-    Mails(Vec<rho_agent_types::Mail>),
-    NewestMail(Option<rho_agent_types::Mail>),
+    Seq(rho_agent_types::ChatSeq),
+    Messages(Vec<rho_agent_types::Message>),
+    /// A topic and the name of its stream.
+    Topic(Option<(crate::store::TopicHead, String)>),
     Models(Vec<crate::record::Runtime>),
     Done,
     Error(String),

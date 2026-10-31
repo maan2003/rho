@@ -19,7 +19,7 @@ mod tests;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, ContentPart, InputWake, MailId, UnixMs, Wpos};
+use rho_agent_types::{AgentId, ContentPart, InputWake, MessageId, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -103,12 +103,12 @@ impl AgentHandle {
         &self,
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
     ) -> anyhow::Result<()> {
         self.send(|done| Control::Input {
             content,
             wake,
-            mail,
+            message,
             done: Some(done),
         })
         .await
@@ -187,7 +187,7 @@ enum Control {
     Input {
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
         done: Option<oneshot::Sender<()>>,
     },
     Compact,
@@ -530,10 +530,10 @@ impl Agent {
             Control::Input {
                 content,
                 wake,
-                mail,
+                message,
                 done,
             } => {
-                self.receive(content, wake, mail).await?;
+                self.receive(content, wake, message).await?;
                 if let Some(done) = done {
                     self.flush().await?;
                     let _ = done.send(());
@@ -704,7 +704,7 @@ impl Agent {
         &mut self,
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
     ) -> anyhow::Result<()> {
         let at = UnixMs::now();
         if wake == InputWake::Person {
@@ -723,7 +723,7 @@ impl Agent {
         }
         self.log(Event::Input {
             agent: self.agent_id,
-            mail,
+            message,
             content,
             wake,
         })
@@ -859,7 +859,7 @@ impl Agent {
         for text in restored {
             self.log(Event::Input {
                 agent,
-                mail: None,
+                message: None,
                 content: vec![ContentPart::Text { text }],
                 wake: InputWake::Quiet,
             })

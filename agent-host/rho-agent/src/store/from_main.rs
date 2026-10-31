@@ -1,12 +1,15 @@
 //! Temporary: converts a store written by `main` (format `6967c9bb`: one
-//! log per agent) to worksets and mail
+//! log per agent) to worksets and chat
 //! ([ARCH-agent-host](../../../specs/ARCH-agent-host.md)). Remove it once the
 //! user's stores have moved forward (`temp-migration` skill).
 //!
 //! Agents keep their ids. The agents of one `main` workset share one
-//! workset, their rows merged by time. Every message becomes mail:
-//! one thread per pair of correspondents. A `Received` row is the `Input`
-//! that hands its mail over, with the text the model was shown then.
+//! workset, their rows merged by time. Every message becomes a chat
+//! message: one topic in the default stream per pair of correspondents,
+//! named by the first line of its first message. A message to the user
+//! mentions them with its kind, unless it was a status. A `Received` row is
+//! the `Input` that hands its message over, with the text the model was
+//! shown then.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -15,14 +18,15 @@ use camino::Utf8PathBuf;
 use redb::TableDefinition;
 use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse};
 use rho_agent_types::{
-    Address, AgentId, AgentRole, ContentPart, ExecMilestone, InputWake, MailId, Props, SendKind,
-    ThreadId, UnixMs, WorksetId, WorksetKind, Wpos,
+    Address, AgentId, AgentRole, ContentPart, ExecMilestone, InputWake, Mention, MentionKind,
+    MessageId as ChatMessageId, Props, StreamId, TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use rho_db::WriteTxn;
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
 
-use super::{NewMail, StoreWrite as _};
+use super::StoreWrite as _;
+use super::chat::{ChatWrite as _, DEFAULT_STREAM, NewMessage};
 use crate::entry::{Block, Notice, RequestNotice, ResponseUsage, Wake};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{Carry, PromptCacheKey};
@@ -82,6 +86,16 @@ const DROPPED: [&str; 4] = [
 ];
 
 // -- `main`'s rows, as it wrote them ------------------------------------------
+
+/// What a send to the user was for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+enum SendKind {
+    Ask,
+    #[default]
+    Result,
+    Status,
+    Fyi,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 struct AgentEventPos {
@@ -284,14 +298,14 @@ struct Created {
     spec: AgentSpec,
 }
 
-/// Rewrites the `main` tables as worksets and mail, then drops them.
+/// Rewrites the `main` tables as worksets and chat, then drops them.
 /// The agents of a `main` workset share one workset, each agent's
 /// rows in order, the agents in creation order. Agents a row of which no
 /// decoder knows keep their rows as they were, in [`SET_ASIDE`].
 pub(crate) fn migrate(write: &mut WriteTxn) {
     write.init_store_tables();
     let (surveys, messages) = survey(write);
-    let mail_ids = post_mail(write, &messages);
+    let message_ids = post_chat(write, &messages);
 
     let mut agents = Vec::new();
     for (id, survey) in surveys {
@@ -319,7 +333,7 @@ pub(crate) fn migrate(write: &mut WriteTxn) {
         let workset = *worksets
             .entry(created.workset.clone())
             .or_insert_with(|| new_workset(write, &created));
-        convert_agent(write, workset, id, &created, &mail_ids);
+        convert_agent(write, workset, id, &created, &message_ids);
     }
     for table in DROPPED {
         write.delete_table(table);
@@ -432,11 +446,9 @@ fn created(
         (_, AgentSpawnedBy::UserOwned { by }, _) => {
             props.insert("preset".into(), "engineer".into());
             props.insert("started_by".into(), by.encoded());
-            props.insert("user_facing".into(), "true".into());
         }
         _ => {
             props.insert("preset".into(), "engineer".into());
-            props.insert("user_facing".into(), "true".into());
         }
     }
     if let Some(name) = spawn_name.clone() {
@@ -494,7 +506,7 @@ fn runtime_of(binding: SessionBinding, runtime: &AgentRuntime) -> Runtime {
     }
 }
 
-/// A message as mail: the first row that told it, by its `main` id.
+/// A message: the first row that told it, by its `main` id.
 struct Message {
     at: UnixMs,
     from: Address,
@@ -555,33 +567,82 @@ fn message(agent: AgentId, entry: &Entry) -> Option<(u64, Message)> {
     }
 }
 
-/// Posts the mail in time order; one thread per pair of correspondents,
-/// named by their first mail.
-fn post_mail(write: &mut WriteTxn, mails: &HashMap<u64, Message>) -> HashMap<u64, MailId> {
-    let mut order = mails.iter().collect::<Vec<_>>();
-    order.sort_by_key(|(id, mail)| (mail.at, **id));
-    let mut threads: HashMap<(Address, Address), ThreadId> = HashMap::new();
+/// The longest topic name a migrated topic gets.
+const TOPIC_NAME_CHARS: usize = 80;
+
+/// A migrated topic's name: the first line of its first message.
+fn topic_name(content: &[ContentPart]) -> String {
+    let text = rho_agent_types::transcript::text_content(content);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("An image");
+    match line.char_indices().nth(TOPIC_NAME_CHARS) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+/// A message to the user mentions them, unless it was a status.
+fn mentions(message: &Message) -> Vec<Mention> {
+    let kind = match message.kind {
+        Some(SendKind::Ask) => MentionKind::Ask,
+        Some(SendKind::Result) => MentionKind::Result,
+        Some(SendKind::Fyi) => MentionKind::Fyi,
+        Some(SendKind::Status) | None => return Vec::new(),
+    };
+    vec![Mention {
+        to: Address::User,
+        kind,
+    }]
+}
+
+/// Posts the messages in time order; one topic per pair of
+/// correspondents.
+fn post_chat(
+    write: &mut WriteTxn,
+    messages: &HashMap<u64, Message>,
+) -> HashMap<u64, ChatMessageId> {
+    write.init_chat_tables();
+    let stream: StreamId = write
+        .chat_stream_named(DEFAULT_STREAM)
+        .expect("a chat has its default stream");
+    let mut order = messages.iter().collect::<Vec<_>>();
+    order.sort_by_key(|(id, message)| (message.at, **id));
+    let mut topics: HashMap<(Address, Address), TopicId> = HashMap::new();
     let mut ids = HashMap::new();
-    for (main_id, mail) in order {
-        let pair = if mail.from <= mail.to {
-            (mail.from, mail.to)
+    for (main_id, message) in order {
+        let pair = if message.from <= message.to {
+            (message.from, message.to)
         } else {
-            (mail.to, mail.from)
+            (message.to, message.from)
         };
-        let id = write
-            .post_mail(
-                mail.at,
-                NewMail {
-                    from: mail.from,
-                    to: mail.to,
-                    thread: threads.get(&pair).copied(),
-                    kind: mail.kind,
-                    content: mail.content.clone(),
-                },
-                None,
-            )
-            .expect("a migrated thread names its first mail");
-        threads.entry(pair).or_insert(ThreadId(id));
+        let new = NewMessage {
+            from: message.from,
+            mentions: mentions(message),
+            content: message.content.clone(),
+        };
+        let id = match topics.get(&pair) {
+            Some(topic) => write
+                .post(message.at, *topic, new, None)
+                .expect("a migrated message has content"),
+            None => {
+                let agents = [pair.0, pair.1]
+                    .into_iter()
+                    .filter_map(|address| match address {
+                        Address::Agent(agent) => Some(agent),
+                        Address::User => None,
+                    })
+                    .collect();
+                let name = topic_name(&message.content);
+                let (topic, first) = write
+                    .start_topic(message.at, stream, name, agents, new, None)
+                    .expect("a migrated topic has a name and content");
+                topics.insert(pair, topic);
+                first
+            }
+        };
         ids.insert(*main_id, id);
     }
     ids
@@ -633,7 +694,7 @@ fn convert_agent(
     workset: WorksetId,
     agent: AgentId,
     created: &Created,
-    mail_ids: &HashMap<u64, MailId>,
+    message_ids: &HashMap<u64, ChatMessageId>,
 ) {
     let rows = agent_rows(write, agent);
     let mut spec = created.spec.clone();
@@ -643,7 +704,8 @@ fn convert_agent(
         let event = decode(&bytes).expect("the survey decoded every row of this agent");
         // A row without a time goes with the one before it.
         at = at_of(&event).unwrap_or(at);
-        let Some(record) = convert(agent, created, &event, at, &mut spec, &placed, mail_ids) else {
+        let Some(record) = convert(agent, created, &event, at, &mut spec, &placed, message_ids)
+        else {
             continue;
         };
         match write.append(workset, &record) {
@@ -734,7 +796,7 @@ fn convert(
     at: UnixMs,
     spec: &mut AgentSpec,
     placed: &BTreeMap<u64, Wpos>,
-    mail_ids: &HashMap<u64, MailId>,
+    message_ids: &HashMap<u64, ChatMessageId>,
 ) -> Option<Record<'static>> {
     let record = |event| Some(Record { at, event });
     match event {
@@ -813,7 +875,7 @@ fn convert(
             row: ClaudeRow::OutputHandedOff { id: *handed },
         }),
         AgentEvent::Entry(entry) => {
-            convert_entry(id, created.claude, entry, mail_ids).map(|event| Record { at, event })
+            convert_entry(id, created.claude, entry, message_ids).map(|event| Record { at, event })
         }
     }
 }
@@ -822,7 +884,7 @@ fn convert_entry(
     id: AgentId,
     claude: bool,
     entry: &Entry,
-    mail_ids: &HashMap<u64, MailId>,
+    message_ids: &HashMap<u64, ChatMessageId>,
 ) -> Option<Event<'static>> {
     let native = |entry| Some(Event::Native { agent: id, entry });
     let report = |report: &Report| crate::entry::Report {
@@ -837,14 +899,14 @@ fn convert_entry(
             ..
         } => Some(Event::Input {
             agent: id,
-            mail: mail_ids.get(&message.0).copied(),
+            message: message_ids.get(&message.0).copied(),
             content: shown(*from, body),
             wake: match from {
                 Party::Human => InputWake::Person,
                 Party::Agent(_) => InputWake::Agent,
             },
         }),
-        // Its mail is in the mail log; the send was a cell.
+        // Its message is in the chat; the send was a cell.
         Entry::Sent { .. } => None,
         Entry::Notice { notice, .. } if claude => Some(Event::Claude {
             agent: id,
@@ -892,13 +954,15 @@ fn convert_entry(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AdvisorIntelligence, AgentIdDomain, EngineerIntelligence};
+    use rho_agent_types::{
+        AdvisorIntelligence, AgentIdDomain, ChatEvent, ChatSeq, EngineerIntelligence,
+    };
     use rho_db::RhoDb;
 
     use super::*;
     use crate::inference::Call;
     use crate::inference::config::ReasoningEffort;
-    use crate::store::StoreRead as _;
+    use crate::store::{ChatRead as _, StoreRead as _};
 
     fn agent(n: u64) -> AgentId {
         AgentId::from_counter(n, &AgentIdDomain(7)).unwrap()
@@ -994,10 +1058,18 @@ mod tests {
         rho_agent_types::transcript::text_content(content)
     }
 
+    fn received_by(read: &rho_db::ReadTxn, agent: AgentId) -> Vec<u64> {
+        use crate::store::ChatRead as _;
+        read.inbox(agent, ChatSeq::ZERO)
+            .iter()
+            .map(|message| message.id.0.0)
+            .collect()
+    }
+
     /// A `main` store: an engineer and its child in one workset, a Claude
     /// agent from before worksets, and an agent no decoder knows.
     #[tokio::test]
-    async fn a_main_store_becomes_worksets_and_mail() {
+    async fn a_main_store_becomes_worksets_and_chat() {
         let dir = tempfile::tempdir().unwrap();
         let db = RhoDb::open(dir.path().join("db"));
         let (a, b, c, d) = (agent(1), agent(2), agent(3), agent(4));
@@ -1038,6 +1110,13 @@ mod tests {
                         title: Some("Fix the bug".into()),
                         at: UnixMs(34),
                     },
+                    entry(Entry::Sent {
+                        at: UnixMs(35),
+                        id: MessageId(905),
+                        to: Party::Human,
+                        text: "looking".into(),
+                        kind: SendKind::Status,
+                    }),
                 ],
             );
             write_main(
@@ -1096,34 +1175,53 @@ mod tests {
 
         let read = db.read();
         assert!(!read.has_table("agent_log"), "the main log is gone");
-        let mails = read.mail_since(MailId(0), 100);
-        let summary = mails
+        let records = read.chat_since(ChatSeq::ZERO, 100);
+        let (user, aa) = (Address::User, Address::Agent(a));
+        let summary = records
             .iter()
-            .map(|m| (m.from, m.to, text(&m.content), m.thread, m.kind))
+            .map(|record| match &record.event {
+                ChatEvent::StreamCreated { name } => format!("stream {name}"),
+                ChatEvent::TopicStarted { name, agents, .. } => {
+                    format!("topic {name:?} {agents:?}")
+                }
+                ChatEvent::Posted {
+                    topic,
+                    from,
+                    mentions,
+                    content,
+                } => format!(
+                    "{} in {} from {from:?} {mentions:?}",
+                    text(content),
+                    topic.0.0
+                ),
+                ChatEvent::Joined { .. } => "joined".to_owned(),
+            })
             .collect::<Vec<_>>();
-        let (user, aa, ab, ac) = (
-            Address::User,
-            Address::Agent(a),
-            Address::Agent(b),
-            Address::Agent(c),
-        );
-        // In time order, the send to the child once; one thread per pair.
+        // In time order, the send to the child once; one topic per pair,
+        // named by its first message; only a send to the user that was no
+        // status mentions them.
+        let result = vec![Mention {
+            to: Address::User,
+            kind: MentionKind::Result,
+        }];
         assert_eq!(
             summary,
             vec![
-                (user, ac, "review".into(), ThreadId(MailId(1)), None),
-                (user, aa, "first".into(), ThreadId(MailId(2)), None),
-                (
-                    aa,
-                    user,
-                    "done one".into(),
-                    ThreadId(MailId(2)),
-                    Some(SendKind::Result)
-                ),
-                (aa, ab, "help me".into(), ThreadId(MailId(4)), None),
-                (user, aa, "second".into(), ThreadId(MailId(2)), None),
+                "stream rho".to_owned(),
+                format!("topic \"review\" {:?}", vec![c]),
+                format!("review in 2 from {user:?} []"),
+                format!("topic \"first\" {:?}", vec![a]),
+                format!("first in 4 from {user:?} []"),
+                format!("done one in 4 from {aa:?} {result:?}"),
+                format!("topic \"help me\" {:?}", vec![a, b]),
+                format!("help me in 7 from {aa:?} []"),
+                format!("second in 4 from {user:?} []"),
+                format!("looking in 4 from {aa:?} []"),
             ]
         );
+        assert_eq!(received_by(&read, b), vec![8]);
+        assert_eq!(received_by(&read, a), vec![5, 9]);
+        assert_eq!(received_by(&read, c), vec![3]);
 
         let worksets = read.worksets();
         assert_eq!(worksets.len(), 2);
@@ -1157,11 +1255,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        assert_eq!(
-            props(&ha),
-            "cwd=/src/repo name=Fix the bug preset=engineer user_facing=true"
-        );
-        assert_eq!(ha.delivered, MailId(5));
+        assert_eq!(props(&ha), "cwd=/src/repo name=Fix the bug preset=engineer");
+        assert_eq!(ha.delivered, ChatSeq(9));
         let hb = read.agent(b).unwrap();
         assert!(matches!(
             hb.spec.runtime,
@@ -1198,18 +1293,18 @@ mod tests {
             .iter()
             .filter_map(|(_, record)| match &record.event {
                 Event::Input {
-                    mail,
+                    message,
                     content,
                     wake,
                     ..
-                } => Some((*mail, text(content), *wake)),
+                } => Some((*message, text(content), *wake)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             inputs,
             vec![(
-                Some(MailId(2)),
+                Some(ChatMessageId(ChatSeq(5))),
                 "Message from the human:\nfirst".into(),
                 InputWake::Person
             )]
@@ -1232,18 +1327,18 @@ mod tests {
             .into_iter()
             .filter_map(|(_, record)| match record.event {
                 Event::Input {
-                    mail,
+                    message,
                     content,
                     wake,
                     ..
-                } => Some((mail, text(&content), wake)),
+                } => Some((message, text(&content), wake)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             b_inputs,
             vec![(
-                Some(MailId(4)),
+                Some(ChatMessageId(ChatSeq(8))),
                 format!("Message from agent {}:\nhelp me", a.encoded()),
                 InputWake::Agent
             )]

@@ -115,7 +115,7 @@ pub struct ChatRecord {
 }
 
 /// A posted message, with where it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Message {
     pub id: MessageId,
     pub at: UnixMs,

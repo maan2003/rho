@@ -1,16 +1,13 @@
 //! The agent store: workset logs, the heads projected from them, and the
-//! mail log ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
+//! chat ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 //!
 //! Each workset has one log, keyed by `(workset, wpos)`, dense from zero and
 //! never rewritten. Agent and workset heads are folded from it in the same
-//! transaction as every append. Mail is one host-wide log, dense from one.
-//! Deleting a workset removes its log and heads; mail stays.
+//! transaction as every append. Chat is one host-wide log ([`chat`]).
+//! Deleting a workset removes its log and heads; chat stays.
 
 use redb::TableDefinition;
-use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, ThreadId, UnixMs, WorksetId,
-    WorksetKind, Wpos,
-};
+use rho_agent_types::{Address, AgentId, ChatSeq, InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
@@ -26,9 +23,6 @@ const WORKSET_HEADS: TableDefinition<WorksetKey, Sen<WorksetHead>> =
     TableDefinition::new("workset_heads");
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
     TableDefinition::new("workset_agent_heads");
-const MAIL_LOG: TableDefinition<u64, Sen<Mail>> = TableDefinition::new("mail_log");
-/// The user's mail by the client's own id for it, so a resend is logged once.
-const MAIL_CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("mail_client_ids");
 
 /// What a workset is, folded from its log.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -51,8 +45,8 @@ pub struct AgentHead {
     pub created: Wpos,
     /// Its newest row.
     pub last: Wpos,
-    /// The newest mail handed to it by an `Input`.
-    pub delivered: MailId,
+    /// The newest message handed to it by an `Input`.
+    pub delivered: ChatSeq,
     /// A Claude rewind whose destination is not verified yet.
     pub claude_rewind: Option<ClaudeRewind>,
     pub native: NativeCursor,
@@ -110,8 +104,9 @@ impl AgentHead {
         match event {
             Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
             Event::Input {
-                mail: Some(mail), ..
-            } => self.delivered = self.delivered.max(*mail),
+                message: Some(message),
+                ..
+            } => self.delivered = self.delivered.max(message.0),
             Event::Native { entry, .. } => self.native.observe(pos, entry),
             Event::Claude {
                 row: ClaudeRow::RewindPending(rewind),
@@ -133,7 +128,7 @@ impl AgentHead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appended {
     Row { workset: WorksetId, pos: Wpos },
-    Mail(MailId),
+    Chat(ChatSeq),
     WorksetDeleted(WorksetId),
 }
 
@@ -194,14 +189,6 @@ pub trait StoreRead {
     fn workset_row(&self, workset: WorksetId, pos: Wpos) -> Option<Record<'static>>;
     /// The agent's visible rows from `from`, rewinds applied.
     fn agent_rows(&self, agent: AgentId, from: Wpos) -> Vec<(Wpos, Record<'static>)>;
-    fn mail_head(&self) -> MailId;
-    /// Up to `limit` mails after `after`, in order.
-    fn mail_since(&self, after: MailId, limit: usize) -> Vec<Mail>;
-    fn mail(&self, id: MailId) -> Option<Mail>;
-    /// Mail to `to` after `after`, in order.
-    fn inbox(&self, to: Address, after: MailId) -> Vec<Mail>;
-    /// The newest mail between `a` and `b`, in either direction.
-    fn newest_between(&self, a: Address, b: Address) -> Option<Mail>;
 }
 
 impl StoreRead for ReadTxn {
@@ -267,54 +254,6 @@ impl StoreRead for ReadTxn {
             .filter(|(pos, _)| *pos >= from)
             .collect()
     }
-
-    fn mail_head(&self) -> MailId {
-        self.open_table(MAIL_LOG)
-            .iter()
-            .next_back()
-            .map_or(MailId(0), |(key, _)| MailId(key.value()))
-    }
-
-    fn mail_since(&self, after: MailId, limit: usize) -> Vec<Mail> {
-        self.open_table(MAIL_LOG)
-            .range(after.0 + 1..)
-            .take(limit)
-            .map(|(_, mail)| mail.value().into_owned())
-            .collect()
-    }
-
-    fn mail(&self, id: MailId) -> Option<Mail> {
-        self.open_table(MAIL_LOG)
-            .get(id.0)
-            .map(|mail| mail.value().into_owned())
-    }
-
-    fn inbox(&self, to: Address, after: MailId) -> Vec<Mail> {
-        self.open_table(MAIL_LOG)
-            .range(after.0 + 1..)
-            .map(|(_, mail)| mail.value().into_owned())
-            .filter(|mail| mail.to == to)
-            .collect()
-    }
-
-    fn newest_between(&self, a: Address, b: Address) -> Option<Mail> {
-        self.open_table(MAIL_LOG)
-            .iter()
-            .rev()
-            .map(|(_, mail)| mail.value().into_owned())
-            .find(|mail| (mail.from, mail.to) == (a, b) || (mail.from, mail.to) == (b, a))
-    }
-}
-
-/// A mail as its sender gives it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewMail {
-    pub from: Address,
-    pub to: Address,
-    /// The thread to post in; `None` starts one.
-    pub thread: Option<ThreadId>,
-    pub kind: Option<SendKind>,
-    pub content: Vec<ContentPart>,
 }
 
 pub trait StoreWrite {
@@ -323,16 +262,7 @@ pub trait StoreWrite {
     fn create_workset(&mut self, workset: WorksetId, at: UnixMs, kind: WorksetKind, code: String);
     /// Append one row to a workset's log, folding the heads it changes.
     fn append(&mut self, workset: WorksetId, record: &Record<'_>) -> anyhow::Result<Wpos>;
-    /// Append a mail; with `client_id`, a mail already posted under that id
-    /// is returned instead of a second one.
-    /// Fails when `thread` names no mail.
-    fn post_mail(
-        &mut self,
-        at: UnixMs,
-        mail: NewMail,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<MailId>;
-    /// Remove a workset's log and heads. Mail stays.
+    /// Remove a workset's log and heads. Chat stays.
     fn delete_workset(&mut self, workset: WorksetId) -> bool;
     /// An agent's head, read inside this transaction.
     fn agent_head(&mut self, agent: AgentId) -> Option<AgentHead>;
@@ -343,8 +273,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_LOG);
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
-        self.open_table(MAIL_LOG);
-        self.open_table(MAIL_CLIENT_IDS);
+        self.init_chat_tables();
     }
 
     fn create_workset(&mut self, workset: WorksetId, at: UnixMs, kind: WorksetKind, code: String) {
@@ -395,7 +324,7 @@ impl StoreWrite for WriteTxn {
                     created_at: record.at,
                     created: pos,
                     last: pos,
-                    delivered: MailId(0),
+                    delivered: ChatSeq::ZERO,
                     claude_rewind: None,
                     native: NativeCursor {
                         from: pos,
@@ -445,61 +374,6 @@ impl StoreWrite for WriteTxn {
             .insert(workset.0, SenValue::borrowed(&head));
         tell(self, Appended::Row { workset, pos });
         Ok(pos)
-    }
-
-    fn post_mail(
-        &mut self,
-        at: UnixMs,
-        mail: NewMail,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<MailId> {
-        if let Some(client_id) = client_id
-            && let Some(id) = self.open_table(MAIL_CLIENT_IDS).get(client_id)
-        {
-            return Ok(MailId(id.value()));
-        }
-        let id = {
-            let log = self.open_table(MAIL_LOG);
-            log.iter()
-                .next_back()
-                .map_or(MailId(1), |(key, _)| MailId(key.value()).next())
-        };
-        let NewMail {
-            from,
-            to,
-            thread,
-            kind,
-            content,
-        } = mail;
-        let thread = match thread {
-            None => ThreadId(id),
-            Some(thread) => {
-                anyhow::ensure!(
-                    self.open_table(MAIL_LOG)
-                        .get(thread.0.0)
-                        .is_some_and(|first| first.value().into_owned().thread == thread),
-                    "no mail thread {}",
-                    thread.0.0
-                );
-                thread
-            }
-        };
-        let mail = Mail {
-            id,
-            at,
-            from,
-            to,
-            thread,
-            kind,
-            content,
-        };
-        self.open_table(MAIL_LOG)
-            .insert(id.0, SenValue::borrowed(&mail));
-        if let Some(client_id) = client_id {
-            self.open_table(MAIL_CLIENT_IDS).insert(client_id, id.0);
-        }
-        tell(self, Appended::Mail(id));
-        Ok(id)
     }
 
     fn agent_head(&mut self, agent: AgentId) -> Option<AgentHead> {
@@ -572,6 +446,9 @@ pub fn wake_of(from: Address) -> InputWake {
     }
 }
 
+pub mod chat;
 pub(crate) mod from_main;
+
+pub use chat::{ChatRead, ChatWrite, NewMessage, TopicHead};
 #[cfg(test)]
 mod tests;

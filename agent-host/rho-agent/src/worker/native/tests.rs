@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rho_agent_types::{Address, SendKind, WorksetId, WorksetKind};
+use rho_agent_types::{Address, ChatSeq, MentionKind, Message, WorksetId, WorksetKind};
 use rho_db::RhoDb;
 
 use super::scripted::Scripted;
@@ -12,7 +12,7 @@ use super::*;
 use crate::inference::Item;
 use crate::inference::config::ReasoningEffort;
 use crate::record::AgentSpec;
-use crate::store::{StoreRead as _, StoreWrite as _};
+use crate::store::{ChatRead as _, StoreRead as _, StoreWrite as _};
 
 struct Harness {
     _directory: tempfile::TempDir,
@@ -131,17 +131,18 @@ impl Harness {
         })
     }
 
-    /// What the model mailed the user, oldest first, with its kind.
-    fn mail(&self) -> Vec<(String, Option<SendKind>)> {
+    /// What the model posted, oldest first, with how it mentions the user.
+    fn mail(&self) -> Vec<(String, Option<MentionKind>)> {
         self.db
             .read()
-            .mail_since(MailId(0), usize::MAX)
-            .into_iter()
-            .filter(|mail| mail.to == Address::User)
-            .map(|mail| {
+            .chat_since(ChatSeq::ZERO, usize::MAX)
+            .iter()
+            .filter_map(Message::from_record)
+            .filter(|message| matches!(message.from, Address::Agent(_)))
+            .map(|message| {
                 (
-                    rho_agent_types::transcript::text_content(&mail.content),
-                    mail.kind,
+                    rho_agent_types::transcript::text_content(&message.content),
+                    message.mentions(Address::User),
                 )
             })
             .collect()
@@ -296,8 +297,8 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     assert_eq!(
         harness.mail(),
         [
-            ("hello there".to_owned(), Some(SendKind::Result)),
-            ("reading".to_owned(), Some(SendKind::Status)),
+            ("hello there".to_owned(), Some(MentionKind::Result)),
+            ("reading".to_owned(), None),
         ]
     );
 }

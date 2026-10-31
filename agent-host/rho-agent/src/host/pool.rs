@@ -3,13 +3,16 @@
 //! The pool owns one process per workset
 //! ([ARCH-agent-host](../../specs/ARCH-agent-host.md)), the id → loaded-agent
 //! map, and the answers to each workset's `_rho` calls. The store is the truth
-//! about worksets, agents and mail; the pool holds only what runs.
+//! about worksets, agents and chat; the pool holds only what runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_types::{Address, AgentId, ContentPart, Mail, MailId, UnixMs, WorksetKind};
+use rho_agent_types::{
+    Address, AgentId, ChatSeq, ContentPart, Message, MessageId, StreamId, TopicId, UnixMs,
+    WorksetKind,
+};
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
 use tokio::sync::Mutex;
@@ -22,14 +25,14 @@ use crate::ipc::protocol::Control;
 use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
-use crate::store::{NewMail, StoreRead as _, StoreWrite as _};
+use crate::store::{ChatRead as _, ChatWrite as _, NewMessage, StoreRead as _, StoreWrite as _};
 
 /// How many agents stay loaded. Past this the least recently used one
 /// that is settled and nobody is looking at is dropped; its log is the
 /// whole of it, so nothing is lost.
 pub const MAX_LOADED: usize = 100;
-/// How long a `_rho.inbox` call waits for mail before it answers with none.
-/// A handoff answers it at once instead.
+/// How long a `_rho.inbox` call waits for a message before it answers with
+/// none. A handoff answers it at once instead.
 const INBOX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
@@ -65,9 +68,9 @@ pub struct AgentPool {
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
-    /// The user's message the running `Eval` of a workset carries: the
-    /// first agent its code creates gets it as mail.
-    first_mail: std::sync::Mutex<HashMap<WorksetId, FirstMail>>,
+    /// The first agent the running `Eval` of a workset created, once it
+    /// created one.
+    first_agent: std::sync::Mutex<HashMap<WorksetId, Option<AgentId>>>,
     /// A handoff is waiting for every request to be answered: a long
     /// `inbox` wait answers empty at once, and Python asks again of the
     /// next host.
@@ -102,17 +105,12 @@ impl Statuses {
 }
 
 /// What code the GUI ran printed, its traceback if it raised, and the
-/// agent its message was mailed to.
+/// first agent it created.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evaluated {
     pub output: String,
     pub error: Option<String>,
     pub agent: Option<AgentId>,
-}
-
-enum FirstMail {
-    Waiting(Vec<ContentPart>),
-    Sent(AgentId),
 }
 
 impl AgentPool {
@@ -144,7 +142,7 @@ impl AgentPool {
             statuses: std::sync::Mutex::new(Vec::new()),
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
-            first_mail: std::sync::Mutex::default(),
+            first_agent: std::sync::Mutex::default(),
             handing: tokio::sync::watch::Sender::new(false),
         });
         let weak = Arc::downgrade(&pool);
@@ -257,7 +255,7 @@ impl AgentPool {
     }
 
     /// Start the workset's process in the background, so its policy runs:
-    /// mail just arrived for one of its agents.
+    /// a message just arrived for one of its agents.
     fn wake_workset(self: &Arc<Self>, workset: WorksetId) {
         let pool = self.clone();
         tokio::spawn(async move {
@@ -736,14 +734,11 @@ impl AgentPool {
         }
     }
 
-    /// A new workset, its first row, and its process running `code`. With a
-    /// `message`, the first agent the code creates gets it as mail from the
-    /// user.
+    /// A new workset, its first row, and its process running `code`.
     pub async fn create_workset(
         self: &Arc<Self>,
         kind: WorksetKind,
         code: String,
-        message: Option<Vec<ContentPart>>,
     ) -> anyhow::Result<(WorksetId, Evaluated)> {
         if let WorksetKind::Host { cwd } = &kind {
             anyhow::ensure!(
@@ -757,17 +752,15 @@ impl AgentPool {
         let mut write = self.db.write().await;
         write.create_workset(workset, UnixMs::now(), kind, code.clone());
         write.commit();
-        let evaluated = self.run(workset, code, message).await?;
+        let evaluated = self.run(workset, code).await?;
         Ok((workset, evaluated))
     }
 
-    /// Run `code` in the workset namespace, logged first. With a `message`,
-    /// the first agent the code creates gets it as mail from the user.
+    /// Run `code` in the workset namespace, logged first.
     pub async fn eval(
         self: &Arc<Self>,
         workset: WorksetId,
         code: String,
-        message: Option<Vec<ContentPart>>,
     ) -> anyhow::Result<Evaluated> {
         {
             let mut write = self.db.write().await;
@@ -780,41 +773,27 @@ impl AgentPool {
             )?;
             write.commit();
         }
-        self.run(workset, code, message).await
+        self.run(workset, code).await
     }
 
-    async fn run(
-        self: &Arc<Self>,
-        workset: WorksetId,
-        code: String,
-        message: Option<Vec<ContentPart>>,
-    ) -> anyhow::Result<Evaluated> {
+    async fn run(self: &Arc<Self>, workset: WorksetId, code: String) -> anyhow::Result<Evaluated> {
         let slot = self.execution_slot(workset).await;
         let process = {
             let _admission = slot.admission.clone().read_owned().await;
             self.process(workset).await?
         };
-        if let Some(message) = message {
-            self.first_mail
-                .lock()
-                .expect("poison")
-                .insert(workset, FirstMail::Waiting(message));
-        }
+        self.first_agent
+            .lock()
+            .expect("poison")
+            .insert(workset, None);
         let result = process.eval(code).await;
-        let first = self.first_mail.lock().expect("poison").remove(&workset);
-        let (output, mut error) = result?;
-        let agent = match first {
-            Some(FirstMail::Sent(agent)) => Some(agent),
-            Some(FirstMail::Waiting(_)) => {
-                let note = "The code created no agent, so the message was not sent.";
-                error = Some(match error {
-                    Some(error) => format!("{error}\n{note}"),
-                    None => note.to_owned(),
-                });
-                None
-            }
-            None => None,
-        };
+        let agent = self
+            .first_agent
+            .lock()
+            .expect("poison")
+            .remove(&workset)
+            .flatten();
+        let (output, error) = result?;
         Ok(Evaluated {
             output,
             error,
@@ -822,37 +801,84 @@ impl AgentPool {
         })
     }
 
-    /// Mail from the user. A resend under the same `client_id` is the same
-    /// mail. The agent's workset starts, so its policy can deliver it.
-    pub async fn post_user_mail(
+    /// A message from the user. A resend under the same `client_id` is the
+    /// same message.
+    pub async fn post_user(
         self: &Arc<Self>,
         client_id: u64,
-        to: AgentId,
-        thread: Option<rho_agent_types::ThreadId>,
+        topic: TopicId,
         content: Vec<ContentPart>,
-    ) -> anyhow::Result<MailId> {
-        let workset = self.workset_of(to)?;
-        let id = self
-            .post_mail(
-                NewMail {
-                    from: Address::User,
-                    to: Address::Agent(to),
-                    thread,
-                    kind: None,
-                    content,
-                },
-                Some(client_id),
-            )
-            .await?;
-        self.wake_workset(workset);
+    ) -> anyhow::Result<MessageId> {
+        let message = NewMessage {
+            from: Address::User,
+            mentions: Vec::new(),
+            content,
+        };
+        let mut write = self.db.write().await;
+        let id = write.post(UnixMs::now(), topic, message, Some(client_id))?;
+        write.commit();
+        self.wake_receivers(id, None);
         Ok(id)
     }
 
-    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> anyhow::Result<MailId> {
+    /// A topic the user starts. A resend under the same `client_id` is the
+    /// same topic.
+    pub async fn start_user_topic(
+        self: &Arc<Self>,
+        client_id: u64,
+        stream: StreamId,
+        name: String,
+        agents: Vec<AgentId>,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<TopicId> {
+        for agent in &agents {
+            self.workset_of(*agent)?;
+        }
+        let first = NewMessage {
+            from: Address::User,
+            mentions: Vec::new(),
+            content,
+        };
         let mut write = self.db.write().await;
-        let id = write.post_mail(UnixMs::now(), mail, client_id)?;
+        let (topic, first) =
+            write.start_topic(UnixMs::now(), stream, name, agents, first, Some(client_id))?;
         write.commit();
-        Ok(id)
+        self.wake_receivers(first, None);
+        Ok(topic)
+    }
+
+    /// Start the process of every workset with an agent that receives
+    /// `message`, but `except`, so its policy can deliver it.
+    fn wake_receivers(self: &Arc<Self>, message: MessageId, except: Option<WorksetId>) {
+        let read = self.db.read();
+        let Some(message) = read.message(message) else {
+            return;
+        };
+        let mut receivers: Vec<AgentId> = read
+            .topic(message.topic)
+            .map(|head| head.agents)
+            .unwrap_or_default();
+        receivers.extend(
+            message
+                .mentions
+                .iter()
+                .filter_map(|mention| match mention.to {
+                    Address::Agent(agent) => Some(agent),
+                    Address::User => None,
+                }),
+        );
+        let mut worksets: Vec<WorksetId> = receivers
+            .into_iter()
+            .filter(|agent| message.from != Address::Agent(*agent))
+            .filter_map(|agent| read.agent(agent).map(|head| head.workset))
+            .filter(|workset| Some(*workset) != except)
+            .collect();
+        drop(read);
+        worksets.sort();
+        worksets.dedup();
+        for workset in worksets {
+            self.wake_workset(workset);
+        }
     }
 
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
@@ -1018,39 +1044,12 @@ impl AgentPool {
                         event: Event::AgentCreated { agent, spec },
                     },
                 )?;
-                // The message the running `Eval` carries, if this is the
-                // first agent it creates.
-                let first = {
-                    let mut first_mail = self.first_mail.lock().expect("poison");
-                    match first_mail.remove(&workset) {
-                        Some(FirstMail::Waiting(content)) => {
-                            first_mail.insert(workset, FirstMail::Sent(agent));
-                            Some(content)
-                        }
-                        other => {
-                            if let Some(other) = other {
-                                first_mail.insert(workset, other);
-                            }
-                            None
-                        }
-                    }
-                };
-                if let Some(content) = first {
-                    write
-                        .post_mail(
-                            UnixMs::now(),
-                            NewMail {
-                                from: Address::User,
-                                to: Address::Agent(agent),
-                                thread: None,
-                                kind: None,
-                                content,
-                            },
-                            None,
-                        )
-                        .expect("a new thread names no mail");
-                }
                 write.commit();
+                if let Some(first) = self.first_agent.lock().expect("poison").get_mut(&workset)
+                    && first.is_none()
+                {
+                    *first = Some(agent);
+                }
                 PyReply::Agent(agent)
             }
             PyRequest::Agents => {
@@ -1097,7 +1096,7 @@ impl AgentPool {
             }
             PyRequest::Delivered(agent) => {
                 self.own_agent(workset, agent)?;
-                PyReply::Mail(
+                PyReply::Seq(
                     self.db
                         .read()
                         .agent(agent)
@@ -1105,40 +1104,74 @@ impl AgentPool {
                         .delivered,
                 )
             }
-            PyRequest::SendMail {
+            PyRequest::Post {
                 sender,
-                to,
+                topic,
+                mentions,
                 content,
-                kind,
-                thread,
             } => {
                 self.own_agent(workset, sender)?;
-                let recipient = match to {
-                    Address::User => None,
-                    Address::Agent(to) => Some(self.workset_of(to)?),
+                self.known_mentions(&mentions)?;
+                let message = NewMessage {
+                    from: Address::Agent(sender),
+                    mentions,
+                    content,
                 };
-                let id = self
-                    .post_mail(
-                        NewMail {
-                            from: Address::Agent(sender),
-                            to,
-                            thread,
-                            kind,
-                            content,
-                        },
-                        None,
-                    )
-                    .await?;
-                if let Some(recipient) = recipient
-                    && recipient != workset
-                {
-                    self.wake_workset(recipient);
-                }
-                PyReply::Mail(id)
+                let mut write = self.db.write().await;
+                let id = write.post(UnixMs::now(), topic, message, None)?;
+                write.commit();
+                self.wake_receivers(id, Some(workset));
+                PyReply::Seq(id.0)
             }
-            PyRequest::Inbox { address, after } => PyReply::Mails(self.inbox(address, after).await),
-            PyRequest::NewestMailBetween(a, b) => {
-                PyReply::NewestMail(self.db.read().newest_between(a, b))
+            PyRequest::StartTopic {
+                sender,
+                stream,
+                name,
+                agents,
+                mentions,
+                content,
+            } => {
+                self.own_agent(workset, sender)?;
+                self.known_mentions(&mentions)?;
+                for agent in &agents {
+                    self.workset_of(*agent)?;
+                }
+                let stream = self
+                    .db
+                    .read()
+                    .stream_named(&stream)
+                    .with_context(|| format!("no stream {stream:?}"))?;
+                let first = NewMessage {
+                    from: Address::Agent(sender),
+                    mentions,
+                    content,
+                };
+                let mut write = self.db.write().await;
+                let (topic, first) =
+                    write.start_topic(UnixMs::now(), stream, name, agents, first, None)?;
+                write.commit();
+                self.wake_receivers(first, Some(workset));
+                PyReply::Seq(topic.0)
+            }
+            PyRequest::Join { topic, agent } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.join(UnixMs::now(), topic, agent)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Topic(topic) => {
+                let read = self.db.read();
+                PyReply::Topic(read.topic(topic).map(|head| {
+                    let stream = read
+                        .stream_name(head.stream)
+                        .expect("a topic's stream exists");
+                    (head, stream)
+                }))
+            }
+            PyRequest::Inbox { agent, after } => {
+                self.own_agent(workset, agent)?;
+                PyReply::Messages(self.inbox(agent, after).await)
             }
             PyRequest::Clone { url, dest, rev } => {
                 let kind = self
@@ -1171,9 +1204,19 @@ impl AgentPool {
         })
     }
 
-    /// Mail to `address` after `after`, waiting up to [`INBOX_WAIT`] for
-    /// some.
-    async fn inbox(&self, address: Address, after: MailId) -> Vec<Mail> {
+    /// Fails unless every agent `mentions` names is on this host.
+    fn known_mentions(&self, mentions: &[rho_agent_types::Mention]) -> anyhow::Result<()> {
+        for mention in mentions {
+            if let Address::Agent(agent) = mention.to {
+                self.workset_of(agent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What `agent` receives after `after`, waiting up to [`INBOX_WAIT`]
+    /// for some.
+    async fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message> {
         let mut feed = crate::store::feed(&self.db);
         let deadline = tokio::time::sleep(INBOX_WAIT);
         tokio::pin!(deadline);
@@ -1181,14 +1224,14 @@ impl AgentPool {
         let handing = handing.wait_for(|handing| *handing);
         tokio::pin!(handing);
         loop {
-            let mails = self.db.read().inbox(address, after);
-            if !mails.is_empty() {
-                return mails;
+            let messages = self.db.read().inbox(agent, after);
+            if !messages.is_empty() {
+                return messages;
             }
             loop {
                 tokio::select! {
                     appended = feed.recv() => match appended {
-                        Ok(crate::store::Appended::Mail(_))
+                        Ok(crate::store::Appended::Chat(_))
                         | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return Vec::new(),

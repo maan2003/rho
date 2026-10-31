@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse};
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, InputWake, MailId, Props, UnixMs, WorksetKind, Wpos,
+    AgentId, ContentPart, ExecMilestone, InputWake, MessageId, Props, UnixMs, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -44,8 +44,8 @@ pub enum Event<'a> {
     /// is true.
     Input {
         agent: AgentId,
-        /// The mail it hands over, if it is one.
-        mail: Option<MailId>,
+        /// The message it hands over, if it is one.
+        message: Option<MessageId>,
         content: Vec<ContentPart>,
         wake: InputWake,
     },

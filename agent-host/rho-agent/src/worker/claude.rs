@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_agent_types::transcript::{ContextItemEvent, PendingInferenceResponse};
-use rho_agent_types::{AgentId, ContentPart, InputWake, MailId, UnixMs, Wpos};
+use rho_agent_types::{AgentId, ContentPart, InputWake, MessageId, UnixMs, Wpos};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -56,14 +56,14 @@ impl ClaudeAgent {
         &self,
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
     ) -> anyhow::Result<()> {
         let (logged, reply) = oneshot::channel();
         self.control
             .send(ClaudeControl::Input {
                 content,
                 wake,
-                mail,
+                message,
                 logged,
             })
             .map_err(|_| anyhow::anyhow!("Claude agent stopped before logging the input"))?;
@@ -117,7 +117,7 @@ enum ClaudeControl {
     Input {
         content: Vec<ContentPart>,
         wake: InputWake,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
         logged: oneshot::Sender<()>,
     },
     Compact,
@@ -636,13 +636,13 @@ impl ClaudeLoop {
             ClaudeControl::Input {
                 content,
                 wake,
-                mail,
+                message,
                 logged,
             } => {
                 self.host
                     .append(Event::Input {
                         agent: self.agent_id,
-                        mail,
+                        message,
                         content: content.clone(),
                         wake,
                     })
@@ -1991,7 +1991,7 @@ impl ClaudeLoop {
             self.host
                 .append(Event::Input {
                     agent: self.agent_id,
-                    mail: None,
+                    message: None,
                     content: content.clone(),
                     wake: InputWake::Quiet,
                 })
@@ -2481,7 +2481,7 @@ mod tests {
     fn input(agent: AgentId, text: &str, wake: InputWake) -> Event<'static> {
         Event::Input {
             agent,
-            mail: None,
+            message: None,
             content: vec![ContentPart::Text { text: text.into() }],
             wake,
         }

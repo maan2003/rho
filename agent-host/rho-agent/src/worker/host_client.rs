@@ -415,13 +415,13 @@ mod tests {
                     text: "queue this".into(),
                 }],
                 wake: rho_agent_types::InputWake::Agent,
-                mail: Some(rho_agent_types::MailId(7)),
+                message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))),
             },
         };
         let decoded = decode(&encode(&input).unwrap()).unwrap();
         assert!(matches!(
             decoded,
-            Message::Control { id: 1, body: Control::Input { content, wake: rho_agent_types::InputWake::Agent, mail: Some(rho_agent_types::MailId(7)) } }
+            Message::Control { id: 1, body: Control::Input { content, wake: rho_agent_types::InputWake::Agent, message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))) } }
             if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this")
         ));
         let cancel = Message::Control {
@@ -536,7 +536,7 @@ mod tests {
                         at: UnixMs(1),
                         event: Event::Input {
                             agent,
-                            mail: Some(rho_agent_types::MailId(37)),
+                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
                             content: vec![rho_agent_types::ContentPart::Text {
                                 text: "a".repeat(count),
                             }],
@@ -554,7 +554,7 @@ mod tests {
                 Request::Append(Record {
                     event:
                         Event::Input {
-                            mail: Some(rho_agent_types::MailId(37)),
+                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
                             content,
                             ..
                         },

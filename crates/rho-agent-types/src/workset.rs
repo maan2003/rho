@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use camino::Utf8PathBuf;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-
 /// How a workset's process sees the filesystem.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum WorksetKind {

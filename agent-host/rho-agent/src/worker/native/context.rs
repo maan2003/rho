@@ -170,7 +170,7 @@ mod tests {
     fn received(text: &str) -> Event<'static> {
         Event::Input {
             agent: agent(),
-            mail: None,
+            message: None,
             content: vec![ContentPart::Text { text: text.into() }],
             wake: InputWake::Person,
         }

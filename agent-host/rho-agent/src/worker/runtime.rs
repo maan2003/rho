@@ -25,10 +25,10 @@ impl Controller {
             Control::Input {
                 content,
                 wake,
-                mail,
+                message,
             } => match self {
-                Self::Rho(agent) => agent.input(content, wake, mail).await?,
-                Self::Claude(agent) => agent.input(content, wake, mail).await?,
+                Self::Rho(agent) => agent.input(content, wake, message).await?,
+                Self::Claude(agent) => agent.input(content, wake, message).await?,
             },
             Control::TellTail => match self {
                 Self::Rho(agent) => agent.tell_tail(),

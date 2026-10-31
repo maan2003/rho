@@ -16,7 +16,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, Mail, MailId, SendKind, ThreadId, WorksetId,
+    Address, AgentId, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId, TopicId,
+    WorksetId,
 };
 use tokio::sync::oneshot;
 
@@ -327,9 +328,11 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(compact, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(start_topic, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(newest_mail_between, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
     Ok(module)
 }
@@ -495,8 +498,14 @@ fn control(py: Python<'_>, agent: &str, control: Control) -> PyResult<()> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (agent, text, *, wake, mail = None))]
-fn input(py: Python<'_>, agent: &str, text: String, wake: &str, mail: Option<u64>) -> PyResult<()> {
+#[pyo3(signature = (agent, text, *, wake, message = None))]
+fn input(
+    py: Python<'_>,
+    agent: &str,
+    text: String,
+    wake: &str,
+    message: Option<u64>,
+) -> PyResult<()> {
     let wake = match wake {
         "person" => InputWake::Person,
         "agent" => InputWake::Agent,
@@ -513,7 +522,7 @@ fn input(py: Python<'_>, agent: &str, text: String, wake: &str, mail: Option<u64
         Control::Input {
             content: vec![ContentPart::Text { text }],
             wake,
-            mail: mail.map(MailId),
+            message: message.map(|seq| MessageId(ChatSeq(seq))),
         },
     )
 }
@@ -521,18 +530,7 @@ fn input(py: Python<'_>, agent: &str, text: String, wake: &str, mail: Option<u64
 #[pyfunction]
 fn delivered(py: Python<'_>, agent: &str) -> PyResult<u64> {
     match PyHost::block(py, PyRequest::Delivered(agent_id(agent)?))? {
-        PyReply::Mail(id) => Ok(id.0),
-        _ => Err(unexpected()),
-    }
-}
-
-#[pyfunction]
-fn newest_mail_between(py: Python<'_>, a: &str, b: &str) -> PyResult<Option<Py<PyAny>>> {
-    let request = PyRequest::NewestMailBetween(address(a)?, address(b)?);
-    match PyHost::block(py, request)? {
-        PyReply::NewestMail(mail) => mail
-            .map(|mail| Ok(mail_to_py(py, &mail)?.into_any().unbind()))
-            .transpose(),
+        PyReply::Seq(seq) => Ok(seq.0),
         _ => Err(unexpected()),
     }
 }
@@ -557,84 +555,173 @@ fn new_cache_key(py: Python<'_>, agent: &str) -> PyResult<()> {
     control(py, agent, Control::CacheKey)
 }
 
-#[pyfunction]
-#[pyo3(signature = (sender, to, text, *, kind = None, thread = None))]
-fn send_mail(
-    py: Python<'_>,
-    sender: &str,
-    to: &str,
-    text: String,
-    kind: Option<&str>,
-    thread: Option<u64>,
-) -> PyResult<u64> {
-    let sender = agent_id(sender)?;
-    let to = address(to)?;
+fn mentions(py_mentions: Option<Vec<(String, String)>>) -> PyResult<Vec<Mention>> {
+    py_mentions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(to, kind)| {
+            let kind = match kind.as_str() {
+                "ask" => MentionKind::Ask,
+                "result" => MentionKind::Result,
+                "fyi" => MentionKind::Fyi,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "a mention's kind is one of \"ask\", \"result\" or \"fyi\"",
+                    ));
+                }
+            };
+            Ok(Mention {
+                to: address(&to)?,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The content of an agent's message, refused when it mentions the user in
+/// other than Simplified Technical English.
+fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPart>> {
     if text.trim().is_empty() {
         return Err(PyValueError::new_err("a message needs text"));
     }
-    let kind = kind
-        .map(|kind| match kind {
-            "ask" => Ok(SendKind::Ask),
-            "result" => Ok(SendKind::Result),
-            "status" => Ok(SendKind::Status),
-            "fyi" => Ok(SendKind::Fyi),
-            _ => Err(PyValueError::new_err(
-                "kind is one of \"ask\", \"result\", \"fyi\" or \"status\"",
-            )),
-        })
-        .transpose()?;
-    if to == Address::User {
-        let Some(kind) = kind else {
-            return Err(PyValueError::new_err("mail to the user needs a kind"));
-        };
-        if kind != SendKind::Status {
-            let findings = crate::worker::ste::ste_findings(&text);
-            if !findings.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "not sent. Write the message in Simplified Technical English \
-                     (ASD-STE100): fix these problems, then send it again.\n\n{}",
-                    findings.join("\n\n")
-                )));
-            }
+    if mentions.iter().any(|mention| mention.to == Address::User) {
+        let findings = crate::worker::ste::ste_findings(&text);
+        if !findings.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "not sent. Write the message in Simplified Technical English \
+                 (ASD-STE100): fix these problems, then send it again.\n\n{}",
+                findings.join("\n\n")
+            )));
         }
     }
-    let request = PyRequest::SendMail {
+    Ok(vec![ContentPart::Text { text }])
+}
+
+/// Post `text` in `topic`; `mentions` are `(address, kind)` pairs.
+#[pyfunction]
+#[pyo3(signature = (sender, topic, text, *, mentions = None))]
+fn post(
+    py: Python<'_>,
+    sender: &str,
+    topic: u64,
+    text: String,
+    mentions: Option<Vec<(String, String)>>,
+) -> PyResult<u64> {
+    let sender = agent_id(sender)?;
+    let mentions = self::mentions(mentions)?;
+    let content = message_content(text, &mentions)?;
+    let request = PyRequest::Post {
         sender,
-        to,
-        content: vec![ContentPart::Text { text }],
-        kind,
-        thread: thread.map(|thread| ThreadId(MailId(thread))),
+        topic: TopicId(ChatSeq(topic)),
+        mentions,
+        content,
     };
     match PyHost::block(py, request)? {
-        PyReply::Mail(id) => Ok(id.0),
+        PyReply::Seq(seq) => Ok(seq.0),
         _ => Err(unexpected()),
     }
 }
 
-fn mail_to_py<'py>(py: Python<'py>, mail: &Mail) -> PyResult<Bound<'py, PyDict>> {
+#[pyfunction]
+#[pyo3(signature = (sender, stream, name, text, *, agents = Vec::new(), mentions = None))]
+fn start_topic(
+    py: Python<'_>,
+    sender: &str,
+    stream: String,
+    name: String,
+    text: String,
+    agents: Vec<String>,
+    mentions: Option<Vec<(String, String)>>,
+) -> PyResult<u64> {
+    let sender = agent_id(sender)?;
+    let agents = agents
+        .iter()
+        .map(|agent| agent_id(agent))
+        .collect::<PyResult<Vec<_>>>()?;
+    let mentions = self::mentions(mentions)?;
+    let content = message_content(text, &mentions)?;
+    let request = PyRequest::StartTopic {
+        sender,
+        stream,
+        name,
+        agents,
+        mentions,
+        content,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Seq(seq) => Ok(seq.0),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn join(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
+    let request = PyRequest::Join {
+        topic: TopicId(ChatSeq(topic)),
+        agent: agent_id(agent)?,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// A topic: its name, its stream's name and its agents; None for no topic.
+#[pyfunction]
+fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
+    match PyHost::block(py, PyRequest::Topic(TopicId(ChatSeq(id))))? {
+        PyReply::Topic(None) => Ok(None),
+        PyReply::Topic(Some((head, stream))) => {
+            let out = PyDict::new(py);
+            out.set_item("id", id)?;
+            out.set_item("name", head.name)?;
+            out.set_item("stream", stream)?;
+            out.set_item(
+                "agents",
+                head.agents
+                    .iter()
+                    .map(|agent| agent.encoded().to_string())
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(Some(out.into_any().unbind()))
+        }
+        _ => Err(unexpected()),
+    }
+}
+
+fn message_to_py<'py>(
+    py: Python<'py>,
+    message: &rho_agent_types::Message,
+) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
-    out.set_item("id", mail.id.0)?;
-    out.set_item("at", mail.at.0)?;
-    out.set_item("sender", address_text(mail.from))?;
-    out.set_item("to", address_text(mail.to))?;
-    out.set_item("thread", mail.thread.0.0)?;
-    out.set_item(
-        "kind",
-        mail.kind.map(|kind| match kind {
-            SendKind::Ask => "ask",
-            SendKind::Result => "result",
-            SendKind::Status => "status",
-            SendKind::Fyi => "fyi",
-        }),
-    )?;
-    out.set_item("text", text(&mail.content))?;
+    out.set_item("id", message.id.0.0)?;
+    out.set_item("at", message.at.0)?;
+    out.set_item("topic", message.topic.0.0)?;
+    out.set_item("sender", address_text(message.from))?;
+    let mentions = message
+        .mentions
+        .iter()
+        .map(|mention| {
+            (
+                address_text(mention.to),
+                match mention.kind {
+                    MentionKind::Ask => "ask",
+                    MentionKind::Result => "result",
+                    MentionKind::Fyi => "fyi",
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    out.set_item("mentions", mentions)?;
+    out.set_item("text", text(&message.content))?;
     Ok(out)
 }
 
-/// Mail to `address` after `after`, as an awaitable of the caller's loop.
+/// What `agent` receives after `after`, as an awaitable of the caller's
+/// loop.
 #[pyfunction]
-fn inbox(py: Python<'_>, address: &str, after: u64) -> PyResult<Py<PyAny>> {
-    let address = self::address(address)?;
+fn inbox(py: Python<'_>, agent: &str, after: u64) -> PyResult<Py<PyAny>> {
+    let agent = agent_id(agent)?;
     let host = host()?;
     let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
     let future = event_loop.call_method0("create_future")?;
@@ -642,18 +729,18 @@ fn inbox(py: Python<'_>, address: &str, after: u64) -> PyResult<Py<PyAny>> {
     host.runtime.spawn(async move {
         let reply = host
             .call(PyRequest::Inbox {
-                address,
-                after: MailId(after),
+                agent,
+                after: ChatSeq(after),
             })
             .await;
         Python::attach(|py| {
             let settle = settle.bind(py);
             let outcome = match reply {
-                Ok(PyReply::Mails(mails)) => mails
+                Ok(PyReply::Messages(messages)) => messages
                     .iter()
-                    .map(|mail| mail_to_py(py, mail))
+                    .map(|message| message_to_py(py, message))
                     .collect::<PyResult<Vec<_>>>()
-                    .and_then(|mails| Ok(PyList::new(py, mails)?.into_any())),
+                    .and_then(|messages| Ok(PyList::new(py, messages)?.into_any())),
                 Ok(_) => Err(unexpected()),
                 Err(error) => Err(PyRuntimeError::new_err(format!("{error:#}"))),
             };
