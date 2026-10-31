@@ -36,7 +36,8 @@ rho_rpc::calls! {
     pub enum Request {
         /// A new workset, whose namespace runs `code` once after `init.py`.
         /// Answered when the workset is created, before `code` ends.
-        CreateWorkset(CreateWorkset) -> WorksetId;
+        /// Answered once the creation code ends.
+        CreateWorkset(CreateWorkset) -> CreatedWorkset;
         /// Code run in a workset's namespace; answered when it ends.
         Eval(Eval) -> EvalResult;
         /// Mail from the user. Logged once per `client_id`.
@@ -76,6 +77,16 @@ pub struct EvalResult {
     pub output: String,
     /// The traceback, when it raised.
     pub error: Option<String>,
+    /// The agent the `message` was mailed to: the first one the code
+    /// created. `None` without a message, or when the code created none.
+    pub agent: Option<AgentId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct CreatedWorkset {
+    pub workset: WorksetId,
+    /// How its creation code ran.
+    pub result: EvalResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]

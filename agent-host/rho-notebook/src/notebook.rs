@@ -181,7 +181,14 @@ impl Report {
 impl Notebook {
     /// A notebook whose thread works in `shell`'s view, with `exports` among
     /// its globals. `wake` is notified whenever something changes.
-    pub fn new(shell: ShellTools, exports: Vec<Export>, wake: Arc<Notify>) -> Result<Self, String> {
+    /// `on_start` runs on the notebook's thread with its globals, before
+    /// any cell; its error fails the start.
+    pub fn new(
+        shell: ShellTools,
+        exports: Vec<Export>,
+        wake: Arc<Notify>,
+        on_start: Option<OnStart>,
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Handle::current();
         let shared = Arc::new(Shared {
             inbox: Arc::new(Inbox::new()?),
@@ -204,6 +211,7 @@ impl Notebook {
                     .map_err(|error| error.to_string())
             }),
             exports,
+            on_start,
         )?;
         Ok(Self { shared })
     }
@@ -667,6 +675,10 @@ impl Cell {
 
 /// A notebook global provided by the host, typically a `#[pyclass]` whose
 /// methods start [`operation`]s. Notebook code can also import it by name.
+/// Code the host runs on a new notebook's thread with its globals.
+pub type OnStart =
+    Box<dyn for<'py> FnOnce(Python<'py>, &Bound<'py, pyo3::types::PyDict>) -> PyResult<()> + Send>;
+
 pub struct Export {
     pub(crate) name: &'static str,
     pub(crate) build: Build,

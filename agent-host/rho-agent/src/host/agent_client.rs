@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use rho_agent_types::{AgentId, AgentRole};
+use rho_agent_types::AgentId;
 use tokio::sync::{oneshot, watch};
 
 use super::services::Services;
 use crate::AgentStatus;
-use crate::db::AgentReadTxnExt as _;
-use crate::ipc::protocol::{self, Bootstrap, Control, Message};
+use crate::ipc::protocol::{self, Control, Message};
+use crate::store::StoreRead as _;
 
 #[derive(Clone)]
 pub struct AgentClient(Arc<Inner>);
@@ -44,9 +44,14 @@ impl AgentClient {
         pool: &Arc<crate::host::pool::AgentPool>,
         agent: AgentId,
     ) -> anyhow::Result<Self> {
-        let place = pool.db().read().get_agent(agent).config.place;
-        let process = pool.process(&place).await?;
-        Self::connect(pool, agent, process, Some(place.cwd)).await
+        let workset = pool
+            .db()
+            .read()
+            .agent(agent)
+            .context("agent was deleted or does not exist")?
+            .workset;
+        let process = pool.process(workset).await?;
+        Self::connect(pool, agent, process, true).await
     }
 
     /// Takes over an agent already running in `process`, handed over by the
@@ -57,19 +62,18 @@ impl AgentClient {
         agent: AgentId,
         process: Arc<crate::host::Process>,
     ) -> anyhow::Result<Self> {
-        Self::connect(pool, agent, process, None).await
+        Self::connect(pool, agent, process, false).await
     }
 
-    /// `cwd` bootstraps a new agent in the worker.
+    /// `bootstrap` starts the agent's loop in the worker.
     async fn connect(
         pool: &Arc<crate::host::pool::AgentPool>,
         agent: AgentId,
         process: Arc<crate::host::Process>,
-        cwd: Option<camino::Utf8PathBuf>,
+        bootstrap: bool,
     ) -> anyhow::Result<Self> {
         let mut services = Services::new(
             pool.db().clone(),
-            pool.inference().clone(),
             agent,
             Arc::downgrade(pool),
             process.next.clone(),
@@ -97,7 +101,7 @@ impl AgentClient {
             closed: closed_rx.clone(),
             process_closed: process.closed.clone(),
         }));
-        if cwd.is_none() {
+        if !bootstrap {
             services.ready.send_replace(true);
         }
         let ready = services.ready.subscribe();
@@ -107,12 +111,9 @@ impl AgentClient {
                 let sender = process.sender.clone();
                 let requests = process.requests.clone();
                 async move {
-                    if let Some(cwd) = cwd {
+                    if bootstrap {
                         sender
-                            .send(
-                                port,
-                                protocol::encode(&Message::Bootstrap(Bootstrap { cwd }))?,
-                            )
+                            .send(port, protocol::encode(&Message::Bootstrap)?)
                             .await?;
                     }
                     services.serve(sender, requests, port, receiver).await
@@ -152,8 +153,7 @@ impl AgentClient {
             }
             process.agents.lock().expect("poison").remove(&agent);
             if !expected {
-                services.worker_failed(error.clone()).await;
-                services.publish_failure(error).await;
+                services.worker_failed(error).await;
             }
             closed.send_replace(true);
         });
@@ -192,7 +192,8 @@ impl AgentClient {
         }
     }
 
-    async fn request(&self, control: Control) -> anyhow::Result<()> {
+    /// Hand the loop a control and wait until it has applied it.
+    pub(crate) async fn control(&self, control: Control) -> anyhow::Result<()> {
         self.0
             .services
             .control(control)?
@@ -210,98 +211,19 @@ impl AgentClient {
     pub(crate) fn status_cell(&self) -> &watch::Sender<AgentStatus> {
         &self.0.services.status
     }
-    pub fn head(&self) -> anyhow::Result<crate::log::AgentHead> {
-        self.0
-            .services
-            .db
-            .read()
-            .try_get_agent(self.0.services.agent)
-            .context("agent was deleted or does not exist")
-    }
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
-        self.request(Control::Retire).await
+        self.control(Control::Retire).await
     }
-
     pub fn settled(&self) -> bool {
         self.status().settled()
-    }
-    pub fn notice_carried(&self) {
-        self.send(Control::NoticeCarried);
     }
     /// Asks the worker to send its status again: an adopted agent's host
     /// has none yet.
     pub fn tell_tail(&self) {
         self.send(Control::TellTail);
     }
-    pub fn compact(&self) {
-        self.send(Control::Compact);
-    }
-    pub fn cancel(&self) {
-        self.send(Control::Cancel);
-    }
-    pub fn retry(&self) {
-        self.send(Control::Retry);
-    }
-    pub fn send_user_message(&self, text: String) {
-        self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }]);
-    }
-    pub fn send_user_content(&self, content: Vec<rho_agent_types::ContentPart>) {
-        self.send(Control::User {
-            id: crate::entry::MessageId::new(),
-            content,
-        });
-    }
-    /// Waits until the message is logged. A message whose `id` the agent
-    /// already logged is accepted again without a second row, so a client
-    /// that never heard the first answer can safely send it again.
-    pub async fn send_user_content_accepted(
-        &self,
-        id: crate::entry::MessageId,
-        content: Vec<rho_agent_types::ContentPart>,
-    ) -> anyhow::Result<()> {
-        self.request(Control::User { id, content }).await
-    }
-    pub fn send_agent_message(&self, sender: AgentId, label: String, body: String) {
-        self.send(Control::Mail {
-            sender,
-            label,
-            body,
-        });
-    }
-    pub async fn send_agent_message_accepted(
-        &self,
-        sender: AgentId,
-        label: String,
-        body: String,
-    ) -> anyhow::Result<()> {
-        self.request(Control::Mail {
-            sender,
-            label,
-            body,
-        })
-        .await
-    }
-    pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
-        use crate::log::AgentRoleSessionProfile as _;
-        anyhow::ensure!(
-            self.head()?.place().workset.is_some()
-                || role.session_profile().claude_model().is_none(),
-            "a Claude agent needs a workset"
-        );
-        self.request(Control::Role(role)).await
-    }
-    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
-        self.request(Control::Rewind(turns)).await
-    }
-    pub fn change_prompt_cache_key(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(
-                self.head()?.config.runtime,
-                crate::log::AgentRuntime::Rho { .. }
-            ),
-            "prompt cache keys are only available for Rho agents"
-        );
-        self.0.services.control(Control::CacheKey)?;
-        Ok(())
+    /// The agent's head changed outside its loop.
+    pub(crate) fn named(&self, head: crate::store::AgentHead) {
+        self.0.services.named(head);
     }
 }

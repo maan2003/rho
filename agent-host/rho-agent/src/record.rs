@@ -66,7 +66,10 @@ pub enum Event<'a> {
         milestone: ExecMilestone,
     },
     /// One of the native runtime's own rows.
-    Native { agent: AgentId, entry: NativeEntry },
+    Native {
+        agent: AgentId,
+        entry: crate::entry::Entry,
+    },
     /// One of the Claude runtime's own rows.
     Claude { agent: AgentId, row: ClaudeRow },
 }
@@ -110,28 +113,6 @@ pub enum Runtime {
     },
 }
 
-/// The native runtime's rows. Inputs are `Event::Input`; mail the agent
-/// sends is in the mail log.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum NativeEntry {
-    Step {
-        exec: Option<String>,
-        prose: String,
-        carry: crate::inference::Carry,
-        /// Complete billable usage, absent for interrupted output.
-        usage: Option<crate::entry::ResponseUsage>,
-    },
-    /// A logical send boundary: it delivers every input of the agent before
-    /// it, and carries the tool output drained for it.
-    RequestSent {
-        why: crate::entry::Wake,
-        report: crate::entry::Report,
-        compact: bool,
-    },
-    /// Durable compaction intent; a `RequestSent` picks it up.
-    CompactionTrigger,
-}
-
 /// The Claude runtime's rows.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum ClaudeRow {
@@ -155,4 +136,11 @@ pub enum ClaudeRow {
     /// A rewind whose destination transcript is not verified yet; `None`
     /// withdraws it. On success the new session is an `AgentChanged`.
     RewindPending(Option<ClaudeRewind>),
+    /// A turn handed to Claude Code. Like the native one, it delivers every
+    /// input of the agent logged before it.
+    RequestSent {
+        why: crate::entry::Wake,
+        report: crate::entry::Report,
+    },
+    Notice(crate::entry::Notice),
 }

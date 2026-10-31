@@ -1,34 +1,10 @@
-//! The Rho runtime's own rows in an agent's log: what the model was shown,
-//! what it answered, and the messages around it. The model's context and
-//! the transcript are both projections of these, and they are only ever
-//! appended.
+//! The native runtime's own rows in its workset's log: what the model was
+//! shown and what it answered. With the agent's `Input` rows, the model's
+//! context and the transcript are both projections of these.
 
-use rho_agent_types::{AgentId, SendKind, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 use crate::inference::{Carry, Image, Usage};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub struct MessageId(pub u64);
-
-impl MessageId {
-    pub fn new() -> Self {
-        Self(rand::random())
-    }
-}
-
-impl Default for MessageId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Who a message is from or to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
-pub enum Party {
-    Human,
-    Agent(AgentId),
-}
 
 /// Part of a message body. Text is kept as written; structure lives around
 /// it, never inside it.
@@ -79,10 +55,6 @@ pub enum Notice {
 pub struct Report {
     pub notices: Vec<RequestNotice>,
     pub notebook: rho_notebook::Report,
-    /// Queued Received records delivered by this send, in delivery order.
-    pub messages: Vec<MessageId>,
-    /// Queued inputs handled without being shown to the model.
-    pub acknowledged: Vec<MessageId>,
 }
 
 impl Report {
@@ -93,18 +65,18 @@ impl Report {
             }
         }
         self.notebook.merge(newer.notebook);
-        self.messages.extend(newer.messages);
-        self.acknowledged.extend(newer.acknowledged);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.notices.is_empty() && self.notebook.is_empty() && self.messages.is_empty()
+        self.notices.is_empty() && self.notebook.is_empty()
     }
 
-    pub fn render(&self) -> rho_notebook::RenderedReport {
+    /// The report as the model reads it. `inputs`: the request also
+    /// delivers inputs, which follow it.
+    pub fn render(&self, inputs: bool) -> rho_notebook::RenderedReport {
         let mut rendered = self.notebook.render();
         let substantive = !self.notebook.is_empty()
-            || !self.messages.is_empty()
+            || inputs
             || self
                 .notices
                 .iter()
@@ -120,7 +92,7 @@ impl Report {
         if !rendered.text.is_empty() {
             parts.push(rendered.text);
         }
-        if parts.is_empty() && !self.messages.is_empty() {
+        if parts.is_empty() && inputs {
             parts.push("New messages below.".into());
         }
         rendered.text = parts.join("\n\n");
@@ -137,21 +109,11 @@ pub enum RequestNotice {
     PreviousResponseHadNoExec,
     Checkin,
     NothingNew,
-    /// The agent's loaded skills, read when the request was made: what a
-    /// compaction took out of the context.
-    Skills(Vec<String>),
 }
 
 impl RequestNotice {
     fn text(&self) -> std::borrow::Cow<'_, str> {
         let text = match self {
-            Self::Skills(skills) => {
-                return format!(
-                    "Your loaded skills, as they are now. Keep following them:\n\n{}",
-                    skills.join("\n\n")
-                )
-                .into();
-            }
             Self::Restarted => {
                 "rho restarted. Your notebook and everything running in it are gone, and their side effects may remain. Check the current state before carrying on."
             }
@@ -177,49 +139,31 @@ impl RequestNotice {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Entry {
     Step {
-        at: UnixMs,
         exec: Option<String>,
         prose: String,
         carry: Carry,
         /// Complete billable usage, absent for interrupted output.
         usage: Option<ResponseUsage>,
     },
-    /// Logical send boundary, not provider acknowledgment.
+    /// Logical send boundary, not provider acknowledgment. It delivers every
+    /// input of the agent logged before it.
     RequestSent {
-        at: UnixMs,
         why: Wake,
         report: Report,
         compact: bool,
     },
-    Received {
-        at: UnixMs,
-        id: MessageId,
-        from: Party,
-        body: Vec<Block>,
-    },
-    Sent {
-        at: UnixMs,
-        id: MessageId,
-        to: Party,
-        text: String,
-        /// What it is for. Only a send to the user ranks on it.
-        #[senax(default)]
-        kind: SendKind,
-    },
     Notice {
-        at: UnixMs,
         notice: Notice,
     },
     /// Durable queued intent; RequestSent records when an attempt picks it up.
     CompactionTrigger {
-        at: UnixMs,
         manual: bool,
     },
 }
 
 /// Derived scheduling facts shared by the live loop and durable recovery.
 /// The log, not this projection, owns compaction intent and completion.
-#[derive(Clone, Debug, Default, Encode, Decode)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct CompactionState {
     pub context_used: Option<u64>,
     pub pending: bool,
@@ -295,15 +239,3 @@ impl ResponseUsage {
     }
 }
 
-impl Entry {
-    pub fn at(&self) -> UnixMs {
-        match self {
-            Entry::Step { at, .. }
-            | Entry::RequestSent { at, .. }
-            | Entry::Received { at, .. }
-            | Entry::Sent { at, .. }
-            | Entry::Notice { at, .. }
-            | Entry::CompactionTrigger { at, .. } => *at,
-        }
-    }
-}

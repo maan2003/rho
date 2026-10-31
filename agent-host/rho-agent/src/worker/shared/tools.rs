@@ -1,49 +1,42 @@
-//! The notebook's host tools for the Rho runtime: images, collaboration,
-//! web search and papercuts, all answered by Rho itself.
+//! The notebook's host tools for both runtimes: images, web search and
+//! papercuts, answered by Rho itself. Policy Python adds the rest
+//! (`hooks.on_notebook`).
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use pyo3::PyClassInitializer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rho_agent_types::AgentId;
 use rho_agent_types::transcript::{ImageDetail, ToolExecutionContext};
-use rho_agent_types::{AgentId, AgentRole};
 use rho_notebook::{Export, operation};
 use rho_tool_shell::ShellTools;
 use rho_web_search::{WebRequest, WebSearchTools};
 
-use super::mailroom::Mailroom;
+use super::outbox::Outbox;
 use crate::inference::Inference;
 use crate::ipc::protocol::SharedCall;
-use crate::multi_agent_tools::{AdvisorArgs, AgentCall, InterruptArgs, SendArgs, SpawnArgs, Team};
 use crate::papercut::PapercutArgs;
 use crate::worker::host_client::HostClient;
 use crate::worker::image_tool::{ImageTools, ViewImageArgs};
 
-/// The shell, and the notebook globals Rho answers itself (images,
-/// collaboration, web search, papercuts, and the mailroom's `human`,
-/// `archive` and `end_turn` when there is one). Unavailable services export
-/// nothing.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "tool wiring combines agent identity, capabilities, and host services"
-)]
+/// The shell, and the notebook globals Rho answers itself (images, web
+/// search, papercuts, and the outbox's `archive` and `end_turn` when there
+/// is one). Unavailable services export nothing. Commands and relative
+/// paths start where the notebook's thread is, which starts at `root`.
 pub(crate) fn host_tools(
-    cwd: &camino::Utf8Path,
-    role: AgentRole,
+    root: &camino::Utf8Path,
     agent_id: AgentId,
     inference: Option<&Inference>,
-    multi_agent: Option<&Team>,
     host: Option<&Arc<HostClient>>,
-    mailroom: Option<&Arc<Mailroom>>,
+    outbox: Option<&Arc<Outbox>>,
     original_images: bool,
 ) -> (ShellTools, Vec<Export>) {
-    let shell = ShellTools::in_directory(cwd.to_owned(), Default::default())
-        .with_env("RHO_AGENT_ID", role.full_handle(agent_id))
+    let shell = ShellTools::in_directory(root.to_owned(), Default::default())
+        .with_env("RHO_AGENT_ID", agent_id.encoded().to_string())
         .with_env(
             "RIPGREP_CONFIG_PATH",
             rho_fs_view::agent_base()
@@ -61,13 +54,10 @@ pub(crate) fn host_tools(
     let mut exports = vec![Export::new(
         "view_image",
         ViewImage {
-            images: ImageTools::new(cwd.to_owned()),
+            images: ImageTools::new(root.to_owned()),
             original: original_images,
         },
     )];
-    if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
-        exports.push(agents(role, Arc::clone(agent_host)));
-    }
     if let Some(inference) = inference {
         exports.push(Export::new(
             "web",
@@ -88,11 +78,7 @@ pub(crate) fn host_tools(
     if let Some(agent_host) = agent_host {
         exports.push(Export::new("papercut", Papercut { agent_host }));
     }
-    exports.extend(
-        mailroom
-            .map(|mailroom| mailroom.exports())
-            .unwrap_or_default(),
-    );
+    exports.extend(outbox.map(|outbox| outbox.exports()).unwrap_or_default());
     (shell, exports)
 }
 
@@ -119,136 +105,6 @@ fn ask(
     })
 }
 
-/// `agents`: collaboration. Engineers may also start and stop others.
-fn agents(role: AgentRole, agent_host: AgentHost) -> Export {
-    let agents = Agents { agent_host };
-    Export::build("agents", move |py| {
-        Ok(match role {
-            AgentRole::Engineer { .. } => {
-                let engineer = PyClassInitializer::from(agents).add_subclass(EngineerAgents);
-                Py::new(py, engineer)?.into_any()
-            }
-            AgentRole::Advisor { .. } => Py::new(py, agents)?.into_any(),
-        })
-    })
-}
-
-#[pyclass(subclass, frozen, module = "__main__")]
-struct Agents {
-    agent_host: AgentHost,
-}
-
-#[pymethods]
-impl Agents {
-    /// Send `message` to another agent, by its role-prefixed handle.
-    #[pyo3(signature = (*, agent_id, message))]
-    fn message(&self, py: Python<'_>, agent_id: String, message: String) -> PyResult<Py<PyAny>> {
-        let call = AgentCall::Message(SendArgs { agent_id, message });
-        ask(
-            py,
-            &self.agent_host,
-            "agents.message",
-            SharedCall::Agent(call),
-        )
-    }
-}
-
-#[pyclass(extends = Agents, frozen, module = "__main__")]
-struct EngineerAgents;
-
-/// A spawned agent shares its spawner's view, so the spawner checks the
-/// directory there: the host cannot see it.
-fn spawn_workdir(workdir: Option<String>) -> PyResult<Option<String>> {
-    let Some(workdir) = workdir else {
-        return Ok(None);
-    };
-    let path = std::path::Path::new(&workdir);
-    if !path.is_absolute() {
-        return Err(PyValueError::new_err("workdir must be an absolute path"));
-    }
-    if !path.is_dir() {
-        return Err(PyValueError::new_err(format!(
-            "workdir is not a directory: {workdir}"
-        )));
-    }
-    Ok(Some(workdir))
-}
-
-#[pymethods]
-impl EngineerAgents {
-    /// Start an Engineer on `prompt`, optionally in `workdir`.
-    #[pyo3(signature = (*, task_name, prompt, workdir = None))]
-    fn spawn_new_engineer(
-        this: PyRef<'_, Self>,
-        py: Python<'_>,
-        task_name: String,
-        prompt: String,
-        workdir: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let call = AgentCall::SpawnEngineer(SpawnArgs {
-            task_name,
-            prompt,
-            workdir: spawn_workdir(workdir)?,
-        });
-        ask(
-            py,
-            &this.as_super().agent_host,
-            "agents.spawn_new_engineer",
-            SharedCall::Agent(call),
-        )
-    }
-
-    /// Start an Engineer the user manages as its own thread; it reports to
-    /// the user, not to the caller.
-    #[pyo3(signature = (*, task_name, prompt, workdir = None))]
-    fn spawn_user_owned_engineer(
-        this: PyRef<'_, Self>,
-        py: Python<'_>,
-        task_name: String,
-        prompt: String,
-        workdir: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let call = AgentCall::SpawnUserOwnedEngineer(SpawnArgs {
-            task_name,
-            prompt,
-            workdir: spawn_workdir(workdir)?,
-        });
-        ask(
-            py,
-            &this.as_super().agent_host,
-            "agents.spawn_user_owned_engineer",
-            SharedCall::Agent(call),
-        )
-    }
-
-    /// Interrupt an Engineer's current turn.
-    #[pyo3(signature = (*, agent_id))]
-    fn cancel(this: PyRef<'_, Self>, py: Python<'_>, agent_id: String) -> PyResult<Py<PyAny>> {
-        let call = AgentCall::Cancel(InterruptArgs { agent_id });
-        ask(
-            py,
-            &this.as_super().agent_host,
-            "agents.cancel",
-            SharedCall::Agent(call),
-        )
-    }
-
-    /// Ask an independent Advisor; its findings arrive as mail.
-    fn spawn_new_advisor(
-        this: PyRef<'_, Self>,
-        py: Python<'_>,
-        msg: String,
-    ) -> PyResult<Py<PyAny>> {
-        let call = AgentCall::SpawnAdvisor(AdvisorArgs { message: msg });
-        ask(
-            py,
-            &this.as_super().agent_host,
-            "agents.spawn_new_advisor",
-            SharedCall::Agent(call),
-        )
-    }
-}
-
 /// `view_image(path, *, detail='high')`: show an image with the cell's
 /// next report.
 #[pyclass(frozen, module = "__main__")]
@@ -270,6 +126,9 @@ impl ViewImage {
             "original" => ImageDetail::High,
             _ => return Err(PyValueError::new_err("detail must be 'high' or 'original'")),
         };
+        // Relative to this thread's directory: the notebook's own.
+        let path = std::path::absolute(&path)
+            .map_err(|error| PyValueError::new_err(format!("{}: {error}", path.display())))?;
         let images = self.images.clone();
         operation(py, "view_image", move |cx| async move {
             let (text, image) = images
@@ -329,19 +188,3 @@ impl Papercut {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn spawn_workdir_must_exist_in_the_spawners_view() {
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().to_str().unwrap().to_owned();
-        let missing = dir.path().join("missing").to_str().unwrap().to_owned();
-        assert_eq!(super::spawn_workdir(None).unwrap(), None);
-        assert_eq!(
-            super::spawn_workdir(Some(existing.clone())).unwrap(),
-            Some(existing)
-        );
-        assert!(super::spawn_workdir(Some(missing)).is_err());
-        assert!(super::spawn_workdir(Some("relative".into())).is_err());
-    }
-}

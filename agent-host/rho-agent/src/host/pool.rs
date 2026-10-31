@@ -1,92 +1,48 @@
-//! Process-local pool of running agents.
+//! The agent host's worksets and the agents loaded in them.
 //!
-//! The pool owns the id → running-agent map and the worksets agents work
-//! in. Higher layers (the agent host) own product policy around it: topics,
-//! titles, land leases.
+//! The pool owns one process per workset ([ARCH-rho2](../../specs/ARCH-rho2.md)),
+//! the id → loaded-agent map, and the answers to each workset's `_rho`
+//! calls. The store is the truth about worksets, agents and mail; the pool
+//! holds only what runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_types::{AgentId, AgentRole, EngineerIntelligence, Place};
+use rho_agent_types::{Address, AgentId, ContentPart, Mail, MailId, UnixMs, WorksetKind};
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 use super::AgentClient;
 use crate::AgentStatus;
-use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
-use crate::log::{
-    AGENT_USAGE_BUCKET_MS, AgentOrigin, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentUsageBucket, SessionBinding,
-};
+use crate::ipc::protocol::Control;
+use crate::ipc::workset::{PyReply, PyRequest};
+use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
+use crate::record::{AgentSpec, Event, Record, Runtime};
+use crate::store::{NewMail, StoreRead as _, StoreWrite as _};
 
-/// Persisted placement and an optional one-shot checkout operation.
-/// Creation commits the agent record before preparing its directory, then
-/// starts the workset worker. Preparation never survives in the loaded agent.
-pub struct StartPlace {
-    pub place: Place,
-    pub(crate) prepare:
-        Option<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>>,
-}
-
-impl StartPlace {
-    pub fn new(place: Place) -> Self {
-        Self {
-            place,
-            prepare: None,
-        }
-    }
-
-    pub fn pending(
-        place: Place,
-        prepare: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
-    ) -> Self {
-        Self {
-            place,
-            prepare: Some(Box::pin(prepare)),
-        }
-    }
-}
-
-/// Runaway protection, not policy: children are user-visible agents.
-const MAX_SPAWN_DEPTH: usize = 3;
-const MAX_WORKING_CHILDREN: usize = 20;
 /// How many agents stay loaded. Past this the least recently used one
 /// that is settled and nobody is looking at is dropped; its log is the
 /// whole of it, so nothing is lost.
 pub const MAX_LOADED: usize = 100;
 const ID_LABEL_HEADROOM: u64 = 200;
-
-/// What a log line calls the process for `workset`.
-fn process_label(workset: Option<WorksetId>) -> String {
-    match workset {
-        Some(workset) => format!("workset {workset}"),
-        None => "host process".to_owned(),
-    }
-}
-
-struct ResponseNotification {
-    sender: AgentId,
-    recipients: Vec<AgentId>,
-    body: String,
-}
+/// How long a `_rho.inbox` call waits for mail before it answers with none.
+/// It holds its request open, so a host handoff waits for it this long.
+const INBOX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct ExecutionSlot {
     admission: Arc<tokio::sync::RwLock<()>>,
     process: Mutex<Option<Arc<crate::host::Process>>>,
 }
-
 pub struct AgentPool {
-    /// By workset; `None` is the host process, for agents without one.
-    processes: Mutex<HashMap<Option<WorksetId>, Arc<ExecutionSlot>>>,
-
-    responses: tokio::sync::mpsc::Sender<ResponseNotification>,
+    processes: Mutex<HashMap<WorksetId, Arc<ExecutionSlot>>>,
     db: RhoDb,
     inference: Accounts,
-    /// The worksets agents work in, named by the agent host rather than
+    /// The worksets' directories, named by the agent host rather than
     /// resolved here: a library does not reach for the user's state
     /// directory.
     worksets: Arc<Worksets>,
@@ -94,6 +50,8 @@ pub struct AgentPool {
     /// the same reason as `worksets`: a library that resolves `$HOME` puts
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
+    /// The host's `init.py`, run by each workset process at its start.
+    init: Option<camino::Utf8PathBuf>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -107,20 +65,10 @@ pub struct AgentPool {
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
-    /// Fires for every agent created in this pool — including agents spawned
-    /// by other agents — so every UI connection can pick them up.
-    created: broadcast::Sender<AgentCreated>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
-}
-
-/// Broadcast when any agent is created in the pool. Carries no handle:
-/// a handle sitting in the channel's buffer would keep an evicted loop
-/// alive.
-#[derive(Clone)]
-pub struct AgentCreated {
-    pub agent_id: AgentId,
-    /// The agent that spawned this one, when another agent did.
-    pub parent: Option<AgentId>,
+    /// The user's message the running `Eval` of a workset carries: the
+    /// first agent its code creates gets it as mail.
+    first_mail: std::sync::Mutex<HashMap<WorksetId, FirstMail>>,
 }
 
 /// One GUI connection's statuses still to send: the latest of each loaded
@@ -150,20 +98,28 @@ impl Statuses {
     }
 }
 
-/// An explicit message, mailed to whoever subscribed to this agent.
-#[derive(Clone, Debug)]
-pub struct AgentMessage {
-    pub agent_id: AgentId,
-    pub text: String,
+/// What code the GUI ran printed, its traceback if it raised, and the
+/// agent its message was mailed to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evaluated {
+    pub output: String,
+    pub error: Option<String>,
+    pub agent: Option<AgentId>,
+}
+
+enum FirstMail {
+    Waiting(Vec<ContentPart>),
+    Sent(AgentId),
 }
 
 impl AgentPool {
-    /// Opens the pool over `db`, initializing the agent tables.
+    /// Opens the pool over `db`, initializing its tables.
     pub async fn new(
         db: RhoDb,
         inference: Accounts,
         worksets: Arc<Worksets>,
         claude: rho_claude::accounts::ClaudePaths,
+        init: Option<camino::Utf8PathBuf>,
     ) -> Arc<Self> {
         crate::db::prepare(&db).await;
         // The account agents run on has to exist before the first spawn.
@@ -171,50 +127,21 @@ impl AgentPool {
         if let Err(error) = claude.bootstrap(&account) {
             panic!("Claude account {account} could not be prepared: {error:#}");
         }
-        let (responses, mut notifications) =
-            tokio::sync::mpsc::channel::<ResponseNotification>(256);
         let pool = Arc::new(Self {
             processes: Mutex::new(HashMap::new()),
-            responses,
             db,
             inference: inference.clone(),
             worksets,
             claude,
+            init,
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
             statuses: std::sync::Mutex::new(Vec::new()),
             load_locks: Mutex::new(HashMap::new()),
-            created: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
-        });
-        let weak = Arc::downgrade(&pool);
-        tokio::spawn(async move {
-            // Completion publication must not await another serialized actor.
-            // A single host-owned consumer preserves notification order, and
-            // never participates in a worker generation's retirement barrier.
-            while let Some(notification) = notifications.recv().await {
-                let Some(pool) = weak.upgrade() else { break };
-                for recipient in notification.recipients {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        pool.deliver_mail(
-                            notification.sender,
-                            recipient,
-                            notification.body.clone(),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        result => eprintln!(
-                            "response notification {:?} -> {:?} was not confirmed: {result:?}",
-                            notification.sender, recipient
-                        ),
-                    }
-                }
-            }
+            first_mail: std::sync::Mutex::default(),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -232,8 +159,7 @@ impl AgentPool {
         pool
     }
 
-    /// The worksets agents work in.
-    async fn execution_slot(&self, workset: Option<WorksetId>) -> Arc<ExecutionSlot> {
+    async fn execution_slot(&self, workset: WorksetId) -> Arc<ExecutionSlot> {
         self.processes
             .lock()
             .await
@@ -242,27 +168,24 @@ impl AgentPool {
             .clone()
     }
 
+    /// The process of an agent's workset, started if it is not running.
     pub async fn execution(
         self: &Arc<Self>,
         agent: AgentId,
     ) -> anyhow::Result<Arc<crate::host::Process>> {
-        let place = self
-            .db
-            .read()
-            .try_get_agent(agent)
-            .context("agent was deleted or does not exist")?
-            .config
-            .place;
-        let slot = self.execution_slot(place.workset).await;
+        let workset = self.workset_of(agent)?;
+        let slot = self.execution_slot(workset).await;
         let _admission = slot.admission.clone().read_owned().await;
-        let place = self
+        self.process(workset).await
+    }
+
+    fn workset_of(&self, agent: AgentId) -> anyhow::Result<WorksetId> {
+        Ok(self
             .db
             .read()
-            .try_get_agent(agent)
+            .agent(agent)
             .context("agent was deleted or does not exist")?
-            .config
-            .place;
-        self.process(&place).await
+            .workset)
     }
 
     pub async fn executions(&self) -> Vec<Arc<crate::host::Process>> {
@@ -288,24 +211,63 @@ impl AgentPool {
         processes
     }
 
+    /// The workset's process, started if it is not running: its view, its
+    /// root, and the host's `init.py`.
     pub(crate) async fn process(
         self: &Arc<Self>,
-        place: &Place,
+        workset: WorksetId,
     ) -> anyhow::Result<Arc<crate::host::Process>> {
-        let slot = self.execution_slot(place.workset).await;
+        let slot = self.execution_slot(workset).await;
         let mut process = slot.process.lock().await;
         if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
             return Ok(process.clone());
         }
-        let layout = match place.workset {
-            Some(workset) => Layout::workset(&self.worksets.open_workset(workset).await?)?,
-            None => Layout::host(&self.worksets),
+        let kind = self
+            .db
+            .read()
+            .workset(workset)
+            .context("workset was deleted or does not exist")?
+            .kind;
+        let directory = self.worksets.open_workset(workset).await?;
+        let (layout, root) = match kind {
+            WorksetKind::Isolated => (
+                Layout::workset(&directory)?,
+                camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT),
+            ),
+            WorksetKind::Host { cwd } => (
+                Layout {
+                    state: directory.state_dir()?,
+                    ..Layout::host(&self.worksets)
+                },
+                cwd,
+            ),
         };
-        let started =
-            crate::host::Process::start(self, layout, self.claude.clone(), slot.admission.clone())
-                .await?;
+        let started = crate::host::Process::start(
+            self,
+            workset,
+            layout,
+            root,
+            self.init.clone(),
+            self.claude.clone(),
+            slot.admission.clone(),
+            self.python_handler(workset),
+        )
+        .await?;
         *process = Some(started.clone());
         Ok(started)
+    }
+
+    /// Start the workset's process in the background, so its policy runs:
+    /// mail just arrived for one of its agents.
+    fn wake_workset(self: &Arc<Self>, workset: WorksetId) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let slot = pool.execution_slot(workset).await;
+            let _admission = slot.admission.clone().read_owned().await;
+            if let Err(error) = pool.process(workset).await {
+                eprintln!("rho-agent: starting workset {workset}: {error:#}");
+            }
+        });
     }
 
     /// Readies every workset process for a re-executed agent host to take
@@ -373,7 +335,6 @@ impl AgentPool {
             process.resume();
         }
     }
-
     /// Replaces a workset's process with one of this agent host's build and
     /// loads its agents again there. Unforced, only a stale process with
     /// nothing running is replaced: every agent retires, and no terminal
@@ -381,7 +342,7 @@ impl AgentPool {
     /// whether it replaced one.
     pub async fn restart_workset(
         self: &Arc<Self>,
-        workset: Option<WorksetId>,
+        workset: WorksetId,
         force: bool,
     ) -> anyhow::Result<bool> {
         let slot = self.execution_slot(workset).await;
@@ -485,7 +446,7 @@ impl AgentPool {
                     if !stale {
                         continue;
                     }
-                    let label = process_label(workset);
+                    let label = format!("workset {workset}");
                     match pool.restart_workset(workset, false).await {
                         Ok(true) => eprintln!("rho-agent: replaced stale {label}"),
                         Ok(false) => {}
@@ -501,7 +462,7 @@ impl AgentPool {
     pub async fn adopt(self: &Arc<Self>, handed: Vec<crate::host::Handed>) {
         for handed in handed {
             if let Err(error) = self.adopt_process(&handed).await {
-                let label = process_label(handed.workset);
+                let label = format!("workset {}", handed.workset);
                 eprintln!("rho-agent: not taking over {label}: {error:#}");
             }
         }
@@ -509,7 +470,13 @@ impl AgentPool {
 
     async fn adopt_process(self: &Arc<Self>, handed: &crate::host::Handed) -> anyhow::Result<()> {
         let slot = self.execution_slot(handed.workset).await;
-        let process = crate::host::Process::adopt(self, handed, slot.admission.clone()).await?;
+        let process = crate::host::Process::adopt(
+            self,
+            handed,
+            slot.admission.clone(),
+            self.python_handler(handed.workset),
+        )
+        .await?;
         *slot.process.lock().await = Some(process.clone());
         for &agent_id in &handed.agents {
             match AgentClient::adopt(self, agent_id, process.clone()).await {
@@ -530,59 +497,6 @@ impl AgentPool {
 
     pub fn worksets(&self) -> &Arc<Worksets> {
         &self.worksets
-    }
-
-    pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
-        self.created.subscribe()
-    }
-
-    pub async fn publish_message(self: &Arc<Self>, completed: AgentMessage) {
-        self.flush_agent_usage(Some(completed.agent_id)).await;
-        self.deliver_response(completed.agent_id, completed.text);
-    }
-
-    pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
-        self.deliver_response(agent_id, format!("Agent hit an error and stopped: {error}"));
-    }
-
-    fn deliver_response(&self, target: AgentId, body: String) {
-        let recipients = self.db.read().agent_response_subscribers(target);
-        if recipients.is_empty() {
-            return;
-        }
-        // Waiting for capacity would recreate the actor dependency cycle when
-        // the consumer is waiting for a recipient to accept an earlier message.
-        if let Err(error) = self.responses.try_send(ResponseNotification {
-            sender: target,
-            recipients,
-            body,
-        }) {
-            eprintln!("response notification from {target:?} was dropped: {error}");
-        }
-    }
-
-    pub async fn set_response_subscription(
-        &self,
-        subscriber: AgentId,
-        target: AgentId,
-        subscribed: bool,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(subscriber != target, "an agent cannot subscribe to itself");
-        anyhow::ensure!(
-            self.agent_exists(subscriber),
-            "subscriber agent does not exist"
-        );
-        anyhow::ensure!(self.agent_exists(target), "target agent does not exist");
-        let mut write = self.db.write().await;
-        write.set_agent_response_subscription(subscriber, target, subscribed);
-        write.commit();
-        Ok(())
-    }
-
-    /// Execution stopped: the usage it accrued lands now rather than at
-    /// the next flush. The turn's edge itself is the log's (`Turn`).
-    pub async fn settle_turn(&self, agent_id: AgentId) {
-        self.flush_agent_usage(Some(agent_id)).await;
     }
 
     pub fn db(&self) -> &RhoDb {
@@ -619,7 +533,7 @@ impl AgentPool {
         }
         let mut write = self.db.write().await;
         for (agent_id, usage) in &drained {
-            if crate::db::agent_head_write(&mut write, *agent_id).is_some() {
+            if write.agent_head(*agent_id).is_some() {
                 write.add_agent_usage(*agent_id, usage);
             }
         }
@@ -820,406 +734,439 @@ impl AgentPool {
         }
     }
 
-    /// Explicit erasure owns the same per-ID locks as activation. Once a
-    /// worker is drained, no stale load may restore it from the deleted log.
-    /// The task completes even if the requesting connection goes away.
-    pub async fn delete_agents(
-        self: &Arc<Self>,
-        ids: Vec<AgentId>,
-        compact: bool,
-    ) -> anyhow::Result<(Vec<(AgentId, usize)>, usize, Option<(u64, u64)>)> {
-        let pool = self.clone();
-        tokio::spawn(async move {
-            let ids = ids.into_iter().collect::<std::collections::BTreeSet<_>>();
-            anyhow::ensure!(!ids.is_empty(), "at least one agent is required");
-            if compact {
-                anyhow::ensure!(
-                    crate::db::savepoints(&pool.db).await.is_empty(),
-                    "recovery savepoints prevent compaction; no agents were deleted"
-                );
-            }
-            let mut locks = Vec::new();
-            for &id in &ids {
-                let lock = pool.load_locks.lock().await.entry(id).or_default().clone();
-                locks.push(lock.lock_owned().await);
-            }
-            {
-                let read = pool.db.read();
-                for &id in &ids {
-                    anyhow::ensure!(
-                        read.agent_exists(id),
-                        "agent {} is not in this database; no agents were deleted",
-                        id.encoded()
-                    );
-                }
-            }
-            for &id in &ids {
-                let agent = pool.agents.lock().await.get(&id).cloned();
-                if let Some(agent) = agent {
-                    agent.shutdown().await;
-                    pool.agents.lock().await.remove(&id);
-                }
-            }
-            // Drain first: a last rewind or fork can commit during shutdown.
-            let db = pool.db.clone();
-            let selected = ids.clone();
-            let sessions = tokio::task::spawn_blocking(move || {
-                let read = db.read();
-                selected
-                    .iter()
-                    .flat_map(|id| read.agent_claude_sessions(*id))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            })
-            .await?;
-            // Keep records if file removal fails, so the same command can
-            // retry all session ids. Some files may already be removed.
-            let files = rho_claude::delete_session_files(&pool.claude, &sessions)
-                .await
-                .context(
-                    "agents stopped; Claude cleanup failed, database histories retained for retry",
-                )?;
-            for &id in &ids {
-                pool.flush_agent_usage(Some(id)).await;
-            }
-            let deleted =
-                crate::db::delete_agents(&pool.db, &ids.iter().copied().collect::<Vec<_>>()).await;
-            pool.recent
-                .lock()
-                .expect("poison")
-                .retain(|id| !ids.contains(id));
-            pool.usage
-                .lock()
-                .await
-                .retain(|(id, _), _| !ids.contains(id));
-            for watcher in pool
-                .statuses
-                .lock()
-                .expect("poison")
-                .iter()
-                .filter_map(|weak| weak.upgrade())
-            {
-                watcher
-                    .unsent
-                    .lock()
-                    .expect("poison")
-                    .retain(|id, _| !ids.contains(id));
-            }
-            drop(locks);
-            let compacted = if compact {
-                Some(
-                    pool.db
-                        .compact_online()
-                        .await
-                        .context("agents and Claude files deleted, but online compaction failed")?,
-                )
-            } else {
-                None
-            };
-            Ok((deleted, files.len(), compacted))
-        })
-        .await?
-    }
 
-    pub async fn create(
+    /// A new workset, its first row, and its process running `code`. With a
+    /// `message`, the first agent the code creates gets it as mail from the
+    /// user.
+    pub async fn create_workset(
         self: &Arc<Self>,
-        config: AgentRole,
-        display_name: Option<String>,
-        start: StartPlace,
-    ) -> anyhow::Result<(AgentId, AgentClient)> {
-        self.create_with_origin(config, display_name, start, AgentOrigin::User)
-            .await
-    }
-
-    async fn create_with_origin(
-        self: &Arc<Self>,
-        config: AgentRole,
-        display_name: Option<String>,
-        start: StartPlace,
-        origin: AgentOrigin,
-    ) -> anyhow::Result<(AgentId, AgentClient)> {
-        let pool = self.clone();
-        // Admission and its per-ID ownership lock outlive cancellation of
-        // the API caller. Never leave an unregistered worker still draining.
-        tokio::spawn(async move {
-            let slot = pool.execution_slot(start.place.workset).await;
-            let admission = slot.admission.clone().read_owned().await;
-            let mode = config.session_profile();
-            let runtime = match mode {
-                SessionBinding::ClaudeFable { .. }
-                | SessionBinding::ClaudeOpus { .. }
-                | SessionBinding::ClaudeAdvisor { .. } => AgentRuntime::Claude {
-                    session_id: uuid::Uuid::new_v4(),
-                },
-                _ => AgentRuntime::Rho {
-                    prompt_cache_key: crate::inference::PromptCacheKey::generate(),
-                },
-            };
-            let StartPlace { place, prepare } = start;
-            // The workset must exist; its directory is the worker's to
-            // check, since only the worker sees the view it is in.
-            match place.workset {
-                Some(workset) => drop(pool.worksets.open_workset(workset).await?),
-                // Claude Code runs in mounts of its own, which the host
-                // process, having no namespace, cannot make.
-                None => anyhow::ensure!(
-                    matches!(runtime, AgentRuntime::Rho { .. }),
-                    "a Claude agent needs a workset"
-                ),
-            }
-            let mut write = pool.db.write().await;
-            let agent_id = write.alloc_agent_id();
-            let lock = pool
-                .load_locks
-                .lock()
-                .await
-                .entry(agent_id)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-            let loading = lock.lock_owned().await;
-            write.create_agent(
-                rho_agent_types::UnixMs::now(),
-                agent_id,
-                display_name,
-                place,
-                config,
-                mode,
-                runtime,
-                origin,
+        kind: WorksetKind,
+        code: String,
+        message: Option<Vec<ContentPart>>,
+    ) -> anyhow::Result<(WorksetId, Evaluated)> {
+        if let WorksetKind::Host { cwd } = &kind {
+            anyhow::ensure!(
+                cwd.is_absolute() && cwd.is_dir(),
+                "a host workset needs an absolute directory: {cwd}"
             );
+        }
+        // Every workset has a directory: its state lives there, and an
+        // isolated one's `/src`.
+        let workset = self.worksets.create().await?.id();
+        let mut write = self.db.write().await;
+        write.create_workset(workset, UnixMs::now(), kind, code.clone());
+        write.commit();
+        let evaluated = self.run(workset, code, message).await?;
+        Ok((workset, evaluated))
+    }
+
+    /// Run `code` in the workset namespace, logged first. With a `message`,
+    /// the first agent the code creates gets it as mail from the user.
+    pub async fn eval(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        code: String,
+        message: Option<Vec<ContentPart>>,
+    ) -> anyhow::Result<Evaluated> {
+        {
+            let mut write = self.db.write().await;
+            write.append(
+                workset,
+                &Record {
+                    at: UnixMs::now(),
+                    event: Event::Evaluated { code: code.clone() },
+                },
+            )?;
             write.commit();
-            // Once its record commits, the workset belongs to that record,
-            // even if the companion cannot start. Do not discard it on error.
-            if let Some(prepare) = prepare {
-                prepare.await?;
+        }
+        self.run(workset, code, message).await
+    }
+
+    async fn run(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        code: String,
+        message: Option<Vec<ContentPart>>,
+    ) -> anyhow::Result<Evaluated> {
+        let slot = self.execution_slot(workset).await;
+        let process = {
+            let _admission = slot.admission.clone().read_owned().await;
+            self.process(workset).await?
+        };
+        if let Some(message) = message {
+            self.first_mail
+                .lock()
+                .expect("poison")
+                .insert(workset, FirstMail::Waiting(message));
+        }
+        let result = process.eval(code).await;
+        let first = self.first_mail.lock().expect("poison").remove(&workset);
+        let (output, mut error) = result?;
+        let agent = match first {
+            Some(FirstMail::Sent(agent)) => Some(agent),
+            Some(FirstMail::Waiting(_)) => {
+                let note = "The code created no agent, so the message was not sent.";
+                error = Some(match error {
+                    Some(error) => format!("{error}\n{note}"),
+                    None => note.to_owned(),
+                });
+                None
             }
-            let agent = AgentClient::start(&pool, agent_id).await?;
-            {
-                let mut agents = pool.agents.lock().await;
-                agents.insert(agent_id, agent.clone());
-                pool.touch(agent_id);
-                pool.tell_status(agent_id, &agent);
-            }
-            drop(loading);
-            drop(admission);
-            pool.trim(MAX_LOADED).await;
-            let _ = pool.created.send(AgentCreated {
-                agent_id,
-                parent: origin.parent(),
-            });
-            Ok((agent_id, agent))
+            None => None,
+        };
+        Ok(Evaluated {
+            output,
+            error,
+            agent,
         })
-        .await?
     }
 
-    /// Create a child in the parent's workset and mail it its task. `workdir`
-    /// selects an existing absolute directory; omission inherits the parent's
-    /// directory. Returns once the child has accepted its task.
-    pub async fn spawn_child(
+    /// Mail from the user. A resend under the same `client_id` is the same
+    /// mail. The agent's workset starts, so its policy can deliver it.
+    pub async fn post_user_mail(
         self: &Arc<Self>,
-        parent: AgentId,
-        task_name: String,
-        prompt: String,
-        config: AgentRole,
-        workdir: Option<camino::Utf8PathBuf>,
-    ) -> anyhow::Result<AgentId> {
-        self.enforce_spawn_limits(parent).await?;
-        self.spawn(
-            AgentOrigin::Child { parent },
-            task_name,
-            prompt,
-            config,
-            workdir,
-        )
-        .await
+        client_id: u64,
+        to: AgentId,
+        re: Option<MailId>,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<MailId> {
+        let workset = self.workset_of(to)?;
+        let id = self
+            .post_mail(
+                NewMail {
+                    from: Address::User,
+                    to: Address::Agent(to),
+                    re,
+                    kind: None,
+                    content,
+                },
+                Some(client_id),
+            )
+            .await;
+        self.wake_workset(workset);
+        Ok(id)
     }
 
-    /// Create an Engineer the user manages, briefed by `by` in its workset.
-    /// It has no parent, so nothing it says is mailed to `by`, but it
-    /// counts against `by`'s spawn limits like a child.
-    pub async fn spawn_user_owned(
-        self: &Arc<Self>,
-        by: AgentId,
-        task_name: String,
-        prompt: String,
-        workdir: Option<camino::Utf8PathBuf>,
-    ) -> anyhow::Result<AgentId> {
-        self.enforce_spawn_limits(by).await?;
-        self.spawn(
-            AgentOrigin::UserOwned { by },
-            task_name,
-            prompt,
-            AgentRole::default(),
-            workdir,
-        )
-        .await
+    async fn post_mail(&self, mail: NewMail, client_id: Option<u64>) -> MailId {
+        let mut write = self.db.write().await;
+        let id = write.post_mail(UnixMs::now(), mail, client_id);
+        write.commit();
+        id
     }
 
-    /// Create an agent in its spawner's workset and mail it its task from
-    /// the spawner. Returns once the agent has accepted its task.
-    async fn spawn(
-        self: &Arc<Self>,
-        origin: AgentOrigin,
-        task_name: String,
-        prompt: String,
-        config: AgentRole,
-        workdir: Option<camino::Utf8PathBuf>,
-    ) -> anyhow::Result<AgentId> {
-        let spawner = match origin {
-            AgentOrigin::Child { parent: spawner } | AgentOrigin::UserOwned { by: spawner } => {
-                spawner
-            }
-            AgentOrigin::User => anyhow::bail!("only an agent can spawn an agent"),
-        };
-        let (spawner_place, spawner_role) = {
-            let record = self
-                .db
-                .read()
-                .try_get_agent(spawner)
-                .context("spawning agent was deleted or does not exist")?;
-            (record.place().clone(), record.config.role)
-        };
-        let mut place = spawner_place;
-        place.cwd = workdir.unwrap_or(place.cwd);
-        anyhow::ensure!(place.cwd.is_absolute(), "workdir must be an absolute path");
-        let start = StartPlace::new(place);
-        let config = child_role(spawner_role, config);
-        let (agent_id, agent) = self
-            .create_with_origin(config, Some(task_name), start, origin)
-            .await?;
-        // Subscribe before the task goes out, or a quick first turn ends
-        // with no one to tell.
-        if let AgentOrigin::Child { parent } = origin {
-            self.set_response_subscription(parent, agent_id, true)
-                .await?;
-        }
-        let spawner_label = self.agent_handle(spawner)?;
-        agent
-            .send_agent_message_accepted(spawner, spawner_label, prompt)
-            .await
-            .with_context(|| {
-                format!(
-                    "created {} but it did not accept its initial task",
-                    agent_id.encoded()
-                )
-            })?;
-        Ok(agent_id)
-    }
-
-    async fn enforce_spawn_limits(&self, spawner: AgentId) -> anyhow::Result<()> {
-        let read = self.db.read();
-        let mut depth = 0;
-        let mut cursor = Some(spawner);
-        while let Some(id) = cursor {
-            depth += 1;
-            if depth > MAX_SPAWN_DEPTH {
-                anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
-            }
-            cursor = read.agent_spawner(id);
-        }
-        drop(read);
-        // Only loaded agents have a working runtime; settled agents can be
-        // evicted. Identify loaded children without visiting every persisted
-        // agent, then inspect their statuses under the pool lock.
-        let loaded = self.agents.lock().await.keys().copied().collect::<Vec<_>>();
-        let read = self.db.read();
-        let children = loaded
-            .into_iter()
-            .filter(|id| read.agent_spawner(*id) == Some(spawner))
-            .collect::<Vec<_>>();
-        drop(read);
-        let agents = self.agents.lock().await;
-        let working_children = children
-            .into_iter()
-            .filter_map(|id| agents.get(&id))
-            .filter(|agent| agent.status().runtime.is_working())
-            .count();
-        if working_children >= MAX_WORKING_CHILDREN {
-            anyhow::bail!(
-                "working sub-agent limit ({MAX_WORKING_CHILDREN}) reached; wait for an existing \
-                 sub-agent to finish"
-            );
+    /// Cut off an agent's turn, if it is loaded; one that is not has none.
+    pub async fn cancel(&self, agent: AgentId) -> anyhow::Result<()> {
+        if let Some(client) = self.get(agent).await {
+            client.control(Control::Cancel).await?;
         }
         Ok(())
     }
 
-    /// Deliver inter-agent mail, loading the recipient internally and waiting
-    /// until its loop accepts the input.
-    pub async fn deliver_mail(
-        self: &Arc<Self>,
-        from: AgentId,
-        to: AgentId,
-        mut body: String,
-    ) -> anyhow::Result<()> {
-        let sender_role = {
-            let read = self.db.read();
-            anyhow::ensure!(read.agent_exists(from), "sender agent no longer exists");
-            read.try_get_agent(from)
-                .context("sender was deleted or does not exist")?
-                .config
-                .role
-        };
-        let (_, agent, _) = self.load(to).await?;
-        let sender_label = self.agent_handle(from)?;
-        if matches!(sender_role, AgentRole::Advisor { .. }) {
-            body.push_str(&format!(
-                "\n\nAdvisor {sender_label} remains available. Use message_agent with this ID \
-                 to continue."
-            ));
+    /// Stop each workset's process and erase it: its log, heads, usage,
+    /// Claude sessions and directory. Mail stays. Every workset is checked
+    /// first, so none is deleted when one is missing.
+    pub async fn delete_worksets(self: &Arc<Self>, ids: Vec<WorksetId>) -> anyhow::Result<()> {
+        let pool = self.clone();
+        // Deletion completes even if the requesting connection goes away.
+        tokio::spawn(async move {
+            {
+                let read = pool.db.read();
+                for &id in &ids {
+                    anyhow::ensure!(
+                        read.workset(id).is_some(),
+                        "workset {id} does not exist; none was deleted"
+                    );
+                }
+            }
+            for workset in ids {
+                pool.delete_workset(workset).await?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn delete_workset(self: &Arc<Self>, workset: WorksetId) -> anyhow::Result<()> {
+        let slot = self.execution_slot(workset).await;
+        let _admission = slot.admission.clone().write_owned().await;
+        let agents = self
+            .db
+            .read()
+            .workset(workset)
+            .map(|head| head.agents)
+            .unwrap_or_default();
+        let mut locks = Vec::new();
+        for &agent in &agents {
+            let lock = self.load_locks.lock().await.entry(agent).or_default().clone();
+            locks.push(lock.lock_owned().await);
         }
-        agent
-            .send_agent_message_accepted(from, sender_label, body)
+        for &agent in &agents {
+            let client = self.agents.lock().await.remove(&agent);
+            if let Some(client) = client {
+                client.shutdown().await;
+            }
+        }
+        if let Some(process) = slot.process.lock().await.take() {
+            process.shutdown().await;
+        }
+        // Every Claude session the agents ever had, from their specs.
+        let sessions = self
+            .db
+            .read()
+            .workset_rows(workset, rho_agent_types::Wpos::ZERO, usize::MAX)
+            .into_iter()
+            .filter_map(|(_, record)| match record.event {
+                Event::AgentCreated { spec, .. } | Event::AgentChanged { spec, .. } => {
+                    match spec.runtime {
+                        Runtime::Claude { session_id, .. } => Some(session_id),
+                        Runtime::Native { .. } => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        rho_claude::delete_session_files(&self.claude, &sessions)
             .await
-    }
-
-    /// Resolve an agent id string or prefix against all generated agent ids.
-    pub fn resolve_agent_id(
-        &self,
-        text: &str,
-    ) -> anyhow::Result<prefix_id::PrefixResolution<rho_agent_types::AgentIdDomain>> {
-        let text = text.trim();
-        let read = self.db.read();
-        let domain = rho_agent_types::AgentIdDomain(read.machine_seed());
-        Ok(AgentId::from_prefix(
-            text,
-            read.last_agent_counter() + 1,
-            &domain,
-        )?)
-    }
-
-    pub fn agent_exists(&self, agent_id: AgentId) -> bool {
-        self.db.read().agent_exists(agent_id)
-    }
-
-    /// Short raw prefix for an agent id.
-    pub fn agent_id_prefix(&self, agent_id: AgentId) -> String {
-        let read = self.db.read();
-        let prefix_len =
-            prefix_id::uniform_prefix_len(read.last_agent_counter(), ID_LABEL_HEADROOM).max(4);
-        agent_id.encoded()[..prefix_len].to_owned()
-    }
-
-    /// A retained agent has a role-prefixed handle. An erased agent still
-    /// has its bare identity for references from retained children.
-    pub fn agent_handle(&self, agent_id: AgentId) -> anyhow::Result<String> {
-        let read = self.db.read();
-        if let Some(head) = read.try_get_agent(agent_id) {
-            return Ok(format!(
-                "{}-{}",
-                head.config.role.handle_prefix(),
-                self.agent_id_prefix(agent_id)
-            ));
+            .context("Claude session cleanup failed; the workset is kept for a retry")?;
+        for &agent in &agents {
+            self.flush_agent_usage(Some(agent)).await;
         }
-        anyhow::ensure!(
-            matches!(
-                read.agent_event(agent_id, crate::log::AgentEventPos::ZERO),
-                Some(crate::AgentEvent::Deleted { .. })
-            ),
-            "agent {} does not exist",
-            agent_id.encoded()
-        );
-        Ok(agent_id.encoded())
+        {
+            let mut write = self.db.write().await;
+            write.delete_workset(workset);
+            for &agent in &agents {
+                write.delete_agent_usage(agent);
+            }
+            write.commit();
+        }
+        self.recent
+            .lock()
+            .expect("poison")
+            .retain(|id| !agents.contains(id));
+        self.usage
+            .lock()
+            .await
+            .retain(|(id, _), _| !agents.contains(id));
+        for watcher in self
+            .statuses
+            .lock()
+            .expect("poison")
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+        {
+            watcher
+                .unsent
+                .lock()
+                .expect("poison")
+                .retain(|id, _| !agents.contains(id));
+        }
+        self.processes.lock().await.remove(&workset);
+        self.worksets.delete(workset).await?;
+        Ok(())
+    }
+
+    /// What answers a workset's `_rho` calls.
+    fn python_handler(self: &Arc<Self>, workset: WorksetId) -> crate::host::process::PythonHandler {
+        let pool = Arc::downgrade(self);
+        Arc::new(move |request| {
+            let pool = pool.clone();
+            Box::pin(async move {
+                let Some(pool) = pool.upgrade() else {
+                    return PyReply::Error("the agent host is shutting down".into());
+                };
+                pool.python(workset, request)
+                    .await
+                    .unwrap_or_else(|error| PyReply::Error(format!("{error:#}")))
+            })
+        })
+    }
+
+    /// The agent, if it belongs to `workset`: a workset acts on its own
+    /// agents only.
+    fn own_agent(&self, workset: WorksetId, agent: AgentId) -> anyhow::Result<AgentSpec> {
+        let head = self
+            .db
+            .read()
+            .agent(agent)
+            .filter(|head| head.workset == workset)
+            .with_context(|| format!("no agent {} in this workset", agent.encoded()))?;
+        Ok(head.spec)
+    }
+
+    async fn python(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        request: PyRequest,
+    ) -> anyhow::Result<PyReply> {
+        Ok(match request {
+            PyRequest::CreateAgent(spec) => {
+                let mut write = self.db.write().await;
+                let agent = write.alloc_agent_id();
+                write.append(
+                    workset,
+                    &Record {
+                        at: UnixMs::now(),
+                        event: Event::AgentCreated { agent, spec },
+                    },
+                )?;
+                // The message the running `Eval` carries, if this is the
+                // first agent it creates.
+                let first = {
+                    let mut first_mail = self.first_mail.lock().expect("poison");
+                    match first_mail.remove(&workset) {
+                        Some(FirstMail::Waiting(content)) => {
+                            first_mail.insert(workset, FirstMail::Sent(agent));
+                            Some(content)
+                        }
+                        other => {
+                            if let Some(other) = other {
+                                first_mail.insert(workset, other);
+                            }
+                            None
+                        }
+                    }
+                };
+                if let Some(content) = first {
+                    write.post_mail(
+                        UnixMs::now(),
+                        NewMail {
+                            from: Address::User,
+                            to: Address::Agent(agent),
+                            re: None,
+                            kind: None,
+                            content,
+                        },
+                        None,
+                    );
+                }
+                write.commit();
+                PyReply::Agent(agent)
+            }
+            PyRequest::Agents => {
+                let read = self.db.read();
+                let agents = read
+                    .workset(workset)
+                    .context("workset was deleted")?
+                    .agents
+                    .into_iter()
+                    .filter_map(|agent| read.agent(agent).map(|head| (agent, head.spec)))
+                    .collect();
+                PyReply::Agents(agents)
+            }
+            PyRequest::SetSpec { agent, spec } => {
+                let current = self.own_agent(workset, agent)?;
+                anyhow::ensure!(
+                    std::mem::discriminant(&current.runtime) == std::mem::discriminant(&spec.runtime),
+                    "an agent keeps its runtime kind"
+                );
+                {
+                    let mut write = self.db.write().await;
+                    write.append(
+                        workset,
+                        &Record {
+                            at: UnixMs::now(),
+                            event: Event::AgentChanged { agent, spec },
+                        },
+                    )?;
+                    write.commit();
+                }
+                if let Some(client) = self.agents.lock().await.get(&agent)
+                    && let Some(head) = self.db.read().agent(agent)
+                {
+                    client.named(head);
+                }
+                PyReply::Done
+            }
+            PyRequest::Control { agent, control } => {
+                self.own_agent(workset, agent)?;
+                let (_, client, _) = self.load(agent).await?;
+                client.control(control).await?;
+                PyReply::Done
+            }
+            PyRequest::Delivered(agent) => {
+                self.own_agent(workset, agent)?;
+                PyReply::Mail(self.db.read().agent(agent).context("agent was deleted")?.delivered)
+            }
+            PyRequest::SendMail {
+                sender,
+                to,
+                content,
+                kind,
+                re,
+            } => {
+                self.own_agent(workset, sender)?;
+                let recipient = match to {
+                    Address::User => None,
+                    Address::Agent(to) => Some(self.workset_of(to)?),
+                };
+                let id = self
+                    .post_mail(
+                        NewMail {
+                            from: Address::Agent(sender),
+                            to,
+                            re,
+                            kind,
+                            content,
+                        },
+                        None,
+                    )
+                    .await;
+                if let Some(recipient) = recipient
+                    && recipient != workset
+                {
+                    self.wake_workset(recipient);
+                }
+                PyReply::Mail(id)
+            }
+            PyRequest::Inbox { address, after } => PyReply::Mails(self.inbox(address, after).await),
+            PyRequest::Clone { url, dest, rev } => {
+                let kind = self.db.read().workset(workset).context("workset was deleted")?.kind;
+                anyhow::ensure!(
+                    kind == WorksetKind::Isolated,
+                    "clone works in an isolated workset only"
+                );
+                let name = dest
+                    .strip_prefix(rho_fs_view::MOUNT_ROOT)
+                    .ok()
+                    .filter(|name| name.components().count() == 1)
+                    .with_context(|| {
+                        format!("clone into a directory directly in {}", rho_fs_view::MOUNT_ROOT)
+                    })?
+                    .to_string();
+                let directory = self.worksets.open_workset(workset).await?;
+                let checkout = directory.clone_repo(&url, Some(&name)).await?;
+                directory.checkout(&checkout, &rev).await?;
+                PyReply::Done
+            }
+            PyRequest::Models => PyReply::Models(models()),
+        })
+    }
+
+    /// Mail to `address` after `after`, waiting up to [`INBOX_WAIT`] for
+    /// some.
+    async fn inbox(&self, address: Address, after: MailId) -> Vec<Mail> {
+        let mut feed = crate::store::feed(&self.db);
+        let deadline = tokio::time::sleep(INBOX_WAIT);
+        tokio::pin!(deadline);
+        loop {
+            let mails = self.db.read().inbox(address, after);
+            if !mails.is_empty() {
+                return mails;
+            }
+            loop {
+                tokio::select! {
+                    appended = feed.recv() => match appended {
+                        Ok(crate::store::Appended::Mail(_))
+                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return Vec::new(),
+                    },
+                    () = &mut deadline => return Vec::new(),
+                }
+            }
+        }
     }
 
     /// Loads a persisted agent if it is not already running. The returned
@@ -1231,13 +1178,7 @@ impl AgentPool {
         let pool = self.clone();
         Box::pin(async move {
             tokio::spawn(async move {
-                let workset = pool
-                    .db
-                    .read()
-                    .try_get_agent(agent_id)
-                    .context("agent was deleted or does not exist")?
-                    .place()
-                    .workset;
+                let workset = pool.workset_of(agent_id)?;
                 let slot = pool.execution_slot(workset).await;
                 let admission = slot.admission.clone().read_owned().await;
                 let lock = pool
@@ -1249,7 +1190,7 @@ impl AgentPool {
                     .clone();
                 let loading = lock.lock_owned().await;
                 anyhow::ensure!(
-                    pool.db.read().agent_exists(agent_id),
+                    pool.db.read().agent(agent_id).is_some(),
                     "agent was deleted or does not exist"
                 );
                 let existing = pool.agents.lock().await.get(&agent_id).cloned();
@@ -1278,1147 +1219,29 @@ impl AgentPool {
     }
 }
 
-fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
-    match (parent, child) {
-        (
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Mini,
-            },
-            AgentRole::Engineer { .. },
-        ) => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        },
-        (
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium1 | EngineerIntelligence::High1,
-            },
-            AgentRole::Engineer { .. },
-        ) => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium1,
-        },
-        (_, AgentRole::Engineer { .. }) => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        },
-        (_, child) => child,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rho_agent_types::EngineerIntelligence;
-
-    use super::*;
-
-    #[test]
-    fn mini_engineers_spawn_mini_engineers() {
-        let mini = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        };
-        let engineer = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        };
-
-        assert_eq!(child_role(mini, engineer), mini);
-        assert_eq!(
-            child_role(
-                mini,
-                AgentRole::Advisor {
-                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
-                }
-            ),
-            AgentRole::Advisor {
-                intelligence: rho_agent_types::AdvisorIntelligence::Medium,
-            }
-        );
-    }
-
-    #[test]
-    fn engineers_spawn_engineers_of_their_family() {
-        for (parent, child) in [
-            (EngineerIntelligence::Medium, EngineerIntelligence::Medium),
-            (EngineerIntelligence::High, EngineerIntelligence::Medium),
-            (EngineerIntelligence::Medium1, EngineerIntelligence::Medium1),
-            (EngineerIntelligence::High1, EngineerIntelligence::Medium1),
-        ] {
-            assert_eq!(
-                child_role(
-                    AgentRole::Engineer {
-                        intelligence: parent
-                    },
-                    AgentRole::Engineer {
-                        intelligence: EngineerIntelligence::High,
-                    },
-                ),
-                AgentRole::Engineer {
-                    intelligence: child
-                },
-                "{parent:?}"
-            );
-        }
-    }
-
-    async fn test_pool(root: &std::path::Path) -> (Arc<AgentPool>, Place) {
-        let worker = std::env::current_exe()
-            .unwrap()
-            .ancestors()
-            .map(|path| path.join("rho-agent-worker"))
-            .chain(std::iter::once(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/debug/rho-agent-worker"),
-            ))
-            .find(|path| path.is_file())
-            .expect("build rho-agent-worker before the pool process test")
-            .canonicalize()
-            .unwrap();
-        let bin = worker.parent().unwrap().to_owned();
-        let mut environment = std::env::vars_os()
-            .filter(|(key, _)| key != "PATH")
-            .collect::<Vec<_>>();
-        environment.push((
-            "PATH".into(),
-            std::env::join_paths(
-                std::iter::once(bin)
-                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-            )
-            .unwrap(),
-        ));
-        let worksets = Worksets::open(
-            root.join("state"),
-            rho_fs_view::UserEnvironment::new(environment),
-            Default::default(),
-            rho_fs_view::StoreService::None,
-        )
-        .await
-        .unwrap();
-        let workset = worksets.create().await.unwrap();
-        let place = Place {
-            workset: Some(workset.id()),
-            cwd: "/src".into(),
-        };
-        let db = RhoDb::open(root.join("agents.redb"));
-        let inference = crate::inference::testing::accounts();
-        let pool = AgentPool::new(
-            db,
-            inference,
-            worksets,
-            rho_claude::accounts::ClaudePaths::at(
-                camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
-            ),
-        )
-        .await;
-        (pool, place)
-    }
-
-    #[tokio::test]
-    async fn online_deletion_drains_workers_erases_old_sessions_and_keeps_other_agents() {
-        use rho_agent_types::{Seq, UnixMs};
-
-        use crate::db::AgentProfileWriteTxnExt as _;
-        use crate::log::{AgentEvent, ClaudeRewind, RuntimeChange};
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, _) = test_pool(dir.path()).await;
-        let (doomed, worker) = pool
-            .create(
-                AgentRole::default(),
-                None,
-                StartPlace::new(Place {
-                    workset: None,
-                    cwd: "/src".into(),
-                }),
-            )
-            .await
-            .unwrap();
-        let (kept, kept_worker) = pool
-            .create(
-                AgentRole::default(),
-                None,
-                StartPlace::new(Place {
-                    workset: None,
-                    cwd: "/src".into(),
-                }),
-            )
-            .await
-            .unwrap();
-        // Retained history with both the original and a pending/abandoned fork.
-        let original = uuid::Uuid::new_v4();
-        let fork = uuid::Uuid::new_v4();
-        let (claude, shared) = {
-            let mut write = pool.db.write().await;
-            let claude = write.alloc_agent_id();
-            write.create_agent(
-                UnixMs(1),
-                claude,
-                None,
-                Place {
-                    workset: None,
-                    cwd: "/src".into(),
-                },
-                AgentRole::default(),
-                SessionBinding::ClaudeOpus {
-                    effort: crate::log::ClaudeEffort::High,
-                },
-                AgentRuntime::Claude {
-                    session_id: original,
-                },
-                AgentOrigin::User,
-            );
-            write.append_agent_event(
-                claude,
-                &AgentEvent::RuntimeRebound {
-                    change: RuntimeChange::ClaudeRewindPending(Some(ClaudeRewind {
-                        source_session_id: original,
-                        session_id: fork,
-                        resume_at: None,
-                    })),
-                    at: UnixMs(2),
-                },
-            );
-            write.append_agent_event(
-                claude,
-                &AgentEvent::Notice {
-                    text: "erase me".repeat(300_000).into(),
-                    at: UnixMs(3),
-                },
-            );
-            let shared = write.alloc_agent_id(); // unknown id for preflight test
-            write.commit();
-            (claude, shared)
-        };
-        let project = pool.claude.projects().join("-src");
-        std::fs::create_dir_all(&project).unwrap();
-        for session in [original, fork] {
-            std::fs::write(project.join(format!("{session}.jsonl")), "owned").unwrap();
-            std::fs::create_dir_all(project.join(session.to_string()).join("subagents")).unwrap();
-        }
-        let unrelated = project.join(format!("{}.jsonl", uuid::Uuid::new_v4()));
-        std::fs::write(&unrelated, "retain").unwrap();
-        let head = pool.db.read().journal_head();
-        let mut feed = crate::journal::feed(&pool.db);
-        assert!(
-            pool.delete_agents(vec![doomed, shared], false)
-                .await
-                .is_err()
-        );
-        assert!(pool.agent_exists(doomed));
-        let savepoint = pool.db.persistent_savepoint(|_, _| {}).await;
-        assert!(pool.delete_agents(vec![doomed], true).await.is_err());
-        assert!(pool.agent_exists(doomed));
-        {
-            let mut write = pool.db.write().await;
-            write.delete_persistent_savepoint(savepoint);
-            write.commit();
-        }
-        let result = pool
-            .delete_agents(vec![doomed, claude, doomed], true)
-            .await
-            .unwrap();
-        assert_eq!(result.0.len(), 2);
-        assert_eq!(result.1, 4);
-        let (before, after) = result.2.unwrap();
-        assert!(after < before, "{before} -> {after}");
-        assert!(worker.stopping());
-        assert!(worker.head().is_err());
-        assert!(!kept_worker.stopping());
-        assert!(pool.get(doomed).await.is_none());
-        assert!(pool.load(doomed).await.is_err());
-        assert!(pool.execution(doomed).await.is_err());
-        assert!(pool.agent_exists(kept));
-        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "retain");
-        assert!(!project.join(format!("{original}.jsonl")).exists());
-        assert!(!project.join(format!("{fork}.jsonl")).exists());
-        let markers = pool.db.read().journal_since(head, 100);
-        assert_eq!(markers.len(), 2);
-        assert!(
-            markers.iter().all(
-                |(seq, _, _, event)| *seq > head && matches!(event, AgentEvent::Deleted { .. })
-            )
-        );
-        assert!(feed.recv().await.unwrap().seq > head);
-        // Late usage cannot recreate the removed agent's per-agent records.
-        pool.record_agent_usage(
-            doomed,
-            AgentUsageBucket {
-                requests: 2,
-                ..Default::default()
-            },
-        )
-        .await;
-        pool.flush_agent_usage(None).await;
-        assert_eq!(pool.db.read().agent_usage_total(doomed).requests, 0);
-        assert!(pool.db.read().journal_head() > Seq(0));
-        kept_worker.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn claude_cleanup_failure_keeps_history_for_an_explicit_retry() {
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, _) = test_pool(dir.path()).await;
-        let session = uuid::Uuid::new_v4();
-        let id = {
-            let mut write = pool.db.write().await;
-            let id = write.alloc_agent_id();
-            write.create_agent(
-                rho_agent_types::UnixMs(1),
-                id,
-                None,
-                Place {
-                    workset: None,
-                    cwd: "/src".into(),
-                },
-                AgentRole::default(),
-                SessionBinding::ClaudeOpus {
-                    effort: crate::log::ClaudeEffort::High,
-                },
-                AgentRuntime::Claude {
-                    session_id: session,
-                },
-                AgentOrigin::User,
-            );
-            write.commit();
-            id
-        };
-        // A malformed session-owned directory is a real I/O error, not
-        // permission dependent (tests can also run as root).
-        std::fs::create_dir_all(pool.claude.config_home()).unwrap();
-        let bad = pool.claude.config_home().join("debug");
-        std::fs::write(&bad, "not a directory").unwrap();
-        let err = pool.delete_agents(vec![id], false).await.unwrap_err();
-        assert!(err.to_string().contains("histories retained for retry"));
-        assert!(pool.agent_exists(id));
-        assert_eq!(
-            pool.db.read().agent_claude_sessions(id),
-            std::collections::BTreeSet::from([session])
-        );
-        std::fs::remove_file(&bad).unwrap();
-        pool.delete_agents(vec![id], false).await.unwrap();
-        assert!(!pool.agent_exists(id));
-    }
-
-    #[tokio::test]
-    async fn deletion_outlives_caller_and_serializes_with_a_waiting_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let (pool, _) = test_pool(dir.path()).await;
-        let id = {
-            let mut write = pool.db.write().await;
-            let id = crate::db::tests::create(&mut write, None, None);
-            write.commit();
-            id
-        };
-        let lock = pool.load_locks.lock().await.entry(id).or_default().clone();
-        let probe = Arc::downgrade(&lock);
-        let held = lock.lock_owned().await;
-        let requested = tokio::spawn({
-            let pool = pool.clone();
-            async move { pool.delete_agents(vec![id], false).await }
-        });
-        // Wait until the deletion task has queued behind this lock.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while probe.strong_count() < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("deletion queued on the per-ID lock");
-        requested.abort();
-        let mut feed = crate::journal::feed(&pool.db);
-        let load = tokio::spawn({
-            let pool = pool.clone();
-            async move { pool.load(id).await }
-        });
-        drop(held);
-        tokio::time::timeout(std::time::Duration::from_secs(5), feed.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(load.await.unwrap().is_err());
-        assert!(!pool.agent_exists(id));
-        assert_eq!(pool.agent_handle(id).unwrap(), id.encoded());
-        assert!(pool.agents.lock().await.get(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_connection_holds_each_agents_latest_status_with_bodies_only_while_live() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, _) = test_pool(directory.path()).await;
-        let (watched, other) = {
-            let mut write = pool.db.write().await;
-            let ids = (write.alloc_agent_id(), write.alloc_agent_id());
-            write.commit();
-            ids
-        };
-        let status = |queued| AgentStatus {
-            response: Some(rho_agents_client::protocol::transcript::StreamingResponse {
-                id: "response".into(),
-                items: Vec::new(),
-            }),
-            draft: Some("draft".into()),
-            queued,
-            ..Default::default()
-        };
-        let tell = |agent_id, queued| {
-            pool.status_changed(agent_id, &tokio::sync::watch::Sender::new(status(queued)))
-        };
-        let slow = pool.watch_statuses().await;
-        assert!(slow.take().is_empty(), "no agent is loaded");
-
-        // A connection that reads nothing meanwhile holds the latest status
-        // of each agent, never a backlog.
-        for queued in 0..1000 {
-            tell(watched, queued);
-        }
-        tell(other, 7);
-        tokio::time::timeout(std::time::Duration::from_secs(1), slow.changed())
-            .await
-            .expect("a waiting connection is woken");
-        let taken = slow.take();
-        assert_eq!(taken.len(), 2);
-        assert_eq!(taken[&watched].queued, 999);
-        assert_eq!(taken[&other].queued, 7);
-        assert!(slow.take().is_empty());
-
-        // Nobody is looking: the body stays home. Once one connection looks,
-        // every connection gets it.
-        assert_eq!(
-            (&taken[&watched].response, &taken[&watched].draft),
-            (&None, &None)
-        );
-        pool.set_live_wants(1, HashSet::from([watched])).await;
-        tell(watched, 1);
-        tell(other, 1);
-        let taken = slow.take();
-        assert_eq!(*taken[&watched], status(1));
-        assert_eq!(taken[&other].response, None);
-
-        // A connection that went away is forgotten.
-        drop(slow);
-        tell(other, 2);
-        assert!(pool.statuses.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pending_placement_commits_before_preparing_and_outlives_caller_cancellation() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, mut place) = test_pool(directory.path()).await;
-        let workset = pool
-            .worksets
-            .open_workset(place.workset.unwrap())
-            .await
-            .unwrap();
-        place.cwd = "/src/not-cloned-yet".into();
-        let host_cwd = workset.root().join("not-cloned-yet");
-        let (entered, preparing) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let db = pool.db.clone();
-        let create = tokio::spawn({
-            let pool = pool.clone();
-            async move {
-                pool.create(
-                    AgentRole::default(),
-                    None,
-                    StartPlace::pending(place, async move {
-                        let ids = db.read().list_agent_ids();
-                        assert_eq!(ids.len(), 1, "the record must commit before preparation");
-                        entered.send(ids[0]).unwrap();
-                        released.await.unwrap();
-                        std::fs::create_dir(host_cwd)?;
-                        Ok(())
-                    }),
-                )
-                .await
-            }
-        });
-        let id = tokio::time::timeout(std::time::Duration::from_secs(5), preparing)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            pool.executions().await.is_empty(),
-            "no worker before placement"
-        );
-        create.abort();
-        assert!(create.await.err().unwrap().is_cancelled());
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if pool.agents.lock().await.contains_key(&id) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let (_, agent, newly_loaded) = pool.load(id).await.unwrap();
-        assert!(
-            !newly_loaded,
-            "cancelled caller must not leave an unregistered agent"
-        );
-        assert_eq!(
-            agent.head().unwrap().config.place.cwd,
-            "/src/not-cloned-yet"
-        );
-        agent.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn failed_placement_keeps_the_record_without_starting_execution() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, place) = test_pool(directory.path()).await;
-        let result = pool
-            .create(
-                AgentRole::default(),
-                None,
-                StartPlace::pending(place, async { anyhow::bail!("checkout failed") }),
-            )
-            .await;
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("checkout failed")
-        );
-        assert_eq!(pool.db.read().list_agent_ids().len(), 1);
-        assert!(pool.executions().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn child_workdir_selects_existing_directory_before_creation() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, place) = test_pool(directory.path()).await;
-        let workset = pool
-            .worksets
-            .open_workset(place.workset.unwrap())
-            .await
-            .unwrap();
-        for name in ["parent", "checkout"] {
-            // The pool's place is the workset root, `/src`.
-            let dir = workset.root().join(name);
-            std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
-            let skill_dir = dir.join(".agents/skills/catalogue-fixture");
-            std::fs::create_dir_all(&skill_dir).unwrap();
-            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: catalogue-fixture\ndescription: Directory-specific skill.\n---\nPrivate skill body.\n").unwrap();
-        }
-        let place = Place {
-            cwd: "/src/parent".into(),
-            ..place
-        };
-        let (parent_id, parent) = pool
-            .create(
-                AgentRole::default(),
-                Some("parent".into()),
-                StartPlace::new(place.clone()),
-            )
-            .await
-            .unwrap();
-
-        let tools =
-            crate::multi_agent_tools::MultiAgentTools::new(Arc::downgrade(&pool), parent_id, None);
-        let spawn = |workdir: Option<&str>| {
-            crate::multi_agent_tools::AgentCall::SpawnEngineer(
-                crate::multi_agent_tools::SpawnArgs {
-                    task_name: "child".into(),
-                    prompt: "No work is required.".into(),
-                    workdir: workdir.map(str::to_owned),
-                },
-            )
-        };
-        for (workdir, expected) in [
-            (Some("/src/checkout"), "/src/checkout"),
-            (None, "/src/parent"),
-        ] {
-            let before = pool.db.read().list_agent_ids();
-            let output = crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(workdir))
-                .await
-                .unwrap();
-            assert!(output.contains(&format!("It works in {expected}.")));
-            let read = pool.db.read();
-            let child_id = read
-                .list_agent_ids()
-                .into_iter()
-                .find(|id| !before.contains(id))
-                .unwrap();
-            let child = read.get_agent(child_id);
-            assert_eq!(child.place().cwd.as_str(), expected);
-            assert_eq!(
-                child.place().workset,
-                read.get_agent(parent_id).place().workset
-            );
-            let backing = camino::Utf8PathBuf::from_path_buf(
-                workset
-                    .root()
-                    .join(expected.strip_prefix("/src/").unwrap())
-                    .into(),
-            )
-            .unwrap();
-
-            // The selected directory supplies the child's guidance, immediately
-            // after workspace context; identity belongs with
-            // collaboration, not that guidance.
-            let team = crate::multi_agent_tools::MultiAgentTools::new(
-                Arc::downgrade(&pool),
-                child_id,
-                Some(parent_id),
-            )
-            .team()
-            .unwrap();
-            let rendered = crate::prompt::prompt(
-                &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
-                Some(&team),
-                child.config.role,
-            );
-            let collaboration = rendered
-                .split("## Working with other agents")
-                .nth(1)
-                .unwrap()
-                .split("## Context and continuity")
-                .next()
-                .unwrap();
-            assert!(collaboration.contains(&team.agent));
-            assert!(collaboration.contains(team.parent.as_ref().unwrap()));
-            let workspace = rendered.split("## Workspace Context").nth(1).unwrap();
-            assert!(workspace.starts_with(&format!("\n\nWorking directory: {expected}\n")));
-            assert!(workspace.contains(&format!(
-                "Guidance for {}.",
-                expected.rsplit('/').next().unwrap()
-            )));
-            assert!(
-                !workspace
-                    .split("## AGENTS.md instructions")
-                    .next()
-                    .unwrap()
-                    .contains("## Skills")
-            );
-            assert!(!rendered.contains("## Team Context"));
-            assert!(!rendered.lines().any(|line| line == "## Environment"));
-            for role in [
-                AgentRole::default(),
-                AgentRole::Advisor {
-                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
-                },
-            ] {
-                let native = crate::prompt::prompt(
-                    &crate::prompt::WorksetPrompt::backed(&child.place().cwd, &backing),
-                    Some(&team),
-                    role,
-                );
-                let claude = crate::prompt::claude_prompt(
-                    Some(&crate::prompt::WorksetPrompt::backed(
-                        &child.place().cwd,
-                        &backing,
-                    )),
-                    Some(&team),
-                    role,
-                );
-                let native_catalogue = native.split("## Skills\n").nth(1).unwrap();
-                let claude_catalogue = claude.split("## Skills\n").nth(1).unwrap();
-                assert_eq!(native_catalogue, claude_catalogue);
-                assert!(
-                    native_catalogue
-                        .contains("- catalogue-fixture: Directory-specific skill. (file: r")
-                );
-                assert!(native_catalogue.contains(&format!("`{expected}/.agents/skills`")));
-                assert!(!native_catalogue.contains("### How to use skills"));
-                assert!(!native_catalogue.contains("Private skill body."));
-            }
-            drop(read);
-            crate::multi_agent_tools::call_agent_tool(
-                tools.clone(),
-                crate::multi_agent_tools::AgentCall::Cancel(
-                    crate::multi_agent_tools::InterruptArgs {
-                        agent_id: team.agent.to_string(),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
-        }
-
-        let count = pool.db.read().list_agent_ids().len();
-        for invalid in ["checkout"] {
-            let result =
-                crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(Some(invalid)))
-                    .await;
-            assert!(result.is_err(), "{invalid}");
-            assert_eq!(pool.db.read().list_agent_ids().len(), count);
-        }
-        pool.execution(parent_id).await.unwrap().shutdown().await;
-        drop(parent);
-    }
-
-    #[tokio::test]
-    async fn user_owned_engineers_answer_to_the_user() {
-        use crate::multi_agent_tools::{
-            AgentCall, InterruptArgs, MultiAgentTools, SendArgs, SpawnArgs, call_agent_tool,
-        };
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, place) = test_pool(directory.path()).await;
-        let (creator_id, creator) = pool
-            .create(
-                AgentRole::default(),
-                Some("creator".into()),
-                StartPlace::new(place),
-            )
-            .await
-            .unwrap();
-        let tools_of =
-            |agent_id, parent| MultiAgentTools::new(Arc::downgrade(&pool), agent_id, parent);
-        let spawn_args = |task_name: &str| SpawnArgs {
-            task_name: task_name.into(),
-            prompt: "No work is required.".into(),
-            workdir: None,
-        };
-        let new_agent = |before: Vec<AgentId>| {
-            pool.db
-                .read()
-                .list_agent_ids()
-                .into_iter()
-                .find(|id| !before.contains(id))
-                .unwrap()
-        };
-
-        let before = pool.db.read().list_agent_ids();
-        let output = call_agent_tool(
-            tools_of(creator_id, None),
-            AgentCall::SpawnUserOwnedEngineer(spawn_args("side")),
-        )
-        .await
-        .unwrap();
-        let owned = new_agent(before);
-        let owned_handle = pool.agent_handle(owned).unwrap();
-        assert!(output.contains(&owned_handle), "{output}");
-        {
-            let read = pool.db.read();
-            assert_eq!(read.agent_parent(owned), None);
-            assert_eq!(
-                read.get_agent(owned).config.spawned_by,
-                crate::log::AgentSpawnedBy::UserOwned { by: creator_id }
-            );
-            assert!(read.agent_response_subscribers(owned).is_empty());
-        }
-
-        // The creator may still answer it, but no longer manages it.
-        call_agent_tool(
-            tools_of(creator_id, None),
-            AgentCall::Message(SendArgs {
-                agent_id: owned_handle.clone(),
-                message: "more context".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        // The bare id behind the handle names the same agent; a prefix of
-        // the wrong role does not.
-        let bare = pool.agent_id_prefix(owned);
-        let output = call_agent_tool(
-            tools_of(creator_id, None),
-            AgentCall::Message(SendArgs {
-                agent_id: bare.clone(),
-                message: "by bare id".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(output.contains(&owned_handle), "{output}");
-        let error = call_agent_tool(
-            tools_of(creator_id, None),
-            AgentCall::Message(SendArgs {
-                agent_id: format!("adv-{bare}"),
-                message: "wrong role".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("role prefix differs"), "{error}");
-        let error = call_agent_tool(
-            tools_of(creator_id, None),
-            AgentCall::Cancel(InterruptArgs {
-                agent_id: owned_handle.clone(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("managed by the user"), "{error}");
-
-        // Its own children still reach it, but one working for an agent
-        // cannot open a thread for the user.
-        let before = pool.db.read().list_agent_ids();
-        call_agent_tool(
-            tools_of(owned, None),
-            AgentCall::SpawnEngineer(spawn_args("helper")),
-        )
-        .await
-        .unwrap();
-        let helper = new_agent(before);
-        call_agent_tool(
-            tools_of(helper, Some(owned)),
-            AgentCall::Message(SendArgs {
-                agent_id: owned_handle,
-                message: "question".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        let count = pool.db.read().list_agent_ids().len();
-        let error = call_agent_tool(
-            tools_of(helper, Some(owned)),
-            AgentCall::SpawnUserOwnedEngineer(spawn_args("nested")),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("only an agent the user manages"),
-            "{error}"
-        );
-        assert_eq!(pool.db.read().list_agent_ids().len(), count);
-
-        // Spawn limits follow the starter: a chain of user-owned Engineers
-        // stops at the depth limit like a chain of children.
-        let mut starter = owned;
-        for _ in 2..=MAX_SPAWN_DEPTH {
-            let before = pool.db.read().list_agent_ids();
-            call_agent_tool(
-                tools_of(starter, None),
-                AgentCall::SpawnUserOwnedEngineer(spawn_args("deeper")),
-            )
-            .await
-            .unwrap();
-            starter = new_agent(before);
-        }
-        let error = call_agent_tool(
-            tools_of(starter, None),
-            AgentCall::SpawnUserOwnedEngineer(spawn_args("too-deep")),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("spawn depth limit"), "{error}");
-
-        pool.execution(creator_id).await.unwrap().shutdown().await;
-        drop(creator);
-    }
-
-    #[tokio::test]
-    async fn external_handles_and_cancelled_eviction_cannot_create_overlapping_workers() {
-        use std::time::Duration;
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let (pool, place) = test_pool(root).await;
-        let role = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        };
-        let (first_id, first) = pool
-            .create(role, Some("first".into()), StartPlace::new(place.clone()))
-            .await
-            .unwrap();
-        let (second_id, second) = pool
-            .create(
-                AgentRole::default(),
-                Some("second".into()),
-                StartPlace::new(place),
-            )
-            .await
-            .unwrap();
-        // Neither completion publication nor queue saturation may wait for
-        // actor acceptance. Hold both activation locks to stall recipients.
-        pool.set_response_subscription(second_id, first_id, true)
-            .await
-            .unwrap();
-        pool.set_response_subscription(first_id, second_id, true)
-            .await
-            .unwrap();
-        let sender_lock = pool.load_locks.lock().await.get(&first_id).unwrap().clone();
-        let receiver_lock = pool
-            .load_locks
-            .lock()
-            .await
-            .get(&second_id)
-            .unwrap()
-            .clone();
-        let sender_guard = sender_lock.clone().lock_owned().await;
-        let receiver_guard = receiver_lock.lock_owned().await;
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            pool.publish_message(AgentMessage {
-                agent_id: first_id,
-                text: "completed".into(),
-            }),
-        )
-        .await
-        .expect("completion waited for a recipient");
-
-        // Reserve the remaining bounded slots without queuing hundreds of
-        // irrelevant messages. The reverse subscription exercises full-queue
-        // admission while its recipient is equally unable to accept mail.
-        let reserved = pool
-            .responses
-            .try_reserve_many(pool.responses.capacity())
-            .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            pool.publish_message(AgentMessage {
-                agent_id: second_id,
-                text: "saturated reverse notification".into(),
-            }),
-        )
-        .await
-        .expect("completion waited for notification capacity");
-        drop(reserved);
-        pool.publish_message(AgentMessage {
-            agent_id: first_id,
-            text: "second".into(),
-        })
-        .await;
-        pool.set_response_subscription(first_id, second_id, false)
-            .await
-            .unwrap();
-        drop(receiver_guard);
-        drop(sender_guard);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let messages = pool
-                    .db
-                    .read()
-                    .agent_event_records(second_id)
-                    .1
-                    .into_iter()
-                    .filter_map(|(_, event)| match event {
-                        crate::AgentEvent::Entry(crate::entry::Entry::Received {
-                            from: crate::entry::Party::Agent(_),
-                            body,
-                            ..
-                        }) => Some(
-                            body.iter()
-                                .filter_map(|block| match block {
-                                    crate::entry::Block::Text(text) => Some(text.as_str()),
-                                    crate::entry::Block::Image(_) => None,
-                                })
-                                .collect::<String>(),
-                        ),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if messages.len() >= 2 {
-                    assert_eq!(&messages[..2], &["completed", "second"]);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("notifications did not preserve FIFO delivery");
-
-        let process = pool.execution(first_id).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &process,
-            &pool.execution(second_id).await.unwrap()
-        ));
-        pool.trim(1).await;
-        assert!(pool.agents.lock().await.contains_key(&first_id));
-        assert!(pool.agents.lock().await.contains_key(&second_id));
-        drop(first);
-
-        // Hold the real workset process, not a fake runtime, during retirement.
-        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
-        let trim = tokio::spawn({
-            let pool = pool.clone();
-            async move {
-                pool.trim(1).await;
-            }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while sender_lock.try_lock().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        trim.abort();
-        let load = || {
-            let pool = pool.clone();
-            tokio::spawn(async move { pool.load(first_id).await.unwrap() })
-        };
-        let one = load();
-        let two = load();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !one.is_finished() && !two.is_finished(),
-            "cancelled eviction released ownership"
-        );
-        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
-        let ((_, one, loaded_one), (_, two, loaded_two)) =
-            tokio::time::timeout(Duration::from_secs(10), async {
-                (one.await.unwrap(), two.await.unwrap())
-            })
-            .await
-            .unwrap();
-        assert_ne!(loaded_one, loaded_two);
-        assert!(Arc::ptr_eq(
-            &process,
-            &pool.execution(first_id).await.unwrap()
-        ));
-
-        // A local service failure must not leave its runtime alive after
-        // reload.
-        process.fail_agent_service(first_id);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let _ = process.closed.clone().wait_for(|closed| *closed).await;
-        })
-        .await
-        .unwrap();
-        let (_, reloaded, _) = pool.load(first_id).await.unwrap();
-        let replacement = pool.execution(first_id).await.unwrap();
-        assert!(!Arc::ptr_eq(&process, &replacement));
-        assert!(!std::path::Path::new(&format!("/proc/{}", process.pid)).exists());
-
-        // A failed Stop enqueue must take the termination-and-drain fallback.
-        replacement.fail_stop_send();
-        tokio::time::timeout(Duration::from_secs(10), reloaded.shutdown())
-            .await
-            .unwrap();
-        assert!(!std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists());
-        let (_, active, _) = pool.load(first_id).await.unwrap();
-        let replacement = pool.execution(first_id).await.unwrap();
-
-        // Buffer agent traffic briefly; workset control still completes, then
-        // restore the route without dropping its queued messages.
-        let (old_route, mut blocked) = replacement.pause_agent_route(first_id);
-        for _ in 0..4 {
-            active.tell_tail();
-        }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while blocked.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists());
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            replacement.action(crate::WorksetAction::TerminalList),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        replacement.restore_agent_route(first_id, old_route.clone(), &mut blocked);
-        assert!(blocked.is_empty(), "buffered messages were not delivered");
-        drop(old_route);
-        let final_agent = active.clone();
-        // A failing shutdown reply consumes the join result exactly once.
-        let process = pool.execution(first_id).await.unwrap();
-        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
-        let shutdown = tokio::spawn({
-            let agent = final_agent.clone();
-            async move { agent.shutdown().await }
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        process.fail_shutdown_reply(first_id);
-        // Resumed only once the failing reply is queued, so the worker exits
-        // on its own rather than after the kill grace.
-        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!std::path::Path::new(&format!("/proc/{}", process.pid)).exists());
-
-        // Caller cancellation cannot release admission for an enqueued create.
-        let process = pool.execution(first_id).await.unwrap();
-        let slot = pool
-            .execution_slot(pool.db().read().get_agent(first_id).config.place.workset)
-            .await;
-        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
-        let attach = tokio::spawn({
-            let process = process.clone();
-            async move {
-                process
-                    .attach(crate::WorksetAttach::Terminal {
-                        agent: first_id,
-                        terminal: 99,
-                        create: true,
-                        cols: 80,
-                        rows: 24,
-                        cwd: "/src".into(),
-                        shell: "bash".into(),
-                    })
-                    .await
-            }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while slot.admission.try_write().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        attach.abort();
-        let _ = attach.await;
-        assert!(
-            slot.admission.try_write().is_err(),
-            "cancelled create released admission"
-        );
-        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
-        // The in-flight attach must finish before exclusive admission succeeds.
-        let _admission = tokio::time::timeout(Duration::from_secs(10), slot.admission.write())
-            .await
-            .unwrap();
-        process.shutdown().await;
-        drop((one, two, second, active));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn only_a_stale_quiet_workset_is_replaced_unless_forced() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pool, place) = test_pool(directory.path()).await;
-        let (agent_id, _) = pool
-            .create(AgentRole::default(), None, StartPlace::new(place.clone()))
-            .await
-            .unwrap();
-        let first = pool.execution(agent_id).await.unwrap();
-        assert!(
-            !pool.restart_workset(place.workset, false).await.unwrap(),
-            "current build"
-        );
-        assert!(!*first.closed.borrow());
-
-        first.make_stale();
-        assert!(pool.restart_workset(place.workset, false).await.unwrap());
-        assert!(*first.closed.borrow());
-        let second = pool.execution(agent_id).await.unwrap();
-        assert_ne!(second.pid, first.pid);
-        assert!(!second.stale());
-        assert!(
-            pool.agents.lock().await.contains_key(&agent_id),
-            "loaded again"
-        );
-
-        let _terminal = second
-            .attach(crate::WorksetAttach::Terminal {
-                agent: agent_id,
-                terminal: 1,
-                create: true,
-                cols: 80,
-                rows: 24,
-                cwd: "/src".into(),
-                shell: "bash".into(),
-            })
-            .await
-            .unwrap();
-        second.make_stale();
-        assert!(
-            !pool.restart_workset(place.workset, false).await.unwrap(),
-            "a terminal is open"
-        );
-        assert!(!*second.closed.borrow());
-
-        assert!(pool.restart_workset(place.workset, true).await.unwrap());
-        assert!(*second.closed.borrow());
-        let third = pool.execution(agent_id).await.unwrap();
-        assert_ne!(third.pid, second.pid);
-        third.shutdown().await;
-    }
+/// The runtimes an agent can be given. Every account's models are listed;
+/// a request on one the host cannot reach fails when it is made.
+fn models() -> Vec<Runtime> {
+    use crate::inference::config::{InferenceModel, InferenceProfile};
+    let native = [
+        InferenceModel::Gpt61Sol,
+        InferenceModel::Gpt61Terra,
+        InferenceModel::Gpt6Astra,
+    ]
+    .map(|model| Runtime::Native {
+        model,
+        profile: InferenceProfile::default(),
+        cache_key: crate::inference::PromptCacheKey::generate(),
+    });
+    let claude = [
+        rho_claude::Model::Fable,
+        rho_claude::Model::Opus,
+        rho_claude::Model::Sonnet,
+    ]
+    .map(|model| Runtime::Claude {
+        model,
+        effort: rho_claude::Effort::High,
+        session_id: uuid::Uuid::nil(),
+    });
+    native.into_iter().chain(claude).collect()
 }

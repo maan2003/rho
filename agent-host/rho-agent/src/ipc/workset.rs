@@ -49,6 +49,52 @@ pub enum Reply {
     DesktopSessions(Vec<rho_desktop_client::protocol::DesktopSession>),
 }
 
+/// What the workset's Python asks of the agent host (`_rho`).
+#[derive(Encode, Decode)]
+pub(crate) enum PyRequest {
+    CreateAgent(crate::record::AgentSpec),
+    Agents,
+    SetSpec {
+        agent: rho_agent_types::AgentId,
+        spec: crate::record::AgentSpec,
+    },
+    /// Route a control to the agent's loop, loading it first if needed.
+    Control {
+        agent: rho_agent_types::AgentId,
+        control: crate::ipc::protocol::Control,
+    },
+    Delivered(rho_agent_types::AgentId),
+    SendMail {
+        sender: rho_agent_types::AgentId,
+        to: rho_agent_types::Address,
+        content: Vec<rho_agent_types::ContentPart>,
+        kind: Option<rho_agent_types::SendKind>,
+        re: Option<rho_agent_types::MailId>,
+    },
+    /// Mail to `address` after `after`, answered once there is some.
+    Inbox {
+        address: rho_agent_types::Address,
+        after: rho_agent_types::MailId,
+    },
+    Clone {
+        url: String,
+        dest: camino::Utf8PathBuf,
+        rev: String,
+    },
+    Models,
+}
+
+#[derive(Encode, Decode)]
+pub(crate) enum PyReply {
+    Agent(rho_agent_types::AgentId),
+    Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
+    Mail(rho_agent_types::MailId),
+    Mails(Vec<rho_agent_types::Mail>),
+    Models(Vec<crate::record::Runtime>),
+    Done,
+    Error(String),
+}
+
 #[derive(Encode, Decode)]
 pub(crate) enum Message {
     Policy(Vec<u8>),
@@ -56,6 +102,18 @@ pub(crate) enum Message {
     Attach { id: u64, port: Port, attach: Attach },
     Reply { id: u64, body: Reply },
     Detach(Port),
+    /// Worker to host: a `_rho` call.
+    Python { id: u64, request: PyRequest },
+    /// Host to worker: the answer to a `Python` call.
+    PythonReply { id: u64, body: PyReply },
+    /// Host to worker: run code in the workset namespace.
+    Eval { id: u64, code: String },
+    /// Worker to host: what an `Eval` printed, and its traceback.
+    Evaluated {
+        id: u64,
+        output: String,
+        error: Option<String>,
+    },
 }
 
 pub(crate) fn encode<T: senax_encoder::Encoder>(value: &T) -> anyhow::Result<bytes::Bytes> {

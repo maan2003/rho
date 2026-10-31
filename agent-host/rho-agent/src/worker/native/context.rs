@@ -1,35 +1,45 @@
-//! One projection for live input and replay. Each RequestSent records only new
-//! contributions. Consecutive requests are merged until a response closes the
+//! One projection for live input and replay, from the agent's visible rows.
+//! Each RequestSent records only new contributions and delivers every input
+//! before it. Consecutive requests are merged until a response closes the
 //! group; provider pairing is derived from the preceding opaque Carry.
 
 use std::sync::Arc;
 
-use crate::entry::{Block, Entry, MessageId, Party, Report};
+use rho_agent_types::ContentPart;
+
+use crate::entry::{Entry, Report};
 use crate::inference::{CacheKey, Carry, Image, Item, Request};
+use crate::record::Event;
 
 #[derive(Default)]
 pub(crate) struct Context {
-    messages: Vec<(MessageId, Party, Vec<Block>)>,
+    /// Inputs no request has delivered yet.
+    queued: Vec<Vec<ContentPart>>,
     pending: Option<Carry>,
     report: Report,
-    delivered: Vec<(Party, Vec<Block>)>,
+    delivered: Vec<Vec<ContentPart>>,
     compact: bool,
 }
 
 impl Context {
-    pub fn restore(entries: &[Entry]) -> Self {
+    pub fn restore<'a>(events: impl IntoIterator<Item = &'a Event<'a>>) -> Self {
         let mut context = Self::default();
-        for entry in entries {
-            context.observe(entry);
+        for event in events {
+            context.observe(event);
         }
         context
     }
 
-    pub fn observe(&mut self, entry: &Entry) {
+    pub fn observe(&mut self, event: &Event<'_>) {
+        match event {
+            Event::Input { content, .. } => self.queued.push(content.clone()),
+            Event::Native { entry, .. } => self.observe_entry(entry),
+            _ => {}
+        }
+    }
+
+    fn observe_entry(&mut self, entry: &Entry) {
         match entry {
-            Entry::Received { id, from, body, .. } => {
-                self.messages.push((*id, *from, body.clone()));
-            }
             Entry::Step { carry, .. } => {
                 self.pending = Some(carry.clone());
                 self.report = Report::default();
@@ -39,27 +49,22 @@ impl Context {
             Entry::RequestSent {
                 report, compact, ..
             } => {
-                for id in &report.messages {
-                    let index = self
-                        .messages
-                        .iter()
-                        .position(|(message, _, _)| message == id)
-                        .expect("send references a queued message");
-                    let (_, from, body) = self.messages.remove(index);
-                    self.delivered.push((from, body));
-                }
-                self.messages
-                    .retain(|(id, _, _)| !report.acknowledged.contains(id));
+                self.delivered.append(&mut self.queued);
                 self.report.merge(report.clone());
                 self.compact |= compact;
             }
-            _ => {}
+            Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
         }
+    }
+
+    /// Inputs wait for the next request.
+    pub fn has_queued(&self) -> bool {
+        !self.queued.is_empty()
     }
 
     /// Snapshot the unanswered input group, not the whole conversation.
     pub fn input(&self) -> Vec<Item> {
-        let rendered = self.report.render();
+        let rendered = self.report.render(!self.delivered.is_empty());
         let images: Vec<Image> = rendered
             .images
             .into_iter()
@@ -76,7 +81,7 @@ impl Context {
                 reply_to: self.pending.clone(),
             });
         }
-        items.extend(self.delivered.iter().map(message_input));
+        items.extend(self.delivered.iter().map(|content| input(content)));
         if self.compact {
             items.push(Item::CompactionTrigger);
         }
@@ -84,11 +89,19 @@ impl Context {
     }
 }
 
-pub(crate) fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -> Request {
+pub(crate) fn request<'a>(
+    instructions: Arc<str>,
+    events: impl IntoIterator<Item = &'a Event<'a>>,
+    cache_key: CacheKey,
+) -> Request {
     let mut context = Context::default();
     let mut items = Vec::new();
-    for entry in entries {
-        if let Entry::Step { carry, exec, .. } = entry {
+    for event in events {
+        if let Event::Native {
+            entry: Entry::Step { carry, exec, .. },
+            ..
+        } = event
+        {
             // Compaction is an instruction for the current attempt, not a
             // historical conversation item to request again on every replay.
             items.extend(
@@ -105,66 +118,65 @@ pub(crate) fn request(instructions: Arc<str>, entries: &[Entry], cache_key: Cach
                 exec: exec.clone(),
             });
         }
-        context.observe(entry);
+        context.observe(event);
     }
     items.extend(context.input());
     Request::new(instructions, items, cache_key)
 }
 
-fn message_input((from, body): &(Party, Vec<Block>)) -> Item {
+/// An input as the model reads it: its text as policy wrote it, and its
+/// images.
+fn input(content: &[ContentPart]) -> Item {
     Item::User {
-        text: render_message(from, body),
-        images: body
+        text: rho_agent_types::transcript::text_content(content),
+        images: content
             .iter()
-            .filter_map(|block| match block {
-                Block::Image(image) => Some(image.clone()),
-                Block::Text(_) => None,
+            .filter_map(|part| match part {
+                ContentPart::Image { media_type, data } => Some(Image {
+                    media_type: media_type.clone(),
+                    data: data.clone(),
+                }),
+                ContentPart::Text { .. } => None,
             })
             .collect(),
     }
 }
 
-pub(crate) fn render_message(from: &Party, body: &[Block]) -> String {
-    let mut out = match from {
-        Party::Human => "Message from the human:\n".to_owned(),
-        Party::Agent(id) => format!("Message from agent {}:\n", id.encoded()),
-    };
-    for block in body {
-        if let Block::Text(text) = block {
-            out.push_str(text);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{AgentId, AgentIdDomain, InputWake};
 
     use super::*;
     use crate::entry::{Notice, RequestNotice, Wake};
     use crate::inference::Call;
 
-    fn response(id: &str) -> Entry {
-        Entry::Step {
-            at: UnixMs(1),
+    fn agent() -> AgentId {
+        AgentId::from_counter(1, &AgentIdDomain(7)).unwrap()
+    }
+    fn native(entry: Entry) -> Event<'static> {
+        Event::Native {
+            agent: agent(),
+            entry,
+        }
+    }
+    fn response(id: &str) -> Event<'static> {
+        native(Entry::Step {
             exec: Some("pass".into()),
             prose: String::new(),
             carry: crate::worker::native::scripted::carry(Call::new(id, "pass".into())),
             usage: None,
+        })
+    }
+    fn received(text: &str) -> Event<'static> {
+        Event::Input {
+            agent: agent(),
+            mail: None,
+            content: vec![ContentPart::Text { text: text.into() }],
+            wake: InputWake::Person,
         }
     }
-    fn received(id: u64, text: &str) -> Entry {
-        Entry::Received {
-            at: UnixMs(id),
-            id: MessageId(id),
-            from: Party::Human,
-            body: vec![Block::Text(text.into())],
-        }
-    }
-    fn attempt(text: &str, messages: Vec<MessageId>, bytes: Vec<u8>) -> Entry {
-        Entry::RequestSent {
-            at: UnixMs(9),
+    fn attempt(text: &str, bytes: Vec<u8>) -> Event<'static> {
+        native(Entry::RequestSent {
             why: Wake::Notify,
             compact: false,
             report: Report {
@@ -180,68 +192,51 @@ mod tests {
                         }]
                     },
                 ),
-                messages,
-                acknowledged: vec![],
             },
-        }
+        })
+    }
+    fn users(items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn delivery_preserves_order_acknowledgment_and_deferred_messages() {
-        let mut entries = vec![
-            received(1, "first"),
-            received(2, "acknowledged"),
-            received(3, "third"),
-            received(4, "still-pending"),
-        ];
-        let mut sent = attempt("old", vec![MessageId(3), MessageId(1)], vec![]);
-        if let Entry::RequestSent { report, .. } = &mut sent {
-            report.acknowledged.push(MessageId(2));
-        }
-        entries.push(sent);
-        let mut context = Context::restore(&entries);
-        let messages = |context: &Context| {
-            context
-                .input()
-                .into_iter()
-                .filter_map(|item| match item {
-                    Item::User { text, .. } => Some(text),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            messages(&context),
-            [
-                "Message from the human:\nthird",
-                "Message from the human:\nfirst",
-            ]
-        );
+    fn a_request_delivers_every_input_before_it_and_none_after() {
+        let mut context = Context::restore(&[received("first"), received("second")]);
+        assert!(users(&context.input()).is_empty(), "nothing is delivered before a request");
+        context.observe(&attempt("old", vec![]));
+        assert_eq!(users(&context.input()), ["first", "second"]);
+        // An input after the request waits for the next one, even before a
+        // response closes the group.
+        context.observe(&received("late"));
+        assert_eq!(users(&context.input()), ["first", "second"]);
         context.observe(&response("next"));
-        context.observe(&attempt("new", vec![MessageId(4)], vec![]));
-        assert_eq!(
-            messages(&context),
-            ["Message from the human:\nstill-pending"]
-        );
+        assert!(users(&context.input()).is_empty());
+        context.observe(&attempt("new", vec![]));
+        assert_eq!(users(&context.input()), ["late"]);
         context.observe(&response("done"));
-        context.observe(&attempt("empty", vec![], vec![]));
-        assert!(messages(&context).is_empty());
+        context.observe(&attempt("empty", vec![]));
+        assert!(users(&context.input()).is_empty());
     }
 
     #[test]
-    fn failed_attempts_merge_once_and_keep_new_messages_and_images() {
-        let entries = vec![
+    fn failed_attempts_merge_once_and_keep_new_inputs_and_images() {
+        let events = vec![
             response("first"),
-            received(3, "steer-left"),
-            attempt("alpha", vec![MessageId(3)], vec![1, 7]),
-            Entry::Notice {
-                at: UnixMs(10),
+            received("steer-left"),
+            attempt("alpha", vec![1, 7]),
+            native(Entry::Notice {
                 notice: Notice::Error("retry".into()),
-            },
-            received(4, "steer-right"),
-            attempt("beta", vec![MessageId(4)], vec![9, 2, 8]),
+            }),
+            received("steer-right"),
+            attempt("beta", vec![9, 2, 8]),
         ];
-        let request = request("system".into(), &entries, CacheKey::from_u128(1));
+        let request = request("system".into(), &events, CacheKey::from_u128(1));
         assert_eq!(request.items().len(), 4);
         let Item::Report {
             text,
@@ -258,14 +253,9 @@ mod tests {
             images.iter().map(|i| i.data.clone()).collect::<Vec<_>>(),
             vec![vec![1, 7], vec![9, 2, 8]]
         );
-        assert!(
-            matches!(&request.items()[2], Item::User {text,..} if text.ends_with("steer-left"))
-        );
-        assert!(
-            matches!(&request.items()[3], Item::User {text,..} if text.ends_with("steer-right"))
-        );
+        assert_eq!(users(&request.items()[2..]), ["steer-left", "steer-right"]);
 
-        let restored = Context::restore(&entries);
+        let restored = Context::restore(&events);
         let rebuilt = Request::continuation(
             "system".into(),
             restored.input(),
@@ -277,13 +267,13 @@ mod tests {
 
     #[test]
     fn partial_step_closes_the_group_and_compaction_drops_old_pairings() {
-        let mut entries = vec![
+        let mut events = vec![
             response("first"),
-            attempt("before-partial", vec![], vec![]),
+            attempt("before-partial", vec![]),
             response("partial"),
-            attempt("after-partial", vec![], vec![]),
+            attempt("after-partial", vec![]),
         ];
-        let built = request("system".into(), &entries, CacheKey::from_u128(2));
+        let built = request("system".into(), &events, CacheKey::from_u128(2));
         let results = built
             .items()
             .iter()
@@ -306,22 +296,19 @@ mod tests {
         assert!(results[1].1.ends_with("after-partial"));
         assert!(!results[1].1.contains("before-partial"));
 
-        entries.push(received(22, "queued-during-compaction"));
-        entries.push(Entry::Step {
-            at: UnixMs(30),
+        events.push(received("queued-during-compaction"));
+        events.push(native(Entry::Step {
             exec: None,
             prose: String::new(),
             usage: None,
             carry: Carry::new(serde_json::json!("script-compaction"), vec![], true),
-        });
-        entries.push(attempt("after-compact", vec![MessageId(22)], vec![]));
-        let built = request("system".into(), &entries, CacheKey::from_u128(2));
+        }));
+        events.push(attempt("after-compact", vec![]));
+        let built = request("system".into(), &events, CacheKey::from_u128(2));
         assert_eq!(built.items().len(), 3);
         assert!(
             matches!(&built.items()[1], Item::Report {text,..} if text.ends_with("after-compact"))
         );
-        assert!(
-            matches!(&built.items()[2], Item::User {text,..} if text.ends_with("queued-during-compaction"))
-        );
+        assert_eq!(users(&built.items()[2..]), ["queued-during-compaction"]);
     }
 }

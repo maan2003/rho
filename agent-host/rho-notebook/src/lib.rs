@@ -11,8 +11,9 @@ mod source;
 #[cfg(test)]
 mod tests;
 
+pub use interpreter::start as start_python;
 pub use notebook::{
-    CellHandle, Export, Notebook, RenderedReport, Report, ToolCx, current_source_id, operation,
+    CellHandle, Export, Notebook, OnStart, RenderedReport, Report, ToolCx, current_source_id, operation,
 };
 use senax_encoder::{Decode, Encode};
 pub use source::{End, Kind, SessionId, SourceFacts, StreamProgress};

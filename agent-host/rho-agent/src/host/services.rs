@@ -1,5 +1,6 @@
-//! Host-owned transactions and policy. Requests are bound to one agent;
-//! callers cannot choose another agent id or send arbitrary database writes.
+//! Host-owned transactions for one agent. Requests are bound to it: a
+//! worker cannot name another agent, write another workset's log, or write
+//! a row that is not about its agent.
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -8,8 +9,9 @@ use rho_db::RhoDb;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use crate::inference::Accounts;
+use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use crate::record::{ClaudeRow, Event, Record};
+use crate::store::{StoreRead as _, StoreWrite as _};
 use crate::ipc::protocol::{self, Message, Reply, Request};
 
 struct Controls {
@@ -30,20 +32,17 @@ pub(crate) struct Services {
     /// Whether the agent's workset process is stale, told in its status.
     pub stale: bool,
     pool: std::sync::Weak<crate::host::pool::AgentPool>,
-    title: tokio::sync::Mutex<crate::title::Task>,
 }
 
 impl Services {
     pub(crate) fn new(
         db: RhoDb,
-        inference: Accounts,
         agent: AgentId,
         pool: std::sync::Weak<crate::host::pool::AgentPool>,
         next_control: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready, _) = tokio::sync::watch::channel(false);
-        let title = tokio::sync::Mutex::new(crate::title::Task::new(inference.client()));
         let (status, _) = tokio::sync::watch::channel(crate::AgentStatus::default());
         Self {
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -57,15 +56,15 @@ impl Services {
             ready,
             db,
             agent,
-            title,
             pool,
             status,
             stale: false,
         }
     }
 
+    /// The worker went away without saying why: the agent's row says it
+    /// stopped, and its status that it failed.
     pub(crate) async fn worker_failed(&self, error: String) {
-        use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             runtime: crate::RuntimeState {
                 inference: crate::InferenceState::Failed {
@@ -77,26 +76,35 @@ impl Services {
         };
         // The supervisor knows the process ended, not which unrecorded Python
         // statements ran. Record only that coarse lifecycle fact.
-        let mut write = self.db.write().await;
-        write.append_agent_event(
-            self.agent,
-            &crate::AgentEvent::Entry(crate::entry::Entry::Notice {
-                at: rho_agent_types::UnixMs::now(),
-                notice: crate::entry::Notice::Stopped(error),
-            }),
-        );
-        write.commit();
+        let workset = self.db.read().agent(self.agent).map(|head| head.workset);
+        if let Some(workset) = workset {
+            let mut write = self.db.write().await;
+            let appended = write.append(
+                workset,
+                &Record {
+                    at: rho_agent_types::UnixMs::now(),
+                    event: Event::Failed {
+                        agent: self.agent,
+                        partial: Default::default(),
+                        error: error.into(),
+                        retrying: false,
+                    },
+                },
+            );
+            if appended.is_ok() {
+                write.commit();
+            }
+        }
         self.status.send_replace(status);
         if let Some(pool) = self.pool.upgrade() {
-            pool.settle_turn(self.agent).await;
+            pool.flush_agent_usage(Some(self.agent)).await;
             pool.status_changed(self.agent, &self.status);
         }
     }
 
-    pub(crate) async fn publish_failure(&self, error: String) {
-        if let Some(pool) = self.pool.upgrade() {
-            pool.publish_failed_turn(self.agent, error).await;
-        }
+    /// The agent's head changed outside its loop: tell the loop.
+    pub(crate) fn named(&self, head: crate::store::AgentHead) {
+        let _ = self.commands.send(Message::Named(head));
     }
 
     pub(crate) fn control(
@@ -175,7 +183,7 @@ impl Services {
                             // The worker sends a status only once the rows it
                             // reflects are committed, so a client that sends
                             // rows before statuses never shows one ahead of them.
-                            Message::Status { mut status, queue: _ } => {
+                            Message::Status { mut status } => {
                                 status.runtime.stale = self.stale;
                                 self.status.send_replace(status);
                                 if let Some(pool) = self.pool.upgrade() {
@@ -224,9 +232,92 @@ impl Services {
             }
             drop(messages);
             calls.shutdown().await;
-            self.title.lock().await.stop().await;
             result
         })
+    }
+
+    fn head(&self) -> anyhow::Result<crate::store::AgentHead> {
+        self.db
+            .read()
+            .agent(self.agent)
+            .context("agent was deleted or does not exist")
+    }
+
+    /// Send `rows` ahead of the reply in frames of about a megabyte.
+    async fn batches(
+        id: u64,
+        rows: Vec<(rho_agent_types::Wpos, Record<'static>)>,
+        outgoing: &mpsc::Sender<(Message<'static>, Option<Arc<()>>)>,
+    ) -> anyhow::Result<()> {
+        let mut batch = Vec::new();
+        let mut bytes = 0;
+        for row in rows {
+            let size = senax_encoder::encode(&row)?.len();
+            if bytes + size > 1024 * 1024 && !batch.is_empty() {
+                outgoing
+                    .send((
+                        Message::HistoryBatch {
+                            id,
+                            rows: std::mem::take(&mut batch),
+                        },
+                        None,
+                    ))
+                    .await?;
+                bytes = 0;
+            }
+            bytes += size;
+            batch.push(row);
+        }
+        if !batch.is_empty() {
+            outgoing
+                .send((Message::HistoryBatch { id, rows: batch }, None))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Append the agent's own rows, with the usage they bill, in one
+    /// transaction.
+    async fn append(&self, records: &[Record<'_>]) -> anyhow::Result<rho_agent_types::Wpos> {
+        let workset = self.head()?.workset;
+        for record in records {
+            anyhow::ensure!(
+                record.event.agent() == Some(self.agent)
+                    && !matches!(record.event, Event::AgentCreated { .. }),
+                "a worker writes only its own agent's rows"
+            );
+        }
+        let mut write = self.db.write().await;
+        let mut last = None;
+        for record in records {
+            last = Some(write.append(workset, record)?);
+            if let Event::Native {
+                entry:
+                    crate::entry::Entry::Step {
+                        usage: Some(usage), ..
+                    },
+                ..
+            } = &record.event
+            {
+                write.add_agent_usage(
+                    self.agent,
+                    &crate::log::AgentUsageBucket {
+                        bucket_start_ms: record.at.0 / crate::log::AGENT_USAGE_BUCKET_MS
+                            * crate::log::AGENT_USAGE_BUCKET_MS,
+                        model: crate::log::AgentUsageModel::named(&usage.model),
+                        input_tokens: usage.input_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                        output_tokens: usage.output_tokens,
+                        requests: 1,
+                        approximate: false,
+                    },
+                );
+            }
+        }
+        write.commit();
+        last.context("no rows to append")
     }
 
     async fn call(
@@ -236,22 +327,6 @@ impl Services {
         outgoing: &mpsc::Sender<(Message<'static>, Option<Arc<()>>)>,
     ) -> anyhow::Result<Reply> {
         let reply = match request {
-            Request::Team => {
-                let team = self
-                    .pool
-                    .upgrade()
-                    .map(|pool| {
-                        let parent = self.db.read().get_agent(self.agent).parent;
-                        crate::multi_agent_tools::MultiAgentTools::new(
-                            Arc::downgrade(&pool),
-                            self.agent,
-                            parent,
-                        )
-                        .team()
-                    })
-                    .transpose()?;
-                Reply::Team(team)
-            }
             Request::SharedTool(call) => {
                 let result = match call {
                     crate::ipc::protocol::SharedCall::Papercut(args) => {
@@ -262,20 +337,6 @@ impl Services {
                         .record(args)
                         .await
                         .map(|id| format!("Saved papercut #{id}."))
-                    }
-                    crate::ipc::protocol::SharedCall::Agent(call) => {
-                        let pool = self.pool.upgrade().context("agent pool is shutting down")?;
-                        let head = self.db.read().get_agent(self.agent);
-                        anyhow::ensure!(
-                            call.allowed(head.config.role),
-                            "not an available host-owned tool"
-                        );
-                        let tools = crate::multi_agent_tools::MultiAgentTools::new(
-                            Arc::downgrade(&pool),
-                            self.agent,
-                            head.parent,
-                        );
-                        crate::multi_agent_tools::call_agent_tool(tools, call).await
                     }
                 };
                 Reply::Shared(match result {
@@ -289,347 +350,81 @@ impl Services {
                 }
                 Reply::Done
             }
-            Request::MessageSent(text) => {
-                if let Some(pool) = self.pool.upgrade() {
-                    pool.publish_message(crate::host::pool::AgentMessage {
-                        agent_id: self.agent,
-                        text,
-                    })
-                    .await;
-                }
-                Reply::Done
-            }
-            Request::Failed(error) => {
-                if let Some(pool) = self.pool.upgrade() {
-                    pool.publish_failed_turn(self.agent, error).await;
-                }
-                Reply::Done
-            }
-            Request::Settled => {
-                if let Some(pool) = self.pool.upgrade() {
-                    pool.settle_turn(self.agent).await;
-                }
-                Reply::Done
-            }
-            Request::Name(input) => {
-                let db = self.db.clone();
-                let agent = self.agent;
-                let outgoing = outgoing.clone();
-                self.title
-                    .lock()
-                    .await
-                    .start(&self.db, agent, &input, move |result| async move {
-                        crate::title::finish(&db, agent, result).await;
-                        let head = db.read().get_agent(agent);
-                        let _ = outgoing.send((Message::Named(head), None)).await;
-                    })
-                    .await;
-                Reply::Head(self.db.read().get_agent(agent))
-            }
-            Request::Head => Reply::Head(self.db.read().get_agent(self.agent)),
-            Request::History | Request::NativeHistory(_) => {
-                let read = self.db.read();
-                let native = if let Request::NativeHistory(boundary) = request {
-                    Some((
-                        boundary.unwrap_or_else(|| read.agent_context_boundary(self.agent)),
-                        read.agent_native_recovery(self.agent),
-                    ))
-                } else {
-                    None
+            Request::Head => Reply::Head(self.head()?),
+            Request::History => {
+                let rows = {
+                    let read = self.db.read();
+                    let head = read.agent(self.agent).context("agent was deleted")?;
+                    read.agent_rows(self.agent, head.created)
                 };
-                let (next, rows) = match &native {
-                    Some((boundary, _)) => (
-                        boundary.through,
-                        read.agent_context_records(self.agent, *boundary),
-                    ),
-                    None => read.agent_event_records(self.agent),
+                Self::batches(id, rows, outgoing).await?;
+                Reply::History { rows: Vec::new() }
+            }
+            Request::NativeHistory(boundary) => {
+                let (boundary, cursor, rows) = {
+                    let read = self.db.read();
+                    let head = read.agent(self.agent).context("agent was deleted")?;
+                    let boundary = boundary.unwrap_or(crate::ipc::protocol::ContextBoundary {
+                        from: head.native.from,
+                        through: head.last,
+                    });
+                    let rows = read
+                        .agent_rows(self.agent, boundary.from)
+                        .into_iter()
+                        .filter(|(pos, _)| *pos <= boundary.through)
+                        .collect::<Vec<_>>();
+                    (boundary, head.native, rows)
                 };
-                drop(read);
-                let mut batch = Vec::new();
-                let mut bytes = 0;
-                for row in rows {
-                    let size = senax_encoder::encode(&row)?.len();
-                    if bytes + size > 1024 * 1024 && !batch.is_empty() {
-                        outgoing
-                            .send((
-                                Message::HistoryBatch {
-                                    id,
-                                    rows: std::mem::take(&mut batch),
-                                },
-                                None,
-                            ))
-                            .await?;
-                        bytes = 0;
-                    }
-                    bytes += size;
-                    batch.push(row);
-                }
-                if !batch.is_empty() {
-                    outgoing
-                        .send((Message::HistoryBatch { id, rows: batch }, None))
-                        .await?;
-                }
-                match native {
-                    Some((boundary, recovery)) => Reply::NativeHistory {
-                        boundary,
-                        recovery,
-                        rows: Vec::new(),
-                    },
-                    None => Reply::History {
-                        next,
-                        rows: Vec::new(),
-                    },
+                Self::batches(id, rows, outgoing).await?;
+                Reply::NativeHistory {
+                    boundary,
+                    cursor,
+                    rows: Vec::new(),
                 }
             }
-            Request::Append(event) => {
-                let mut write = self.db.write().await;
-                let position = write.append_agent_event(self.agent, &event);
-                write.commit();
-                Reply::Position(position)
+            Request::Append(record) => {
+                Reply::Position(self.append(std::slice::from_ref(&record)).await?)
             }
-            Request::AppendBatch(events) => {
-                let mut write = self.db.write().await;
-                for event in &events {
-                    write.append_agent_event(self.agent, event);
-                    if let crate::AgentEvent::Entry(crate::entry::Entry::Step {
-                        usage: Some(usage),
-                        at,
-                        ..
-                    }) = event
-                    {
-                        write.add_agent_usage(
-                            self.agent,
-                            &crate::log::AgentUsageBucket {
-                                bucket_start_ms: at.0 / crate::log::AGENT_USAGE_BUCKET_MS
-                                    * crate::log::AGENT_USAGE_BUCKET_MS,
-                                model: crate::log::AgentUsageModel::named(&usage.model),
-                                input_tokens: usage.input_tokens,
-                                cache_read_tokens: usage.cache_read_tokens,
-                                cache_write_tokens: usage.cache_write_tokens,
-                                cache_write_1h_tokens: usage.cache_write_1h_tokens,
-                                output_tokens: usage.output_tokens,
-                                requests: 1,
-                                approximate: false,
-                            },
-                        );
-                    }
-                }
-                let boundary = write.agent_context_boundary(self.agent);
-                write.commit();
-                Reply::Boundary(boundary)
+            Request::AppendBatch(records) => {
+                self.append(&records).await?;
+                let head = self.head()?;
+                Reply::Boundary(crate::ipc::protocol::ContextBoundary {
+                    from: head.native.from,
+                    through: head.last,
+                })
             }
-            Request::Profile { role, binding } => {
-                let mut write = self.db.write().await;
-                write.set_agent_profile(self.agent, role, binding);
-                write.commit();
-                Reply::Done
-            }
-            Request::CacheKey(key) => {
-                let mut write = self.db.write().await;
-                write.set_agent_prompt_cache_key(self.agent, key);
-                write.commit();
-                Reply::Done
-            }
-            Request::Rewind { at, to } => {
-                let mut write = self.db.write().await;
-                write.rewind_agent(at, self.agent, to);
-                write.commit();
-                Reply::Done
-            }
-            Request::ClaudeRewind { at, to, rewind } => {
-                let mut write = self.db.write().await;
-                if let Some(to) = to {
-                    write.rewind_agent(at, self.agent, to);
-                }
-                write.set_agent_claude_rewind(self.agent, rewind);
-                write.commit();
-                Reply::Done
-            }
-            Request::CompleteClaudeRewind(session) => {
-                let mut write = self.db.write().await;
-                write.complete_agent_claude_rewind(self.agent, session);
-                write.commit();
-                Reply::Done
-            }
-            Request::ClaudePendingOutput => {
-                Reply::ClaudePendingOutput(self.db.read().agent_pending_claude_output(self.agent))
-            }
+            Request::ClaudePendingOutput => Reply::ClaudePendingOutput(self.pending_output()?),
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
             Request::UsageTotal => Reply::Usage(self.db.read().agent_usage_total(self.agent)),
         };
         Ok(reply)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use rho_agent_types::{AgentRole, UnixMs};
-
-    use super::*;
-    use crate::AgentEvent;
-    use crate::log::{AgentRoleSessionProfile as _, AgentRuntime};
-
-    #[tokio::test]
-    async fn blocked_append_does_not_block_reads_and_history_crosses_multiple_frames() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(directory.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent = write.alloc_agent_id();
-        let role = AgentRole::default();
-        write.create_agent(
-            UnixMs(1),
-            agent,
-            None,
-            crate::db::tests::test_workspace(),
-            role,
-            role.session_profile(),
-            AgentRuntime::Rho {
-                prompt_cache_key: crate::inference::PromptCacheKey::generate(),
-            },
-            crate::log::AgentOrigin::User,
-        );
-        for _ in 0..3 {
-            write.append_agent_event(
-                agent,
-                &AgentEvent::Entry(crate::entry::Entry::Sent {
-                    at: UnixMs(2),
-                    id: crate::entry::MessageId::new(),
-                    to: crate::entry::Party::Human,
-                    text: "x".repeat(700_000),
-                    kind: rho_agent_types::SendKind::Status,
-                }),
-            );
-        }
-        write.commit();
-        let inference = crate::inference::testing::accounts();
-        let services = Arc::new(Services::new(
-            db.clone(),
-            inference,
-            agent,
-            Default::default(),
-            Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        ));
-        let (client, server) = crate::testing::pair();
-        let server = tokio::spawn(services.clone().serve(
-            server.sender.clone(),
-            server.sender,
-            server.port,
-            crate::testing::route(server.incoming),
-        ));
-        let host = client.host();
-        let locked = db.write().await;
-        let append = tokio::spawn({
-            let host = host.clone();
-            async move {
-                host.append(AgentEvent::Notice {
-                    text: "last".into(),
-                    at: UnixMs(3),
-                })
-                .await
-            }
-        });
-        let head = tokio::time::timeout(std::time::Duration::from_secs(2), host.head())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(head, db.read().get_agent(agent));
-        assert!(!append.is_finished());
-        drop(locked);
-        let appended = append.await.unwrap().unwrap();
-        let (next, rows) = host.history().await.unwrap();
-        assert_eq!(next, appended.next());
-        assert_eq!((next, rows), db.read().agent_event_records(agent));
-        let (boundary, _, entries) = host.native_history(None).await.unwrap();
-        assert_eq!(boundary.through, next);
-        assert_eq!(entries.len(), 3);
-        assert!(
-            entries.iter().all(|entry| matches!(
-                entry, crate::entry::Entry::Sent { text, .. } if text.len() == 700_000
-            )),
-            "all native history frames must reach the caller"
-        );
-
-        // More than the service concurrency bound must wait, never return
-        // "too many pending agent services" or lose an append.
-        let locked = db.write().await;
-        let mut pending = JoinSet::new();
-        for index in 0..80 {
-            let host = host.clone();
-            pending.spawn(async move {
-                host.append(AgentEvent::Notice {
-                    text: format!("queued-{index}").into(),
-                    at: UnixMs(4),
-                })
-                .await
-            });
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert!(
-            pending.try_join_next().is_none(),
-            "a busy store rejected work"
-        );
-        drop(locked);
-        let mut positions = std::collections::BTreeSet::new();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while let Some(result) = pending.join_next().await {
-                positions.insert(result.unwrap().unwrap());
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(positions.len(), 80);
-        let (after, rows) = host.history().await.unwrap();
-        assert_eq!(after.pos, next.pos + 80);
-        let labels = rows
-            .iter()
-            .filter_map(|(_, event)| match event {
-                AgentEvent::Notice { text, .. } if text.starts_with("queued-") => {
-                    Some(text.to_string())
+    /// The newest Claude output batch, unless it was handed off. Only the
+    /// newest can still be pending; handoffs of older batches do not retire
+    /// it, including across a rewind.
+    fn pending_output(&self) -> anyhow::Result<Option<crate::ClaudeOutputBatch>> {
+        let read = self.db.read();
+        let head = read.agent(self.agent).context("agent was deleted")?;
+        let rows = read.workset_rows(head.workset, head.created, usize::MAX);
+        let mut handed_off = std::collections::BTreeSet::new();
+        for (_, record) in rows.into_iter().rev() {
+            match record.event {
+                Event::Claude {
+                    agent,
+                    row: ClaudeRow::OutputHandedOff { id },
+                } if agent == self.agent => {
+                    handed_off.insert(id);
                 }
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            labels,
-            (0..80).map(|index| format!("queued-{index}")).collect()
-        );
-        drop(host);
-        assert!(server.await.unwrap().is_err());
-
-        // The agent host committed, but the worker never received its reply.
-        // Neither transport nor store client is allowed to resend the append.
-        let (client, mut server) = crate::testing::pair();
-        let host = client.host();
-        let append = tokio::spawn({
-            let host = host.clone();
-            async move {
-                host.append(AgentEvent::Notice {
-                    text: "lost-ack".into(),
-                    at: UnixMs(4),
-                })
-                .await
+                Event::Claude {
+                    agent,
+                    row: ClaudeRow::Output { batch },
+                } if agent == self.agent => {
+                    return Ok((!handed_off.contains(&batch.id)).then_some(batch));
+                }
+                _ => {}
             }
-        });
-        let Message::Request { id, body } = server.read().await.unwrap() else {
-            panic!()
-        };
-        let (outgoing, _incoming) = mpsc::channel(1);
-        assert!(matches!(
-            services.call(id, body, &outgoing).await.unwrap(),
-            Reply::Position(_)
-        ));
-        drop(server);
-        assert!(append.await.unwrap().is_err());
-        let (_, records) = db.read().agent_event_records(agent);
-        assert_eq!(
-            records
-                .iter()
-                .filter(|(_, event)| matches!(
-                    event, AgentEvent::Notice { text, .. } if text == "lost-ack"
-                ))
-                .count(),
-            1
-        );
+        }
+        Ok(None)
     }
 }

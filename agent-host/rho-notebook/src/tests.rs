@@ -11,7 +11,7 @@ fn notebook() -> (Notebook, Arc<Notify>) {
     let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
     let wake = Arc::new(Notify::new());
     (
-        Notebook::new(shell, Vec::new(), Arc::clone(&wake)).unwrap(),
+        Notebook::new(shell, Vec::new(), Arc::clone(&wake), None).unwrap(),
         wake,
     )
 }

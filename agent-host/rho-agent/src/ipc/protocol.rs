@@ -1,13 +1,14 @@
 //! Private agent messages shared by the host and worker.
 use std::io;
 
-use rho_agent_types::{AgentRole, UnixMs};
+use rho_agent_types::{ContentPart, InputWake, MailId, Wpos};
 use senax_encoder::{Decode, Encode};
 
-use crate::AgentEvent;
-use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
+use crate::log::AgentUsageBucket;
+use crate::record::Record;
+use crate::store::{AgentHead, NativeCursor};
 
-pub(crate) const VERSION: u32 = 24;
+pub(crate) const VERSION: u32 = 25;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host
@@ -15,28 +16,18 @@ pub(crate) const VERSION: u32 = 24;
 pub(crate) const REQUESTS_FD: i32 = 3;
 
 #[derive(Encode, Decode)]
-pub(crate) struct Bootstrap {
-    pub cwd: camino::Utf8PathBuf,
-}
-
-#[derive(Encode, Decode)]
 pub(crate) enum Control {
     Retire,
-    User {
-        id: crate::entry::MessageId,
-        content: Vec<rho_agent_types::ContentPart>,
+    /// Log this input as the agent's own row; the ack follows the commit.
+    Input {
+        content: Vec<ContentPart>,
+        wake: InputWake,
+        mail: Option<MailId>,
     },
-    Mail {
-        sender: rho_agent_types::AgentId,
-        label: String,
-        body: String,
-    },
-    NoticeCarried,
     TellTail,
     Compact,
     Cancel,
     Retry,
-    Role(rho_agent_types::AgentRole),
     CacheKey,
     Rewind(u32),
 }
@@ -44,7 +35,6 @@ pub(crate) enum Control {
 /// A notebook host function the agent host answers for the worker.
 #[derive(Debug, Encode, Decode)]
 pub(crate) enum SharedCall {
-    Agent(crate::multi_agent_tools::AgentCall),
     Papercut(crate::papercut::PapercutArgs),
 }
 
@@ -55,35 +45,25 @@ pub(crate) enum SharedReply {
     Err(String),
 }
 
+/// The rows a native context reads: from its start through the newest row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct ContextBoundary {
+    pub from: Wpos,
+    pub through: Wpos,
+}
+
 #[derive(Encode, Decode)]
 pub(crate) enum Request<'a> {
-    Name(String),
-    Team,
     SharedTool(SharedCall),
     Usage(AgentUsageBucket),
-    MessageSent(String),
-    Failed(String),
-    Settled,
     Head,
+    /// Every visible row of the agent.
     History,
-    NativeHistory(Option<crate::log::ContextBoundary>),
-    Append(AgentEvent<'a>),
-    AppendBatch(Vec<AgentEvent<'static>>),
-    Profile {
-        role: AgentRole,
-        binding: SessionBinding,
-    },
-    CacheKey(crate::inference::PromptCacheKey),
-    Rewind {
-        at: UnixMs,
-        to: AgentEventPos,
-    },
-    ClaudeRewind {
-        at: UnixMs,
-        to: Option<AgentEventPos>,
-        rewind: Option<ClaudeRewind>,
-    },
-    CompleteClaudeRewind(uuid::Uuid),
+    /// The agent's visible rows from its native context start, or from the
+    /// given boundary.
+    NativeHistory(Option<ContextBoundary>),
+    Append(Record<'a>),
+    AppendBatch(Vec<Record<'static>>),
     ClaudeAccount,
     ClaudePendingOutput,
     UsageTotal,
@@ -91,20 +71,18 @@ pub(crate) enum Request<'a> {
 
 #[derive(Encode, Decode)]
 pub(crate) enum Reply {
-    Team(Option<crate::multi_agent_tools::Team>),
     Shared(SharedReply),
     Head(AgentHead),
     History {
-        next: AgentEventPos,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
+        rows: Vec<(Wpos, Record<'static>)>,
     },
     NativeHistory {
-        boundary: crate::log::ContextBoundary,
-        recovery: crate::log::NativeRecovery,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
+        boundary: ContextBoundary,
+        cursor: NativeCursor,
+        rows: Vec<(Wpos, Record<'static>)>,
     },
-    Boundary(crate::log::ContextBoundary),
-    Position(AgentEventPos),
+    Boundary(ContextBoundary),
+    Position(Wpos),
     ClaudeAccount(String),
     ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
     Usage(AgentUsageBucket),
@@ -118,7 +96,8 @@ pub(crate) enum Message<'a> {
     Stopped {
         error: Option<String>,
     },
-    Bootstrap(Bootstrap),
+    /// Start the agent on this port.
+    Bootstrap,
     Ready {
         status: crate::AgentStatus,
     },
@@ -130,16 +109,14 @@ pub(crate) enum Message<'a> {
         id: u64,
         error: Option<String>,
     },
+    /// The agent's head changed outside its loop: a new spec or title.
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
-        // TODO: drop at the next protocol VERSION bump. Every loop keeps its
-        // queue in its rows now, so workers always send `None`.
-        queue: Option<Vec<crate::QueuedInput>>,
     },
     HistoryBatch {
         id: u64,
-        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
+        rows: Vec<(Wpos, Record<'static>)>,
     },
     Request {
         id: u64,
@@ -171,7 +148,12 @@ pub(crate) fn encode(message: &Message<'_>) -> io::Result<bytes::Bytes> {
 #[derive(senax_encoder::Encode, senax_encoder::Decode)]
 pub(crate) struct Startup {
     pub version: u32,
+    pub workset: rho_agent_types::WorksetId,
     pub layout: rho_fs_view::Layout,
     pub claude: rho_claude::accounts::ClaudePaths,
     pub responses_base_url: String,
+    /// The host's `init.py`, run in the workset namespace at each start.
+    pub init: Option<camino::Utf8PathBuf>,
+    /// Where the workset namespace and new notebooks start.
+    pub root: camino::Utf8PathBuf,
 }

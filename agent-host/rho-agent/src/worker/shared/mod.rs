@@ -1,7 +1,7 @@
 //! Code-first policy shared by the native provider and Claude Code drivers.
 //! Transport correlation and conversation ownership stay in the drivers.
 
-pub(crate) mod mailroom;
+pub(crate) mod outbox;
 pub(crate) mod python_preview;
 pub(crate) mod tools;
 pub(crate) mod wake;

@@ -3,39 +3,26 @@
 //!
 //! The crate root exposes shared live state and public entry points.
 
-use std::sync::Arc;
-
-use rho_agent_types::transcript::ToolSpec;
 use senax_encoder::{Decode, Encode};
 
 pub mod host;
 pub mod inference;
 mod ipc;
-pub use worker::native::{AgentHandle, render_agent_surface};
+pub use worker::native::AgentHandle;
 
 pub mod db;
 pub mod entry;
 pub mod heap;
-pub mod journal;
 pub mod log;
-pub mod multi_agent_tools;
 mod papercut;
-pub mod prompt;
 pub mod record;
+pub mod store;
 #[cfg(test)]
 mod testing;
-mod title;
 pub mod worker;
 pub use host::{Process as WorksetProcess, WorksetClient};
 pub use ipc::workset::{Action as WorksetAction, Attach as WorksetAttach, Reply as WorksetReply};
 pub use worker::worker_main;
-
-/// Model-facing prompt and top-level tools for a newly created role. Dynamic
-/// agent identity/team text and stateful integration hosts are omitted.
-pub struct RenderedAgentSurface {
-    pub system_prompt: Arc<str>,
-    pub tools: Arc<[ToolSpec]>,
-}
 
 pub use log::{
     AgentEvent, ClaudeOutputBatch, InputKind, QueuedInput, RuntimeChange, TranscriptCall,
@@ -105,4 +92,3 @@ impl InputQueues {
     }
 }
 
-pub use host::pool::StartPlace;

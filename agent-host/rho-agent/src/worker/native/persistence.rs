@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::AgentEvent;
-use crate::log::ContextBoundary;
+use crate::ipc::protocol::ContextBoundary;
+use crate::record::Record;
 use crate::worker::host_client::{HostClient, StoreError};
 
 enum Write {
-    Events(Vec<AgentEvent<'static>>),
+    Events(Vec<Record<'static>>),
     Flush(oneshot::Sender<ContextBoundary>),
 }
 
@@ -44,7 +44,7 @@ impl Writer {
         Self { queue }
     }
 
-    pub async fn append(&self, events: Vec<AgentEvent<'static>>) -> Result<(), StoreError> {
+    pub async fn append(&self, events: Vec<Record<'static>>) -> Result<(), StoreError> {
         self.queue
             .send(Write::Events(events))
             .await

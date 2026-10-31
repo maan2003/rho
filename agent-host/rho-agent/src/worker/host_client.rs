@@ -4,14 +4,15 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::{AgentRole, UnixMs};
+use rho_agent_types::{UnixMs, Wpos};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::AgentEvent;
 use crate::ipc::protocol::{
-    Control, Message, Reply, Request, SharedCall, SharedReply, decode, encode,
+    ContextBoundary, Control, Message, Reply, Request, SharedCall, SharedReply, decode, encode,
 };
-use crate::log::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
+use crate::log::AgentUsageBucket;
+use crate::record::{Event, Record};
+use crate::store::{AgentHead, NativeCursor};
 
 #[derive(Default)]
 struct Replies {
@@ -20,7 +21,7 @@ struct Replies {
 }
 struct Waiting {
     reply: oneshot::Sender<Reply>,
-    history: Vec<(AgentEventPos, AgentEvent<'static>)>,
+    history: Vec<(Wpos, Record<'static>)>,
 }
 
 type Waiters = Arc<Mutex<Replies>>;
@@ -59,7 +60,6 @@ pub(crate) struct HostClient {
     closed: watch::Receiver<bool>,
     names: watch::Receiver<Option<AgentHead>>,
     publication: Arc<Publication>,
-    team: tokio::sync::OnceCell<Option<crate::multi_agent_tools::Team>>,
 }
 
 impl std::fmt::Debug for HostClient {
@@ -116,24 +116,21 @@ impl HostClient {
                             if let Some(waiter) = pending.lock().expect("poison").calls.remove(&id)
                             {
                                 let body = match body {
-                                    Reply::History { next, mut rows } => {
+                                    Reply::History { mut rows } => {
                                         let mut history = waiter.history;
                                         history.append(&mut rows);
-                                        Reply::History {
-                                            next,
-                                            rows: history,
-                                        }
+                                        Reply::History { rows: history }
                                     }
                                     Reply::NativeHistory {
                                         boundary,
-                                        recovery,
+                                        cursor,
                                         mut rows,
                                     } => {
                                         let mut history = waiter.history;
                                         history.append(&mut rows);
                                         Reply::NativeHistory {
                                             boundary,
-                                            recovery,
+                                            cursor,
                                             rows: history,
                                         }
                                     }
@@ -157,7 +154,7 @@ impl HostClient {
                         Message::Stopped { .. }
                         | Message::Request { .. }
                         | Message::Status { .. }
-                        | Message::Bootstrap(_)
+                        | Message::Bootstrap
                         | Message::Ready { .. }
                         | Message::Controlled { .. } => {
                             return Err::<(), _>(io::Error::new(
@@ -180,8 +177,7 @@ impl HostClient {
                             let status = published.status.lock().expect("poison").upgrade()
                                 .map(|status| status.read().expect("poison").clone());
                             if let Some(status) = status {
-                                // No loop keeps its queue outside its rows any more.
-                                writer.send(port, encode(&Message::Status { status, queue: None })?).await?;
+                                writer.send(port, encode(&Message::Status { status })?).await?;
                             }
                         }
                     }
@@ -220,7 +216,6 @@ impl HostClient {
             closed: connection_closed,
             names: name_updates,
             publication,
-            team: Default::default(),
         })
     }
 
@@ -246,17 +241,6 @@ impl HostClient {
         self.closed().await;
     }
 
-    pub(crate) async fn team(&self) -> anyhow::Result<Option<crate::multi_agent_tools::Team>> {
-        self.team
-            .get_or_try_init(|| async {
-                match self.request(Request::Team).await? {
-                    Reply::Team(team) => Ok(team),
-                    _ => anyhow::bail!("unexpected team reply"),
-                }
-            })
-            .await
-            .cloned()
-    }
     pub(crate) async fn shared_tool(&self, call: SharedCall) -> Result<String, String> {
         match self.request(Request::SharedTool(call)).await {
             Ok(Reply::Shared(SharedReply::Ok(text))) => Ok(text),
@@ -281,17 +265,6 @@ impl HostClient {
 
     pub(crate) fn names(&self) -> watch::Receiver<Option<AgentHead>> {
         self.names.clone()
-    }
-
-    pub(crate) async fn name(&self, input: &str) -> Result<AgentHead, StoreError> {
-        match self
-            .request(Request::Name(input.to_owned()))
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::Head(head) => Ok(head),
-            _ => Err(StoreError(anyhow::anyhow!("unexpected naming reply"))),
-        }
     }
 
     pub(crate) async fn closed(&self) {
@@ -335,25 +308,18 @@ impl HostClient {
             _ => Err(StoreError(anyhow::anyhow!("unexpected head reply"))),
         }
     }
-    pub(crate) async fn history(
-        &self,
-    ) -> Result<(AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>), StoreError> {
+    /// Every visible row of the agent.
+    pub(crate) async fn history(&self) -> Result<Vec<(Wpos, Record<'static>)>, StoreError> {
         match self.request(Request::History).await.map_err(StoreError)? {
-            Reply::History { next, rows } => Ok((next, rows)),
+            Reply::History { rows } => Ok(rows),
             _ => Err(StoreError(anyhow::anyhow!("unexpected history reply"))),
         }
     }
+    /// The agent's rows in its native context, from its start or `boundary`.
     pub(crate) async fn native_history(
         &self,
-        boundary: Option<crate::log::ContextBoundary>,
-    ) -> Result<
-        (
-            crate::log::ContextBoundary,
-            crate::log::NativeRecovery,
-            Vec<crate::entry::Entry>,
-        ),
-        StoreError,
-    > {
+        boundary: Option<ContextBoundary>,
+    ) -> Result<(ContextBoundary, NativeCursor, Vec<(Wpos, Record<'static>)>), StoreError> {
         match self
             .request(Request::NativeHistory(boundary))
             .await
@@ -361,26 +327,22 @@ impl HostClient {
         {
             Reply::NativeHistory {
                 boundary,
-                recovery,
+                cursor,
                 rows,
-            } => Ok((
-                boundary,
-                recovery,
-                rows.into_iter()
-                    .filter_map(|(_, event)| match event {
-                        AgentEvent::Entry(entry) => Some(entry),
-                        _ => None,
-                    })
-                    .collect(),
-            )),
+            } => Ok((boundary, cursor, rows)),
             _ => Err(StoreError(anyhow::anyhow!(
                 "unexpected native history reply"
             ))),
         }
     }
-    pub(crate) async fn append(&self, event: AgentEvent<'_>) -> Result<AgentEventPos, StoreError> {
+    /// Append one row now.
+    pub(crate) async fn append(&self, event: Event<'_>) -> Result<Wpos, StoreError> {
+        let record = Record {
+            at: UnixMs::now(),
+            event,
+        };
         match self
-            .request(Request::Append(event))
+            .request(Request::Append(record))
             .await
             .map_err(StoreError)?
         {
@@ -390,10 +352,10 @@ impl HostClient {
     }
     pub(crate) async fn append_batch(
         &self,
-        events: Vec<AgentEvent<'static>>,
-    ) -> Result<crate::log::ContextBoundary, StoreError> {
+        records: Vec<Record<'static>>,
+    ) -> Result<ContextBoundary, StoreError> {
         match self
-            .request(Request::AppendBatch(events))
+            .request(Request::AppendBatch(records))
             .await
             .map_err(StoreError)?
         {
@@ -404,15 +366,6 @@ impl HostClient {
 
     pub(crate) async fn record_usage(&self, usage: AgentUsageBucket) -> Result<(), StoreError> {
         self.change(Request::Usage(usage)).await
-    }
-    pub(crate) async fn message_sent(&self, answer: String) -> Result<(), StoreError> {
-        self.change(Request::MessageSent(answer)).await
-    }
-    pub(crate) async fn failed(&self, error: String) -> Result<(), StoreError> {
-        self.change(Request::Failed(error)).await
-    }
-    pub(crate) async fn settled(&self) -> Result<(), StoreError> {
-        self.change(Request::Settled).await
     }
 
     pub(crate) async fn usage_total(&self) -> Result<AgentUsageBucket, StoreError> {
@@ -451,37 +404,6 @@ impl HostClient {
                 "unexpected Claude account reply"
             ))),
         }
-    }
-    pub(crate) async fn claude_rewind(
-        &self,
-        at: UnixMs,
-        to: Option<AgentEventPos>,
-        rewind: Option<ClaudeRewind>,
-    ) -> Result<(), StoreError> {
-        self.change(Request::ClaudeRewind { at, to, rewind }).await
-    }
-    pub(crate) async fn complete_claude_rewind(
-        &self,
-        session: uuid::Uuid,
-    ) -> Result<(), StoreError> {
-        self.change(Request::CompleteClaudeRewind(session)).await
-    }
-
-    pub(crate) async fn profile(
-        &self,
-        role: AgentRole,
-        binding: SessionBinding,
-    ) -> Result<(), StoreError> {
-        self.change(Request::Profile { role, binding }).await
-    }
-    pub(crate) async fn cache_key(
-        &self,
-        key: crate::inference::PromptCacheKey,
-    ) -> Result<(), StoreError> {
-        self.change(Request::CacheKey(key)).await
-    }
-    pub(crate) async fn rewind(&self, at: UnixMs, to: AgentEventPos) -> Result<(), StoreError> {
-        self.change(Request::Rewind { at, to }).await
     }
     async fn change(&self, request: Request<'_>) -> Result<(), StoreError> {
         match self.request(request).await.map_err(StoreError)? {

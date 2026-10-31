@@ -1,11 +1,12 @@
-//! The Rho runtime: one agent's log, its notebook, and the loop that wakes
-//! the model.
+//! The native runtime: one agent's rows in its workset's log, its notebook,
+//! and the loop that wakes the model.
 //!
-//! The loop does three things, over and over: record what arrives (messages
-//! from outside, and what the notebook sends out), ask [`wake::decide`]
-//! whether the model should look, and if so wake it with a report and run
-//! the cell it answers with. The model answers every wake with one `exec`
-//! call and speaks to the person only through `human.send`.
+//! The loop does three things, over and over: record what arrives (inputs
+//! from policy Python, and what the notebook hands back), ask
+//! [`wake::decide`] whether the model should look, and if so wake it with a
+//! report and run the cell it answers with. The model answers every wake
+//! with one `exec` call; what it says to anyone goes through the tools
+//! policy gave its notebook.
 
 pub(crate) mod context;
 mod persistence;
@@ -15,28 +16,28 @@ mod scripted;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, SendKind, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, InputWake, MailId, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::entry::{
-    Block, Entry, MessageId, Notice, Party, Report, RequestNotice, ResponseUsage, Wake,
-};
+use crate::entry::{Entry, Notice, Report, RequestNotice, ResponseUsage, Wake};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
-    CacheKey, Call, Carry, Event, Image, Inference, InferenceSession, Request, Response, Step,
+    CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey,
+    Request, Response, Step,
 };
-use crate::log::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime};
+use crate::record::{Event, Record, Runtime};
+use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
-use crate::worker::shared::mailroom::{Mailroom, Outbound};
+use crate::worker::python::{self, TurnEnd};
+use crate::worker::shared::outbox::{Outbound, Outbox};
 use crate::worker::shared::wake::{Decision, Facts};
 use crate::worker::shared::{Progress, tools, wake};
-use crate::{AgentEvent, AgentStatus, InferenceState, RuntimeState, StreamingResponse, prompt};
+use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
 struct Backoff {
@@ -78,8 +79,7 @@ const AUTO_COMPACT_TOKENS: u64 = 232_560;
 pub struct AgentHandle {
     control: mpsc::UnboundedSender<Control>,
     status: Arc<RwLock<AgentStatus>>,
-    /// The record as the loop keeps it: read here instead of folding the
-    /// log again for every mail, tool call, or shell.
+    /// The head as the loop keeps it.
     head: Arc<RwLock<AgentHead>>,
 }
 
@@ -88,15 +88,9 @@ impl AgentHandle {
         self.status.read().expect("poison").clone()
     }
 
-    /// The record as of the loop's last change to it.
+    /// The head as of the loop's last change to it.
     pub fn head(&self) -> AgentHead {
         self.head.read().expect("poison").clone()
-    }
-
-    /// A user message carried the pending notice: it is not said again.
-    /// The log agrees once the message's row is in it.
-    pub fn notice_carried(&self) {
-        self.head.write().expect("poison").pending_notice = None;
     }
 
     /// Say the whole tail again: a client just started looking.
@@ -104,56 +98,17 @@ impl AgentHandle {
         let _ = self.control.send(Control::TellTail);
     }
 
-    pub fn send_user_message(&self, text: impl Into<String>) {
-        self.send_user_content(vec![ContentPart::Text { text: text.into() }]);
-    }
-
-    pub fn send_user_content(&self, content: Vec<ContentPart>) {
-        let _ = self.control.send(Control::Received {
-            id: MessageId::new(),
-            from: Party::Human,
-            content,
-            done: None,
-        });
-    }
-
-    /// Send user input and wait until the loop has durably logged it. An
-    /// `id` already logged is acknowledged without a second row.
-    pub async fn send_user_content_accepted(
+    /// Queue an input and wait until the loop has durably logged it.
+    pub async fn input(
         &self,
-        id: MessageId,
         content: Vec<ContentPart>,
+        wake: InputWake,
+        mail: Option<MailId>,
     ) -> anyhow::Result<()> {
-        self.send(|done| Control::Received {
-            id,
-            from: Party::Human,
+        self.send(|done| Control::Input {
             content,
-            done: Some(done),
-        })
-        .await
-    }
-
-    /// Deliver mail from a peer agent.
-    pub fn send_agent_message(&self, sender: AgentId, text: impl Into<String>) {
-        let _ = self.control.send(Control::Received {
-            id: MessageId::new(),
-            from: Party::Agent(sender),
-            content: vec![ContentPart::Text { text: text.into() }],
-            done: None,
-        });
-    }
-
-    /// Deliver mail and wait until the loop has durably logged it.
-    pub async fn send_agent_message_accepted(
-        &self,
-        sender: AgentId,
-        text: impl Into<String>,
-    ) -> anyhow::Result<()> {
-        let content = vec![ContentPart::Text { text: text.into() }];
-        self.send(|done| Control::Received {
-            id: MessageId::new(),
-            from: Party::Agent(sender),
-            content,
+            wake,
+            mail,
             done: Some(done),
         })
         .await
@@ -175,16 +130,6 @@ impl AgentHandle {
         let _ = self.control.send(Control::Retry);
     }
 
-    pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control
-            .send(Control::ChangeRole { role, reply })
-            .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?
-    }
-
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -195,17 +140,24 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("agent loop is closed"))?
     }
 
-    pub fn change_prompt_cache_key(&self) {
-        let _ = self.control.send(Control::ChangePromptCacheKey(
-            crate::inference::PromptCacheKey::generate(),
-        ));
+    /// A fresh prompt cache key, logged as a spec change.
+    pub async fn new_cache_key(&self) -> anyhow::Result<()> {
+        self.ask(|reply| Control::NewCacheKey { reply }).await
     }
 
-    /// Branch before the `turns`-th last human message; the notebook stays.
+    /// Branch before the `turns`-th last input from the user; the notebook
+    /// stays.
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+        self.ask(|reply| Control::Rewind { turns, reply }).await
+    }
+
+    async fn ask(
+        &self,
+        command: impl FnOnce(oneshot::Sender<anyhow::Result<()>>) -> Control,
+    ) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
-            .send(Control::Rewind { turns, reply })
+            .send(command(reply))
             .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?;
         result
             .await
@@ -229,23 +181,21 @@ impl AgentHandle {
 }
 
 /// A command, and for the ones a caller may wait on, the ack that says it
-/// landed: after its row is on disk, not after the model has seen it.
+/// landed: after its row is durable, not after the model has seen it.
 enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
-    Received {
-        id: MessageId,
-        from: Party,
+    Input {
         content: Vec<ContentPart>,
+        wake: InputWake,
+        mail: Option<MailId>,
         done: Option<oneshot::Sender<()>>,
     },
     Compact,
     Cancel,
     Retry,
-    ChangeRole {
-        role: AgentRole,
+    NewCacheKey {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    ChangePromptCacheKey(crate::inference::PromptCacheKey),
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -283,7 +233,7 @@ struct PreparedTurn {
     instructions: Arc<str>,
     input: Vec<crate::inference::Item>,
     previous: Option<crate::inference::Continuation>,
-    boundary: oneshot::Receiver<crate::log::ContextBoundary>,
+    boundary: oneshot::Receiver<crate::ipc::protocol::ContextBoundary>,
     cache_key: CacheKey,
 }
 impl PreparedTurn {
@@ -299,10 +249,10 @@ impl PreparedTurn {
         let boundary = (&mut self.boundary)
             .await
             .map_err(|_| anyhow::anyhow!("native event replication stopped"))?;
-        let (_, _, entries) = host.native_history(Some(boundary)).await?;
+        let (_, _, rows) = host.native_history(Some(boundary)).await?;
         Ok(context::request(
             self.instructions.clone(),
-            &entries,
+            rows.iter().map(|(_, record)| &record.event),
             self.cache_key,
         ))
     }
@@ -315,11 +265,12 @@ pub(crate) struct Agent {
     inference: Inference,
     session: InferenceSession,
     model_name: String,
-    cwd: camino::Utf8PathBuf,
+    /// Where a new notebook starts, before `hooks.on_notebook` moves it.
+    root: camino::Utf8PathBuf,
     context: context::Context,
     continuation: Option<crate::inference::Continuation>,
     notebook: Option<Notebook>,
-    mailroom: Arc<Mailroom>,
+    outbox_handle: Arc<Outbox>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     control_rx: mpsc::UnboundedReceiver<Control>,
     wake: Arc<Notify>,
@@ -341,11 +292,8 @@ pub(crate) struct Agent {
     cell: Option<Latest>,
     /// The latest step was cut off part-way through its cell.
     interrupted: bool,
-    /// Messages the model has not seen, oldest first.
-    unread: Vec<(MessageId, Party, UnixMs)>,
-    /// Every message id the loaded log holds, so a message sent again
-    /// after its answer was lost is not logged twice.
-    received: HashSet<MessageId>,
+    /// Inputs that wake the model and it has not seen, oldest first.
+    unread: Vec<(InputWake, UnixMs)>,
     progress: Progress,
     awaiting: bool,
     /// The notebook went with a restart since the model's last wake: tell
@@ -357,11 +305,9 @@ pub(crate) struct Agent {
     stopped: Option<Stopped>,
     cache_key: CacheKey,
     compaction: crate::entry::CompactionState,
-    /// The skills the model loaded, oldest first.
-    skills: Vec<crate::log::SkillDir>,
-    /// The context lacks the skills: it was compacted since the last
-    /// request. The next request carries them.
-    skills_owed: bool,
+    /// The context was compacted and no request has followed: the next one
+    /// first logs what `hooks.on_compaction` gives back.
+    compaction_owed: bool,
 }
 
 impl Agent {
@@ -371,20 +317,21 @@ impl Agent {
         agent_id: AgentId,
         host: Arc<HostClient>,
         inference: Inference,
-        cwd: camino::Utf8PathBuf,
+        root: camino::Utf8PathBuf,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
-        let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
-            anyhow::bail!("agent does not use the Rho runtime");
+        let Runtime::Native {
+            model,
+            profile,
+            cache_key: key,
+        } = head.spec.runtime
+        else {
+            anyhow::bail!("agent does not use the native runtime");
         };
-        let (session, model_name) = inference_session(&inference, head.config.binding)?;
-        let (boundary, recovery, entries) = host.native_history(None).await?;
-        let context = context::Context::restore(&entries);
-        let skills = head.skills.clone();
-        // History starts at the agent's birth, before any skill, or at its
-        // latest compaction, which took them out.
-        let skills_owed = entries.iter().fold(true, skills_owed_after);
-        let (mailroom, outbox) = Mailroom::new();
+        let (session, model_name) = inference_session(&inference, model, profile);
+        let (boundary, cursor, rows) = host.native_history(None).await?;
+        let context = context::Context::restore(rows.iter().map(|(_, record)| &record.event));
+        let (outbox_handle, outbox) = Outbox::new();
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -397,18 +344,18 @@ impl Agent {
             inference,
             session,
             model_name,
-            cwd,
+            root,
             context,
             continuation: None,
             notebook: None,
-            mailroom,
+            outbox_handle,
             outbox,
             control_rx,
             wake: Arc::new(Notify::new()),
             status: Arc::clone(&status),
             head: Arc::clone(&head),
             working: false,
-            archived: recovery.archived,
+            archived: cursor.archived,
             fresh: false,
             responding: false,
             writing: None,
@@ -416,13 +363,6 @@ impl Agent {
             cell: None,
             interrupted: false,
             unread: Vec::new(),
-            received: entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    Entry::Received { id, .. } => Some(*id),
-                    _ => None,
-                })
-                .collect(),
             progress: Progress::default(),
             awaiting: false,
             restarted: false,
@@ -430,12 +370,11 @@ impl Agent {
             retry: false,
             backoff: None,
             stopped: None,
-            cache_key: cache_key(prompt_cache_key),
-            compaction: recovery.compaction,
-            skills,
-            skills_owed,
+            cache_key: cache_key(key),
+            compaction: cursor.compaction,
+            compaction_owed: false,
         };
-        agent.resume(&entries, recovery.woken);
+        agent.resume(&rows, cursor.woken);
         agent.publish().await?;
         Ok((
             AgentHandle {
@@ -447,7 +386,7 @@ impl Agent {
         ))
     }
 
-    /// Answer from `script` instead of the role's provider.
+    /// Answer from `script` instead of the spec's provider.
     #[cfg(test)]
     fn script(&mut self, script: Arc<scripted::Scripted>) {
         self.session = Arc::new(script);
@@ -455,21 +394,34 @@ impl Agent {
 
     /// Pick up from the log: what the model has not seen, and whether there
     /// was a notebook that is now gone.
-    fn resume(&mut self, entries: &[Entry], woken: bool) {
-        self.restore_unread(entries);
+    fn resume(&mut self, rows: &[(Wpos, Record<'static>)], woken: bool) {
+        self.restore_unread(rows);
         if woken && !self.archived {
             self.restarted = true;
         }
     }
 
-    fn restore_unread(&mut self, entries: &[Entry]) {
+    /// Every input after the newest request is unread: delivery is
+    /// positional. A compaction with no request after it is owed its
+    /// texts.
+    fn restore_unread(&mut self, rows: &[(Wpos, Record<'static>)]) {
         self.unread.clear();
-        for entry in entries {
-            match entry {
-                Entry::Received { at, id, from, .. } => self.unread.push((*id, *from, *at)),
-                Entry::RequestSent { report, .. } => self.unread.retain(|(id, _, _)| {
-                    !report.messages.contains(id) && !report.acknowledged.contains(id)
-                }),
+        self.compaction_owed = false;
+        for (_, record) in rows {
+            match &record.event {
+                Event::Input { wake, .. } if *wake != InputWake::Quiet => {
+                    self.unread.push((*wake, record.at));
+                }
+                Event::Native { entry, .. } => match entry {
+                    Entry::RequestSent { .. } => {
+                        self.unread.clear();
+                        self.compaction_owed = false;
+                    }
+                    Entry::Step { carry, .. } if carry.has_compaction() => {
+                        self.compaction_owed = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -542,13 +494,23 @@ impl Agent {
         Ok(())
     }
 
+    /// The head changed outside the loop: a new spec takes effect at the
+    /// next request.
     fn named(&mut self) {
         let stored = self.name_updates.borrow_and_update().clone();
-        if let Some(stored) = stored {
-            let mut head = self.head.write().expect("poison");
-            head.generated_title = stored.generated_title;
-            head.title_attempted = stored.title_attempted;
+        let Some(stored) = stored else { return };
+        if let Runtime::Native {
+            model,
+            profile,
+            cache_key: key,
+        } = stored.spec.runtime
+        {
+            let (session, model_name) = inference_session(&self.inference, model, profile);
+            self.session = session;
+            self.model_name = model_name;
+            self.cache_key = cache_key(key);
         }
+        *self.head.write().expect("poison") = stored;
     }
 
     async fn control(&mut self, control: Control) -> anyhow::Result<()> {
@@ -565,24 +527,15 @@ impl Agent {
                 }
             }
             Control::TellTail => self.host.tell_tail(),
-            Control::Received {
-                id,
-                from,
+            Control::Input {
                 content,
+                wake,
+                mail,
                 done,
             } => {
-                if !self.received.insert(id) {
-                    if let Some(done) = done {
-                        let _ = done.send(());
-                    }
-                    return Ok(());
-                }
-                let text = rho_agent_types::transcript::text_content(&content);
-                self.receive(id, from, blocks(content)).await?;
-                if !text.trim().is_empty() {
-                    self.name(&text).await?;
-                }
+                self.receive(content, wake, mail).await?;
                 if let Some(done) = done {
+                    self.flush().await?;
                     let _ = done.send(());
                 }
             }
@@ -598,16 +551,12 @@ impl Agent {
                     self.retry = true;
                 }
             }
-            Control::ChangeRole { role, reply } => {
-                let result = self.change_role(role).await;
+            Control::NewCacheKey { reply } => {
+                let result = self.new_cache_key().await;
                 if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
                     return result;
                 }
                 let _ = reply.send(result);
-            }
-            Control::ChangePromptCacheKey(key) => {
-                self.host.cache_key(key).await?;
-                self.cache_key = cache_key(key);
             }
             Control::Rewind { turns, reply } => {
                 let result = self.rewind(turns).await;
@@ -643,68 +592,25 @@ impl Agent {
             .is_some_and(|latest| latest.cell.facts().finished.is_none())
     }
 
-    async fn name(&mut self, input: &str) -> anyhow::Result<()> {
+    async fn new_cache_key(&mut self) -> anyhow::Result<()> {
+        let mut spec = self.head.read().expect("poison").spec.clone();
+        let Runtime::Native { cache_key: key, .. } = &mut spec.runtime else {
+            anyhow::bail!("prompt cache keys are only available for native agents");
+        };
+        *key = PromptCacheKey::generate();
+        self.cache_key = cache_key(*key);
+        self.log(Event::AgentChanged {
+            agent: self.agent_id,
+            spec: spec.clone(),
+        })
+        .await?;
         self.flush().await?;
-        let stored = self.host.name(input).await?;
-        let mut head = self.head.write().expect("poison");
-        head.generated_title = stored.generated_title;
-        head.title_attempted = stored.title_attempted;
+        self.head.write().expect("poison").spec = spec;
         Ok(())
     }
 
-    async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.responding && !self.cell_running(),
-            "a role change is only available while idle; cancel the turn first"
-        );
-        let requested = match requested {
-            AgentRole::Engineer { intelligence } => intelligence,
-            _ => anyhow::bail!("role changes currently support only engineer roles"),
-        };
-        let switchable = |intelligence| {
-            matches!(
-                intelligence,
-                EngineerIntelligence::Mini
-                    | EngineerIntelligence::Medium
-                    | EngineerIntelligence::High
-            )
-        };
-        anyhow::ensure!(
-            switchable(requested),
-            "this agent can switch only between mini-eng, med-eng, and high-eng"
-        );
-        let current = self.head.read().expect("poison").config.role;
-        let role = match current {
-            AgentRole::Engineer { intelligence } if switchable(intelligence) => {
-                AgentRole::Engineer {
-                    intelligence: requested,
-                }
-            }
-            _ => {
-                anyhow::bail!("this agent can switch only between mini-eng, med-eng, and high-eng")
-            }
-        };
-        if role == current {
-            return Ok(());
-        }
-        let binding = role.session_profile();
-        let (session, model_name) = inference_session(&self.inference, binding)?;
-        self.flush().await?;
-        self.host.profile(role, binding).await?;
-        {
-            let mut head = self.head.write().expect("poison");
-            head.config.role = role;
-            head.config.binding = binding;
-        }
-        self.session = session;
-        self.model_name = model_name;
-        // Instructions are rendered from the current role on each wake. The
-        // notebook, and its Python globals, stay alive.
-        Ok(())
-    }
-
-    /// Branch history before the `turns`-th last human message. What the
-    /// agent walked away from stays in the log
+    /// Branch history before the `turns`-th last input from the user. What
+    /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`); the notebook, its globals and
     /// anything it did are not rewound.
     async fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
@@ -715,27 +621,33 @@ impl Agent {
         );
         self.drain_outbox().await?;
         self.flush().await?;
-        let (_, rows) = self.host.history().await?;
-        let humans = rows
+        let rows = self.host.history().await?;
+        let people = rows
             .iter()
-            .filter(|(_, event)| {
+            .filter(|(_, record)| {
                 matches!(
-                    event,
-                    AgentEvent::Entry(Entry::Received {
-                        from: Party::Human,
+                    record.event,
+                    Event::Input {
+                        wake: InputWake::Person,
                         ..
-                    })
+                    }
                 )
             })
             .map(|(pos, _)| *pos)
             .collect::<Vec<_>>();
-        anyhow::ensure!(!humans.is_empty(), "nothing to rewind");
-        let to = humans[humans.len().saturating_sub(turns as usize)];
-        self.host.rewind(rho_agent_types::UnixMs::now(), to).await?;
-        let (_, recovery, entries) = self.host.native_history(None).await?;
-        self.context = context::Context::restore(&entries);
+        anyhow::ensure!(!people.is_empty(), "nothing to rewind");
+        let to = people[people.len().saturating_sub(turns as usize)];
+        self.host
+            .append(Event::Rewound {
+                agent: self.agent_id,
+                to,
+            })
+            .await?;
+        let (boundary, cursor, rows) = self.host.native_history(None).await?;
+        self.writer = persistence::Writer::new(self.host.clone(), boundary);
+        self.context = context::Context::restore(rows.iter().map(|(_, record)| &record.event));
         self.continuation = None;
-        self.restore_unread(&entries);
+        self.restore_unread(&rows);
         self.progress.last_response = None;
         self.cell = None;
         self.progress.told_returned = false;
@@ -745,31 +657,47 @@ impl Agent {
         self.stopped = None;
         self.restarted = false;
         self.rewound = true;
-        self.compaction = recovery.compaction;
+        self.compaction = cursor.compaction;
         Ok(())
     }
 
     async fn compact(&mut self) -> anyhow::Result<()> {
         if !self.archived && !self.compaction.pending {
-            self.append(Entry::CompactionTrigger {
-                at: UnixMs::now(),
-                manual: true,
-            })
-            .await?;
+            self.append(Entry::CompactionTrigger { manual: true }).await?;
         }
         Ok(())
     }
 
     async fn append(&mut self, entry: Entry) -> anyhow::Result<()> {
+        self.log(Event::Native {
+            agent: self.agent_id,
+            entry,
+        })
+        .await
+    }
+
+    /// Log one of this agent's rows and fold it into the live context.
+    async fn log(&mut self, event: Event<'static>) -> anyhow::Result<()> {
         self.writer
-            .append(vec![AgentEvent::Entry(entry.clone())])
+            .append(vec![Record {
+                at: UnixMs::now(),
+                event: event.clone(),
+            }])
             .await?;
-        self.context.observe(&entry);
-        if matches!(entry, Entry::Step { .. }) {
-            self.continuation = None;
+        self.context.observe(&event);
+        if let Event::Native { entry, .. } = &event {
+            match entry {
+                Entry::Step { carry, .. } => {
+                    self.continuation = None;
+                    if carry.has_compaction() {
+                        self.compaction_owed = true;
+                    }
+                }
+                Entry::RequestSent { .. } => self.compaction_owed = false,
+                _ => {}
+            }
+            self.compaction.observe(entry);
         }
-        self.skills_owed = skills_owed_after(self.skills_owed, &entry);
-        self.compaction.observe(&entry);
         Ok(())
     }
 
@@ -779,27 +707,35 @@ impl Agent {
 
     async fn receive(
         &mut self,
-        id: MessageId,
-        from: Party,
-        body: Vec<Block>,
+        content: Vec<ContentPart>,
+        wake: InputWake,
+        mail: Option<MailId>,
     ) -> anyhow::Result<()> {
         let at = UnixMs::now();
-        if from == Party::Human {
+        if wake == InputWake::Person {
             if self.archived && !self.responding {
-                self.fresh_notebook(at).await?;
+                self.fresh_notebook().await?;
             }
-            // The human's message ends a wait it answers.
+            // The user's message ends a wait it answers.
             self.awaiting = false;
             self.stopped = None;
         }
-        if let Some(backoff) = &mut self.backoff {
-            backoff.at = at;
+        if wake != InputWake::Quiet {
+            if let Some(backoff) = &mut self.backoff {
+                backoff.at = at;
+            }
+            self.unread.push((wake, at));
         }
-        self.unread.push((id, from, at));
-        self.append(Entry::Received { at, id, from, body }).await
+        self.log(Event::Input {
+            agent: self.agent_id,
+            mail,
+            content,
+            wake,
+        })
+        .await
     }
 
-    async fn fresh_notebook(&mut self, at: UnixMs) -> anyhow::Result<()> {
+    async fn fresh_notebook(&mut self) -> anyhow::Result<()> {
         if let Some(notebook) = self.notebook.take() {
             notebook.cancel();
             let _ = notebook.shutdown().await;
@@ -809,43 +745,13 @@ impl Agent {
         self.cell = None;
         self.progress = Progress::default();
         self.append(Entry::Notice {
-            at,
             notice: Notice::FreshNotebook,
         })
         .await
     }
 
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
-        let at = UnixMs::now();
         match outbound {
-            Outbound::Send { cell, text, kind } => {
-                if let Some(latest) = &mut self.cell
-                    && latest.cell.source_id() == cell
-                {
-                    latest.published = true;
-                }
-                let to = self
-                    .head
-                    .read()
-                    .expect("poison")
-                    .parent
-                    .map_or(Party::Human, Party::Agent);
-                self.append(Entry::Sent {
-                    at,
-                    id: MessageId::new(),
-                    to,
-                    text: text.clone(),
-                    kind,
-                })
-                .await?;
-                // Whoever is subscribed to this agent's answers gets it as
-                // mail; a status is the agent's line, not mail.
-                self.flush().await?;
-                if kind != SendKind::Status {
-                    self.host.message_sent(text).await?;
-                }
-                Ok(())
-            }
             Outbound::Archive => {
                 self.archived = true;
                 self.backoff = None;
@@ -856,27 +762,24 @@ impl Agent {
                 self.cell = None;
                 self.awaiting = false;
                 self.append(Entry::Notice {
-                    at,
                     notice: Notice::Archived,
                 })
-                .await
+                .await?;
+                self.turn_ended(TurnEnd::Archived, None);
+                Ok(())
             }
             Outbound::EndTurn => {
                 self.progress.ended = true;
                 self.awaiting = true;
-                Ok(())
-            }
-            Outbound::LoadSkill(dir) => {
-                if self.skills.contains(&dir) {
-                    return Ok(());
-                }
-                self.skills.push(dir.clone());
-                self.writer
-                    .append(vec![AgentEvent::SkillLoaded { dir, at }])
-                    .await?;
+                self.turn_ended(TurnEnd::EndTurn, None);
                 Ok(())
             }
         }
+    }
+
+    /// Tell policy, without holding up the loop.
+    fn turn_ended(&self, end: TurnEnd, error: Option<String>) {
+        tokio::spawn(python::on_turn_end(self.agent_id, end, error));
     }
 
     async fn drain_outbox(&mut self) -> anyhow::Result<()> {
@@ -891,19 +794,17 @@ impl Agent {
             self.notebook.as_ref(),
             self.cell.as_ref().map(|latest| &latest.cell),
         );
+        let first = |wake| {
+            self.unread
+                .iter()
+                .find(|(from, _)| *from == wake)
+                .map(|(_, at)| *at)
+        };
         Facts {
             // The cell that ended the turn returns to nobody.
             finished: notebook.finished.filter(|_| !self.progress.ended),
-            human: self
-                .unread
-                .iter()
-                .find(|(_, from, _)| *from == Party::Human)
-                .map(|(_, _, at)| *at),
-            agent: self
-                .unread
-                .iter()
-                .find(|(_, from, _)| *from != Party::Human)
-                .map(|(_, _, at)| *at),
+            human: first(InputWake::Person),
+            agent: first(InputWake::Agent),
             prose: self.progress.prose > 0 || self.retry,
             rewound: self.rewound,
             compaction: self.compaction.pending,
@@ -914,36 +815,27 @@ impl Agent {
         }
     }
 
-    /// Start the notebook on first use; workset setup has already completed.
+    /// Start the notebook on first use.
     async fn notebook(&mut self) -> anyhow::Result<&Notebook> {
         if self.notebook.is_none() {
-            let team = self.host.team().await?;
-            let role = self.head.read().expect("poison").config.role;
             let (shell, exports) = tools::host_tools(
-                &self.cwd,
-                role,
+                &self.root,
                 self.agent_id,
                 Some(&self.inference),
-                team.as_ref(),
                 Some(&self.host),
-                Some(&self.mailroom),
+                Some(&self.outbox_handle),
                 true,
             );
-            let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
-                .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
+            let notebook = Notebook::new(
+                shell,
+                exports,
+                Arc::clone(&self.wake),
+                Some(python::on_notebook(self.agent_id)),
+            )
+            .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
             self.notebook = Some(notebook);
         }
         Ok(self.notebook.as_ref().expect("started above"))
-    }
-
-    async fn instructions(&mut self) -> anyhow::Result<Arc<str>> {
-        let team = self.host.team().await?;
-        let role = self.head.read().expect("poison").config.role;
-        Ok(prompt::prompt(
-            &prompt::WorksetPrompt::new(&self.cwd),
-            team.as_ref(),
-            role,
-        ))
     }
 
     async fn wake_model(&mut self, why: Wake) -> anyhow::Result<()> {
@@ -952,20 +844,35 @@ impl Agent {
             return Ok(());
         }
         self.retry = false;
+        let agent = self.agent_id;
+        let owed = self.compaction_owed;
         let prepared = async {
-            let instructions = self.instructions().await?;
+            let instructions = Arc::<str>::from(python::instructions(agent).await?);
+            let restored = if owed {
+                python::on_compaction(agent).await?
+            } else {
+                Vec::new()
+            };
             self.notebook().await?;
-            anyhow::Ok(instructions)
+            anyhow::Ok((instructions, restored))
         }
         .await;
-        let instructions = match prepared {
-            Ok(instructions) => instructions,
+        let (instructions, restored) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => return self.fail(format!("{error:#}")).await,
         };
+        for text in restored {
+            self.log(Event::Input {
+                agent,
+                mail: None,
+                content: vec![ContentPart::Text { text }],
+                wake: InputWake::Quiet,
+            })
+            .await?;
+        }
         let mut report = Report::default();
         if self.restarted {
             self.append(Entry::Notice {
-                at: UnixMs::now(),
                 notice: Notice::Restarted,
             })
             .await?;
@@ -1003,17 +910,9 @@ impl Agent {
         if self.cell.is_some() {
             self.progress.told_returned = true;
         }
-        let messages = std::mem::take(&mut self.unread);
-        report.messages = messages.into_iter().map(|(id, _, _)| id).collect();
-        let manual_only = why == Wake::Compaction && report.is_empty();
-        if self.skills_owed && !self.skills.is_empty() {
-            report.notices.push(RequestNotice::Skills(
-                self.skills
-                    .iter()
-                    .map(crate::log::SkillDir::render)
-                    .collect(),
-            ));
-        }
+        self.unread.clear();
+        let manual_only =
+            why == Wake::Compaction && report.is_empty() && !self.context.has_queued();
         if report.is_empty() && !manual_only {
             report.notices.push(if why == Wake::Checkin {
                 RequestNotice::Checkin
@@ -1027,14 +926,10 @@ impl Agent {
             .is_some_and(|used| used >= AUTO_COMPACT_TOKENS)
             && !self.compaction.pending
         {
-            self.append(Entry::CompactionTrigger {
-                at: UnixMs::now(),
-                manual: false,
-            })
-            .await?;
+            self.append(Entry::CompactionTrigger { manual: false })
+                .await?;
         }
         self.append(Entry::RequestSent {
-            at: UnixMs::now(),
             why,
             report,
             compact: self.compaction.pending,
@@ -1101,20 +996,20 @@ impl Agent {
                         },
                         event = async { response.as_mut().unwrap().recv().await }, if response.is_some() => {
                             match event {
-                                Some(Event::Call { carry }) => {
+                                Some(Streamed::Call { carry }) => {
                                     self.stream(&mut streaming, (Some(carry), String::new()));
                                     pending_stream = true;
                                     stream_needs_runtime = true;
                                 }
-                                Some(Event::Code(code)) => {
+                                Some(Streamed::Code(code)) => {
                                     self.stream(&mut streaming, (None, code));
                                     pending_stream = true;
                                 }
-                                Some(Event::Completed(step)) => break 'exchange Ok(step),
-                                Some(Event::NeedsContext) => {
+                                Some(Streamed::Completed(step)) => break 'exchange Ok(step),
+                                Some(Streamed::NeedsContext) => {
                                     break; // The consumed continuation becomes a full replay at the same cutoff.
                                 }
-                                Some(Event::Failed(error)) => break 'exchange Err(error),
+                                Some(Streamed::Failed(error)) => break 'exchange Err(error),
                                 None => break 'exchange Err(anyhow::anyhow!("model session stopped")),
                             }
                         },
@@ -1150,7 +1045,6 @@ impl Agent {
                     let retryable = crate::inference::is_retryable(&error);
                     let error = format!("{error:#}");
                     self.append(Entry::Notice {
-                        at: UnixMs::now(),
                         notice: Notice::Error(error.clone()),
                     })
                     .await?;
@@ -1167,7 +1061,7 @@ impl Agent {
                         self.responding = false;
                         self.writing = None;
                         if self.archived {
-                            return self.revive_if_written(UnixMs::now()).await;
+                            return self.revive_if_written().await;
                         }
                         if retryable {
                             self.backoff = Some(Backoff::failed(previous_backoff, error));
@@ -1188,14 +1082,13 @@ impl Agent {
                 self.interrupted = true;
                 self.progress.prose = 0;
                 self.append(Entry::Step {
-                    at,
                     exec: Some(code),
                     prose: String::new(),
                     carry,
                     usage: None,
                 })
                 .await?;
-                return self.revive_if_written(at).await;
+                return self.revive_if_written().await;
             }
         };
         self.finish_turn(step, streaming).await
@@ -1206,12 +1099,10 @@ impl Agent {
         step: Step,
         streaming: Option<Streaming>,
     ) -> anyhow::Result<()> {
-        let at = UnixMs::now();
         let continuation = step.continuation;
         let compacted = step.carry.has_compaction();
         let usage = step.usage;
         self.append(Entry::Step {
-            at,
             exec: step.call.as_ref().map(|call| call.code.clone()),
             prose: step.prose,
             carry: step.carry,
@@ -1256,13 +1147,13 @@ impl Agent {
                 }
             }
         }
-        self.revive_if_written(at).await
+        self.revive_if_written().await
     }
 
-    /// The human wrote to an archived agent while it was responding.
-    async fn revive_if_written(&mut self, at: UnixMs) -> anyhow::Result<()> {
-        if self.archived && self.unread.iter().any(|(_, from, _)| *from == Party::Human) {
-            self.fresh_notebook(at).await?;
+    /// The user wrote to an archived agent while it was responding.
+    async fn revive_if_written(&mut self) -> anyhow::Result<()> {
+        if self.archived && self.unread.iter().any(|(wake, _)| *wake == InputWake::Person) {
+            self.fresh_notebook().await?;
         }
         Ok(())
     }
@@ -1272,7 +1163,7 @@ impl Agent {
         self.backoff = None;
         self.stopped = Some(Stopped::Failed(Arc::from(error.as_str())));
         self.flush().await?;
-        self.host.failed(error).await?;
+        self.turn_ended(TurnEnd::Failed, Some(error));
         Ok(())
     }
 
@@ -1290,7 +1181,6 @@ impl Agent {
             let code = streaming.code;
             carry.set_exec(&code);
             self.append(Entry::Step {
-                at: UnixMs::now(),
                 exec: Some(code),
                 prose: String::new(),
                 carry,
@@ -1434,16 +1324,9 @@ impl Agent {
         if working != self.working {
             if !working && let Some(Stopped::Failed(error)) = &self.stopped {
                 let notice = Notice::Stopped(error.to_string());
-                self.append(Entry::Notice {
-                    at: UnixMs::now(),
-                    notice,
-                })
-                .await?;
+                self.append(Entry::Notice { notice }).await?;
             }
             self.flush().await?;
-            if !working {
-                self.host.settled().await?;
-            }
             self.working = working;
         }
         *self.status.write().expect("poison") = status;
@@ -1452,86 +1335,28 @@ impl Agent {
     }
 }
 
-/// The inference session for a role's binding, and the name its usage is
-/// billed under. Credentials come from the agent host's account selection.
+/// The inference session for a spec's model and profile, and the name its
+/// usage is billed under. Credentials come from the agent host's account
+/// selection.
 fn inference_session(
     inference: &Inference,
-    binding: crate::log::SessionBinding,
-) -> anyhow::Result<(InferenceSession, String)> {
-    let profile: InferenceProfile = binding
-        .deep_config()
-        .ok_or_else(|| anyhow::anyhow!("Rho runtime stored with a Claude mode"))?;
-    let model: InferenceModel = binding
-        .deep_model()
-        .ok_or_else(|| anyhow::anyhow!("Rho runtime stored without a model"))?;
+    model: InferenceModel,
+    profile: InferenceProfile,
+) -> (InferenceSession, String) {
     let billed = match model {
         InferenceModel::Gpt6Astra => crate::log::AgentUsageModel::ASTRA,
         InferenceModel::Gpt61Terra => crate::log::AgentUsageModel::TERRA,
         InferenceModel::Gpt61Sol => crate::log::AgentUsageModel::GPT,
     };
-    Ok((inference.session(profile, model), billed.name().to_owned()))
+    (inference.session(profile, model), billed.name().to_owned())
 }
 
-fn cache_key(key: crate::inference::PromptCacheKey) -> CacheKey {
+fn cache_key(key: PromptCacheKey) -> CacheKey {
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&key.to_bytes());
     CacheKey::from_u128(u128::from_le_bytes(bytes))
 }
 
-fn blocks(content: Vec<ContentPart>) -> Vec<Block> {
-    content
-        .into_iter()
-        .map(|part| match part {
-            ContentPart::Text { text } => Block::Text(text),
-            ContentPart::Image { media_type, data } => Block::Image(Image { media_type, data }),
-        })
-        .collect()
-}
-
-/// Whether the context still lacks the agent's skills after `entry`: a
-/// request carries them when it is owed them, and a compaction takes them
-/// out again.
-fn skills_owed_after(owed: bool, entry: &Entry) -> bool {
-    match entry {
-        Entry::Step { carry, .. } if carry.has_compaction() => true,
-        Entry::RequestSent { .. } => false,
-        _ => owed,
-    }
-}
-
 fn until(at: UnixMs) -> Duration {
     Duration::from_millis(at.0.saturating_sub(UnixMs::now().0))
-}
-
-/// The model-facing surface of a role, for a reader: the prompt and the tool
-/// entry point a new agent of that role would get, without constructing a
-/// notebook.
-/// `cwd` is the working directory as the agent would see it; its files are
-/// read from `backing`, the same directory as this process reaches it.
-pub fn render_agent_surface(
-    cwd: &camino::Utf8Path,
-    backing: &camino::Utf8Path,
-    role: AgentRole,
-) -> anyhow::Result<crate::RenderedAgentSurface> {
-    let place = prompt::WorksetPrompt::backed(cwd, backing);
-    let binding = role.session_profile();
-    if binding.claude_model().is_some() {
-        return Ok(crate::RenderedAgentSurface {
-            system_prompt: prompt::claude_prompt(Some(&place), None, role),
-            tools: Arc::from([rho_claude::mcp::exec_spec()]),
-        });
-    }
-    binding
-        .deep_config()
-        .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
-    Ok(crate::RenderedAgentSurface {
-        system_prompt: prompt::prompt(&place, None, role),
-        tools: Arc::from([rho_agent_types::transcript::ToolSpec {
-            name: rho_agent_types::transcript::ToolName::try_from("exec").unwrap(),
-            tool_type: rho_agent_types::transcript::ToolType::Custom,
-            description: "Execute Python in the persistent notebook.".into(),
-            input_schema: serde_json::Value::Null,
-            format: Some(rho_agent_types::transcript::ToolFormat::Text),
-        }]),
-    })
 }

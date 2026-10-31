@@ -17,12 +17,21 @@ use crate::ipc::{protocol, transport, workset};
 /// transport.
 pub(crate) type AgentRoute = mpsc::UnboundedSender<(transport::Packet, Arc<()>)>;
 
+/// Answers the workset's `_rho` calls; the pool's, bound to the workset.
+pub(crate) type PythonHandler = Arc<
+    dyn Fn(workset::PyRequest) -> futures::future::BoxFuture<'static, workset::PyReply>
+        + Send
+        + Sync,
+>;
+
+/// `Eval`s waiting for what they printed and their traceback.
+type Evals = Arc<Mutex<HashMap<u64, oneshot::Sender<(String, Option<String>)>>>>;
+
 /// A workset process handed from this agent host to its re-executed
 /// successor: the same pid, so the worker is still its child.
 #[derive(senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Handed {
-    /// `None` for the host process.
-    pub(crate) workset: Option<rho_agent_types::WorksetId>,
+    pub(crate) workset: rho_agent_types::WorksetId,
     pub(crate) pid: u32,
     /// The connections, open across exec.
     pub(crate) fd: i32,
@@ -63,6 +72,7 @@ pub struct Process {
     commands: mpsc::UnboundedSender<workset::Message>,
     clients: workset_client::Clients,
     pending: workset_client::Pending,
+    evals: Evals,
     pub(crate) sender: transport::Sender,
     /// For answers to the worker's requests.
     pub(crate) requests: transport::Sender,
@@ -199,6 +209,24 @@ impl Process {
         }
     }
 
+    /// Run `code` in the workset namespace: what it printed, and its
+    /// traceback if it raised.
+    pub(crate) async fn eval(&self, code: String) -> anyhow::Result<(String, Option<String>)> {
+        anyhow::ensure!(!*self.closed.borrow(), "workset process closed");
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (reply, response) = oneshot::channel();
+        self.evals.lock().expect("poison").insert(id, reply);
+        if self
+            .commands
+            .send(workset::Message::Eval { id, code })
+            .is_err()
+        {
+            self.evals.lock().expect("poison").remove(&id);
+            anyhow::bail!("workset process closed");
+        }
+        response.await.context("workset process closed")
+    }
+
     pub async fn attach(&self, attach: workset::Attach) -> anyhow::Result<workset_client::Client> {
         let admission = self.admission.clone().read_owned().await;
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -276,10 +304,7 @@ impl Process {
     /// What a successor needs to take this process over, once it is idle
     /// and not reading. Holds the writers between frames and clears
     /// `CLOEXEC` on the connections.
-    pub(crate) async fn hand(
-        &self,
-        workset: Option<rho_agent_types::WorksetId>,
-    ) -> anyhow::Result<Handed> {
+    pub(crate) async fn hand(&self, workset: rho_agent_types::WorksetId) -> anyhow::Result<Handed> {
         use std::os::fd::AsRawFd as _;
         // Whatever is sent after this stays queued; no frame is cut short.
         self.sender.hold().await?;
@@ -315,17 +340,28 @@ impl Process {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the workset's identity, view and policy start together"
+    )]
     pub(crate) async fn start(
         pool: &Arc<crate::host::pool::AgentPool>,
+        workset: rho_agent_types::WorksetId,
         layout: rho_fs_view::Layout,
+        root: camino::Utf8PathBuf,
+        init: Option<camino::Utf8PathBuf>,
         claude: rho_claude::accounts::ClaudePaths,
         admission: Arc<tokio::sync::RwLock<()>>,
+        python: PythonHandler,
     ) -> anyhow::Result<Arc<Self>> {
         let startup = Startup {
             version: protocol::VERSION,
+            workset,
             layout,
             claude,
             responses_base_url: pool.inference().responses_base_url().to_owned(),
+            init,
+            root,
         };
         let mut command = tokio::process::Command::new(worker_program()?);
         pool.worksets().environment().apply(&mut command);
@@ -374,6 +410,7 @@ impl Process {
             1,
             admission,
             false,
+            python,
         )
         .await
     }
@@ -385,6 +422,7 @@ impl Process {
         pool: &Arc<crate::host::pool::AgentPool>,
         handed: &Handed,
         admission: Arc<tokio::sync::RwLock<()>>,
+        python: PythonHandler,
     ) -> anyhow::Result<Arc<Self>> {
         use std::os::fd::FromRawFd as _;
         // SAFETY: the predecessor left these fds open for us and nothing else
@@ -418,6 +456,7 @@ impl Process {
             handed.next,
             admission,
             stale,
+            python,
         )
         .await?;
         for (sender, unwritten) in [
@@ -447,6 +486,7 @@ impl Process {
         next: u64,
         admission: Arc<tokio::sync::RwLock<()>>,
         stale: bool,
+        python: PythonHandler,
     ) -> anyhow::Result<Arc<Self>> {
         let pid = worker.pid;
         let version = startup
@@ -468,6 +508,9 @@ impl Process {
         let agents: Arc<Mutex<HashMap<rho_agent_types::AgentId, AgentRoute>>> = Arc::default();
         let clients: workset_client::Clients = Arc::default();
         let pending: workset_client::Pending = Arc::default();
+        let evals: Evals = Arc::default();
+        let eval_replies = evals.clone();
+        let pending_evals = evals.clone();
         let client_routes = clients.clone();
         let replies = pending.clone();
         let pending_close = pending.clone();
@@ -493,6 +536,7 @@ impl Process {
                 };
                 let (sender, mut receiver, mut writer) = open(socket);
                 let (request_sender, mut request_receiver, mut request_writer) = open(requests);
+                let python_replies = request_sender.clone();
                 let _ = connected.send((sender.clone(), request_sender.clone()));
                 let (policy_incoming, policy_messages) = mpsc::channel(32);
                 let policy_sender: crate::inference::PolicySender = Arc::new({
@@ -543,6 +587,21 @@ impl Process {
                                         }
                                         workset::Message::Policy(message) => {
                                             policy_incoming.try_send((message, token)).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
+                                        }
+                                        workset::Message::Evaluated { id, output, error } => {
+                                            if let Some(reply) = eval_replies.lock().expect("poison").remove(&id) { let _ = reply.send((output, error)); }
+                                        }
+                                        workset::Message::Python { id, request } => {
+                                            // The reply carries the request's token: a handoff waits for it.
+                                            let answer = python(request);
+                                            let replies = python_replies.clone();
+                                            tokio::spawn(async move {
+                                                let body = answer.await;
+                                                if let Ok(bytes) = workset::encode(&workset::Message::PythonReply { id, body }) {
+                                                    let _ = replies.send(transport::Port::Workset, bytes).await;
+                                                }
+                                                drop(token);
+                                            });
                                         }
                                         _ => anyhow::bail!("unexpected workset reply"),
                                     }
@@ -632,6 +691,7 @@ impl Process {
             // Cancelled callers cannot release admission before an enqueued
             // operation replies or the execution process has actually exited.
             pending_close.lock().expect("poison").clear();
+            pending_evals.lock().expect("poison").clear();
             closed.send_replace(true);
         });
         let (sender, requests) = connection.await.context("workset startup failed")?;
@@ -654,6 +714,7 @@ impl Process {
             commands,
             clients,
             pending,
+            evals,
             sender,
             requests,
             agents,

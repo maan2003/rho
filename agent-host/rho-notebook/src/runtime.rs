@@ -117,6 +117,7 @@ pub(crate) fn spawn(
     shared: Arc<Shared>,
     setup: Box<dyn FnOnce() -> Result<(), String> + Send>,
     exports: Vec<Export>,
+    on_start: Option<crate::OnStart>,
 ) -> Result<(), String> {
     crate::interpreter::initialize()?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -125,7 +126,7 @@ pub(crate) fn spawn(
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&shared, setup, exports, &ready_tx)
+                run(&shared, setup, exports, on_start, &ready_tx)
             }));
             let error = match result {
                 Ok(Ok(())) => None,
@@ -148,6 +149,7 @@ fn run(
     shared: &Arc<Shared>,
     setup: Box<dyn FnOnce() -> Result<(), String> + Send>,
     exports: Vec<Export>,
+    on_start: Option<crate::OnStart>,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     // Filesystem state (not the process or descriptor table) is private to
@@ -187,6 +189,9 @@ fn run(
                 },
                 objects,
             ))?;
+        if let Some(on_start) = on_start {
+            on_start(py, notebook.getattr("namespace")?.cast()?)?;
+        }
         let _ = ready.send(Ok(()));
         notebook.call_method0("run").map(drop)
     })

@@ -43,7 +43,7 @@ pub(crate) fn initialize() -> Result<(), String> {
             std::thread::Builder::new()
                 .name("rho-python-main".into())
                 .spawn(move || {
-                    let result = unsafe { start() };
+                    let result = unsafe { boot() };
                     if result.is_err() {
                         let _ = started.send(result);
                         return;
@@ -61,7 +61,7 @@ pub(crate) fn initialize() -> Result<(), String> {
         .clone()
 }
 
-unsafe fn start() -> Result<(), String> {
+unsafe fn boot() -> Result<(), String> {
     unsafe {
         if pyo3::ffi::Py_IsInitialized() != 0 {
             return Err("Python was initialized outside rho's notebook runtime".into());
@@ -97,10 +97,10 @@ unsafe fn start() -> Result<(), String> {
     }
 }
 
-/// The notebook kernel module, loaded once.
-pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
-    static KERNEL: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
-    KERNEL
+/// Put the bundled site-packages on `sys.path`, once.
+pub(crate) fn paths(py: Python<'_>) -> PyResult<()> {
+    static PATHS: PyOnceLock<()> = PyOnceLock::new();
+    PATHS
         .get_or_try_init(py, || {
             let sys_path = py.import("sys")?.getattr("path")?;
             let site_packages = rho_fs_view::bundled(
@@ -116,6 +116,17 @@ pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
             // A str: the import system skips the `pathlib.Path` a PathBuf becomes.
             sys_path.call_method1("insert", (0, site_packages.to_string_lossy()))?;
             sys_path.call_method1("insert", (0, ""))?;
+            Ok(())
+        })
+        .copied()
+}
+
+/// The notebook kernel module, loaded once.
+pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
+    static KERNEL: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+    KERNEL
+        .get_or_try_init(py, || {
+            paths(py)?;
             PyModule::from_code(
                 py,
                 pyo3::ffi::c_str!(include_str!("kernel.py")),
@@ -125,4 +136,11 @@ pub(crate) fn kernel(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
             .map(Bound::unbind)
         })
         .map(|kernel| kernel.bind(py))
+}
+
+/// Start the interpreter with the bundled packages importable, for a host
+/// thread that runs Python outside a notebook.
+pub fn start() -> Result<(), String> {
+    initialize()?;
+    Python::attach(|py| paths(py).map_err(|error| error.to_string()))
 }

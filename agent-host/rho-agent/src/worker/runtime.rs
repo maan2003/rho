@@ -22,29 +22,13 @@ impl Controller {
                 Self::Rho(agent) => agent.retire().await?,
                 Self::Claude(agent) => agent.retire().await?,
             },
-            Control::User { id, content } => match self {
-                Self::Rho(agent) => agent.send_user_content_accepted(id, content).await?,
-                Self::Claude(agent) => agent.send_user_content_accepted(id, content).await?,
-            },
-            Control::Mail {
-                sender,
-                label,
-                body,
-                ..
+            Control::Input {
+                content,
+                wake,
+                mail,
             } => match self {
-                Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await?,
-                Self::Claude(agent) => {
-                    agent
-                        .send_agent_message_accepted(
-                            sender,
-                            format!("Message Type: MESSAGE\nSender: {label}\nPayload:\n{body}"),
-                        )
-                        .await?
-                }
-            },
-            Control::NoticeCarried => match self {
-                Self::Rho(agent) => agent.notice_carried(),
-                Self::Claude(agent) => agent.notice_carried(),
+                Self::Rho(agent) => agent.input(content, wake, mail).await?,
+                Self::Claude(agent) => agent.input(content, wake, mail).await?,
             },
             Control::TellTail => match self {
                 Self::Rho(agent) => agent.tell_tail(),
@@ -62,14 +46,10 @@ impl Controller {
                 Self::Rho(agent) => agent.retry(),
                 Self::Claude(_) => {}
             },
-            Control::Role(role) => match self {
-                Self::Rho(agent) => agent.change_role(role).await?,
-                Self::Claude(agent) => agent.change_role(role).await?,
-            },
             Control::CacheKey => match self {
-                Self::Rho(agent) => agent.change_prompt_cache_key(),
+                Self::Rho(agent) => agent.new_cache_key().await?,
                 Self::Claude(_) => {
-                    anyhow::bail!("prompt cache keys are only available for Rho agents")
+                    anyhow::bail!("prompt cache keys are only available for native agents")
                 }
             },
             Control::Rewind(turns) => match self {
@@ -176,6 +156,18 @@ pub(crate) async fn run(
         }
     });
     let provider = factory(&startup.responses_base_url, policy_sender)?;
+    // The process cwd is where every thread starts: the workset thread,
+    // and each notebook until `hooks.on_notebook` moves it.
+    std::env::set_current_dir(&startup.root)?;
+    super::python::start(
+        super::python::PyHost::new(
+            requests.clone(),
+            tokio::runtime::Handle::current(),
+            startup.workset,
+            startup.layout.mount.is_some(),
+        ),
+        startup.init.clone(),
+    )?;
     let inference = provider.inference;
     let policy = provider.policy;
     let devshell_path = startup.layout.cache.join("rho-devshell");
@@ -285,6 +277,22 @@ pub(crate) async fn run(
                     W::Detach(port) => {
                         execution.clients.lock().expect("poison").remove(&port);
                     }
+                    W::PythonReply { id, body } => super::python::replied(id, body),
+                    W::Eval { id, code } => {
+                        let sender = sender.clone();
+                        tasks.spawn(async move {
+                            let (output, error) = super::python::eval(code)
+                                .await
+                                .unwrap_or_else(|error| (String::new(), Some(format!("{error:#}"))));
+                            let _ = sender
+                                .send(
+                                    Port::Workset,
+                                    workset::encode(&W::Evaluated { id, output, error })
+                                        .expect("encode evaluation"),
+                                )
+                                .await;
+                        });
+                    }
                     _ => break Err(anyhow::anyhow!("unexpected workset control")),
                 }
                 continue;
@@ -314,7 +322,7 @@ pub(crate) async fn run(
             Ok(message) => message,
             Err(error) => break Err(error.into()),
         };
-        let Message::Bootstrap(bootstrap) = message else {
+        let Message::Bootstrap = message else {
             // The old agent has drained. Late service replies have no consumer.
             continue;
         };
@@ -331,23 +339,19 @@ pub(crate) async fn run(
         );
         let claude = startup.claude.clone();
         let inference = inference.clone();
+        let root = startup.root.clone();
         tasks.spawn(async move {
             let result = async {
-                let cwd = bootstrap.cwd;
-                anyhow::ensure!(
-                    cwd.is_absolute() && cwd.is_dir(),
-                    "working directory does not exist: {cwd}"
-                );
                 let head = host.head().await?;
-                match head.config.runtime {
-                    crate::log::AgentRuntime::Rho { .. } => {
+                match head.spec.runtime {
+                    crate::record::Runtime::Native { .. } => {
                         let (handle, runtime) =
-                            Agent::load(agent, host.clone(), inference, cwd).await?;
+                            Agent::load(agent, host.clone(), inference, root).await?;
                         drive_native(runtime, handle, host.clone()).await
                     }
-                    crate::log::AgentRuntime::Claude { .. } => {
+                    crate::record::Runtime::Claude { .. } => {
                         let (handle, runtime) =
-                            ClaudeLoop::load(agent, host.clone(), inference, claude, cwd).await?;
+                            ClaudeLoop::load(agent, host.clone(), inference, claude, root).await?;
                         drive_claude(runtime, handle, host.clone()).await
                     }
                 }

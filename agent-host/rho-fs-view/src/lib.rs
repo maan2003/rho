@@ -371,6 +371,19 @@ impl Worksets {
         Ok(Workset(workset))
     }
 
+    /// Remove a workset's directory and everything in it.
+    pub async fn delete(self: &Arc<Self>, workset_id: WorksetId) -> anyhow::Result<()> {
+        self.worksets.lock().await.remove(&workset_id);
+        let base = self.root.join("worksets").join(workset_id.to_string());
+        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&base) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("delete workset {base}")),
+        })
+        .await
+        .context("workset deletion panicked")?
+    }
+
     /// Ids of every workset directory under the root.
     pub fn list(&self) -> anyhow::Result<Vec<WorksetId>> {
         let dir = self.root.join("worksets");
