@@ -1347,6 +1347,7 @@ where
     match open.protocol {
         Protocol::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Ledger => anyhow::bail!("the old ledger protocol is no longer supported"),
+        Protocol::Worksets => anyhow::bail!("the worksets protocol is not served yet"),
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,

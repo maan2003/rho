@@ -83,6 +83,7 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
     use rho_rpc::protocol::{Protocol, describe_as};
     match open.protocol {
         Protocol::Agents => describe_as::<agents::Open>(open, reply),
+        Protocol::Worksets => describe_as::<agents::rho2::Open>(open, reply),
         Protocol::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
         Protocol::Host => describe_as::<host::Open>(open, reply),
         Protocol::Ledger => "retired ledger protocol".to_owned(),

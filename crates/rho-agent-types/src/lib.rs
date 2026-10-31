@@ -8,7 +8,9 @@ mod log;
 mod place;
 pub mod transcript;
 mod vocab;
+mod workset;
 
 pub use log::*;
 pub use place::*;
 pub use vocab::*;
+pub use workset::*;

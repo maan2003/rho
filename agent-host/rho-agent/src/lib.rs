@@ -21,6 +21,7 @@ pub mod log;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod prompt;
+pub mod record;
 #[cfg(test)]
 mod testing;
 mod title;

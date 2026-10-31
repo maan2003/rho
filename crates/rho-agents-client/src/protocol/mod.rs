@@ -13,6 +13,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use self::transcript::{DetailBody, Live, LogEntry};
 
+pub mod rho2;
 pub mod transcript;
 
 /// What an agents stream is for.

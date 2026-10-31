@@ -25,7 +25,7 @@ impl ReasoningEffort {
 /// Which Responses-API model a step talks to. Not part of
 /// [`InferenceProfile`]: agent modes carry it separately, so persisted configs
 /// stay unchanged.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Encode, Decode)]
 pub enum InferenceModel {
     Gpt61Sol,
     Gpt61Terra,
