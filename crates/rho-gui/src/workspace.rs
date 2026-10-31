@@ -80,8 +80,7 @@ use crate::{
     SlackEditMessage, SlackFindFile, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
     SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch,
     SlackSearchNextPage, SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose,
-    TaskBoard, ThreadActivity, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
-    VoiceToggle,
+    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -8622,9 +8621,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ThreadActivity, window, cx| {
-                this.open_activity(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_shell_view::protocol::PagerAction::Continue, cx);
