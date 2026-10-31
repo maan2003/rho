@@ -31,7 +31,9 @@ Each workset has one append-only log keyed by `(WorksetId, wpos)`, dense from
 zero. A record is its time and one typed event; events about an agent carry
 its `AgentId`. The workset process is the only writer of its log after
 creation. Agent heads and the workset head are projections committed with each
-append. Deleting a workset deletes its log, heads and process; it is the only
+append. So is an index of each agent's rows, `(AgentId, wpos)`: a workset
+holds many agents, and reading one of them must not cost the others' rows.
+Deleting a workset deletes its log, heads and process; it is the only
 deletion.
 
 The log holds what each model saw and what each agent is: workset creation and
@@ -63,8 +65,10 @@ host's Slack server as Python, as before.
 ## GUI sync
 
 The GUI syncs the mail log from the newest mail it holds and receives the
-directory of worksets and agents as whole entries. It names the worksets it
-follows, each from the position it holds, and the host pushes their later rows
-in order, never repeated or skipped. It pages older rows on demand and fetches
+directory of worksets and agents as whole entries. It reads the rows of each
+agent it opens, from the newest it holds, through that agent's index; the read
+ends with where the workset's log ends. It then names the worksets it follows,
+each from where a read ended, and the host pushes their later rows in order,
+never repeated or skipped. It pages older rows on demand and fetches
 row bodies (tool output, whole responses) only when shown. Live streaming
 frames come only for the agents it focuses.

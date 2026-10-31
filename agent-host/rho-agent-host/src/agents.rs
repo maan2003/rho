@@ -14,9 +14,9 @@ use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
 use rho_agent_types::{AgentId, MailId, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
-    AgentEntry, Cancel, ClientFrame, CreateWorkset, CreatedWorkset, DeleteWorksets, Eval,
-    EvalResult, LogEvent, Open, PostMail, Request, ServerFrame, WorksetEntry, WorksetLog,
-    WorksetLogPage,
+    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
+    DeleteWorksets, Eval, EvalResult, LogEvent, LogNext, Open, PostMail, Request, ServerFrame,
+    WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -544,28 +544,30 @@ fn strip_row(
     stripped
 }
 
-/// One page of a workset's rows, stripped as the session strips them.
-fn workset_log_page(
-    db: &RhoDb,
-    WorksetLog { workset, from }: WorksetLog,
-) -> anyhow::Result<WorksetLogPage> {
-    let page = {
+/// One page of an agent's rows, stripped as the session strips them: read
+/// through the agent's index, so the workset's other rows cost nothing.
+fn agent_log_page(db: &RhoDb, AgentLog { agent, from }: AgentLog) -> anyhow::Result<AgentLogPage> {
+    let (page, end) = {
         let read = db.read();
-        anyhow::ensure!(
-            read.workset(workset).is_some(),
-            "no workset {workset} on this host"
-        );
-        read.workset_rows(workset, from, LOG_PAGE)
+        let head = read
+            .agent(agent)
+            .ok_or_else(|| anyhow::anyhow!("no agent {} on this host", agent.encoded()))?;
+        let end = read
+            .workset(head.workset)
+            .ok_or_else(|| anyhow::anyhow!("no workset {} on this host", head.workset))?
+            .next;
+        (read.agent_log(agent, from, LOG_PAGE), end)
     };
-    let next = (page.len() == LOG_PAGE)
-        .then(|| page.last().map(|(pos, _)| pos.next()))
-        .flatten();
+    let next = match page.last() {
+        Some((last, _)) if page.len() == LOG_PAGE => LogNext::Page(last.next()),
+        _ => LogNext::Follow(end),
+    };
     let mut befores = Befores::new();
     let rows = page
         .iter()
         .filter_map(|(pos, record)| Some((*pos, strip_row(db, &mut befores, *pos, record)?)))
         .collect();
-    Ok(WorksetLogPage { rows, next })
+    Ok(AgentLogPage { rows, next })
 }
 
 /// Answers one call with its handler's reply: the call names the reply's
@@ -681,9 +683,9 @@ where
             })
             .await
         }
-        Request::WorksetLog(call) => {
+        Request::AgentLog(call) => {
             respond(writer, call, |call| async {
-                workset_log_page(&services.db, call)
+                agent_log_page(&services.db, call)
             })
             .await
         }
@@ -1110,9 +1112,9 @@ mod tests {
     use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
     use rho_agent::store::StoreWrite as _;
     use rho_agent_types::{InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
-    use rho_agents_client::protocol::worksets::{LogEvent, WorksetLog};
+    use rho_agents_client::protocol::worksets::{AgentLog, LogEvent, LogNext};
 
-    use super::{detail, detail_result, workset_log_page};
+    use super::{agent_log_page, detail, detail_result};
 
     fn step(id: &str) -> Entry {
         Entry::Step {
@@ -1221,7 +1223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
         // Rows 2..=5; the rewind at 6 takes back row 4 (exec-2) and on.
-        let (workset, _, positions) = workset(
+        let (workset, agent, positions) = workset(
             &db,
             vec![
                 native(step("exec-1")),
@@ -1242,7 +1244,7 @@ mod tests {
         .await;
         assert_eq!(positions[2], Wpos(4));
         let reports = |from| {
-            workset_log_page(&db, WorksetLog { workset, from })
+            agent_log_page(&db, AgentLog { agent, from })
                 .unwrap()
                 .rows
                 .into_iter()
@@ -1279,7 +1281,7 @@ mod tests {
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
         let spoken =
             "<realtime_delegation>\n  <input>fix &lt;b&gt;</input>\n</realtime_delegation>";
-        let (workset, agent, _) = workset(
+        let (_, agent, _) = workset(
             &db,
             vec![
                 Event::Input {
@@ -1311,10 +1313,10 @@ mod tests {
             ],
         )
         .await;
-        let rows = workset_log_page(
+        let rows = agent_log_page(
             &db,
-            WorksetLog {
-                workset,
+            AgentLog {
+                agent,
                 from: Wpos(2),
             },
         )
@@ -1395,9 +1397,16 @@ mod tests {
                                             profile: Default::default(),
                                             cache_key: rho_agent::inference::PromptCacheKey::generate(),
                                         },
-                                        props: [("name".to_owned(), format!("crowded-{created}"))]
-                                            .into_iter()
-                                            .collect(),
+                                        props: [
+                                            ("name".to_owned(), format!("crowded-{created}")),
+                                            // Findable in the GUI.
+                                            (
+                                                rho_agent_types::props::USER_FACING.to_owned(),
+                                                "true".to_owned(),
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .collect(),
                                     },
                                 },
                             },
@@ -1449,8 +1458,54 @@ mod tests {
         (workset, ids)
     }
 
-    /// Not a test: times reading a crowded workset the way the Activity
-    /// view does. `cargo test --release -p rho-agent-host --lib
+    /// An agent's log is its own rows, page by page, then where its
+    /// workset's next row goes: what following the workset starts from.
+    #[tokio::test]
+    async fn an_agents_log_is_its_rows_then_where_to_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        // Three agents over 6,000 rows: the middle one writes about a
+        // third of them, interleaved with the others, over several pages.
+        let (workset, agents) = crowded_workset(&db, 3, 6_000).await;
+        let agent = agents[1];
+        let read = db.read();
+        let expected =
+            rho_agent::store::StoreRead::workset_rows(&read, workset, Wpos::ZERO, usize::MAX)
+                .into_iter()
+                .filter(|(_, record)| record.event.agent() == Some(agent))
+                .map(|(pos, _)| pos)
+                .collect::<Vec<_>>();
+        let end = rho_agent::store::StoreRead::workset(&read, workset)
+            .unwrap()
+            .next;
+        drop(read);
+        assert!(expected.len() > 2 * super::LOG_PAGE, "it spans pages");
+
+        let mut from = Wpos(1);
+        let mut read = Vec::new();
+        let follow = loop {
+            let page = agent_log_page(&db, AgentLog { agent, from }).unwrap();
+            assert!(
+                page.rows
+                    .iter()
+                    .all(|(_, event)| event.agent() == Some(agent))
+            );
+            read.extend(page.rows.iter().map(|(pos, _)| *pos));
+            match page.next {
+                LogNext::Page(next) => from = next,
+                LogNext::Follow(at) => break at,
+            }
+        };
+        let expected_from = expected
+            .into_iter()
+            .filter(|pos| *pos >= Wpos(1))
+            .collect::<Vec<_>>();
+        assert_eq!(read, expected_from);
+        assert_eq!(follow, end);
+    }
+
+    /// Not a test: times reading a crowded workset's agent the way the
+    /// Activity view does. `cargo test --release -p rho-agent-host --lib
     /// crowded_workset_log -- --ignored --nocapture`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -1461,42 +1516,30 @@ mod tests {
             .map_or_else(|| dir.path().join("rho.redb"), std::path::PathBuf::from);
         let db = rho_db::RhoDb::open(path);
         let started = std::time::Instant::now();
-        let (workset, agents) = crowded_workset(&db, 66, 330_000).await;
+        let (_, agents) = crowded_workset(&db, 66, 330_000).await;
         eprintln!("built {} agents in {:?}", agents.len(), started.elapsed());
 
         let started = std::time::Instant::now();
         let mut from = Wpos::ZERO;
         let (mut pages, mut rows) = (0, 0);
         loop {
-            let page = workset_log_page(&db, WorksetLog { workset, from }).unwrap();
+            let page = agent_log_page(
+                &db,
+                AgentLog {
+                    agent: agents[30],
+                    from,
+                },
+            )
+            .unwrap();
             pages += 1;
             rows += page.rows.len();
             match page.next {
-                Some(next) => from = next,
-                None => break,
+                LogNext::Page(next) => from = next,
+                LogNext::Follow(_) => break,
             }
         }
         eprintln!(
-            "whole workset: {pages} pages, {rows} rows in {:?}",
-            started.elapsed()
-        );
-
-        // Where a page's time goes: reading it, and each agent's state
-        // before it.
-        let read = db.read();
-        let mid = Wpos(165_000);
-        let started = std::time::Instant::now();
-        let page = rho_agent::store::StoreRead::workset_rows(&read, workset, mid, super::LOG_PAGE);
-        eprintln!("read one page: {:?}", started.elapsed());
-        let on_page: std::collections::HashSet<_> =
-            page.iter().filter_map(|(_, r)| r.event.agent()).collect();
-        let started = std::time::Instant::now();
-        for agent in &on_page {
-            crate::transcript::before_at(&read, *agent, mid);
-        }
-        eprintln!(
-            "before_at for the page's {} agents: {:?}",
-            on_page.len(),
+            "one agent's log: {pages} pages, {rows} rows in {:?}",
             started.elapsed()
         );
     }

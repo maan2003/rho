@@ -1,6 +1,6 @@
 //! One host's agents session: the host's mail, directory, rows and live
 //! tails to the model, and the model's follows and the window's focus back
-//! to the host. The workset log pages a follow needs are read here too, on
+//! to the host. The agent log pages a follow needs are read here too, on
 //! streams of their own, so everything the model hears of a host comes in
 //! one order.
 //!
@@ -15,26 +15,28 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use rho_agent_hosts::{Dialer, HostStream};
-use rho_agent_types::{AgentId, WorksetId, Wpos};
+use rho_agent_types::{AgentId, Wpos};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;
 use crate::model::ToModel;
-use crate::protocol::worksets::{self, ClientFrame, ServerFrame, WorksetLogPage};
+use crate::protocol::worksets::{self, AgentLogPage, ClientFrame, LogNext, ServerFrame};
 
 /// What reaches the model from one host.
 #[derive(Debug)]
 pub enum AgentFrame {
     /// A frame of the host's session.
     Server(ServerFrame),
-    /// One page of a workset's log that the model asked for.
+    /// One page of an agent's log that the model asked for, from the read
+    /// it named.
     Log {
-        workset: WorksetId,
-        page: WorksetLogPage,
+        agent: AgentId,
+        read: ReadId,
+        page: AgentLogPage,
     },
-    /// Reading a workset's log stopped short; the model asks again when
-    /// the stream opens again.
-    LogFailed { workset: WorksetId },
+    /// Reading an agent's log stopped short; the model asks again when the
+    /// stream opens again.
+    LogFailed { agent: AgentId, read: ReadId },
 }
 
 impl From<ServerFrame> for AgentFrame {
@@ -49,9 +51,18 @@ pub struct AgentEvent {
     pub frame: AgentFrame,
 }
 
+/// One read of an agent's log, as the model numbers them: a page of a read
+/// it gave up on is not one of the read it waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadId(pub(crate) u64);
+
 pub(crate) enum Command {
     Frame(ClientFrame),
-    ReadLog { workset: WorksetId, from: Wpos },
+    ReadLog {
+        agent: AgentId,
+        read: ReadId,
+        from: Wpos,
+    },
 }
 
 /// What this client says down one host's agents stream. Whatever is
@@ -69,12 +80,12 @@ impl AgentCommands {
         let _ = self.commands.unbounded_send(Command::Frame(frame));
     }
 
-    /// Reads a workset's log from `from` to its end, page by page, each
+    /// Reads an agent's log from `from` to its end, page by page, each
     /// page to the model as [`AgentFrame::Log`].
-    pub fn read_log(&self, workset: WorksetId, from: Wpos) {
+    pub(crate) fn read_log(&self, agent: AgentId, read: ReadId, from: Wpos) {
         let _ = self
             .commands
-            .unbounded_send(Command::ReadLog { workset, from });
+            .unbounded_send(Command::ReadLog { agent, read, from });
     }
 
     /// The agents whose live frames this host should stream: every open
@@ -110,26 +121,27 @@ impl AgentStream {
     }
 }
 
-/// A workset's log from `from` to its end, each page to the model as it
+/// An agent's log from `from` to its end, each page to the model as it
 /// comes. Ends early, with `LogFailed`, when a page cannot be read.
 async fn read_log(
     dialer: Dialer,
     host: HostId,
     model: futures_mpsc::UnboundedSender<ToModel>,
-    workset: WorksetId,
+    agent: AgentId,
+    read: ReadId,
     mut from: Wpos,
 ) {
     loop {
         let page = async {
             let mut stream = dialer
-                .open(<worksets::WorksetLog as rho_rpc::protocol::Call>::PRIORITY)
+                .open(<worksets::AgentLog as rho_rpc::protocol::Call>::PRIORITY)
                 .await?;
-            rho_rpc::protocol::call(&mut stream, worksets::WorksetLog { workset, from }).await
+            rho_rpc::protocol::call(&mut stream, worksets::AgentLog { agent, from }).await
         };
         let frame = match page.await {
             Ok(page) => {
                 let next = page.next;
-                let frame = AgentFrame::Log { workset, page };
+                let frame = AgentFrame::Log { agent, read, page };
                 if model
                     .unbounded_send(ToModel::Event(AgentEvent { host, frame }))
                     .is_err()
@@ -137,16 +149,16 @@ async fn read_log(
                     return;
                 }
                 match next {
-                    Some(next) => {
+                    LogNext::Page(next) => {
                         from = next;
                         continue;
                     }
-                    None => return,
+                    LogNext::Follow(_) => return,
                 }
             }
             Err(error) => {
-                tracing::warn!(%workset, "reading the workset log failed: {error:#}");
-                AgentFrame::LogFailed { workset }
+                tracing::warn!(agent = %agent.encoded(), "reading the agent log failed: {error:#}");
+                AgentFrame::LogFailed { agent, read }
             }
         };
         let _ = model.unbounded_send(ToModel::Event(AgentEvent { host, frame }));
@@ -196,11 +208,12 @@ impl HostStream for AgentStream {
                     tokio::select! {
                         command = commands.next() => match command {
                             Some(Command::Frame(frame)) => write_frame(&mut writer, &frame).await?,
-                            Some(Command::ReadLog { workset, from }) => reads.push(read_log(
+                            Some(Command::ReadLog { agent, read, from }) => reads.push(read_log(
                                 dialer.clone(),
                                 host,
                                 model.clone(),
-                                workset,
+                                agent,
+                                read,
                                 from,
                             )),
                             None => return anyhow::Ok(()),

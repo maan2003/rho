@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_types::{Address, AgentId, Mail, MailId, ThreadId, WorksetId, Wpos};
+use rho_agent_types::{Address, AgentId, Mail, MailId, ThreadId, Wpos};
 use rho_db::{RhoDb, Sen, SenValue};
 
 use crate::fold::{AgentIdentity, Digest};
@@ -34,9 +34,9 @@ const AGENTS: TableDefinition<AgentId, Sen<StoredAgent>> = TableDefinition::new(
 /// read gives one agent's conversation and nothing else. Mail between two
 /// agents is kept under both.
 const MAIL: TableDefinition<(AgentId, u64), Sen<Mail>> = TableDefinition::new("gui_mail_v1");
-/// The rows of each workset whose transcript was opened, by position.
-const ROWS: TableDefinition<([u8; 6], u64), Sen<LogEvent>> =
-    TableDefinition::new("gui_workset_rows_v1");
+/// The rows of each agent whose transcript was opened, by position.
+const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
+    TableDefinition::new("gui_agent_rows_v1");
 /// What the user wrote that no host has taken yet, by agent and the id
 /// the client gave it. The user's own words, with no copy anywhere else:
 /// never dropped to be asked for again.
@@ -49,7 +49,9 @@ const DRAFTS: TableDefinition<(AgentId, u64), &str> = TableDefinition::new("gui_
 
 /// Tables nothing reads: the per-agent journal mirror the workset log replaced,
 /// and its retired formats. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 37] = [
+const RETIRED_TABLES: [&str; 38] = [
+    // The rows of whole worksets; a transcript reads its agent's alone.
+    "gui_workset_rows_v1",
     // A copy of the dealer's marks per agent, which only agent cards read.
     "gui_agent_verdict_v2",
     "gui_mirror_host_v10",
@@ -148,11 +150,9 @@ enum Write {
     /// Agents gone from their host's directory, with their mail.
     Forget(Vec<AgentId>),
     Rows {
-        workset: WorksetId,
+        agent: AgentId,
         rows: Vec<(Wpos, LogEvent)>,
     },
-    /// A workset gone from its host, with its rows.
-    ForgetWorkset(WorksetId),
     /// A message kept until its host takes it, or `None` once it has.
     /// A new one was its thread's draft, which goes with it.
     Outgoing(AgentId, u64, Option<Outgoing>),
@@ -274,22 +274,23 @@ impl Mirror {
             .collect()
     }
 
-    /// The rows held of a workset, oldest first.
-    pub fn read_rows(&self, workset: WorksetId) -> Vec<(Wpos, LogEvent)> {
+    /// The rows held of an agent, oldest first.
+    pub fn read_rows(&self, agent: AgentId) -> Vec<(Wpos, LogEvent)> {
         self.db
             .read()
             .open_table(ROWS)
-            .range((workset.0, 0)..=(workset.0, u64::MAX))
+            .range((agent, 0)..=(agent, u64::MAX))
             .map(|(key, value)| (Wpos(key.value().1), value.value().into_owned()))
             .collect()
     }
 
-    /// One past the newest row held of a workset: where reading it goes on.
-    pub fn rows_next(&self, workset: WorksetId) -> Wpos {
+    /// One past the newest row held of an agent: where reading its log
+    /// goes on.
+    pub fn rows_next(&self, agent: AgentId) -> Wpos {
         self.db
             .read()
             .open_table(ROWS)
-            .range((workset.0, 0)..=(workset.0, u64::MAX))
+            .range((agent, 0)..=(agent, u64::MAX))
             .next_back()
             .map_or(Wpos::ZERO, |(key, _)| Wpos(key.value().1).next())
     }
@@ -435,13 +436,12 @@ fn apply(
                 forget_agent(transaction, agent_id);
             }
         }
-        Write::Rows { workset, rows } => {
+        Write::Rows { agent, rows } => {
             let mut table = transaction.open_table(ROWS);
             for (pos, event) in &rows {
-                table.insert((workset.0, pos.0), SenValue::borrowed(event));
+                table.insert((agent, pos.0), SenValue::borrowed(event));
             }
         }
-        Write::ForgetWorkset(workset) => drop_rows(transaction, workset),
         Write::Outgoing(agent_id, id, Some(outgoing)) => {
             transaction
                 .open_table(OUTBOX)
@@ -471,9 +471,8 @@ fn apply(
                 .map(|(key, value)| (key.value(), value.value().into_owned()))
                 .filter(|(_, stored)| stored.host == host)
                 .collect::<Vec<_>>();
-            for (agent_id, stored) in departed {
+            for (agent_id, _) in departed {
                 forget_agent(transaction, agent_id);
-                drop_rows(transaction, stored.identity.entry.workset);
             }
         }
         Write::Flush(done) => flushed.push(done),
@@ -491,12 +490,10 @@ fn forget_agent(transaction: &mut rho_db::WriteTxn, agent_id: AgentId) {
     for key in held {
         mail.remove(key);
     }
-}
-
-fn drop_rows(transaction: &mut rho_db::WriteTxn, workset: WorksetId) {
+    drop(mail);
     let mut rows = transaction.open_table(ROWS);
     let held = rows
-        .range((workset.0, 0)..=(workset.0, u64::MAX))
+        .range((agent_id, 0)..=(agent_id, u64::MAX))
         .map(|(key, _)| key.value())
         .collect::<Vec<_>>();
     for key in held {
@@ -586,12 +583,12 @@ pub fn read_mail(agent_id: AgentId) -> Vec<Mail> {
     read(|mirror| mirror.read_mail(agent_id))
 }
 
-pub fn read_rows(workset: WorksetId) -> Vec<(Wpos, LogEvent)> {
-    read(|mirror| mirror.read_rows(workset))
+pub fn read_rows(agent: AgentId) -> Vec<(Wpos, LogEvent)> {
+    read(|mirror| mirror.read_rows(agent))
 }
 
-pub fn rows_next(workset: WorksetId) -> Wpos {
-    read(|mirror| mirror.rows_next(workset))
+pub fn rows_next(agent: AgentId) -> Wpos {
+    read(|mirror| mirror.rows_next(agent))
 }
 
 pub fn write_host(host: &str, machine_seed: u64) {
@@ -621,12 +618,10 @@ pub fn forget_agents(agents: Vec<AgentId>) {
     }
 }
 
-pub fn write_rows(workset: WorksetId, rows: Vec<(Wpos, LogEvent)>) {
-    send(Write::Rows { workset, rows });
-}
-
-pub fn forget_workset(workset: WorksetId) {
-    send(Write::ForgetWorkset(workset));
+pub fn write_rows(agent: AgentId, rows: Vec<(Wpos, LogEvent)>) {
+    if !rows.is_empty() {
+        send(Write::Rows { agent, rows });
+    }
 }
 
 pub fn write_outgoing(agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
@@ -657,7 +652,7 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{ContentPart, InputWake, SendKind, UnixMs};
+    use rho_agent_types::{ContentPart, InputWake, SendKind, UnixMs, WorksetId};
 
     use super::*;
     use crate::fold::Said;
@@ -742,8 +737,8 @@ mod tests {
                 ],
             });
             mirror.send(Write::Rows {
-                workset: workset(1),
-                rows: vec![(Wpos(0), input(a)), (Wpos(1), input(b))],
+                agent: a,
+                rows: vec![(Wpos(0), input(a)), (Wpos(2), input(a))],
             });
             mirror.flush();
         }
@@ -781,9 +776,9 @@ mod tests {
             1,
             "mail between agents is under both"
         );
-        assert_eq!(mirror.read_rows(workset(1)).len(), 2);
-        assert_eq!(mirror.rows_next(workset(1)), Wpos(2));
-        assert_eq!(mirror.rows_next(workset(2)), Wpos::ZERO);
+        assert_eq!(mirror.read_rows(a).len(), 2);
+        assert_eq!(mirror.rows_next(a), Wpos(3));
+        assert_eq!(mirror.rows_next(b), Wpos::ZERO);
     }
 
     /// A host with another database starts its copy over; the user's own
@@ -809,8 +804,12 @@ mod tests {
             mails: vec![mail(1, Address::User, Address::Agent(a), None)],
         });
         mirror.send(Write::Rows {
-            workset: workset(1),
+            agent: a,
             rows: vec![(Wpos(0), input(a))],
+        });
+        mirror.send(Write::Rows {
+            agent: b,
+            rows: vec![(Wpos(0), input(b))],
         });
         mirror.send(Write::Outgoing(
             a,
@@ -842,7 +841,8 @@ mod tests {
             [b]
         );
         assert!(mirror.read_mail(a).is_empty());
-        assert!(mirror.read_rows(workset(1)).is_empty());
+        assert!(mirror.read_rows(a).is_empty());
+        assert_eq!(mirror.read_rows(b).len(), 1, "another host's rows stay");
         assert_eq!(mirror.read_outbox().len(), 1, "unsent words are the user's");
     }
 }

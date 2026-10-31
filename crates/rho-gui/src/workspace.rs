@@ -722,10 +722,11 @@ impl Workspace {
         if self.transcripts.is_open(&agent_id) {
             return false;
         }
-        let Some(workset) = self.registry.agent_workset(agent_id) else {
+        // An agent no host has named is not opened.
+        if self.registry.agent_workset(agent_id).is_none() {
             return false;
-        };
-        let rows = self.agents_client.read_transcript(agent_id, workset);
+        }
+        let rows = self.agents_client.read_transcript(agent_id);
         if !self.transcripts.seed(agent_id, &rows) {
             return false;
         }
@@ -767,10 +768,7 @@ impl Workspace {
         if !self.transcripts.is_open(&agent_id) {
             return;
         }
-        let Some(workset) = self.registry.agent_workset(agent_id) else {
-            return;
-        };
-        let rows = self.agents_client.read_transcript(agent_id, workset);
+        let rows = self.agents_client.read_transcript(agent_id);
         let Some(state) = self.transcripts.reread(agent_id, &rows) else {
             return;
         };
