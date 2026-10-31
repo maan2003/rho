@@ -649,6 +649,27 @@ impl Workspace {
         self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Folded(delta))], window, cx);
     }
 
+    /// An open transcript whose log's past is read: folded again from the
+    /// disk copy, in time order, and handed whole.
+    fn reread_open_transcript(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transcripts.is_open(&agent_id) {
+            return;
+        }
+        let Some(workset) = self.registry.agent_workset(agent_id) else {
+            return;
+        };
+        let rows = self.agents_client.read_transcript(agent_id, workset);
+        let Some(state) = self.transcripts.reread(agent_id, &rows) else {
+            return;
+        };
+        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
+    }
+
     fn apply_frame_state(
         &mut self,
         agent_id: AgentId,
@@ -1939,6 +1960,9 @@ impl Workspace {
             }
             rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
+            }
+            rho_agents_client::model::ModelMsg::Read { agent_id } => {
+                self.reread_open_transcript(agent_id, window, cx);
             }
             rho_agents_client::model::ModelMsg::Runtime { agent_id, state } => {
                 if self.registry.set_runtime(agent_id, state) {
