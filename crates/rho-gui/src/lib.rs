@@ -31,7 +31,7 @@ pub(crate) mod when;
 pub mod workspace;
 
 use gpui::{App, KeyBinding, actions};
-use rho_agents_view::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
+use rho_agents_view::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RuntimeCycleGroup};
 pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
@@ -200,10 +200,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new(
             "shift-tab",
-            RoleCycleGroup,
+            RuntimeCycleGroup,
             Some("RhoGui > Editor && !showing_completions && !VimDeal"),
         ),
-        // The values the header rows hold, cycled in place: the role, and
+        // The values the header rows hold, cycled in place: the model, and
         // whether the agent starts on top of the target, joins it, or is
         // sandboxed. Shift-tab used to do this, which cost the draft its
         // way back through the rows.
@@ -213,7 +213,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions && !VimDeal"),
         ),
         // A draft is one message however many rows it has, so enter in the
-        // workdir, role, or start row sends it like enter in the body does.
+        // workdir, model, or start row sends it like enter in the body does.
         // The prompt's own enter is insert-only, and tab leaves the cursor
         // in normal mode, so from a field the key used to mean nothing at
         // all. In the body it is still vim's own motion; the handler passes

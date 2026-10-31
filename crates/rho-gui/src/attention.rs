@@ -440,7 +440,7 @@ impl Workspace {
             let said = marks.facts();
             let handled = said.seen_agent().unwrap_or(0);
             let verdict = rho_agents_client::Verdict {
-                handled_through: rho_agent_types::AgentPos(handled),
+                handled_through: rho_agents_client::ConversationPos(handled),
                 muted: said.muted(),
             };
             filings.push((

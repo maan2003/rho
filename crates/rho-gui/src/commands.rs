@@ -79,8 +79,8 @@ pub fn workdir_field_candidates(
         .collect()
 }
 
-/// Completion inside the draft's role field buffer.
-pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
+/// Completion inside the draft's model field buffer.
+pub fn runtime_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
     let trimmed = text_before_cursor.trim_start();
     let token = last_token(text_before_cursor);
     let typing_new_token = text_before_cursor
@@ -89,12 +89,12 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["mini-eng", "med-eng", "high-eng", "med1-eng", "high1-eng"]
+        return rho_agents_client::snippets::RUNTIMES
             .into_iter()
-            .filter(|mode| fuzzy_contains(mode, token))
-            .map(|mode| Candidate {
-                value: mode.to_owned(),
-                description: "engineer mode".to_owned(),
+            .filter(|runtime| fuzzy_contains(runtime, token))
+            .map(|runtime| Candidate {
+                value: runtime.to_owned(),
+                description: "model".to_owned(),
             })
             .collect();
     }
@@ -107,9 +107,9 @@ pub struct WorkspaceCompletionProvider {
     /// The draft view's workdir field buffer: completions in it come from
     /// the registered projects, not the prompt grammar.
     workdir_buffer: Option<gpui::EntityId>,
-    /// The draft view's role field buffer: completions are role/intelligence
-    /// names.
-    role_buffer: Option<gpui::EntityId>,
+    /// The draft view's model field buffer: completions are the runtimes
+    /// the picker offers.
+    runtime_buffer: Option<gpui::EntityId>,
     /// The draft view's start field buffer: completions are `user` and the
     /// live agent labels.
     start_buffer: Option<gpui::EntityId>,
@@ -119,13 +119,13 @@ impl WorkspaceCompletionProvider {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         workdir_buffer: Option<gpui::EntityId>,
-        role_buffer: Option<gpui::EntityId>,
+        runtime_buffer: Option<gpui::EntityId>,
         start_buffer: Option<gpui::EntityId>,
     ) -> Rc<Self> {
         Rc::new(Self {
             workspace,
             workdir_buffer,
-            role_buffer,
+            runtime_buffer,
             start_buffer,
         })
     }
@@ -157,7 +157,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .unwrap_or_default();
 
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
-        let in_role_field = self.role_buffer == Some(buffer.entity_id());
+        let in_runtime_field = self.runtime_buffer == Some(buffer.entity_id());
         let in_start_field = self.start_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
@@ -167,8 +167,8 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
         let candidates = if in_workdir_field {
             workdir_field_candidates(&text_before_cursor, &workdirs)
-        } else if in_role_field {
-            role_field_candidates(&text_before_cursor)
+        } else if in_runtime_field {
+            runtime_field_candidates(&text_before_cursor)
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
@@ -277,17 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn role_field_completes_current_engineer_modes() {
+    fn model_field_completes_the_offered_runtimes() {
         let values = |needle| {
-            role_field_candidates(needle)
+            runtime_field_candidates(needle)
                 .iter()
                 .map(|candidate| candidate.value.clone())
                 .collect::<Vec<_>>()
         };
+        assert_eq!(values(""), rho_agents_client::snippets::RUNTIMES);
+        assert_eq!(values("sol"), ["sol-medium", "sol-high"]);
         assert_eq!(
-            values(""),
-            ["mini-eng", "med-eng", "high-eng", "med1-eng", "high1-eng"]
+            values("high"),
+            ["sol-high", "astra-high", "opus-high", "fable-high"]
         );
-        assert_eq!(values("high"), ["high-eng", "high1-eng"]);
     }
 }

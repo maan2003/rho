@@ -1,16 +1,16 @@
 //! The transcripts this client holds open.
 //!
-//! An agent's transcript is two things joined: the fold of its mirror on
-//! disk, and the runtime's live tail. Both land in one rendered state per
-//! agent, which is what a screen draws. Which agents are held open is the
+//! An agent's transcript is two things joined: the fold of its workset rows
+//! and its mail, and the runtime's live tail. Both land in one rendered state
+//! per agent, which is what a screen draws. Which agents are held open is the
 //! same question as which agents this client asks the model thread for
 //! rows about, so it is answered here.
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_types::{AgentId, AgentPos};
+use rho_agent_types::AgentId;
 use rho_agents_client::TranscriptFold;
-use rho_agents_client::protocol::transcript::TranscriptEvent;
+use rho_agents_client::fold::TranscriptRow;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};
 
@@ -83,17 +83,18 @@ impl Transcripts {
         self.store.erase(agent_id);
     }
 
-    /// Opens an agent's transcript from the mirror the client already
-    /// holds: the fold, for a reader who opened it before any live frame,
-    /// or with the agent host down. The live frame rides on its tail.
+    /// Opens an agent's transcript from what the client has read of it:
+    /// its rows and mail, interleaved. An agent with nothing read yet opens
+    /// empty, so the rows that follow land in it. The live frame rides on
+    /// its tail.
     ///
-    /// Answers whether it opened one; an agent already open, or one with
-    /// nothing on disk, is left as it was.
-    pub fn seed(&mut self, agent_id: AgentId, events: &[(AgentPos, TranscriptEvent)]) -> bool {
-        if self.open.contains_key(&agent_id) || events.is_empty() {
+    /// Answers whether it opened one; an agent already open is left as it
+    /// was.
+    pub fn seed(&mut self, agent_id: AgentId, rows: &[TranscriptRow]) -> bool {
+        if self.open.contains_key(&agent_id) {
             return false;
         }
-        let mut fold = TranscriptFold::new(events);
+        let mut fold = TranscriptFold::new(agent_id, rows);
         // The one time a transcript is handed whole: nothing was here to
         // append to. Every telling after this hands the rows it moved.
         self.store.set_fold(agent_id, fold.state());
@@ -102,19 +103,19 @@ impl Transcripts {
         true
     }
 
-    /// Rows of an agent whose transcript is open, folded into the copy
-    /// behind it. Positions already held are skipped, so the rows the
-    /// reader's own open read already picked up cost nothing. Answers
+    /// Rows and mail of an agent whose transcript is open, folded into the
+    /// copy behind it. Positions and mail already held are skipped, so what
+    /// the reader's own open read already picked up costs nothing. Answers
     /// with the rows the telling moved, and nothing when it moved none.
     pub fn refold(
         &mut self,
         agent_id: AgentId,
-        rows: &[(AgentPos, TranscriptEvent)],
+        rows: &[TranscriptRow],
     ) -> Option<rho_agents_client::fold::FoldDelta> {
         let fold = self.open.get_mut(&agent_id)?;
         let mut refolded = false;
-        for (pos, event) in rows {
-            refolded |= fold.tell(*pos, event);
+        for row in rows {
+            refolded |= fold.tell(row);
         }
         if !refolded {
             return None;
@@ -151,7 +152,8 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{Address, ContentPart, InputWake, Mail, MailId, UnixMs, Wpos};
+    use rho_agents_client::protocol::rho2::LogEvent;
 
     use super::*;
 
@@ -159,84 +161,128 @@ mod tests {
         AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn said(text: &str, at: u64) -> TranscriptEvent {
-        TranscriptEvent::Message {
-            from: None,
-            text: text.to_owned(),
-            at: UnixMs(at),
-        }
+    fn other() -> AgentId {
+        AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn sent(at: u64) -> TranscriptEvent {
-        TranscriptEvent::Sent {
-            results: Vec::new(),
-            compaction: false,
-            at: UnixMs(at),
-        }
+    /// The user's mail to the agent, then the input that hands it over and
+    /// the request that carries it: one told turn.
+    fn turn(mail: u64, pos: u64, text: &str, at: u64) -> Vec<TranscriptRow> {
+        vec![
+            TranscriptRow::Mail(Mail {
+                id: MailId(mail),
+                at: UnixMs(at),
+                from: Address::User,
+                to: Address::Agent(agent()),
+                re: None,
+                kind: None,
+                content: vec![ContentPart::Text {
+                    text: text.to_owned(),
+                }],
+            }),
+            TranscriptRow::Log(
+                Wpos(pos),
+                LogEvent::Input {
+                    agent: agent(),
+                    mail: Some(MailId(mail)),
+                    text: text.to_owned(),
+                    wake: InputWake::Person,
+                    at: UnixMs(at),
+                },
+            ),
+            TranscriptRow::Log(
+                Wpos(pos + 1),
+                LogEvent::Sent {
+                    agent: agent(),
+                    results: Vec::new(),
+                    compaction: false,
+                    at: UnixMs(at),
+                },
+            ),
+        ]
     }
 
-    fn rows(events: Vec<TranscriptEvent>, from: u64) -> Vec<(AgentPos, TranscriptEvent)> {
-        events
-            .into_iter()
-            .enumerate()
-            .map(|(nth, event)| (AgentPos(from + nth as u64), event))
+    fn texts(transcripts: &Transcripts) -> Vec<String> {
+        transcripts
+            .state(&agent())
+            .expect("the open state")
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                rho_agents_client::state::UiBlock::UserMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
             .collect()
     }
 
-    /// Opening an agent reads its disk copy once; the rows that follow
-    /// cost the rows they are, not the transcript they land in.
+    /// Opening an agent reads what was read of it once; the rows that
+    /// follow cost the rows they are, not the transcript they land in.
     #[test]
     fn an_open_transcript_grows_by_what_it_is_told() {
         let mut transcripts = Transcripts::default();
         let agent_id = agent();
         assert!(!transcripts.is_open(&agent_id));
 
-        let opened = transcripts.seed(agent_id, &rows(vec![said("first", 1), sent(1)], 0));
-        assert!(opened, "the disk copy had rows to fold");
+        let opened = transcripts.seed(agent_id, &turn(0, 0, "first", 1));
+        assert!(opened);
         assert!(transcripts.is_open(&agent_id));
         assert_eq!(
             transcripts.open_agents(),
             BTreeSet::from([agent_id]),
             "an open transcript is what this client asks for rows about"
         );
-        assert_eq!(
-            transcripts
-                .state(&agent_id)
-                .expect("the seeded state")
-                .blocks
-                .len(),
-            1
-        );
+        assert_eq!(texts(&transcripts), ["first"]);
+        let held = transcripts.state(&agent_id).unwrap().blocks.len();
 
         let delta = transcripts
-            .refold(agent_id, &rows(vec![said("second", 2), sent(2)], 2))
+            .refold(agent_id, &turn(1, 2, "second", 2))
             .expect("the telling moved rows");
-        assert_eq!(delta.from, 1, "the transcript is appended to, not remade");
-        assert_eq!(delta.blocks.len(), 1);
+        assert_eq!(
+            delta.from, held,
+            "the transcript is appended to, not remade"
+        );
 
         transcripts.apply(agent_id, TranscriptFrame::Folded(delta));
-        assert_eq!(
+        assert_eq!(texts(&transcripts), ["first", "second"]);
+
+        assert!(
             transcripts
-                .state(&agent_id)
-                .expect("the state after the delta")
-                .blocks
-                .len(),
-            2
+                .refold(agent_id, &turn(1, 2, "second", 2))
+                .is_none(),
+            "a page read twice moves nothing"
+        );
+        let elsewhere = TranscriptRow::Log(
+            Wpos(9),
+            LogEvent::Sent {
+                agent: other(),
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(3),
+            },
+        );
+        assert!(
+            transcripts.refold(agent_id, &[elsewhere]).is_none(),
+            "a row about another agent in the workset is not this transcript"
         );
     }
 
-    /// A transcript is opened once. A second open, or one with nothing on
-    /// disk, leaves what is held alone rather than handing it whole again.
+    /// A transcript is opened once, even one with nothing read yet; a
+    /// second open leaves what is held alone rather than handing it whole
+    /// again.
     #[test]
     fn a_transcript_is_handed_whole_once() {
         let mut transcripts = Transcripts::default();
         let agent_id = agent();
-        assert!(!transcripts.seed(agent_id, &[]), "nothing on disk");
-        assert!(transcripts.seed(agent_id, &rows(vec![said("first", 1), sent(1)], 0)));
+        assert!(transcripts.seed(agent_id, &[]), "a fresh agent opens empty");
         assert!(
-            !transcripts.seed(agent_id, &rows(vec![said("again", 1), sent(1)], 0)),
+            !transcripts.seed(agent_id, &turn(0, 0, "again", 1)),
             "already open"
         );
+        let delta = transcripts
+            .refold(agent_id, &turn(0, 0, "first", 1))
+            .expect("rows land in the empty transcript");
+        transcripts.apply(agent_id, TranscriptFrame::Folded(delta));
+        assert_eq!(texts(&transcripts), ["first"]);
 
         transcripts.forget(agent_id);
         assert!(!transcripts.is_open(&agent_id));
@@ -248,10 +294,7 @@ mod tests {
     fn deletion_erases_open_history_and_status_without_erasing_unsent_text() {
         let mut transcripts = Transcripts::default();
         let agent_id = agent();
-        assert!(transcripts.seed(
-            agent_id,
-            &rows(vec![said("private history", 1), sent(2)], 0)
-        ));
+        assert!(transcripts.seed(agent_id, &turn(0, 0, "private history", 1)));
         transcripts.apply(
             agent_id,
             TranscriptFrame::Status(Some("private status".into())),
@@ -265,7 +308,7 @@ mod tests {
         assert!(transcripts.state(&agent_id).is_none());
         assert!(transcripts.open_agents().is_empty());
 
-        assert!(transcripts.seed(agent_id, &rows(vec![said("new history", 3), sent(4)], 0)));
+        assert!(transcripts.seed(agent_id, &turn(0, 0, "new history", 3)));
         let blocks = &transcripts.state(&agent_id).unwrap().blocks;
         assert!(blocks.iter().any(|block| matches!(&**block,
             rho_agents_client::state::UiBlock::Unsent { text } if text == "sole-copy message")));
@@ -274,6 +317,7 @@ mod tests {
                 .iter()
                 .any(|block| matches!(&**block, rho_agents_client::state::UiBlock::Status { .. }))
         );
+        assert_eq!(texts(&transcripts), ["new history"]);
     }
 
     /// Rows for an agent nobody has open are dropped: the client folds
@@ -283,7 +327,7 @@ mod tests {
         let mut transcripts = Transcripts::default();
         assert!(
             transcripts
-                .refold(agent(), &rows(vec![said("first", 1), sent(1)], 0))
+                .refold(agent(), &turn(0, 0, "first", 1))
                 .is_none()
         );
         assert!(transcripts.state(&agent()).is_none());

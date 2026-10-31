@@ -43,8 +43,7 @@ use rho_agent_types::AgentId;
 
 use crate::fold::{AgentIdentity, Digest, MirroredAgent, Verdict};
 use crate::now_ms;
-#[cfg(test)]
-use crate::protocol::transcript::LogEntry;
+use crate::protocol::rho2::SpecView;
 
 const LABEL_HEADROOM: u64 = 200;
 
@@ -136,7 +135,6 @@ pub struct AgentMap {
     /// The agents a screen will draw, in order: everything not filed away.
     /// `next_agent` steps through this without collecting it.
     visible: BTreeSet<(OrderKey, AgentId)>,
-    announced_hosts: BTreeMap<AgentId, HostId>,
 }
 
 impl AgentMap {
@@ -153,19 +151,7 @@ impl AgentMap {
         if self.hosts.remove(&host).is_none() {
             return BTreeSet::new();
         }
-        let departed = self
-            .by_host
-            .get(&host)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .chain(
-                self.announced_hosts
-                    .iter()
-                    .filter(|(_, owner)| **owner == host)
-                    .map(|(id, _)| *id),
-            )
-            .collect::<BTreeSet<_>>();
+        let departed = self.by_host.get(&host).cloned().unwrap_or_default();
         self.forget_agents(&departed);
         for agent_id in &departed {
             self.runtime.remove(agent_id);
@@ -194,20 +180,11 @@ impl AgentMap {
     }
 
     pub fn host_of_agent(&self, agent_id: AgentId) -> Option<HostId> {
-        self.agent_hosts
-            .get(&agent_id)
-            .or_else(|| self.announced_hosts.get(&agent_id))
-            .copied()
+        self.agent_hosts.get(&agent_id).copied()
     }
 
-    pub fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
-        self.announced_hosts.insert(agent_id, host);
-        self.mark_known(agent_id);
-    }
-
-    /// What a host's agents stream says of it when it opens, and again of
-    /// the counter with each agent created. The agents come by the log,
-    /// not here.
+    /// What a host's agents stream says of it when it opens. The agents
+    /// come by the directory, not here.
     pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
@@ -234,37 +211,8 @@ impl AgentMap {
             self.mirror.remove(agent_id);
             self.filing.remove(agent_id);
             self.last_active.remove(agent_id);
-            self.announced_hosts.remove(agent_id);
             self.indexed_as.remove(agent_id);
         }
-    }
-
-    /// A run of a host's log, folded. The client's own fold runs on the
-    /// model thread now; this is what the registry's tests fold with, and
-    /// what `told` is checked against.
-    #[cfg(test)]
-    pub fn tell(&mut self, host: HostId, entries: &[LogEntry]) -> Vec<AgentId> {
-        let mut changed = Vec::new();
-        for entry in entries {
-            let told = match self.mirror.get_mut(&entry.agent_id) {
-                Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
-                None => match MirroredAgent::new(host, entry.agent_id, &entry.event) {
-                    Some(mirrored) => {
-                        self.mirror.insert(entry.agent_id, mirrored);
-                        self.agents
-                            .entry(entry.agent_id)
-                            .or_insert(AgentLife::Known);
-                        true
-                    }
-                    None => false,
-                },
-            };
-            if told && !changed.contains(&entry.agent_id) {
-                changed.push(entry.agent_id);
-            }
-        }
-        self.refresh(changed.iter().copied());
-        changed
     }
 
     /// The agents the model folded, as they now stand: what this client
@@ -402,8 +350,8 @@ impl AgentMap {
         let host = mirrored.host;
         let identity = &mirrored.identity;
         let digest = &mirrored.digest;
-        let last_active = digest.last_active.max(identity.created_at);
-        let now = (identity.parent, identity.role.handle_prefix());
+        let last_active = digest.last_active.max(identity.entry.created_at);
+        let now = (identity.parent(), identity.handle_prefix());
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
         let active = self
             .last_active
@@ -575,7 +523,7 @@ impl AgentMap {
         let len = prefix_id::uniform_prefix_len(counter, LABEL_HEADROOM).max(4);
         let prefix = self
             .agent_identity(agent_id)
-            .map(|identity| identity.role.handle_prefix())
+            .map(AgentIdentity::handle_prefix)
             .unwrap_or("eng");
         let label = format!("{prefix}-{}", &agent_id.encoded()[..len]);
         match host.filter(|_| self.hosts.len() > 1) {
@@ -604,28 +552,34 @@ impl AgentMap {
 
     /// The directory the agent works in, as the agent sees it.
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
-        self.agent_place(agent_id).map(|place| place.cwd.clone())
+        self.agent_place(agent_id).map(|place| place.cwd)
     }
     /// Where the agent works.
-    pub fn agent_place(&self, agent_id: AgentId) -> Option<&rho_agent_types::Place> {
-        self.agent_identity(agent_id)
-            .map(|identity| &identity.place)
+    pub fn agent_place(&self, agent_id: AgentId) -> Option<rho_agent_types::Place> {
+        self.agent_identity(agent_id).map(AgentIdentity::place)
     }
-    pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_agent_types::AgentRole> {
-        self.agent_identity(agent_id).map(|identity| identity.role)
+    /// The workset the agent is in.
+    pub fn agent_workset(&self, agent_id: AgentId) -> Option<rho_agent_types::WorksetId> {
+        self.agent_identity(agent_id)
+            .map(|identity| identity.entry.workset)
+    }
+    /// What the agent runs on.
+    pub fn agent_spec(&self, agent_id: AgentId) -> Option<&SpecView> {
+        self.agent_identity(agent_id)
+            .map(|identity| &identity.entry.spec)
     }
     pub fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
         self.agent_identity(agent_id)
-            .and_then(|identity| identity.parent)
+            .and_then(AgentIdentity::parent)
     }
-    /// The user manages this agent: they made it, or an Engineer started
-    /// it for them. An agent working for another agent belongs to that
-    /// agent: it is not dealt, not on Home, not in the running list, and
-    /// not in Find, and its waiting reaches the user through its parent's
-    /// card. The fact is fixed at creation; filing is placement and says
-    /// nothing about it.
+    /// The user manages this agent: the policy that made it said it is
+    /// user-facing. Any other agent works for an agent: it is not dealt,
+    /// not on Home, not in the running list, and not in Find, and its
+    /// waiting reaches the user through its parent's card. Filing is
+    /// placement and says nothing about it.
     pub fn owned_by_user(&self, agent_id: AgentId) -> bool {
-        self.agent_parent(agent_id).is_none()
+        self.agent_identity(agent_id)
+            .is_some_and(AgentIdentity::user_facing)
     }
     /// The user muted this agent: they said "not this one", and nothing
     /// the agent does takes that back. Every list that draws agents asks
@@ -692,7 +646,7 @@ impl AgentMap {
             .filter(|text| !text.is_empty())
     }
     pub fn agent_human_name(&self, agent_id: AgentId) -> String {
-        let Some(role) = self.agent_role(agent_id) else {
+        let Some(identity) = self.agent_identity(agent_id) else {
             return "Untitled agent".into();
         };
         if let Some(name) = self.agent_display_name(agent_id) {
@@ -701,10 +655,10 @@ impl AgentMap {
         if let Some(said) = self.agent_last_user_message(agent_id) {
             return said.into();
         }
-        if role.is_engineer() {
-            "Engineer".into()
-        } else {
+        if identity.is_advisor() {
             "Advisor".into()
+        } else {
+            "Engineer".into()
         }
     }
 
@@ -799,46 +753,62 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, AgentPos, SendKind, Seq, UnixMs};
+    use rho_agent_types::{
+        Address, AgentIdDomain, ContentPart, Mail, MailId, SendKind, UnixMs, WorksetKind, props,
+    };
 
     use super::*;
-    use crate::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
-
-    fn created(at: u64) -> TranscriptEvent {
-        child_of(None, at)
-    }
-
-    fn child_of(parent: Option<AgentId>, at: u64) -> TranscriptEvent {
-        TranscriptEvent::Created {
-            role: rho_agent_types::AgentRole::default(),
-            runtime: RuntimeKind::Rho,
-            place: rho_agent_types::Place {
-                workset: Some("0123456789ab".parse().unwrap()),
-                cwd: "/src/repo".into(),
-            },
-            spawned_by: SpawnedBy::Direct,
-            spawn_name: None,
-            parent,
-            model: "sol".to_owned(),
-            at: UnixMs(at),
-        }
-    }
+    use crate::fold::ConversationPos;
+    use crate::protocol::rho2::AgentEntry;
+    use crate::protocol::transcript::RuntimeKind;
 
     fn agent(nth: u64) -> AgentId {
         AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap()
     }
 
-    fn log(agent_id: AgentId, from: u64, events: Vec<TranscriptEvent>) -> Vec<LogEntry> {
-        events
-            .into_iter()
-            .enumerate()
-            .map(|(offset, event)| LogEntry {
-                seq: Seq(from + offset as u64 + 1),
-                agent_id,
-                pos: AgentPos(from + offset as u64),
-                event,
-            })
-            .collect()
+    /// An agent as the directory names it: the user's unless it has a
+    /// parent.
+    fn named(nth: u64, parent: Option<AgentId>, at: u64) -> MirroredAgent {
+        let mut spec_props = Props::new();
+        match parent {
+            Some(parent) => {
+                spec_props.insert(props::PARENT.into(), parent.encoded());
+            }
+            None => {
+                spec_props.insert(props::USER_FACING.into(), "true".into());
+            }
+        }
+        MirroredAgent::new(
+            HostId::default(),
+            AgentIdentity {
+                entry: AgentEntry {
+                    agent: agent(nth),
+                    workset: "0123456789ab".parse().unwrap(),
+                    spec: SpecView {
+                        runtime: RuntimeKind::Rho,
+                        model: "sol".into(),
+                        effort: "medium".into(),
+                        props: spec_props,
+                    },
+                    created_at: UnixMs(at),
+                },
+                kind: WorksetKind::Isolated,
+            },
+        )
+    }
+
+    type Props = rho_agent_types::Props;
+
+    fn to_user(id: u64, from: AgentId, kind: SendKind, text: &str) -> Mail {
+        Mail {
+            id: MailId(id),
+            at: UnixMs(id),
+            from: Address::Agent(from),
+            to: Address::User,
+            re: None,
+            kind: Some(kind),
+            content: vec![ContentPart::Text { text: text.into() }],
+        }
     }
 
     #[test]
@@ -846,7 +816,7 @@ mod tests {
         use crate::protocol::transcript::RuntimeState;
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.tell(host, &log(agent(1), 0, vec![created(1)]));
+        map.told(vec![named(1, None, 1)]);
         map.set_runtime(
             agent(1),
             RuntimeState {
@@ -863,35 +833,33 @@ mod tests {
         map.clear_host_runtime(host);
         assert!(map.agent_facts(agent(1)).runtime.is_none());
     }
+
+    /// Whose an agent is comes from its props: user-facing is the user's,
+    /// and an agent with neither is not, whatever its parent.
     #[test]
-    fn an_agent_working_for_an_agent_belongs_to_it() {
+    fn an_agent_is_the_users_when_the_policy_says_so() {
         let mut registry = AgentMap::default();
-        let host = HostId::default();
-        registry.set_host_data(host, 0, 3);
-        let mut entries = log(agent(1), 0, vec![created(1)]);
-        entries.extend(log(agent(2), 1, vec![child_of(Some(agent(1)), 2)]));
-        // Started by agent 1 for the user: no parent, so the user's.
-        let mut user_owned = created(3);
-        if let TranscriptEvent::Created { spawned_by, .. } = &mut user_owned {
-            *spawned_by = SpawnedBy::UserOwned { by: agent(1) };
-        }
-        entries.extend(log(agent(3), 2, vec![user_owned]));
-        registry.tell(host, &entries);
+        registry.set_host_data(HostId::default(), 0, 3);
+        let mut neither = named(3, None, 3);
+        neither.identity.entry.spec.props.clear();
+        registry.told(vec![
+            named(1, None, 1),
+            named(2, Some(agent(1)), 2),
+            neither,
+        ]);
 
         assert!(registry.owned_by_user(agent(1)));
         assert!(!registry.owned_by_user(agent(2)));
-        assert!(registry.owned_by_user(agent(3)));
+        assert!(!registry.owned_by_user(agent(3)));
+        assert_eq!(registry.agent_parent(agent(2)), Some(agent(1)));
+        assert_eq!(registry.agent_children(agent(1)), [agent(2)]);
     }
 
     /// The desk files every agent in one go, so the registry rebuilds once.
-    /// Filed one at a time this was a rebuild of n agents per agent, and it
-    /// was 3,120 of 3,395 main-thread samples on a first desk sync.
     #[test]
     fn filing_a_whole_desk_rebuilds_once() {
         let mut registry = AgentMap::default();
-        let agents = (1..=32)
-            .map(|nth| AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap())
-            .collect::<Vec<_>>();
+        let agents = (1..=32).map(agent).collect::<Vec<_>>();
         for agent_id in &agents {
             registry.mark_known(*agent_id);
         }
@@ -907,173 +875,103 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-
         assert!(registry.set_agent_filings(filings.clone()));
-
-        // A desk sync that files what is already filed says so, so what is
-        // derived from filing is not made again.
         assert!(!registry.set_agent_filings(filings));
     }
 
     #[test]
     fn a_verdict_said_twice_changes_nothing_the_second_time() {
-        let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let mut registry = AgentMap::default();
-        registry.mark_known(agent_id);
+        registry.mark_known(agent(1));
         let handled = Verdict {
-            handled_through: AgentPos(3),
+            handled_through: ConversationPos(3),
             muted: false,
         };
-        assert!(registry.set_agent_verdict(agent_id, handled));
-        assert!(!registry.set_agent_verdict(agent_id, handled));
-        assert_eq!(registry.agent_verdict(agent_id), handled);
+        assert!(registry.set_agent_verdict(agent(1), handled));
+        assert!(!registry.set_agent_verdict(agent(1), handled));
+        assert_eq!(registry.agent_verdict(agent(1)), handled);
     }
-    /// The rails read the log, not the agent host: what the agent put to
-    /// the user since they wrote is what the fold says.
+
+    /// What the rails read is the fold of the agent's mail: its status
+    /// line, and what it put to the user.
     #[test]
-    fn the_log_is_what_the_rails_read() {
-        let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+    fn the_mail_is_what_the_rails_read() {
         let host = HostId::default();
         let mut registry = AgentMap::default();
         registry.set_host_data(host, 0, 1);
-        let sent = |kind, text: &str, at| TranscriptEvent::MessageSent {
-            to: None,
-            text: text.to_owned(),
-            kind,
-            at: UnixMs(at),
-        };
-        // A row before the creation says nothing.
-        assert!(
-            registry
-                .tell(
-                    host,
-                    &log(agent_id, 1, vec![sent(SendKind::Ask, "early", 11)])
-                )
-                .is_empty()
-        );
-        assert_eq!(
-            registry.tell(
-                host,
-                &log(
-                    agent_id,
-                    0,
-                    vec![
-                        created(1),
-                        TranscriptEvent::Message {
-                            from: None,
-                            text: "do the thing\nand then some".to_owned(),
-                            at: UnixMs(10),
-                        },
-                        sent(SendKind::Status, "reading", 11),
-                    ],
-                )
-            ),
-            [agent_id]
-        );
-        let digest = registry.agent_digest(agent_id).unwrap();
-        assert_eq!(digest.last_user_message_text, "do the thing");
-        assert!(digest.unread.is_empty(), "a status is not unread");
-        assert_eq!(registry.agent_status(agent_id), Some("reading"));
-        assert_eq!(registry.all_mirrored().len(), 1);
-        assert_eq!(registry.host_of_agent(agent_id), Some(host));
+        let mut mirrored = named(1, None, 1);
+        mirrored.tell(&to_user(1, agent(1), SendKind::Status, "reading"));
+        assert_eq!(registry.told(vec![mirrored.clone()]), [agent(1)]);
+        assert_eq!(registry.agent_status(agent(1)), Some("reading"));
+        assert!(registry.agent_digest(agent(1)).unwrap().unread.is_empty());
+        assert_eq!(registry.host_of_agent(agent(1)), Some(host));
 
-        let to_agent = TranscriptEvent::MessageSent {
-            to: Some(agent_id),
-            text: "mail".to_owned(),
-            kind: SendKind::Ask,
-            at: UnixMs(12),
-        };
-        registry.tell(
-            host,
-            &log(
-                agent_id,
-                3,
-                vec![to_agent, sent(SendKind::Ask, "which one?", 13)],
-            ),
-        );
-        let digest = registry.agent_digest(agent_id).unwrap();
-        assert_eq!(
-            digest.unread,
-            [crate::Unread {
-                pos: AgentPos(4),
-                at: UnixMs(13),
-                said: crate::Said::Ask,
-            }],
-            "mail to another agent is not the user's"
-        );
-        assert_eq!(registry.agent_status(agent_id), None, "a send hides it");
-        // Replaying a range the fold already holds changes nothing.
-        assert!(
-            registry
-                .tell(
-                    host,
-                    &log(agent_id, 4, vec![sent(SendKind::Ask, "which one?", 13)])
-                )
-                .is_empty()
-        );
-        assert_eq!(registry.agent_digest(agent_id).unwrap().newest, AgentPos(5));
+        mirrored.tell(&to_user(2, agent(1), SendKind::Ask, "which one?"));
+        registry.told(vec![mirrored]);
+        assert_eq!(registry.agent_status(agent(1)), None, "a send hides it");
+        assert_eq!(registry.agent_digest(agent(1)).unwrap().unread.len(), 1);
 
         registry.reset_host(host);
         assert_eq!(registry.all_mirrored().len(), 0);
     }
-    /// The order is what the user moves through, and it is handed out
-    /// once: an agent that arrives later goes to the front and moves
-    /// nobody, and one that arrives again does not move at all. Before the
-    /// indexes this was a splice into a vector after a pass over the whole
-    /// map, and the positions of everyone already in it shifted.
+
+    /// Labels read the preset: an advisor is `adv-`, anything else `eng-`,
+    /// and the label finds the agent again.
     #[test]
-    fn the_order_puts_the_newest_first_and_leaves_the_rest_where_they_were() {
+    fn a_label_reads_the_preset() {
         let host = HostId::default();
         let mut map = AgentMap::default();
         map.set_host_data(host, 0, 3);
-        map.tell(host, &log(agent(1), 0, vec![created(10)]));
-        map.tell(host, &log(agent(2), 0, vec![created(20)]));
+        let mut advisor = named(2, None, 2);
+        advisor
+            .identity
+            .entry
+            .spec
+            .props
+            .insert(crate::fold::PRESET.into(), "advisor".into());
+        map.told(vec![named(1, None, 1), advisor]);
+        let engineer = map.agent_id_label(agent(1));
+        let advisor = map.agent_id_label(agent(2));
+        assert!(engineer.starts_with("eng-"), "{engineer}");
+        assert!(advisor.starts_with("adv-"), "{advisor}");
+        assert_eq!(map.agent_by_tag(host, &advisor), Some(agent(2)));
+        assert_eq!(map.agent_human_name(agent(2)), "Advisor");
+    }
 
-        // Newest first: agent 2 arrived after agent 1, so it leads.
+    /// The order is what the user moves through, and it is handed out
+    /// once: an agent that arrives later goes to the front and moves
+    /// nobody, and one that arrives again does not move at all.
+    #[test]
+    fn the_order_puts_the_newest_first_and_leaves_the_rest_where_they_were() {
+        let mut map = AgentMap::default();
+        map.set_host_data(HostId::default(), 0, 3);
+        map.told(vec![named(1, None, 10)]);
+        map.told(vec![named(2, None, 20)]);
         assert_eq!(map.next_agent(None, 1), Some(agent(2)));
         assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(1)));
-        // And the ends wrap, in both directions.
         assert_eq!(map.next_agent(Some(agent(1)), 1), Some(agent(2)));
         assert_eq!(map.next_agent(Some(agent(2)), -1), Some(agent(1)));
         assert_eq!(map.next_agent(None, -1), Some(agent(1)));
 
-        // A third agent takes the front and the other two keep their order.
-        map.tell(host, &log(agent(3), 0, vec![created(30)]));
+        map.told(vec![named(3, None, 30)]);
         assert_eq!(map.next_agent(None, 1), Some(agent(3)));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
-        assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(1)));
 
-        // Being told about an agent again is not arriving again.
-        map.tell(
-            host,
-            &log(
-                agent(1),
-                1,
-                vec![TranscriptEvent::MessageSent {
-                    to: None,
-                    text: "news".to_owned(),
-                    kind: rho_agent_types::SendKind::Result,
-                    at: UnixMs(40),
-                }],
-            ),
-        );
+        let mut again = named(1, None, 10);
+        again.tell(&to_user(1, agent(1), SendKind::Result, "news"));
+        map.told(vec![again]);
         assert_eq!(map.next_agent(None, 1), Some(agent(3)));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
     }
 
-    /// Filing an agent away takes it out of the way of the keys that move
-    /// through the map, and unfiling puts it back where it was rather than
-    /// at the end.
     #[test]
     fn a_filed_agent_is_stepped_over_and_comes_back_in_place() {
-        let host = HostId::default();
         let mut map = AgentMap::default();
-        map.set_host_data(host, 0, 3);
+        map.set_host_data(HostId::default(), 0, 3);
         for (nth, at) in [(1, 10), (2, 20), (3, 30)] {
-            map.tell(host, &log(agent(nth), 0, vec![created(at)]));
+            map.told(vec![named(nth, None, at)]);
         }
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
-
         assert!(map.set_agent_filings([(
             agent(2),
             AgentFiling {
@@ -1082,48 +980,23 @@ mod tests {
             },
         )]));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(1)));
-        // The agent the point is in can be one that is filed away; the
-        // step out of it starts from the front rather than nowhere.
         assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(3)));
-
         assert!(map.set_agent_filings([(agent(2), AgentFiling::default())]));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
     }
 
-    #[test]
-    fn forgetting_one_agent_removes_its_indexes_and_runtime_but_preserves_peers() {
-        let host = HostId::default();
-        let mut map = AgentMap::default();
-        map.tell(host, &log(agent(1), 0, vec![created(10)]));
-        map.tell(host, &log(agent(2), 0, vec![created(20)]));
-        map.set_runtime(
-            agent(1),
-            crate::protocol::transcript::RuntimeState::default(),
-        );
-        let handle = map.agent_id_label(agent(1));
-        let (_, tag) = handle.split_once('/').unwrap_or(("", &handle));
-        map.forget_agents(&BTreeSet::from([agent(1)]));
-        assert_eq!(map.host_agents(host), [agent(2)]);
-        assert_eq!(map.agent_by_tag(host, tag), None);
-        assert!(map.agent_facts(agent(1)).runtime.is_none());
-        assert_eq!(map.next_agent(None, 1), Some(agent(2)));
-        assert_eq!(map.all_mirrored().len(), 1);
-    }
-
-    /// The indexes are what the screens read, so they must say the same
-    /// thing after a change as they would if they had been made from
+    /// The indexes say the same after a change as they would if made from
     /// scratch: a child reparented, an agent gone, a host reset.
     #[test]
     fn the_indexes_follow_what_changed() {
         let host = HostId::default();
         let mut map = AgentMap::default();
         map.set_host_data(host, 0, 3);
-        map.tell(host, &log(agent(1), 0, vec![created(10)]));
-        map.tell(host, &log(agent(2), 0, vec![child_of(Some(agent(1)), 20)]));
-        map.tell(host, &log(agent(3), 0, vec![child_of(Some(agent(1)), 30)]));
-
-        // Children and subtree members come out in agent-id order, the
-        // order the rails have always drawn them in.
+        map.told(vec![
+            named(1, None, 10),
+            named(2, Some(agent(1)), 20),
+            named(3, Some(agent(1)), 30),
+        ]);
         let mut children = vec![agent(2), agent(3)];
         children.sort_unstable();
         assert_eq!(map.agent_children(agent(1)), children);
@@ -1131,21 +1004,21 @@ mod tests {
             map.agent_subtree(agent(1)),
             [vec![agent(1)], children.clone()].concat()
         );
-        let mut all = vec![agent(1), agent(2), agent(3)];
-        all.sort_unstable();
-        assert_eq!(map.host_agents(host), all);
-        // The tag index answers the handle the user types.
-        let handle = map.agent_id_label(agent(2));
-        let (_, tag) = handle.split_once('/').unwrap_or(("", &handle));
-        assert_eq!(map.agent_by_tag(host, tag), Some(agent(2)));
+        // Reparented by a changed spec.
+        map.told(vec![named(3, Some(agent(2)), 30)]);
+        assert_eq!(map.agent_children(agent(1)), [agent(2)]);
+        assert_eq!(map.agent_children(agent(2)), [agent(3)]);
 
-        // A host that starts over takes its agents out of every index.
+        let handle = map.agent_id_label(agent(2));
+        assert_eq!(map.agent_by_tag(host, &handle), Some(agent(2)));
+        map.forget_agents(&BTreeSet::from([agent(2)]));
+        assert_eq!(map.agent_by_tag(host, &handle), None);
+        assert!(map.agent_children(agent(2)).is_empty());
+
         let departed = map.reset_host(host);
-        assert_eq!(departed.into_iter().collect::<Vec<_>>(), all);
+        assert_eq!(departed.len(), 2);
         assert_eq!(map.all_mirrored().len(), 0);
-        assert!(map.agent_children(agent(1)).is_empty());
         assert_eq!(map.host_agents(host), []);
-        assert_eq!(map.agent_by_tag(host, tag), None);
         assert_eq!(map.next_agent(None, 1), None);
     }
 }

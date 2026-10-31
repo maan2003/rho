@@ -1,42 +1,89 @@
 //! Making an agent: what the draft means, and what it takes to start one.
 //!
-//! A draft is four answers — a working directory, a base, a role and a
+//! A draft is four answers — a working directory, a base, a runtime and a
 //! first message — and every way one of them can be refused is here, in
 //! the words the reader is shown. What the shell keeps is the screen and
 //! the buffers; what it asks of this module is whether the answers make a
-//! `NewAgent`, and on which host.
+//! workset or an agent in one, and on which host.
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, Hosts};
-use rho_agent_types::{AgentRole, EngineerIntelligence, Place};
+use rho_agent_types::{ContentPart, WorksetId, WorksetKind};
 
-use crate::protocol::StartMode;
+use crate::protocol::rho2::{CreateWorkset, Eval};
+use crate::snippets::{self, Runtime};
 
 /// The user-facing name for selecting the first available conventional base.
 pub const DEFAULT_START: &str = "auto";
 /// The git revision represented by [`DEFAULT_START`]: none, so the agent
 /// starts where a fresh clone is born, on the remote's default branch.
 pub const AUTO_BASE_REV: &str = "";
-pub const DEFAULT_ROLE: &str = "med-eng";
 /// How the start field's target is interpreted; cycled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartFieldMode {
     /// A fresh clone with the target revision checked out.
     NewOn,
-    /// The same directory as the target agent.
+    /// The same workset as the target agent, in its directory.
     Join,
     /// The workdir itself, in place: no clone, and no target.
     Here,
 }
 
 /// What the agents map says about the label in the start field: which host
-/// that agent is on, and the place it works in. Both are the map's to
+/// that agent is on, and its workset and directory. Both are the map's to
 /// answer, so the caller looks them up and hands them in.
 #[derive(Clone, Debug, Default)]
 pub struct StartBase {
     pub host: Option<HostId>,
-    pub place: Option<Place>,
+    pub agent: Option<(WorksetId, Utf8PathBuf)>,
+}
+
+/// Where a new agent starts. Each carries exactly what it needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// A fresh isolated workset holding a clone of `repo` (a URL or a
+    /// host-side path) at `rev`.
+    NewOn { repo: Utf8PathBuf, rev: String },
+    /// Beside another agent, in its workset and directory, seeing its
+    /// edits at once.
+    Join {
+        workset: WorksetId,
+        cwd: Utf8PathBuf,
+    },
+    /// A host workset: the host as it is, in `cwd`.
+    Here { cwd: Utf8PathBuf },
+}
+
+/// What a start asks of the host.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Creation {
+    Workset(CreateWorkset),
+    Eval(Eval),
+}
+
+impl Start {
+    /// The call that starts it, with the user's first message, which the
+    /// host mails to the agent the code creates.
+    pub fn creation(&self, runtime: &Runtime, message: Option<Vec<ContentPart>>) -> Creation {
+        match self {
+            Self::NewOn { repo, rev } => Creation::Workset(CreateWorkset {
+                kind: WorksetKind::Isolated,
+                code: snippets::new_agent_on(repo, rev, runtime),
+                message,
+            }),
+            Self::Here { cwd } => Creation::Workset(CreateWorkset {
+                kind: WorksetKind::Host { cwd: cwd.clone() },
+                code: snippets::new_agent_in(cwd, runtime),
+                message,
+            }),
+            Self::Join { workset, cwd } => Creation::Eval(Eval {
+                workset: *workset,
+                code: snippets::new_agent_in(cwd, runtime),
+                message,
+            }),
+        }
+    }
 }
 
 /// Whether text names a repository to clone rather than a place on a
@@ -123,7 +170,7 @@ pub fn parse_start(
     workdir: Option<Workdir>,
     placement: Placement,
     base: StartBase,
-) -> Result<(HostId, StartMode), String> {
+) -> Result<(HostId, Start), String> {
     let require_workdir = || {
         workdir.clone().ok_or_else(|| {
             "no repository for the new agent: type its URL in the \
@@ -166,7 +213,7 @@ pub fn parse_start(
             }
         })?,
     };
-    let start = match (mode, target, base.place) {
+    let start = match (mode, target, base.agent) {
         (StartFieldMode::NewOn, "", _) => {
             return Err(
                 "pick a base: a git revision like `origin/main` or an agent label".to_owned(),
@@ -187,9 +234,9 @@ pub fn parse_start(
             {
                 return Err(format!("no agent named `{target}`"));
             }
-            StartMode::NewOn {
+            Start::NewOn {
                 repo: require_workdir()?.path,
-                revset: if target.eq_ignore_ascii_case(DEFAULT_START) {
+                rev: if target.eq_ignore_ascii_case(DEFAULT_START) {
                     AUTO_BASE_REV
                 } else {
                     target
@@ -197,59 +244,17 @@ pub fn parse_start(
                 .to_owned(),
             }
         }
-        (StartFieldMode::Join, _, Some(place)) => StartMode::Join(place),
+        (StartFieldMode::Join, _, Some((workset, cwd))) => Start::Join { workset, cwd },
         (StartFieldMode::Join, target, None) => {
             return Err(format!(
                 "join target must be an agent label, not `{target}`"
             ));
         }
-        (StartFieldMode::Here, _, _) => StartMode::Here {
+        (StartFieldMode::Here, _, _) => Start::Here {
             cwd: require_workdir()?.path,
         },
     };
     Ok((host, start))
-}
-
-pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "" | "med-eng" => Ok(AgentRole::default()),
-        "mini-eng" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        }),
-        "high-eng" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        }),
-        "med1-eng" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium1,
-        }),
-        "high1-eng" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High1,
-        }),
-        other => Err(format!(
-            "unknown role `{other}`; use mini-eng, med-eng, high-eng, med1-eng, or high1-eng"
-        )),
-    }
-}
-
-pub fn cycle_agent_role_text(current: &str) -> &'static str {
-    match parse_agent_role(current).unwrap_or_default() {
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        } => "med-eng",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        } => "high-eng",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        } => "med1-eng",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium1,
-        } => "high1-eng",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High1,
-        }
-        | AgentRole::Advisor { .. } => "mini-eng",
-    }
 }
 
 #[cfg(test)]
@@ -297,7 +302,7 @@ mod tests {
     fn placement_takes_the_agent_base_then_the_choice_then_the_default() {
         let base_on = |host: u32| StartBase {
             host: Some(HostId(host)),
-            place: None,
+            agent: None,
         };
         let start = |placement, base| {
             parse_start(
@@ -328,26 +333,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_and_cycles_current_agent_roles() {
-        assert_eq!(parse_agent_role("").unwrap(), AgentRole::default());
-        assert_eq!(parse_agent_role("med-eng").unwrap(), AgentRole::default());
-        assert_eq!(
-            parse_agent_role("mini-eng").unwrap(),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Mini,
-            }
-        );
-        assert_eq!(cycle_agent_role_text("mini-eng"), "med-eng");
-        assert_eq!(cycle_agent_role_text("med-eng"), "high-eng");
-        assert_eq!(cycle_agent_role_text("high-eng"), "med1-eng");
-        assert_eq!(cycle_agent_role_text("med1-eng"), "high1-eng");
-        assert_eq!(cycle_agent_role_text("high1-eng"), "mini-eng");
-        for retired in ["eng", "eng-low", "eng-cheap", "eng-high", "eng-ultra"] {
-            assert!(parse_agent_role(retired).is_err(), "{retired}");
-        }
-    }
-
     /// A base that names an agent on one host and a workdir on another is
     /// refused in words, not resolved to whichever came last.
     #[test]
@@ -364,7 +349,7 @@ mod tests {
             Placement::default(),
             StartBase {
                 host: Some(HostId(1)),
-                place: None,
+                agent: None,
             },
         )
         .expect_err("two hosts cannot both be right");
@@ -388,14 +373,14 @@ mod tests {
             Placement::default(),
             StartBase {
                 host: Some(HostId(1)),
-                place: None,
+                agent: None,
             },
         )
         .expect("a workdir is all in place needs");
         assert_eq!(host, HostId(2));
         assert_eq!(
             start,
-            StartMode::Here {
+            Start::Here {
                 cwd: Utf8PathBuf::from("/src/notes")
             }
         );
@@ -424,9 +409,9 @@ mod tests {
         assert_eq!(host, HostId(7));
         assert_eq!(
             start,
-            StartMode::NewOn {
+            Start::NewOn {
                 repo: Utf8PathBuf::from("/src/rho"),
-                revset: AUTO_BASE_REV.to_owned(),
+                rev: AUTO_BASE_REV.to_owned(),
             }
         );
     }
@@ -449,5 +434,51 @@ mod tests {
         )
         .expect_err("nothing says where the agent works");
         assert!(refusal.contains("type its URL in the Workdir field"));
+    }
+
+    /// Each start is the call it needs: a new workset of the right kind, or
+    /// code in the workset the agent joins, and the message rides beside
+    /// the code, never in it.
+    #[test]
+    fn each_start_is_the_call_it_needs() {
+        let runtime = Runtime::parse("sol-high").unwrap();
+        let message = Some(vec![ContentPart::Text {
+            text: "print('pwned')".into(),
+        }]);
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let joined = Start::Join {
+            workset,
+            cwd: "/src/rho".into(),
+        }
+        .creation(&runtime, message.clone());
+        let Creation::Eval(eval) = joined else {
+            panic!("joining is code in the workset joined: {joined:?}");
+        };
+        assert_eq!(eval.workset, workset);
+        assert!(eval.code.contains("new_agent(cwd=\"/src/rho\""));
+        assert_eq!(eval.message, message);
+        assert!(!eval.code.contains("pwned"), "the message is not code");
+
+        let Creation::Workset(here) = (Start::Here {
+            cwd: "/home/me".into(),
+        })
+        .creation(&runtime, None) else {
+            panic!("in place is a workset of its own");
+        };
+        assert_eq!(
+            here.kind,
+            WorksetKind::Host {
+                cwd: "/home/me".into()
+            }
+        );
+        let Creation::Workset(fresh) = (Start::NewOn {
+            repo: "https://x/y".into(),
+            rev: "main".into(),
+        })
+        .creation(&runtime, None) else {
+            panic!("a new clone is a workset of its own");
+        };
+        assert_eq!(fresh.kind, WorksetKind::Isolated);
+        assert!(fresh.code.contains("repo=\"https://x/y\", rev=\"main\""));
     }
 }

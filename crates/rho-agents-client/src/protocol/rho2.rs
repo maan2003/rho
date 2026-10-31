@@ -1,7 +1,6 @@
 //! The rho2 agents protocol
 //! ([ARCH-rho2](../../../../agent-host/specs/ARCH-rho2.md)): worksets, the
-//! agent directory and mail. It replaces the parent module once the GUI and the
-//! host speak it; until then both live side by side.
+//! agent directory and mail.
 //!
 //! The session ([`Open::Session`]) carries the mail log, the directory, the
 //! rows of the worksets a client follows, and the live tails of the agents
@@ -13,7 +12,9 @@ use rho_agent_types::{
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use super::transcript::{DetailBody, Item, Live, RuntimeKind, Speaker, ToolOutcome, Usage};
+use super::transcript::{
+    DetailBody, Item, Live, RuntimeKind, RuntimeState, Speaker, ToolOutcome, Usage,
+};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
@@ -48,8 +49,18 @@ rho_rpc::calls! {
         DeleteWorksets(DeleteWorksets) -> ();
         /// Bulk: one workset's rows from `from`, a page at a time.
         WorksetLog(WorksetLog) -> WorksetLogPage, priority None;
-        // The usage, quota, account and visualization calls move here from
-        // the parent module when it goes; a type has one `Call` impl.
+        // Bulk: an answer that waits behind interactive traffic.
+        Visualization(super::Visualization) -> super::VisualizationContent, priority None;
+        /// Answered with the recorded visualization's id.
+        RecordVisualization(super::RecordVisualization) -> String;
+        QuotaUsage(super::QuotaUsage) -> Vec<super::QuotaSummary>;
+        QuotaHistory(super::QuotaHistory) -> Vec<super::QuotaSeries>;
+        GlobalUsage(super::GlobalUsage) -> Vec<super::AgentUsageSeries>;
+        AgentCostDistribution(super::AgentCostDistribution) -> Vec<super::AgentCostSeries>;
+        ClaudeAccounts(super::ClaudeAccounts) -> super::ClaudeAccountList;
+        /// Answered with the accounts as they stand after the switch.
+        SetClaudeAccount(super::SetClaudeAccount) -> super::ClaudeAccountList;
+        SetAuthAccountEnabled(super::SetAuthAccountEnabled) -> ();
     }
 }
 
@@ -183,6 +194,13 @@ pub enum ServerFrame {
     Live {
         agent_id: AgentId,
         live: Live,
+    },
+    /// What a loaded agent's runtime is doing, for every agent and not only
+    /// the focused ones: after `Hello`, and on change. The list and the
+    /// dealer read it (a stopped agent is a card).
+    Status {
+        agent_id: AgentId,
+        state: RuntimeState,
     },
     Detail {
         workset: WorksetId,
@@ -360,3 +378,100 @@ impl LogEvent {
 
 /// What a mail to the user is for, on the wire with the mail.
 pub type MailKind = SendKind;
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::{Address, AgentIdDomain};
+
+    use super::*;
+
+    fn round_trips<
+        T: senax_encoder::Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,
+    >(
+        frame: T,
+    ) {
+        let bytes = senax_encoder::pack(&frame).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: T = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn frames_round_trip() {
+        let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        round_trips(ClientFrame::FollowMail { since: MailId(9) });
+        round_trips(ClientFrame::FollowWorksets {
+            from: vec![(workset, Wpos(3))],
+        });
+        round_trips(ServerFrame::Mail {
+            mails: vec![Mail {
+                id: MailId(4),
+                at: UnixMs(5),
+                from: Address::Agent(agent_id),
+                to: Address::User,
+                re: Some(MailId(2)),
+                kind: Some(SendKind::Ask),
+                content: vec![ContentPart::Text {
+                    text: "which branch?".into(),
+                }],
+            }],
+        });
+        round_trips(ServerFrame::Status {
+            agent_id,
+            state: RuntimeState {
+                inference: super::super::transcript::InferenceState::Failed {
+                    error: "quota".into(),
+                },
+                ..Default::default()
+            },
+        });
+        round_trips(ServerFrame::Rows {
+            workset,
+            rows: vec![(
+                Wpos(7),
+                LogEvent::Input {
+                    agent: agent_id,
+                    mail: Some(MailId(4)),
+                    text: "hi".into(),
+                    wake: InputWake::Person,
+                    at: UnixMs(8),
+                },
+            )],
+        });
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        let agent = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
+        for request in [
+            Request::from(PostMail {
+                client_id: 7,
+                to: agent,
+                re: None,
+                content: vec![ContentPart::Image {
+                    media_type: "image/gif".to_owned(),
+                    data: vec![1, 2, 3],
+                }],
+            }),
+            CreateWorkset {
+                kind: WorksetKind::Host {
+                    cwd: "/src/notes".into(),
+                },
+                code: "new_agent()".into(),
+                message: None,
+            }
+            .into(),
+            Cancel { agent }.into(),
+            super::super::QuotaUsage.into(),
+            super::super::SetAuthAccountEnabled {
+                name: "work".to_owned(),
+                enabled: false,
+            }
+            .into(),
+        ] {
+            round_trips(Open::Request(request));
+        }
+        round_trips(rho_rpc::protocol::Answer::Done(MailId(3)));
+    }
+}

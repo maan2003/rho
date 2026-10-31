@@ -39,9 +39,9 @@ own, reads it through to its end. Opening it reads nothing.
 | A5 | Several unread sends | one card, of the strongest kind, counting from its oldest unread send |
 | A6 | Read | nothing until a newer ask or result |
 | A7 | The user wrote within the hour before the send | a bonus, fading over the hour |
-| A8 | Notice: it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask |
-| A9 | Notice: an error the host retries by itself | nothing |
-| A10 | An engineer another agent started for the user | its brief opens the conversation as context, never unread; it deals by its own sends |
+| A8 | Its runtime reports it stopped on an error and will not go on alone (retries run out, crashed, needs an account or an approval) | as an ask, until the runtime runs again or the user writes |
+| A9 | Its runtime retries an error by itself | nothing |
+| A10 | An engineer another agent started for the user | its brief, mail from that agent, is context, never unread; it deals by its own sends |
 | A11 | Made by another agent for its own work | nothing; it belongs to that agent |
 | A12 | Running, waiting, or idle | changes nothing |
 | A13 | Muted, or its host is gone | nothing |

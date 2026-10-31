@@ -1,5 +1,5 @@
 //! How a client draws an agent: the block list and status it folds from
-//! the mirror and the live tail. Nothing here crosses the wire.
+//! the workset rows, mail, and the live tail. Nothing here crosses the wire.
 
 use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -26,14 +26,6 @@ pub struct UiAgentState {
     #[senax(default)]
     pub exec_timings:
         std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiNotebookActivity {
-    pub responding: bool,
-    pub running_tasks: u32,
-    pub checkin_at: Option<UnixMs>,
-    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

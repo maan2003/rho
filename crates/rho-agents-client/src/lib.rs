@@ -1,8 +1,9 @@
 //! The agents, as the client holds them.
 //!
-//! A transcript is the fold of an agent's log with the host's live tail on
-//! its end, and this crate owns every step of that: the host frames that
-//! carry it, the fold on its own thread ([`model`]) and the disk copy
+//! An agent is its directory entry and the fold of its mail; a transcript
+//! is the fold of its workset's rows and its mail, with the host's live
+//! tail on its end. This crate owns every step of that: the host frames
+//! that carry it, the fold on its own thread ([`model`]) and the disk copy
 //! ([`cache`]). What crosses out is agents as they now stand; nothing above
 //! needs to know there is a fold underneath. Nothing here draws: the
 //! screens are `rho-agents-view`'s.
@@ -16,7 +17,6 @@ pub mod protocol;
 pub mod cache;
 #[cfg(feature = "client")]
 pub mod create;
-#[cfg(feature = "client")]
 #[cfg(feature = "client")]
 pub mod find;
 #[cfg(feature = "client")]
@@ -34,6 +34,8 @@ pub mod remote;
 #[cfg(feature = "client")]
 pub mod session;
 #[cfg(feature = "client")]
+pub mod snippets;
+#[cfg(feature = "client")]
 pub mod state;
 #[cfg(feature = "client")]
 pub mod store;
@@ -43,13 +45,13 @@ pub mod stream;
 pub mod usage;
 
 #[cfg(feature = "client")]
-pub use create::{StartBase, StartFieldMode};
+pub use create::{Creation, Start, StartBase, StartFieldMode};
 #[cfg(feature = "client")]
 pub use find::AgentHit;
 #[cfg(feature = "client")]
 pub use fold::{
-    AgentIdentity, DIGEST_VERSION, Digest, MirroredAgent, Said, TranscriptFold, Unread, Verdict,
-    one_line, transcript,
+    AgentIdentity, ConversationPos, Digest, MirroredAgent, Said, TranscriptFold, TranscriptRow,
+    Unread, Verdict, one_line, transcript,
 };
 #[cfg(feature = "client")]
 pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};

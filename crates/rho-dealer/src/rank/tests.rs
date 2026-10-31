@@ -5,10 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned};
-use rho_agent_types::{AgentId, AgentIdDomain, AgentPos, SendKind, UnixMs};
+use rho_agent_types::{
+    Address, AgentId, AgentIdDomain, ContentPart, Mail, MailId, SendKind, UnixMs, props,
+};
 use rho_agents_client::fold::MirroredAgent;
-use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, Speaker, TranscriptEvent};
-use rho_agents_client::{AgentMap, HostId};
+use rho_agents_client::protocol::transcript::{InferenceState, RuntimeState};
+use rho_agents_client::{AgentIdentity, AgentMap, HostId};
 use rho_slack::config::WorkspaceName;
 use rho_slack::model::Model;
 use rho_slack::types::{ChannelId, Conversation, ConversationKind, Message, Ts, User, UserId};
@@ -32,7 +34,10 @@ enum Said {
 struct World {
     agents: AgentMap,
     host: HostId,
-    pos: HashMap<AgentId, u64>,
+    /// Agents made so far, for the next one's id.
+    made: u64,
+    /// The host's newest mail.
+    mail: u64,
     slack: Model,
     ts: u64,
     marks: Marks,
@@ -83,7 +88,8 @@ fn world_in(zone: TimeZone) -> World {
     World {
         agents,
         host,
-        pos: HashMap::new(),
+        made: 0,
+        mail: 0,
         slack,
         ts: 0,
         marks: Marks::default(),
@@ -114,40 +120,65 @@ impl World {
         self.now.timestamp().as_millisecond() as u64
     }
 
-    /// One row of an agent's story, folded the way the client folds it.
-    fn log(&mut self, agent_id: AgentId, event: TranscriptEvent) {
-        let pos = self.pos.entry(agent_id).or_insert(0);
-        let mirrored = match self.agents.mirrored(agent_id) {
-            Some(mirrored) => {
-                let mut mirrored = mirrored.clone();
-                mirrored.tell(AgentPos(*pos), &event);
-                mirrored
-            }
-            None => MirroredAgent::new(self.host, agent_id, &event).unwrap(),
-        };
-        *pos += 1;
+    /// One agent as the model would hand it up, changed by `change`.
+    fn fold(&mut self, agent_id: AgentId, change: impl FnOnce(&mut MirroredAgent)) {
+        let mut mirrored = self
+            .agents
+            .mirrored(agent_id)
+            .expect("an agent made by the world")
+            .clone();
+        change(&mut mirrored);
         self.agents.told(vec![mirrored]);
     }
 
+    /// One mail on the host's log, folded the way the client folds it.
+    fn mail(&mut self, from: Address, to: Address, kind: Option<SendKind>) {
+        self.mail += 1;
+        let mail = Mail {
+            id: MailId(self.mail),
+            at: UnixMs(self.ms()),
+            from,
+            to,
+            re: None,
+            kind,
+            content: vec![ContentPart::Text {
+                text: "update".into(),
+            }],
+        };
+        for address in [from, to] {
+            if let Address::Agent(agent_id) = address
+                && self.agents.mirrored(agent_id).is_some()
+            {
+                self.fold(agent_id, |mirrored| {
+                    mirrored.tell(&mail);
+                });
+            }
+        }
+    }
+
+    /// What the agent's runtime reports, folded the way the model folds it.
+    fn status(&mut self, node: &NodeId, inference: InferenceState) {
+        let (head, at) = (MailId(self.mail), UnixMs(self.ms()));
+        let state = RuntimeState {
+            inference,
+            ..Default::default()
+        };
+        self.fold(Self::id(node), |mirrored| {
+            mirrored.digest.observe(&state, head, at);
+        });
+    }
+
+    /// An agent the user's policy made: user-facing unless it has a parent.
     fn agent_under(&mut self, name: &str, parent: Option<AgentId>) -> NodeId {
-        let agent_id = AgentId::from_counter(self.pos.len() as u64 + 1, &AgentIdDomain(0)).unwrap();
-        let at = UnixMs(self.ms());
-        self.log(
-            agent_id,
-            TranscriptEvent::Created {
-                role: rho_agent_types::AgentRole::default(),
-                runtime: RuntimeKind::Rho,
-                place: rho_agent_types::Place {
-                    workset: Some("0123456789ab".parse().unwrap()),
-                    cwd: "/src/repo".into(),
-                },
-                spawned_by: SpawnedBy::Direct,
-                spawn_name: None,
-                parent,
-                model: "sol".into(),
-                at,
-            },
-        );
+        self.made += 1;
+        let agent_id = AgentId::from_counter(self.made, &AgentIdDomain(0)).unwrap();
+        let spec_props = match parent {
+            Some(parent) => [(props::PARENT.to_owned(), parent.encoded())].into(),
+            None => [(props::USER_FACING.to_owned(), "true".to_owned())].into(),
+        };
+        let identity = AgentIdentity::for_test(agent_id, spec_props, UnixMs(self.ms()));
+        self.agents
+            .told(vec![MirroredAgent::new(self.host, identity)]);
         let node = NodeId::Agent(agent_id);
         self.names.insert(node.clone(), name.into());
         node
@@ -162,16 +193,7 @@ impl World {
     }
 
     fn sends(&mut self, node: &NodeId, kind: SendKind) {
-        let at = UnixMs(self.ms());
-        self.log(
-            Self::id(node),
-            TranscriptEvent::MessageSent {
-                to: None,
-                text: "update".into(),
-                kind,
-                at,
-            },
-        );
+        self.mail(Address::Agent(Self::id(node)), Address::User, Some(kind));
     }
 
     fn finishes(&mut self, node: &NodeId) {
@@ -188,26 +210,16 @@ impl World {
     }
 
     fn stops(&mut self, node: &NodeId) {
-        let at = UnixMs(self.ms());
-        self.log(
-            Self::id(node),
-            TranscriptEvent::Stopped {
+        self.status(
+            node,
+            InferenceState::Failed {
                 error: "boom".into(),
-                at,
             },
         );
     }
 
     fn writes_to(&mut self, node: &NodeId) {
-        let at = UnixMs(self.ms());
-        self.log(
-            Self::id(node),
-            TranscriptEvent::ClaudeMessage {
-                speaker: Speaker::User,
-                text: "go on".into(),
-                at,
-            },
-        );
+        self.mail(Address::User, Address::Agent(Self::id(node)), None);
     }
 
     fn newest(&self, node: &NodeId) -> u64 {
@@ -540,16 +552,24 @@ fn a9_an_error_the_host_retries_is_nothing() {
     let mut w = world();
     let a = w.agent("a");
     let at = UnixMs(w.ms());
-    w.log(
-        World::id(&a),
-        TranscriptEvent::Failed {
-            text: String::new(),
-            error: "overloaded".into(),
-            retrying: true,
+    w.status(
+        &a,
+        InferenceState::Retrying {
             at,
+            error: "overloaded".into(),
         },
     );
     assert_eq!(w.hand(), "");
+    w.stops(&a);
+    assert_eq!(w.hand(), "a · stopped · 0m ago");
+    w.status(
+        &a,
+        InferenceState::Retrying {
+            at,
+            error: "overloaded".into(),
+        },
+    );
+    assert_eq!(w.hand(), "", "retrying again, it is running");
 }
 
 #[test]
@@ -557,15 +577,10 @@ fn a10_an_engineer_started_for_the_user_deals_by_its_own_sends() {
     let mut w = world();
     let parent = w.agent("parent");
     let a = w.agent("a");
-    let at = UnixMs(w.ms());
-    w.log(
-        World::id(&a),
-        TranscriptEvent::Received {
-            id: 1,
-            from: Some(World::id(&parent)),
-            text: "the brief".into(),
-            at,
-        },
+    w.mail(
+        Address::Agent(World::id(&parent)),
+        Address::Agent(World::id(&a)),
+        None,
     );
     assert_eq!(w.hand(), "", "its brief is context, never unread");
     w.asks(&a);
