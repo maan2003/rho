@@ -17,10 +17,11 @@ use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
 use rho_agent_types::{AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, TopicId, Wpos};
-use rho_db::{RhoDb, Sen, SenValue};
+use rho_db::{Lenient, RhoDb, Sen, SenValue};
 
 use crate::chat::HostTopic;
 use crate::fold::AgentIdentity;
+use crate::from_main;
 use crate::outbox::Outgoing;
 use crate::protocol::worksets::LogEvent;
 
@@ -55,15 +56,23 @@ const OUTBOX: TableDefinition<(u64, u64), Sen<Outgoing>> =
 /// same write, so a message is never in both or in neither.
 const DRAFTS: TableDefinition<(u64, u64), &str> = TableDefinition::new("gui_topic_draft_v1");
 
+/// Temporary ([`crate::from_main`]): what a GUI that ran `main` kept of
+/// the user's unsent words, by agent. Read through [`Lenient`], so a row
+/// that does not decode stays where it is. Each table is dropped once
+/// everything in it is carried into the tables above.
+const MAIN_OUTBOX: TableDefinition<(AgentId, u64), Lenient<from_main::Outgoing>> =
+    TableDefinition::new("gui_agent_outbox_v1");
+const MAIN_DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_draft_v1");
+
 /// Tables nothing reads: the per-agent journal mirror the workset log
 /// replaced, the mail the chat replaced, and their retired formats.
-/// Dropped on open, every open. The mail outbox (`gui_agent_outbox_v1`)
-/// and thread drafts (`gui_thread_draft_v1`) are the user's words and
-/// stay where they are, unread.
-const RETIRED_TABLES: [&str; 40] = [
+/// Dropped on open, every open.
+const RETIRED_TABLES: [&str; 41] = [
     // Mail, which the chat replaced; the host keeps all of it as chat.
+    // Thread drafts were never shipped, so they held no one's words.
     "gui_host_v1",
     "gui_mail_v1",
+    "gui_thread_draft_v1",
     // The rows of whole worksets; a transcript reads its agent's alone.
     "gui_workset_rows_v1",
     // A copy of the dealer's marks per agent, which only agent cards read.
@@ -171,8 +180,12 @@ enum Write {
     /// A message kept until its host takes it, or `None` once it has.
     /// A new one in a topic was the topic's draft, which goes with it.
     Outgoing(u64, u64, Option<Outgoing>),
+    /// A message kept, told where it now goes; no draft goes with it.
+    Retarget(u64, u64, Outgoing),
     /// A topic's draft as it stands; empty drops it.
     Draft(HostTopic, String),
+    /// `main`'s words carried into topics, and gone from `main`'s tables.
+    Carry(from_main::Carried),
     /// Everything heard from a host, gone: its agent host has another
     /// database.
     Reset(String),
@@ -228,6 +241,8 @@ impl Mirror {
             for table in RETIRED_TABLES {
                 write.delete_table(table);
             }
+            drop_if_empty(&mut write, MAIN_DRAFTS);
+            drop_if_empty(&mut write, MAIN_OUTBOX);
             write.commit();
         });
         let (sender, receiver) = mpsc::channel();
@@ -376,6 +391,35 @@ impl Mirror {
             .collect()
     }
 
+    /// What is left of `main`'s tables, if anything.
+    pub fn read_main_leftovers(&self) -> from_main::Leftovers {
+        let read = self.db.read();
+        let mut leftovers = from_main::Leftovers::default();
+        if read.has_table(MAIN_DRAFTS.name()) {
+            leftovers.drafts = read
+                .open_table(MAIN_DRAFTS)
+                .iter()
+                .map(|(key, value)| (key.value(), value.value().to_owned()))
+                .collect();
+        }
+        if read.has_table(MAIN_OUTBOX.name()) {
+            let mut unsent = read
+                .open_table(MAIN_OUTBOX)
+                .iter()
+                .filter_map(|(key, value)| Some((key.value(), value.value()?)))
+                .collect::<Vec<_>>();
+            unsent.sort_by_key(|(_, outgoing)| outgoing.at);
+            for ((agent, id), outgoing) in unsent {
+                leftovers
+                    .outbox
+                    .entry(agent)
+                    .or_default()
+                    .push((id, outgoing));
+            }
+        }
+        leftovers
+    }
+
     /// Waits for everything already queued to commit.
     pub fn flush(&self) {
         let (send, receive) = mpsc::sync_channel(0);
@@ -517,6 +561,11 @@ fn apply(
                     .remove((machine_seed, topic.0.0));
             }
         }
+        Write::Retarget(machine_seed, id, outgoing) => {
+            transaction
+                .open_table(OUTBOX)
+                .insert((machine_seed, id), SenValue::borrowed(&outgoing));
+        }
         Write::Outgoing(machine_seed, id, None) => {
             transaction.open_table(OUTBOX).remove((machine_seed, id));
         }
@@ -529,6 +578,7 @@ fn apply(
                 table.insert(key, text.as_str());
             }
         }
+        Write::Carry(carried) => carry(transaction, &carried),
         Write::Reset(host) => {
             transaction.open_table(HOSTS).remove(host.as_str());
             {
@@ -566,6 +616,58 @@ fn apply(
         }
         Write::Flush(done) => flushed.push(done),
     }
+}
+
+/// Drops one of `main`'s tables once nothing is left in it, or when it
+/// never held anything.
+fn drop_if_empty<K, V>(write: &mut rho_db::WriteTxn, definition: TableDefinition<K, V>)
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    let empty = write
+        .try_open_table(definition)
+        .is_some_and(|table| table.iter().next().is_none());
+    if empty {
+        write.delete_table(definition.name());
+    }
+}
+
+/// `main`'s words into the chat's tables and out of `main`'s, at once, so
+/// they are never in both or in neither. A topic's draft already there is
+/// kept, after the older words.
+fn carry(transaction: &mut rho_db::WriteTxn, carried: &from_main::Carried) {
+    {
+        let mut drafts = transaction.open_table(DRAFTS);
+        for (_, topic, text) in &carried.drafts {
+            let key = (topic.machine_seed, topic.topic.0.0);
+            let text = match drafts.get(key).map(|held| held.value().to_owned()) {
+                Some(held) if !held.is_empty() => format!("{text}\n\n{held}"),
+                _ => text.clone(),
+            };
+            drafts.insert(key, text.as_str());
+        }
+    }
+    {
+        let mut outbox = transaction.open_table(OUTBOX);
+        for (_, machine_seed, id, outgoing) in &carried.outbox {
+            outbox.insert((*machine_seed, *id), SenValue::borrowed(outgoing));
+        }
+    }
+    {
+        let mut drafts = transaction.open_table(MAIN_DRAFTS);
+        for (agent, ..) in &carried.drafts {
+            drafts.remove(agent);
+        }
+    }
+    {
+        let mut outbox = transaction.open_table(MAIN_OUTBOX);
+        for (agent, _, id, _) in &carried.outbox {
+            outbox.remove((*agent, *id));
+        }
+    }
+    drop_if_empty(transaction, MAIN_DRAFTS);
+    drop_if_empty(transaction, MAIN_OUTBOX);
 }
 
 /// Only host-owned copies go away: the agent, what reached it, and its
@@ -733,6 +835,10 @@ pub fn write_outgoing(machine_seed: u64, id: u64, outgoing: Option<Outgoing>) {
     send(Write::Outgoing(machine_seed, id, outgoing));
 }
 
+pub fn retarget_outgoing(machine_seed: u64, id: u64, outgoing: Outgoing) {
+    send(Write::Retarget(machine_seed, id, outgoing));
+}
+
 pub fn write_draft(topic: HostTopic, text: String) {
     send(Write::Draft(topic, text));
 }
@@ -743,6 +849,16 @@ pub fn read_drafts() -> Vec<(HostTopic, String)> {
 
 pub fn read_outbox() -> Vec<(u64, u64, Outgoing)> {
     read(Mirror::read_outbox)
+}
+
+pub fn read_main_leftovers() -> from_main::Leftovers {
+    read(Mirror::read_main_leftovers)
+}
+
+pub fn carry_from_main(carried: from_main::Carried) {
+    if !carried.is_empty() {
+        send(Write::Carry(carried));
+    }
 }
 
 pub fn reset_host(host: &str) {
@@ -993,6 +1109,113 @@ mod tests {
         assert_eq!(mirror.read_rows(b).len(), 1, "another host's rows stay");
         assert_eq!(mirror.read_outbox().len(), 1, "unsent words are the user's");
         assert_eq!(mirror.read_drafts(), [(draft, "half written".to_owned())]);
+    }
+
+    /// `main`'s words move into the chat's tables in the write that takes
+    /// them out of `main`'s, and each of `main`'s tables goes once empty.
+    /// A topic's own draft stays, after the older words.
+    #[test]
+    fn words_carried_from_main_leave_mains_tables() {
+        use crate::from_main;
+        const MAINS_OUTBOX: TableDefinition<(AgentId, u64), Sen<from_main::Outgoing>> =
+            TableDefinition::new("gui_agent_outbox_v1");
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (agent_id(1), agent_id(2));
+        let words = |text: &str| vec![ContentPart::Text { text: text.into() }];
+        let db = rho_db::client::open(dir.path()).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut write = db.write().await;
+                {
+                    let mut drafts = write.open_table(MAIN_DRAFTS);
+                    drafts.insert(a, "to a");
+                    drafts.insert(b, "to b");
+                }
+                {
+                    let mut outbox = write.open_table(MAINS_OUTBOX);
+                    for (agent, id, at) in [(a, 1, 20), (a, 2, 10), (b, 3, 30)] {
+                        let outgoing = from_main::Outgoing {
+                            at: UnixMs(at),
+                            content: words(&format!("message {id}")),
+                        };
+                        outbox.insert((agent, id), SenValue::borrowed(&outgoing));
+                    }
+                }
+                write.commit();
+            });
+        let mirror = Mirror::open_on(db).unwrap();
+        let leftovers = mirror.read_main_leftovers();
+        assert_eq!(
+            leftovers.drafts,
+            [(a, "to a".to_owned()), (b, "to b".to_owned())].into()
+        );
+        assert_eq!(
+            leftovers.outbox[&a]
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [2, 1],
+            "oldest first"
+        );
+        let in_topic = |n| HostTopic {
+            machine_seed: 9,
+            topic: topic(n),
+        };
+        mirror.send(Write::Draft(in_topic(4), "written since".into()));
+        let carried_a = from_main::Carried {
+            drafts: vec![(a, in_topic(4), "to a".into())],
+            outbox: [(2, 10), (1, 20)]
+                .map(|(id, at)| {
+                    (
+                        a,
+                        9,
+                        id,
+                        Outgoing {
+                            at: UnixMs(at),
+                            content: words(&format!("message {id}")),
+                            to: Destination::Topic(topic(4)),
+                        },
+                    )
+                })
+                .into(),
+        };
+        mirror.send(Write::Carry(carried_a));
+        mirror.flush();
+        let left = mirror.read_main_leftovers();
+        assert_eq!(left.drafts, [(b, "to b".to_owned())].into());
+        assert_eq!(left.outbox.keys().copied().collect::<Vec<_>>(), [b]);
+        assert_eq!(
+            mirror.read_drafts(),
+            [(in_topic(4), "to a\n\nwritten since".to_owned())]
+        );
+        assert_eq!(
+            mirror
+                .read_outbox()
+                .into_iter()
+                .map(|(seed, id, _)| (seed, id))
+                .collect::<Vec<_>>(),
+            [(9, 1), (9, 2)]
+        );
+        mirror.send(Write::Carry(from_main::Carried {
+            drafts: vec![(b, in_topic(5), "to b".into())],
+            outbox: vec![(
+                b,
+                9,
+                3,
+                Outgoing {
+                    at: UnixMs(30),
+                    content: words("message 3"),
+                    to: Destination::Topic(topic(5)),
+                },
+            )],
+        }));
+        mirror.flush();
+        assert!(mirror.read_main_leftovers().is_empty());
+        let read = mirror.db.read();
+        assert!(!read.has_table("gui_agent_draft_v1"));
+        assert!(!read.has_table("gui_agent_outbox_v1"));
     }
 
     /// Sending a message in a topic takes its draft in the same write, so

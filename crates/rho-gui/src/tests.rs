@@ -5879,6 +5879,191 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     );
 }
 
+/// A topic the user started is recent before any agent answers, and the
+/// buffer picker reaches it from Home, where it is open in no surface. A
+/// topic in which an agent only gave a status, mentioning nobody, is not.
+#[gpui::test]
+fn a_topic_the_user_started_is_recent_before_anyone_answers(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let mine = agent(791);
+    let quiet = agent(793);
+    let now = jiff::Timestamp::now().as_millisecond() as u64;
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(mine), ui_head(quiet)], 794),
+                window,
+                cx,
+            );
+            for (agent_id, event) in [
+                (
+                    mine,
+                    story::UiStoryEvent::UserMessage {
+                        text: "deploy the docs".to_owned(),
+                        at: UnixMs(now - 60_000),
+                    },
+                ),
+                (
+                    quiet,
+                    story::UiStoryEvent::Sent {
+                        text: "reading tests".to_owned(),
+                        kind: None,
+                        at: UnixMs(now - 30_000),
+                    },
+                ),
+            ] {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story::story(agent_id, vec![event]),
+                    window,
+                    cx,
+                );
+            }
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let home = workspace.home_view().expect("home is in view");
+            home.update(cx, |home, cx| home.toggle_recent(cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = home_text(&workspace, cx);
+    assert_eq!(
+        text.lines()
+            .skip_while(|line| !line.starts_with("recent"))
+            .collect::<Vec<_>>(),
+        ["recent ▾ 1", "  rho › deploy the docs  1m ago"],
+        "{text:?}"
+    );
+    let picked = workspace
+        .update(cx, |workspace, _, _| workspace.buffer_table())
+        .unwrap();
+    assert!(
+        picked.contains(&("rho › deploy the docs".to_owned(), "topic".to_owned())),
+        "{picked:?}"
+    );
+    assert!(
+        !picked
+            .iter()
+            .any(|(name, _)| name.contains("reading tests")),
+        "{picked:?}"
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.switch_buffer("rho › deploy the docs", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let current = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_surface_key_for_test()
+        })
+        .unwrap();
+    let crate::pane::SurfaceKey::Topic(topic) = current else {
+        panic!("expected the topic, on {current:?}");
+    };
+    workspace
+        .update(cx, |workspace, _, _| {
+            let (_, held) = workspace.chat.topic(topic).expect("a topic held");
+            assert_eq!(held.name, "deploy the docs");
+        })
+        .unwrap();
+}
+
+/// What the user was writing to agents under `main` lands in each agent's
+/// topic with the user once its host has told its chat: a draft in one
+/// agent's topic, an unsent message posted under its old id in the other
+/// agent's, not crossed.
+#[gpui::test]
+fn the_users_words_from_main_land_in_each_agents_topic(cx: &mut TestAppContext) {
+    use rho_agents_client::from_main::{Leftovers, Outgoing};
+    use rho_agents_client::protocol::worksets::Request;
+
+    let workspace = test_workspace(cx);
+    let (drafted, unsent) = (agent(801), agent(803));
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.carry_from_main_for_test(Leftovers {
+                drafts: [(drafted, "half a thought".to_owned())].into(),
+                outbox: [(
+                    unsent,
+                    vec![(
+                        41,
+                        Outgoing {
+                            at: UnixMs(9),
+                            content: vec![rho_agent_types::ContentPart::Text {
+                                text: "never sent".into(),
+                            }],
+                        },
+                    )],
+                )]
+                .into(),
+            });
+            // The host's migration wrote each agent's topic with the user
+            // before the stream opened, so its head is past them: they are
+            // told after the directory, and nothing is carried until they
+            // are.
+            let migrated = [drafted, unsent].map(|agent_id| {
+                story::story(
+                    agent_id,
+                    vec![story::UiStoryEvent::UserMessage {
+                        text: format!("hello {}", agent_id.encoded()),
+                        at: UnixMs(1),
+                    }],
+                )
+            });
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(drafted), ui_head(unsent)], 804),
+                window,
+                cx,
+            );
+            for frame in migrated {
+                story::feed(workspace, HostId::default(), frame, window, cx);
+            }
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let (drafted_topic, unsent_topic) = workspace
+        .update(cx, |workspace, _, _| {
+            (workspace.test_topic(drafted), workspace.test_topic(unsent))
+        })
+        .unwrap();
+    assert_ne!(drafted_topic, unsent_topic);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.saved_topic_draft_for_test(drafted_topic),
+                Some("half a thought")
+            );
+            assert_eq!(workspace.saved_topic_draft_for_test(unsent_topic), None);
+        })
+        .unwrap();
+    let calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "one message");
+    let (Request::Post(post), _) = &calls[0] else {
+        panic!("expected a post: {:?}", calls[0].0);
+    };
+    assert_eq!(post.client_id, 41, "under the id main gave it");
+    assert_eq!(post.topic, unsent_topic.topic);
+    assert_eq!(
+        rho_agent_types::transcript::text_content(&post.content),
+        "never sent"
+    );
+}
+
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
     workspace
         .update(cx, |workspace, _, cx| {

@@ -245,13 +245,23 @@ struct Held {
     /// Which database the host's ids count in; `None` until it says.
     machine_seed: Option<u64>,
     chat: HostChat,
+    /// The host has told its chat up to its head since the window held
+    /// it: what is here is all it has, not the disk copy alone.
+    told: bool,
 }
 
 impl ChatMap {
     /// What there is of a host's chat now: the disk copy, or nothing after
     /// the copy started over.
     pub fn load(&mut self, host: HostId, machine_seed: Option<u64>, chat: HostChat) {
-        self.hosts.insert(host, Held { machine_seed, chat });
+        self.hosts.insert(
+            host,
+            Held {
+                machine_seed,
+                chat,
+                told: false,
+            },
+        );
     }
 
     /// Which database a host's ids count in, once it has said.
@@ -263,9 +273,19 @@ impl ChatMap {
         self.hosts.entry(host).or_default().machine_seed = Some(machine_seed);
     }
 
-    /// Streams and topics as they now stand.
+    /// Streams and topics as they now stand, told once the host's chat
+    /// has caught up with its head.
     pub fn merge(&mut self, host: HostId, moved: HostChat) {
-        self.hosts.entry(host).or_default().chat.merge(moved);
+        let held = self.hosts.entry(host).or_default();
+        held.chat.merge(moved);
+        held.told = true;
+    }
+
+    /// The host's chat as it now stands, once the host has told all of
+    /// it; `None` while only the disk copy is held.
+    pub fn told_chat(&self, host: HostId) -> Option<(u64, &HostChat)> {
+        let held = self.hosts.get(&host).filter(|held| held.told)?;
+        Some((held.machine_seed?, &held.chat))
     }
 
     pub fn detach_host(&mut self, host: HostId) {
