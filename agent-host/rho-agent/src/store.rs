@@ -189,6 +189,17 @@ pub trait StoreRead {
     fn workset_row(&self, workset: WorksetId, pos: Wpos) -> Option<Record<'static>>;
     /// The agent's visible rows from `from`, rewinds applied.
     fn agent_rows(&self, agent: AgentId, from: Wpos) -> Vec<(Wpos, Record<'static>)>;
+    /// Up to `limit` of the agent's rows from `from`, every one as logged,
+    /// rewinds included and not applied.
+    fn agent_log(&self, agent: AgentId, from: Wpos, limit: usize) -> Vec<(Wpos, Record<'static>)>;
+    /// Up to `limit` of the agent's rows before `before`, newest first, as
+    /// logged.
+    fn agent_log_before(
+        &self,
+        agent: AgentId,
+        before: Wpos,
+        limit: usize,
+    ) -> Vec<(Wpos, Record<'static>)>;
 }
 
 impl StoreRead for ReadTxn {
@@ -243,15 +254,54 @@ impl StoreRead for ReadTxn {
         };
         // Rewinds are read from the agent's start, so one that hides rows
         // after `from` is seen even when it was made from before `from`.
-        let rows = self
-            .open_table(WORKSET_LOG)
-            .range(log_range(head.workset, head.created))
-            .map(|(key, record)| (Wpos(key.value().1), record.value().into_owned()))
-            .filter(|(_, record)| record.event.agent() == Some(agent))
+        let positions = agent_rows::after(self, agent, Wpos::ZERO, usize::MAX);
+        let rows = positions
+            .into_iter()
+            .map(|pos| {
+                (
+                    pos,
+                    self.workset_row(head.workset, pos).expect("an indexed row"),
+                )
+            })
             .collect();
         visible(rows)
             .into_iter()
             .filter(|(pos, _)| *pos >= from)
+            .collect()
+    }
+
+    fn agent_log(&self, agent: AgentId, from: Wpos, limit: usize) -> Vec<(Wpos, Record<'static>)> {
+        let Some(head) = self.agent(agent) else {
+            return Vec::new();
+        };
+        agent_rows::after(self, agent, from, limit)
+            .into_iter()
+            .map(|pos| {
+                (
+                    pos,
+                    self.workset_row(head.workset, pos).expect("an indexed row"),
+                )
+            })
+            .collect()
+    }
+
+    fn agent_log_before(
+        &self,
+        agent: AgentId,
+        before: Wpos,
+        limit: usize,
+    ) -> Vec<(Wpos, Record<'static>)> {
+        let Some(head) = self.agent(agent) else {
+            return Vec::new();
+        };
+        agent_rows::before(self, agent, before, limit)
+            .into_iter()
+            .map(|pos| {
+                (
+                    pos,
+                    self.workset_row(head.workset, pos).expect("an indexed row"),
+                )
+            })
             .collect()
     }
 }
@@ -274,6 +324,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
         self.init_chat_tables();
+        agent_rows::init(self);
     }
 
     fn create_workset(&mut self, workset: WorksetId, at: UnixMs, kind: WorksetKind, code: String) {
@@ -357,6 +408,7 @@ impl StoreWrite for WriteTxn {
                     // changes which rows those are.
                     self.open_table(WORKSET_LOG)
                         .insert((workset.0, pos.0), SenValue::borrowed(record));
+                    agent_rows::index(self, pos, record);
                     head.next = pos.next();
                     self.open_table(WORKSET_HEADS)
                         .insert(workset.0, SenValue::borrowed(&head));
@@ -369,6 +421,7 @@ impl StoreWrite for WriteTxn {
         }
         self.open_table(WORKSET_LOG)
             .insert((workset.0, pos.0), SenValue::borrowed(record));
+        agent_rows::index(self, pos, record);
         head.next = pos.next();
         self.open_table(WORKSET_HEADS)
             .insert(workset.0, SenValue::borrowed(&head));
@@ -392,6 +445,7 @@ impl StoreWrite for WriteTxn {
         };
         for agent in &head.agents {
             self.open_table(AGENT_HEADS).remove(*agent);
+            agent_rows::forget(self, *agent);
         }
         let positions: Vec<u64> = self
             .open_table(WORKSET_LOG)
@@ -417,11 +471,17 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         .expect("agent head")
         .value()
         .into_owned();
-    let rows: Vec<(Wpos, Record<'static>)> = write
-        .open_table(WORKSET_LOG)
-        .range(log_range(head.workset, head.created))
-        .map(|(key, record)| (Wpos(key.value().1), record.value().into_owned()))
-        .filter(|(_, record)| record.event.agent() == Some(agent))
+    let rows: Vec<(Wpos, Record<'static>)> = agent_rows::positions_in_write(write, agent)
+        .into_iter()
+        .map(|pos| {
+            let record = write
+                .open_table(WORKSET_LOG)
+                .get((head.workset.0, pos.0))
+                .expect("an indexed row")
+                .value()
+                .into_owned();
+            (pos, record)
+        })
         .collect();
     let mut cursor = NativeCursor {
         from: head.created,
@@ -446,6 +506,7 @@ pub fn wake_of(from: Address) -> InputWake {
     }
 }
 
+pub(crate) mod agent_rows;
 pub mod chat;
 pub(crate) mod from_main;
 

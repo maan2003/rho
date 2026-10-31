@@ -110,7 +110,6 @@ actions!(
         NoteOpenRow,
         MessagesOpen,
         HomeOpenRow,
-        ThreadActivity,
     ]
 );
 
@@ -357,13 +356,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("n", SearchRepeat, Some(&context)),
             KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
         ]);
-    }
-    // From a mail thread, what its agent did: its tool calls and their
-    // output. Vim's increment has no number to change in a thread, and the
-    // reply box is reached in insert mode, where the key stays the editor's.
-    for mode in ["normal", "helix_normal"] {
-        let context = format!("RhoThread > Editor && vim_mode == {mode}");
-        cx.bind_keys([KeyBinding::new("ctrl-a", ThreadActivity, Some(&context))]);
     }
     // Slack reads the same way: `enter` opens the row or the thread the
     // cursor is on, `i` goes to the composer and `enter` there sends, `q`

@@ -2538,8 +2538,8 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
     assert!(display_text(&workspace, cx).contains("unsent draft"));
     assert!(!display_text(&workspace, cx).contains("$ echo"));
 
-    // One key in a thread's normal mode is its agent's activity.
-    cx.simulate_keystrokes(*workspace, "escape ctrl-a");
+    // From a thread, the agent menu opens its agent's activity.
+    cx.simulate_keystrokes(*workspace, "escape space a a");
     cx.run_until_parked();
     assert_eq!(
         workspace

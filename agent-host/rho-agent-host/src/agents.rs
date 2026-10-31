@@ -14,9 +14,9 @@ use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, Works
 use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
-    AgentEntry, Cancel, ClientFrame, CreateWorkset, CreatedWorkset, DeleteWorksets, Eval,
-    EvalResult, LogEvent, Open, Post, Request, ServerFrame, StartTopic, WorksetEntry, WorksetLog,
-    WorksetLogPage,
+    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
+    DeleteWorksets, Eval, EvalResult, LogEvent, LogNext, Open, Post, Request, ServerFrame,
+    StartTopic, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -544,28 +544,30 @@ fn strip_row(
     stripped
 }
 
-/// One page of a workset's rows, stripped as the session strips them.
-fn workset_log_page(
-    db: &RhoDb,
-    WorksetLog { workset, from }: WorksetLog,
-) -> anyhow::Result<WorksetLogPage> {
-    let page = {
+/// One page of an agent's rows, stripped as the session strips them: read
+/// through the agent's index, so the workset's other rows cost nothing.
+fn agent_log_page(db: &RhoDb, AgentLog { agent, from }: AgentLog) -> anyhow::Result<AgentLogPage> {
+    let (page, end) = {
         let read = db.read();
-        anyhow::ensure!(
-            read.workset(workset).is_some(),
-            "no workset {workset} on this host"
-        );
-        read.workset_rows(workset, from, LOG_PAGE)
+        let head = read
+            .agent(agent)
+            .ok_or_else(|| anyhow::anyhow!("no agent {} on this host", agent.encoded()))?;
+        let end = read
+            .workset(head.workset)
+            .ok_or_else(|| anyhow::anyhow!("no workset {} on this host", head.workset))?
+            .next;
+        (read.agent_log(agent, from, LOG_PAGE), end)
     };
-    let next = (page.len() == LOG_PAGE)
-        .then(|| page.last().map(|(pos, _)| pos.next()))
-        .flatten();
+    let next = match page.last() {
+        Some((last, _)) if page.len() == LOG_PAGE => LogNext::Page(last.next()),
+        _ => LogNext::Follow(end),
+    };
     let mut befores = Befores::new();
     let rows = page
         .iter()
         .filter_map(|(pos, record)| Some((*pos, strip_row(db, &mut befores, *pos, record)?)))
         .collect();
-    Ok(WorksetLogPage { rows, next })
+    Ok(AgentLogPage { rows, next })
 }
 
 /// Answers one call with its handler's reply: the call names the reply's
@@ -672,9 +674,9 @@ where
             })
             .await
         }
-        Request::WorksetLog(call) => {
+        Request::AgentLog(call) => {
             respond(writer, call, |call| async {
-                workset_log_page(&services.db, call)
+                agent_log_page(&services.db, call)
             })
             .await
         }
@@ -1101,9 +1103,9 @@ mod tests {
     use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
     use rho_agent::store::StoreWrite as _;
     use rho_agent_types::{InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
-    use rho_agents_client::protocol::worksets::{LogEvent, WorksetLog};
+    use rho_agents_client::protocol::worksets::{AgentLog, LogEvent, LogNext};
 
-    use super::{detail, detail_result, workset_log_page};
+    use super::{agent_log_page, detail, detail_result};
 
     fn step(id: &str) -> Entry {
         Entry::Step {
@@ -1212,7 +1214,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
         // Rows 2..=5; the rewind at 6 takes back row 4 (exec-2) and on.
-        let (workset, _, positions) = workset(
+        let (workset, agent, positions) = workset(
             &db,
             vec![
                 native(step("exec-1")),
@@ -1233,7 +1235,7 @@ mod tests {
         .await;
         assert_eq!(positions[2], Wpos(4));
         let reports = |from| {
-            workset_log_page(&db, WorksetLog { workset, from })
+            agent_log_page(&db, AgentLog { agent, from })
                 .unwrap()
                 .rows
                 .into_iter()
@@ -1270,7 +1272,7 @@ mod tests {
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
         let spoken =
             "<realtime_delegation>\n  <input>fix &lt;b&gt;</input>\n</realtime_delegation>";
-        let (workset, agent, _) = workset(
+        let (_, agent, _) = workset(
             &db,
             vec![
                 Event::Input {
@@ -1302,10 +1304,10 @@ mod tests {
             ],
         )
         .await;
-        let rows = workset_log_page(
+        let rows = agent_log_page(
             &db,
-            WorksetLog {
-                workset,
+            AgentLog {
+                agent,
                 from: Wpos(2),
             },
         )
@@ -1342,6 +1344,315 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A workset shaped like a migrated one: many agents' rows merged by
+    /// time, a few agents active at once. Returns the workset, its agents
+    /// and the agent with the most rows.
+    async fn crowded_workset(
+        db: &rho_db::RhoDb,
+        agents: usize,
+        rows: usize,
+    ) -> (WorksetId, Vec<rho_agent_types::AgentId>) {
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let mut ids = Vec::new();
+        {
+            let mut write = db.write().await;
+            write.init_agent_tables();
+            write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
+            write.commit();
+        }
+        let cell = "x = 1\n".repeat(60);
+        let mut written = 0usize;
+        let mut created = 0usize;
+        // Agent `i` is active over rows [i * span, i * span + 4 * span).
+        let span = rows / agents;
+        while written < rows {
+            let mut write = db.write().await;
+            for _ in 0..10_000 {
+                if written >= rows {
+                    break;
+                }
+                while created < agents && created * span <= written {
+                    let agent = write.alloc_agent_id();
+                    write
+                        .append(
+                            workset,
+                            &Record {
+                                at: UnixMs(0),
+                                event: Event::AgentCreated {
+                                    agent,
+                                    spec: AgentSpec {
+                                        runtime: Runtime::Native {
+                                            model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                            profile: Default::default(),
+                                            cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                                        },
+                                        props: [("name".to_owned(), format!("crowded-{created}"))]
+                                            .into_iter()
+                                            .collect(),
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                    ids.push(agent);
+                    created += 1;
+                }
+                let active: Vec<_> = (0..created)
+                    .filter(|i| written < i * span + 4 * span)
+                    .collect();
+                let agent = ids[active[written % active.len()]];
+                let entry = match (written / active.len()) % 3 {
+                    0 => Entry::RequestSent {
+                        why: rho_agent::entry::Wake::Notify,
+                        report: Report::default(),
+                        compact: false,
+                    },
+                    _ => Entry::Step {
+                        exec: None,
+                        prose: String::new(),
+                        carry: rho_agent::inference::Carry::new(
+                            serde_json::json!({"items": [{
+                                "type": "custom_tool_call", "name": "exec",
+                                "call_id": format!("c{written}"), "input": cell
+                            }]}),
+                            vec![rho_agent::inference::Call::new(
+                                format!("c{written}"),
+                                cell.clone(),
+                            )],
+                            false,
+                        ),
+                        usage: None,
+                    },
+                };
+                write
+                    .append(
+                        workset,
+                        &Record {
+                            at: UnixMs(1),
+                            event: Event::Native { agent, entry },
+                        },
+                    )
+                    .unwrap();
+                written += 1;
+            }
+            write.commit();
+        }
+        (workset, ids)
+    }
+
+    /// An agent's log is its own rows, page by page, then where its
+    /// workset's next row goes: what following the workset starts from.
+    #[tokio::test]
+    async fn an_agents_log_is_its_rows_then_where_to_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        // Three agents over 6,000 rows: the middle one writes about a
+        // third of them, interleaved with the others, over several pages.
+        let (workset, agents) = crowded_workset(&db, 3, 6_000).await;
+        let agent = agents[1];
+        let read = db.read();
+        let expected =
+            rho_agent::store::StoreRead::workset_rows(&read, workset, Wpos::ZERO, usize::MAX)
+                .into_iter()
+                .filter(|(_, record)| record.event.agent() == Some(agent))
+                .map(|(pos, _)| pos)
+                .collect::<Vec<_>>();
+        let end = rho_agent::store::StoreRead::workset(&read, workset)
+            .unwrap()
+            .next;
+        drop(read);
+        assert!(expected.len() > 2 * super::LOG_PAGE, "it spans pages");
+
+        let mut from = Wpos(1);
+        let mut read = Vec::new();
+        let follow = loop {
+            let page = agent_log_page(&db, AgentLog { agent, from }).unwrap();
+            assert!(
+                page.rows
+                    .iter()
+                    .all(|(_, event)| event.agent() == Some(agent))
+            );
+            read.extend(page.rows.iter().map(|(pos, _)| *pos));
+            match page.next {
+                LogNext::Page(next) => from = next,
+                LogNext::Follow(at) => break at,
+            }
+        };
+        let expected_from = expected
+            .into_iter()
+            .filter(|pos| *pos >= Wpos(1))
+            .collect::<Vec<_>>();
+        assert_eq!(read, expected_from);
+        assert_eq!(follow, end);
+    }
+
+    /// Not a test: times reading a crowded workset's agent the way the
+    /// Activity view does. `cargo test --release -p rho-agent-host --lib
+    /// crowded_workset_log -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn crowded_workset_log() {
+        // `RHO_BENCH_DB` keeps the store, for a host to serve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("RHO_BENCH_DB")
+            .map_or_else(|| dir.path().join("rho.redb"), std::path::PathBuf::from);
+        let db = rho_db::RhoDb::open(path);
+        let started = std::time::Instant::now();
+        let (_, agents) = crowded_workset(&db, 66, 330_000).await;
+        eprintln!("built {} agents in {:?}", agents.len(), started.elapsed());
+
+        let started = std::time::Instant::now();
+        let mut from = Wpos::ZERO;
+        let (mut pages, mut rows) = (0, 0);
+        loop {
+            let page = agent_log_page(
+                &db,
+                AgentLog {
+                    agent: agents[30],
+                    from,
+                },
+            )
+            .unwrap();
+            pages += 1;
+            rows += page.rows.len();
+            match page.next {
+                LogNext::Page(next) => from = next,
+                LogNext::Follow(_) => break,
+            }
+        }
+        eprintln!(
+            "one agent's log: {pages} pages, {rows} rows in {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// What `before_at` answered by walking the whole workset forwards, as
+    /// it did before the agent's rows were indexed: the reference.
+    fn before_by_scan(
+        read: &rho_db::ReadTxn,
+        agent: rho_agent_types::AgentId,
+        pos: Wpos,
+    ) -> crate::transcript::Before {
+        use rho_agent::store::StoreRead as _;
+        let head = read.agent(agent).unwrap();
+        let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
+        for (row, record) in read.workset_rows(head.workset, head.created, usize::MAX) {
+            if row >= pos {
+                break;
+            }
+            if record.event.agent() != Some(agent) {
+                continue;
+            }
+            if let Event::Rewound { to, .. } = &record.event {
+                let keep = kept.partition_point(|(kept, _)| kept < to);
+                kept.truncate(keep);
+            }
+            kept.push((row, record));
+        }
+        let mut before = crate::transcript::Before::default();
+        for (_, record) in &kept {
+            before.observe(&record.event);
+        }
+        before
+    }
+
+    /// Three agents' steps, requests, inputs and rewinds (rewinds of
+    /// rewinds among them), interleaved: the state before every row, read
+    /// newest first from the agent's own rows, is the forward fold's.
+    #[tokio::test]
+    async fn before_at_is_the_forward_fold_of_the_agents_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
+        let mut agents = Vec::new();
+        let mut rows: Vec<Vec<Wpos>> = Vec::new();
+        for _ in 0..3 {
+            let agent = write.alloc_agent_id();
+            let pos = write
+                .append(
+                    workset,
+                    &Record {
+                        at: UnixMs(0),
+                        event: Event::AgentCreated {
+                            agent,
+                            spec: AgentSpec {
+                                runtime: Runtime::Native {
+                                    model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                    profile: Default::default(),
+                                    cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                                },
+                                props: Default::default(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            agents.push(agent);
+            rows.push(vec![pos]);
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for n in 0..600 {
+            let which = next(3);
+            let agent = agents[which];
+            let event = match next(7) {
+                0 | 1 => native(step(&format!("exec-{n}"))),
+                2 | 3 => native(request()),
+                4 | 5 => Event::Input {
+                    agent,
+                    message: None,
+                    content: Vec::new(),
+                    wake: InputWake::Person,
+                },
+                _ if rows[which].len() > 1 => {
+                    let to = rows[which][1 + next(rows[which].len() - 1)];
+                    Event::Rewound { agent, to }
+                }
+                _ => native(request()),
+            };
+            let event = match event {
+                Event::Native { entry, .. } => Event::Native { agent, entry },
+                event => event,
+            };
+            let pos = write
+                .append(
+                    workset,
+                    &Record {
+                        at: UnixMs(1),
+                        event,
+                    },
+                )
+                .unwrap();
+            rows[which].push(pos);
+        }
+        write.commit();
+        let read = db.read();
+        let end = rho_agent::store::StoreRead::workset(&read, workset)
+            .unwrap()
+            .next;
+        for agent in &agents {
+            for pos in 0..=end.0 {
+                let pos = Wpos(pos);
+                let fast = crate::transcript::before_at(&read, *agent, pos);
+                let scan = before_by_scan(&read, *agent, pos);
+                assert_eq!(
+                    (fast.carry, fast.inputs),
+                    (scan.carry, scan.inputs),
+                    "agent {} before {pos:?}",
+                    agent.encoded()
+                );
+            }
+        }
     }
 
     #[test]
