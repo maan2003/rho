@@ -6391,7 +6391,7 @@ impl Workspace {
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
             Command::AgentActivity => self.open_activity(window, cx),
-            Command::NewMail => self.prompt_new_topic(window, cx),
+            Command::NewTopic => self.prompt_new_topic(window, cx),
             Command::PullCard => self.pull_card(window, cx),
             Command::CloseAndDeal => self.cmd_close_and_deal(window, cx),
             Command::OpenFile => self.prompt_open_file(window, cx),
