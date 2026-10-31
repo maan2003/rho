@@ -57,7 +57,7 @@ pub enum Scenario {
     FortyToolCalls,
     /// Emit encrypted reasoning followed by a compaction item.
     ReasoningCompaction,
-    /// Ask a question through exec/mail.send and await the user.
+    /// Ask a question through exec/chat.post and await the user.
     ClarifyingQuestion,
 }
 
@@ -736,6 +736,23 @@ fn openai_turn(
     events
 }
 
+/// The topic of the newest message in the request: policy heads each
+/// delivered message with `[#<topic> `. A request without one answers in
+/// topic 0, which the policy refuses.
+fn reply_topic(request: &OpenAiRequest) -> u64 {
+    let input = serde_json::to_string(&request.input).unwrap_or_default();
+    input
+        .rmatch_indices("[#")
+        .find_map(|(at, _)| {
+            let digits: String = input[at + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 fn request_tools(request: &OpenAiRequest) -> Vec<ProviderTool> {
     if !request.tools.is_empty() {
         return request.tools.clone();
@@ -771,7 +788,9 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source = format!("mail.send(\"user\", {text:?}, kind=\"result\")\nend_turn()");
+        let topic = reply_topic(request);
+        let source =
+            format!("chat.post({topic}, {text:?}, mention=\"user\", kind=\"result\")\nend_turn()");
         append_tool_call(
             events,
             state,

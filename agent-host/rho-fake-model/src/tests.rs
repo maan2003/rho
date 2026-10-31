@@ -2,7 +2,10 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{FakeModel, FakeModelConfig, Scenario, TerminalOutcome, synthetic_result_bytes};
+use super::{
+    FakeModel, FakeModelConfig, OpenAiRequest, Scenario, TerminalOutcome, reply_topic,
+    synthetic_result_bytes,
+};
 
 #[tokio::test]
 async fn openai_websocket_is_deterministic_and_continues_after_tool_result() {
@@ -201,7 +204,7 @@ async fn stream_cut_before_python_admission_allows_retry() {
     assert!(retry.iter().any(|event| {
         event["item"]["input"]
             .as_str()
-            .is_some_and(|code| code.contains("mail.send(\"user\""))
+            .is_some_and(|code| code.contains("chat.post("))
     }));
     server.shutdown().await.unwrap();
 }
@@ -288,7 +291,7 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
         .unwrap()["item"]["input"]
         .as_str()
         .unwrap();
-    assert!(code.contains("mail.send(\"user\""));
+    assert!(code.contains("chat.post("));
     assert!(code.contains("end_turn()"));
     assert!(code.contains("clarify"));
     clarifying.shutdown().await.unwrap();
@@ -383,7 +386,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
                 "{code}"
             );
         } else {
-            assert!(code.contains("mail.send(\"user\""));
+            assert!(code.contains("chat.post("));
             assert!(code.contains("end_turn()"));
         }
     }
@@ -439,4 +442,16 @@ fn request_timing_counts_overlap_once_and_closes_cancelled_requests() {
     let (_, third) = super::begin_request(&metrics, &ordinal);
     drop(third);
     assert_eq!(super::snapshot(&metrics).idle_gaps_us.len(), 1);
+}
+
+#[test]
+fn a_reply_goes_in_the_topic_of_the_newest_message() {
+    let request: OpenAiRequest = serde_json::from_value(json!({"input":[
+        {"role":"user","content":[{"type":"input_text","text":"[#3 rho › first] Message from the user:\nhi"}]},
+        {"role":"user","content":[{"type":"input_text","text":"[#12 rho › second] Message from the user:\nmore [# not a topic"}]},
+    ]}))
+    .unwrap();
+    assert_eq!(reply_topic(&request), 12);
+    let none: OpenAiRequest = serde_json::from_value(json!({"input":[]})).unwrap();
+    assert_eq!(reply_topic(&none), 0);
 }

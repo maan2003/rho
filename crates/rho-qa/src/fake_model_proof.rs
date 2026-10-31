@@ -13,12 +13,13 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
-    Address, AgentId, ContentPart, InputWake, MailId, ThreadId, WorksetId, WorksetKind, Wpos,
-};
-use rho_agents_client::protocol::worksets::{
-    ClientFrame, CreateWorkset, LogEvent, PostMail, ServerFrame,
+    Address, AgentId, ChatEvent, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId,
+    StreamId, TopicId, WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
+use rho_agents_client::protocol::worksets::{
+    ClientFrame, CreateWorkset, LogEvent, Post, ServerFrame, StartTopic,
+};
 use rho_agents_client::snippets;
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_rpc::protocol::client::Client;
@@ -187,8 +188,8 @@ async fn run_async(args: Args) -> Result<()> {
 
     let mut client = Streams::open(connect(&socket).await?, &socket).await?;
     ensure!(
-        client.mail_head == MailId(0),
-        "fresh isolated agent host mail was not empty"
+        client.chat_head == StreamId::DEFAULT.0,
+        "fresh isolated agent host chat held more than its default stream"
     );
     println!(
         "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
@@ -199,7 +200,9 @@ async fn run_async(args: Args) -> Result<()> {
         args.seed
     );
     client
-        .send(&ClientFrame::FollowMail { since: MailId(0) })
+        .send(&ClientFrame::FollowChat {
+            since: ChatSeq::ZERO,
+        })
         .await?;
 
     let repo = Utf8PathBuf::try_from(workspace).context("workspace path is not UTF-8")?;
@@ -214,9 +217,15 @@ async fn run_async(args: Args) -> Result<()> {
         client.create(CreateWorkset {
             kind: WorksetKind::Isolated,
             code: snippets::new_agent_on(&repo, "HEAD", &runtime),
-            message: Some(prompt(index, 0)),
         });
     }
+    // The client id of each user post: the host logs a name once.
+    let mut next_client_id = 0u64;
+    let mut client_id = move || {
+        next_client_id += 1;
+        next_client_id
+    };
+    let mut briefed = 0usize;
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args.seconds);
@@ -227,7 +236,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut awaiting = HashSet::new();
     let mut posted = HashSet::new();
     let mut received = HashSet::new();
-    let mut queued: HashMap<AgentId, Vec<MailId>> = HashMap::new();
+    let mut queued: HashMap<AgentId, Vec<MessageId>> = HashMap::new();
     let mut delivered_ids = HashSet::new();
     let mut reported_calls = HashSet::new();
     let mut messages_sent = 0usize;
@@ -242,9 +251,8 @@ async fn run_async(args: Args) -> Result<()> {
     let mut clarifying = 0u64;
 
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
-    let mut next_client_id = 0u64;
-    let mut last_mail = MailId(0);
-    let mut user_threads: HashMap<AgentId, ThreadId> = HashMap::new();
+    let mut last_seq = ChatSeq::ZERO;
+    let mut user_topics: HashMap<AgentId, TopicId> = HashMap::new();
     let quiesce_deadline = deadline
         + if matches!(
             args.scenario,
@@ -294,7 +302,7 @@ async fn run_async(args: Args) -> Result<()> {
             .with_context(|| {
                 format!(
                     "agent host session stalled with {} agents created, rows read to {worksets:?}, \
-                     {} responding, {} awaiting, {} details pending, {} mails to the user: {}",
+                     {} responding, {} awaiting, {} details pending, {} messages to the user: {}",
                     agents.len(),
                     responding.len(),
                     awaiting.len(),
@@ -311,8 +319,16 @@ async fn run_async(args: Args) -> Result<()> {
                 error,
             } => {
                 ensure!(error.is_none(), "workset creation code failed: {error:?}");
-                let agent = agent.context("the creation code mailed no agent")?;
+                let agent = agent.context("the creation code created no agent")?;
                 agents.insert(agent);
+                client.start_topic(StartTopic {
+                    client_id: client_id(),
+                    stream: StreamId::DEFAULT,
+                    name: format!("QA agent {briefed}"),
+                    agents: vec![agent],
+                    content: prompt(briefed, 0),
+                });
+                briefed += 1;
                 ensure!(
                     agents.len() <= agent_count,
                     "agent host created more than {agent_count} agents"
@@ -348,55 +364,79 @@ async fn run_async(args: Args) -> Result<()> {
                 {
                     let cycle = cycles.entry(agent_id).or_default();
                     *cycle += 1;
-                    client.post(PostMail {
-                        // One name per mail: the host logs a name once.
-                        client_id: {
-                            next_client_id += 1;
-                            next_client_id
-                        },
-                        to: agent_id,
-                        thread: None,
+                    let topic = *user_topics
+                        .get(&agent_id)
+                        .context("an agent awaits the user before its topic arrived")?;
+                    client.post(Post {
+                        client_id: client_id(),
+                        topic,
                         content: prompt(0, *cycle),
                     });
                 }
             }
-            Incoming::Session(ServerFrame::Mail { mails }) => {
-                for mail in mails {
+            Incoming::Session(ServerFrame::Chat { records }) => {
+                for record in records {
                     ensure!(
-                        mail.id > last_mail,
-                        "mail order regressed: {:?} after {:?}",
-                        mail.id,
-                        last_mail
+                        record.seq > last_seq,
+                        "chat order regressed: {:?} after {:?}",
+                        record.seq,
+                        last_seq
                     );
-                    last_mail = mail.id;
-                    match (mail.from, mail.to) {
-                        (Address::User, Address::Agent(agent)) => {
+                    last_seq = record.seq;
+                    match record.event {
+                        ChatEvent::StreamCreated { .. } | ChatEvent::Joined { .. } => {}
+                        ChatEvent::TopicStarted {
+                            by: Address::User,
+                            agents,
+                            ..
+                        } => {
+                            let [agent] = agents[..] else {
+                                bail!("the proof started a topic with agents {agents:?}");
+                            };
                             ensure!(
-                                mail.thread == ThreadId(mail.id),
-                                "a mail posted without a thread did not start one: {mail:?}"
+                                user_topics.insert(agent, TopicId(record.seq)).is_none(),
+                                "agent {} got a second topic",
+                                agent.encoded()
                             );
-                            user_threads.insert(agent, mail.thread);
-                            posted.insert(mail.id);
                         }
-                        (Address::Agent(agent), Address::User) => {
-                            // Policy goes on in the thread of the newest mail
-                            // between the two; mail arrives in log order.
+                        ChatEvent::TopicStarted { by, .. } => {
+                            bail!("fake agent {by:?} started a topic")
+                        }
+                        ChatEvent::Posted {
+                            from: Address::User,
+                            ..
+                        } => {
+                            posted.insert(MessageId(record.seq));
+                        }
+                        ChatEvent::Posted {
+                            topic,
+                            from: Address::Agent(agent),
+                            mentions,
+                            content,
+                        } => {
+                            // Each agent answers in the topic its brief came
+                            // in.
                             ensure!(
-                                user_threads.get(&agent) == Some(&mail.thread),
-                                "agent {} answered in thread {:?}, not {:?}",
+                                user_topics.get(&agent) == Some(&topic),
+                                "agent {} answered in topic {:?}, not {:?}",
                                 agent.encoded(),
-                                mail.thread,
-                                user_threads.get(&agent)
+                                topic,
+                                user_topics.get(&agent)
                             );
-                            let text = content_text(&mail.content);
-                            ensure!(!text.trim().is_empty(), "empty user-facing message");
+                            ensure!(
+                                mentions
+                                    == [Mention {
+                                        to: Address::User,
+                                        kind: MentionKind::Result,
+                                    }],
+                                "agent {} posted with mentions {mentions:?}",
+                                agent.encoded()
+                            );
+                            let text = content_text(&content);
+                            ensure!(!text.trim().is_empty(), "empty message to the user");
                             messages_sent += 1;
                             clarifying += u64::from(text.trim_end().ends_with('?'));
                         }
-                        (Address::Agent(_), Address::Agent(_)) => {
-                            bail!("fake agent sent mail to another agent")
-                        }
-                        (Address::User, Address::User) => bail!("mail from the user to the user"),
                     }
                 }
             }
@@ -421,22 +461,22 @@ async fn run_async(args: Args) -> Result<()> {
                         }
                         LogEvent::Input {
                             agent,
-                            mail,
+                            message,
                             text,
                             wake,
                             ..
                         } => {
-                            let mail = mail.context("an input that is not mail")?;
+                            let message = message.context("an input that is not a message")?;
                             ensure!(
                                 wake == InputWake::Person,
                                 "unexpected peer input in isolated proof"
                             );
                             ensure!(!text.is_empty(), "empty user input");
                             ensure!(
-                                received.insert((agent, mail)),
-                                "mail handed to the agent twice"
+                                received.insert((agent, message)),
+                                "message handed to the agent twice"
                             );
-                            queued.entry(agent).or_default().push(mail);
+                            queued.entry(agent).or_default().push(message);
                         }
                         LogEvent::NotebookReport {
                             agent,
@@ -445,10 +485,10 @@ async fn run_async(args: Args) -> Result<()> {
                             ..
                         } => {
                             // A request delivers every input before it.
-                            for mail in queued.remove(&agent).unwrap_or_default() {
+                            for message in queued.remove(&agent).unwrap_or_default() {
                                 ensure!(
-                                    delivered_ids.insert((agent, mail)),
-                                    "mail delivered twice"
+                                    delivered_ids.insert((agent, message)),
+                                    "message delivered twice"
                                 );
                             }
                             for id in &answered {
@@ -575,25 +615,25 @@ async fn run_async(args: Args) -> Result<()> {
     ensure!(!latencies.is_empty(), "no model replies completed");
     ensure!(
         messages_sent > 0,
-        "model prose did not become mail to the user"
+        "model prose did not become a message to the user"
     );
     ensure!(
         received.len() >= agent_count,
-        "not every agent was handed its mail"
+        "not every agent was handed its brief"
     );
     ensure!(
-        received.iter().all(|(_, mail)| posted.contains(mail)),
-        "an agent was handed mail the user never sent"
+        received.iter().all(|(_, message)| posted.contains(message)),
+        "an agent was handed a message the user never sent"
     );
     ensure!(
         delivered_ids.len() >= agent_count,
-        "not every agent delivered its mail to its model"
+        "not every agent delivered its brief to its model"
     );
 
     let final_head = Streams::open(connect(&socket).await?, &socket)
         .await?
-        .mail_head;
-    ensure!(last_mail <= final_head, "mail seen beyond the durable head");
+        .chat_head;
+    ensure!(last_seq <= final_head, "chat seen beyond the durable head");
 
     let metrics: FakeMetrics = reqwest::get(format!(
         "{}/metrics",
