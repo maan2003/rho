@@ -1,19 +1,8 @@
-//! Transcripts: what a client keeps of an agent's raw log.
-//!
-//! Every [`TranscriptEvent`] is `strip` of exactly one raw event, in that
-//! event's position: the transcript is a pure function of the raw log.
-//! Bodies a person does not read at a glance (tool
-//! output, reasoning, the argument blob) are left behind; a client asks
-//! for them by position when it wants them.
-//!
-//! The runtimes write their own events; the agent host's `strip` is the one
-//! place they become these. The log's positions and the facts every reader
-//! takes as the runtime wrote them (what a send is for) are in
-//! `rho-agent-types`.
+//! The vocabulary of a transcript: what a workset row
+//! ([`super::rho2::LogEvent`]) carries of a response and its calls, and the
+//! live tail a runtime has past the log.
 
-use rho_agent_types::{
-    AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, Seq, UnixMs,
-};
+use rho_agent_types::UnixMs;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Whose transcript this is.
@@ -21,19 +10,6 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 pub enum RuntimeKind {
     Rho,
     Claude,
-}
-
-/// Who asked for this agent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum SpawnedBy {
-    #[default]
-    Direct,
-    Engineer,
-    /// An Engineer started it for the user, who manages it: it has no
-    /// parent.
-    UserOwned {
-        by: AgentId,
-    },
 }
 
 /// Who said a mirrored Claude message.
@@ -75,187 +51,6 @@ pub enum ToolStatus {
     Cancelled,
 }
 
-/// One raw event, stripped. Every variant says when, because "how long
-/// has it been?" is the reader's question and nothing else answers it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum TranscriptEvent {
-    /// Position zero of every agent.
-    Created {
-        role: AgentRole,
-        runtime: RuntimeKind,
-        place: Place,
-        spawned_by: SpawnedBy,
-        spawn_name: Option<String>,
-        parent: Option<AgentId>,
-        /// The model the agent's binding names, so cost can be priced
-        /// from the first reply.
-        model: String,
-        at: UnixMs,
-    },
-    RoleChanged {
-        role: AgentRole,
-        /// The model after the change, when the binding moved with it.
-        model: Option<String>,
-        at: UnixMs,
-    },
-    /// Something Rho has to tell the agent, carried by its next user
-    /// message: what a migration did to its place, say.
-    Notice {
-        text: String,
-        at: UnixMs,
-    },
-    /// The person or another agent spoke. Queued until a later `Sent`
-    /// carries it; a `QueueCleared` before that drops it.
-    Message {
-        /// `None` when the person wrote it.
-        from: Option<AgentId>,
-        text: String,
-        at: UnixMs,
-    },
-    /// A code-first inbox message, identified for exact report delivery.
-    Received {
-        id: u64,
-        from: Option<AgentId>,
-        text: String,
-        at: UnixMs,
-    },
-    /// The person asked for a compaction; queued like a message.
-    CompactionRequested {
-        at: UnixMs,
-    },
-    QueueCleared {
-        at: UnixMs,
-    },
-    /// A request went out: everything queued went with it, and these
-    /// calls came back with these results.
-    Sent {
-        results: Vec<ToolOutcome>,
-        /// The request asked the model to compact.
-        compaction: bool,
-        at: UnixMs,
-    },
-    /// A delivered message written by this agent, not a final answer.
-    MessageSent {
-        to: Option<AgentId>,
-        text: String,
-        /// What it is for, as the agent classed it.
-        kind: SendKind,
-        at: UnixMs,
-    },
-    /// Durable notebook state, independent of whether it awaits the person.
-    NotebookActivity {
-        responding: bool,
-        running_tasks: u32,
-        checkin_at: Option<UnixMs>,
-        archived: bool,
-        at: UnixMs,
-    },
-    /// A notebook report answered provider calls, but completed no task.
-    /// Delivered IDs entered the request; acknowledged IDs were consumed
-    /// without entering it. Other inbox messages remain queued.
-    NotebookReport {
-        calls: Vec<String>,
-        delivered: Vec<u64>,
-        acknowledged: Vec<u64>,
-        compaction: bool,
-        at: UnixMs,
-    },
-    /// Calls came back with these results and nothing else moved: what
-    /// was queued is still queued. A Claude agent's tool results; a Rho
-    /// request, which carries the queue, is `Sent`.
-    Results {
-        results: Vec<ToolOutcome>,
-        at: UnixMs,
-    },
-    /// The model answered.
-    Replied {
-        /// Visible response items, in model order, just like the live tail.
-        items: Vec<Item>,
-        /// The answer compacted the context.
-        compacted: bool,
-        usage: Option<Usage>,
-        context_used: Option<u64>,
-        at: UnixMs,
-    },
-    /// The sidecar's title for this agent.
-    Presented {
-        title: PresentationField,
-        at: UnixMs,
-    },
-    /// Everything from `to` up to here is no longer the agent's history.
-    Rewound {
-        to: AgentPos,
-        at: UnixMs,
-    },
-    /// A request failed with this much said. `retrying` when the runtime
-    /// asks again by itself; otherwise `Stopped` comes next.
-    Failed {
-        text: String,
-        error: String,
-        retrying: bool,
-        at: UnixMs,
-    },
-    /// The agent stopped on an error and will not go on without the user.
-    Stopped {
-        error: String,
-        at: UnixMs,
-    },
-    /// One message of a Claude transcript, mirrored as Claude confirmed
-    /// it. Claude's own file is not ours to keep; this is the durable copy.
-    ClaudeMessage {
-        speaker: Speaker,
-        text: String,
-        at: UnixMs,
-    },
-    /// The agent and its earlier history are gone. The journal cursor still
-    /// advances.
-    Deleted {
-        at: UnixMs,
-    },
-    ExecObserved {
-        id: String,
-        milestone: rho_agent_types::ExecMilestone,
-        at: UnixMs,
-    },
-}
-
-impl TranscriptEvent {
-    pub fn at(&self) -> UnixMs {
-        match self {
-            Self::Created { at, .. }
-            | Self::RoleChanged { at, .. }
-            | Self::Notice { at, .. }
-            | Self::Message { at, .. }
-            | Self::Received { at, .. }
-            | Self::CompactionRequested { at }
-            | Self::QueueCleared { at }
-            | Self::Sent { at, .. }
-            | Self::MessageSent { at, .. }
-            | Self::NotebookActivity { at, .. }
-            | Self::NotebookReport { at, .. }
-            | Self::Results { at, .. }
-            | Self::Replied { at, .. }
-            | Self::Presented { at, .. }
-            | Self::Rewound { at, .. }
-            | Self::Failed { at, .. }
-            | Self::Stopped { at, .. }
-            | Self::ClaudeMessage { at, .. }
-            | Self::ExecObserved { at, .. }
-            | Self::Deleted { at } => *at,
-        }
-    }
-}
-
-/// One journal entry as it crosses the wire: where it is in the host's
-/// order, whose log it is, where in that log, and what it says.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct LogEntry {
-    pub seq: Seq,
-    pub agent_id: AgentId,
-    pub pos: AgentPos,
-    pub event: TranscriptEvent,
-}
-
 /// What a runtime has that the log does not yet, told as it changes:
 /// the response in flight and the phase. Everything else a reader wants
 /// is a row: the queue is `Message` rows no `Sent` has carried, a call
@@ -272,10 +67,6 @@ pub enum Live {
         #[senax(default)]
         draft: Option<String>,
     },
-    /// Claude Code holds its queue in its process, outside the mirror.
-    // TODO: drop at the next GUI protocol bump. No agent host sends it any
-    // more: every loop keeps its queue in its rows.
-    Queued { items: Vec<QueuedItem> },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -318,17 +109,6 @@ pub enum InferenceState {
 pub struct StreamingResponse {
     pub id: String,
     pub items: Vec<Item>,
-}
-
-/// One thing waiting in an agent's queue.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum QueuedItem {
-    Message {
-        /// `None` when the person wrote it.
-        from: Option<AgentId>,
-        text: String,
-    },
-    Compaction,
 }
 
 /// One response item, shared by the live tail, committed mirror, and `Detail`.

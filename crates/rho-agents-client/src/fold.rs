@@ -1,43 +1,77 @@
-//! The fold: what a client makes of the mirror.
+//! The fold: what a client makes of mail, the directory, and the workset
+//! rows it reads.
 //!
-//! The agent host sends the mirror, one stripped event per raw row: the
-//! mirror is a pure function of the raw log. Everything a rail or a transcript
-//! shows is folded from it here, on the client, so the wire carries facts and
-//! never conclusions.
+//! The host sends facts: the mail log, the directory's whole entries, and a
+//! workset's rows when a transcript is open. Everything a rail or a
+//! transcript shows is folded from them here, on the client, so the wire
+//! carries facts and never conclusions.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use rho_agent_types::{AgentId, AgentPos, AgentRole, Place, PresentationField, SendKind, UnixMs};
+use rho_agent_types::{
+    Address, AgentId, Mail, MailId, Place, SendKind, UnixMs, WorksetKind, Wpos, props,
+};
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
-use crate::protocol::transcript::{
-    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
-};
-use crate::state::{
-    UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiNotebookActivity, UiToolStatus,
-};
+use crate::protocol::rho2::{AgentEntry, LogEvent};
+use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
+use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
+
+/// A place in an agent's conversation with the user, which is how far the
+/// user has dealt with it. Mail `m` sits at `2m`. A stop has no mail id, so
+/// it sits half a step after the host's newest mail when it was seen:
+/// after everything said before it, and before anything said later.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
+)]
+pub struct ConversationPos(pub u64);
+
+impl ConversationPos {
+    pub fn of_mail(mail: MailId) -> Self {
+        Self(mail.0.checked_mul(2).expect("mail log overflow"))
+    }
+
+    /// A stop seen while `head` was the host's newest mail.
+    pub fn of_stop(head: MailId) -> Self {
+        Self(Self::of_mail(head).0 + 1)
+    }
+
+    pub fn next(self) -> Self {
+        Self(self.0.checked_add(1).expect("conversation overflow"))
+    }
+}
 
 /// What the user last said about an agent: how far they have dealt with
-/// its rows, and whether they muted it. The only facts attention needs
-/// that no row carries; kept by the client with the digest.
+/// its conversation, and whether they muted it. The only facts attention
+/// needs that the host does not carry; kept by the client.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct Verdict {
-    /// One past the newest position the user has dealt with.
-    pub handled_through: AgentPos,
+    /// One past the newest place the user has dealt with.
+    pub handled_through: ConversationPos,
     pub muted: bool,
 }
 
-/// What a row put to the user.
+/// What the agent put to the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub enum Said {
-    /// A send asking for something the work needs.
+    /// Mail asking for something the work needs.
     Ask,
     /// The agent stopped on an error: as much an ask as a question.
     Stopped,
-    /// A send delivering what the user asked for.
+    /// Mail delivering what the user asked for.
     Result,
 }
 
@@ -55,45 +89,123 @@ impl Said {
 /// One thing the agent put to the user since they last wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Unread {
-    pub pos: AgentPos,
+    pub pos: ConversationPos,
     pub at: UnixMs,
     pub said: Said,
 }
 
-/// What an agent is: its `Created` row, kept current by the rows that
-/// change it. Never what has happened to it; that is the [`Digest`].
+/// What an agent is: its directory entry and the kind of workset it is
+/// in. Never what has happened to it; that is the [`Digest`].
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct AgentIdentity {
-    pub agent_id: AgentId,
-    pub role: AgentRole,
-    pub runtime: RuntimeKind,
-    pub place: Place,
-    pub spawned_by: SpawnedBy,
-    pub spawn_name: Option<String>,
-    pub parent: Option<AgentId>,
-    /// The model its binding names, for pricing.
-    pub model: String,
-    pub created_at: UnixMs,
+    pub entry: AgentEntry,
+    pub kind: WorksetKind,
 }
 
-/// Which fold made a stored digest. Bump when `Digest::tell` changes
-/// what it makes of a row; a client finding another version on disk
-/// folds that agent's rows again, once.
-pub const DIGEST_VERSION: u32 = 3;
+impl AgentIdentity {
+    pub fn agent_id(&self) -> AgentId {
+        self.entry.agent
+    }
 
-/// What the rails read of an agent, folded from its mirror. Incremental,
-/// and kept on disk by the client, so a restart reads it back instead of
-/// folding every event again. Only the conversation with the user counts:
-/// what the agent says to other agents, and whether it is running, do not.
-#[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+    fn prop(&self, key: &str) -> Option<&str> {
+        self.entry
+            .spec
+            .props
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// The agent's name for a reader: what Python named it, else the title
+    /// generated for it.
+    pub fn name(&self) -> Option<&str> {
+        self.prop(props::NAME).or_else(|| self.prop(props::TITLE))
+    }
+
+    /// The agent this one answers to. A parent that does not parse is
+    /// none: the prop is Python's to write, and the GUI does not trust it.
+    pub fn parent(&self) -> Option<AgentId> {
+        AgentId::from_encoded(self.prop(props::PARENT)?).ok()
+    }
+
+    /// Whether the agent belongs in the user's list and the dealer.
+    pub fn user_facing(&self) -> bool {
+        self.prop(props::USER_FACING) == Some("true")
+    }
+
+    /// The prefix of the agent's label: `adv` for an advisor, `eng` for
+    /// everything else.
+    pub fn handle_prefix(&self) -> &'static str {
+        match self.prop(PRESET) {
+            Some("advisor") => "adv",
+            _ => "eng",
+        }
+    }
+
+    pub fn is_advisor(&self) -> bool {
+        self.handle_prefix() == "adv"
+    }
+
+    /// Where the agent works: its `cwd` prop, else where its workset
+    /// starts. An isolated workset is reached by its id; a host one is the
+    /// host's own directory.
+    pub fn place(&self) -> Place {
+        let start = match &self.kind {
+            WorksetKind::Isolated => camino::Utf8Path::new("/src"),
+            WorksetKind::Host { cwd } => cwd.as_path(),
+        };
+        let cwd = self.prop(props::CWD).map_or(start, camino::Utf8Path::new);
+        Place {
+            cwd: cwd.to_owned(),
+            workset: match self.kind {
+                WorksetKind::Isolated => Some(self.entry.workset),
+                WorksetKind::Host { .. } => None,
+            },
+        }
+    }
+
+    pub fn runtime(&self) -> RuntimeKind {
+        self.entry.spec.runtime
+    }
+}
+
+impl AgentIdentity {
+    /// An agent of an isolated workset with these props, on the default
+    /// runtime: what a test that folds mail into an agent starts from.
+    pub fn for_test(agent: AgentId, props: rho_agent_types::Props, created_at: UnixMs) -> Self {
+        Self {
+            entry: AgentEntry {
+                agent,
+                workset: rho_agent_types::WorksetId([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]),
+                spec: crate::protocol::rho2::SpecView {
+                    runtime: RuntimeKind::Rho,
+                    model: "sol".into(),
+                    effort: "medium".into(),
+                    props,
+                },
+                created_at,
+            },
+            kind: WorksetKind::Isolated,
+        }
+    }
+}
+
+/// The prop that names the preset an agent was made from; the label's
+/// prefix reads it.
+pub const PRESET: &str = "preset";
+
+/// What the rails read of an agent, folded from its mail and its runtime's
+/// status. Only the conversation with the user counts: what the agent says
+/// to other agents, and whether it is running, do not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Digest {
-    /// One past the newest position folded.
-    pub newest: AgentPos,
-    /// The sidecar's title. A spawn name always beats it.
-    pub title: Option<String>,
-    /// The agent's newest status and where it said it, until any later
-    /// message from either side hides it.
-    pub status: Option<(AgentPos, String)>,
+    /// One past the newest place folded.
+    pub newest: ConversationPos,
+    /// One past the newest mail folded; older mail is a replay.
+    mail_next: MailId,
+    /// The agent's newest status and the mail that said it, until any
+    /// later mail from either side hides it.
+    pub status: Option<(MailId, String)>,
     pub last_active: UnixMs,
     pub last_user_message_at: UnixMs,
     pub last_user_message_text: String,
@@ -101,127 +213,101 @@ pub struct Digest {
     pub last_sent_at: Option<UnixMs>,
     /// What it put to the user since they last wrote, oldest first.
     pub unread: Vec<Unread>,
-    pub notebook: Option<UiNotebookActivity>,
-    /// Every reply's usage, summed.
-    pub usage: AgentUsageBucket,
-    /// The model the newest usage named.
-    pub usage_model: String,
 }
 
 impl Digest {
-    /// Folds one event. Positions already held are skipped, so a repeated
-    /// run is harmless; returns whether anything was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
-        if pos < self.newest {
+    /// Folds one mail of `agent`'s. Mail already held is skipped, so a
+    /// replayed page is harmless; returns whether anything was new.
+    pub fn tell(&mut self, agent: AgentId, mail: &Mail) -> bool {
+        if mail.id < self.mail_next {
             return false;
         }
-        self.newest = pos.next();
-        self.last_active = self.last_active.max(event.at());
-        match event {
-            TranscriptEvent::Received {
-                from: None,
-                text,
-                at,
-                ..
-            } => self.user_spoke(*at, text),
-            TranscriptEvent::Message {
-                from: None,
-                text,
-                at,
-                ..
-            } => self.user_spoke(*at, text),
-            TranscriptEvent::ClaudeMessage {
-                speaker: Speaker::User,
-                text,
-                at,
-            } => self.user_spoke(*at, text),
-            TranscriptEvent::MessageSent {
-                to: None,
-                text,
-                kind: SendKind::Status,
-                ..
-            } => self.status = Some((pos, text.clone())),
-            TranscriptEvent::MessageSent {
-                to: None, kind, at, ..
-            } => {
-                let said = match kind {
-                    SendKind::Ask => Some(Said::Ask),
-                    SendKind::Result => Some(Said::Result),
-                    // Kept in the conversation, but nothing the user is owed.
-                    SendKind::Status | SendKind::Fyi => None,
-                };
-                if let Some(said) = said {
-                    self.unread.push(Unread { pos, at: *at, said });
-                }
-                self.status = None;
-                self.last_sent_at = Some(*at);
-            }
-            TranscriptEvent::Stopped { at, .. } => self.unread.push(Unread {
-                pos,
-                at: *at,
-                said: Said::Stopped,
-            }),
-            TranscriptEvent::NotebookActivity {
-                responding,
-                running_tasks,
-                checkin_at,
-                archived,
-                ..
-            } => {
-                self.notebook = Some(UiNotebookActivity {
-                    responding: *responding,
-                    running_tasks: *running_tasks,
-                    checkin_at: *checkin_at,
-                    archived: *archived,
-                });
-            }
-            TranscriptEvent::Presented { title, .. } => apply(&mut self.title, title),
-            TranscriptEvent::Replied {
-                usage: Some(usage), ..
-            } => {
-                self.usage.input_tokens += usage.input_tokens;
-                self.usage.cache_read_tokens += usage.cache_read_tokens;
-                self.usage.cache_write_tokens += usage.cache_write_tokens;
-                self.usage.cache_write_1h_tokens += usage.cache_write_1h_tokens;
-                self.usage.output_tokens += usage.output_tokens;
-                self.usage.requests += 1;
-                self.usage_model = usage.model.clone();
-            }
-            // History from `to` on is gone, and with it anything it said.
-            TranscriptEvent::Rewound { to, .. } => {
-                self.unread.retain(|unread| unread.pos < *to);
-                if self.status.as_ref().is_some_and(|(at, _)| at >= to) {
+        self.mail_next = mail.id.next();
+        let pos = ConversationPos::of_mail(mail.id);
+        self.newest = self.newest.max(pos.next());
+        self.last_active = self.last_active.max(mail.at);
+        let me = Address::Agent(agent);
+        if mail.from == Address::User && mail.to == me {
+            self.user_spoke(mail.at, &text(mail));
+        } else if mail.from == me && mail.to == Address::User {
+            match mail.kind {
+                Some(SendKind::Status) => self.status = Some((mail.id, text(mail))),
+                kind => {
+                    let said = match kind {
+                        Some(SendKind::Ask) => Some(Said::Ask),
+                        Some(SendKind::Result) => Some(Said::Result),
+                        // Kept in the conversation, but nothing the user
+                        // is owed.
+                        Some(SendKind::Fyi | SendKind::Status) | None => None,
+                    };
+                    if let Some(said) = said {
+                        self.unread.push(Unread {
+                            pos,
+                            at: mail.at,
+                            said,
+                        });
+                    }
                     self.status = None;
+                    self.last_sent_at = Some(mail.at);
                 }
             }
-            TranscriptEvent::Message { .. }
-            | TranscriptEvent::Received { .. }
-            | TranscriptEvent::ClaudeMessage { .. }
-            | TranscriptEvent::Created { .. }
-            | TranscriptEvent::Deleted { .. }
-            | TranscriptEvent::RoleChanged { .. }
-            | TranscriptEvent::Notice { .. }
-            | TranscriptEvent::CompactionRequested { .. }
-            | TranscriptEvent::QueueCleared { .. }
-            | TranscriptEvent::Sent { .. }
-            | TranscriptEvent::NotebookReport { .. }
-            | TranscriptEvent::MessageSent { .. }
-            | TranscriptEvent::ExecObserved { .. }
-            | TranscriptEvent::Results { .. }
-            | TranscriptEvent::Replied { .. }
-            | TranscriptEvent::Failed { .. } => {}
         }
         true
     }
 
+    /// The agent's runtime stopped on an error while `head` was the host's
+    /// newest mail. A stop already held is the same stop, told again by a
+    /// reconnect; returns whether anything changed.
+    pub fn stopped(&mut self, head: MailId, at: UnixMs) -> bool {
+        if self.stop().is_some() {
+            return false;
+        }
+        let pos = ConversationPos::of_stop(head);
+        self.newest = self.newest.max(pos.next());
+        self.unread.push(Unread {
+            pos,
+            at,
+            said: Said::Stopped,
+        });
+        true
+    }
+
+    /// A stop the copy kept across a restart.
+    pub fn restore_stop(&mut self, stop: Unread) {
+        if self.stop().is_none() {
+            self.newest = self.newest.max(stop.pos.next());
+            self.unread.push(stop);
+        }
+    }
+
+    /// The runtime is not stopped: whatever stop was held is over.
+    pub fn running(&mut self) -> bool {
+        let before = self.unread.len();
+        self.unread.retain(|unread| unread.said != Said::Stopped);
+        before != self.unread.len()
+    }
+
+    /// The stop the user has not dealt with by writing, if any.
+    pub fn stop(&self) -> Option<Unread> {
+        self.unread
+            .iter()
+            .find(|unread| unread.said == Said::Stopped)
+            .copied()
+    }
+
     /// The strongest thing the agent put to the user past `seen`, counted
     /// from the oldest of that kind (`rho-dealer/cases.md`, A5).
-    pub fn strongest_unread(&self, seen: AgentPos) -> Option<Unread> {
+    pub fn strongest_unread(&self, seen: ConversationPos) -> Option<Unread> {
         self.unread
             .iter()
             .filter(|unread| unread.pos >= seen)
             .min_by_key(|unread| (unread.said.strength(), unread.pos))
             .copied()
+    }
+
+    /// The newest thing put to the user: where the card's source last moved.
+    pub fn newest_unread(&self) -> Option<Unread> {
+        self.unread.iter().max_by_key(|unread| unread.pos).copied()
     }
 
     /// Writing reads everything before it.
@@ -233,12 +319,8 @@ impl Digest {
     }
 }
 
-fn apply(field: &mut Option<String>, change: &PresentationField) {
-    match change {
-        PresentationField::Unchanged => {}
-        PresentationField::Set(value) => *field = Some(value.clone()),
-        PresentationField::Clear => *field = None,
-    }
+fn text(mail: &Mail) -> String {
+    rho_agent_types::transcript::text_content(&mail.content)
 }
 
 /// One agent as the client holds it.
@@ -250,65 +332,27 @@ pub struct MirroredAgent {
 }
 
 impl MirroredAgent {
-    /// From the agent's first row. `None` unless it is a `Created`.
-    pub fn new(host: HostId, agent_id: AgentId, event: &TranscriptEvent) -> Option<Self> {
-        let TranscriptEvent::Created {
-            role,
-            runtime,
-            place,
-            spawned_by,
-            spawn_name,
-            parent,
-            model,
-            at,
-        } = event
-        else {
-            return None;
-        };
-        let mut digest = Digest::default();
-        digest.tell(AgentPos::ZERO, event);
-        Some(Self {
+    /// An agent the directory named, before any of its mail.
+    pub fn new(host: HostId, identity: AgentIdentity) -> Self {
+        Self {
             host,
-            identity: AgentIdentity {
-                agent_id,
-                role: *role,
-                runtime: *runtime,
-                place: place.clone(),
-                spawned_by: *spawned_by,
-                spawn_name: spawn_name.clone(),
-                parent: *parent,
-                model: model.clone(),
-                created_at: *at,
-            },
-            digest,
-        })
+            identity,
+            digest: Digest::default(),
+        }
+    }
+
+    /// Folds one of its mail; returns whether it was new.
+    pub fn tell(&mut self, mail: &Mail) -> bool {
+        self.digest.tell(self.agent_id(), mail)
     }
 
     pub fn agent_id(&self) -> AgentId {
-        self.identity.agent_id
+        self.identity.agent_id()
     }
 
-    /// The agent's name for a reader: what the spawner called it, else
-    /// what the sidecar made of it.
+    /// The agent's name for a reader.
     pub fn title(&self) -> Option<&str> {
-        self.identity
-            .spawn_name
-            .as_deref()
-            .or(self.digest.title.as_deref())
-    }
-
-    /// Folds one event; returns whether it was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
-        if !self.digest.tell(pos, event) {
-            return false;
-        }
-        if let TranscriptEvent::RoleChanged { role, model, .. } = event {
-            self.identity.role = *role;
-            if let Some(model) = model {
-                self.identity.model = model.clone();
-            }
-        }
-        true
+        self.identity.name()
     }
 }
 
@@ -323,38 +367,93 @@ pub fn one_line(text: &str) -> String {
         .join(" ")
 }
 
-/// The transcript of one agent's mirror, oldest first. Nothing here is
-/// invented: a call is its name and its line, a reply is what was said,
-/// and a message waits as queued until a request carries it.
-pub fn transcript(events: &[(AgentPos, TranscriptEvent)]) -> UiAgentState {
-    TranscriptFold::new(events).state()
+/// One thing a transcript is folded from: a row of the agent's workset log
+/// that is about it, or a mail from or to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptRow {
+    Log(Wpos, LogEvent),
+    Mail(Mail),
 }
 
-/// The transcript as a fold that takes one row at a time, so a `Log`
-/// entry costs what it changes and never a walk of the whole mirror.
-#[derive(Clone, Debug, Default)]
+impl TranscriptRow {
+    pub fn at(&self) -> UnixMs {
+        match self {
+            Self::Log(_, event) => event.at(),
+            Self::Mail(mail) => mail.at,
+        }
+    }
+}
+
+/// An agent's workset rows and its mail as one transcript, in time order:
+/// each is in its own order already, and the two meet where their clocks
+/// say. Rows about other agents are left out.
+pub fn interleave(
+    agent: AgentId,
+    rows: impl IntoIterator<Item = (Wpos, LogEvent)>,
+    mails: impl IntoIterator<Item = Mail>,
+) -> Vec<TranscriptRow> {
+    let mut rows = rows
+        .into_iter()
+        .filter(|(_, event)| event.agent() == Some(agent))
+        .map(|(pos, event)| TranscriptRow::Log(pos, event))
+        .peekable();
+    let mut mails = mails.into_iter().map(TranscriptRow::Mail).peekable();
+    let mut merged = Vec::new();
+    loop {
+        let next = match (rows.peek(), mails.peek()) {
+            (Some(row), Some(mail)) if mail.at() < row.at() => mails.next(),
+            (Some(_), _) => rows.next(),
+            (None, _) => mails.next(),
+        };
+        match next {
+            Some(row) => merged.push(row),
+            None => return merged,
+        }
+    }
+}
+
+/// The transcript of one agent, oldest first. Nothing here is invented: a
+/// call is its name and its line, a reply is what was said, and an input
+/// waits as queued until a request carries it.
+pub fn transcript(agent: AgentId, rows: &[TranscriptRow]) -> UiAgentState {
+    TranscriptFold::new(agent, rows).state()
+}
+
+/// The transcript as a fold that takes one row at a time, so a row costs
+/// what it changes and never a walk of the whole transcript.
+#[derive(Clone, Debug)]
 pub struct TranscriptFold {
+    agent: AgentId,
     exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
-    timing_events: Vec<(AgentPos, String, rho_agent_types::ExecMilestone, UnixMs)>,
-    /// One past the newest position folded.
-    next: AgentPos,
+    timing_events: Vec<(Wpos, String, rho_agent_types::ExecMilestone, UnixMs)>,
+    /// One past the newest row folded.
+    next: Wpos,
+    /// One past the newest mail folded.
+    mail_next: MailId,
     /// Shared with every state handed out, so a row costs the blocks it
     /// adds or changes and a state is a list of pointers.
     blocks: Vec<Arc<UiBlock>>,
-    /// Where each block came from, so a rewind drops exactly what was
-    /// told after it and keeps the rest.
-    told_at: Vec<AgentPos>,
-    /// Messages no request has carried yet; drawn after the blocks.
-    queue: Vec<(AgentPos, Option<u64>, UiBlock)>,
+    /// The row each block came from, so a rewind drops exactly what was
+    /// told after it. `None` for mail, which no rewind takes back.
+    told_at: Vec<Option<Wpos>>,
+    /// Inputs no request has carried yet; drawn after the blocks.
+    queue: Vec<(Wpos, UiBlock)>,
+    /// Mail to the agent that no input has handed it yet; drawn last.
+    mailbox: Vec<(MailId, UiBlock)>,
+    /// Mail an input has handed over, so mail heard after its input is
+    /// not shown waiting.
+    handed: BTreeSet<MailId>,
+    /// Who wrote each mail to the agent, for the input that hands it over.
+    senders: HashMap<MailId, Address>,
     /// The agent stopped on an error and nobody has written since.
     errored: bool,
     /// What the last reply said the context holds, and where it said it.
-    context_used: Option<(AgentPos, u64)>,
-    digest: Digest,
+    context_used: Option<(Wpos, u64)>,
+    /// Every reply's usage, summed, and the model the newest one named.
+    usage: AgentUsageBucket,
+    usage_model: String,
     /// The lowest index of the folded transcript whose block has moved
-    /// since a delta was last taken, or `None` when none has. Handing the
-    /// whole state made every appended row cost the whole transcript;
-    /// this is what a row costs instead.
+    /// since a delta was last taken, or `None` when none has.
     dirty_from: Option<usize>,
 }
 
@@ -372,25 +471,37 @@ pub struct FoldDelta {
 }
 
 impl TranscriptFold {
-    pub fn new(events: &[(AgentPos, TranscriptEvent)]) -> Self {
-        let mut fold = Self::default();
-        for (pos, event) in events {
-            fold.tell(*pos, event);
+    pub fn new(agent: AgentId, rows: &[TranscriptRow]) -> Self {
+        let mut fold = Self {
+            agent,
+            exec_timings: Arc::default(),
+            timing_events: Vec::new(),
+            next: Wpos::ZERO,
+            mail_next: MailId::default(),
+            blocks: Vec::new(),
+            told_at: Vec::new(),
+            queue: Vec::new(),
+            mailbox: Vec::new(),
+            handed: BTreeSet::new(),
+            senders: HashMap::new(),
+            errored: false,
+            context_used: None,
+            usage: AgentUsageBucket::default(),
+            usage_model: String::new(),
+            dirty_from: None,
+        };
+        for row in rows {
+            fold.tell(row);
         }
         fold
     }
 
-    /// One past the newest position folded.
-    pub fn next(&self) -> AgentPos {
-        self.next
-    }
-
-    fn push(&mut self, pos: AgentPos, block: UiBlock) {
+    fn push(&mut self, told_at: Option<Wpos>, block: UiBlock) {
         // The queue is drawn after the blocks, so a block landing moves
         // every queued row along with it.
         self.touch(self.blocks.len());
         self.blocks.push(Arc::new(block));
-        self.told_at.push(pos);
+        self.told_at.push(told_at);
     }
 
     /// Notes that the transcript differs from `at` on.
@@ -398,17 +509,30 @@ impl TranscriptFold {
         self.dirty_from = Some(self.dirty_from.map_or(at, |held| held.min(at)));
     }
 
-    /// The composed transcript from one index on: the folded blocks, then
-    /// the messages no request has carried yet.
-    fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
-        let queued = self
-            .queue
+    /// The end of the queue, where a new input lands.
+    fn queue_end(&self) -> usize {
+        self.blocks.len() + self.queue.len()
+    }
+
+    fn waiting(&self) -> impl Iterator<Item = Arc<UiBlock>> + '_ {
+        self.queue
             .iter()
-            .map(|(_, _, queued)| Arc::new(queued.clone()));
+            .map(|(_, queued)| queued)
+            .chain(self.mailbox.iter().map(|(_, waiting)| waiting))
+            .map(|block| Arc::new(block.clone()))
+    }
+
+    /// The composed transcript from one index on: the folded blocks, then
+    /// the inputs no request has carried yet, then mail not yet handed over.
+    fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
         if from < self.blocks.len() {
-            self.blocks[from..].iter().cloned().chain(queued).collect()
+            self.blocks[from..]
+                .iter()
+                .cloned()
+                .chain(self.waiting())
+                .collect()
         } else {
-            queued.skip(from - self.blocks.len()).collect()
+            self.waiting().skip(from - self.blocks.len()).collect()
         }
     }
 
@@ -427,9 +551,7 @@ impl TranscriptFold {
         })
     }
 
-    /// Each result lands on the call it answers: its status and its two
-    /// timestamps. Where the log holds the output is not kept, because
-    /// nothing in the transcript draws it.
+    /// Each reported call is marked reported, its task still running.
     fn report_calls(&mut self, calls: &[String]) {
         for id in calls {
             if let Some(index) = self
@@ -447,6 +569,9 @@ impl TranscriptFold {
         }
     }
 
+    /// Each result lands on the call it answers: its status and its two
+    /// timestamps. The output is not kept, because nothing in the
+    /// transcript draws it.
     fn finish_calls(&mut self, results: &[ToolOutcome]) {
         for result in results {
             let called = self
@@ -471,16 +596,76 @@ impl TranscriptFold {
         }
     }
 
-    /// Folds one row. Positions already held are skipped, so a repeated
-    /// row is harmless; returns whether anything was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
-        if pos < self.next {
-            return false;
+    /// A request went out: every input before it went with it.
+    fn deliver_queue(&mut self, pos: Wpos) {
+        for (_, queued) in std::mem::take(&mut self.queue) {
+            self.push(Some(pos), delivered(queued));
         }
-        self.next = pos.next();
-        self.digest.tell(pos, event);
+    }
+
+    /// Folds one row. Rows and mail already held are skipped, as are rows
+    /// about another agent, so a repeated page is harmless; returns
+    /// whether anything was new.
+    pub fn tell(&mut self, row: &TranscriptRow) -> bool {
+        match row {
+            TranscriptRow::Log(pos, event) => {
+                if *pos < self.next || event.agent() != Some(self.agent) {
+                    return false;
+                }
+                self.next = pos.next();
+                self.tell_row(*pos, event);
+            }
+            TranscriptRow::Mail(mail) => {
+                if mail.id < self.mail_next {
+                    return false;
+                }
+                self.mail_next = mail.id.next();
+                self.tell_mail(mail);
+            }
+        }
+        true
+    }
+
+    fn tell_mail(&mut self, mail: &Mail) {
+        let me = Address::Agent(self.agent);
+        if mail.from == me {
+            // A status is the status line, not a message.
+            if mail.kind == Some(SendKind::Status) && mail.to == Address::User {
+                return;
+            }
+            let to = match mail.to {
+                Address::User => None,
+                Address::Agent(agent) => Some(agent),
+            };
+            self.push(
+                None,
+                UiBlock::MessageSent {
+                    to,
+                    text: text(mail),
+                },
+            );
+        } else if mail.to == me {
+            self.senders.insert(mail.id, mail.from);
+            if self.handed.contains(&mail.id) {
+                return;
+            }
+            self.errored = false;
+            self.touch(self.queue_end() + self.mailbox.len());
+            self.mailbox.push((
+                mail.id,
+                UiBlock::QueuedMessage {
+                    text: text(mail),
+                    sender: sender(mail.from),
+                },
+            ));
+        }
+    }
+
+    fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
         match event {
-            TranscriptEvent::ExecObserved { id, milestone, at } => {
+            LogEvent::ExecObserved {
+                id, milestone, at, ..
+            } => {
                 self.timing_events.push((pos, id.clone(), *milestone, *at));
                 Arc::make_mut(&mut self.exec_timings)
                     .entry(id.clone())
@@ -497,56 +682,46 @@ impl TranscriptFold {
                     tool.timing = self.exec_timings[id];
                 }
             }
-
-            TranscriptEvent::Message { from, text, .. } => {
+            LogEvent::Input { mail, text, .. } => {
                 self.errored = false;
-                self.touch(self.blocks.len() + self.queue.len());
-                self.queue.push((
-                    pos,
-                    None,
-                    UiBlock::QueuedMessage {
-                        text: text.clone(),
-                        sender: *from,
-                    },
-                ));
+                let block = match mail {
+                    Some(id) => {
+                        self.handed.insert(*id);
+                        if let Some(index) =
+                            self.mailbox.iter().position(|(waiting, _)| waiting == id)
+                        {
+                            self.touch(self.queue_end() + index);
+                            self.mailbox.remove(index);
+                        }
+                        UiBlock::QueuedMessage {
+                            text: text.clone(),
+                            sender: self.senders.get(id).copied().and_then(sender),
+                        }
+                    }
+                    // Not mail: what the policy has to tell the agent.
+                    None => UiBlock::Notice { text: text.clone() },
+                };
+                self.touch(self.queue_end());
+                self.queue.push((pos, block));
             }
-            TranscriptEvent::Received { id, from, text, .. } => {
-                self.errored = false;
-                self.touch(self.blocks.len() + self.queue.len());
+            LogEvent::CompactionRequested { .. } => {
+                self.touch(self.queue_end());
                 self.queue.push((
                     pos,
-                    Some(*id),
-                    UiBlock::QueuedMessage {
-                        text: text.clone(),
-                        sender: *from,
-                    },
-                ));
-            }
-            TranscriptEvent::CompactionRequested { .. } => {
-                self.touch(self.blocks.len() + self.queue.len());
-                self.queue.push((
-                    pos,
-                    None,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
                     },
                 ));
             }
-            TranscriptEvent::QueueCleared { .. } => {
-                self.touch(self.blocks.len());
-                self.queue.clear();
-            }
-            TranscriptEvent::Sent {
+            LogEvent::Sent {
                 results,
                 compaction,
                 ..
             } => {
-                for (_, _, queued) in std::mem::take(&mut self.queue) {
-                    self.push(pos, delivered(queued));
-                }
+                self.deliver_queue(pos);
                 if *compaction {
                     self.push(
-                        pos,
+                        Some(pos),
                         UiBlock::Notice {
                             text: "compacting context".to_owned(),
                         },
@@ -554,28 +729,13 @@ impl TranscriptFold {
                 }
                 self.finish_calls(results);
             }
-            TranscriptEvent::NotebookReport {
-                calls,
-                delivered: delivered_ids,
-                acknowledged,
-                compaction,
-                ..
+            LogEvent::NotebookReport {
+                calls, compaction, ..
             } => {
-                let queue = std::mem::take(&mut self.queue);
-                for (queued_at, id, queued) in queue {
-                    if id.is_some_and(|id| delivered_ids.contains(&id)) {
-                        self.push(pos, delivered(queued));
-                    } else if id.is_some_and(|id| acknowledged.contains(&id))
-                        || (*compaction && id.is_none() && matches!(queued, UiBlock::Notice { .. }))
-                    {
-                        self.touch(self.blocks.len() + self.queue.len());
-                    } else {
-                        self.queue.push((queued_at, id, queued));
-                    }
-                }
+                self.deliver_queue(pos);
                 if *compaction {
                     self.push(
-                        pos,
+                        Some(pos),
                         UiBlock::Notice {
                             text: "compacting context".to_owned(),
                         },
@@ -583,24 +743,11 @@ impl TranscriptFold {
                 }
                 self.report_calls(calls);
             }
-            // A status is the status line, not a message.
-            TranscriptEvent::MessageSent {
-                kind: SendKind::Status,
-                ..
-            } => {}
-            TranscriptEvent::MessageSent { to, text, .. } => {
-                self.push(
-                    pos,
-                    UiBlock::MessageSent {
-                        to: *to,
-                        text: text.clone(),
-                    },
-                );
-            }
-            TranscriptEvent::Results { results, .. } => self.finish_calls(results),
-            TranscriptEvent::Replied {
+            LogEvent::Results { results, .. } => self.finish_calls(results),
+            LogEvent::Replied {
                 items,
                 compacted,
+                usage,
                 context_used,
                 at,
                 ..
@@ -608,28 +755,36 @@ impl TranscriptFold {
                 if let Some(used) = context_used {
                     self.context_used = Some((pos, *used));
                 }
+                if let Some(usage) = usage {
+                    self.usage.input_tokens += usage.input_tokens;
+                    self.usage.cache_read_tokens += usage.cache_read_tokens;
+                    self.usage.cache_write_tokens += usage.cache_write_tokens;
+                    self.usage.cache_write_1h_tokens += usage.cache_write_1h_tokens;
+                    self.usage.output_tokens += usage.output_tokens;
+                    self.usage.requests += 1;
+                    self.usage_model = usage.model.clone();
+                }
                 for item in items {
                     let mut block = crate::store::block(item);
                     if let UiBlock::Tool(tool) = &mut block {
                         tool.timing = self.exec_timings.get(&tool.id).copied().unwrap_or_default();
                         tool.started_at = Some(*at);
                     }
-                    self.push(pos, block);
+                    self.push(Some(pos), block);
                 }
                 if *compacted {
                     self.push(
-                        pos,
+                        Some(pos),
                         UiBlock::Notice {
                             text: "compacted".to_owned(),
                         },
                     );
                 }
             }
-            // Claude's transcript is mirrored message by message. Its queue
-            // is live state (Claude Code never persists one), never rows.
-            TranscriptEvent::ClaudeMessage { speaker, text, .. } => {
+            // Claude's transcript is mirrored message by message.
+            LogEvent::ClaudeMessage { speaker, text, .. } => {
                 self.push(
-                    pos,
+                    Some(pos),
                     match speaker {
                         Speaker::Assistant => UiBlock::AssistantMessage {
                             text: text.clone(),
@@ -641,7 +796,7 @@ impl TranscriptFold {
                     },
                 );
             }
-            TranscriptEvent::Stopped { error, .. } => {
+            LogEvent::Stopped { error, .. } => {
                 self.errored = true;
                 // A call the agent never answered is over too. Only a
                 // running one is copied out of its sharing.
@@ -653,7 +808,7 @@ impl TranscriptFold {
                     }
                 }
                 self.push(
-                    pos,
+                    Some(pos),
                     UiBlock::Notice {
                         text: error.clone(),
                     },
@@ -662,7 +817,7 @@ impl TranscriptFold {
             // What the model said before its request failed stays
             // readable; a retry says so, a final failure is `Stopped`
             // right after.
-            TranscriptEvent::Failed {
+            LogEvent::Failed {
                 text,
                 error,
                 retrying,
@@ -670,7 +825,7 @@ impl TranscriptFold {
             } => {
                 if !text.is_empty() {
                     self.push(
-                        pos,
+                        Some(pos),
                         UiBlock::AssistantMessage {
                             text: text.clone(),
                             phase: None,
@@ -679,7 +834,7 @@ impl TranscriptFold {
                 }
                 if *retrying {
                     self.push(
-                        pos,
+                        Some(pos),
                         UiBlock::Notice {
                             text: format!("temporary inference error: {error}; retrying"),
                         },
@@ -687,8 +842,8 @@ impl TranscriptFold {
                 }
             }
             // A rewind is told rather than unwritten, so the reader is the
-            // one that hides what it undid.
-            TranscriptEvent::Rewound { to, .. } => {
+            // one that hides what it undid. Mail stays: it was sent.
+            LogEvent::Rewound { to, .. } => {
                 self.timing_events.retain(|(pos, ..)| pos < to);
                 let timings = Arc::make_mut(&mut self.exec_timings);
                 timings.clear();
@@ -707,41 +862,37 @@ impl TranscriptFold {
                 }
                 self.touch(0);
 
-                let kept = self.told_at.iter().take_while(|told| *told < to).count();
-                self.touch(kept);
-                self.blocks.truncate(kept);
-                self.told_at.truncate(kept);
-                self.queue.retain(|(queued_at, _, _)| queued_at < to);
+                let undone = |told: &Option<Wpos>| told.is_some_and(|told| told >= *to);
+                let blocks = std::mem::take(&mut self.blocks);
+                let told_at = std::mem::take(&mut self.told_at);
+                for (block, told) in blocks.into_iter().zip(told_at) {
+                    if !undone(&told) {
+                        self.blocks.push(block);
+                        self.told_at.push(told);
+                    }
+                }
+                self.queue.retain(|(queued_at, _)| queued_at < to);
                 if self.context_used.is_some_and(|(said_at, _)| said_at >= *to) {
                     self.context_used = None;
                 }
             }
-            TranscriptEvent::Created { .. }
-            | TranscriptEvent::Deleted { .. }
-            | TranscriptEvent::RoleChanged { .. }
-            | TranscriptEvent::Notice { .. }
-            | TranscriptEvent::Presented { .. } => {}
-            TranscriptEvent::NotebookActivity { .. } => {
-                self.touch(self.blocks.len() + self.queue.len());
-            }
+            LogEvent::WorksetCreated { .. }
+            | LogEvent::Evaluated { .. }
+            | LogEvent::AgentCreated { .. }
+            | LogEvent::AgentChanged { .. } => {}
         }
-        true
     }
 
-    /// The transcript as it stands: the blocks, then what is queued.
+    /// The transcript as it stands: the blocks, then what waits.
     pub fn state(&self) -> UiAgentState {
         let mut blocks = self.blocks.clone();
-        blocks.extend(
-            self.queue
-                .iter()
-                .map(|(_, _, queued)| Arc::new(queued.clone())),
-        );
+        blocks.extend(self.waiting());
         UiAgentState {
             exec_timings: self.exec_timings.clone(),
             blocks,
             runtime: None,
-            // Never `Streaming`: this is the mirror, not the live tail.
-            // Whether the agent is working is the agent host's to report.
+            // Never `Streaming`: this is the log, not the live tail.
+            // Whether the agent is working is the host's to report.
             status: if self.errored {
                 UiAgentStatus::Error
             } else {
@@ -749,10 +900,17 @@ impl TranscriptFold {
             },
             context_used: self.context_used.map(|(_, used)| used),
             usage: UiAgentUsage {
-                provider: self.digest.usage_model.clone(),
-                total: self.digest.usage.clone(),
+                provider: self.usage_model.clone(),
+                total: self.usage.clone(),
             },
         }
+    }
+}
+
+fn sender(from: Address) -> Option<AgentId> {
+    match from {
+        Address::User => None,
+        Address::Agent(agent) => Some(agent),
     }
 }
 
@@ -770,42 +928,98 @@ fn delivered(queued: UiBlock) -> UiBlock {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use crate::protocol::transcript::{ArgumentsFormat, Item, ToolOutcome, Usage};
+    use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
     use crate::state::UiTool;
 
-    pub(crate) fn test_place() -> Place {
-        Place {
-            workset: Some("0123456789ab".parse().unwrap()),
-            cwd: "/src/repo".into(),
-        }
+    fn agent(n: u64) -> AgentId {
+        AgentId::from_counter(n, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn told(events: Vec<TranscriptEvent>) -> UiAgentState {
+    const ME: u64 = 1;
+
+    fn me() -> AgentId {
+        agent(ME)
+    }
+
+    /// Rows about the agent under test, at consecutive positions.
+    fn told(events: Vec<LogEvent>) -> UiAgentState {
         transcript(
+            me(),
             &events
                 .into_iter()
                 .enumerate()
-                .map(|(pos, event)| (AgentPos(pos as u64), event))
+                .map(|(pos, event)| TranscriptRow::Log(Wpos(pos as u64), event))
                 .collect::<Vec<_>>(),
         )
     }
 
-    fn user(text: &str, at: u64) -> TranscriptEvent {
-        TranscriptEvent::Message {
-            from: None,
+    fn input(text: &str, mail: Option<u64>, at: u64) -> LogEvent {
+        LogEvent::Input {
+            agent: me(),
+            mail: mail.map(MailId),
             text: text.to_owned(),
+            wake: rho_agent_types::InputWake::Person,
             at: UnixMs(at),
         }
     }
 
-    /// A long transcript, one page appended: the reader is told where the
-    /// transcript first differs, and that is the end of what it already
-    /// had. Handing the state whole made a row cost every row above it.
+    fn sent_row(at: u64) -> LogEvent {
+        LogEvent::Sent {
+            agent: me(),
+            results: Vec::new(),
+            compaction: false,
+            at: UnixMs(at),
+        }
+    }
+
+    fn replied(items: Vec<Item>, usage: Option<Usage>, context: Option<u64>, at: u64) -> LogEvent {
+        LogEvent::Replied {
+            agent: me(),
+            items,
+            compacted: false,
+            usage,
+            context_used: context,
+            at: UnixMs(at),
+        }
+    }
+
+    fn mail(id: u64, from: Address, to: Address, kind: Option<SendKind>, at: u64) -> Mail {
+        Mail {
+            id: MailId(id),
+            at: UnixMs(at),
+            from,
+            to,
+            re: None,
+            kind,
+            content: vec![rho_agent_types::ContentPart::Text {
+                text: format!("mail {id}"),
+            }],
+        }
+    }
+
+    fn to_user(id: u64, kind: SendKind, at: u64) -> Mail {
+        mail(id, Address::Agent(me()), Address::User, Some(kind), at)
+    }
+
+    fn from_user(id: u64, at: u64) -> Mail {
+        mail(id, Address::User, Address::Agent(me()), None, at)
+    }
+
+    fn only_tool(state: &UiAgentState) -> &UiTool {
+        state
+            .blocks
+            .iter()
+            .find_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("the call is a tool block")
+    }
+
     #[test]
     fn committed_items_keep_live_order_and_phase_and_rewind_together() {
-        use crate::protocol::transcript::{ArgumentsFormat, Item, TextPhase};
+        use crate::protocol::transcript::TextPhase;
         let items = vec![
             Item::Text {
                 text: "before".into(),
@@ -820,213 +1034,115 @@ mod tests {
             Item::Reasoning {
                 text: "after call".into(),
             },
-            Item::Text {
-                text: "last".into(),
-                phase: Some(TextPhase::FinalAnswer),
-            },
         ];
-        let event = TranscriptEvent::Replied {
-            items: items.clone(),
-            compacted: false,
-            usage: None,
-            context_used: Some(73),
-            at: UnixMs(19),
-        };
-        let mut fold = TranscriptFold::new(&[(AgentPos(0), user("question", 1))]);
-        fold.tell(
-            AgentPos(1),
-            &TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(2),
-            },
+        let mut fold = TranscriptFold::new(
+            me(),
+            &[
+                TranscriptRow::Log(Wpos(0), input("question", None, 1)),
+                TranscriptRow::Log(Wpos(1), sent_row(2)),
+                TranscriptRow::Log(Wpos(2), replied(items.clone(), None, Some(73), 19)),
+            ],
         );
-        fold.tell(AgentPos(2), &event);
         for (index, item) in items.iter().enumerate() {
             let expected = crate::store::block(item);
-            let actual = &*fold.blocks[index + 1];
-            match (actual, expected) {
+            match (&*fold.blocks[index + 1], expected) {
                 (UiBlock::Tool(tool), UiBlock::Tool(expected)) => {
                     assert_eq!(tool.id, expected.id);
-                    assert_eq!(tool.arguments, "print(42)");
                     assert_eq!(tool.started_at, Some(UnixMs(19)));
                 }
                 (actual, expected) => assert_eq!(actual, &expected),
             }
         }
-        fold.tell(
-            AgentPos(3),
-            &TranscriptEvent::Rewound {
-                to: AgentPos(2),
+        fold.tell(&TranscriptRow::Log(
+            Wpos(3),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(2),
                 at: UnixMs(20),
             },
-        );
+        ));
         assert_eq!(fold.blocks.len(), 1);
     }
 
+    /// A long transcript, one row appended: the reader is told where the
+    /// transcript first differs, and that is the end of what it had.
     #[test]
     fn a_page_for_the_open_agent_costs_its_rows() {
-        let mut fold = TranscriptFold::default();
+        let mut fold = TranscriptFold::new(me(), &[]);
         let mut pos = 0u64;
-        let mut tell = |fold: &mut TranscriptFold, event: TranscriptEvent| {
-            fold.tell(AgentPos(pos), &event);
+        let mut tell = |fold: &mut TranscriptFold, event: LogEvent| {
+            fold.tell(&TranscriptRow::Log(Wpos(pos), event));
             pos += 1;
         };
         for nth in 0..64 {
-            tell(&mut fold, user(&format!("row {nth}"), nth as u64));
-            tell(
-                &mut fold,
-                TranscriptEvent::Sent {
-                    results: Vec::new(),
-                    compaction: false,
-                    at: UnixMs(nth as u64),
-                },
-            );
+            tell(&mut fold, input(&format!("row {nth}"), None, nth));
+            tell(&mut fold, sent_row(nth));
         }
-        // The one hand-off that is whole: the reader had nothing.
         let whole = fold.state();
         let held = whole.blocks.len();
-        assert_eq!(held, 64, "one block per delivered message");
+        assert_eq!(held, 64, "one block per delivered input");
         fold.delta().expect("the first read hands everything");
         assert!(fold.delta().is_none(), "nothing has moved since");
 
-        tell(&mut fold, user("one more", 100));
-        tell(
-            &mut fold,
-            TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(100),
-            },
-        );
+        tell(&mut fold, input("one more", None, 100));
+        tell(&mut fold, sent_row(100));
         let delta = fold.delta().expect("a row moved the transcript");
         assert_eq!(
             delta.from, held,
-            "the transcript first differs where it used to end"
+            "the transcript first differs where it ended"
         );
-        assert_eq!(
-            delta.blocks.len(),
-            1,
-            "and what differs is the row appended"
-        );
+        assert_eq!(delta.blocks.len(), 1);
 
         let mut store = crate::store::AgentStore::default();
-        let agent =
-            AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).expect("an agent id");
-        // The reader opened the agent and was handed the transcript whole,
-        // once; the page arrives after that.
-        store.set_fold(agent, whole);
-        let summary = store.apply_fold_delta(agent, delta);
+        store.set_fold(me(), whole);
+        let summary = store.apply_fold_delta(me(), delta);
+        assert_eq!(summary.first_changed_block, Some(held));
         assert_eq!(
-            summary.first_changed_block,
-            Some(held),
-            "the reader renders from there, not from the top"
-        );
-        assert_eq!(
-            store.get(&agent).map(|state| state.blocks.len()),
-            Some(held + 1),
-            "and the transcript it holds is the whole of it"
+            store.get(&me()).map(|state| state.blocks.len()),
+            Some(held + 1)
         );
     }
 
-    fn only_tool(state: &UiAgentState) -> &UiTool {
-        state
-            .blocks
-            .iter()
-            .find_map(|block| match &**block {
-                UiBlock::Tool(tool) => Some(tool),
-                _ => None,
-            })
-            .expect("the call is a tool block")
-    }
-
-    /// A code-mode `exec` call's arguments are JavaScript source, not JSON,
-    /// so the mirror must preserve the complete source. The
-    /// call has to carry them itself or the transcript shows the word
-    /// "exec" and the code is gone, which is what the user saw.
+    /// A code cell's arguments are its source, kept whole.
     #[test]
     fn an_exec_call_folds_to_a_tool_whose_arguments_are_the_code() {
-        let code = "const files = await tools.exec_command({ cmd: 'ls' });\nconsole.log(files);\n";
-        let state = told(vec![
-            user("what is in there", 1),
-            TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(2),
-            },
-            TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: "call-1".to_owned(),
-                    name: "exec".to_owned(),
-                    arguments: code.to_owned(),
-                    format: ArgumentsFormat::Text,
-                }],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(2),
-            },
-        ]);
-        let tool = only_tool(&state);
-        assert_eq!(tool.arguments, code, "the whole cell, every line of it");
-    }
-
-    /// And the reduction that lost it still leaves the label its command: a
-    /// shell call carries its arguments whole, which is what the transcript
-    /// reads its label out of.
-    #[test]
-    fn a_shell_call_still_carries_its_command() {
-        let state = told(vec![
-            user("build it", 1),
-            TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(2),
-            },
-            TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: "call-1".to_owned(),
-                    name: "shell_command".to_owned(),
-                    arguments: r#"{"command":"cargo build"}"#.to_owned(),
-                    format: ArgumentsFormat::Json,
-                }],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(2),
-            },
-        ]);
-        let tool = only_tool(&state);
-        assert_eq!(tool.name, "shell_command");
-        assert_eq!(tool.arguments, r#"{"command":"cargo build"}"#);
+        let code = "files = os.listdir('.')\nprint(files)\n";
+        let state = told(vec![replied(
+            vec![Item::ToolCall {
+                id: "call-1".to_owned(),
+                name: "exec".to_owned(),
+                arguments: code.to_owned(),
+                format: ArgumentsFormat::Text,
+            }],
+            None,
+            None,
+            2,
+        )]);
+        assert_eq!(only_tool(&state).arguments, code);
     }
 
     #[test]
     fn a_told_turn_reads_as_a_transcript() {
         let state = told(vec![
-            user("have a look", 1),
-            TranscriptEvent::Sent {
-                results: Vec::new(),
-                compaction: false,
-                at: UnixMs(2),
-            },
-            TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
+            input("have a look", Some(1), 1),
+            sent_row(2),
+            replied(
+                vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "Read".to_owned(),
                     arguments: r#"{"file_path":"/tmp/README.md"}"#.to_owned(),
                     format: ArgumentsFormat::Json,
                 }],
-                compacted: false,
-                usage: Some(Usage {
+                Some(Usage {
                     model: "sol".to_owned(),
                     output_tokens: 5,
                     ..Default::default()
                 }),
-                context_used: Some(10),
-                at: UnixMs(3),
-            },
-            TranscriptEvent::Sent {
+                Some(10),
+                3,
+            ),
+            LogEvent::Sent {
+                agent: me(),
                 results: vec![ToolOutcome {
                     id: "call-1".to_owned(),
                     status: ToolStatus::Error,
@@ -1036,20 +1152,19 @@ mod tests {
                 compaction: false,
                 at: UnixMs(4),
             },
-            TranscriptEvent::Replied {
-                items: vec![Item::Text {
+            replied(
+                vec![Item::Text {
                     text: "done looking".to_owned(),
                     phase: None,
                 }],
-                compacted: false,
-                usage: Some(Usage {
+                Some(Usage {
                     model: "sol".to_owned(),
                     output_tokens: 7,
                     ..Default::default()
                 }),
-                context_used: Some(12),
-                at: UnixMs(5),
-            },
+                Some(12),
+                5,
+            ),
         ]);
         assert_eq!(state.status, UiAgentStatus::Idle);
         assert_eq!(state.blocks.len(), 3);
@@ -1059,71 +1174,168 @@ mod tests {
                 text: "have a look".to_owned()
             }
         );
-        let UiBlock::Tool(tool) = &*state.blocks[1] else {
-            panic!("the call is a tool block");
-        };
-        assert_eq!(
-            tool.arguments, r#"{"file_path":"/tmp/README.md"}"#,
-            "the call carries what the model sent; the label reads the path \
-             out of it at render time"
-        );
+        let tool = only_tool(&state);
         assert_eq!(tool.status, UiToolStatus::Error);
         assert_eq!(tool.finished_at, Some(UnixMs(4)));
-        assert_eq!(tool.output, None, "the mirror never carries tool output");
         assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
         assert_eq!(state.usage.provider, "sol");
+        assert_eq!(state.context_used, Some(12));
     }
 
+    /// Results alone carry nothing out of the queue; a request does.
     #[test]
-    fn a_message_waits_as_queued_until_a_request_carries_it() {
-        let state = told(vec![user("later", 1)]);
-        assert!(matches!(*state.blocks[0], UiBlock::QueuedMessage { .. }));
+    fn an_input_waits_as_queued_until_a_request_carries_it() {
         let state = told(vec![
-            user("later", 1),
-            TranscriptEvent::QueueCleared { at: UnixMs(2) },
-        ]);
-        assert!(state.blocks.is_empty());
-    }
-
-    /// A Claude agent's tool results carry nothing out of the queue: the
-    /// message waits until Claude's own echo of it.
-    #[test]
-    fn results_alone_leave_the_queue_where_it_is() {
-        let state = told(vec![
-            user("later", 1),
-            TranscriptEvent::Results {
+            input("later", None, 1),
+            LogEvent::Results {
+                agent: me(),
                 results: Vec::new(),
                 at: UnixMs(2),
             },
         ]);
         assert_eq!(state.blocks.len(), 1);
-        assert!(matches!(*state.blocks[0], UiBlock::QueuedMessage { .. }));
+        assert!(matches!(&*state.blocks[0], UiBlock::Notice { text } if text == "later"));
     }
 
-    fn replied_with_context(used: u64, at: u64) -> TranscriptEvent {
-        TranscriptEvent::Replied {
-            items: Vec::new(),
-            compacted: false,
-            usage: None,
-            context_used: Some(used),
-            at: UnixMs(at),
-        }
+    /// The workset's log holds every agent's rows; only this agent's are
+    /// its transcript.
+    #[test]
+    fn rows_about_another_agent_are_not_this_transcript() {
+        let other = LogEvent::ClaudeMessage {
+            agent: agent(2),
+            speaker: Speaker::Assistant,
+            text: "not mine".into(),
+            at: UnixMs(1),
+        };
+        let mut fold = TranscriptFold::new(me(), &[]);
+        assert!(!fold.tell(&TranscriptRow::Log(Wpos(0), other.clone())));
+        assert!(fold.state().blocks.is_empty());
+        let merged = interleave(me(), [(Wpos(0), other)], []);
+        assert!(merged.is_empty());
+    }
+
+    /// Mail to the agent waits until an input hands it over, then reads as
+    /// the input does, from whoever wrote it, and is never shown twice;
+    /// what the agent mails out is in its transcript, except a status.
+    #[test]
+    fn mail_waits_until_an_input_hands_it_over() {
+        let peer = agent(2);
+        let mut fold = TranscriptFold::new(me(), &[]);
+        fold.tell(&TranscriptRow::Mail(mail(
+            3,
+            Address::Agent(peer),
+            Address::Agent(me()),
+            None,
+            1,
+        )));
+        fold.tell(&TranscriptRow::Mail(from_user(4, 2)));
+        let state = fold.state();
+        assert_eq!(state.blocks.len(), 2, "both wait");
+        assert!(matches!(&*state.blocks[0],
+            UiBlock::QueuedMessage { sender: Some(sender), .. } if *sender == peer));
+
+        fold.tell(&TranscriptRow::Log(Wpos(0), input("from peer", Some(3), 3)));
+        fold.tell(&TranscriptRow::Log(Wpos(1), sent_row(4)));
+        let state = fold.state();
+        assert_eq!(
+            *state.blocks[0],
+            UiBlock::AgentMessage {
+                sender: peer,
+                text: "from peer".into()
+            }
+        );
+        assert_eq!(state.blocks.len(), 2, "the user's mail still waits, once");
+        assert!(matches!(&*state.blocks[1],
+            UiBlock::QueuedMessage { sender: None, text } if text == "mail 4"));
+
+        fold.tell(&TranscriptRow::Mail(to_user(5, SendKind::Status, 5)));
+        fold.tell(&TranscriptRow::Mail(to_user(6, SendKind::Ask, 6)));
+        let state = fold.state();
+        assert_eq!(state.blocks.len(), 3, "a status is not a message");
+        assert!(matches!(&*state.blocks[1],
+            UiBlock::MessageSent { to: None, text } if text == "mail 6"));
+        assert!(
+            matches!(&*state.blocks[2], UiBlock::QueuedMessage { .. }),
+            "waiting mail stays last"
+        );
+    }
+
+    /// An input may be heard before the mail it hands over: the mail then
+    /// never waits.
+    #[test]
+    fn mail_heard_after_its_input_does_not_wait() {
+        let mut fold = TranscriptFold::new(me(), &[]);
+        fold.tell(&TranscriptRow::Log(Wpos(0), input("hello", Some(9), 2)));
+        fold.tell(&TranscriptRow::Mail(from_user(9, 1)));
+        let state = fold.state();
+        assert_eq!(state.blocks.len(), 1);
+        assert!(
+            !fold.tell(&TranscriptRow::Mail(from_user(9, 1))),
+            "a replay"
+        );
+    }
+
+    /// A rewind takes back rows, not mail: what was mailed was sent.
+    #[test]
+    fn a_rewind_hides_rows_but_not_mail() {
+        let rows = interleave(
+            me(),
+            [
+                (
+                    Wpos(0),
+                    LogEvent::ClaudeMessage {
+                        agent: me(),
+                        speaker: Speaker::User,
+                        text: "first".into(),
+                        at: UnixMs(1),
+                    },
+                ),
+                (
+                    Wpos(1),
+                    LogEvent::ClaudeMessage {
+                        agent: me(),
+                        speaker: Speaker::Assistant,
+                        text: "second".into(),
+                        at: UnixMs(2),
+                    },
+                ),
+                (
+                    Wpos(2),
+                    LogEvent::Rewound {
+                        agent: me(),
+                        to: Wpos(1),
+                        at: UnixMs(4),
+                    },
+                ),
+            ],
+            [to_user(7, SendKind::Result, 3)],
+        );
+        assert!(matches!(rows[2], TranscriptRow::Mail(_)), "merged by time");
+        let state = transcript(me(), &rows);
+        assert_eq!(
+            state.blocks,
+            vec![
+                Arc::new(UiBlock::UserMessage {
+                    text: "first".to_owned()
+                }),
+                Arc::new(UiBlock::MessageSent {
+                    to: None,
+                    text: "mail 7".to_owned()
+                }),
+            ]
+        );
     }
 
     #[test]
-    fn the_last_reply_says_how_full_the_context_is() {
+    fn the_last_reply_says_how_full_the_context_is_until_rewound() {
         let state = told(vec![
-            replied_with_context(10, 1),
-            replied_with_context(12, 2),
-        ]);
-        assert_eq!(state.context_used, Some(12));
-        let state = told(vec![
-            replied_with_context(10, 1),
-            replied_with_context(12, 2),
-            TranscriptEvent::Rewound {
-                to: AgentPos(1),
+            replied(Vec::new(), None, Some(10), 1),
+            replied(Vec::new(), None, Some(12), 2),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(1),
                 at: UnixMs(3),
             },
         ]);
@@ -1133,40 +1345,20 @@ mod tests {
         );
     }
 
-    /// The error text is the trailing notice, which is what `Error` status
-    /// means to every reader of a live frame.
-    #[test]
-    fn a_stopped_agent_ends_in_a_notice() {
-        let state = told(vec![TranscriptEvent::Stopped {
-            error: "the deploy script exited 1".to_owned(),
-            at: UnixMs(2),
-        }]);
-        assert_eq!(state.status, UiAgentStatus::Error);
-        assert_eq!(
-            state.blocks,
-            vec![Arc::new(UiBlock::Notice {
-                text: "the deploy script exited 1".to_owned()
-            })]
-        );
-    }
     /// What the model said before its request failed stays on screen:
     /// a retry says so after it, a final failure is the stop's notice.
     #[test]
     fn a_failed_request_keeps_what_was_said() {
         let state = told(vec![
-            TranscriptEvent::Failed {
+            LogEvent::Failed {
+                agent: me(),
                 text: "half an answer".to_owned(),
                 error: "overloaded".to_owned(),
                 retrying: true,
                 at: UnixMs(2),
             },
-            TranscriptEvent::Failed {
-                text: "another half".to_owned(),
-                error: "quota".to_owned(),
-                retrying: false,
-                at: UnixMs(3),
-            },
-            TranscriptEvent::Stopped {
+            LogEvent::Stopped {
+                agent: me(),
                 error: "quota".to_owned(),
                 at: UnixMs(3),
             },
@@ -1182,10 +1374,6 @@ mod tests {
                 Arc::new(UiBlock::Notice {
                     text: "temporary inference error: overloaded; retrying".to_owned()
                 }),
-                Arc::new(UiBlock::AssistantMessage {
-                    text: "another half".to_owned(),
-                    phase: None
-                }),
                 Arc::new(UiBlock::Notice {
                     text: "quota".to_owned()
                 }),
@@ -1193,275 +1381,190 @@ mod tests {
         );
     }
 
-    fn sent(kind: SendKind, at: u64) -> TranscriptEvent {
-        TranscriptEvent::MessageSent {
-            to: None,
-            text: format!("sent at {at}"),
-            kind,
-            at: UnixMs(at),
-        }
-    }
-
-    /// The card counts from the oldest unread of the strongest kind, and a
-    /// stop is as strong as a question (`rho-dealer/cases.md`, A5, A8).
-    #[test]
-    fn the_strongest_unread_counts_from_its_oldest() {
-        let mut digest = Digest::default();
-        digest.tell(AgentPos(0), &user("go", 1));
-        digest.tell(AgentPos(1), &sent(SendKind::Result, 2));
-        digest.tell(
-            AgentPos(2),
-            &TranscriptEvent::Stopped {
-                error: "quota".to_owned(),
-                at: UnixMs(3),
-            },
-        );
-        digest.tell(AgentPos(3), &sent(SendKind::Fyi, 4));
-        digest.tell(AgentPos(4), &sent(SendKind::Ask, 5));
-        let strongest = |seen| {
-            digest
-                .strongest_unread(AgentPos(seen))
-                .map(|unread| (unread.said, unread.pos.0))
-        };
-        assert_eq!(strongest(0), Some((Said::Stopped, 2)));
-        assert_eq!(strongest(3), Some((Said::Ask, 4)));
-        assert_eq!(strongest(5), None);
-
-        let mut digest = Digest::default();
-        digest.tell(AgentPos(0), &sent(SendKind::Status, 1));
-        digest.tell(AgentPos(1), &sent(SendKind::Fyi, 2));
-        assert_eq!(
-            digest.strongest_unread(AgentPos::ZERO),
-            None,
-            "an fyi is owed nothing"
-        );
-        assert_eq!(digest.last_sent_at, Some(UnixMs(2)), "but it is a send");
-        assert_eq!(digest.status, None, "and it ends the status");
-    }
-
-    /// Only the conversation counts: a status, a retried error and mail to
-    /// another agent put nothing to the user, and writing reads it all.
-    #[test]
-    fn unread_is_what_the_agent_put_to_the_user_since_they_wrote() {
-        let mut digest = Digest::default();
-        digest.tell(AgentPos(0), &sent(SendKind::Status, 1));
-        digest.tell(
-            AgentPos(1),
-            &TranscriptEvent::Failed {
-                text: String::new(),
-                error: "overloaded".to_owned(),
-                retrying: true,
-                at: UnixMs(2),
-            },
-        );
-        digest.tell(
-            AgentPos(2),
-            &TranscriptEvent::MessageSent {
-                to: Some(AgentId::from_counter(9, &rho_agent_types::AgentIdDomain(0)).unwrap()),
-                text: "mail".to_owned(),
-                kind: SendKind::Ask,
-                at: UnixMs(3),
-            },
-        );
-        assert!(digest.unread.is_empty());
-        assert_eq!(
-            digest.status,
-            Some((AgentPos(0), "sent at 1".to_owned())),
-            "mail to an agent is not the conversation and leaves the status"
-        );
-        assert_eq!(digest.last_sent_at, None);
-
-        digest.tell(AgentPos(3), &sent(SendKind::Result, 4));
-        assert_eq!(digest.status, None, "a later send hides the status");
-        assert_eq!(digest.last_sent_at, Some(UnixMs(4)));
-        digest.tell(AgentPos(4), &sent(SendKind::Status, 5));
-        assert_eq!(digest.unread.len(), 1);
-        digest.tell(AgentPos(5), &user("thanks", 6));
-        assert!(
-            digest.unread.is_empty(),
-            "writing reads everything before it"
-        );
-        assert_eq!(digest.status, None, "and hides the status");
-    }
-    #[test]
-    fn report_delivers_exact_messages_and_reports_call_while_task_runs() {
-        let mut fold = TranscriptFold::default();
-        let mut tell = |pos, event| {
-            fold.tell(AgentPos(pos), &event);
-        };
-        tell(
-            0,
-            TranscriptEvent::NotebookActivity {
-                responding: true,
-                running_tasks: 2,
-                checkin_at: None,
-                archived: false,
-                at: UnixMs(1),
-            },
-        );
-        tell(
-            1,
-            TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: "exec-1".into(),
-                    name: "exec".into(),
-                    arguments: "print(1)".into(),
-                    format: ArgumentsFormat::Text,
-                }],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(2),
-            },
-        );
-        for (pos, id) in [(2, 41), (3, 73), (4, 82)] {
-            tell(
-                pos,
-                TranscriptEvent::Received {
-                    id,
-                    from: None,
-                    text: format!("message-{id}"),
-                    at: UnixMs(pos),
-                },
-            );
-        }
-        tell(
-            5,
-            TranscriptEvent::NotebookReport {
-                calls: vec!["exec-1".into()],
-                delivered: vec![41],
-                acknowledged: vec![73],
-                compaction: false,
-                at: UnixMs(5),
-            },
-        );
-        let state = fold.state();
-        assert!(state.runtime.is_none());
-        assert_eq!(fold.digest.notebook.unwrap().running_tasks, 2);
-        let UiBlock::Tool(tool) = &*state.blocks[0] else {
-            panic!("expected tool")
-        };
-        assert_eq!(tool.status, UiToolStatus::Reported);
-        assert_eq!((tool.started_at, tool.finished_at), (None, None));
-        assert_eq!(
-            *state.blocks[1],
-            UiBlock::UserMessage {
-                text: "message-41".into()
-            }
-        );
-        assert!(
-            matches!(&*state.blocks[2], UiBlock::QueuedMessage { text, .. } if text == "message-82")
-        );
-        assert_eq!(
-            state.blocks.len(),
-            3,
-            "acknowledged message is not delivered"
-        );
-    }
-
-    /// A rewind hides what it undid and keeps what came before it.
-    #[test]
-    fn a_rewind_hides_what_it_undid() {
-        let state = told(vec![
-            TranscriptEvent::ClaudeMessage {
-                speaker: Speaker::User,
-                text: "first".to_owned(),
-                at: UnixMs(1),
-            },
-            TranscriptEvent::ClaudeMessage {
-                speaker: Speaker::Assistant,
-                text: "second".to_owned(),
-                at: UnixMs(2),
-            },
-            TranscriptEvent::Rewound {
-                to: AgentPos(1),
-                at: UnixMs(3),
-            },
-        ]);
-        assert_eq!(
-            state.blocks,
-            vec![Arc::new(UiBlock::UserMessage {
-                text: "first".to_owned()
-            })]
-        );
-    }
-
-    #[test]
-    fn the_digest_reads_what_the_rails_need() {
-        let host = HostId(1);
-        let agent_id = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let created = TranscriptEvent::Created {
-            role: AgentRole::default(),
-            runtime: RuntimeKind::Rho,
-            place: test_place(),
-            spawned_by: SpawnedBy::Direct,
-            spawn_name: None,
-            parent: None,
-            model: "sol".to_owned(),
-            at: UnixMs(1),
-        };
-        assert!(MirroredAgent::new(host, agent_id, &user("x", 1)).is_none());
-        let mut mirrored = MirroredAgent::new(host, agent_id, &created).unwrap();
-        assert!(mirrored.tell(AgentPos(1), &user("do the thing\nand then some", 10)));
-        assert_eq!(mirrored.digest.last_user_message_text, "do the thing");
-        assert!(mirrored.tell(AgentPos(2), &sent(SendKind::Status, 11)));
-        assert!(mirrored.tell(AgentPos(3), &sent(SendKind::Ask, 12)));
-        assert_eq!(mirrored.digest.unread.len(), 1);
-        // Replaying a position the fold already holds changes nothing.
-        assert!(!mirrored.tell(AgentPos(3), &user("again", 99)));
-        assert_eq!(mirrored.digest.newest, AgentPos(4));
-        assert_eq!(mirrored.digest.last_active, UnixMs(12));
-        assert!(mirrored.tell(
-            AgentPos(4),
-            &TranscriptEvent::Rewound {
-                to: AgentPos(2),
-                at: UnixMs(14),
-            }
-        ));
-        assert!(mirrored.digest.unread.is_empty());
-        assert_eq!(mirrored.digest.status, None);
-    }
     #[test]
     fn exec_observations_survive_commit_and_rewind_without_retiming() {
         use rho_agent_types::ExecMilestone::*;
-        let mut fold = TranscriptFold::default();
+        let mut fold = TranscriptFold::new(me(), &[]);
         let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
-            fold.tell(
-                AgentPos(pos),
-                &TranscriptEvent::ExecObserved {
+            fold.tell(&TranscriptRow::Log(
+                Wpos(pos),
+                LogEvent::ExecObserved {
+                    agent: me(),
                     id: "exec-1".into(),
                     milestone,
                     at: UnixMs(at),
                 },
-            );
+            ));
         };
         tell(&mut fold, 0, FirstBlock, 10);
-        tell(&mut fold, 1, ArgumentsFinished, 20);
-        let early = fold.state();
-        assert_eq!(
-            early.exec_timings["exec-1"].first_block_at,
-            Some(UnixMs(10))
-        );
-        tell(&mut fold, 2, ResponseFinished, 30);
-        tell(&mut fold, 3, Boundary, 40);
-        tell(&mut fold, 4, HandedOff, 50);
-        // Redelivery of one observation is idempotent even at a new log
-        // position.
-        tell(&mut fold, 5, FirstBlock, 99);
+        tell(&mut fold, 1, ResponseFinished, 30);
+        tell(&mut fold, 2, Boundary, 40);
+        tell(&mut fold, 3, FirstBlock, 99);
         assert_eq!(
             fold.state().exec_timings["exec-1"].first_block_at,
             Some(UnixMs(10))
         );
-        fold.tell(
-            AgentPos(6),
-            &TranscriptEvent::Rewound {
-                to: AgentPos(3),
+        fold.tell(&TranscriptRow::Log(
+            Wpos(4),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(2),
                 at: UnixMs(60),
             },
-        );
+        ));
         let timing = fold.state().exec_timings["exec-1"];
         assert_eq!(timing.response_finished_at, Some(UnixMs(30)));
         assert_eq!(timing.boundary_at, None);
-        assert_eq!(timing.handed_off_at, None);
+    }
+
+    fn digest(mails: &[Mail]) -> Digest {
+        let mut digest = Digest::default();
+        for mail in mails {
+            digest.tell(me(), mail);
+        }
+        digest
+    }
+
+    /// The card counts from the oldest unread of the strongest kind
+    /// (`rho-dealer/cases.md`, A5); a status, an fyi and mail between
+    /// agents are never owed to the user.
+    #[test]
+    fn the_strongest_unread_counts_from_its_oldest() {
+        let peer = Address::Agent(agent(2));
+        let digest = digest(&[
+            from_user(1, 1),
+            to_user(2, SendKind::Result, 2),
+            to_user(3, SendKind::Status, 3),
+            to_user(4, SendKind::Fyi, 4),
+            mail(5, Address::Agent(me()), peer, Some(SendKind::Ask), 5),
+            to_user(6, SendKind::Ask, 6),
+            to_user(7, SendKind::Ask, 7),
+        ]);
+        let strongest = |seen| {
+            digest
+                .strongest_unread(seen)
+                .map(|unread| (unread.said, unread.pos))
+        };
+        let at = |id| ConversationPos::of_mail(MailId(id));
+        assert_eq!(strongest(ConversationPos(0)), Some((Said::Ask, at(6))));
+        assert_eq!(strongest(at(7)), Some((Said::Ask, at(7))));
+        assert_eq!(strongest(digest.newest), None);
+        assert_eq!(
+            digest.unread.len(),
+            3,
+            "a status, an fyi and agent mail are no card"
+        );
+        assert_eq!(digest.last_sent_at, Some(UnixMs(7)));
+    }
+
+    /// A status is the status line until any later mail to the user.
+    #[test]
+    fn a_status_is_never_unread() {
+        let mut digest = digest(&[to_user(1, SendKind::Status, 1)]);
+        assert!(digest.unread.is_empty());
+        assert_eq!(digest.status, Some((MailId(1), "mail 1".into())));
+        assert_eq!(digest.last_sent_at, None, "a status is not a send");
+        digest.tell(me(), &to_user(2, SendKind::Fyi, 2));
+        assert_eq!(digest.status, None);
+        assert!(digest.unread.is_empty());
+    }
+
+    /// The user writing reads everything before it, once: the same mail
+    /// heard again (a reconnect replays the log from a cursor) does not
+    /// read what the agent said after it.
+    #[test]
+    fn writing_reads_what_came_before_it_and_a_replay_reads_nothing() {
+        let mut digest = digest(&[to_user(1, SendKind::Ask, 1), from_user(2, 2)]);
+        assert!(
+            digest.unread.is_empty(),
+            "writing reads everything before it"
+        );
+        assert_eq!(digest.last_user_message_text, "mail 2");
+        assert!(digest.tell(me(), &to_user(3, SendKind::Result, 3)));
+        assert!(!digest.tell(me(), &from_user(2, 2)), "a replay is not news");
+        assert_eq!(digest.unread.len(), 1, "the result after it is still owed");
+        assert_eq!(digest.newest, ConversationPos::of_mail(MailId(3)).next());
+    }
+
+    /// A stop sits after the mail before it and before the mail after it,
+    /// so dealing with the conversation up to a stop deals with the stop,
+    /// and mail after a dealt-with stop is owed again.
+    #[test]
+    fn a_stop_is_ordered_between_the_mail_around_it() {
+        let mut digest = digest(&[to_user(4, SendKind::Result, 1)]);
+        let seen_mail = digest.newest;
+        assert!(digest.stopped(MailId(9), UnixMs(2)));
+        assert!(
+            !digest.stopped(MailId(12), UnixMs(3)),
+            "told again by a reconnect"
+        );
+        let stop = digest
+            .strongest_unread(seen_mail)
+            .expect("the stop is owed");
+        assert_eq!(stop.said, Said::Stopped);
+        let seen_stop = digest.newest;
+        assert_eq!(digest.strongest_unread(seen_stop), None);
+        digest.tell(me(), &to_user(10, SendKind::Result, 4));
+        assert_eq!(
+            digest.strongest_unread(seen_stop).map(|unread| unread.said),
+            Some(Said::Result),
+            "mail after the stop is new"
+        );
+        assert!(digest.running());
+        assert!(digest.stop().is_none());
+    }
+
+    #[test]
+    fn identity_reads_the_props_the_gui_gives_meaning() {
+        let parent = agent(7);
+        let mut entry = AgentEntry {
+            agent: me(),
+            workset: "0123456789ab".parse().unwrap(),
+            spec: crate::protocol::rho2::SpecView {
+                runtime: RuntimeKind::Rho,
+                model: "sol".into(),
+                effort: "medium".into(),
+                props: Default::default(),
+            },
+            created_at: UnixMs(1),
+        };
+        let identity = |entry: &AgentEntry, kind| AgentIdentity {
+            entry: entry.clone(),
+            kind,
+        };
+        let bare = identity(&entry, WorksetKind::Isolated);
+        assert_eq!(bare.name(), None);
+        assert!(!bare.user_facing());
+        assert_eq!(bare.handle_prefix(), "eng");
+        assert_eq!(bare.place().cwd, "/src");
+        assert_eq!(bare.place().workset, Some(entry.workset));
+
+        for (key, value) in [
+            (props::TITLE, "a title"),
+            (props::NAME, " "),
+            (props::PARENT, &parent.encoded()),
+            (props::USER_FACING, "true"),
+            (props::CWD, "/src/rho"),
+            (PRESET, "advisor"),
+        ] {
+            entry.spec.props.insert(key.into(), value.into());
+        }
+        let full = identity(
+            &entry,
+            WorksetKind::Host {
+                cwd: "/home/me".into(),
+            },
+        );
+        assert_eq!(full.name(), Some("a title"), "a blank name is no name");
+        assert_eq!(full.parent(), Some(parent));
+        assert!(full.user_facing());
+        assert_eq!(full.handle_prefix(), "adv");
+        assert_eq!(full.place().cwd, "/src/rho");
+        assert_eq!(full.place().workset, None, "a host workset is the host");
+        entry
+            .spec
+            .props
+            .insert(props::PARENT.into(), "not an id".into());
+        assert_eq!(identity(&entry, WorksetKind::Isolated).parent(), None);
     }
 }

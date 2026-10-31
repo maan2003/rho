@@ -2,17 +2,17 @@
 //!
 //! A message goes in here the moment it is written, under a random id the
 //! client picks, and onto disk with it. It leaves when its host answers
-//! that the message is logged. Until then it is sent again whenever the
-//! host comes back: a host logs an id once, so sending twice is harmless,
-//! and words written while the network was down are not lost. An agent's
-//! unsent messages go together in one call, in the order they were
-//! written, which the host keeps.
+//! that the mail is logged. Until then it is posted again whenever the
+//! host comes back: a host logs a `client_id` once, so posting twice is
+//! harmless, and words written while the network was down are not lost.
+//! An agent's messages go one at a time, oldest first, so the mail log
+//! holds them in the order they were written.
 
 use std::collections::HashMap;
 
 use rho_agent_types::{AgentId, ContentPart, UnixMs};
 
-use crate::protocol::{AgentCommand, UserMessage};
+use crate::protocol::rho2::PostMail;
 
 /// One message on disk until its host takes it.
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -25,9 +25,9 @@ pub struct Outgoing {
 pub struct Outbox {
     /// Oldest first.
     waiting: Vec<(AgentId, u64, Outgoing)>,
-    /// The ids on their way to each agent; what is written meanwhile
-    /// waits for their answer.
-    sending: HashMap<AgentId, Vec<u64>>,
+    /// The id on its way to each agent; what is written meanwhile waits
+    /// for its answer.
+    sending: HashMap<AgentId, u64>,
 }
 
 impl Outbox {
@@ -53,44 +53,33 @@ impl Outbox {
         id
     }
 
-    /// Everything unsent to the agent, to send now, unless a send is
+    /// The agent's oldest unsent message, to post now, unless a post is
     /// already on its way.
-    pub fn next(&mut self, agent_id: AgentId) -> Option<AgentCommand> {
+    pub fn next(&mut self, agent_id: AgentId) -> Option<PostMail> {
         if self.sending.contains_key(&agent_id) {
             return None;
         }
-        let messages: Vec<UserMessage> = self
-            .waiting
-            .iter()
-            .filter(|(to, ..)| *to == agent_id)
-            .map(|(_, id, outgoing)| UserMessage {
-                id: *id,
-                content: outgoing.content.clone(),
-            })
-            .collect();
-        if messages.is_empty() {
-            return None;
-        }
-        self.sending.insert(
-            agent_id,
-            messages.iter().map(|message| message.id).collect(),
-        );
-        Some(AgentCommand::Send { agent_id, messages })
+        let (_, id, outgoing) = self.waiting.iter().find(|(to, ..)| *to == agent_id)?;
+        self.sending.insert(agent_id, *id);
+        Some(PostMail {
+            client_id: *id,
+            to: agent_id,
+            re: None,
+            content: outgoing.content.clone(),
+        })
     }
 
-    /// The host logged what was on its way: it is the agent's now.
+    /// The host logged what was on its way: it is the agent's mail now.
     pub fn delivered(&mut self, agent_id: AgentId) {
         let Some(sent) = self.sending.remove(&agent_id) else {
             return;
         };
         self.waiting
-            .retain(|(to, id, _)| *to != agent_id || !sent.contains(id));
-        for id in sent {
-            crate::cache::write_outgoing(agent_id, id, None);
-        }
+            .retain(|(to, id, _)| *to != agent_id || *id != sent);
+        crate::cache::write_outgoing(agent_id, sent, None);
     }
 
-    /// The send failed; the messages wait for the next try.
+    /// The post failed; the message waits for the next try.
     pub fn failed(&mut self, agent_id: AgentId) {
         self.sending.remove(&agent_id);
     }
@@ -128,25 +117,19 @@ mod tests {
         vec![ContentPart::Text { text: text.into() }]
     }
 
-    fn sent(command: Option<AgentCommand>) -> Vec<(u64, String)> {
-        match command {
-            Some(AgentCommand::Send { messages, .. }) => messages
-                .into_iter()
-                .map(|message| {
-                    let text = rho_agent_types::transcript::text_content(&message.content);
-                    (message.id, text)
-                })
-                .collect(),
-            other => panic!("expected a send, got {other:?}"),
-        }
+    fn sent(post: Option<PostMail>) -> (u64, String) {
+        let post = post.expect("a post");
+        (
+            post.client_id,
+            rho_agent_types::transcript::text_content(&post.content),
+        )
     }
 
-    /// Everything unsent to an agent goes in one call, oldest first, and
-    /// one call at a time: a failed call goes again whole, under the same
-    /// ids, and what is written while one is on its way waits for its
-    /// answer rather than being taken as delivered with it.
+    /// An agent's messages go one at a time, oldest first: a failed post
+    /// goes again under the same id, so the host logs it once, and what is
+    /// written while one is on its way waits behind it.
     #[test]
-    fn an_agents_messages_go_together_in_order() {
+    fn an_agents_messages_go_one_at_a_time_in_order() {
         let (a, b) = (agent(1), agent(2));
         let mut outbox = Outbox::default();
         let first = outbox.push(a, text("a1"));
@@ -154,21 +137,19 @@ mod tests {
         let second = outbox.push(a, text("a2"));
         assert_eq!(outbox.agents(), [a, b]);
 
-        let both = vec![(first, "a1".to_owned()), (second, "a2".to_owned())];
-        assert_eq!(sent(outbox.next(a)), both);
-        assert!(outbox.next(a).is_none(), "one call at a time");
-        assert_eq!(
-            sent(outbox.next(b)).len(),
-            1,
-            "another agent is not held up"
-        );
+        assert_eq!(sent(outbox.next(a)), (first, "a1".to_owned()));
+        assert!(outbox.next(a).is_none(), "one post at a time");
+        assert_eq!(sent(outbox.next(b)).1, "b1", "another agent is not held up");
 
         outbox.failed(a);
-        assert_eq!(sent(outbox.next(a)), both, "sent again whole, same ids");
-        let third = outbox.push(a, text("a3"));
+        assert_eq!(
+            sent(outbox.next(a)),
+            (first, "a1".to_owned()),
+            "posted again under the same id"
+        );
         outbox.delivered(a);
-        assert_eq!(outbox.texts(a), ["a3"]);
-        assert_eq!(sent(outbox.next(a)), [(third, "a3".to_owned())]);
+        assert_eq!(outbox.texts(a), ["a2"]);
+        assert_eq!(sent(outbox.next(a)), (second, "a2".to_owned()));
         outbox.delivered(a);
         assert!(outbox.texts(a).is_empty());
         assert!(outbox.next(a).is_none());

@@ -1,5 +1,8 @@
-//! One host's agents stream: the agent host's journal and live tails to the
-//! model, the model's follow and the window's focus back to the agent host.
+//! One host's agents session: the host's mail, directory, rows and live
+//! tails to the model, and the model's follows and the window's focus back
+//! to the host. The workset log pages a follow needs are read here too, on
+//! streams of their own, so everything the model hears of a host comes in
+//! one order.
 //!
 //! The host opens it on every connection
 //! ([`rho_agent_hosts::HostStream`]); what is said on it and where its frames
@@ -10,41 +13,34 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use rho_agent_hosts::{Dialer, HostStream};
-use rho_agent_types::{AgentId, Seq};
+use rho_agent_types::{AgentId, WorksetId, Wpos};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;
 use crate::model::ToModel;
-use crate::protocol::transcript::{Live, LogEntry};
-use crate::protocol::{self, AuthState, ClientFrame, QuotaSummary, ServerFrame};
+use crate::protocol::rho2::{self, ClientFrame, ServerFrame, WorksetLogPage};
 
-/// What a host says on its agents stream.
+/// What reaches the model from one host.
+#[derive(Debug)]
 pub enum AgentFrame {
-    /// The stream is open: whose journal this is and how far it runs.
-    /// Every (re)opened stream starts with one, and a follow is asked for
-    /// only after it.
-    JournalHead {
-        machine_seed: u64,
-        journal_head: Seq,
-        agent_counter: u64,
+    /// A frame of the host's session.
+    Server(ServerFrame),
+    /// One page of a workset's log that the model asked for.
+    Log {
+        workset: WorksetId,
+        page: WorksetLogPage,
     },
-    /// Which provider accounts the host's agents may run on.
-    Auth { auth: AuthState },
-    /// A run of the host's journal, contiguous by seq: the answer to
-    /// `Follow` and everything appended since.
-    Log { entries: Vec<LogEntry> },
-    /// What changed in the runtime's tail past the log, for an agent some
-    /// client is looking at.
-    Live { agent_id: AgentId, live: Live },
-    /// An agent was created on the host, by any client or agent, and the
-    /// agent-id counter moved to `agent_counter`.
-    AgentCreated {
-        agent_id: AgentId,
-        agent_counter: u64,
-    },
-    /// The host's quota: every account's latest usage.
-    QuotaUsage { summaries: Vec<QuotaSummary> },
+    /// Reading a workset's log stopped short; the model asks again when
+    /// the stream opens again.
+    LogFailed { workset: WorksetId },
+}
+
+impl From<ServerFrame> for AgentFrame {
+    fn from(frame: ServerFrame) -> Self {
+        Self::Server(frame)
+    }
 }
 
 /// An agents-stream frame tagged with the host it came from.
@@ -53,24 +49,36 @@ pub struct AgentEvent {
     pub frame: AgentFrame,
 }
 
+pub(crate) enum Command {
+    Frame(ClientFrame),
+    ReadLog { workset: WorksetId, from: Wpos },
+}
+
 /// What this client says down one host's agents stream. Whatever is
-/// queued while the stream is down is dropped when it opens again: a
-/// follow was asked of the last stream's journal head, and the new stream
-/// says its own. The focus is state, so each new stream is told it whole.
+/// queued while the stream is down is dropped when it opens again: the
+/// model says its follows again to each new stream. The focus is state,
+/// so each new stream is told it whole.
 #[derive(Clone)]
 pub struct AgentCommands {
-    commands: futures_mpsc::UnboundedSender<ClientFrame>,
+    commands: futures_mpsc::UnboundedSender<Command>,
     focus: Arc<Mutex<Option<Vec<AgentId>>>>,
 }
 
 impl AgentCommands {
     pub fn send(&self, frame: ClientFrame) {
-        let _ = self.commands.unbounded_send(frame);
+        let _ = self.commands.unbounded_send(Command::Frame(frame));
+    }
+
+    /// Reads a workset's log from `from` to its end, page by page, each
+    /// page to the model as [`AgentFrame::Log`].
+    pub fn read_log(&self, workset: WorksetId, from: Wpos) {
+        let _ = self
+            .commands
+            .unbounded_send(Command::ReadLog { workset, from });
     }
 
     /// The agents whose live frames this host should stream: every open
-    /// pane, replaced wholesale. Everything durable is on the journal
-    /// regardless, so this only decides who streams.
+    /// pane, replaced wholesale.
     pub fn focus(&self, agent_ids: Vec<AgentId>) {
         *self.focus.lock().unwrap() = Some(agent_ids.clone());
         self.send(ClientFrame::Focus { agent_ids });
@@ -81,7 +89,7 @@ impl AgentCommands {
 pub(crate) struct AgentStream {
     host: HostId,
     model: futures_mpsc::UnboundedSender<ToModel>,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientFrame>>>,
+    pub(crate) commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<Command>>>,
     focus: Arc<Mutex<Option<Vec<AgentId>>>>,
 }
 
@@ -102,14 +110,58 @@ impl AgentStream {
     }
 }
 
+/// A workset's log from `from` to its end, each page to the model as it
+/// comes. Ends early, with `LogFailed`, when a page cannot be read.
+async fn read_log(
+    dialer: Dialer,
+    host: HostId,
+    model: futures_mpsc::UnboundedSender<ToModel>,
+    workset: WorksetId,
+    mut from: Wpos,
+) {
+    loop {
+        let page = async {
+            let mut stream = dialer
+                .open(<rho2::WorksetLog as rho_rpc::protocol::Call>::PRIORITY)
+                .await?;
+            rho_rpc::protocol::call(&mut stream, rho2::WorksetLog { workset, from }).await
+        };
+        let frame = match page.await {
+            Ok(page) => {
+                let next = page.next;
+                let frame = AgentFrame::Log { workset, page };
+                if model
+                    .unbounded_send(ToModel::Event(AgentEvent { host, frame }))
+                    .is_err()
+                {
+                    return;
+                }
+                match next {
+                    Some(next) => {
+                        from = next;
+                        continue;
+                    }
+                    None => return,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%workset, "reading the workset log failed: {error:#}");
+                AgentFrame::LogFailed { workset }
+            }
+        };
+        let _ = model.unbounded_send(ToModel::Event(AgentEvent { host, frame }));
+        return;
+    }
+}
+
 impl HostStream for AgentStream {
     fn name(&self) -> &'static str {
         "agents"
     }
 
-    /// The agent host's frames to the model, this client's frames to the
-    /// agent host, for as long as the connection lasts. Ends with an error
-    /// when either direction does.
+    /// The host's frames to the model, this client's frames to the host,
+    /// for as long as the connection lasts. Ends with an error when either
+    /// direction does.
     fn run(&self, dialer: Dialer) -> BoxFuture<'static, anyhow::Result<()>> {
         let host = self.host;
         let model = self.model.clone();
@@ -118,7 +170,7 @@ impl HostStream for AgentStream {
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
-            write_open(&mut socket, &protocol::Open::Session).await?;
+            write_open(&mut socket, &rho2::Open::Session).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             while commands.try_recv().is_ok() {}
@@ -128,45 +180,34 @@ impl HostStream for AgentStream {
             }
             let read = async {
                 loop {
-                    let frame = match read_frame::<_, ServerFrame>(&mut reader).await? {
-                        ServerFrame::JournalHead {
-                            machine_seed,
-                            journal_head,
-                            agent_counter,
-                        } => AgentFrame::JournalHead {
-                            machine_seed,
-                            journal_head,
-                            agent_counter,
-                        },
-                        ServerFrame::Auth { auth } => AgentFrame::Auth { auth },
-                        ServerFrame::Log { entries } => AgentFrame::Log { entries },
-                        ServerFrame::Live { agent_id, live } => AgentFrame::Live { agent_id, live },
-                        ServerFrame::AgentCreated {
-                            agent_id,
-                            agent_counter,
-                        } => AgentFrame::AgentCreated {
-                            agent_id,
-                            agent_counter,
-                        },
-                        ServerFrame::QuotaUsage { summaries } => {
-                            AgentFrame::QuotaUsage { summaries }
-                        }
-                        // Nothing here asks for a detail body: the
-                        // transcript draws a call's line and never its
-                        // output.
-                        ServerFrame::Detail { .. } => continue,
-                    };
-                    let event = ToModel::Event(AgentEvent { host, frame });
+                    let frame = read_frame::<_, ServerFrame>(&mut reader).await?;
+                    let event = ToModel::Event(AgentEvent {
+                        host,
+                        frame: frame.into(),
+                    });
                     if model.unbounded_send(event).is_err() {
                         return Ok(());
                     }
                 }
             };
             let write = async {
-                while let Some(frame) = commands.next().await {
-                    write_frame(&mut writer, &frame).await?;
+                let mut reads = FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        command = commands.next() => match command {
+                            Some(Command::Frame(frame)) => write_frame(&mut writer, &frame).await?,
+                            Some(Command::ReadLog { workset, from }) => reads.push(read_log(
+                                dialer.clone(),
+                                host,
+                                model.clone(),
+                                workset,
+                                from,
+                            )),
+                            None => return anyhow::Ok(()),
+                        },
+                        Some(()) = reads.next(), if !reads.is_empty() => {}
+                    }
                 }
-                anyhow::Ok(())
             };
             tokio::select! {
                 result = read => result,

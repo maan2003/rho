@@ -11,9 +11,7 @@ use std::sync::Arc;
 
 use rho_agent_types::AgentId;
 
-use crate::protocol::transcript::{
-    InferenceState, Item, Live, QueuedItem, RuntimeState, StreamingResponse,
-};
+use crate::protocol::transcript::{InferenceState, Item, Live, RuntimeState, StreamingResponse};
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,9 +116,6 @@ impl Layered {
                 .blocks
                 .push(Arc::new(UiBlock::MessageDraft { text: text.clone() }));
         }
-        self.state
-            .blocks
-            .extend(self.tail.queue.iter().cloned().map(Arc::new));
         self.state.blocks.extend(self.unsent.iter().cloned());
         self.state.blocks.extend(self.status.iter().cloned());
         self.state.status = match self.tail.runtime.as_ref() {
@@ -151,14 +146,12 @@ impl Layered {
     }
 }
 
-/// Runtime snapshots replace the response and state together. The Claude
-/// queue is a separate live stream and survives a response replacement.
+/// Runtime snapshots replace the response and state together.
 #[derive(Default)]
 struct Tail {
     runtime: Option<RuntimeState>,
     response: Option<StreamingResponse>,
     draft: Option<String>,
-    queue: Vec<UiBlock>,
 }
 
 impl Tail {
@@ -173,17 +166,7 @@ impl Tail {
                 self.response = response;
                 self.draft = draft;
             }
-            Live::Queued { items } => self.queue = items.into_iter().map(queued_block).collect(),
         }
-    }
-}
-
-fn queued_block(item: QueuedItem) -> UiBlock {
-    match item {
-        QueuedItem::Message { from, text } => UiBlock::QueuedMessage { text, sender: from },
-        QueuedItem::Compaction => UiBlock::Notice {
-            text: "compacting context".to_string(),
-        },
     }
 }
 
@@ -328,7 +311,6 @@ impl AgentStore {
             layered.tail.runtime = None;
             layered.tail.response = None;
             layered.tail.draft = None;
-            layered.tail.queue.clear();
         })
     }
 
@@ -487,11 +469,12 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, AgentPos, ExecMilestone, UnixMs};
+    use rho_agent_types::{AgentIdDomain, ExecMilestone, UnixMs, Wpos};
 
     use super::*;
-    use crate::fold::TranscriptFold;
-    use crate::protocol::transcript::{ArgumentsFormat, TranscriptEvent};
+    use crate::fold::{TranscriptFold, TranscriptRow};
+    use crate::protocol::rho2::LogEvent;
+    use crate::protocol::transcript::ArgumentsFormat;
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()
@@ -545,22 +528,15 @@ mod tests {
         let mut fold = empty_state();
         fold.blocks
             .push(Arc::new(UiBlock::UserMessage { text: "hi".into() }));
-        store.set_fold(agent(), fold.clone());
-        store.apply_live(
-            agent(),
-            Live::Queued {
-                items: vec![QueuedItem::Message {
-                    from: None,
-                    text: "queued".into(),
-                }],
-            },
-        );
-        let unsent = UiBlock::Unsent {
-            text: "later".into(),
-        };
         let queued = UiBlock::QueuedMessage {
             text: "queued".into(),
             sender: None,
+        };
+        let mut queued_fold = fold.clone();
+        queued_fold.blocks.push(Arc::new(queued.clone()));
+        store.set_fold(agent(), queued_fold);
+        let unsent = UiBlock::Unsent {
+            text: "later".into(),
         };
         let said = UiBlock::UserMessage { text: "hi".into() };
         assert_eq!(blocks(&store), [said.clone(), queued, unsent.clone()]);
@@ -759,16 +735,18 @@ mod tests {
             "provider completion must not withdraw it"
         );
 
-        let mut fold = TranscriptFold::default();
-        fold.tell(
-            AgentPos(0),
-            &TranscriptEvent::MessageSent {
-                to: None,
+        let mut fold = TranscriptFold::new(agent(), &[]);
+        fold.tell(&TranscriptRow::Mail(rho_agent_types::Mail {
+            id: rho_agent_types::MailId(1),
+            at: UnixMs(1),
+            from: rho_agent_types::Address::Agent(agent()),
+            to: rho_agent_types::Address::User,
+            re: None,
+            kind: Some(rho_agent_types::SendKind::Result),
+            content: vec![rho_agent_types::ContentPart::Text {
                 text: "other cell".into(),
-                kind: rho_agent_types::SendKind::Result,
-                at: UnixMs(1),
-            },
-        );
+            }],
+        }));
         store.apply_fold_delta(agent(), fold.delta().unwrap());
         assert_eq!(
             text(&store),
@@ -789,17 +767,18 @@ mod tests {
     fn committed_tool_is_not_repeated_while_snapshot_remains() {
         let mut store = AgentStore::default();
         store.apply_live(agent(), snapshot("first", vec![call("one"), call("two")]));
-        let mut fold = TranscriptFold::default();
-        fold.tell(
-            AgentPos(0),
-            &TranscriptEvent::Replied {
+        let mut fold = TranscriptFold::new(agent(), &[]);
+        fold.tell(&TranscriptRow::Log(
+            Wpos(0),
+            LogEvent::Replied {
+                agent: agent(),
                 items: vec![call("one")],
                 compacted: false,
                 usage: None,
                 context_used: None,
                 at: UnixMs(1),
             },
-        );
+        ));
         store.apply_fold_delta(agent(), fold.delta().unwrap());
         let ids: Vec<_> = store
             .get(&agent())
@@ -889,15 +868,16 @@ mod tests {
     fn durable_provider_timing_reaches_the_live_tail() {
         let mut store = AgentStore::default();
         store.apply_live(agent(), snapshot("first", vec![call("one")]));
-        let mut fold = TranscriptFold::default();
-        fold.tell(
-            AgentPos(0),
-            &TranscriptEvent::ExecObserved {
+        let mut fold = TranscriptFold::new(agent(), &[]);
+        fold.tell(&TranscriptRow::Log(
+            Wpos(0),
+            LogEvent::ExecObserved {
+                agent: agent(),
                 id: "one".into(),
                 milestone: ExecMilestone::FirstBlock,
                 at: UnixMs(10),
             },
-        );
+        ));
         store.apply_fold_delta(agent(), fold.delta().unwrap());
         let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
             panic!("missing tool")
