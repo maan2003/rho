@@ -623,9 +623,12 @@ fn post_chat(
             mentions: mentions(message),
             content: message.content.clone(),
         };
+        // The user's message keeps the id the GUI gave it, so a GUI that
+        // sends it again from main's outbox finds it posted.
+        let client_id = (message.from == Address::User).then_some(*main_id);
         let id = match topics.get(&pair) {
             Some(topic) => write
-                .post(message.at, *topic, new, None)
+                .post(message.at, *topic, new, client_id)
                 .expect("a migrated message has content"),
             None => {
                 let agents = [pair.0, pair.1]
@@ -637,7 +640,7 @@ fn post_chat(
                     .collect();
                 let name = topic_name(&message.content);
                 let (topic, first) = write
-                    .start_topic(message.at, stream, name, agents, new, None)
+                    .start_topic(message.at, stream, name, agents, new, client_id)
                     .expect("a migrated topic has a name and content");
                 topics.insert(pair, topic);
                 first
@@ -1380,6 +1383,46 @@ mod tests {
                 "{MAIN_FORMAT}->{}",
                 crate::db::CURRENT_FORMAT
             ))]
+        );
+        // A GUI sending main's outbox again finds the user's messages
+        // posted under the ids it gave them; the agent's ids name nothing.
+        let mut write = db.write().await;
+        let again = |content: &str| NewMessage {
+            from: Address::User,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: content.to_owned(),
+            }],
+        };
+        let head = db.read().chat_head();
+        assert_eq!(
+            write
+                .post(UnixMs(99), TopicId(ChatSeq(4)), again("second"), Some(903))
+                .unwrap(),
+            ChatMessageId(ChatSeq(9))
+        );
+        let stream = StreamId::DEFAULT;
+        assert_eq!(
+            write
+                .start_topic(
+                    UnixMs(99),
+                    stream,
+                    "review".into(),
+                    vec![c],
+                    again("review"),
+                    Some(904)
+                )
+                .unwrap(),
+            (TopicId(ChatSeq(2)), ChatMessageId(ChatSeq(3)))
+        );
+        write.commit();
+        assert_eq!(db.read().chat_head(), head, "nothing was posted twice");
+        let mut write = db.write().await;
+        assert_eq!(
+            write
+                .post(UnixMs(99), TopicId(ChatSeq(4)), again("new"), Some(902))
+                .unwrap(),
+            ChatMessageId(ChatSeq(head.0 + 1))
         );
     }
 }

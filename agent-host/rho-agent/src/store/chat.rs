@@ -230,8 +230,9 @@ impl ChatWrite for WriteTxn {
         client_id: Option<u64>,
     ) -> anyhow::Result<(TopicId, MessageId)> {
         if let Some(seq) = sent_before(self, client_id) {
-            // A topic's first message is the event after it.
-            return Ok((TopicId(seq), MessageId(seq.next())));
+            // A client id names a message, and a topic's first message is
+            // the event after the topic's.
+            return Ok((TopicId(ChatSeq(seq.0 - 1)), MessageId(seq)));
         }
         anyhow::ensure!(
             self.open_table(STREAMS).get(stream.0.0).is_some(),
@@ -265,8 +266,7 @@ impl ChatWrite for WriteTxn {
                 agents: unique,
             }),
         );
-        remember(self, client_id, seq);
-        let first = self.post(at, topic, first, None)?;
+        let first = self.post(at, topic, first, client_id)?;
         Ok((topic, first))
     }
 
