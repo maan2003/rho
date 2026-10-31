@@ -490,6 +490,23 @@
             };
             # The client of the host's Notion server; see
             # agent-host/rho-notebook/src/rho_notion.
+            # rho2's policy layer over the workset process's native `_rho`;
+            # see agent-host/rho-notebook/src/rho.
+            rhoPolicy = ps.buildPythonPackage {
+              pname = "rho";
+              version = "0.1.0";
+              src = ./agent-host/rho-notebook/src/rho;
+              format = "other";
+              dontBuild = true;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/${pkgs.python3.sitePackages}/rho"
+                cp -r *.py prompt "$out/${pkgs.python3.sitePackages}/rho/"
+                runHook postInstall
+              '';
+              dependencies = [ ps.pyyaml ];
+              doCheck = false;
+            };
             rhoNotion = ps.buildPythonPackage {
               pname = "rho-notion";
               version = "0.1.0";
@@ -513,6 +530,7 @@
             pythonLs
             slackSdk
             rhoNotion
+            rhoPolicy
           ]
         );
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
