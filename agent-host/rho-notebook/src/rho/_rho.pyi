@@ -101,7 +101,9 @@ def send_mail(
     re: int | None = None,
 ) -> int:
     """Append a mail to the host's mail log; returns its id once durable.
-    `sender` must be an agent of this workset. A mail to "user" needs a
+    `sender` must be an agent of this workset: mail from the user comes only
+    from the GUI (`CreateWorkset.message` and `Eval.message` are mailed by the
+    host to the first agent that code creates), so Python cannot forge it. A mail to "user" needs a
     `kind`; the text must pass the STE check, or this raises ValueError
     with the findings."""
 async def inbox(address: str, after: int) -> list[MailRecord]:

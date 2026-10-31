@@ -56,12 +56,18 @@ rho_rpc::calls! {
 pub struct CreateWorkset {
     pub kind: WorksetKind,
     pub code: String,
+    /// The user's first mail, to the first agent `code` creates. User mail
+    /// comes only from the GUI, so Python cannot write it.
+    pub message: Option<Vec<ContentPart>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Eval {
     pub workset: WorksetId,
     pub code: String,
+    /// As in [`CreateWorkset`]: mailed from the user to the first agent
+    /// `code` creates.
+    pub message: Option<Vec<ContentPart>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
