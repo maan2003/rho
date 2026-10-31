@@ -1,5 +1,5 @@
 //! The workset log: one append-only log per workset, keyed by
-//! `(WorksetId, Wpos)` ([ARCH-rho2](../../specs/ARCH-rho2.md)).
+//! `(WorksetId, Wpos)` ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 //!
 //! A record is its time and one event. Events about an agent carry its id;
 //! the others are about the workset. Agent and workset heads are projections

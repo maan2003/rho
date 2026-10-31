@@ -10,7 +10,7 @@ use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, Hosts};
 use rho_agent_types::{ContentPart, WorksetId, WorksetKind};
 
-use crate::protocol::rho2::{CreateWorkset, Eval};
+use crate::protocol::worksets::{CreateWorkset, Eval};
 use crate::snippets::{self, Runtime};
 
 /// The user-facing name for selecting the first available conventional base.

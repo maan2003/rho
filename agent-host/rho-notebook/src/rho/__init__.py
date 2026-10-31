@@ -1,4 +1,4 @@
-"""rho2's policy layer: the Python each workset process runs ([ARCH-rho2]).
+"""rho's policy layer: the Python each workset process runs ([ARCH-agent-host]).
 
 Rust is the core; this package decides policy on top of the native `_rho`
 module: which agents exist and on which runtime, what each model is told,

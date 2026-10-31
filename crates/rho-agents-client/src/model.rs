@@ -21,8 +21,8 @@ use rho_agent_types::{Address, AgentId, Mail, MailId, WorksetId, WorksetKind, Wp
 
 use crate::HostId;
 use crate::fold::{AgentIdentity, Digest, MirroredAgent, TranscriptRow};
-use crate::protocol::rho2::{AgentEntry, ClientFrame, LogEvent, ServerFrame, WorksetEntry};
 use crate::protocol::transcript::{Live, RuntimeState};
+use crate::protocol::worksets::{AgentEntry, ClientFrame, LogEvent, ServerFrame, WorksetEntry};
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
 
 /// What the main thread hears from the model.
@@ -843,8 +843,8 @@ mod tests {
 
     use super::*;
     use crate::fold::Said;
-    use crate::protocol::rho2::SpecView;
     use crate::protocol::transcript::RuntimeKind;
+    use crate::protocol::worksets::SpecView;
     use crate::stream::AgentStream;
 
     const HOST: HostId = HostId(0);
@@ -1087,7 +1087,7 @@ mod tests {
         };
         let page = |rows, next| AgentFrame::Log {
             workset: workset(1),
-            page: crate::protocol::rho2::WorksetLogPage { rows, next },
+            page: crate::protocol::worksets::WorksetLogPage { rows, next },
         };
         // The log's past and the mail heard meanwhile go to disk, not up:
         // told as rows, the past would land after the newer mail.

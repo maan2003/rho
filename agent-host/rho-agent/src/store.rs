@@ -1,5 +1,5 @@
-//! The rho2 store: workset logs, the heads projected from them, and the
-//! mail log ([ARCH-rho2](../../specs/ARCH-rho2.md)).
+//! The agent store: workset logs, the heads projected from them, and the
+//! mail log ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 //!
 //! Each workset has one log, keyed by `(workset, wpos)`, dense from zero and
 //! never rewritten. Agent and workset heads are folded from it in the same

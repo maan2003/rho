@@ -12,12 +12,12 @@ use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::record::{Event, Record};
 use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
 use rho_agent_types::{AgentId, MailId, WorksetId, WorksetKind, Wpos};
-use rho_agents_client::protocol::rho2::{
+use rho_agents_client::protocol::transcript::Live;
+use rho_agents_client::protocol::worksets::{
     AgentEntry, Cancel, ClientFrame, CreateWorkset, CreatedWorkset, DeleteWorksets, Eval,
     EvalResult, LogEvent, Open, PostMail, Request, ServerFrame, WorksetEntry, WorksetLog,
     WorksetLogPage,
 };
-use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
     QuotaUsage, RecordVisualization, SetAuthAccountEnabled, SetClaudeAccount, Visualization,
@@ -1110,7 +1110,7 @@ mod tests {
     use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
     use rho_agent::store::StoreWrite as _;
     use rho_agent_types::{InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
-    use rho_agents_client::protocol::rho2::{LogEvent, WorksetLog};
+    use rho_agents_client::protocol::worksets::{LogEvent, WorksetLog};
 
     use super::{detail, detail_result, workset_log_page};
 

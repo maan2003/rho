@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use rho_agent_types::{AgentId, ContentPart, ThreadId, UnixMs};
 
-use crate::protocol::rho2::PostMail;
+use crate::protocol::worksets::PostMail;
 
 /// One message on disk until its host takes it.
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]

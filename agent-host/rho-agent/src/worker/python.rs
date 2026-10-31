@@ -1,5 +1,5 @@
-//! The workset's Python ([ARCH-rho2](../../../specs/ARCH-rho2.md)): the
-//! `_rho` module policy code calls, the workset thread that runs
+//! The workset's Python ([ARCH-agent-host](../../../specs/ARCH-agent-host.md)):
+//! the `_rho` module policy code calls, the workset thread that runs
 //! `rho._boot._main`, and the hooks the agent loops call through
 //! `rho._boot._hook`.
 //!

@@ -1,5 +1,5 @@
 //! The vocabulary of a transcript: what a workset row
-//! ([`super::rho2::LogEvent`]) carries of a response and its calls, and the
+//! ([`super::worksets::LogEvent`]) carries of a response and its calls, and the
 //! live tail a runtime has past the log.
 
 use rho_agent_types::UnixMs;

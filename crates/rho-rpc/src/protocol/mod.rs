@@ -191,7 +191,7 @@ pub enum Protocol {
     /// Append-only sealed byte logs; the old Ledger protocol is retired.
     LedgerLog,
     /// Worksets, the agent directory and mail (`rho-agents-client`,
-    /// `protocol::rho2`). Replaces `Agents`.
+    /// `protocol::worksets`). Replaces `Agents`.
     Worksets,
 }
 

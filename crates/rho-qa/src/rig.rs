@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_types::{ContentPart, WorksetKind};
-use rho_agents_client::protocol::rho2::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
+use rho_agents_client::protocol::worksets::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
 use rho_agents_client::snippets;
 use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};

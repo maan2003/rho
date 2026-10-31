@@ -1,4 +1,4 @@
-"""Mail between the user and agents, kept by the host ([ARCH-rho2]).
+"""Mail between the user and agents, kept by the host ([ARCH-agent-host]).
 An address is "user" or an agent id."""
 
 import _rho

@@ -703,7 +703,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
     // The user's policy, read by each workset process at its start
-    // (ARCH-rho2). Resolved here, like the state directory.
+    // (ARCH-agent-host). Resolved here, like the state directory.
     let init = dirs::config_dir()
         .and_then(|dir| Utf8PathBuf::try_from(dir.join("rho").join("init.py")).ok());
     let pool = AgentPool::new(

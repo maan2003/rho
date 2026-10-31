@@ -1,10 +1,10 @@
 //! Temporary: converts a store written by `main` (format `6967c9bb`: one
 //! log per agent) to worksets and mail
-//! ([ARCH-rho2](../../../specs/ARCH-rho2.md)). Remove it once the user's stores
-//! have moved forward (`temp-migration` skill).
+//! ([ARCH-agent-host](../../../specs/ARCH-agent-host.md)). Remove it once the
+//! user's stores have moved forward (`temp-migration` skill).
 //!
 //! Agents keep their ids. The agents of one `main` workset share one
-//! rho2 workset, their rows merged by time. Every message becomes mail:
+//! workset, their rows merged by time. Every message becomes mail:
 //! one thread per pair of correspondents. A `Received` row is the `Input`
 //! that hands its mail over, with the text the model was shown then.
 
@@ -285,7 +285,7 @@ struct Created {
 }
 
 /// Rewrites the `main` tables as worksets and mail, then drops them.
-/// The agents of a `main` workset share one rho2 workset, each agent's
+/// The agents of a `main` workset share one workset, each agent's
 /// rows in order, the agents in creation order. Agents a row of which no
 /// decoder knows keep their rows as they were, in [`SET_ASIDE`].
 pub(crate) fn migrate(write: &mut WriteTxn) {
@@ -725,8 +725,8 @@ fn changed_spec(event: &AgentEvent<'_>, current: &AgentSpec) -> Option<AgentSpec
     (spec != *current).then_some(spec)
 }
 
-/// One row as rho2 keeps it, if it keeps it. `spec`: the agent's spec as
-/// the conversion has written it so far; `at`: the row's time.
+/// One row as the workset log keeps it, if it keeps it. `spec`: the agent's
+/// spec as the conversion has written it so far; `at`: the row's time.
 fn convert(
     id: AgentId,
     created: &Created,
@@ -766,7 +766,7 @@ fn convert(
         | AgentEvent::TitleAttempted { .. }
         | AgentEvent::Titled { .. }
         // Told ahead of a user message `main` no longer sends; nothing
-        // in rho2 carries it.
+        // in the workset log carries it.
         | AgentEvent::Notice { .. } => None,
         AgentEvent::Rewound { to, .. } => {
             // The first kept row at or after `to`.

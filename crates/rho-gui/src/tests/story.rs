@@ -8,7 +8,9 @@ use rho_agent_types::{
     Address, AgentId, ContentPart, Mail, MailId, Props, SendKind, UnixMs, WorksetId, WorksetKind,
     props,
 };
-use rho_agents_client::protocol::rho2::{self, AgentEntry, ServerFrame, SpecView, WorksetEntry};
+use rho_agents_client::protocol::worksets::{
+    self, AgentEntry, ServerFrame, SpecView, WorksetEntry,
+};
 use rho_agents_client::stream::AgentFrame;
 use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
 use senax_encoder::{Packer, Unpacker};
@@ -216,12 +218,12 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
 /// the stream to answer it on.
 pub fn calls(
     streams: &mut tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>,
-) -> Vec<(rho2::Request, rho_rpc::Stream)> {
+) -> Vec<(worksets::Request, rho_rpc::Stream)> {
     let mut calls = Vec::new();
     while let Ok(mut stream) = streams.try_recv() {
         let open = futures::executor::block_on(read_frame::<_, Open>(&mut stream))
             .expect("a stream opens by saying what it is for");
-        if let Ok(rho2::Open::Request(request)) = open.unpack() {
+        if let Ok(worksets::Open::Request(request)) = open.unpack() {
             calls.push((request, stream));
         }
     }
@@ -274,7 +276,10 @@ pub fn deleted(workset: WorksetId) -> AgentFrame {
 }
 
 /// Rows of a followed workset, as the host pushes them.
-pub fn rows(workset: WorksetId, rows: Vec<(rho_agent_types::Wpos, rho2::LogEvent)>) -> AgentFrame {
+pub fn rows(
+    workset: WorksetId,
+    rows: Vec<(rho_agent_types::Wpos, worksets::LogEvent)>,
+) -> AgentFrame {
     AgentFrame::Server(ServerFrame::Rows { workset, rows })
 }
 

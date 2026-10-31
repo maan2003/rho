@@ -1,6 +1,6 @@
-//! The rho2 agents protocol
-//! ([ARCH-rho2](../../../../agent-host/specs/ARCH-rho2.md)): worksets, the
-//! agent directory and mail.
+//! The agents protocol
+//! ([ARCH-agent-host](../../../../agent-host/specs/ARCH-agent-host.md)):
+//! worksets, the agent directory and mail.
 //!
 //! The session ([`Open::Session`]) carries the mail log, the directory, the
 //! rows of the worksets a client follows, and the live tails of the agents

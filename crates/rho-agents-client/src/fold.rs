@@ -15,8 +15,8 @@ use rho_agent_types::{
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
-use crate::protocol::rho2::{AgentEntry, LogEvent};
 use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
+use crate::protocol::worksets::{AgentEntry, LogEvent};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// What the agent put to the user that wants an answer.
@@ -111,7 +111,7 @@ impl AgentIdentity {
             entry: AgentEntry {
                 agent,
                 workset: rho_agent_types::WorksetId([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]),
-                spec: crate::protocol::rho2::SpecView {
+                spec: crate::protocol::worksets::SpecView {
                     runtime: RuntimeKind::Rho,
                     model: "sol".into(),
                     effort: "medium".into(),
@@ -1601,7 +1601,7 @@ mod tests {
         let mut entry = AgentEntry {
             agent: me(),
             workset: "0123456789ab".parse().unwrap(),
-            spec: crate::protocol::rho2::SpecView {
+            spec: crate::protocol::worksets::SpecView {
                 runtime: RuntimeKind::Rho,
                 model: "sol".into(),
                 effort: "medium".into(),

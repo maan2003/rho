@@ -49,9 +49,10 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-/// The stamp of the rho2 store. Older stores are not migrated yet: they
-/// refuse to open ([ARCH-rho2](../specs/ARCH-rho2.md), Status).
-const CURRENT_AGENT_DB_FORMAT: &str = "rho2-1";
+/// The stamp of the workset store
+/// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)). A store from before
+/// worksets is migrated ([`crate::store::from_main`]).
+const CURRENT_AGENT_DB_FORMAT: &str = "c3e81f5a";
 #[cfg(test)]
 pub(crate) const CURRENT_FORMAT: &str = CURRENT_AGENT_DB_FORMAT;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;

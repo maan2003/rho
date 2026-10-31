@@ -152,7 +152,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             code,
             message,
         } => {
-            let call = rho_agents_client::protocol::rho2::CreateWorkset {
+            let call = rho_agents_client::protocol::worksets::CreateWorkset {
                 kind: match cwd {
                     Some(cwd) => rho_agent_types::WorksetKind::Host { cwd },
                     None => rho_agent_types::WorksetKind::Isolated,
@@ -178,7 +178,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         } => {
             let to = rho_agent_types::parse_full_handle(&agent)
                 .with_context(|| format!("agent id {agent}"))?;
-            let call = rho_agents_client::protocol::rho2::PostMail {
+            let call = rho_agents_client::protocol::worksets::PostMail {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 to,
                 thread: None,
@@ -708,7 +708,7 @@ async fn delete_worksets(socket_path: Option<PathBuf>, worksets: &[String]) -> a
         .collect::<anyhow::Result<Vec<rho_agent_types::WorksetId>>>()?;
     rho_rpc::protocol::client::call(
         host_socket(socket_path)?,
-        rho_agents_client::protocol::rho2::DeleteWorksets {
+        rho_agents_client::protocol::worksets::DeleteWorksets {
             worksets: worksets.clone(),
         },
     )

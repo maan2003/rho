@@ -226,7 +226,7 @@ async fn create_agent(
 ) -> anyhow::Result<rho_agent_types::AgentId> {
     let created = rho_rpc::protocol::client::call(
         socket_path,
-        rho_agents_client::protocol::rho2::CreateWorkset {
+        rho_agents_client::protocol::worksets::CreateWorkset {
             kind: rho_agent_types::WorksetKind::Isolated,
             code: format!(
                 "print(new_agent(repo={}, runtime={{\"kind\": \"native\", \"model\": \"sol\", \"effort\": \"medium\"}}), end=\"\")",

@@ -1,5 +1,5 @@
-//! Worksets and mail: the units rho2 keeps state in
-//! ([ARCH-rho2](../../../agent-host/specs/ARCH-rho2.md)).
+//! Worksets and mail: the units the agent host keeps state in
+//! ([ARCH-agent-host](../../../agent-host/specs/ARCH-agent-host.md)).
 
 use std::collections::BTreeMap;
 

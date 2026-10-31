@@ -1341,7 +1341,7 @@ impl Workspace {
         ) else {
             return;
         };
-        let eval = agents::rho2::Eval {
+        let eval = agents::worksets::Eval {
             workset,
             code,
             message: None,
@@ -2970,7 +2970,7 @@ impl Workspace {
                 return;
             }
             if let Some(host) = self.host_of(agent_id) {
-                let cancel = agents::rho2::Cancel { agent: agent_id };
+                let cancel = agents::worksets::Cancel { agent: agent_id };
                 self.call(host, cancel, cx, |_, (), _| {});
             }
         }

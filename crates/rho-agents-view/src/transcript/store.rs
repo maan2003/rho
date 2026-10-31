@@ -172,7 +172,7 @@ impl Transcripts {
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{Address, ContentPart, InputWake, Mail, MailId, UnixMs, Wpos};
-    use rho_agents_client::protocol::rho2::LogEvent;
+    use rho_agents_client::protocol::worksets::LogEvent;
 
     use super::*;
 

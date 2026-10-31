@@ -633,7 +633,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                     story::own_workset(gone),
                     vec![(
                         rho_agent_types::Wpos(0),
-                        rho_agents_client::protocol::rho2::LogEvent::Failed {
+                        rho_agents_client::protocol::worksets::LogEvent::Failed {
                             agent: gone,
                             text: String::new(),
                             error: "deleted activity secret".into(),
@@ -1258,7 +1258,7 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
-    use rho_agents_client::protocol::rho2::Request;
+    use rho_agents_client::protocol::worksets::Request;
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
@@ -1342,7 +1342,7 @@ fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
 #[gpui::test]
 fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
-    use rho_agents_client::protocol::rho2::Request;
+    use rho_agents_client::protocol::worksets::Request;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(731);
@@ -5052,10 +5052,10 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
 
 /// A new workset's answer: its code made `agent_id` and mailed it the
 /// draft.
-fn created(agent_id: AgentId) -> rho_agents_client::protocol::rho2::CreatedWorkset {
-    rho_agents_client::protocol::rho2::CreatedWorkset {
+fn created(agent_id: AgentId) -> rho_agents_client::protocol::worksets::CreatedWorkset {
+    rho_agents_client::protocol::worksets::CreatedWorkset {
         workset: story::own_workset(agent_id),
-        result: rho_agents_client::protocol::rho2::EvalResult {
+        result: rho_agents_client::protocol::worksets::EvalResult {
             output: String::new(),
             error: None,
             agent: Some(agent_id),
@@ -5287,13 +5287,13 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     assert!(
         matches!(
             call,
-            rho_agents_client::protocol::rho2::Request::CreateWorkset(_)
+            rho_agents_client::protocol::worksets::Request::CreateWorkset(_)
         ),
         "the draft asked for a new agent: {call:?}"
     );
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::<rho_agents_client::protocol::rho2::CreatedWorkset>::Failed {
+        rho_rpc::protocol::Answer::<rho_agents_client::protocol::worksets::CreatedWorkset>::Failed {
             reason: "create workspace: no such repository".to_owned(),
         },
     );

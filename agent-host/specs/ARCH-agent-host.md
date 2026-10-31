@@ -1,11 +1,7 @@
-# ARCH-rho2: Worksets, mail, and Python policy
+# ARCH-agent-host: Worksets, mail, and Python policy
 
-## Status
-
-Target architecture for the `rho2` branch, approved in discussion with
-maan2003 on 2026-10-31. The branch implements it in parts; until the branch
-lands, [ARCH-rho-agent](../rho-agent/specs/ARCH-rho-agent.md) describes `main`.
-Migration of existing stores is the last part.
+Approved in discussion with maan2003 on 2026-10-31. The runtimes inside a
+workset process are in [ARCH-rho-agent](../rho-agent/specs/ARCH-rho-agent.md).
 
 ## Shape
 

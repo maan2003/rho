@@ -43,7 +43,7 @@ use rho_agent_types::AgentId;
 
 use crate::fold::{AgentIdentity, Digest, MirroredAgent};
 use crate::now_ms;
-use crate::protocol::rho2::SpecView;
+use crate::protocol::worksets::SpecView;
 
 const LABEL_HEADROOM: u64 = 200;
 
@@ -726,8 +726,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::protocol::rho2::AgentEntry;
     use crate::protocol::transcript::RuntimeKind;
+    use crate::protocol::worksets::AgentEntry;
 
     fn agent(nth: u64) -> AgentId {
         AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap()

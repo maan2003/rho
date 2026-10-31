@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use rho_agent_types::{AgentId, MailId, WorksetId};
-use rho_agents_client::protocol::rho2::{
+use rho_agents_client::protocol::worksets::{
     ClientFrame, CreateWorkset, CreatedWorkset, Open, PostMail, ServerFrame,
 };
 use rho_rpc::protocol::client::Client;

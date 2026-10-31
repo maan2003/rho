@@ -1,13 +1,13 @@
 //! What a GUI and an agent host say about agents. The protocol itself is
-//! [`rho2`]; this module holds the types its calls share with the host's
+//! [`worksets`]; this module holds the types its calls share with the host's
 //! other tables (usage, quota, accounts, visualizations) and
 //! [`transcript`], the vocabulary of a transcript row.
 
 use rho_agent_types::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-pub mod rho2;
 pub mod transcript;
+pub mod worksets;
 
 /// A recorded visualization.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]

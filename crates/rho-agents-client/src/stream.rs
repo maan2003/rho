@@ -20,7 +20,7 @@ use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;
 use crate::model::ToModel;
-use crate::protocol::rho2::{self, ClientFrame, ServerFrame, WorksetLogPage};
+use crate::protocol::worksets::{self, ClientFrame, ServerFrame, WorksetLogPage};
 
 /// What reaches the model from one host.
 #[derive(Debug)]
@@ -122,9 +122,9 @@ async fn read_log(
     loop {
         let page = async {
             let mut stream = dialer
-                .open(<rho2::WorksetLog as rho_rpc::protocol::Call>::PRIORITY)
+                .open(<worksets::WorksetLog as rho_rpc::protocol::Call>::PRIORITY)
                 .await?;
-            rho_rpc::protocol::call(&mut stream, rho2::WorksetLog { workset, from }).await
+            rho_rpc::protocol::call(&mut stream, worksets::WorksetLog { workset, from }).await
         };
         let frame = match page.await {
             Ok(page) => {
@@ -170,7 +170,7 @@ impl HostStream for AgentStream {
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
-            write_open(&mut socket, &rho2::Open::Session).await?;
+            write_open(&mut socket, &worksets::Open::Session).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             while commands.try_recv().is_ok() {}

@@ -8,8 +8,8 @@ use rho_agent::log::{AgentUsageBucket, TranscriptLine};
 use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
 use rho_agent_types::{ContentPart, InputWake, UnixMs};
-use rho_agents_client::protocol::rho2::{LogEvent, SpecView};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
+use rho_agents_client::protocol::worksets::{LogEvent, SpecView};
 
 /// An agent's spec as a reader needs it.
 pub fn spec_view(spec: &AgentSpec) -> SpecView {

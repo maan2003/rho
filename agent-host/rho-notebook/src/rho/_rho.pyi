@@ -1,4 +1,4 @@
-"""The Rust core of rho2, as Python sees it ([ARCH-rho2]).
+"""The Rust core of rho, as Python sees it ([ARCH-agent-host]).
 
 This module is built into the workset process. The `rho` package wraps it;
 policy code imports `rho`, not `_rho`. Every function runs in the workset

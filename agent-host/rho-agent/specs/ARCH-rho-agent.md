@@ -20,7 +20,9 @@ the same host handlers and worker clients through an in-process Unix socket
 pair, not an alternate local backend. These are module boundaries within one
 crate, not separate build targets.
 
-The append-only agent log owns the recoverable conversation prefix. The
+The append-only workset log
+([ARCH-agent-host](../../specs/ARCH-agent-host.md)) owns the recoverable
+conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
 inference. Historical rows use the same format; normal replay has no historical input mode. Claude Code instead owns its session, history, and compaction; Rho

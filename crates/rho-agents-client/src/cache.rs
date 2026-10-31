@@ -21,7 +21,7 @@ use rho_db::{RhoDb, Sen, SenValue};
 
 use crate::fold::{AgentIdentity, Digest};
 use crate::outbox::Outgoing;
-use crate::protocol::rho2::LogEvent;
+use crate::protocol::worksets::LogEvent;
 
 /// Where this client stands in a host's mail log, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -47,8 +47,8 @@ const OUTBOX: TableDefinition<(AgentId, u64), Sen<Outgoing>> =
 /// message is never in both or in neither.
 const DRAFTS: TableDefinition<(AgentId, u64), &str> = TableDefinition::new("gui_thread_draft_v1");
 
-/// Tables nothing reads: the per-agent journal mirror rho2 replaced, and
-/// its retired formats. Dropped on open, every open.
+/// Tables nothing reads: the per-agent journal mirror the workset log replaced,
+/// and its retired formats. Dropped on open, every open.
 const RETIRED_TABLES: [&str; 37] = [
     // A copy of the dealer's marks per agent, which only agent cards read.
     "gui_agent_verdict_v2",
@@ -56,7 +56,7 @@ const RETIRED_TABLES: [&str; 37] = [
     "gui_mirror_events_v10",
     "gui_agent_digest_v7",
     "gui_agent_host_v5",
-    // Verdicts counted journal positions; rho2 counts the conversation.
+    // Verdicts counted journal positions; now the conversation counts.
     "gui_agent_verdict_v1",
     "gui_mirror_host_v9",
     "gui_mirror_events_v9",
@@ -661,8 +661,8 @@ mod tests {
 
     use super::*;
     use crate::fold::Said;
-    use crate::protocol::rho2::{AgentEntry, SpecView};
     use crate::protocol::transcript::RuntimeKind;
+    use crate::protocol::worksets::{AgentEntry, SpecView};
 
     fn agent_id(counter: u64) -> AgentId {
         AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(7)).expect("agent id")

@@ -1,9 +1,9 @@
 //! The agent host's worksets and the agents loaded in them.
 //!
 //! The pool owns one process per workset
-//! ([ARCH-rho2](../../specs/ARCH-rho2.md)), the id → loaded-agent map, and the
-//! answers to each workset's `_rho` calls. The store is the truth about
-//! worksets, agents and mail; the pool holds only what runs.
+//! ([ARCH-agent-host](../../specs/ARCH-agent-host.md)), the id → loaded-agent
+//! map, and the answers to each workset's `_rho` calls. The store is the truth
+//! about worksets, agents and mail; the pool holds only what runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

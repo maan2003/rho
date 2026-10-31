@@ -457,8 +457,8 @@ mod tests {
 
     use super::*;
     use crate::fold::{TranscriptFold, TranscriptRow};
-    use crate::protocol::rho2::LogEvent;
     use crate::protocol::transcript::ArgumentsFormat;
+    use crate::protocol::worksets::LogEvent;
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()
