@@ -16,9 +16,10 @@ impl ReportOutput {
         &self.id
     }
 }
-pub fn report_results(report: &Report, prior: Option<&Carry>) -> Vec<ReportOutput> {
+/// `inputs`: the request also delivered inputs, as `Report::render` takes it.
+pub fn report_results(report: &Report, inputs: bool, prior: Option<&Carry>) -> Vec<ReportOutput> {
     let results: Vec<step::CallResult> = {
-        let rendered = report.render();
+        let rendered = report.render(inputs);
         let images = rendered
             .images
             .into_iter()

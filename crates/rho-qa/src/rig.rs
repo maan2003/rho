@@ -10,7 +10,6 @@
 //! in the rig's state the way the user's own state accumulates. `rig new` is
 //! for starting a new line of QA, not for cleaning up after a run.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -19,11 +18,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_types::{AgentRole, ContentPart};
-use rho_agents_client::protocol::transcript::TranscriptEvent;
-use rho_agents_client::protocol::{
-    ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame, StartMode,
-};
+use rho_agent_types::{ContentPart, WorksetKind};
+use rho_agents_client::protocol::rho2::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
+use rho_agents_client::snippets;
 use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1151,46 +1148,43 @@ async fn probe_async(name: &str) -> Result<()> {
         .await
         .with_context(|| format!("connect to the running rig at {}", socket.display()))?;
     let mut client = Streams::open(client, &socket).await?;
-    let head = client.journal_head;
-    client
-        .send_agents(&AgentsClientFrame::Follow { since: head })
-        .await?;
-    client.create(NewAgent {
-        role: AgentRole::default(),
-        start: StartMode::Here {
+    let runtime = snippets::Runtime::parse("").map_err(anyhow::Error::msg)?;
+    client.create(CreateWorkset {
+        kind: WorksetKind::Host {
             cwd: workspace.try_into().context("rig workspace is not UTF-8")?,
         },
-        content: Some(vec![ContentPart::Text {
+        code: snippets::new_agent_in(camino::Utf8Path::new("/"), &runtime)
+            .replace("cwd=\"/\", ", ""),
+        message: Some(vec![ContentPart::Text {
             text: "Complete one deterministic rig probe turn.".to_owned(),
         }]),
     });
-    // Follow has no acknowledgement. Let the deliberately fast fake finish,
-    // then replay from the pre-creation head so setup cannot race the turn.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    client
-        .send_agents(&AgentsClientFrame::Follow { since: head })
-        .await?;
 
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     let mut replies = 0_u64;
-    let mut seen = HashSet::new();
     loop {
         let message = tokio::time::timeout_at(deadline, client.recv())
             .await
             .context("rig probe timed out")??;
         match message {
-            Incoming::Agents(AgentsServerFrame::Log { entries }) => {
-                for entry in entries {
-                    if !seen.insert(entry.seq) {
+            Incoming::Created { workset, error, .. } => {
+                anyhow::ensure!(error.is_none(), "rig creation code failed: {error:?}");
+                // Followed from its start, so the turn cannot race it.
+                client
+                    .send(&ClientFrame::FollowWorksets {
+                        from: vec![(workset, rho_agent_types::Wpos::ZERO)],
+                    })
+                    .await?;
+            }
+            Incoming::Session(ServerFrame::Rows { rows, .. }) => {
+                for (pos, event) in rows {
+                    let LogEvent::Replied { agent, items, .. } = &event else {
                         continue;
-                    }
-                    let completed_reply = matches!(
-                        &entry.event,
-                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agents_client::protocol::transcript::Item::ToolCall { .. }))
-                    );
-                    if matches!(&entry.event, TranscriptEvent::Replied { .. }) {
-                        replies += 1;
-                    }
+                    };
+                    replies += 1;
+                    let completed_reply = !items.iter().any(|item| {
+                        matches!(item, rho_agents_client::protocol::transcript::Item::ToolCall { .. })
+                    });
                     if completed_reply {
                         let model: FakeModel = serde_json::from_str(
                             fs::read_to_string(root.join("logs/fake-model.log"))?
@@ -1207,8 +1201,8 @@ async fn probe_async(name: &str) -> Result<()> {
                             bail!("rig turn ended without a fake-model reply");
                         }
                         println!(
-                            "RIG_PROOF agent={:?} replies={replies} fake_completed_turns={} journal_head={}",
-                            entry.agent_id, metrics.completed_turns, entry.seq.0
+                            "RIG_PROOF agent={:?} replies={replies} fake_completed_turns={} row={}",
+                            agent, metrics.completed_turns, pos.0
                         );
                         return Ok(());
                     }

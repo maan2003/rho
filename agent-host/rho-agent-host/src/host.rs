@@ -278,8 +278,8 @@ async fn shutdown_if_idle(services: &Services) -> anyhow::Result<()> {
     if !working.is_empty() {
         let names = working
             .iter()
-            .map(|agent_id| services.pool.agent_handle(*agent_id))
-            .collect::<anyhow::Result<Vec<_>>>()?
+            .map(rho_agent_types::AgentId::encoded)
+            .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!("agents still working: {names}");
     }

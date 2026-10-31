@@ -1,51 +1,57 @@
-//! An agent host's agents stream, with agent commands on call streams beside
-//! it, for a harness that reads the journal and
-//! drives agents in one loop.
+//! An agent host's session stream, with calls on streams of their own
+//! beside it, for a harness that reads worksets and mail and drives agents
+//! in one loop.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_types::{AgentId, Seq};
-use rho_agents_client::protocol as agents;
-use rho_agents_client::protocol::{AgentCommand, ClientFrame, NewAgent, ServerFrame};
+use rho_agent_types::{AgentId, MailId, WorksetId};
+use rho_agents_client::protocol::rho2::{
+    ClientFrame, CreateWorkset, CreatedWorkset, Open, PostMail, ServerFrame,
+};
 use rho_rpc::protocol::client::Client;
 use rho_rpc::protocol::{Answer, read_frame, write_frame, write_open};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
-/// A frame from the agents stream or an answer, in the order it was read.
+/// A frame from the session or an answer, in the order it was read.
 pub enum Incoming {
-    Agents(ServerFrame),
-    /// The agent [`Streams::create`] asked for.
-    Created(AgentId),
+    Session(ServerFrame),
+    /// The workset [`Streams::create`] asked for, and the agent its
+    /// message went to.
+    Created {
+        workset: WorksetId,
+        agent: Option<AgentId>,
+        error: Option<String>,
+    },
     /// A call the agent host would not make, and why.
     Refused(String),
 }
 
 pub struct Streams {
     socket: PathBuf,
-    agents: WriteHalf<rho_rpc::Stream>,
+    session: WriteHalf<rho_rpc::Stream>,
     incoming_tx: mpsc::UnboundedSender<Result<Incoming>>,
     incoming: mpsc::UnboundedReceiver<Result<Incoming>>,
-    /// How far the journal ran when the agents stream opened.
-    pub journal_head: Seq,
+    /// How far the mail ran when the session opened.
+    pub mail_head: MailId,
 }
 
 impl Streams {
-    /// Opens an agents stream on `agents`, a connection to the agent host at
-    /// `socket`, and reads its journal head. Nothing is followed yet.
-    pub async fn open(agents: Client, socket: &Path) -> Result<Self> {
-        let mut agents = agents.into_stream();
-        write_open(&mut agents, &agents::Open::Session).await?;
-        let ServerFrame::JournalHead { journal_head, .. } = read_frame(&mut agents).await? else {
-            bail!("the agents stream did not open with its journal head");
+    /// Opens a session on `client`, a connection to the agent host at
+    /// `socket`, and reads its `Hello`. Nothing is followed yet.
+    pub async fn open(client: Client, socket: &Path) -> Result<Self> {
+        let mut session = client.into_stream();
+        write_open(&mut session, &Open::Session).await?;
+        let ServerFrame::Hello { mail_head, .. } = read_frame(&mut session).await? else {
+            bail!("the session did not open with its hello");
         };
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
-        let (mut agents_read, agents) = tokio::io::split(agents);
+        let (mut session_read, session) = tokio::io::split(session);
         let tx = incoming_tx.clone();
         tokio::spawn(async move {
             loop {
-                let read = read_frame(&mut agents_read).await.map(Incoming::Agents);
+                let read = read_frame(&mut session_read).await.map(Incoming::Session);
                 let failed = read.is_err();
                 if tx.send(read).is_err() || failed {
                     break;
@@ -54,23 +60,29 @@ impl Streams {
         });
         Ok(Self {
             socket: socket.to_owned(),
-            agents,
+            session,
             incoming_tx,
             incoming,
-            journal_head,
+            mail_head,
         })
     }
 
-    /// Starts an agent on a call stream of its own; the agent arrives as
+    /// Creates a workset on a call stream of its own; it arrives as
     /// [`Incoming::Created`].
-    pub fn create(&self, new: NewAgent) {
-        self.call(new, |agent_id| Some(Incoming::Created(agent_id)));
+    pub fn create(&self, create: CreateWorkset) {
+        self.call(create, |CreatedWorkset { workset, result }| {
+            Some(Incoming::Created {
+                workset,
+                agent: result.agent,
+                error: result.error,
+            })
+        });
     }
 
-    /// Sends `command` on a call stream of its own. Only a refusal says
-    /// anything.
-    pub fn send(&self, command: AgentCommand) {
-        self.call(command, |()| None);
+    /// Mails an agent as the user, on a call stream of its own. Only a
+    /// refusal says anything.
+    pub fn post(&self, mail: PostMail) {
+        self.call(mail, |_| None);
     }
 
     fn call<C: rho_rpc::protocol::Call>(
@@ -103,8 +115,8 @@ impl Streams {
         });
     }
 
-    pub async fn send_agents(&mut self, frame: &ClientFrame) -> Result<()> {
-        write_frame(&mut self.agents, frame).await
+    pub async fn send(&mut self, frame: &ClientFrame) -> Result<()> {
+        write_frame(&mut self.session, frame).await
     }
 
     pub async fn recv(&mut self) -> Result<Incoming> {

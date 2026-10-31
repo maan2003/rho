@@ -57,7 +57,7 @@ pub enum Scenario {
     FortyToolCalls,
     /// Emit encrypted reasoning followed by a compaction item.
     ReasoningCompaction,
-    /// Ask a question through exec/human.send and await the human.
+    /// Ask a question through exec/mail.send and await the user.
     ClarifyingQuestion,
 }
 
@@ -765,7 +765,7 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source = format!("human.send({text:?}, kind=\"result\")\nend_turn()");
+        let source = format!("mail.send(\"user\", {text:?}, kind=\"result\")\nend_turn()");
         append_tool_call(
             events,
             state,

@@ -201,7 +201,7 @@ async fn stream_cut_before_python_admission_allows_retry() {
     assert!(retry.iter().any(|event| {
         event["item"]["input"]
             .as_str()
-            .is_some_and(|code| code.contains("human.send("))
+            .is_some_and(|code| code.contains("mail.send(\"user\""))
     }));
     server.shutdown().await.unwrap();
 }
@@ -288,7 +288,7 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
         .unwrap()["item"]["input"]
         .as_str()
         .unwrap();
-    assert!(code.contains("human.send("));
+    assert!(code.contains("mail.send(\"user\""));
     assert!(code.contains("end_turn()"));
     assert!(code.contains("clarify"));
     clarifying.shutdown().await.unwrap();
@@ -383,7 +383,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
                 "{code}"
             );
         } else {
-            assert!(code.contains("human.send("));
+            assert!(code.contains("mail.send(\"user\""));
             assert!(code.contains("end_turn()"));
         }
     }

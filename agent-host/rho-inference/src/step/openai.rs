@@ -902,7 +902,6 @@ mod tests {
             "filtered response cannot use server continuation"
         );
         let entry = rho_agent::entry::Entry::Step {
-            at: rho_agent_types::UnixMs(9),
             exec: Some("print(7)".into()),
             prose: answer.prose,
             carry: answer.carry,

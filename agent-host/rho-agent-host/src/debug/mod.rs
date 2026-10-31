@@ -4,10 +4,9 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rho_agent::db::AgentReadTxnExt as _;
-use rho_agent::log::AgentRuntime;
+use rho_agent::record::Runtime;
+use rho_agent::store::StoreRead as _;
 use rho_agent_hosts::protocol::DebugReport;
-use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
 use rho_inference::Accounts;
 
@@ -62,19 +61,13 @@ enum DebugCommand {
         #[arg(long)]
         socket_path: Option<PathBuf>,
     },
-    /// Permanently delete agents and their transcripts from the database,
-    /// including session-owned Claude files and mirrored GUI transcripts.
-    /// Runs through the host, which stops and drains the named agents.
-    /// Use --socket-path to select a host, not --db-path.
-    #[command(visible_alias = "delete-transcripts")]
-    DeleteAgents {
-        /// Full agent ids or handles (eng-… / adv-…).
+    /// Permanently delete worksets: their logs, agents, Claude sessions and
+    /// directories. Mail stays. Runs through the host, which stops their
+    /// processes first. Use --socket-path to select a host, not --db-path.
+    DeleteWorksets {
+        /// Workset ids.
         #[arg(required = true)]
-        agents: Vec<String>,
-        /// Reclaim disk space online after deletion. Other database access
-        /// pauses during compaction. Recovery savepoints must be gone.
-        #[arg(long)]
-        compact: bool,
+        worksets: Vec<String>,
         /// Host socket; defaults to $RHO_SOCKET_PATH, then the user's host.
         #[arg(long)]
         socket_path: Option<PathBuf>,
@@ -85,12 +78,6 @@ enum DebugCommand {
     /// Print the context usage each agent would restore on load (event log for
     /// Rho agents, session transcript for Claude agents).
     Context,
-    /// Render the system prompt and top-level model-facing tools for a role.
-    RenderPrompt {
-        /// Role text: mini-eng, med-eng, high-eng, med1-eng, high1-eng,
-        /// low-adv, med-adv, or med1-adv.
-        role: String,
-    },
     /// Print one agent's persisted events, each cut to `--max-chars`.
     Transcript {
         /// Full agent id.
@@ -98,25 +85,23 @@ enum DebugCommand {
         #[arg(long = "max-chars", default_value_t = 3000)]
         max_chars: usize,
     },
-    /// Start an agent on a running agent host and print its id.
-    NewAgent {
-        /// Role text, as for `render-prompt`.
-        #[arg(long, default_value = "high-eng")]
-        role: String,
-        /// The repository its workset is cloned from.
+    /// Create a workset on a running agent host, run `code` in it, and
+    /// print the workset, the agent the message went to, and the output.
+    CreateWorkset {
+        /// A host directory to work in as it is; without it, an isolated
+        /// workset with its own `/src`.
         #[arg(long)]
-        repo: camino::Utf8PathBuf,
-        #[arg(long, default_value = "@")]
-        revset: String,
+        cwd: Option<camino::Utf8PathBuf>,
         /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
         /// user's agent host.
         #[arg(long = "socket-path")]
         socket_path: Option<PathBuf>,
-        /// The first message.
-        text: String,
+        /// Python run once in the new workset's namespace.
+        code: String,
+        /// The user's first mail, to the first agent `code` creates.
+        message: Option<String>,
     },
-    /// Send an agent a message, as the user would, on a running agent host.
-    /// Never starts one: the message is for an agent that already lives there.
+    /// Mail an agent, as the user would, on a running agent host.
     SendMessage {
         /// Full agent id, as in `$RHO_AGENT_ID`.
         agent: String,
@@ -143,19 +128,17 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Compact { socket_path } => compact(args.db_path, socket_path).await,
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
-        DebugCommand::DeleteAgents {
-            agents,
-            compact,
+        DebugCommand::DeleteWorksets {
+            worksets,
             socket_path,
         } => {
             anyhow::ensure!(
                 args.db_path.is_none(),
                 "deletion runs through the host; select it with --socket-path, not --db-path"
             );
-            delete_agents(socket_path, &agents, compact).await
+            delete_worksets(socket_path, &worksets).await
         }
         DebugCommand::Context => print_report(args.db_path, &claude, DebugReport::Context).await,
-        DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
         DebugCommand::Transcript { agent, max_chars } => {
             let report = DebugReport::Transcript {
                 agent,
@@ -163,20 +146,29 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             };
             print_report(args.db_path, &claude, report).await
         }
-        DebugCommand::NewAgent {
-            role,
-            repo,
-            revset,
+        DebugCommand::CreateWorkset {
+            cwd,
             socket_path,
-            text,
+            code,
+            message,
         } => {
-            let call = rho_agents_client::protocol::NewAgent {
-                role: parse_role(&role)?,
-                start: rho_agents_client::protocol::StartMode::NewOn { repo, revset },
-                content: Some(vec![rho_agent_types::ContentPart::Text { text }]),
+            let call = rho_agents_client::protocol::rho2::CreateWorkset {
+                kind: match cwd {
+                    Some(cwd) => rho_agent_types::WorksetKind::Host { cwd },
+                    None => rho_agent_types::WorksetKind::Isolated,
+                },
+                code,
+                message: message.map(|text| vec![rho_agent_types::ContentPart::Text { text }]),
             };
-            let agent_id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
-            println!("{}", agent_id.encoded());
+            let created = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            println!("workset {}", created.workset);
+            if let Some(agent) = created.result.agent {
+                println!("agent {}", agent.encoded());
+            }
+            print!("{}", created.result.output);
+            if let Some(error) = created.result.error {
+                eprintln!("{error}");
+            }
             Ok(())
         }
         DebugCommand::SendMessage {
@@ -184,16 +176,16 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             socket_path,
             text,
         } => {
-            let agent_id = rho_agent_types::parse_full_handle(&agent)
+            let to = rho_agent_types::parse_full_handle(&agent)
                 .with_context(|| format!("agent id {agent}"))?;
-            let call = rho_agents_client::protocol::AgentCommand::Send {
-                agent_id,
-                messages: vec![rho_agents_client::protocol::UserMessage {
-                    id: rho_agent::entry::MessageId::new().0,
-                    content: vec![rho_agent_types::ContentPart::Text { text }],
-                }],
+            let call = rho_agents_client::protocol::rho2::PostMail {
+                client_id: uuid::Uuid::new_v4().as_u64_pair().0,
+                to,
+                re: None,
+                content: vec![rho_agent_types::ContentPart::Text { text }],
             };
-            rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            let id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            println!("mail {}", id.0);
             Ok(())
         }
     }
@@ -223,79 +215,6 @@ fn try_host_lock(host_lock: &Path) -> anyhow::Result<Option<std::fs::File>> {
         return Err(error).with_context(|| format!("lock {}", host_lock.display()));
     }
     Ok(Some(lock))
-}
-
-async fn render_prompt(role: &str) -> anyhow::Result<()> {
-    let role = parse_role(role)?;
-    let cwd = std::env::current_dir().context("read current directory")?;
-    let cwd = camino::Utf8PathBuf::try_from(cwd).context("current directory is not UTF-8")?;
-    // The prompt an agent would get with the invoking directory as its
-    // workset, which it sees as `/src`.
-    let surface = rho_agent::render_agent_surface(
-        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-        &cwd,
-        role,
-    )?;
-
-    println!("# System prompt\n");
-    if surface.system_prompt.is_empty() {
-        println!("(empty; Claude Code supplies its own system prompt)");
-    } else {
-        print!("{}", surface.system_prompt);
-        if !surface.system_prompt.ends_with('\n') {
-            println!();
-        }
-    }
-    println!("\n# Tools");
-    if surface.tools.is_empty() {
-        println!("\n(none supplied by Rho at the provider API level)");
-    }
-    for tool in surface.tools.iter() {
-        println!("\n## {} ({:?})\n", tool.name.as_str(), tool.tool_type);
-        println!("{}", tool.description);
-        if !tool.input_schema.is_null() {
-            println!(
-                "\nInput schema:\n```json\n{}\n```",
-                serde_json::to_string_pretty(&tool.input_schema)?
-            );
-        }
-        if let Some(format) = &tool.format {
-            println!("\nFormat:\n```text\n{format:?}\n```");
-        }
-    }
-    Ok(())
-}
-
-fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
-    Ok(match text {
-        "mini-eng" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        },
-        "med-eng" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        },
-        "high-eng" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        },
-        "med1-eng" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium1,
-        },
-        "high1-eng" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High1,
-        },
-        "low-adv" => AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::Low,
-        },
-        "med-adv" => AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::Medium,
-        },
-        "med1-adv" => AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::Medium1,
-        },
-        _ => anyhow::bail!(
-            "unknown role `{text}`; use mini-eng, med-eng, high-eng, med1-eng, high1-eng, low-adv, med-adv, or med1-adv"
-        ),
-    })
 }
 
 #[derive(Debug)]
@@ -542,40 +461,54 @@ async fn render_agents(
     claude: &rho_claude::accounts::ClaudePaths,
 ) -> anyhow::Result<String> {
     let read = db.read();
-    let mut agents = read.list_agents();
-    agents.sort_by_key(|(id, _)| *id);
+    let worksets = read.worksets();
+    let mut agents = read.agents();
+    agents.sort_by_key(|(_, head)| head.created_at);
 
     let mut output = String::new();
     writeln!(output, "source: {}", source.display())?;
-    writeln!(output, "agents: {}", agents.len())?;
-    for (agent_id, agent) in agents {
-        writeln!(output)?;
-        writeln!(output, "{agent_id:?}")?;
-        if let Some(name) = agent.title() {
-            writeln!(output, "  name: {name}")?;
-        }
-        writeln!(output, "  mode: {}", config_name(agent.config()))?;
+    writeln!(output, "worksets: {}", worksets.len())?;
+    for (workset, head) in &worksets {
         writeln!(
             output,
-            "  log: next {:?}, {} rows visible",
-            agent.next,
-            read.agent_events(agent_id).1.len()
+            "  {workset}: {:?}, {} rows, {} agents",
+            head.kind,
+            head.next.0,
+            head.agents.len()
         )?;
-        writeln!(output, "  place: {}", place_name(agent.place()))?;
-        match agent.config.runtime {
-            AgentRuntime::Rho { prompt_cache_key } => {
-                writeln!(output, "  runtime: rho")?;
-                writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
+    }
+    writeln!(output, "agents: {}", agents.len())?;
+    for (agent_id, head) in agents {
+        writeln!(output)?;
+        writeln!(output, "{}", agent_id.encoded())?;
+        writeln!(output, "  workset: {}", head.workset)?;
+        writeln!(output, "  props: {:?}", head.spec.props)?;
+        writeln!(
+            output,
+            "  log: rows {}..={}, {} visible",
+            head.created.0,
+            head.last.0,
+            read.agent_rows(agent_id, head.created).len()
+        )?;
+        match head.spec.runtime {
+            Runtime::Native {
+                model,
+                profile,
+                cache_key,
+            } => {
+                writeln!(output, "  runtime: native {model:?} {profile:?}")?;
+                writeln!(output, "  prompt_cache_key: {cache_key:?}")?;
             }
-            AgentRuntime::Claude { session_id } => {
-                writeln!(output, "  runtime: claude")?;
+            Runtime::Claude {
+                model,
+                effort,
+                session_id,
+            } => {
+                writeln!(output, "  runtime: claude {model:?} {effort:?}")?;
                 writeln!(output, "  session_id: {session_id}")?;
-                match rho_claude::find_session_transcript(
-                    &claude.projects(),
-                    session_id,
-                    &agent.place().cwd,
-                )
-                .await?
+                let cwd = workset_cwd(&read, head.workset);
+                match rho_claude::find_session_transcript(&claude.projects(), session_id, &cwd)
+                    .await?
                 {
                     Some(path) => writeln!(output, "  transcript: {path}")?,
                     None => writeln!(output, "  transcript: <missing>")?,
@@ -586,18 +519,27 @@ async fn render_agents(
     Ok(output)
 }
 
+/// Where a workset's agents work.
+fn workset_cwd(read: &rho_db::ReadTxn, workset: rho_agent_types::WorksetId) -> camino::Utf8PathBuf {
+    read.workset(workset).map_or_else(
+        || camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT),
+        |head| rho_agent::host::pool::workset_root(&head.kind),
+    )
+}
+
 fn render_transcript(db: &RhoDb, agent: &str, max_chars: usize) -> anyhow::Result<String> {
     let agent_id = rho_agent_types::AgentId::from_encoded(agent)
         .with_context(|| format!("agent id {agent}"))?;
     let read = db.read();
+    let head = read.agent(agent_id).context("no such agent")?;
     let mut output = String::new();
-    for (index, event) in read.agent_events(agent_id).1.iter().enumerate() {
-        let text = format!("{event:?}");
+    for (pos, record) in read.agent_rows(agent_id, head.created) {
+        let text = format!("{record:?}");
         let cut = text
             .char_indices()
             .nth(max_chars)
             .map_or(text.len(), |(at, _)| at);
-        writeln!(output, "#{index} {}", &text[..cut])?;
+        writeln!(output, "#{} {}", pos.0, &text[..cut])?;
         if cut < text.len() {
             writeln!(output, "   … {} more bytes", text.len() - cut)?;
         }
@@ -611,60 +553,32 @@ async fn render_context(
     claude: &rho_claude::accounts::ClaudePaths,
 ) -> anyhow::Result<String> {
     let read = db.read();
-    let mut agents = read.list_agents();
-    agents.sort_by_key(|(id, _)| *id);
+    let mut agents = read.agents();
+    agents.sort_by_key(|(_, head)| head.created_at);
 
     let mut output = String::new();
     writeln!(output, "source: {}", source.display())?;
     writeln!(output, "agents: {}", agents.len())?;
-    for (agent_id, agent) in agents {
+    for (agent_id, head) in agents {
         writeln!(output)?;
-        writeln!(
-            output,
-            "{agent_id:?} ({})",
-            agent.title().unwrap_or("unnamed")
-        )?;
-        match agent.config.runtime {
-            AgentRuntime::Rho { .. } => {
-                let (_, events) = read.agent_events(agent_id);
-                let mut context_used = None;
-                let mut responses = 0usize;
-                for event in &events {
-                    if let rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
-                        usage,
-                        ..
-                    }) = event
-                    {
-                        responses += 1;
-                        if let Some(usage) = usage
-                            && usage.input_tokens.saturating_add(usage.cache_read_tokens) > 0
-                        {
-                            context_used = Some(
-                                usage
-                                    .input_tokens
-                                    .saturating_add(usage.cache_read_tokens)
-                                    .saturating_add(usage.output_tokens),
-                            );
-                        }
-                    }
-                }
-                writeln!(output, "  runtime: rho")?;
+        writeln!(output, "{}", agent_id.encoded())?;
+        match head.spec.runtime {
+            Runtime::Native { .. } => {
+                writeln!(output, "  runtime: native")?;
+                writeln!(output, "  context from row: {}", head.native.from.0)?;
                 writeln!(
                     output,
-                    "  events: {} ({responses} inference responses)",
-                    events.len()
+                    "  restored context_used: {:?}",
+                    head.native.compaction.context_used
                 )?;
-                writeln!(output, "  restored context_used: {context_used:?}")?;
             }
-            AgentRuntime::Claude { session_id } => {
+            Runtime::Claude { session_id, .. } => {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
-                let transcript = rho_claude::find_session_transcript(
-                    &claude.projects(),
-                    session_id,
-                    &agent.place().cwd,
-                )
-                .await?;
+                let cwd = workset_cwd(&read, head.workset);
+                let transcript =
+                    rho_claude::find_session_transcript(&claude.projects(), session_id, &cwd)
+                        .await?;
                 let Some(transcript) = transcript else {
                     writeln!(output, "  transcript: <missing>")?;
                     continue;
@@ -673,36 +587,18 @@ async fn render_context(
                 let messages = rho_claude::read_session_messages_by_id(
                     &claude.projects(),
                     session_id,
-                    &agent.place().cwd,
+                    &cwd,
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;
                 writeln!(output, "  messages: {}", messages.len())?;
                 match rho_claude::last_assistant_usage(&messages) {
-                    Some(usage) => {
-                        writeln!(output, "  last assistant usage:")?;
-                        writeln!(output, "    input_tokens: {:?}", usage.input_tokens)?;
-                        writeln!(
-                            output,
-                            "    cache_creation_input_tokens: {:?}",
-                            usage.cache_creation_input_tokens
-                        )?;
-                        writeln!(
-                            output,
-                            "    cache_read_input_tokens: {:?}",
-                            usage.cache_read_input_tokens
-                        )?;
-                        writeln!(output, "    output_tokens: {:?}", usage.output_tokens)?;
-                        writeln!(
-                            output,
-                            "  restored context_used: Some({})",
-                            usage.context_total()
-                        )?;
-                    }
-                    None => {
-                        writeln!(output, "  last assistant usage: <none>")?;
-                        writeln!(output, "  restored context_used: None")?;
-                    }
+                    Some(usage) => writeln!(
+                        output,
+                        "  restored context_used: Some({})",
+                        usage.context_total()
+                    )?,
+                    None => writeln!(output, "  restored context_used: None")?,
                 }
             }
         }
@@ -716,28 +612,30 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     migrate_snapshot(&db).await?;
 
     let read = db.read();
-    let agents = read.list_agents();
-    let mut events = 0usize;
-    // Check physical rows too: a later rewind must not hide an obsolete
+    let worksets = read.worksets();
+    let mut rows = 0usize;
+    // Every physical row decodes: a later rewind must not hide an obsolete
     // decoder.
-    for (agent_id, head) in &agents {
-        for pos in 0..head.next.pos {
-            anyhow::ensure!(
-                read.agent_event(*agent_id, rho_agent::log::AgentEventPos::new(pos))
-                    .is_some(),
-                "missing physical event {}:{pos}",
-                agent_id.encoded(),
-            );
-            events += 1;
+    for (workset, head) in &worksets {
+        let mut from = rho_agent_types::Wpos::ZERO;
+        while from < head.next {
+            let page = read.workset_rows(*workset, from, 4096);
+            let Some((last, _)) = page.last() else {
+                anyhow::bail!("workset {workset} ends at {} of {}", from.0, head.next.0);
+            };
+            from = last.next();
+            rows += page.len();
         }
     }
+    let mails = read.mail_head().0;
 
     let mut output = String::new();
     writeln!(output, "source: {}", snapshot.source.display())?;
     writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "migration on copied database: ok")?;
-    writeln!(output, "agents decoded: {}", agents.len())?;
-    writeln!(output, "events decoded: {events}")?;
+    writeln!(output, "worksets decoded: {}", worksets.len())?;
+    writeln!(output, "rows decoded: {rows}")?;
+    writeln!(output, "mails: {mails}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }
@@ -803,30 +701,21 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn delete_agents(
-    socket_path: Option<PathBuf>,
-    agents: &[String],
-    compact: bool,
-) -> anyhow::Result<()> {
-    let agents = agents
+async fn delete_worksets(socket_path: Option<PathBuf>, worksets: &[String]) -> anyhow::Result<()> {
+    let worksets = worksets
         .iter()
-        .map(|id| rho_agent_types::parse_full_handle(id).with_context(|| format!("agent id {id}")))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let result = rho_rpc::protocol::client::call(
+        .map(|id| id.parse().with_context(|| format!("workset id {id}")))
+        .collect::<anyhow::Result<Vec<rho_agent_types::WorksetId>>>()?;
+    rho_rpc::protocol::client::call(
         host_socket(socket_path)?,
-        rho_agents_client::protocol::DeleteAgents { agents, compact },
+        rho_agents_client::protocol::rho2::DeleteWorksets {
+            worksets: worksets.clone(),
+        },
     )
     .await
-    .context("ask the running host to delete agents")?;
-    for (id, rows) in result.deleted {
-        println!("deleted {} ({rows} log rows)", id.encoded());
-    }
-    println!(
-        "removed {} Claude session file(s)/directory tree(s)",
-        result.claude_paths_removed
-    );
-    if let Some((before, after)) = result.compacted {
-        println!("database: {before} -> {after} bytes");
+    .context("ask the running host to delete worksets")?;
+    for workset in worksets {
+        println!("deleted {workset}");
     }
     Ok(())
 }
@@ -872,50 +761,6 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let hop = rho_agent::db::rollback(&db).await?;
     println!("{}: migration {hop} undone", path.display());
     Ok(())
-}
-
-fn config_name(config: rho_agent_types::AgentRole) -> String {
-    use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
-    match config {
-        AgentRole::Advisor { intelligence } => match intelligence {
-            AdvisorIntelligence::Low => "low-adv",
-            AdvisorIntelligence::Medium => "med-adv",
-            AdvisorIntelligence::Medium1 => "med1-adv",
-        },
-        AgentRole::Engineer { intelligence } => match intelligence {
-            EngineerIntelligence::Mini => "mini-eng",
-            EngineerIntelligence::Medium => "med-eng",
-            EngineerIntelligence::High => "high-eng",
-            EngineerIntelligence::Medium1 => "med1-eng",
-            EngineerIntelligence::High1 => "high1-eng",
-        },
-    }
-    .to_owned()
-}
-
-fn place_name(place: &rho_agent_types::Place) -> String {
-    match place.workset {
-        Some(workset) => format!("{} in workset {workset}", place.cwd),
-        None => format!("{} on the host", place.cwd),
-    }
-}
-
-#[cfg(test)]
-mod render_prompt_tests {
-    use super::*;
-
-    #[test]
-    fn parses_render_prompt_roles() {
-        assert_eq!(parse_role("med-eng").unwrap(), AgentRole::default());
-        assert_eq!(
-            parse_role("med1-adv").unwrap(),
-            AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium1
-            }
-        );
-        assert!(parse_role("eng").is_err());
-        assert!(parse_role("advisor-high").is_err());
-    }
 }
 
 #[cfg(test)]
@@ -997,35 +842,5 @@ mod snapshot_tests {
         );
         assert!(leftovers[0].1.as_secs() >= 47 * 60 * 60, "with its age");
         assert!(killed.exists(), "and it is still there afterwards");
-    }
-}
-
-#[cfg(test)]
-mod delete_tests {
-    use clap::Parser;
-
-    use super::*;
-
-    #[derive(Parser)]
-    struct Cli {
-        #[command(flatten)]
-        debug: DebugArgs,
-    }
-
-    #[test]
-    fn delete_transcripts_and_delete_agents_share_one_command() {
-        for name in ["delete-transcripts", "delete-agents"] {
-            let cli = Cli::try_parse_from(["debug", name, "--compact", "eng-abc"]).unwrap();
-            assert!(matches!(
-                cli.debug.command,
-                DebugCommand::DeleteAgents { agents, compact: true, .. } if agents == ["eng-abc"]
-            ));
-        }
-        let cli = Cli::try_parse_from(["debug", "delete-transcripts", "first", "second"]).unwrap();
-        assert!(matches!(
-            cli.debug.command,
-            DebugCommand::DeleteAgents { agents, compact: false, .. } if agents == ["first", "second"]
-        ));
-        assert!(Cli::try_parse_from(["debug", "delete-transcripts", "--compact"]).is_err());
     }
 }

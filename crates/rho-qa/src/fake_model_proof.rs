@@ -12,12 +12,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, Seq};
-use rho_agents_client::protocol::transcript::{DetailBody, TranscriptEvent};
-use rho_agents_client::protocol::{
-    AgentCommand, ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame,
-    StartMode, UserMessage,
+use rho_agent_types::{
+    Address, AgentId, ContentPart, InputWake, MailId, WorksetId, WorksetKind, Wpos,
 };
+use rho_agents_client::protocol::rho2::{
+    ClientFrame, CreateWorkset, LogEvent, PostMail, ServerFrame,
+};
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
+use rho_agents_client::snippets;
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_rpc::protocol::client::Client;
 use serde::Deserialize;
@@ -179,10 +181,9 @@ async fn run_async(args: Args) -> Result<()> {
     let _children = children;
 
     let mut client = Streams::open(connect(&socket).await?, &socket).await?;
-    let initial_head = client.journal_head;
     ensure!(
-        initial_head == Seq(0),
-        "fresh isolated agent host journal was not empty"
+        client.mail_head == MailId(0),
+        "fresh isolated agent host mail was not empty"
     );
     println!(
         "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
@@ -193,10 +194,11 @@ async fn run_async(args: Args) -> Result<()> {
         args.seed
     );
     client
-        .send_agents(&AgentsClientFrame::Follow { since: Seq(0) })
+        .send(&ClientFrame::FollowMail { since: MailId(0) })
         .await?;
 
     let repo = Utf8PathBuf::try_from(workspace).context("workspace path is not UTF-8")?;
+    let runtime = snippets::Runtime::parse("").map_err(anyhow::Error::msg)?;
     let agent_count = if args.scenario == Scenario::Baseline {
         AGENTS
     } else {
@@ -204,24 +206,23 @@ async fn run_async(args: Args) -> Result<()> {
     };
     let submitted = Instant::now();
     for index in 0..agent_count {
-        client.create(NewAgent {
-            role: AgentRole::default(),
-            start: StartMode::NewOn {
-                repo: repo.clone(),
-                revset: "HEAD".into(),
-            },
-            content: Some(prompt(index, 0)),
+        client.create(CreateWorkset {
+            kind: WorksetKind::Isolated,
+            code: snippets::new_agent_on(&repo, "HEAD", &runtime),
+            message: Some(prompt(index, 0)),
         });
     }
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args.seconds);
     let mut agents = HashSet::new();
-    let mut expected_pos: HashMap<AgentId, AgentPos> = HashMap::new();
+    let mut worksets: HashMap<WorksetId, Wpos> = HashMap::new();
     let mut report_at = HashMap::new();
     let mut responding = HashSet::new();
     let mut awaiting = HashSet::new();
-    let mut received = HashMap::new();
+    let mut posted = HashSet::new();
+    let mut received = HashSet::new();
+    let mut queued: HashMap<AgentId, Vec<MailId>> = HashMap::new();
     let mut delivered_ids = HashSet::new();
     let mut reported_calls = HashSet::new();
     let mut messages_sent = 0usize;
@@ -236,7 +237,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut clarifying = 0u64;
 
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
-    let mut last_seq = Seq(0);
+    let mut last_mail = MailId(0);
     let quiesce_deadline = deadline
         + if matches!(
             args.scenario,
@@ -285,23 +286,33 @@ async fn run_async(args: Args) -> Result<()> {
             .await
             .with_context(|| {
                 format!(
-                    "agent host journal stalled: {}",
+                    "agent host session stalled: {}",
                     fs::read_to_string(root.path().join("agent host.stderr.log"))
                         .unwrap_or_default()
                 )
             })??;
         match message {
-            Incoming::Created(agent_id) => {
-                agents.insert(agent_id);
+            Incoming::Created {
+                workset,
+                agent,
+                error,
+            } => {
+                ensure!(error.is_none(), "workset creation code failed: {error:?}");
+                let agent = agent.context("the creation code mailed no agent")?;
+                agents.insert(agent);
                 ensure!(
                     agents.len() <= agent_count,
                     "agent host created more than {agent_count} agents"
                 );
+                // Followed from its start: the rows so far come first.
+                worksets.insert(workset, Wpos::ZERO);
+                client
+                    .send(&ClientFrame::FollowWorksets {
+                        from: worksets.keys().map(|workset| (*workset, Wpos::ZERO)).collect(),
+                    })
+                    .await?;
             }
-            Incoming::Agents(AgentsServerFrame::Live {
-                agent_id,
-                live: rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
-            }) => {
+            Incoming::Session(ServerFrame::Status { agent_id, state }) => {
                 if matches!(
                     state.inference,
                     rho_agents_client::protocol::transcript::InferenceState::Responding
@@ -320,101 +331,109 @@ async fn run_async(args: Args) -> Result<()> {
                 {
                     let cycle = cycles.entry(agent_id).or_default();
                     *cycle += 1;
-                    client.send(AgentCommand::Send {
-                        agent_id,
-                        messages: vec![UserMessage {
-                            id: *cycle,
-                            content: prompt(0, *cycle),
-                        }],
+                    client.post(PostMail {
+                        client_id: (agents.len() as u64) << 32 | *cycle,
+                        to: agent_id,
+                        re: None,
+                        content: prompt(0, *cycle),
                     });
                 }
             }
-            Incoming::Agents(AgentsServerFrame::Log { entries }) => {
-                for entry in entries {
+            Incoming::Session(ServerFrame::Mail { mails }) => {
+                for mail in mails {
                     ensure!(
-                        entry.seq > last_seq,
-                        "global journal sequence regressed: {:?} after {:?}",
-                        entry.seq,
-                        last_seq
+                        mail.id > last_mail,
+                        "mail order regressed: {:?} after {:?}",
+                        mail.id,
+                        last_mail
                     );
-                    last_seq = entry.seq;
-                    let expected = expected_pos.entry(entry.agent_id).or_insert(AgentPos::ZERO);
-                    ensure!(
-                        entry.pos >= *expected,
-                        "agent {:?} position regressed: {:?} expected {:?}",
-                        entry.agent_id,
-                        entry.pos,
-                        expected
-                    );
-                    *expected = entry.pos.next();
-                    match entry.event {
-                        TranscriptEvent::Created { runtime, .. } => {
-                            ensure!(
-                                runtime
-                                    == rho_agents_client::protocol::transcript::RuntimeKind::Rho,
-                                "created a non-native agent"
-                            );
-                            agents.insert(entry.agent_id);
+                    last_mail = mail.id;
+                    match (mail.from, mail.to) {
+                        (Address::User, Address::Agent(_)) => {
+                            posted.insert(mail.id);
                         }
-                        TranscriptEvent::Received { id, from, text, .. } => {
-                            ensure!(from.is_none(), "unexpected peer message in isolated proof");
-                            ensure!(!text.is_empty(), "empty human message");
-                            ensure!(
-                                received.insert((entry.agent_id, id), ()).is_none(),
-                                "duplicate received message id"
-                            );
-                        }
-                        TranscriptEvent::NotebookReport {
-                            calls: answered,
-                            delivered,
-                            acknowledged,
-                            at,
-                            ..
-                        } => {
-                            for id in delivered {
-                                ensure!(
-                                    received.contains_key(&(entry.agent_id, id)),
-                                    "report delivered an unknown message"
-                                );
-                                ensure!(
-                                    delivered_ids.insert((entry.agent_id, id)),
-                                    "message delivered twice"
-                                );
-                            }
-                            for id in acknowledged {
-                                ensure!(
-                                    received.contains_key(&(entry.agent_id, id)),
-                                    "report acknowledged an unknown message"
-                                );
-                            }
-                            for id in &answered {
-                                ensure!(
-                                    reported_calls.insert((entry.agent_id, id.clone())),
-                                    "provider call was answered twice"
-                                );
-                            }
-                            if !answered.is_empty() {
-                                pending_details.insert(
-                                    (entry.agent_id, entry.pos),
-                                    ExpectedDetail::Report(answered),
-                                );
-                                client
-                                    .send_agents(&AgentsClientFrame::Detail {
-                                        agent_id: entry.agent_id,
-                                        pos: entry.pos,
-                                        more: Vec::new(),
-                                    })
-                                    .await?;
-                            }
-                            report_at.insert(entry.agent_id, at);
-                        }
-                        TranscriptEvent::MessageSent { to, text, .. } => {
-                            ensure!(to.is_none(), "fake agent sent mail to another agent");
+                        (Address::Agent(_), Address::User) => {
+                            let text = content_text(&mail.content);
                             ensure!(!text.trim().is_empty(), "empty user-facing message");
                             messages_sent += 1;
                             clarifying += u64::from(text.trim_end().ends_with('?'));
                         }
-                        TranscriptEvent::Replied {
+                        (Address::Agent(_), Address::Agent(_)) => {
+                            bail!("fake agent sent mail to another agent")
+                        }
+                        (Address::User, Address::User) => bail!("mail from the user to the user"),
+                    }
+                }
+            }
+            Incoming::Session(ServerFrame::Rows { workset, rows }) => {
+                let next = worksets
+                    .get_mut(&workset)
+                    .context("rows of a workset this proof does not follow")?;
+                for (pos, event) in rows {
+                    ensure!(
+                        pos >= *next,
+                        "workset {workset} position regressed: {pos:?} expected {next:?}"
+                    );
+                    *next = pos.next();
+                    match event {
+                        LogEvent::AgentCreated { agent, spec, .. } => {
+                            ensure!(
+                                spec.runtime
+                                    == rho_agents_client::protocol::transcript::RuntimeKind::Rho,
+                                "created a non-native agent"
+                            );
+                            agents.insert(agent);
+                        }
+                        LogEvent::Input {
+                            agent,
+                            mail,
+                            text,
+                            wake,
+                            ..
+                        } => {
+                            let mail = mail.context("an input that is not mail")?;
+                            ensure!(wake == InputWake::Person, "unexpected peer input in isolated proof");
+                            ensure!(!text.is_empty(), "empty user input");
+                            ensure!(
+                                received.insert((agent, mail)),
+                                "mail handed to the agent twice"
+                            );
+                            queued.entry(agent).or_default().push(mail);
+                        }
+                        LogEvent::NotebookReport {
+                            agent,
+                            calls: answered,
+                            at,
+                            ..
+                        } => {
+                            // A request delivers every input before it.
+                            for mail in queued.remove(&agent).unwrap_or_default() {
+                                ensure!(
+                                    delivered_ids.insert((agent, mail)),
+                                    "mail delivered twice"
+                                );
+                            }
+                            for id in &answered {
+                                ensure!(
+                                    reported_calls.insert((agent, id.clone())),
+                                    "provider call was answered twice"
+                                );
+                            }
+                            if !answered.is_empty() {
+                                pending_details
+                                    .insert((workset, pos), ExpectedDetail::Report(answered));
+                                client
+                                    .send(&ClientFrame::Detail {
+                                        workset,
+                                        pos,
+                                        more: Vec::new(),
+                                    })
+                                    .await?;
+                            }
+                            report_at.insert(agent, at);
+                        }
+                        LogEvent::Replied {
+                            agent,
                             items,
                             compacted: did_compact,
                             at,
@@ -426,40 +445,36 @@ async fn run_async(args: Args) -> Result<()> {
                                 continue;
                             }
                             let started = report_at
-                                .get(&entry.agent_id)
+                                .get(&agent)
                                 .context("Replied without preceding NotebookReport")?;
                             latencies.push(at.saturating_duration_since(*started));
                             replies += 1;
-                            calls +=
-                                items
-                                    .iter()
-                                    .filter(|item| {
-                                        matches!(item,
-                                rho_agents_client::protocol::transcript::Item::ToolCall { .. }
-                            )
-                                    })
-                                    .count();
+                            calls += items
+                                .iter()
+                                .filter(|item| matches!(item, Item::ToolCall { .. }))
+                                .count();
                             compacted += u64::from(did_compact);
                             if !items.is_empty() {
-                                ensure!(items.iter().all(|item| matches!(item,
-                                    rho_agents_client::protocol::transcript::Item::ToolCall { name, arguments, format, .. }
-                                        if name == "exec" && !arguments.is_empty()
-                                            && *format == rho_agents_client::protocol::transcript::ArgumentsFormat::Text
-                                )), "native response contained prose or a non-exec tool");
-                                pending_details.insert(
-                                    (entry.agent_id, entry.pos),
-                                    ExpectedDetail::Response(items),
+                                ensure!(
+                                    items.iter().all(|item| matches!(item,
+                                        Item::ToolCall { name, arguments, format, .. }
+                                            if name == "exec" && !arguments.is_empty()
+                                                && *format == ArgumentsFormat::Text
+                                    )),
+                                    "native response contained prose or a non-exec tool"
                                 );
+                                pending_details
+                                    .insert((workset, pos), ExpectedDetail::Response(items));
                                 client
-                                    .send_agents(&AgentsClientFrame::Detail {
-                                        agent_id: entry.agent_id,
-                                        pos: entry.pos,
+                                    .send(&ClientFrame::Detail {
+                                        workset,
+                                        pos,
                                         more: Vec::new(),
                                     })
                                     .await?;
                             }
                         }
-                        TranscriptEvent::Failed {
+                        LogEvent::Failed {
                             retrying: is_retrying,
                             ..
                         } => {
@@ -470,13 +485,9 @@ async fn run_async(args: Args) -> Result<()> {
                     }
                 }
             }
-            Incoming::Agents(AgentsServerFrame::Detail {
-                agent_id,
-                pos,
-                body,
-            }) => {
+            Incoming::Session(ServerFrame::Detail { workset, pos, body }) => {
                 let expected = pending_details
-                    .remove(&(agent_id, pos))
+                    .remove(&(workset, pos))
                     .context("unexpected Detail response")?;
                 match (expected, body) {
                     (ExpectedDetail::Response(visible), DetailBody::Response(detail)) => {
@@ -508,7 +519,7 @@ async fn run_async(args: Args) -> Result<()> {
                             reported_output_sizes.push(result.output.len());
                         }
                     }
-                    _ => bail!("agent host Detail body did not match its journal event"),
+                    _ => bail!("agent host Detail body did not match its row"),
                 }
             }
             Incoming::Refused(reason) => {
@@ -526,26 +537,27 @@ async fn run_async(args: Args) -> Result<()> {
     ensure!(!latencies.is_empty(), "no model replies completed");
     ensure!(
         messages_sent > 0,
-        "model prose did not become a human.send delivery"
+        "model prose did not become mail to the user"
     );
     ensure!(
         received.len() >= agent_count,
-        "not every agent received a message"
+        "not every agent was handed its mail"
+    );
+    ensure!(
+        received.iter().all(|(_, mail)| posted.contains(mail)),
+        "an agent was handed mail the user never sent"
     );
     ensure!(
         delivered_ids.len() >= agent_count,
-        "not every agent delivered a message to its model"
+        "not every agent delivered its mail to its model"
     );
 
     let final_head = Streams::open(connect(&socket).await?, &socket)
         .await?
-        .journal_head;
-    // The wire projects only visible journal rows. Filtered rows advance
-    // the durable head without a Log message, so gaps are valid and the final
-    // visible row need not equal the durable head.
+        .mail_head;
     ensure!(
-        last_seq <= final_head,
-        "visible journal advanced beyond durable head"
+        last_mail <= final_head,
+        "mail seen beyond the durable head"
     );
 
     let metrics: FakeMetrics = reqwest::get(format!(
@@ -604,7 +616,7 @@ async fn run_async(args: Args) -> Result<()> {
     .err();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} reported_calls={} messages_sent={} delivered={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} report_reply_p50_ms={} report_reply_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} journal_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} reported_calls={} messages_sent={} delivered={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} report_reply_p50_ms={} report_reply_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} mail_head={}",
         args.scenario.as_str(),
         agent_count,
         args.seconds,
@@ -986,4 +998,15 @@ mod tests {
         assert_eq!(percentile(&[1, 2, 3, 4], 50), 2);
         assert_eq!(percentile(&[1, 2, 3, 4], 99), 4);
     }
+}
+
+/// The text parts of some content, in order.
+fn content_text(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect()
 }

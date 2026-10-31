@@ -36,7 +36,6 @@ impl rho_rpc::protocol::ProtocolOpen for Open {
 rho_rpc::calls! {
     pub enum Request {
         /// A new workset, whose namespace runs `code` once after `init.py`.
-        /// Answered when the workset is created, before `code` ends.
         /// Answered once the creation code ends.
         CreateWorkset(CreateWorkset) -> CreatedWorkset;
         /// Code run in a workset's namespace; answered when it ends.

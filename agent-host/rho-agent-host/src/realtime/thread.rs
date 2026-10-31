@@ -7,9 +7,9 @@
 //! The formats and budgets follow `codex-rs` (`realtime_context.rs`,
 //! `context/realtime_delegation.rs`), so the model sees what it is tuned on.
 
-use rho_agent::entry::{Block, Entry, Notice, Party};
-use rho_agent::log::AgentEvent;
-use rho_agent_types::SendKind;
+use rho_agent_types::{Address, AgentId, Mail, SendKind};
+
+use crate::transcript::content_text;
 use rho_openai_realtime::ContextChannel;
 
 const APPROX_BYTES_PER_TOKEN: usize = 4;
@@ -29,25 +29,16 @@ pub(super) enum Said {
 }
 
 impl Said {
-    pub(super) fn of(event: &AgentEvent<'_>) -> Option<Self> {
-        match event {
-            AgentEvent::Entry(Entry::Received {
-                from: Party::Human,
-                body,
-                ..
-            }) => Some(Self::User(
-                body.iter()
-                    .filter_map(|block| match block {
-                        Block::Text(text) => Some(text.as_str()),
-                        Block::Image(_) => None,
-                    })
-                    .collect(),
-            )),
-            AgentEvent::Entry(Entry::Sent {
-                to: Party::Human,
-                text,
-                ..
-            }) => Some(Self::Agent(text.clone())),
+    /// What a mail says in the conversation between the user and `agent`,
+    /// if it is a part of it.
+    pub(super) fn of(mail: &Mail, agent: AgentId) -> Option<Self> {
+        match (mail.from, mail.to) {
+            (Address::User, Address::Agent(to)) if to == agent => {
+                Some(Self::User(content_text(&mail.content)))
+            }
+            (Address::Agent(from), Address::User) if from == agent => {
+                Some(Self::Agent(content_text(&mail.content)))
+            }
             _ => None,
         }
     }
@@ -136,29 +127,27 @@ pub(crate) fn shown_to_reader(text: &str) -> Option<String> {
     Some(format!("{}🎤 {}", &text[..start], input.trim()))
 }
 
-/// What the live model is told of one row of the agent's log, on which
+/// What the live model is told of a mail `agent` sent the user, on which
 /// channel, and whether it ends the request. Progress is a `[STATUS]` the
-/// model may keep to itself; a result, a question, or a stop is the
+/// model may keep to itself; a result or a question is the `[COMPLETE]`
+/// answer.
+pub(super) fn reply(mail: &Mail, agent: AgentId) -> Option<(ContextChannel, String, bool)> {
+    if mail.from != Address::Agent(agent) || mail.to != Address::User {
+        return None;
+    }
+    let complete = matches!(mail.kind, Some(SendKind::Result | SendKind::Ask));
+    Some(told(&content_text(&mail.content), complete))
+}
+
+/// What the live model is told when the agent stopped on an error: the
 /// `[COMPLETE]` answer.
-pub(super) fn reply(event: &AgentEvent<'_>) -> Option<(ContextChannel, String, bool)> {
-    let (complete, text) = match event {
-        AgentEvent::Entry(Entry::Sent {
-            to: Party::Human,
-            kind,
-            text,
-            ..
-        }) => (
-            matches!(kind, SendKind::Result | SendKind::Ask),
-            text.as_str(),
-        ),
-        AgentEvent::Entry(Entry::Notice {
-            notice: Notice::Stopped(error),
-            ..
-        }) => (true, error.as_str()),
-        _ => return None,
-    };
+pub(super) fn stopped(error: &str) -> (ContextChannel, String, bool) {
+    told(error, true)
+}
+
+fn told(text: &str, complete: bool) -> (ContextChannel, String, bool) {
     let text = clip(text.trim(), REPLY_TOKEN_BUDGET);
-    Some(match complete {
+    match complete {
         true => (
             ContextChannel::Speakable,
             format!("[COMPLETE] {text}"),
@@ -169,7 +158,7 @@ pub(super) fn reply(event: &AgentEvent<'_>) -> Option<(ContextChannel, String, b
             format!("[STATUS] {text}"),
             false,
         ),
-    })
+    }
 }
 
 fn approx_tokens(text: &str) -> usize {
@@ -231,19 +220,30 @@ fn escape_bounded(text: &str, retain: Retain) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent::entry::MessageId;
-    use rho_agent_types::{AgentId, AgentIdDomain, UnixMs};
+    use rho_agent_types::{AgentIdDomain, ContentPart, MailId, UnixMs};
 
     use super::*;
 
-    fn sent(to: Party, kind: SendKind, text: &str) -> AgentEvent<'static> {
-        AgentEvent::Entry(Entry::Sent {
+    fn agent(counter: u64) -> AgentId {
+        AgentId::from_counter(counter, &AgentIdDomain(0)).unwrap()
+    }
+
+    fn mail(from: Address, to: Address, kind: Option<SendKind>, text: &str) -> Mail {
+        Mail {
+            id: MailId(1),
             at: UnixMs(1),
-            id: MessageId::new(),
+            from,
             to,
-            text: text.to_owned(),
+            re: None,
             kind,
-        })
+            content: vec![ContentPart::Text {
+                text: text.to_owned(),
+            }],
+        }
+    }
+
+    fn sent(kind: SendKind, text: &str) -> Mail {
+        mail(Address::Agent(agent(1)), Address::User, Some(kind), text)
     }
 
     fn channel_name(channel: ContextChannel) -> &'static str {
@@ -333,20 +333,24 @@ mod tests {
         ];
         for (kind, channel, text, complete) in cases {
             let (got_channel, got_text, got_complete) =
-                reply(&sent(Party::Human, kind, " looking\n")).unwrap();
+                reply(&sent(kind, " looking\n"), agent(1)).unwrap();
             assert_eq!(
                 (channel_name(got_channel), got_text.as_str(), got_complete),
                 (channel, text, complete),
                 "{kind:?}"
             );
         }
-        let to_agent = Party::Agent(AgentId::from_counter(7, &AgentIdDomain(0)).unwrap());
-        assert_eq!(reply(&sent(to_agent, SendKind::Result, "x")), None);
-        let stopped = AgentEvent::Entry(Entry::Notice {
-            at: UnixMs(1),
-            notice: Notice::Stopped("quota".to_owned()),
-        });
-        let (channel, text, complete) = reply(&stopped).unwrap();
+        // Mail to another agent, or from another agent, is not this
+        // agent's answer to the user.
+        let to_agent = mail(
+            Address::Agent(agent(1)),
+            Address::Agent(agent(7)),
+            Some(SendKind::Result),
+            "x",
+        );
+        assert_eq!(reply(&to_agent, agent(1)), None);
+        assert_eq!(reply(&sent(SendKind::Result, "x"), agent(7)), None);
+        let (channel, text, complete) = stopped("quota");
         assert_eq!(
             (channel_name(channel), text.as_str(), complete),
             ("speakable", "[COMPLETE] quota", true)
@@ -354,9 +358,25 @@ mod tests {
     }
 
     #[test]
+    fn the_thread_is_the_mail_between_the_user_and_this_agent() {
+        let me = Address::Agent(agent(1));
+        let other = Address::Agent(agent(2));
+        assert_eq!(
+            Said::of(&mail(Address::User, me, None, "ask"), agent(1)),
+            Some(Said::User("ask".to_owned()))
+        );
+        assert_eq!(
+            Said::of(&mail(me, Address::User, Some(SendKind::Result), "done"), agent(1)),
+            Some(Said::Agent("done".to_owned()))
+        );
+        assert_eq!(Said::of(&mail(Address::User, other, None, "x"), agent(1)), None);
+        assert_eq!(Said::of(&mail(other, me, None, "x"), agent(1)), None);
+    }
+
+    #[test]
     fn a_long_reply_is_cut_to_two_thousand_tokens() {
         let text = format!("HEAD{}TAIL", "ü".repeat(20_000));
-        let (_, reply, _) = reply(&sent(Party::Human, SendKind::Result, &text)).unwrap();
+        let (_, reply, _) = reply(&sent(SendKind::Result, &text), agent(1)).unwrap();
         assert!(reply.starts_with("[COMPLETE] HEAD") && reply.ends_with("TAIL"));
         assert!(reply.len() <= REPLY_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN + 20);
     }

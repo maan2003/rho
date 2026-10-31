@@ -229,18 +229,13 @@ impl AgentPool {
             .context("workset was deleted or does not exist")?
             .kind;
         let directory = self.worksets.open_workset(workset).await?;
-        let (layout, root) = match kind {
-            WorksetKind::Isolated => (
-                Layout::workset(&directory)?,
-                camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT),
-            ),
-            WorksetKind::Host { cwd } => (
-                Layout {
-                    state: directory.state_dir()?,
-                    ..Layout::host(&self.worksets)
-                },
-                cwd,
-            ),
+        let root = workset_root(&kind);
+        let layout = match kind {
+            WorksetKind::Isolated => Layout::workset(&directory)?,
+            WorksetKind::Host { .. } => Layout {
+                state: directory.state_dir()?,
+                ..Layout::host(&self.worksets)
+            },
         };
         let started = crate::host::Process::start(
             self,
@@ -1216,6 +1211,15 @@ impl AgentPool {
             })
             .await?
         })
+    }
+}
+
+/// Where a workset's process and its agents work: an isolated workset's
+/// `/src`, or a host workset's own directory.
+pub fn workset_root(kind: &WorksetKind) -> camino::Utf8PathBuf {
+    match kind {
+        WorksetKind::Isolated => camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT),
+        WorksetKind::Host { cwd } => cwd.clone(),
     }
 }
 

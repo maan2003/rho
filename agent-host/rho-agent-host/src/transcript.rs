@@ -1,33 +1,38 @@
-//! Transcripts: what a client is told of an agent's raw log. `strip`
-//! takes one raw event to what a client keeps of it, per event, in that
-//! event's position: the transcript is a pure function of the raw log.
-//! The runtime writes its own events; this is
-//! the one place they become the client's words.
+//! Transcripts: what a client is told of a workset's log. `strip` takes
+//! one row to what a client keeps of it, in that row's position: the
+//! transcript is a pure function of the log. The runtimes write their own
+//! rows; this is the one place they become the client's words.
 
-use rho_agent::AgentEvent;
-use rho_agent::entry::{Block, Entry, Notice, Party, Report};
+use rho_agent::db::usage_model_of;
+use rho_agent::entry::{Entry, Notice, Report};
 use rho_agent::inference::Carry;
-use rho_agent::log::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
-use rho_agent_types::PresentationField;
-#[cfg(test)]
-use rho_agent_types::UnixMs;
+use rho_agent::log::{AgentUsageBucket, TranscriptLine};
+use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agents_client::protocol::transcript::{
-    ArgumentsFormat, Item, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
-};
+use rho_agent_types::{ContentPart, InputWake, UnixMs, Wpos};
+use rho_agents_client::protocol::rho2::{LogEvent, SpecView};
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
 
-pub fn runtime_kind(runtime: &AgentRuntime) -> RuntimeKind {
-    match runtime {
-        AgentRuntime::Rho { .. } => RuntimeKind::Rho,
-        AgentRuntime::Claude { .. } => RuntimeKind::Claude,
-    }
-}
-
-pub fn spawned_by(spawned_by: AgentSpawnedBy) -> SpawnedBy {
-    match spawned_by {
-        AgentSpawnedBy::Direct => SpawnedBy::Direct,
-        AgentSpawnedBy::Engineer => SpawnedBy::Engineer,
-        AgentSpawnedBy::UserOwned { by } => SpawnedBy::UserOwned { by },
+/// An agent's spec as a reader needs it.
+pub fn spec_view(spec: &AgentSpec) -> SpecView {
+    let (runtime, effort) = match &spec.runtime {
+        Runtime::Native { profile, .. } => (RuntimeKind::Rho, profile.effort.as_str()),
+        Runtime::Claude { effort, .. } => (
+            RuntimeKind::Claude,
+            match effort {
+                rho_claude::Effort::Low => "low",
+                rho_claude::Effort::Medium => "medium",
+                rho_claude::Effort::High => "high",
+                rho_claude::Effort::Xhigh => "xhigh",
+                rho_claude::Effort::Max => "max",
+            },
+        ),
+    };
+    SpecView {
+        runtime,
+        model: usage_model_of(&spec.runtime).name().to_owned(),
+        effort: effort.to_owned(),
+        props: spec.props.clone(),
     }
 }
 
@@ -42,181 +47,202 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
     }
 }
 
-/// What a client keeps of one raw event: the same fact with the bodies
-/// left behind. Pure, per event; the position is the raw event's own.
-/// `None` for rows that say nothing a client uses.
-pub fn strip(event: &AgentEvent<'_>, prior_carry: Option<&Carry>) -> Option<TranscriptEvent> {
-    Some(match event {
-        AgentEvent::Deleted { at } => TranscriptEvent::Deleted { at: *at },
-        AgentEvent::TitleAttempted { .. } | AgentEvent::SkillLoaded { .. } => {
-            return None;
+/// What a request's report is read against: the agent's newest step before
+/// it, whose calls the report answers, and whether inputs went with it.
+#[derive(Clone, Debug, Default)]
+pub struct Before {
+    pub carry: Option<Carry>,
+    pub inputs: bool,
+}
+
+impl Before {
+    /// The state after one more of the agent's visible rows.
+    pub fn observe(&mut self, event: &Event<'_>) {
+        match event {
+            Event::Input { .. } => self.inputs = true,
+            Event::Native {
+                entry: Entry::Step { carry, .. },
+                ..
+            } => self.carry = Some(carry.clone()),
+            Event::Native {
+                entry: Entry::RequestSent { .. },
+                ..
+            }
+            | Event::Claude {
+                row: ClaudeRow::RequestSent { .. },
+                ..
+            } => self.inputs = false,
+            _ => {}
         }
-        AgentEvent::Titled { title, at } => TranscriptEvent::Presented {
-            title: title
-                .clone()
-                .map_or(PresentationField::Clear, PresentationField::Set),
-            at: *at,
+    }
+}
+
+/// The agent's state just before `pos`: its visible rows before it, folded.
+/// A rewind before `pos` hides what it took back; one after does not.
+pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: Wpos) -> Before {
+    use rho_agent::store::StoreRead as _;
+    let Some(head) = read.agent(agent) else {
+        return Before::default();
+    };
+    let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
+    let mut from = head.created;
+    while from < pos {
+        let page = read.workset_rows(head.workset, from, 4096);
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        from = last.next();
+        for (row, record) in page {
+            if row >= pos {
+                break;
+            }
+            if record.event.agent() != Some(agent) {
+                continue;
+            }
+            if let Event::Rewound { to, .. } = &record.event {
+                let keep = kept.partition_point(|(kept, _)| kept < to);
+                kept.truncate(keep);
+            }
+            kept.push((row, record));
+        }
+    }
+    let mut before = Before::default();
+    for (_, record) in &kept {
+        before.observe(&record.event);
+    }
+    before
+}
+
+/// The text of some content: its text parts, in order.
+pub fn content_text(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect()
+}
+
+/// What a client keeps of one row: the same fact with the bodies left
+/// behind. `before` is the agent's state as of the row, for a request.
+/// `None` for rows that say nothing a client uses.
+pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
+    let at = record.at;
+    Some(match &record.event {
+        Event::WorksetCreated { kind, code } => LogEvent::WorksetCreated {
+            kind: kind.clone(),
+            code: code.clone(),
+            at,
         },
-        AgentEvent::ExecObserved { id, milestone, at } => TranscriptEvent::ExecObserved {
-            id: id.as_str().to_owned(),
-            milestone: *milestone,
-            at: *at,
+        Event::Evaluated { code } => LogEvent::Evaluated {
+            code: code.clone(),
+            at,
         },
-        AgentEvent::Failed {
+        Event::AgentCreated { agent, spec } => LogEvent::AgentCreated {
+            agent: *agent,
+            spec: spec_view(spec),
+            at,
+        },
+        Event::AgentChanged { agent, spec } => LogEvent::AgentChanged {
+            agent: *agent,
+            spec: spec_view(spec),
+            at,
+        },
+        Event::Input {
+            agent,
+            mail,
+            content,
+            wake,
+        } => {
+            let text = content_text(content);
+            LogEvent::Input {
+                agent: *agent,
+                mail: *mail,
+                // A spoken request reads as what was asked, not as the
+                // markup the agent is handed.
+                text: match wake {
+                    InputWake::Person => crate::realtime::shown_to_reader(&text).unwrap_or(text),
+                    _ => text,
+                },
+                wake: *wake,
+                at,
+            }
+        }
+        Event::Rewound { agent, to } => LogEvent::Rewound {
+            agent: *agent,
+            to: *to,
+            at,
+        },
+        Event::Failed {
+            agent,
             partial,
             error,
             retrying,
-            at,
-        } => TranscriptEvent::Failed {
+        } => LogEvent::Failed {
+            agent: *agent,
             text: partial_text(partial),
             error: error.to_string(),
             retrying: *retrying,
-            at: *at,
+            at,
         },
-        AgentEvent::RuntimeRebound { .. }
-        | AgentEvent::ClaudeExecAdmitted { .. }
-        | AgentEvent::ClaudeOutput { .. }
-        | AgentEvent::ClaudeOutputHandedOff { .. } => return None,
-        // Claude's transcript, told in the runtime-neutral words a reader
-        // already knows: a person's line is a message, the model's a
-        // reply, the results a request that carried them.
-        AgentEvent::Transcript { line, at, .. } => match line {
-            rho_agent::TranscriptLine::User { .. } => return None,
-            rho_agent::TranscriptLine::Assistant {
-                text: _,
-                calls,
-                usage: cost,
-                context_used,
-            } => TranscriptEvent::Replied {
-                items: calls
-                    .iter()
-                    .map(|call| Item::ToolCall {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        // A transcript call is Claude's, and Claude's tools
-                        // are all schema'd: its arguments are always JSON.
-                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
-                    })
-                    .collect(),
-                compacted: false,
-                usage: cost.as_ref().map(usage),
-                context_used: *context_used,
-                at: *at,
-            },
-            rho_agent::TranscriptLine::ToolResults { results } => TranscriptEvent::NotebookReport {
-                delivered: Vec::new(),
-                acknowledged: Vec::new(),
-                calls: results
-                    .iter()
-                    .map(|result| result.call_id.as_str().to_owned())
-                    .collect(),
-                compaction: false,
-                at: *at,
-            },
-            rho_agent::TranscriptLine::Compacted { context_used } => TranscriptEvent::Replied {
-                items: Vec::new(),
-                compacted: true,
-                usage: None,
-                context_used: *context_used,
-                at: *at,
-            },
+        Event::ExecObserved {
+            agent,
+            exec,
+            milestone,
+        } => LogEvent::ExecObserved {
+            agent: *agent,
+            id: exec.as_str().to_owned(),
+            milestone: *milestone,
+            at,
         },
-        AgentEvent::Created {
-            role,
-            binding,
-            runtime,
-            place,
-            spawned_by: by,
-            spawn_name,
-            created_at,
-            parent,
-        } => TranscriptEvent::Created {
-            role: *role,
-            runtime: runtime_kind(runtime),
-            place: place.clone(),
-            spawned_by: spawned_by(*by),
-            spawn_name: spawn_name.clone(),
-            parent: *parent,
-            model: usage_model_of(runtime, *binding).name().to_owned(),
-            at: *created_at,
-        },
-        AgentEvent::RoleChanged { role, binding, at } => TranscriptEvent::RoleChanged {
-            role: *role,
-            // The runtime does not change with a role, so either kind
-            // names the model the same way.
-            model: binding.map(|binding| {
-                usage_model_of(
-                    &AgentRuntime::Rho {
-                        prompt_cache_key: rho_inference::PromptCacheKey::generate(),
-                    },
-                    binding,
-                )
-                .name()
-                .to_owned()
-            }),
-            at: *at,
-        },
-        AgentEvent::Notice { text, .. } if text.is_empty() => return None,
-        AgentEvent::Notice { text, at } => TranscriptEvent::Notice {
-            text: text.to_string(),
-            at: *at,
-        },
-        AgentEvent::Retired { .. } => return None,
-        AgentEvent::Rewound { to, at } => TranscriptEvent::Rewound {
-            to: (*to).into(),
-            at: *at,
-        },
-        AgentEvent::Entry(entry) => return strip_entry(entry, prior_carry),
+        Event::Native { agent, entry } => return strip_entry(*agent, entry, before, at),
+        Event::Claude { agent, row } => return strip_claude(*agent, row, at),
     })
 }
 
-/// The Rho runtime's rows, in the words a reader already knows: a received
-/// message is a message, a wake the request that carried the queue, a step
-/// the model's reply, and what it sends the person a final answer.
-fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptEvent> {
-    Some(match entry {
-        Entry::Received { id, from, body, at } => TranscriptEvent::Received {
-            id: id.0,
-            from: match from {
-                Party::Human => None,
-                Party::Agent(id) => Some(*id),
-            },
-            text: {
-                let text: String = body
-                    .iter()
-                    .filter_map(|block| match block {
-                        Block::Text(text) => Some(text.as_str()),
-                        Block::Image(_) => None,
-                    })
-                    .collect();
-                // A spoken request reads as what was asked, not as the
-                // markup the agent is handed.
-                match from {
-                    Party::Human => crate::realtime::shown_to_reader(&text).unwrap_or(text),
-                    Party::Agent(_) => text,
-                }
-            },
-            at: *at,
-        },
-        Entry::RequestSent {
-            report,
-            compact,
+/// A notice, in the words a reader knows; `None` for one that says nothing
+/// the runtime state does not.
+fn strip_notice(agent: rho_agent_types::AgentId, notice: &Notice, at: UnixMs) -> Option<LogEvent> {
+    match notice {
+        Notice::Error(error) => Some(LogEvent::Failed {
+            agent,
+            text: String::new(),
+            error: error.clone(),
+            retrying: true,
             at,
-            ..
-        } => TranscriptEvent::NotebookReport {
-            delivered: report.messages.iter().map(|id| id.0).collect(),
-            acknowledged: report.acknowledged.iter().map(|id| id.0).collect(),
-            calls: report_results(report, prior_carry)
+        }),
+        Notice::Stopped(error) => Some(LogEvent::Stopped {
+            agent,
+            error: error.clone(),
+            at,
+        }),
+        Notice::Restarted | Notice::Archived | Notice::FreshNotebook => None,
+    }
+}
+
+/// The native runtime's rows: a request the report that carried the
+/// queue, a step the model's reply.
+fn strip_entry(
+    agent: rho_agent_types::AgentId,
+    entry: &Entry,
+    before: &Before,
+    at: UnixMs,
+) -> Option<LogEvent> {
+    Some(match entry {
+        Entry::RequestSent {
+            report, compact, ..
+        } => LogEvent::NotebookReport {
+            agent,
+            calls: report_results(report, before)
                 .iter()
                 .map(|result| result.display_id().to_owned())
                 .collect(),
             compaction: *compact,
-            at: *at,
+            at,
         },
-        Entry::Step {
-            carry, usage, at, ..
-        } => TranscriptEvent::Replied {
+        Entry::Step { carry, usage, .. } => LogEvent::Replied {
+            agent,
             items: step_items(&carry.display_calls()),
             compacted: carry.has_compaction(),
             usage: usage.as_ref().map(|usage| Usage {
@@ -241,46 +267,73 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
                             .saturating_add(usage.output_tokens)
                     })
             }),
-            at: *at,
+            at,
         },
-        Entry::Sent {
-            to, text, kind, at, ..
-        } => TranscriptEvent::MessageSent {
-            to: match to {
-                Party::Human => None,
-                Party::Agent(id) => Some(*id),
+        Entry::Notice { notice } => return strip_notice(agent, notice, at),
+        Entry::CompactionTrigger { .. } => LogEvent::CompactionRequested { agent, at },
+    })
+}
+
+/// Claude's rows, in the runtime-neutral words a reader already knows: the
+/// model's line a reply, the results a report, a turn the request that
+/// carried the queue.
+fn strip_claude(agent: rho_agent_types::AgentId, row: &ClaudeRow, at: UnixMs) -> Option<LogEvent> {
+    Some(match row {
+        ClaudeRow::Transcript { line, .. } => match line {
+            // What Claude was handed is the agent's `Input` rows.
+            TranscriptLine::User { .. } => return None,
+            TranscriptLine::Assistant {
+                text: _,
+                calls,
+                usage: cost,
+                context_used,
+            } => LogEvent::Replied {
+                agent,
+                items: calls
+                    .iter()
+                    .map(|call| Item::ToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        // Claude's tools are all schema'd: their arguments
+                        // are always JSON.
+                        format: ArgumentsFormat::Json,
+                    })
+                    .collect(),
+                compacted: false,
+                usage: cost.as_ref().map(usage),
+                context_used: *context_used,
+                at,
             },
-            text: text.clone(),
-            kind: *kind,
-            at: *at,
+            TranscriptLine::ToolResults { results } => LogEvent::NotebookReport {
+                agent,
+                calls: results
+                    .iter()
+                    .map(|result| result.call_id.as_str().to_owned())
+                    .collect(),
+                compaction: false,
+                at,
+            },
+            TranscriptLine::Compacted { context_used } => LogEvent::Replied {
+                agent,
+                items: Vec::new(),
+                compacted: true,
+                usage: None,
+                context_used: *context_used,
+                at,
+            },
         },
-        Entry::Notice {
-            notice: Notice::Error(error),
+        ClaudeRow::RequestSent { .. } => LogEvent::NotebookReport {
+            agent,
+            calls: Vec::new(),
+            compaction: false,
             at,
-        } => TranscriptEvent::Failed {
-            text: String::new(),
-            error: error.clone(),
-            retrying: true,
-            at: *at,
         },
-        Entry::Notice {
-            notice: Notice::Stopped(error),
-            at,
-        } => TranscriptEvent::Stopped {
-            error: error.clone(),
-            at: *at,
-        },
-        Entry::Notice { notice, at } => TranscriptEvent::Notice {
-            text: match notice {
-                Notice::Restarted => "rho restarted; the notebook was lost",
-                Notice::Archived => "archived",
-                Notice::FreshNotebook => "started a fresh notebook",
-                Notice::Error(_) | Notice::Stopped(_) => unreachable!("matched above"),
-            }
-            .to_owned(),
-            at: *at,
-        },
-        Entry::CompactionTrigger { at, .. } => TranscriptEvent::CompactionRequested { at: *at },
+        ClaudeRow::Notice(notice) => return strip_notice(agent, notice, at),
+        ClaudeRow::ExecAdmitted { .. }
+        | ClaudeRow::Output { .. }
+        | ClaudeRow::OutputHandedOff { .. }
+        | ClaudeRow::RewindPending(_) => return None,
     })
 }
 
@@ -288,10 +341,11 @@ fn strip_entry(entry: &Entry, prior_carry: Option<&Carry>) -> Option<TranscriptE
 /// Without one, it is ordinary user context, not a tool result.
 pub(crate) fn report_results(
     report: &Report,
-    prior_carry: Option<&Carry>,
+    before: &Before,
 ) -> Vec<rho_inference::transcript::ReportOutput> {
-    rho_inference::transcript::report_results(report, prior_carry)
+    rho_inference::transcript::report_results(report, before.inputs, before.carry.as_ref())
 }
+
 
 /// A step's visible items: the prose it wrote, then its calls.
 pub(crate) fn step_items(calls: &[rho_agent::inference::Call]) -> Vec<Item> {
@@ -389,231 +443,3 @@ fn join(parts: &[AStr]) -> String {
         .join("\n")
 }
 
-#[cfg(test)]
-mod tests {
-    use rho_agent::entry::{MessageId, RequestNotice, ResponseUsage};
-
-    use super::*;
-
-    fn call_carry(id: &str, code: &str) -> Carry {
-        Carry::new(
-            serde_json::json!({"items":[{
-                "type":"custom_tool_call","name":"exec","call_id":id,"input":code
-            }]}),
-            vec![rho_agent::inference::Call::new(id, code.into())],
-            false,
-        )
-    }
-
-    #[test]
-    fn reports_deliver_exact_messages_without_claiming_task_completion() {
-        let prior = call_carry("exec-9", "cell");
-        let event = AgentEvent::Entry(Entry::RequestSent {
-            at: UnixMs(71),
-            why: rho_agent::entry::Wake::Notify,
-            report: Report {
-                notices: vec![RequestNotice::Restarted],
-                messages: vec![MessageId(42)],
-                acknowledged: vec![MessageId(11)],
-                ..Default::default()
-            },
-            compact: true,
-        });
-        let projected = strip(&event, Some(&prior)).unwrap();
-        assert_eq!(
-            projected,
-            TranscriptEvent::NotebookReport {
-                calls: vec!["exec-9".into()],
-                compaction: true,
-                delivered: vec![42],
-                acknowledged: vec![11],
-                at: UnixMs(71),
-            }
-        );
-        assert_eq!(
-            report_results(
-                match &event {
-                    AgentEvent::Entry(Entry::RequestSent { report, .. }) => report,
-                    _ => unreachable!(),
-                },
-                Some(&prior)
-            )[0]
-            .text,
-            "rho restarted. Your notebook and everything running in it are gone, and their side effects may remain. Check the current state before carrying on."
-        );
-        assert_eq!(
-            strip(&event, None).unwrap(),
-            TranscriptEvent::NotebookReport {
-                calls: vec![],
-                compaction: true,
-                delivered: vec![42],
-                acknowledged: vec![11],
-                at: UnixMs(71),
-            }
-        );
-    }
-
-    #[test]
-    fn step_usage_and_interruption_preserve_call_display() {
-        let carry = call_carry("exec-7", "print(3)");
-        let usage = ResponseUsage {
-            model: "model-a".into(),
-            input_tokens: 17,
-            cache_read_tokens: 5,
-            cache_write_tokens: 2,
-            cache_write_1h_tokens: 3,
-            output_tokens: 11,
-        };
-        let step = |exec, usage| {
-            AgentEvent::Entry(Entry::Step {
-                at: UnixMs(72),
-                exec,
-                prose: String::new(),
-                carry: carry.clone(),
-                usage,
-            })
-        };
-        assert_eq!(
-            strip(&step(Some("print(3)".into()), Some(usage)), None),
-            Some(TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: "exec-7".into(),
-                    name: "exec".into(),
-                    arguments: "print(3)".into(),
-                    format: ArgumentsFormat::Text,
-                }],
-                compacted: false,
-                usage: Some(Usage {
-                    model: "model-a".into(),
-                    input_tokens: 17,
-                    cache_read_tokens: 5,
-                    cache_write_tokens: 2,
-                    cache_write_1h_tokens: 3,
-                    output_tokens: 11,
-                }),
-                context_used: Some(38),
-                at: UnixMs(72),
-            })
-        );
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::Step {
-                    at: UnixMs(72),
-                    exec: None,
-                    prose: String::new(),
-                    carry: Carry::new(serde_json::json!({"items":[]}), vec![], false),
-                    usage: None,
-                }),
-                None
-            ),
-            Some(TranscriptEvent::Replied {
-                items: vec![],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(72),
-            })
-        );
-    }
-
-    #[test]
-    fn migrated_step_displays_evicted_call_not_in_provider_replay() {
-        let carry = Carry::new(
-            serde_json::json!({"items":[]}),
-            vec![rho_agent::inference::Call::new(
-                "evicted",
-                "print(4)".into(),
-            )],
-            false,
-        );
-        let event = AgentEvent::Entry(Entry::Step {
-            at: UnixMs(74),
-            exec: Some("print(4)".into()),
-            prose: String::new(),
-            carry,
-            usage: None,
-        });
-        assert_eq!(
-            strip(&event, None),
-            Some(TranscriptEvent::Replied {
-                items: vec![Item::ToolCall {
-                    id: "evicted".into(),
-                    name: "exec".into(),
-                    arguments: "print(4)".into(),
-                    format: ArgumentsFormat::Text,
-                }],
-                compacted: false,
-                usage: None,
-                context_used: None,
-                at: UnixMs(74),
-            })
-        );
-    }
-
-    #[test]
-    fn only_explicit_sends_are_human_messages() {
-        let call = rho_agent::inference::Call::new("call", "human.send('hello')".into());
-        assert_eq!(
-            step_items(&[call]),
-            vec![Item::ToolCall {
-                id: "call".into(),
-                name: "exec".into(),
-                arguments: "human.send('hello')".into(),
-                format: ArgumentsFormat::Text,
-            }]
-        );
-        assert_eq!(
-            strip(
-                &AgentEvent::Entry(Entry::Sent {
-                    at: UnixMs(5),
-                    id: MessageId(7),
-                    to: Party::Human,
-                    text: "hello".into(),
-                    kind: rho_agent_types::SendKind::Ask,
-                }),
-                None
-            ),
-            Some(TranscriptEvent::MessageSent {
-                to: None,
-                text: "hello".into(),
-                kind: rho_agent_types::SendKind::Ask,
-                at: UnixMs(5)
-            })
-        );
-        assert_eq!(
-            strip(
-                &AgentEvent::Transcript {
-                    uuid: uuid::Uuid::nil(),
-                    line: rho_agent::TranscriptLine::User {
-                        text: "CLI echo".into()
-                    },
-                    at: UnixMs(6),
-                    wake: None,
-                },
-                None
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn worker_failure_is_mirrored_without_panicking() {
-        assert_eq!(
-            strip(
-                &AgentEvent::Failed {
-                    partial: Default::default(),
-                    error: "worker disconnected".into(),
-                    retrying: false,
-                    at: UnixMs(17),
-                },
-                None
-            ),
-            Some(TranscriptEvent::Failed {
-                text: String::new(),
-                error: "worker disconnected".into(),
-                retrying: false,
-                at: UnixMs(17),
-            })
-        );
-    }
-}

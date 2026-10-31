@@ -1,7 +1,7 @@
 //! The agents part of the agent host, and the parts about one agent's workset:
-//! its terminals and shells. The agents session carries the journal, the
-//! live tails, new agents and the quota; requests, terminals and shells are
-//! streams of their own.
+//! its terminals and shells. The session carries the directory, the mail,
+//! the rows of the worksets a client follows, the live tails and the quota;
+//! requests, terminals and shells are streams of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -9,11 +9,19 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_types::{AgentId, Seq};
+use rho_agent::record::{Event, Record};
+use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
+use rho_agent_types::{AgentId, MailId, WorksetId, WorksetKind, Wpos};
+use rho_agents_client::protocol::rho2::{
+    AgentEntry, Cancel, ClientFrame, CreateWorkset, CreatedWorkset, DeleteWorksets, Eval,
+    EvalResult, LogEvent, Open, PostMail, Request, ServerFrame, WorksetEntry, WorksetLog,
+    WorksetLogPage,
+};
+use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::{
-    AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
-    GlobalUsage, NewAgent, Open, QuotaHistory, QuotaUsage, RecordVisualization, Request,
-    ServerFrame, SetAuthAccountEnabled, SetClaudeAccount, Visualization, VisualizationContent,
+    AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
+    QuotaUsage, RecordVisualization, SetAuthAccountEnabled, SetClaudeAccount, Visualization,
+    VisualizationContent,
 };
 use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
@@ -141,20 +149,24 @@ impl Drop for Attached {
     }
 }
 
-/// How many journal entries travel in one `ServerFrame::Log` while a
-/// client is catching up. A cold client's first copy is a whole history,
-/// so it goes in pages the connection can interleave.
+/// How many rows or mails travel in one frame while a client is catching
+/// up, so a cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
 /// How often a session hears the quota when nothing has moved it.
 const QUOTA_REFRESH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// A client's agents session: whose journal this is and how far it runs,
-/// then the rows past wherever the client's copy stops, every append after
-/// them and the live tails, until the client goes; and beside them the
-/// agents created and the quota as it moves. A stream of its own so that a
-/// catch-up of thousands of pages queues behind nothing and holds nothing
-/// up. A second `Follow` starts the follow again from its `since`.
+/// What a client asks the session's follower for.
+enum Follow {
+    Mail(MailId),
+    Worksets(Vec<(WorksetId, Wpos)>),
+    Focus(HashSet<AgentId>),
+}
+
+/// A client's session: `Hello`, the directory, then whatever the client
+/// follows (the mail, some worksets' rows, the live tails of the agents it
+/// looks at) as it lands, beside the auth state and the quota. A stream of
+/// its own, so a catch-up queues behind nothing and holds nothing up.
 async fn serve_session<R, W>(
     services: Arc<Services>,
     mut reader: R,
@@ -174,18 +186,20 @@ where
             }
         }
     });
-    // Subscribed before the head is read, so a creation in between is in
-    // the head's counter or on the receiver (occasionally both, harmlessly).
-    let mut created = services.pool.subscribe_created();
-    let (journal_head, agent_counter) = {
+    // Both subscribed before anything is read, so nothing that lands in
+    // between is lost; positions drop what is told twice.
+    let feed = rho_agent::store::feed(&services.db);
+    let statuses = services.pool.watch_statuses().await;
+    let (mail_head, agent_counter) = {
         let read = services.db.read();
-        (read.journal_head(), read.last_agent_counter())
+        (read.mail_head(), read.last_agent_counter())
     };
-    let _ = outgoing_tx.send(ServerFrame::JournalHead {
+    let _ = outgoing_tx.send(ServerFrame::Hello {
         machine_seed: services.machine_seed,
-        journal_head,
+        mail_head,
         agent_counter,
     });
+    let _ = outgoing_tx.send(directory(&services.db));
     // Which accounts agents run on: now, and whenever the inference state
     // moves.
     let auth_task = {
@@ -201,30 +215,6 @@ where
                 }
                 if state.changed().await.is_err() {
                     break;
-                }
-            }
-        })
-    };
-    // Agents made anywhere, by clients or by agents spawning children. The
-    // journal carries them whole; this only says which are new. A lagged
-    // receiver misses a counter that the next creation brings up to date.
-    let created_task = {
-        let services = Arc::clone(&services);
-        let outgoing_tx = outgoing_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match created.recv().await {
-                    Ok(created) => {
-                        let frame = ServerFrame::AgentCreated {
-                            agent_id: created.agent_id,
-                            agent_counter: services.db.read().last_agent_counter(),
-                        };
-                        if outgoing_tx.send(frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
@@ -256,10 +246,17 @@ where
             }
         })
     };
+    let (follow_tx, follow_rx) = mpsc::unbounded_channel();
+    let follower = tokio::spawn(follow(
+        Arc::clone(&services),
+        outgoing_tx.clone(),
+        feed,
+        statuses,
+        follow_rx,
+    ));
     // Names this stream's focus in the pool's live set, so it leaves with
     // the stream.
     let stream_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let mut follow: Option<tokio::task::JoinHandle<()>> = None;
     let result = loop {
         let frame =
             match rho_rpc::protocol::read_frame_optional::<_, ClientFrame>(&mut reader).await {
@@ -268,51 +265,37 @@ where
                 Err(error) => break Err(error),
             };
         match frame {
-            ClientFrame::Follow { since } => {
-                if let Some(previous) = follow.take() {
-                    previous.abort();
-                }
-                follow = Some(spawn_log_follow(
-                    Arc::clone(&services),
-                    outgoing_tx.clone(),
-                    since,
-                ));
+            ClientFrame::FollowMail { since } => {
+                let _ = follow_tx.send(Follow::Mail(since));
+            }
+            ClientFrame::FollowWorksets { from } => {
+                let _ = follow_tx.send(Follow::Worksets(from));
             }
             ClientFrame::Focus { agent_ids } => {
                 if agent_ids.len() > 64 {
                     break Err(anyhow::anyhow!("too many focused agents"));
                 }
+                let agent_ids = agent_ids.into_iter().collect::<HashSet<_>>();
                 // Focus is what this client is looking at, nothing more: it
                 // never loads an agent. The pool unions it across streams
                 // into the live set; a loaded agent in it shows its response.
                 services
                     .pool
-                    .set_live_wants(stream_id, agent_ids.into_iter().collect())
+                    .set_live_wants(stream_id, agent_ids.clone())
                     .await;
+                let _ = follow_tx.send(Follow::Focus(agent_ids));
             }
-            ClientFrame::Detail {
-                agent_id,
-                pos,
-                more,
-            } => {
-                // One answer per position, each naming its own `pos`. A chunk
-                // asks once and is answered as many times as it asked for.
+            ClientFrame::Detail { workset, pos, more } => {
+                // One answer per position, each naming its own `pos`.
                 for pos in std::iter::once(pos).chain(more) {
-                    let body = agent_detail(&services.db, agent_id, pos);
-                    let _ = outgoing_tx.send(ServerFrame::Detail {
-                        agent_id,
-                        pos,
-                        body,
-                    });
+                    let body = detail(&services.db, workset, pos);
+                    let _ = outgoing_tx.send(ServerFrame::Detail { workset, pos, body });
                 }
             }
         }
     };
-    if let Some(follow) = follow {
-        follow.abort();
-    }
+    follower.abort();
     auth_task.abort();
-    created_task.abort();
     quota_task.abort();
     services
         .pool
@@ -322,89 +305,169 @@ where
     result
 }
 
-/// One pipe per connection: rows and live statuses go out in one order.
-/// Rows are read from the journal, never from the feed: an append only
-/// says a row landed, and the connection pages the journal from the last
-/// seq it sent. A lagged subscription does the same. Rows the transcript
-/// leaves behind (`strip` says nothing) advance the seq without a message.
+/// Every workset and agent on the host.
+fn directory(db: &RhoDb) -> ServerFrame {
+    let read = db.read();
+    ServerFrame::Directory {
+        worksets: read
+            .worksets()
+            .into_iter()
+            .map(|(workset, head)| workset_entry(workset, &head))
+            .collect(),
+        agents: read
+            .agents()
+            .into_iter()
+            .map(|(agent, head)| agent_entry(agent, &head))
+            .collect(),
+    }
+}
+
+fn workset_entry(workset: WorksetId, head: &WorksetHead) -> WorksetEntry {
+    WorksetEntry {
+        workset,
+        kind: head.kind.clone(),
+        created_at: head.created_at,
+    }
+}
+
+fn agent_entry(agent: AgentId, head: &AgentHead) -> AgentEntry {
+    AgentEntry {
+        agent,
+        workset: head.workset,
+        spec: crate::transcript::spec_view(&head.spec),
+        created_at: head.created_at,
+    }
+}
+
+/// The directory frame one appended row calls for, if it changed what the
+/// directory says.
+fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
+    match appended {
+        Appended::Mail(_) => None,
+        Appended::WorksetDeleted(workset) => Some(ServerFrame::WorksetDeleted { workset }),
+        Appended::Row { workset, pos } => {
+            let read = db.read();
+            match read.workset_row(workset, pos)?.event {
+                Event::WorksetCreated { .. } => read
+                    .workset(workset)
+                    .map(|head| ServerFrame::Workset(workset_entry(workset, &head))),
+                Event::AgentCreated { agent, .. } | Event::AgentChanged { agent, .. } => read
+                    .agent(agent)
+                    .map(|head| ServerFrame::Agent(agent_entry(agent, &head))),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The session's one pipe for everything that follows the store: directory
+/// changes, then mail and rows past what the client holds, then the
+/// statuses, which arrive after the rows they reflect commit. Rows are read
+/// from the store, never from the feed: an append only says something
+/// landed. A lagged feed sends the directory whole.
 ///
 /// Statuses are full snapshots, the latest per agent: an unsent one is
 /// replaced rather than queued, so a slow connection never falls behind.
-fn spawn_log_follow(
+async fn follow(
     services: Arc<Services>,
-    outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
-    since: Seq,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Both subscribed before the first read, so nothing that lands
-        // during it is lost; the seq drops duplicate rows.
-        let statuses = services.pool.watch_statuses().await;
-        let mut feed = rho_agent::journal::feed(&services.db);
-        let mut sent = since;
-        loop {
-            // Taken before the rows are read: an agent's status arrives
-            // after the rows it reflects commit, so they go out first.
-            let changed = statuses.take();
-            if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
+    outgoing_tx: mpsc::UnboundedSender<ServerFrame>,
+    mut feed: broadcast::Receiver<Appended>,
+    statuses: Arc<rho_agent::host::pool::Statuses>,
+    mut asks: mpsc::UnboundedReceiver<Follow>,
+) {
+    let mut mail: Option<MailId> = None;
+    let mut worksets: HashMap<WorksetId, Wpos> = HashMap::new();
+    let mut focus: HashSet<AgentId> = HashSet::new();
+    let mut befores = Befores::new();
+    loop {
+        // Taken before the rows are read: an agent's status arrives after
+        // the rows it reflects commit, so they go out first.
+        let changed = statuses.take();
+        if let Some(sent) = mail.as_mut()
+            && !send_mail_from(&services.db, &outgoing_tx, sent).await
+        {
+            return;
+        }
+        for (workset, next) in &mut worksets {
+            if !send_rows_from(&services.db, &outgoing_tx, &mut befores, *workset, next).await {
                 return;
             }
-            for (agent_id, status) in changed {
-                let live = rho_agents_client::protocol::transcript::Live::Snapshot {
+        }
+        for (agent_id, status) in changed {
+            if outgoing_tx
+                .send(ServerFrame::Status {
+                    agent_id,
+                    state: status.runtime.clone(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            if focus.contains(&agent_id) {
+                let live = Live::Snapshot {
                     state: status.runtime.clone(),
                     response: status.response.clone(),
                     draft: status.draft.clone(),
                 };
-                if outgoing_tx
-                    .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
-                    .is_err()
-                {
+                if outgoing_tx.send(ServerFrame::Live { agent_id, live }).is_err() {
                     return;
                 }
             }
-            loop {
-                tokio::select! {
-                    appended = feed.recv() => match appended {
-                        Ok(appended) if appended.seq <= sent => continue,
+        }
+        tokio::select! {
+            appended = feed.recv() => {
+                let mut next = Some(appended);
+                while let Some(appended) = next.take() {
+                    let frame = match appended {
+                        Ok(appended) => directory_change(&services.db, appended),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Some(directory(&services.db))
+                        }
                         Err(broadcast::error::RecvError::Closed) => return,
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => break,
-                    },
-                    () = statuses.changed() => break,
+                    };
+                    if let Some(frame) = frame
+                        && outgoing_tx.send(frame).is_err()
+                    {
+                        return;
+                    }
+                    next = match feed.try_recv() {
+                        Ok(appended) => Some(Ok(appended)),
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            Some(Err(broadcast::error::RecvError::Lagged(n)))
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => None,
+                        Err(broadcast::error::TryRecvError::Closed) => return,
+                    };
                 }
             }
+            () = statuses.changed() => {}
+            ask = asks.recv() => match ask {
+                None => return,
+                Some(Follow::Mail(since)) => mail = Some(since),
+                Some(Follow::Worksets(from)) => {
+                    worksets = from.into_iter().collect();
+                    befores.clear();
+                }
+                Some(Follow::Focus(agents)) => focus = agents,
+            },
         }
-    })
+    }
 }
 
-/// Pages the journal out from after `sent`, moving it as it goes. False
-/// when the connection is gone.
-async fn send_journal_from(
+/// Pages the mail out from after `sent`, moving it as it goes. False when
+/// the connection is gone.
+async fn send_mail_from(
     db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
-    sent: &mut rho_agent_types::Seq,
+    outgoing_tx: &mpsc::UnboundedSender<ServerFrame>,
+    sent: &mut MailId,
 ) -> bool {
-    let mut carries = Carries::new();
     loop {
-        let page = db.read().journal_since(*sent, LOG_PAGE);
-        let Some((last, _, _, _)) = page.last() else {
+        let mails = db.read().mail_since(*sent, LOG_PAGE);
+        let Some(last) = mails.last() else {
             return true;
         };
-        *sent = *last;
-        let entries = page
-            .into_iter()
-            .filter_map(|(seq, agent_id, pos, event)| {
-                Some(rho_agents_client::protocol::transcript::LogEntry {
-                    seq,
-                    agent_id,
-                    pos: pos.into(),
-                    event: strip_row(db, &mut carries, agent_id, pos, &event)?,
-                })
-            })
-            .collect::<Vec<_>>();
-        if !entries.is_empty()
-            && outgoing_tx
-                .send(rho_agents_client::protocol::ServerFrame::Log { entries })
-                .is_err()
-        {
+        *sent = last.id;
+        if outgoing_tx.send(ServerFrame::Mail { mails }).is_err() {
             return false;
         }
         // Catching up must never starve the connection's own traffic.
@@ -412,63 +475,82 @@ async fn send_journal_from(
     }
 }
 
-/// Each agent's newest visible step as of the rows already read, so a
-/// request reads its carry back from the log once per agent, not once per
-/// request: that walk is as long as the gap since the last step.
-type Carries = HashMap<AgentId, Option<rho_agent::inference::Carry>>;
-
-/// A row as clients read it, or `None` for one they never see.
-fn strip_row(
+/// Pages a workset's rows out from `next`, moving it as it goes. Rows the
+/// transcript leaves behind advance `next` without a message. False when
+/// the connection is gone.
+async fn send_rows_from(
     db: &RhoDb,
-    carries: &mut Carries,
-    agent_id: AgentId,
-    pos: rho_agent::log::AgentEventPos,
-    event: &rho_agent::AgentEvent<'_>,
-) -> Option<rho_agents_client::protocol::transcript::TranscriptEvent> {
-    let mut prior_carry = None;
-    match event {
-        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { carry, .. }) => {
-            carries.insert(agent_id, Some(carry.clone()));
+    outgoing_tx: &mpsc::UnboundedSender<ServerFrame>,
+    befores: &mut Befores,
+    workset: WorksetId,
+    next: &mut Wpos,
+) -> bool {
+    loop {
+        let page = db.read().workset_rows(workset, *next, LOG_PAGE);
+        let Some((last, _)) = page.last() else {
+            return true;
+        };
+        *next = last.next();
+        let rows = page
+            .iter()
+            .filter_map(|(pos, record)| Some((*pos, strip_row(db, befores, *pos, record)?)))
+            .collect::<Vec<_>>();
+        if !rows.is_empty() && outgoing_tx.send(ServerFrame::Rows { workset, rows }).is_err() {
+            return false;
         }
-        rho_agent::AgentEvent::Rewound { .. } => {
-            carries.remove(&agent_id);
-        }
-        rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent { .. }) => {
-            prior_carry = carries
-                .entry(agent_id)
-                .or_insert_with(|| db.read().agent_input_carry(agent_id, pos))
-                .as_ref();
-        }
-        _ => {}
+        tokio::task::yield_now().await;
     }
-    crate::transcript::strip(event, prior_carry)
 }
 
-/// One page of an agent's rows, stripped as the journal strips them.
-fn agent_log_page(
+/// Each agent's state as of the rows already read, so a request reads its
+/// prior step back from the log once per agent, not once per request.
+type Befores = HashMap<AgentId, crate::transcript::Before>;
+
+/// A row as clients read it, or `None` for one they never see. Rows must
+/// come in order per agent; a rewind sends the agent back to the store.
+fn strip_row(
     db: &RhoDb,
-    rho_agents_client::protocol::AgentLog { agent_id, from }: rho_agents_client::protocol::AgentLog,
-) -> anyhow::Result<rho_agents_client::protocol::AgentLogPage> {
-    let page = db.read().agent_rows(agent_id, from.into(), LOG_PAGE);
-    anyhow::ensure!(
-        !page.is_empty() || from.0 > 0,
-        "no agent {} on this host",
-        agent_id.encoded()
-    );
+    befores: &mut Befores,
+    pos: Wpos,
+    record: &Record<'_>,
+) -> Option<LogEvent> {
+    let Some(agent) = record.event.agent() else {
+        return crate::transcript::strip(record, &Default::default());
+    };
+    if matches!(record.event, Event::Rewound { .. }) {
+        befores.remove(&agent);
+        return crate::transcript::strip(record, &Default::default());
+    }
+    let before = befores
+        .entry(agent)
+        .or_insert_with(|| crate::transcript::before_at(&db.read(), agent, pos));
+    let stripped = crate::transcript::strip(record, before);
+    before.observe(&record.event);
+    stripped
+}
+
+/// One page of a workset's rows, stripped as the session strips them.
+fn workset_log_page(
+    db: &RhoDb,
+    WorksetLog { workset, from }: WorksetLog,
+) -> anyhow::Result<WorksetLogPage> {
+    let page = {
+        let read = db.read();
+        anyhow::ensure!(
+            read.workset(workset).is_some(),
+            "no workset {workset} on this host"
+        );
+        read.workset_rows(workset, from, LOG_PAGE)
+    };
     let next = (page.len() == LOG_PAGE)
-        .then(|| page.last().map(|(pos, _)| pos.next().into()))
+        .then(|| page.last().map(|(pos, _)| pos.next()))
         .flatten();
-    let mut carries = Carries::new();
+    let mut befores = Befores::new();
     let rows = page
         .iter()
-        .filter_map(|(pos, event)| {
-            Some((
-                (*pos).into(),
-                strip_row(db, &mut carries, agent_id, *pos, event)?,
-            ))
-        })
+        .filter_map(|(pos, record)| Some((*pos, strip_row(db, &mut befores, *pos, record)?)))
         .collect();
-    Ok(rho_agents_client::protocol::AgentLogPage { rows, next })
+    Ok(WorksetLogPage { rows, next })
 }
 
 /// Answers one call with its handler's reply: the call names the reply's
@@ -488,6 +570,14 @@ where
     write_frame(writer, &Answer::from(reply)).await
 }
 
+fn eval_result(evaluated: rho_agent::host::pool::Evaluated) -> EvalResult {
+    EvalResult {
+        output: evaluated.output,
+        error: evaluated.error,
+        agent: evaluated.agent,
+    }
+}
+
 /// One call stream's call.
 async fn serve_call<W>(
     services: &Arc<Services>,
@@ -498,30 +588,89 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     match request {
-        Request::DeleteAgents(call) => {
+        Request::CreateWorkset(call) => {
             respond(
                 writer,
                 call,
-                |call: rho_agents_client::protocol::DeleteAgents| async move {
-                    let (deleted, files, compacted) = services
-                        .pool
-                        .delete_agents(call.agents, call.compact)
-                        .await?;
-                    Ok(rho_agents_client::protocol::DeleteAgentsResult {
-                        deleted: deleted
-                            .into_iter()
-                            .map(|(id, rows)| (id, rows as u64))
-                            .collect(),
-                        claude_paths_removed: files as u64,
-                        compacted,
+                |CreateWorkset {
+                     kind,
+                     code,
+                     mut message,
+                 }| async move {
+                    if let Some(message) = message.as_mut() {
+                        prepare_image_content(message).await?;
+                    }
+                    let kind = match kind {
+                        WorksetKind::Host { cwd } => WorksetKind::Host {
+                            cwd: crate::expand_home(&cwd).unwrap_or(cwd),
+                        },
+                        kind => kind,
+                    };
+                    let (workset, evaluated) =
+                        services.pool.create_workset(kind, code, message).await?;
+                    Ok(CreatedWorkset {
+                        workset,
+                        result: eval_result(evaluated),
                     })
                 },
             )
             .await
         }
-        Request::New(call) => respond(writer, call, |call| new_agent(services, call)).await,
-        Request::Command(call) => {
-            respond(writer, call, |call| handle_agent_command(services, call)).await
+        Request::Eval(call) => {
+            respond(
+                writer,
+                call,
+                |Eval {
+                     workset,
+                     code,
+                     mut message,
+                 }| async move {
+                    if let Some(message) = message.as_mut() {
+                        prepare_image_content(message).await?;
+                    }
+                    Ok(eval_result(
+                        services.pool.eval(workset, code, message).await?,
+                    ))
+                },
+            )
+            .await
+        }
+        Request::PostMail(call) => {
+            respond(
+                writer,
+                call,
+                |PostMail {
+                     client_id,
+                     to,
+                     re,
+                     mut content,
+                 }| async move {
+                    prepare_image_content(&mut content).await?;
+                    services
+                        .pool
+                        .post_user_mail(client_id, to, re, content)
+                        .await
+                },
+            )
+            .await
+        }
+        Request::Cancel(call) => {
+            respond(writer, call, |Cancel { agent }| async move {
+                services.pool.cancel(agent).await
+            })
+            .await
+        }
+        Request::DeleteWorksets(call) => {
+            respond(writer, call, |DeleteWorksets { worksets }| async move {
+                services.pool.delete_worksets(worksets).await
+            })
+            .await
+        }
+        Request::WorksetLog(call) => {
+            respond(writer, call, |call| async {
+                workset_log_page(&services.db, call)
+            })
+            .await
         }
         Request::ClaudeAccounts(call) => {
             respond(writer, call, |ClaudeAccounts| async {
@@ -539,12 +688,6 @@ where
                 write.set_claude_account(&name);
                 write.commit();
                 claude_accounts(&services.db, &services.claude)
-            })
-            .await
-        }
-        Request::AgentLog(call) => {
-            respond(writer, call, |call| async {
-                agent_log_page(&services.db, call)
             })
             .await
         }
@@ -615,96 +758,6 @@ where
     }
 }
 
-/// Starts a new agent. Sessions hear of it from the pool's creation
-/// broadcast; the answer tells this client which one is its own.
-async fn new_agent(services: &Arc<Services>, new: NewAgent) -> anyhow::Result<AgentId> {
-    let NewAgent {
-        role,
-        start,
-        mut content,
-    } = new;
-    if let Some(content) = content.as_mut() {
-        prepare_image_content(content).await?;
-    }
-    let (agent_id, agent) = services.create(role, start).await?;
-    if let Some(content) = content {
-        agent
-            .send_user_content_accepted(rho_agent::entry::MessageId::new(), content)
-            .await?;
-    }
-    Ok(agent_id)
-}
-
-pub(crate) async fn handle_agent_command(
-    services: &Arc<Services>,
-    command: AgentCommand,
-) -> anyhow::Result<()> {
-    match command {
-        AgentCommand::Send {
-            agent_id,
-            mut messages,
-        } => {
-            for message in &mut messages {
-                prepare_image_content(&mut message.content).await?;
-            }
-            let (_, agent, _) = services.load(agent_id).await?;
-            // One at a time, in order: a message fails before any after it
-            // is logged, and the client sends them all again.
-            for message in messages {
-                let mut content = message.content;
-                // What Rho has to tell the agent goes ahead of the person's
-                // words, once: the loop's head forgets it as soon as the
-                // message is accepted, the log when the message's row lands.
-                let notice = agent.head()?.pending_notice;
-                if let Some(text) = notice.clone() {
-                    content.insert(0, rho_agent_types::ContentPart::Text { text });
-                }
-                agent
-                    .send_user_content_accepted(rho_agent::entry::MessageId(message.id), content)
-                    .await?;
-                if notice.is_some() {
-                    agent.notice_carried();
-                }
-            }
-        }
-        AgentCommand::Compact { agent_id } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.compact();
-        }
-        AgentCommand::ChangeRole { agent_id, role } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.change_role(role).await?;
-        }
-        AgentCommand::ChangePromptCacheKey { agent_id } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.change_prompt_cache_key()?;
-        }
-        AgentCommand::Cancel { agent_id } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.cancel();
-        }
-        AgentCommand::Rewind { agent_id, turns } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.rewind(turns).await?;
-        }
-        AgentCommand::Continue { agent_id } => {
-            let (_, agent, _) = services.load(agent_id).await?;
-            agent.retry();
-        }
-        AgentCommand::RestartWorkset { agent_id } => {
-            let workset = services
-                .pool
-                .db()
-                .read()
-                .get_agent(agent_id)
-                .place()
-                .workset;
-            services.pool.restart_workset(workset, true).await?;
-        }
-    }
-    Ok(())
-}
-
 fn claude_accounts(
     db: &RhoDb,
     claude: &rho_claude::accounts::ClaudePaths,
@@ -745,9 +798,9 @@ where
 }
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
-    let agent = services.resolve_display_agent_id(agent).await?;
+    let agent = services.resolve_display_agent_id(agent)?;
     let process = services.pool.execution(agent).await?;
-    let cwd = services.db.read().get_agent(agent).config.place.cwd;
+    let cwd = services.cwd_of(agent)?;
     process
         .action(rho_agent::WorksetAction::ShellStart {
             agent,
@@ -763,7 +816,7 @@ async fn shell_attach(
     services: &Arc<Services>,
     agent: &str,
 ) -> anyhow::Result<rho_agent::WorksetClient> {
-    let agent = services.resolve_display_agent_id(agent).await?;
+    let agent = services.resolve_display_agent_id(agent)?;
     services
         .pool
         .execution(agent)
@@ -777,7 +830,7 @@ async fn shell_list(
     agent: Option<&str>,
 ) -> anyhow::Result<Vec<rho_shell_view::protocol::ShellInfo>> {
     let filter = match agent {
-        Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
+        Some(agent) => Some(services.resolve_display_agent_id(agent)?.encoded()),
         None => None,
     };
     let mut shells = Vec::new();
@@ -796,7 +849,7 @@ async fn shell_list(
 }
 
 async fn shell_close(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
-    let agent = services.resolve_display_agent_id(agent).await?;
+    let agent = services.resolve_display_agent_id(agent)?;
     services
         .pool
         .execution(agent)
@@ -897,9 +950,9 @@ async fn terminal_attach(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<rho_agent::WorksetClient> {
-    let agent = services.resolve_display_agent_id(agent).await?;
+    let agent = services.resolve_display_agent_id(agent)?;
     let process = services.pool.execution(agent).await?;
-    let cwd = services.db.read().get_agent(agent).config.place.cwd;
+    let cwd = services.cwd_of(agent)?;
     let shell = services
         .user_environment
         .get("SHELL")
@@ -928,7 +981,7 @@ async fn terminal_list(
     agent: Option<&str>,
 ) -> anyhow::Result<Vec<rho_terminal::protocol::TerminalInfo>> {
     let filter = match agent {
-        Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
+        Some(agent) => Some(services.resolve_display_agent_id(agent)?.encoded()),
         None => None,
     };
     let mut terminals = Vec::new();
@@ -947,66 +1000,67 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-/// a request's tool results whole, or a response as the transcript draws
+
+/// A request's tool results whole, or a response as the transcript draws
 /// it. Rows a rewind hid still answer; the client asked for one it holds.
-fn agent_detail(
+fn detail(
     db: &RhoDb,
-    agent_id: AgentId,
-    pos: rho_agent_types::AgentPos,
+    workset: WorksetId,
+    pos: Wpos,
 ) -> rho_agents_client::protocol::transcript::DetailBody {
-    use rho_agents_client::protocol::transcript::DetailBody;
-    let event = db.read().agent_event(agent_id, pos.into());
-    match event {
-        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
-            report, ..
-        })) => DetailBody::Results(
+    use rho_agent::entry::Entry;
+    use rho_agent::log::TranscriptLine;
+    use rho_agent::record::ClaudeRow;
+    use rho_agents_client::protocol::transcript::{
+        ArgumentsFormat, DetailBody, DetailResult, Item, ToolStatus,
+    };
+    let read = db.read();
+    let Some(record) = read.workset_row(workset, pos) else {
+        return DetailBody::Nothing;
+    };
+    match record.event {
+        Event::Native {
+            agent,
+            entry: Entry::RequestSent { report, .. },
+        } => DetailBody::Results(
             crate::transcript::report_results(
                 &report,
-                db.read().agent_input_carry(agent_id, pos.into()).as_ref(),
+                &crate::transcript::before_at(&read, agent, pos),
             )
             .into_iter()
-            .map(
-                |result| rho_agents_client::protocol::transcript::DetailResult {
-                    id: result.display_id().to_owned(),
-                    status: rho_agents_client::protocol::transcript::ToolStatus::Reported,
-                    output: result.text,
-                    error: None,
-                },
-            )
+            .map(|result| DetailResult {
+                id: result.display_id().to_owned(),
+                status: ToolStatus::Reported,
+                output: result.text,
+                error: None,
+            })
             .collect(),
         ),
-        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { carry, .. })) => {
-            DetailBody::Response(crate::transcript::step_items(&carry.display_calls()))
-        }
-        Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
-            rho_agent::TranscriptLine::Assistant { calls, .. } => DetailBody::Response(
+        Event::Native {
+            entry: Entry::Step { carry, .. },
+            ..
+        } => DetailBody::Response(crate::transcript::step_items(&carry.display_calls())),
+        Event::Claude {
+            row: ClaudeRow::Transcript { line, .. },
+            ..
+        } => match line {
+            TranscriptLine::Assistant { calls, .. } => DetailBody::Response(
                 calls
                     .into_iter()
-                    .map(
-                        |call| rho_agents_client::protocol::transcript::Item::ToolCall {
-                            id: call.id,
-                            name: call.name,
-                            arguments: call.arguments,
-                            format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
-                        },
-                    )
-                    .collect(),
-            ),
-            rho_agent::TranscriptLine::ToolResults { results } => DetailBody::Results(
-                results
-                    .iter()
-                    .map(|result| {
-                        let mut detail = detail_result(result);
-                        detail.status =
-                            rho_agents_client::protocol::transcript::ToolStatus::Reported;
-                        detail
+                    .map(|call| Item::ToolCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                        format: ArgumentsFormat::Json,
                     })
                     .collect(),
             ),
-            rho_agent::TranscriptLine::User { .. }
-            | rho_agent::TranscriptLine::Compacted { .. } => DetailBody::Nothing,
+            TranscriptLine::ToolResults { results } => {
+                DetailBody::Results(results.iter().map(detail_result).collect())
+            }
+            TranscriptLine::User { .. } | TranscriptLine::Compacted { .. } => DetailBody::Nothing,
         },
-        Some(rho_agent::AgentEvent::Failed { partial, .. }) => DetailBody::Response(
+        Event::Failed { partial, .. } => DetailBody::Response(
             partial
                 .items
                 .iter()
@@ -1032,168 +1086,5 @@ fn detail_result(
         status: ToolStatus::Reported,
         output: result.body.recorded_output().to_owned(),
         error: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use rho_agent::AgentEvent;
-    use rho_agent::db::AgentWriteTxnExt as _;
-    use rho_agent::entry::{Entry, Report, RequestNotice};
-    use rho_agent_types::{Seq, UnixMs};
-    use rho_agents_client::protocol::ServerFrame;
-    use rho_agents_client::protocol::transcript::TranscriptEvent;
-
-    use super::{detail_result, send_journal_from};
-
-    #[tokio::test]
-    async fn a_request_after_a_rewind_reports_the_step_still_standing() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let step = |id: &str| {
-            AgentEvent::Entry(Entry::Step {
-                at: UnixMs(1),
-                exec: None,
-                prose: String::new(),
-                carry: rho_agent::inference::Carry::new(
-                    serde_json::json!({"items": [{
-                        "type": "custom_tool_call", "name": "exec", "call_id": id, "input": "cell"
-                    }]}),
-                    vec![rho_agent::inference::Call::new(id, "cell".into())],
-                    false,
-                ),
-                usage: None,
-            })
-        };
-        let request = AgentEvent::Entry(Entry::RequestSent {
-            at: UnixMs(2),
-            why: rho_agent::entry::Wake::Notify,
-            report: Report {
-                notices: vec![RequestNotice::Restarted],
-                ..Default::default()
-            },
-            compact: false,
-        });
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent = write.alloc_agent_id();
-        write.append_agent_event(
-            agent,
-            &AgentEvent::Created {
-                role: Default::default(),
-                binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
-                runtime: rho_agent::log::AgentRuntime::Rho {
-                    prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
-                },
-                place: rho_agent_types::Place {
-                    workset: Some("0123456789ab".parse().unwrap()),
-                    cwd: "/src/rho".into(),
-                },
-                spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
-                spawn_name: None,
-                created_at: UnixMs(0),
-                parent: None,
-            },
-        );
-        write.append_agent_event(agent, &step("exec-1"));
-        write.append_agent_event(agent, &request);
-        let taken_back = write.append_agent_event(agent, &step("exec-2"));
-        write.append_agent_event(
-            agent,
-            &AgentEvent::Rewound {
-                to: taken_back,
-                at: UnixMs(3),
-            },
-        );
-        write.append_agent_event(agent, &request);
-        write.commit();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
-        let mut reported = Vec::new();
-        while let Ok(ServerFrame::Log { entries }) = rx.try_recv() {
-            for entry in entries {
-                if let TranscriptEvent::NotebookReport { calls, .. } = entry.event {
-                    reported.push(calls);
-                }
-            }
-        }
-        assert_eq!(reported, [["exec-1"], ["exec-1"]]);
-    }
-
-    #[tokio::test]
-    async fn erased_history_reaches_both_live_and_reconnected_mirrors() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let id = write.alloc_agent_id();
-        write.append_agent_event(
-            id,
-            &AgentEvent::Created {
-                role: Default::default(),
-                binding: rho_agent::log::SessionBinding::ResponsesSol(Default::default()),
-                runtime: rho_agent::log::AgentRuntime::Rho {
-                    prompt_cache_key: rho_agent::inference::PromptCacheKey::generate(),
-                },
-                place: rho_agent_types::Place {
-                    workset: None,
-                    cwd: "/src".into(),
-                },
-                spawned_by: rho_agent::log::AgentSpawnedBy::Direct,
-                spawn_name: None,
-                created_at: UnixMs(0),
-                parent: None,
-            },
-        );
-        write.append_agent_event(
-            id,
-            &AgentEvent::Notice {
-                text: "secret".into(),
-                at: UnixMs(1),
-            },
-        );
-        write.commit();
-        let mut cursor = Seq(0);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(send_journal_from(&db, &tx, &mut cursor).await);
-        while rx.try_recv().is_ok() {}
-        let previous = cursor;
-        rho_agent::db::delete_agents(&db, &[id]).await;
-        assert!(send_journal_from(&db, &tx, &mut cursor).await);
-        let live = rx.recv().await.unwrap();
-        let ServerFrame::Log { entries } = &live else {
-            panic!("expected log page")
-        };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].agent_id, id);
-        assert!(entries[0].seq > previous);
-        assert!(matches!(entries[0].event, TranscriptEvent::Deleted { .. }));
-        // A cold mirror has no creation to fold, but sees the same removal.
-        assert!(send_journal_from(&db, &tx, &mut Seq(0)).await);
-        assert_eq!(rx.recv().await.unwrap(), live);
-        let bytes = senax_encoder::pack(&live).unwrap();
-        let decoded: ServerFrame = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
-        assert_eq!(decoded, live);
-    }
-
-    #[test]
-    fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_agent_types::transcript::ToolResult {
-            call_id: rho_agent_types::transcript::ExecId::try_from("call-1").unwrap(),
-            tool_type: rho_agent_types::transcript::ToolType::Custom,
-            body: rho_agent_types::transcript::ToolOutput {
-                output: Arc::new("bounded model view".to_owned()),
-                full_output: Some(Arc::new("complete host record".to_owned())),
-                images: Arc::new(Vec::new()),
-                status: rho_agent_types::ToolOutputStatus::Success,
-            },
-            started_at: rho_agent_types::UnixMs(1),
-            finished_at: rho_agent_types::UnixMs(2),
-        };
-
-        assert_eq!(detail_result(&result).output, "complete host record");
     }
 }

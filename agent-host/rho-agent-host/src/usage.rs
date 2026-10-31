@@ -8,6 +8,7 @@ use rho_agent::db::{
     AgentReadTxnExt as _, AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::log::AgentUsageModel;
+use rho_agent::store::StoreRead as _;
 use rho_agent_types::AgentId;
 use rho_agents_client::protocol::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, QuotaPoint,
@@ -139,7 +140,7 @@ fn hourly_agent_cost_series(
 
     let read = db.read();
     let mut hourly = BTreeMap::new();
-    for agent_id in read.list_agent_ids() {
+    for (agent_id, _) in read.agents() {
         for bucket in read.agent_usage(agent_id, since) {
             if !matches!(
                 bucket.model,

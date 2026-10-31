@@ -2541,11 +2541,9 @@ mod tests {
             )
             .unwrap();
         write.commit();
-        let host = crate::testing::services_pair(
-            db.clone(),
-            agent_id,
-            std::sync::Weak::new(),
-        );
+        // Its failure calls a policy hook, which needs the workset Python.
+        crate::testing::python(agent_id, &db);
+        let host = crate::testing::services_pair(db.clone(), agent_id, std::sync::Weak::new());
         let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
         let (agent, mut runtime) = ClaudeLoop::load(
             agent_id,
@@ -2802,12 +2800,6 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");
-    }
-
-    fn text(text: &str) -> Arc<Vec<ContentPart>> {
-        Arc::new(vec![ContentPart::Text {
-            text: text.to_owned(),
-        }])
     }
 }
 

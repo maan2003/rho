@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::db::AgentReadTxnExt as _;
-use rho_agent::host::AgentClient;
 use rho_agent::host::pool::AgentPool;
 use rho_agent_hosts::protocol::GitProviderFrame;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, Place};
-use rho_agents_client::protocol::{AuthState, StartMode};
+use rho_agent::store::StoreRead as _;
+use rho_agent_types::{AgentId, ContentPart};
+use rho_agents_client::protocol::AuthState;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
 use rho_rpc::protocol::server::{Server, ServerConnection};
@@ -702,11 +702,16 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
+    // The user's policy, read by each workset process at its start
+    // (ARCH-rho2). Resolved here, like the state directory.
+    let init = dirs::config_dir()
+        .and_then(|dir| Utf8PathBuf::try_from(dir.join("rho").join("init.py")).ok());
     let pool = AgentPool::new(
         db.clone(),
         Arc::new(inference.clone()),
         worksets,
         claude.clone(),
+        init,
     )
     .await;
     if let Some(handoff) = handoff {
@@ -1229,58 +1234,14 @@ impl Services {
         self.inference.set_account_enabled(name, enabled).await;
     }
 
-    async fn create(
-        &self,
-        role: AgentRole,
-        start: StartMode,
-    ) -> anyhow::Result<(AgentId, AgentClient)> {
-        let start = match start {
-            StartMode::NewOn { repo, revset } => {
-                // The agent record is committed before its workset is cloned
-                // and checked out, then the worker starts. The checkout name
-                // is known before the clone, so the record is complete.
-                let origin = expand_home(&repo).unwrap_or(repo);
-                let name = rho_fs_view::repo_name(origin.as_str())
-                    .with_context(|| format!("no repository name in {origin}"))?;
-                let worksets = self.pool.worksets();
-                let workset = worksets.create().await?;
-                let cwd = Utf8Path::new(rho_fs_view::MOUNT_ROOT).join(&name);
-                let place = Place {
-                    workset: Some(workset.id()),
-                    cwd,
-                };
-                rho_agent::StartPlace::pending(place, async move {
-                    let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
-                    workset.checkout(&checkout, &revset).await?;
-                    Ok(())
-                })
-            }
-            StartMode::Join(place) => rho_agent::StartPlace::new(place),
-            StartMode::Here { cwd } => {
-                let cwd = expand_home(&cwd).unwrap_or(cwd);
-                // A workset's `/src` exists only in its view, never here.
-                anyhow::ensure!(
-                    !cwd.starts_with(rho_fs_view::MOUNT_ROOT),
-                    "{cwd} is inside a workset's view, which the agent host cannot see"
-                );
-                let cwd = Utf8PathBuf::try_from(
-                    cwd.canonicalize()
-                        .with_context(|| format!("working directory {cwd}"))?,
-                )?;
-                rho_agent::StartPlace::new(Place { cwd, workset: None })
-            }
-        };
-        let (agent_id, agent) = self.pool.create(role, None, start).await?;
-        Ok((agent_id, agent))
-    }
-
-    async fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
+    /// An agent named by its id or a unique prefix of it, with or without
+    /// a handle prefix (`eng-`) in front, which is presentation only.
+    fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
         let text = agent_id.trim();
-        let (prefix, raw_agent_id) = match text.split_once('-') {
-            Some((prefix, raw)) => (Some(prefix), raw),
-            None => (None, text),
-        };
-        let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
+        let raw = text.split_once('-').map_or(text, |(_, raw)| raw);
+        let read = self.db.read();
+        let domain = rho_agent_types::AgentIdDomain(read.machine_seed());
+        let resolved = match AgentId::from_prefix(raw, read.last_agent_counter() + 1, &domain)? {
             prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
             prefix_id::PrefixResolution::Ambiguous { .. } => {
                 anyhow::bail!("ambiguous agent id {agent_id}")
@@ -1289,28 +1250,19 @@ impl Services {
                 anyhow::bail!("no agent with id {agent_id}")
             }
         };
-        if !self.pool.agent_exists(resolved) {
-            anyhow::bail!("no agent with id {agent_id}");
-        }
-        if let Some(prefix) = prefix {
-            let expected = self
-                .load(resolved)
-                .await?
-                .1
-                .head()?
-                .config
-                .role
-                .handle_prefix();
-            anyhow::ensure!(
-                prefix == expected,
-                "agent handle prefix does not match its role"
-            );
-        }
+        anyhow::ensure!(
+            read.agent(resolved).is_some(),
+            "no agent with id {agent_id}"
+        );
         Ok(resolved)
     }
 
-    async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, AgentClient, bool)> {
-        self.pool.load(agent_id).await
+    /// Where the agent works: its workset's root.
+    fn cwd_of(&self, agent: AgentId) -> anyhow::Result<Utf8PathBuf> {
+        let read = self.db.read();
+        let head = read.agent(agent).context("no such agent")?;
+        let workset = read.workset(head.workset).context("no such workset")?;
+        Ok(rho_agent::host::pool::workset_root(&workset.kind))
     }
 }
 
@@ -1345,9 +1297,9 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match open.protocol {
-        Protocol::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
+        Protocol::Agents => anyhow::bail!("the agents protocol is now the worksets protocol"),
         Protocol::Ledger => anyhow::bail!("the old ledger protocol is no longer supported"),
-        Protocol::Worksets => anyhow::bail!("the worksets protocol is not served yet"),
+        Protocol::Worksets => agents::serve(services, open.unpack()?, reader, writer).await,
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
@@ -1890,7 +1842,7 @@ where
     // and retains its priority; this does not replace QUIC congestion control.
     transport.set_send_rate(250_000);
     let result = async {
-        let agent = services.resolve_display_agent_id(&agent).await?;
+        let agent = services.resolve_display_agent_id(&agent)?;
         let process = services.pool.execution(agent).await?;
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("agent desktops require a Linux agent host");

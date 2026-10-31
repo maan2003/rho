@@ -1,17 +1,18 @@
-//! The loop end to end: a scripted model, a real notebook, and the agent
-//! host's services over the worker socket.
+//! The loop end to end: a scripted model, a real notebook, the test
+//! policy Python, and the agent host's services over the worker socket.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rho_agent_types::{AgentRole, UnixMs};
+use rho_agent_types::{Address, SendKind, WorksetId, WorksetKind};
 use rho_db::RhoDb;
 
 use super::scripted::Scripted;
 use super::*;
-use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use crate::entry::{Block, Entry, Notice, Party};
 use crate::inference::Item;
-use crate::log::AgentRuntime;
+use crate::inference::config::ReasoningEffort;
+use crate::record::AgentSpec;
+use crate::store::{StoreRead as _, StoreWrite as _};
 
 struct Harness {
     _directory: tempfile::TempDir,
@@ -19,7 +20,7 @@ struct Harness {
     agent: AgentId,
     host: Arc<crate::worker::host_client::HostClient>,
     inference: Inference,
-    cwd: camino::Utf8PathBuf,
+    root: camino::Utf8PathBuf,
 }
 
 impl Harness {
@@ -27,54 +28,60 @@ impl Harness {
         // The worker installs one at startup; the notebook's web client needs
         // it.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // The test policy answers `_rho` by agent across every test in the
+        // process: each harness has an agent of its own.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let agent = AgentId::from_counter(
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            &rho_agent_types::AgentIdDomain(9),
+        )
+        .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
+        let workset = WorksetId([1; 6]);
         let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent = write.alloc_agent_id();
-        let role = AgentRole::default();
-        write.create_agent(
-            UnixMs(1),
-            agent,
-            None,
-            crate::db::tests::test_workspace(),
-            role,
-            role.session_profile(),
-            AgentRuntime::Rho {
-                prompt_cache_key: crate::inference::PromptCacheKey::generate(),
-            },
-            crate::log::AgentOrigin::User,
-        );
+        write.init_store_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent,
+                        spec: AgentSpec {
+                            runtime: Runtime::Native {
+                                model: InferenceModel::Gpt61Sol,
+                                profile: InferenceProfile {
+                                    effort: ReasoningEffort::High,
+                                    fast_mode: false,
+                                },
+                                cache_key: PromptCacheKey::generate(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
         write.commit();
-        let accounts = crate::inference::testing::accounts();
-        let host = crate::testing::services_pair(
-            db.clone(),
-            accounts.clone(),
-            agent,
-            std::sync::Weak::new(),
-        );
-        let cwd = camino::Utf8PathBuf::from_path_buf(directory.path().join("work")).unwrap();
-        std::fs::create_dir(&cwd).unwrap();
+        crate::testing::python(agent, &db);
+        let host = crate::testing::services_pair(db.clone(), agent, std::sync::Weak::new());
+        let root = camino::Utf8PathBuf::from_path_buf(directory.path().join("work")).unwrap();
+        std::fs::create_dir(&root).unwrap();
         Self {
             _directory: directory,
             db,
             agent,
             host,
-            inference: accounts.client(),
-            cwd,
+            inference: crate::inference::testing::backend(),
+            root,
         }
     }
 
     /// Load the agent and run its loop against `script`.
     async fn start(&self, script: &Arc<Scripted>) -> (AgentHandle, tokio::task::JoinHandle<()>) {
-        let (handle, mut agent) = Agent::load(
-            self.agent,
-            self.host.clone(),
-            self.inference.clone(),
-            self.cwd.clone(),
-        )
-        .await
-        .unwrap();
+        let (handle, mut agent) = self.load().await;
         agent.script(script.clone());
         let task = tokio::spawn(async move {
             let result = agent.run().await;
@@ -84,14 +91,64 @@ impl Harness {
         (handle, task)
     }
 
+    async fn load(&self) -> (AgentHandle, Agent) {
+        Agent::load(
+            self.agent,
+            self.host.clone(),
+            self.inference.clone(),
+            self.root.clone(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The agent's visible rows.
+    fn events(&self) -> Vec<Event<'static>> {
+        let read = self.db.read();
+        let created = read.agent(self.agent).unwrap().created;
+        read.agent_rows(self.agent, created)
+            .into_iter()
+            .map(|(_, record)| record.event)
+            .collect()
+    }
+
+    /// The loop's own rows.
     fn entries(&self) -> Vec<Entry> {
-        let (_, rows) = self.db.read().agent_event_records(self.agent);
-        rows.into_iter()
-            .filter_map(|(_, event)| match event {
-                AgentEvent::Entry(entry) => Some(entry),
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Native { entry, .. } => Some(entry),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Whether a person's input with `text` is still history.
+    fn received(&self, text: &str) -> bool {
+        self.events().iter().any(|event| {
+            matches!(event, Event::Input { wake: InputWake::Person, content, .. }
+                if rho_agent_types::transcript::text_content(content) == text)
+        })
+    }
+
+    /// What the model mailed the user, oldest first, with its kind.
+    fn mail(&self) -> Vec<(String, Option<SendKind>)> {
+        self.db
+            .read()
+            .mail_since(MailId(0), usize::MAX)
+            .into_iter()
+            .filter(|mail| mail.to == Address::User)
+            .map(|mail| {
+                (
+                    rho_agent_types::transcript::text_content(&mail.content),
+                    mail.kind,
+                )
+            })
+            .collect()
+    }
+
+    fn sent(&self) -> Vec<String> {
+        self.mail().into_iter().map(|(text, _)| text).collect()
     }
 
     /// The visible log, once `done` holds of it.
@@ -109,16 +166,38 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// Until the model has mailed the user `text`.
+    async fn until_sent(&self, text: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let sent = self.sent();
+            if sent.iter().any(|sent| sent == text) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the mail {text:?}: {sent:?} {:#?}",
+                self.entries()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 async fn say(handle: &AgentHandle, text: &str) {
     handle
-        .send_user_content_accepted(
-            MessageId::new(),
+        .input(
             vec![ContentPart::Text { text: text.into() }],
+            InputWake::Person,
+            None,
         )
         .await
         .unwrap();
+}
+
+fn words(text: &str) -> Vec<ContentPart> {
+    vec![ContentPart::Text { text: text.into() }]
 }
 
 /// Everything a request tells the model, besides replayed steps.
@@ -170,50 +249,14 @@ async fn requests(script: &Scripted, count: usize) -> Vec<crate::inference::Requ
     }
 }
 
-fn received(entries: &[Entry], text: &str) -> bool {
-    entries.iter().any(|entry| {
-        matches!(entry, Entry::Received { from: Party::Human, body, .. }
-            if body.iter().any(|block| matches!(block, Block::Text(t) if t == text)))
-    })
-}
-
-#[tokio::test]
-async fn draft_waits_for_the_originating_cells_actual_send() {
-    let harness = Harness::new().await;
-    let script = Arc::new(Scripted::new());
-    script.then(
-        "import asyncio\nawait asyncio.sleep(0.6)\nhuman.send('hello from cell', kind='result')",
-    );
-    let (handle, _task) = harness.start(&script).await;
-    say(&handle, "start").await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = handle.status();
-        if status.response.is_none() && status.draft.as_deref() == Some("hello from cell") {
-            break;
-        }
+async fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !done() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the completed source never remained a draft: {status:?}"
+            "timed out waiting for {what}"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    harness
-        .until("the cell's send", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "hello from cell"))
-        })
-        .await;
-    loop {
-        if handle.status().draft.is_none() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the cell's send did not withdraw its draft"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -227,14 +270,9 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let (handle, _task) = harness.start(&script).await;
 
     say(&handle, "hi").await;
-    let entries = harness
-        .until("the reply and the wait", |entries| {
-            entries.iter().any(|entry| {
-                matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "hello there")
-            }) && handle.status().runtime.awaiting_human
-        })
-        .await;
-    assert!(received(&entries, "hi"));
+    harness.until_sent("hello there").await;
+    wait_for("the wait", || handle.status().runtime.awaiting_human).await;
+    assert!(harness.received("hi"));
     let first = requests(&script, 1).await;
     assert!(told(&first[0]).contains("hi"), "{}", told(&first[0]));
     // Awaiting the human is not work: the turn is over.
@@ -254,13 +292,14 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
             .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
-    harness
-        .until("the status", |entries| {
-            entries.iter().any(|entry| {
-                matches!(entry, Entry::Sent { text, kind: SendKind::Status, .. } if text == "reading")
-            })
-        })
-        .await;
+    harness.until_sent("reading").await;
+    assert_eq!(
+        harness.mail(),
+        [
+            ("hello there".to_owned(), Some(SendKind::Result)),
+            ("reading".to_owned(), Some(SendKind::Status)),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -370,46 +409,6 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
 
 /// A client that never heard the answer sends the same message again,
 /// maybe after the worker restarted; it lands in the log once.
-#[tokio::test]
-async fn a_message_sent_again_under_its_id_is_logged_once() {
-    let harness = Harness::new().await;
-    let script = Arc::new(Scripted::new());
-    script.then("end_turn()");
-    let (handle, task) = harness.start(&script).await;
-    let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
-    let first = MessageId(11);
-    handle
-        .send_user_content_accepted(first, text("first"))
-        .await
-        .unwrap();
-    handle
-        .send_user_content_accepted(first, text("first"))
-        .await
-        .unwrap();
-    drop(handle);
-    task.await.unwrap();
-
-    let script = Arc::new(Scripted::new());
-    script.then("end_turn()");
-    let (handle, _task) = harness.start(&script).await;
-    handle
-        .send_user_content_accepted(first, text("first"))
-        .await
-        .unwrap();
-    handle
-        .send_user_content_accepted(MessageId(12), text("second"))
-        .await
-        .unwrap();
-    let received = harness
-        .entries()
-        .into_iter()
-        .filter_map(|entry| match entry {
-            Entry::Received { id, .. } => Some(id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(received, [first, MessageId(12)]);
-}
 
 #[tokio::test]
 async fn rewind_branches_before_the_last_human_message() {
@@ -443,9 +442,8 @@ async fn rewind_branches_before_the_last_human_message() {
     assert!(told.contains("rewound"), "{told}");
     assert!(told.contains("one"), "{told}");
     assert!(!told.contains("two"), "{told}");
-    let entries = harness.entries();
-    assert!(received(&entries, "one"));
-    assert!(!received(&entries, "two"), "the rewound message is hidden");
+    assert!(harness.received("one"));
+    assert!(!harness.received("two"), "the rewound message is hidden");
 }
 
 #[tokio::test]
@@ -526,13 +524,8 @@ async fn waiting_never_checks_in_and_archive_revival_has_a_fresh_notebook() {
         })
         .await;
     say(&handle, "revive").await;
-    harness
-        .until("fresh globals", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "False"))
-        })
-        .await;
+    harness.until_sent("False").await;
+    assert_eq!(harness.sent(), ["archiving", "False"]);
 }
 
 #[tokio::test]
@@ -545,13 +538,7 @@ async fn transient_failures_recover_beyond_three_attempts() {
     script.then("human.send('recovered', kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "original task").await;
-    harness
-        .until("recovered message", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "recovered"))
-        })
-        .await;
+    harness.until_sent("recovered").await;
     let attempts = script.requests();
     assert_eq!(attempts.len(), 5);
     assert!(told(&attempts[4]).contains("original task"));
@@ -621,14 +608,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
         let harness = Harness::new().await;
         let script = Arc::new(Scripted::new());
         script.then("human.send('fresh input seen', kind='result')\nend_turn()");
-        let (handle, mut agent) = Agent::load(
-            harness.agent,
-            harness.host.clone(),
-            harness.inference.clone(),
-            harness.cwd.clone(),
-        )
-        .await
-        .unwrap();
+        let (handle, mut agent) = harness.load().await;
         agent.script(script.clone());
         let mut retry = Backoff::failed(None, "temporary outage".into());
         retry.at = UnixMs::now() + Duration::from_secs(1800);
@@ -659,7 +639,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
 }
 
 #[tokio::test]
-async fn a_send_outside_simplified_technical_english_raises_and_is_not_logged() {
+async fn a_send_outside_simplified_technical_english_raises_and_is_not_mailed() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script
@@ -679,25 +659,9 @@ async fn a_send_outside_simplified_technical_english_raises_and_is_not_logged() 
         told.contains("line 1, contraction: `It's` is a contraction."),
         "{told}"
     );
-    let entries = harness
-        .until("the rewritten result", |entries| {
-            entries.iter().any(|entry| {
-                matches!(entry, Entry::Sent { to: Party::Human, text, .. } if text == "It is done.")
-            })
-        })
-        .await;
-    let sent: Vec<&str> = entries
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Sent {
-                to: Party::Human,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(sent, ["I'm reading", "It is done."]);
+    harness.until_sent("It is done.").await;
+    // A status is not held to the standard.
+    assert_eq!(harness.sent(), ["I'm reading", "It is done."]);
     drop(handle);
 }
 
@@ -706,14 +670,7 @@ async fn exhausted_retry_window_stops_without_another_request() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script.then("human.send('must not run', kind='result')");
-    let (handle, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (handle, mut agent) = harness.load().await;
     agent.script(script.clone());
     let mut retry = Backoff::failed(None, "outage".into());
     retry.since = tokio::time::Instant::now() - Backoff::WINDOW;
@@ -744,21 +701,9 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
     script.then("human.send(str(counter), kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "count once").await;
-    harness
-        .until("actual admission", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "admitted"))
-        })
-        .await;
+    harness.until_sent("admitted").await;
     admit.send(()).unwrap();
-    harness
-        .until("counter message", |entries| {
-            entries
-                .iter()
-                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "1"))
-        })
-        .await;
+    harness.until_sent("1").await;
     let attempts = script.requests();
     assert_eq!(attempts.len(), 2);
     assert!(told(&attempts[1]).contains("cut off"));
@@ -774,14 +719,7 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
 #[tokio::test]
 async fn code_fragments_wait_for_a_publication_frame() {
     let harness = Harness::new().await;
-    let (_, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (_, mut agent) = harness.load().await;
     agent.notebook().await.unwrap();
     agent.responding = true;
     agent.response_id = "response-id".into();
@@ -823,14 +761,6 @@ async fn code_fragments_wait_for_a_publication_frame() {
         rho_agents_client::protocol::transcript::Item::ToolCall { arguments, .. }
         if arguments.ends_with("# final\n"))
     );
-    agent.stream(&mut streaming, (None, "human.send('Hel".into()));
-    assert_eq!(agent.status.read().unwrap().draft, None);
-    agent.publish_stream(streaming.as_ref(), false);
-    assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hel"));
-    agent.stream(&mut streaming, (None, "lo')\n".into()));
-    assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hel"));
-    agent.publish_stream(streaming.as_ref(), false);
-    assert_eq!(agent.status.read().unwrap().draft.as_deref(), Some("Hello"));
     agent.shutdown().await.unwrap();
 }
 
@@ -886,10 +816,14 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
 /// Exercise the agent-owned boundary through the same injected session API used
 /// in production. Provider wire replay is tested independently in
 /// rho-inference.
+
+/// Exercise the agent-owned boundary through the same injected session API used
+/// in production. Provider wire replay is tested independently in
+/// rho-inference.
 #[tokio::test]
 async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() {
     use crate::inference::{Continuation, Request};
-    struct Controlled(mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Event>)>);
+    struct Controlled(mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Streamed>)>);
     impl crate::inference::Session for Controlled {
         fn start(&self, request: Request) -> Response {
             let (events, response) = mpsc::unbounded_channel();
@@ -897,9 +831,9 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
             response
         }
     }
-    fn answer(events: mpsc::UnboundedSender<Event>, id: &str) {
+    fn answer(events: mpsc::UnboundedSender<Streamed>, id: &str) {
         events
-            .send(Event::Completed(Step {
+            .send(Streamed::Completed(Step {
                 continuation: Some(Continuation::new(id.into())),
                 call: None,
                 prose: format!("ack-{id}"),
@@ -909,7 +843,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
             .unwrap();
     }
     let (submitted, mut requests) =
-        mpsc::unbounded_channel::<(Request, mpsc::UnboundedSender<Event>)>();
+        mpsc::unbounded_channel::<(Request, mpsc::UnboundedSender<Streamed>)>();
     let (reconnecting, reconnect) = oneshot::channel();
     let (resume, resumed) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -926,7 +860,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         assert_eq!(third.continuation, Some(Continuation::new("r2".into())));
         reconnecting.send(()).unwrap();
         resumed.await.unwrap();
-        events.send(Event::NeedsContext).unwrap();
+        events.send(Streamed::NeedsContext).unwrap();
         let (replay, events) = requests.recv().await.unwrap();
         assert!(replay.continuation.is_none());
         let text = format!("{:?}", replay.items);
@@ -954,23 +888,12 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         answer(events, "r4");
     });
     let harness = Harness::new().await;
-    let (handle, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (handle, mut agent) = harness.load().await;
     agent.session = Arc::new(Controlled(submitted));
     let instructions: Arc<str> = "test instructions".into();
     for text in ["first-message", "second-message"] {
         agent
-            .receive(
-                MessageId::new(),
-                Party::Human,
-                vec![Block::Text(text.into())],
-            )
+            .receive(words(text), InputWake::Person, None)
             .await
             .unwrap();
         agent
@@ -983,18 +906,14 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         );
     }
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("third-message".into())],
-        )
+        .receive(words("third-message"), InputWake::Person, None)
         .await
         .unwrap();
     let control = async {
         reconnect.await.unwrap();
         handle.compact();
         handle
-            .send_agent_message_accepted(harness.agent, "late-message")
+            .input(words("late-message"), InputWake::Agent, None)
             .await
             .unwrap();
         resume.send(()).unwrap();
@@ -1026,19 +945,11 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script.then_transient().then("end_turn()");
-    let (_handle, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (_handle, mut agent) = harness.load().await;
     agent.script(script.clone());
     agent.notebook().await.unwrap();
     agent
         .append(Entry::Step {
-            at: UnixMs::now(),
             exec: Some("pass".into()),
             prose: String::new(),
             usage: None,
@@ -1047,11 +958,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .await
         .unwrap();
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("initial-message".into())],
-        )
+        .receive(words("initial-message"), InputWake::Person, None)
         .await
         .unwrap();
     let first = Report {
@@ -1065,11 +972,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     assert!(agent.backoff.is_some());
 
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("arrived-after-failure".into())],
-        )
+        .receive(words("arrived-after-failure"), InputWake::Person, None)
         .await
         .unwrap();
     let second = Report {
@@ -1108,7 +1011,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .entries()
         .into_iter()
         .filter_map(|entry| match entry {
-            Entry::RequestSent { report, .. } => Some(report.render().text),
+            Entry::RequestSent { report, .. } => Some(report.render(false).text),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1117,62 +1020,38 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
 }
 
 #[tokio::test]
-async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compaction() {
+async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     let harness = Harness::new().await;
-    let (_, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (_, mut agent) = harness.load().await;
     // These recovery facts precede the retained replay range.
     agent
         .append(Entry::Notice {
-            at: UnixMs(1),
             notice: Notice::FreshNotebook,
         })
         .await
         .unwrap();
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("old-discarded".into())],
-        )
+        .receive(words("old-discarded"), InputWake::Person, None)
         .await
         .unwrap();
     agent
-        .append(Entry::CompactionTrigger {
-            at: UnixMs(3),
-            manual: false,
-        })
+        .append(Entry::CompactionTrigger { manual: false })
         .await
         .unwrap();
     agent
         .append(Entry::RequestSent {
-            at: UnixMs(4),
             why: Wake::Compaction,
             compact: true,
-            report: Report {
-                messages: agent.unread.iter().map(|(id, _, _)| *id).collect(),
-                ..Report::default()
-            },
+            report: Report::default(),
         })
         .await
         .unwrap();
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("during-compaction".into())],
-        )
+        .receive(words("during-compaction"), InputWake::Person, None)
         .await
         .unwrap();
     agent
         .append(Entry::Step {
-            at: UnixMs(5),
             exec: None,
             prose: String::new(),
             usage: None,
@@ -1181,36 +1060,27 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
         .await
         .unwrap();
     agent
-        .receive(
-            MessageId::new(),
-            Party::Agent(harness.agent),
-            vec![Block::Text("after-compaction".into())],
-        )
+        .receive(words("after-compaction"), InputWake::Agent, None)
         .await
         .unwrap();
     agent.shutdown().await.unwrap();
     drop(agent);
 
-    let (_, mut agent) = Agent::load(
-        harness.agent,
-        harness.host.clone(),
-        harness.inference.clone(),
-        harness.cwd.clone(),
-    )
-    .await
-    .unwrap();
+    let (_, mut agent) = harness.load().await;
     assert!(agent.restarted);
     assert!(
         agent.compaction.reply,
         "automatic compaction still owes a reply"
     );
+    assert!(agent.compaction_owed, "the compaction's texts are owed");
     assert_eq!(
         agent
             .unread
             .iter()
-            .map(|(_, from, _)| *from)
+            .map(|(wake, _)| *wake)
             .collect::<Vec<_>>(),
-        [Party::Human, Party::Agent(harness.agent)]
+        [InputWake::Person, InputWake::Agent],
+        "the inputs after the compacting request are unread"
     );
 
     // Freeze while persistence is blocked. A later request and compaction must
@@ -1219,40 +1089,27 @@ async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compacti
     let write = harness.db.write().await;
     agent
         .append(Entry::RequestSent {
-            at: UnixMs(6),
             why: Wake::Message,
             compact: false,
-            report: Report {
-                messages: agent.unread.iter().map(|(id, _, _)| *id).collect(),
-                ..Report::default()
-            },
+            report: Report::default(),
         })
         .await
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .receive(
-            MessageId::new(),
-            Party::Human,
-            vec![Block::Text("too-late".into())],
-        )
+        .receive(words("too-late"), InputWake::Person, None)
         .await
         .unwrap();
     agent
         .append(Entry::RequestSent {
-            at: UnixMs(7),
             why: Wake::Compaction,
             compact: true,
-            report: Report {
-                messages: vec![agent.unread.last().unwrap().0],
-                ..Report::default()
-            },
+            report: Report::default(),
         })
         .await
         .unwrap();
     agent
         .append(Entry::Step {
-            at: UnixMs(8),
             exec: None,
             prose: String::new(),
             usage: None,
@@ -1295,54 +1152,89 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
 
 /// A loaded skill is shown when loaded, shown again as it reads then after
 /// a compaction, and not repeated on requests in between or after.
+
+/// A compaction owes the model what policy gives back: the texts are quiet
+/// inputs logged after the compaction and before the next request, which
+/// tells them to the model once.
 #[tokio::test]
-async fn a_loaded_skill_comes_back_after_a_compaction() {
+async fn a_compaction_is_followed_by_the_policys_texts_once() {
     let harness = Harness::new().await;
-    let skill = harness.cwd.join("review");
-    std::fs::create_dir(&skill).unwrap();
-    std::fs::write(
-        skill.join("SKILL.md"),
-        "---\nname: review\n---\nVerdict v1.\n",
-    )
-    .unwrap();
+    let restored = format!("Kept after compaction: {}", harness.agent.encoded());
     let script = Arc::new(Scripted::new());
     script
-        // The skill changes on disk right after it is loaded.
-        .then(&format!(
-            "skills.load({:?})\nopen({:?}, 'w').write('---\\nname: review\\n---\\nVerdict v2.\\n')",
-            skill.join("SKILL.md").as_str(),
-            skill.join("SKILL.md").as_str(),
-        ))
+        .then("pass")
         .then_compaction()
+        .then("end_turn()")
         .then("end_turn()")
         .then("end_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "hi").await;
-    let loaded = requests(&script, 2).await;
-    let shown = told_new(&loaded[1]);
-    assert!(shown.contains("Verdict v1."), "{shown}");
-    assert!(!shown.contains("Your loaded skills"), "{shown}");
-    assert_eq!(
-        harness.db.read().get_agent(harness.agent).skills,
-        [crate::log::SkillDir::new(skill.clone()).unwrap()],
+    requests(&script, 2).await;
+    harness
+        .until("the compaction", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+        })
+        .await;
+    assert!(
+        !told(&script.requests()[1]).contains(&restored),
+        "nothing is restored before a compaction"
     );
 
     say(&handle, "after").await;
-    let compacted = requests(&script, 3).await;
-    let after = told_new(&compacted[2]);
-    assert!(after.contains("after"), "{after}");
-    assert!(after.contains("Your loaded skills"), "{after}");
-    assert!(after.contains("Verdict v2."), "{after}");
-    assert!(!after.contains("Verdict v1."), "{after}");
-    harness
-        .until("the turn to end", |_| {
-            handle.status().runtime.awaiting_human
+    let all = requests(&script, 3).await;
+    let after = told_new(&all[2]);
+    assert!(after.contains(&restored), "{after}");
+    // In the log: compaction, then the quiet input, then the request that
+    // delivers it.
+    let events = harness.events();
+    let compacted = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::Native { entry: Entry::Step { carry, .. }, .. } if carry.has_compaction())
         })
-        .await;
+        .unwrap();
+    let quiet = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::Input { wake: InputWake::Quiet, content, .. }
+                if rho_agent_types::transcript::text_content(content) == restored)
+        })
+        .expect("the restored text is a quiet input");
+    let delivered = events[compacted..]
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                Event::Native {
+                    entry: Entry::RequestSent { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        + compacted;
+    assert!(compacted < quiet && quiet < delivered, "{events:#?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::Input {
+                    wake: InputWake::Quiet,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "restored once"
+    );
+    wait_for("the turn to end", || handle.status().runtime.awaiting_human).await;
 
     say(&handle, "again").await;
     let all = requests(&script, 4).await;
-    let later = told_new(&all[3]);
+    let later = told_new(all.last().unwrap());
     assert!(later.contains("again"), "{later}");
-    assert!(!later.contains("Your loaded skills"), "{later}");
+    assert!(!later.contains(&restored), "{later}");
 }
