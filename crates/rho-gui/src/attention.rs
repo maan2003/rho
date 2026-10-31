@@ -323,7 +323,15 @@ impl Workspace {
             LedgerEvent::Appended(mut items) => {
                 items.retain(|item| matches!(item.channel, Channel::Facts));
                 let touched = self.attention.marks.apply(read_entries(&items));
+                // What another device said about an agent may settle the
+                // topics a migrated host made of it.
+                let about_agents = touched
+                    .iter()
+                    .any(|node| matches!(node, NodeId::Agent(_) | NodeId::Mail(_)));
                 self.marks_moved(touched, cx);
+                if about_agents {
+                    self.settle_migrated_topics(cx);
+                }
             }
             LedgerEvent::Note(arrived) => {
                 let Some(theirs) = NoteRev::decode(&arrived.plain) else {
@@ -460,6 +468,7 @@ impl Workspace {
         let session = self.slack.session().map(|session| session.read(cx));
         let sources = Sources {
             agents: &self.registry,
+            chat: &self.chat,
             slack: session.map(|session| rank::Slack {
                 model: session.model(),
                 mirror: session.mirror(),
@@ -556,7 +565,7 @@ impl Workspace {
             return card;
         }
         let kind = match node {
-            NodeId::Mail(_) => CardKind::Mail,
+            NodeId::Topic(_) => CardKind::Topic,
             NodeId::Slack(_) => CardKind::Slack,
             _ => CardKind::Dated,
         };
@@ -619,11 +628,11 @@ impl Workspace {
     /// How far the user has seen `node`: everything its source has now.
     pub(crate) fn seen(&self, node: &NodeId, cx: &gpui::App) -> Seen {
         match node {
-            NodeId::Mail(thread) => Seen::Mail(
-                self.registry
-                    .agent_digest(thread.agent)
-                    .and_then(|digest| digest.threads.get(&thread.thread))
-                    .map_or(0, |digest| digest.newest.0),
+            NodeId::Topic(topic) => Seen::Topic(
+                self.chat
+                    .topic(*topic)
+                    .and_then(|(_, topic)| topic.newest)
+                    .map_or(0, |(newest, _)| newest.0.0),
             ),
             NodeId::Slack(unit) => self
                 .slack

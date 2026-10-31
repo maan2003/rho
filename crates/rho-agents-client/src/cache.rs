@@ -1,55 +1,69 @@
-//! The client's own copy of what agent hosts told it: every host's mail
+//! The client's own copy of what agent hosts told it: every host's chat
 //! log and its cursor, the agent directory, and the workset rows of the
 //! transcripts the user opened.
 //!
 //! The rails are not folded from the network at startup: what an agent is
-//! and its mail are read back from here, so the GUI comes up already
-//! knowing them and asks a host only for the mail after its cursor. A
-//! workset's rows are kept once read, so opening a transcript again asks
-//! only for the rows after them.
+//! and each host's chat are read back from here, so the GUI comes up
+//! already knowing them and asks a host only for the chat after its
+//! cursor. A workset's rows are kept once read, so opening a transcript
+//! again asks only for the rows after them.
 //!
 //! It is a copy, never a source, except for what the user said that no
-//! host has: their unsent mail and their drafts. Anything
-//! else doubted is thrown away and asked for again from the start.
+//! host has: their unsent messages and their drafts. Anything else doubted
+//! is thrown away and asked for again from the start.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_types::{Address, AgentId, Mail, MailId, ThreadId, Wpos};
+use rho_agent_types::{AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, TopicId, Wpos};
 use rho_db::{RhoDb, Sen, SenValue};
 
-use crate::fold::{AgentIdentity, Digest};
+use crate::chat::HostTopic;
+use crate::fold::AgentIdentity;
 use crate::outbox::Outgoing;
 use crate::protocol::worksets::LogEvent;
 
-/// Where this client stands in a host's mail log, by the host's name. The
+/// Where this client stands in a host's chat log, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the cursor
 /// counts in; an agent host with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_host_v1");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_chat_host_v1");
 /// The directory as each host last told it.
 const AGENTS: TableDefinition<AgentId, Sen<StoredAgent>> = TableDefinition::new("gui_agent_v1");
-/// Every mail, under each agent it is from or to, in log order: a range
-/// read gives one agent's conversation and nothing else. Mail between two
-/// agents is kept under both.
-const MAIL: TableDefinition<(AgentId, u64), Sen<Mail>> = TableDefinition::new("gui_mail_v1");
+/// Every chat event but a message, by host and position: the streams,
+/// the topics and who joined them.
+const CHAT: TableDefinition<(&str, u64), Sen<ChatRecord>> = TableDefinition::new("gui_chat_v1");
+/// Every message, by host, topic and position: a range read gives one
+/// topic and nothing else.
+const MESSAGES: TableDefinition<(&str, u64, u64), Sen<ChatRecord>> =
+    TableDefinition::new("gui_chat_message_v1");
+/// The messages each agent posted or received, by agent and position,
+/// with the topic each is in: what its transcript reads. Written with the
+/// messages, as the fold decided who they reached.
+const DELIVERED: TableDefinition<(AgentId, u64), u64> = TableDefinition::new("gui_chat_agent_v1");
 /// The rows of each agent whose transcript was opened, by position.
 const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
     TableDefinition::new("gui_agent_rows_v1");
-/// What the user wrote that no host has taken yet, by agent and the id
-/// the client gave it. The user's own words, with no copy anywhere else:
-/// never dropped to be asked for again.
-const OUTBOX: TableDefinition<(AgentId, u64), Sen<Outgoing>> =
-    TableDefinition::new("gui_agent_outbox_v1");
-/// What the user is writing in each mail thread and has not sent, by agent
-/// and thread id. Sending moves it to the outbox in the same write, so a
-/// message is never in both or in neither.
-const DRAFTS: TableDefinition<(AgentId, u64), &str> = TableDefinition::new("gui_thread_draft_v1");
+/// What the user wrote that no host has taken yet, by the database of the
+/// host it goes to and the id the client gave it. The user's own words,
+/// with no copy anywhere else: never dropped to be asked for again.
+const OUTBOX: TableDefinition<(u64, u64), Sen<Outgoing>> =
+    TableDefinition::new("gui_chat_outbox_v1");
+/// What the user is writing in each topic and has not sent, by the
+/// topic's host database and id. Sending moves it to the outbox in the
+/// same write, so a message is never in both or in neither.
+const DRAFTS: TableDefinition<(u64, u64), &str> = TableDefinition::new("gui_topic_draft_v1");
 
-/// Tables nothing reads: the per-agent journal mirror the workset log replaced,
-/// and its retired formats. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 38] = [
+/// Tables nothing reads: the per-agent journal mirror the workset log
+/// replaced, the mail the chat replaced, and their retired formats.
+/// Dropped on open, every open. The mail outbox (`gui_agent_outbox_v1`)
+/// and thread drafts (`gui_thread_draft_v1`) are the user's words and
+/// stay where they are, unread.
+const RETIRED_TABLES: [&str; 40] = [
+    // Mail, which the chat replaced; the host keeps all of it as chat.
+    "gui_host_v1",
+    "gui_mail_v1",
     // The rows of whole worksets; a transcript reads its agent's alone.
     "gui_workset_rows_v1",
     // A copy of the dealer's marks per agent, which only agent cards read.
@@ -96,8 +110,8 @@ const RETIRED_TABLES: [&str; 38] = [
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub(crate) struct StoredHost {
     machine_seed: u64,
-    /// The newest mail held.
-    mail: MailId,
+    /// The newest chat event held.
+    chat: ChatSeq,
 }
 
 /// One host as the copy holds it.
@@ -105,8 +119,8 @@ pub(crate) struct StoredHost {
 pub struct MirroredHost {
     pub name: String,
     pub machine_seed: u64,
-    /// The newest mail this client holds; what `FollowMail` sends.
-    pub mail: MailId,
+    /// The newest chat event this client holds; what `FollowChat` sends.
+    pub chat: ChatSeq,
 }
 
 /// One agent of the directory as the copy keeps it.
@@ -117,13 +131,12 @@ pub struct StoredAgent {
     pub identity: AgentIdentity,
 }
 
-/// One agent as the copy holds it: whose it is, what it is, and what its
-/// mail folds to.
+/// One agent as the copy holds it: whose it is and what it is. What its
+/// messages fold to is folded again from the chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedAgent {
     pub host: String,
     pub identity: AgentIdentity,
-    pub digest: Digest,
 }
 
 #[derive(Default)]
@@ -138,26 +151,28 @@ enum Write {
         host: String,
         machine_seed: u64,
     },
-    /// A run of a host's mail log, and the cursor it moves to. One
-    /// transaction, so the cursor never claims mail that is not there.
-    Mail {
+    /// A run of a host's chat log, who each message reached, and the
+    /// cursor it moves to. One transaction, so the cursor never claims
+    /// events that are not there.
+    Chat {
         host: String,
-        through: MailId,
-        mails: Vec<Mail>,
+        through: ChatSeq,
+        records: Vec<ChatRecord>,
+        delivered: Vec<(AgentId, MessageId, TopicId)>,
     },
     /// Directory entries as they now stand.
     Agents(Vec<(AgentId, StoredAgent)>),
-    /// Agents gone from their host's directory, with their mail.
+    /// Agents gone from their host's directory, with what they received.
     Forget(Vec<AgentId>),
     Rows {
         agent: AgentId,
         rows: Vec<(Wpos, LogEvent)>,
     },
     /// A message kept until its host takes it, or `None` once it has.
-    /// A new one was its thread's draft, which goes with it.
-    Outgoing(AgentId, u64, Option<Outgoing>),
-    /// A thread's draft as it stands; empty drops it.
-    Draft(AgentId, ThreadId, String),
+    /// A new one in a topic was the topic's draft, which goes with it.
+    Outgoing(u64, u64, Option<Outgoing>),
+    /// A topic's draft as it stands; empty drops it.
+    Draft(HostTopic, String),
     /// Everything heard from a host, gone: its agent host has another
     /// database.
     Reset(String),
@@ -204,7 +219,9 @@ impl Mirror {
             let mut write = db.write().await;
             open_or_rebuild(&mut write, HOSTS);
             open_or_rebuild(&mut write, AGENTS);
-            open_or_rebuild(&mut write, MAIL);
+            open_or_rebuild(&mut write, CHAT);
+            open_or_rebuild(&mut write, MESSAGES);
+            open_or_rebuild(&mut write, DELIVERED);
             open_or_rebuild(&mut write, ROWS);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
@@ -226,9 +243,9 @@ impl Mirror {
         })
     }
 
-    /// Every host's cursor and every agent, its mail folded: what the GUI
-    /// starts from. No workset rows; those are read when a transcript
-    /// opens.
+    /// Every host's cursor and every agent: what the GUI starts from. No
+    /// chat, which is read a host at a time as each attaches, and no
+    /// workset rows, which are read when a transcript opens.
     pub fn load(&self) -> Loaded {
         let read = self.db.read();
         let hosts = read
@@ -239,38 +256,70 @@ impl Mirror {
                 MirroredHost {
                     name: key.value().to_owned(),
                     machine_seed: stored.machine_seed,
-                    mail: stored.mail,
+                    chat: stored.chat,
                 }
             })
             .collect();
-        let mail = read.open_table(MAIL);
         let agents = read
             .open_table(AGENTS)
             .iter()
-            .map(|(key, value)| {
-                let agent_id = key.value();
+            .map(|(_, value)| {
                 let stored = value.value().into_owned();
-                let mut digest = Digest::default();
-                for (_, mail) in mail.range((agent_id, 0)..=(agent_id, u64::MAX)) {
-                    digest.tell(agent_id, &mail.value().into_owned());
-                }
                 LoadedAgent {
                     host: stored.host,
                     identity: stored.identity,
-                    digest,
                 }
             })
             .collect();
         Loaded { hosts, agents }
     }
 
-    /// One agent's mail, oldest first, for the transcript a reader opens.
-    pub fn read_mail(&self, agent_id: AgentId) -> Vec<Mail> {
+    /// A host's whole chat log: every event but the messages in log order,
+    /// then the messages a topic at a time, each topic's oldest first.
+    pub fn read_chat(&self, host: &str) -> Vec<ChatRecord> {
+        let read = self.db.read();
+        let mut records = read
+            .open_table(CHAT)
+            .range((host, 0)..=(host, u64::MAX))
+            .map(|(_, value)| value.value().into_owned())
+            .collect::<Vec<_>>();
+        records.extend(
+            read.open_table(MESSAGES)
+                .range((host, 0, 0)..=(host, u64::MAX, u64::MAX))
+                .map(|(_, value)| value.value().into_owned()),
+        );
+        records
+    }
+
+    /// One topic's messages, oldest first, for the reader that opens it.
+    pub fn read_topic(&self, host: &str, topic: TopicId) -> Vec<Message> {
+        let topic = topic.0.0;
         self.db
             .read()
-            .open_table(MAIL)
+            .open_table(MESSAGES)
+            .range((host, topic, 0)..=(host, topic, u64::MAX))
+            .filter_map(|(_, value)| Message::from_record(&value.value().into_owned()))
+            .collect()
+    }
+
+    /// The messages an agent posted or received, oldest first, for its
+    /// transcript.
+    pub fn read_agent_messages(&self, agent_id: AgentId) -> Vec<Message> {
+        let read = self.db.read();
+        let Some(host) = read
+            .open_table(AGENTS)
+            .get(agent_id)
+            .map(|stored| stored.value().into_owned().host)
+        else {
+            return Vec::new();
+        };
+        let messages = read.open_table(MESSAGES);
+        read.open_table(DELIVERED)
             .range((agent_id, 0)..=(agent_id, u64::MAX))
-            .map(|(_, value)| value.value().into_owned())
+            .filter_map(|(key, topic)| {
+                let record = messages.get((host.as_str(), topic.value(), key.value().1))?;
+                Message::from_record(&record.value().into_owned())
+            })
             .collect()
     }
 
@@ -295,26 +344,34 @@ impl Mirror {
             .map_or(Wpos::ZERO, |(key, _)| Wpos(key.value().1).next())
     }
 
-    pub fn read_drafts(&self) -> Vec<(AgentId, ThreadId, String)> {
+    pub fn read_drafts(&self) -> Vec<(HostTopic, String)> {
         self.db
             .read()
             .open_table(DRAFTS)
             .iter()
             .map(|(key, value)| {
-                let (agent_id, thread) = key.value();
-                (agent_id, ThreadId(MailId(thread)), value.value().to_owned())
+                let (machine_seed, topic) = key.value();
+                (
+                    HostTopic {
+                        machine_seed,
+                        topic: TopicId(ChatSeq(topic)),
+                    },
+                    value.value().to_owned(),
+                )
             })
             .collect()
     }
 
-    pub fn read_outbox(&self) -> Vec<(AgentId, u64, Outgoing)> {
+    /// Every unsent message, by the database of the host it goes to and
+    /// its client id.
+    pub fn read_outbox(&self) -> Vec<(u64, u64, Outgoing)> {
         self.db
             .read()
             .open_table(OUTBOX)
             .iter()
             .map(|(key, value)| {
-                let (agent_id, id) = key.value();
-                (agent_id, id, value.value().into_owned())
+                let (machine_seed, id) = key.value();
+                (machine_seed, id, value.value().into_owned())
             })
             .collect()
     }
@@ -374,17 +431,6 @@ fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     }
 }
 
-/// The agents a mail is kept under.
-fn parties(mail: &Mail) -> impl Iterator<Item = AgentId> {
-    let agent = |address| match address {
-        Address::Agent(agent) => Some(agent),
-        Address::User => None,
-    };
-    let from = agent(mail.from);
-    let to = agent(mail.to).filter(|to| Some(*to) != from);
-    from.into_iter().chain(to)
-}
-
 fn apply(
     transaction: &mut rho_db::WriteTxn,
     write: Write,
@@ -393,27 +439,46 @@ fn apply(
     match write {
         Write::Host { host, machine_seed } => {
             let mut hosts = transaction.open_table(HOSTS);
-            let mail = hosts
+            let chat = hosts
                 .get(host.as_str())
                 .map(|stored| stored.value().into_owned())
                 .filter(|stored| stored.machine_seed == machine_seed)
-                .map_or(MailId::default(), |stored| stored.mail);
+                .map_or(ChatSeq::ZERO, |stored| stored.chat);
             hosts.insert(
                 host.as_str(),
-                SenValue::borrowed(&StoredHost { machine_seed, mail }),
+                SenValue::borrowed(&StoredHost { machine_seed, chat }),
             );
         }
-        Write::Mail {
+        Write::Chat {
             host,
             through,
-            mails,
+            records,
+            delivered,
         } => {
+            let (posted, events): (Vec<_>, Vec<_>) = records
+                .iter()
+                .partition(|record| matches!(record.event, ChatEvent::Posted { .. }));
             {
-                let mut table = transaction.open_table(MAIL);
-                for mail in &mails {
-                    for agent in parties(mail) {
-                        table.insert((agent, mail.id.0), SenValue::borrowed(mail));
+                let mut chat = transaction.open_table(CHAT);
+                for record in events {
+                    chat.insert((host.as_str(), record.seq.0), SenValue::borrowed(record));
+                }
+            }
+            {
+                let mut messages = transaction.open_table(MESSAGES);
+                for record in posted {
+                    if let ChatEvent::Posted { topic, .. } = &record.event {
+                        messages.insert(
+                            (host.as_str(), topic.0.0, record.seq.0),
+                            SenValue::borrowed(record),
+                        );
                     }
+                }
+            }
+            {
+                let mut table = transaction.open_table(DELIVERED);
+                for (agent_id, message, topic) in &delivered {
+                    table.insert((*agent_id, message.0.0), topic.0.0);
                 }
             }
             let mut hosts = transaction.open_table(HOSTS);
@@ -421,7 +486,7 @@ fn apply(
                 .get(host.as_str())
                 .map(|stored| stored.value().into_owned())
             {
-                stored.mail = stored.mail.max(through);
+                stored.chat = stored.chat.max(through);
                 hosts.insert(host.as_str(), SenValue::borrowed(&stored));
             }
         }
@@ -442,29 +507,53 @@ fn apply(
                 table.insert((agent, pos.0), SenValue::borrowed(event));
             }
         }
-        Write::Outgoing(agent_id, id, Some(outgoing)) => {
+        Write::Outgoing(machine_seed, id, Some(outgoing)) => {
             transaction
                 .open_table(OUTBOX)
-                .insert((agent_id, id), SenValue::borrowed(&outgoing));
-            if let Some(thread) = outgoing.thread {
+                .insert((machine_seed, id), SenValue::borrowed(&outgoing));
+            if let crate::outbox::Destination::Topic(topic) = outgoing.to {
                 transaction
                     .open_table(DRAFTS)
-                    .remove((agent_id, thread.0.0));
+                    .remove((machine_seed, topic.0.0));
             }
         }
-        Write::Outgoing(agent_id, id, None) => {
-            transaction.open_table(OUTBOX).remove((agent_id, id));
+        Write::Outgoing(machine_seed, id, None) => {
+            transaction.open_table(OUTBOX).remove((machine_seed, id));
         }
-        Write::Draft(agent_id, thread, text) => {
+        Write::Draft(topic, text) => {
             let mut table = transaction.open_table(DRAFTS);
+            let key = (topic.machine_seed, topic.topic.0.0);
             if text.is_empty() {
-                table.remove((agent_id, thread.0.0));
+                table.remove(key);
             } else {
-                table.insert((agent_id, thread.0.0), text.as_str());
+                table.insert(key, text.as_str());
             }
         }
         Write::Reset(host) => {
             transaction.open_table(HOSTS).remove(host.as_str());
+            {
+                let mut chat = transaction.open_table(CHAT);
+                let held = chat
+                    .range((host.as_str(), 0)..=(host.as_str(), u64::MAX))
+                    .map(|(key, _)| key.value().1)
+                    .collect::<Vec<_>>();
+                for seq in held {
+                    chat.remove((host.as_str(), seq));
+                }
+            }
+            {
+                let mut messages = transaction.open_table(MESSAGES);
+                let held = messages
+                    .range((host.as_str(), 0, 0)..=(host.as_str(), u64::MAX, u64::MAX))
+                    .map(|(key, _)| {
+                        let (_, topic, seq) = key.value();
+                        (topic, seq)
+                    })
+                    .collect::<Vec<_>>();
+                for (topic, seq) in held {
+                    messages.remove((host.as_str(), topic, seq));
+                }
+            }
             let departed = transaction
                 .open_table(AGENTS)
                 .iter()
@@ -479,18 +568,20 @@ fn apply(
     }
 }
 
-/// Only host-owned copies go away. Drafts and outbox have no other copy.
+/// Only host-owned copies go away: the agent, what reached it, and its
+/// rows. Drafts and outbox have no other copy, and the messages stay with
+/// their topics.
 fn forget_agent(transaction: &mut rho_db::WriteTxn, agent_id: AgentId) {
     transaction.open_table(AGENTS).remove(agent_id);
-    let mut mail = transaction.open_table(MAIL);
-    let held = mail
+    let mut delivered = transaction.open_table(DELIVERED);
+    let held = delivered
         .range((agent_id, 0)..=(agent_id, u64::MAX))
         .map(|(key, _)| key.value())
         .collect::<Vec<_>>();
     for key in held {
-        mail.remove(key);
+        delivered.remove(key);
     }
-    drop(mail);
+    drop(delivered);
     let mut rows = transaction.open_table(ROWS);
     let held = rows
         .range((agent_id, 0)..=(agent_id, u64::MAX))
@@ -579,8 +670,16 @@ pub fn load() -> Loaded {
     read(Mirror::load)
 }
 
-pub fn read_mail(agent_id: AgentId) -> Vec<Mail> {
-    read(|mirror| mirror.read_mail(agent_id))
+pub fn read_chat(host: &str) -> Vec<ChatRecord> {
+    read(|mirror| mirror.read_chat(host))
+}
+
+pub fn read_topic(host: &str, topic: TopicId) -> Vec<Message> {
+    read(|mirror| mirror.read_topic(host, topic))
+}
+
+pub fn read_agent_messages(agent_id: AgentId) -> Vec<Message> {
+    read(|mirror| mirror.read_agent_messages(agent_id))
 }
 
 pub fn read_rows(agent: AgentId) -> Vec<(Wpos, LogEvent)> {
@@ -598,11 +697,17 @@ pub fn write_host(host: &str, machine_seed: u64) {
     });
 }
 
-pub fn write_mail(host: &str, through: MailId, mails: Vec<Mail>) {
-    send(Write::Mail {
+pub fn write_chat(
+    host: &str,
+    through: ChatSeq,
+    records: Vec<ChatRecord>,
+    delivered: Vec<(AgentId, MessageId, TopicId)>,
+) {
+    send(Write::Chat {
         host: host.to_owned(),
         through,
-        mails,
+        records,
+        delivered,
     });
 }
 
@@ -624,19 +729,19 @@ pub fn write_rows(agent: AgentId, rows: Vec<(Wpos, LogEvent)>) {
     }
 }
 
-pub fn write_outgoing(agent_id: AgentId, id: u64, outgoing: Option<Outgoing>) {
-    send(Write::Outgoing(agent_id, id, outgoing));
+pub fn write_outgoing(machine_seed: u64, id: u64, outgoing: Option<Outgoing>) {
+    send(Write::Outgoing(machine_seed, id, outgoing));
 }
 
-pub fn write_draft(agent_id: AgentId, thread: ThreadId, text: String) {
-    send(Write::Draft(agent_id, thread, text));
+pub fn write_draft(topic: HostTopic, text: String) {
+    send(Write::Draft(topic, text));
 }
 
-pub fn read_drafts() -> Vec<(AgentId, ThreadId, String)> {
+pub fn read_drafts() -> Vec<(HostTopic, String)> {
     read(Mirror::read_drafts)
 }
 
-pub fn read_outbox() -> Vec<(AgentId, u64, Outgoing)> {
+pub fn read_outbox() -> Vec<(u64, u64, Outgoing)> {
     read(Mirror::read_outbox)
 }
 
@@ -652,10 +757,12 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{ContentPart, InputWake, SendKind, UnixMs, WorksetId};
+    use rho_agent_types::{
+        Address, ContentPart, InputWake, Mention, MentionKind, StreamId, UnixMs, WorksetId,
+    };
 
     use super::*;
-    use crate::fold::Said;
+    use crate::outbox::Destination;
     use crate::protocol::transcript::RuntimeKind;
     use crate::protocol::worksets::{AgentEntry, SpecView};
 
@@ -687,33 +794,65 @@ mod tests {
         }
     }
 
-    fn mail(id: u64, from: Address, to: Address, kind: Option<SendKind>) -> Mail {
-        Mail {
-            id: MailId(id),
-            at: UnixMs(id),
-            from,
-            to,
-            thread: rho_agent_types::ThreadId(MailId(id)),
-            kind,
-            content: vec![ContentPart::Text {
-                text: format!("mail {id}"),
-            }],
+    fn record(seq: u64, event: ChatEvent) -> ChatRecord {
+        ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(seq),
+            event,
         }
+    }
+
+    fn topic(seq: u64) -> TopicId {
+        TopicId(ChatSeq(seq))
+    }
+
+    fn started(seq: u64, agents: Vec<AgentId>) -> ChatRecord {
+        record(
+            seq,
+            ChatEvent::TopicStarted {
+                stream: StreamId(ChatSeq(1)),
+                name: format!("topic {seq}"),
+                by: Address::User,
+                agents,
+            },
+        )
+    }
+
+    fn posted(seq: u64, topic_seq: u64, from: Address) -> ChatRecord {
+        record(
+            seq,
+            ChatEvent::Posted {
+                topic: topic(topic_seq),
+                from,
+                mentions: vec![Mention {
+                    to: Address::User,
+                    kind: MentionKind::Ask,
+                }],
+                content: vec![ContentPart::Text {
+                    text: format!("message {seq}"),
+                }],
+            },
+        )
     }
 
     fn input(agent: AgentId) -> LogEvent {
         LogEvent::Input {
             agent,
-            mail: None,
+            message: None,
             text: "go".into(),
             wake: InputWake::Quiet,
             at: UnixMs(1),
         }
     }
 
+    fn ids(messages: &[Message]) -> Vec<u64> {
+        messages.iter().map(|message| message.id.0.0).collect()
+    }
+
     /// What the copy reads back is what it was told: the cursor, the
-    /// directory, each agent's conversation folded, mail between agents
-    /// under both, and a workset's rows with where reading goes on.
+    /// directory, the chat a topic at a time with the events that made the
+    /// topics first, each topic's messages alone, what each agent posted
+    /// or received, and a workset's rows with where reading goes on.
     #[test]
     fn a_restart_reads_back_what_was_heard() {
         let dir = tempfile::tempdir().unwrap();
@@ -728,12 +867,22 @@ mod tests {
                 (a, stored(a, "fern", workset(1))),
                 (b, stored(b, "fern", workset(1))),
             ]));
-            mirror.send(Write::Mail {
+            mirror.send(Write::Chat {
                 host: "fern".into(),
-                through: MailId(5),
-                mails: vec![
-                    mail(3, Address::Agent(a), Address::User, Some(SendKind::Ask)),
-                    mail(5, Address::Agent(a), Address::Agent(b), None),
+                through: ChatSeq(6),
+                records: vec![
+                    record(1, ChatEvent::StreamCreated { name: "rho".into() }),
+                    started(2, vec![a]),
+                    started(3, vec![b]),
+                    // Interleaved in the log, kept apart by topic.
+                    posted(4, 3, Address::Agent(b)),
+                    posted(5, 2, Address::Agent(a)),
+                    posted(6, 3, Address::User),
+                ],
+                delivered: vec![
+                    (b, MessageId(ChatSeq(4)), topic(3)),
+                    (a, MessageId(ChatSeq(5)), topic(2)),
+                    (b, MessageId(ChatSeq(6)), topic(3)),
                 ],
             });
             mirror.send(Write::Rows {
@@ -749,33 +898,21 @@ mod tests {
             vec![MirroredHost {
                 name: "fern".into(),
                 machine_seed: 9,
-                mail: MailId(5),
+                chat: ChatSeq(6),
             }]
         );
-        let digest_of = |agent| {
-            loaded
-                .agents
-                .iter()
-                .find(|loaded| loaded.identity.agent_id() == agent)
-                .map(|loaded| loaded.digest.clone())
-                .expect("the agent is held")
-        };
-        let wants = digest_of(a)
-            .threads
-            .values()
-            .filter_map(|thread| thread.wants.map(|wanting| wanting.said))
+        assert_eq!(loaded.agents.len(), 2);
+        let order = mirror
+            .read_chat("fern")
+            .iter()
+            .map(|record| record.seq.0)
             .collect::<Vec<_>>();
-        assert_eq!(wants, [Said::Ask], "its mail to the user, folded");
-        assert!(
-            digest_of(b).threads.is_empty(),
-            "mail between agents is no thread"
-        );
-        assert_eq!(mirror.read_mail(a).len(), 2);
-        assert_eq!(
-            mirror.read_mail(b).len(),
-            1,
-            "mail between agents is under both"
-        );
+        assert_eq!(order, [1, 2, 3, 5, 4, 6], "a topic at a time");
+        assert!(mirror.read_chat("oak").is_empty());
+        assert_eq!(ids(&mirror.read_topic("fern", topic(3))), [4, 6]);
+        assert_eq!(ids(&mirror.read_topic("fern", topic(2))), [5]);
+        assert_eq!(ids(&mirror.read_agent_messages(b)), [4, 6]);
+        assert_eq!(ids(&mirror.read_agent_messages(a)), [5]);
         assert_eq!(mirror.read_rows(a).len(), 2);
         assert_eq!(mirror.rows_next(a), Wpos(3));
         assert_eq!(mirror.rows_next(b), Wpos::ZERO);
@@ -793,33 +930,39 @@ mod tests {
                 host: host.into(),
                 machine_seed: 1,
             });
+            mirror.send(Write::Chat {
+                host: host.into(),
+                through: ChatSeq(2),
+                records: vec![started(1, vec![]), posted(2, 1, Address::User)],
+                delivered: Vec::new(),
+            });
         }
         mirror.send(Write::Agents(vec![
             (a, stored(a, "fern", workset(1))),
             (b, stored(b, "oak", workset(2))),
         ]));
-        mirror.send(Write::Mail {
-            host: "fern".into(),
-            through: MailId(1),
-            mails: vec![mail(1, Address::User, Address::Agent(a), None)],
-        });
         mirror.send(Write::Rows {
             agent: a,
             rows: vec![(Wpos(0), input(a))],
         });
+        let draft = HostTopic {
+            machine_seed: 1,
+            topic: topic(1),
+        };
+        mirror.send(Write::Draft(draft, "half written".into()));
         mirror.send(Write::Rows {
             agent: b,
             rows: vec![(Wpos(0), input(b))],
         });
         mirror.send(Write::Outgoing(
-            a,
+            1,
             7,
             Some(Outgoing {
                 at: UnixMs(1),
                 content: vec![ContentPart::Text {
                     text: "kept".into(),
                 }],
-                thread: None,
+                to: Destination::Topic(topic(2)),
             }),
         ));
         mirror.send(Write::Reset("fern".into()));
@@ -831,7 +974,7 @@ mod tests {
         mirror.flush();
         let loaded = mirror.load();
         assert_eq!(loaded.hosts.len(), 1);
-        assert_eq!(loaded.hosts[0].mail, MailId(0));
+        assert_eq!(loaded.hosts[0].chat, ChatSeq(0));
         assert_eq!(
             loaded
                 .agents
@@ -840,9 +983,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             [b]
         );
-        assert!(mirror.read_mail(a).is_empty());
+        assert!(mirror.read_chat("fern").is_empty());
+        assert_eq!(
+            mirror.read_chat("oak").len(),
+            2,
+            "another host's copy stays"
+        );
         assert!(mirror.read_rows(a).is_empty());
         assert_eq!(mirror.read_rows(b).len(), 1, "another host's rows stay");
         assert_eq!(mirror.read_outbox().len(), 1, "unsent words are the user's");
+        assert_eq!(mirror.read_drafts(), [(draft, "half written".to_owned())]);
+    }
+
+    /// Sending a message in a topic takes its draft in the same write, so
+    /// the words are never in both or in neither.
+    #[test]
+    fn sending_takes_the_topics_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror::open(dir.path()).unwrap();
+        let draft = |n| HostTopic {
+            machine_seed: 1,
+            topic: topic(n),
+        };
+        mirror.send(Write::Draft(draft(2), "to send".into()));
+        mirror.send(Write::Draft(draft(3), "another topic".into()));
+        mirror.send(Write::Outgoing(
+            1,
+            7,
+            Some(Outgoing {
+                at: UnixMs(1),
+                content: Vec::new(),
+                to: Destination::Topic(topic(2)),
+            }),
+        ));
+        mirror.flush();
+        assert_eq!(
+            mirror.read_drafts(),
+            [(draft(3), "another topic".to_owned())]
+        );
     }
 }

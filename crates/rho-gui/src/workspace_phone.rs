@@ -328,7 +328,7 @@ impl Workspace {
             let Some(surface) = this.phone_surface() else {
                 return;
             };
-            if !matches!(surface.key, super::SurfaceKey::Thread(_)) {
+            if !matches!(surface.key, super::SurfaceKey::Topic(_)) {
                 return;
             }
             let super::SurfaceView::Transcript { model, editor } = &surface.view else {
@@ -1079,7 +1079,7 @@ impl Workspace {
             matches!(
                 surface.key,
                 super::SurfaceKey::Draft
-                    | super::SurfaceKey::Thread(_)
+                    | super::SurfaceKey::Topic(_)
                     | super::SurfaceKey::SlackConversation(_)
             )
         }) {
@@ -1125,7 +1125,7 @@ impl Workspace {
         };
         match surface.key {
             super::SurfaceKey::Draft => self.submit_prompt(&crate::SubmitPrompt, window, cx),
-            super::SurfaceKey::Thread(_) => self.submit_reply(&surface, window, cx),
+            super::SurfaceKey::Topic(_) => self.submit_reply(&surface, window, cx),
             super::SurfaceKey::SlackConversation(_) => {
                 let super::SurfaceView::SlackConversation(view) = surface.view else {
                     return;

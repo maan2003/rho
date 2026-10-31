@@ -1,18 +1,18 @@
 //! The transcripts this client holds open.
 //!
 //! An agent's transcript is two things joined: the fold of its workset rows
-//! and its mail, and the runtime's live tail. Both land in one rendered state
-//! per agent, which is what a screen draws. Which agents are held open is the
-//! same question as which agents this client asks the model thread for
+//! and its messages, and the runtime's live tail. Both land in one rendered
+//! state per agent, which is what a screen draws. Which agents are held open is
+//! the same question as which agents this client asks the model thread for
 //! rows about, so it is answered here.
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_types::{AgentId, ThreadId};
-use rho_agents_client::TranscriptFold;
+use rho_agent_types::AgentId;
 use rho_agents_client::fold::TranscriptRow;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};
+use rho_agents_client::{HostTopic, TranscriptFold};
 
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
@@ -41,8 +41,8 @@ pub struct Transcripts {
     /// The transcript fold of every agent held open, in memory, so a row
     /// folds into it without waiting on the disk copy.
     open: HashMap<AgentId, TranscriptFold>,
-    /// The mail threads held open, each as its mails make it.
-    threads: HashMap<(AgentId, ThreadId), UiAgentState>,
+    /// The chat topics held open, each as its messages make it.
+    topics: HashMap<HostTopic, UiAgentState>,
 }
 
 impl Transcripts {
@@ -60,37 +60,23 @@ impl Transcripts {
         self.open.keys().copied().collect()
     }
 
-    /// A mail thread as it stands now, and what moved since it was last
-    /// set: everything, the first time.
-    pub fn set_thread(
-        &mut self,
-        agent_id: AgentId,
-        thread: ThreadId,
-        state: UiAgentState,
-    ) -> FrameSummary {
-        let summary = match self.threads.get(&(agent_id, thread)) {
+    /// A topic as it stands now, and what moved since it was last set:
+    /// everything, the first time.
+    pub fn set_topic(&mut self, topic: HostTopic, state: UiAgentState) -> FrameSummary {
+        let summary = match self.topics.get(&topic) {
             Some(held) => rho_agents_client::store::summarize(&held.blocks, &state.blocks),
             None => FrameSummary::everything(),
         };
-        self.threads.insert((agent_id, thread), state);
+        self.topics.insert(topic, state);
         summary
     }
 
-    pub fn thread(&self, agent_id: AgentId, thread: ThreadId) -> Option<&UiAgentState> {
-        self.threads.get(&(agent_id, thread))
+    pub fn topic(&self, topic: HostTopic) -> Option<&UiAgentState> {
+        self.topics.get(&topic)
     }
 
-    /// The threads held open of one agent.
-    pub fn agent_threads(&self, agent_id: AgentId) -> Vec<ThreadId> {
-        self.threads
-            .keys()
-            .filter(|(agent, _)| *agent == agent_id)
-            .map(|(_, thread)| *thread)
-            .collect()
-    }
-
-    pub fn forget_thread(&mut self, agent_id: AgentId, thread: ThreadId) {
-        self.threads.remove(&(agent_id, thread));
+    pub fn forget_topic(&mut self, topic: HostTopic) {
+        self.topics.remove(&topic);
     }
 
     /// Lets go of one agent's transcript, held state and all.
@@ -171,7 +157,9 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, ContentPart, InputWake, Mail, MailId, UnixMs, Wpos};
+    use rho_agent_types::{
+        Address, ChatSeq, ContentPart, InputWake, Message, MessageId, TopicId, UnixMs, Wpos,
+    };
     use rho_agents_client::protocol::worksets::LogEvent;
 
     use super::*;
@@ -184,17 +172,16 @@ mod tests {
         AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
-    /// The user's mail to the agent, then the input that hands it over and
-    /// the request that carries it: one told turn.
-    fn turn(mail: u64, pos: u64, text: &str, at: u64) -> Vec<TranscriptRow> {
+    /// The user's message to the agent, then the input that hands it over
+    /// and the request that carries it: one told turn.
+    fn turn(message: u64, pos: u64, text: &str, at: u64) -> Vec<TranscriptRow> {
         vec![
-            TranscriptRow::Mail(Mail {
-                id: MailId(mail),
+            TranscriptRow::Message(Message {
+                id: MessageId(ChatSeq(message)),
                 at: UnixMs(at),
+                topic: TopicId(ChatSeq(1)),
                 from: Address::User,
-                to: Address::Agent(agent()),
-                thread: rho_agent_types::ThreadId(MailId(mail)),
-                kind: None,
+                mentions: Vec::new(),
                 content: vec![ContentPart::Text {
                     text: text.to_owned(),
                 }],
@@ -203,7 +190,7 @@ mod tests {
                 Wpos(pos),
                 LogEvent::Input {
                     agent: agent(),
-                    mail: Some(MailId(mail)),
+                    message: Some(MessageId(ChatSeq(message))),
                     text: text.to_owned(),
                     wake: InputWake::Person,
                     at: UnixMs(at),
@@ -326,12 +313,12 @@ mod tests {
                 .into_iter()
                 .map(|row| match row {
                     TranscriptRow::Log(pos, event) => (pos, event),
-                    TranscriptRow::Mail(_) => unreachable!(),
+                    TranscriptRow::Message(_) => unreachable!(),
                 }),
             [first[0].clone(), second[0].clone()]
                 .into_iter()
                 .map(|row| match row {
-                    TranscriptRow::Mail(mail) => mail,
+                    TranscriptRow::Message(message) => message,
                     TranscriptRow::Log(..) => unreachable!(),
                 }),
         );

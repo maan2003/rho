@@ -56,7 +56,9 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 #[cfg(test)]
 mod tests {
     use rho_agent_hosts::HostId;
-    use rho_agent_types::{Address, AgentIdDomain, ContentPart, Mail, MailId, SendKind, UnixMs};
+    use rho_agent_types::{
+        Address, AgentIdDomain, ChatSeq, ContentPart, Message, MessageId, TopicId, UnixMs,
+    };
 
     use super::*;
     use crate::{AgentIdentity, MirroredAgent};
@@ -65,35 +67,30 @@ mod tests {
         AgentId::from_counter(1, &AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn mail(id: u64, from: Address, to: Address, kind: Option<SendKind>, text: &str) -> Mail {
-        Mail {
-            id: MailId(id),
+    fn message(id: u64, from: Address, text: &str) -> Message {
+        Message {
+            id: MessageId(ChatSeq(id)),
             at: UnixMs(id),
+            topic: TopicId(ChatSeq(1)),
             from,
-            to,
-            thread: rho_agent_types::ThreadId(MailId(id)),
-            kind,
+            mentions: Vec::new(),
             content: vec![ContentPart::Text { text: text.into() }],
         }
     }
 
-    fn said(id: u64, text: &str) -> Mail {
-        mail(id, Address::User, Address::Agent(agent()), None, text)
+    fn said(id: u64, text: &str) -> Message {
+        message(id, Address::User, text)
     }
 
     /// The agent as the model thread hands it up: its directory entry, its
-    /// mail folded into its digest.
-    fn told(registry: &mut AgentMap, mails: Vec<Mail>) {
+    /// messages folded into its digest.
+    fn told(registry: &mut AgentMap, messages: Vec<Message>) {
         let host = HostId::default();
         registry.set_host_data(host, 0, 1);
-        let identity = AgentIdentity::for_test(
-            agent(),
-            [("user_facing".to_owned(), "true".to_owned())].into(),
-            UnixMs(1),
-        );
+        let identity = AgentIdentity::for_test(agent(), Default::default(), UnixMs(1));
         let mut mirrored = MirroredAgent::new(host, identity);
-        for mail in &mails {
-            mirrored.tell(mail);
+        for message in &messages {
+            mirrored.digest.tell(message);
         }
         registry.told(vec![mirrored]);
     }
@@ -107,13 +104,7 @@ mod tests {
             &mut registry,
             vec![
                 said(2, "fix the flaky mirror test"),
-                mail(
-                    3,
-                    Address::Agent(agent()),
-                    Address::User,
-                    Some(SendKind::Result),
-                    "fixed",
-                ),
+                message(3, Address::Agent(agent()), "fixed"),
             ],
         );
 

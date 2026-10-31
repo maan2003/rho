@@ -1,5 +1,6 @@
 //! How a client draws an agent: the block list and status it folds from
-//! the workset rows, mail, and the live tail. Nothing here crosses the wire.
+//! the workset rows, chat messages, and the live tail. Nothing here crosses the
+//! wire.
 
 use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -85,6 +86,12 @@ pub enum UiBlock {
     Status {
         text: String,
     },
+    /// A message in a chat topic: who posted it and whom it mentions.
+    ChatMessage {
+        from: rho_agent_types::Address,
+        mentions: Vec<rho_agent_types::Mention>,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -96,7 +103,7 @@ pub enum UiAgentStatus {
     },
     ToolCalling {
         /// Deadline of the batch's armed `wait` call, if one is parked
-        /// until mail arrives or the wall clock passes it.
+        /// until a message arrives or the wall clock passes it.
         waiting: Option<UnixMs>,
     },
     UnfinishedTurn {

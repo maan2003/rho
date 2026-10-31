@@ -619,7 +619,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                     gone,
                     vec![story::UiStoryEvent::Sent {
                         text: "deleted transcript secret".into(),
-                        kind: rho_agent_types::SendKind::Ask,
+                        kind: Some(rho_agent_types::MentionKind::Ask),
                         at: UnixMs(10),
                     }],
                 ),
@@ -656,12 +656,12 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                 .hand(cx)
                 .cards
                 .into_iter()
-                .find(|card| matches!(card.node, rho_dealer::NodeId::Mail(thread) if thread.agent == gone))
-                .expect("control: the agent's thread is dealt before deletion")
+                .find(|card| matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.agents.contains_key(&gone))))
+                .expect("control: the agent's topic is dealt before deletion")
         })
         .unwrap();
-    let rho_dealer::NodeId::Mail(thread) = card.node.clone() else {
-        unreachable!("found as a mail card");
+    let rho_dealer::NodeId::Topic(topic) = card.node.clone() else {
+        unreachable!("found as a topic card");
     };
     workspace
         .update(cx, |workspace, window, cx| {
@@ -674,7 +674,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
         .update(cx, |workspace, window, cx| {
             assert_eq!(
                 workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Thread(thread)
+                crate::pane::SurfaceKey::Topic(topic)
             );
             editor.update(cx, |editor, cx| {
                 editor.insert("sole-copy unfinished draft", window, cx)
@@ -704,14 +704,14 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
             assert!(
                 workspace
                     .open_surfaces_for_test()
-                    .all(|surface| surface.key.transcript_agent() != Some(gone))
+                    .all(|surface| workspace.surface_agent(&surface.key) != Some(gone))
             );
             assert_eq!(
                 workspace.current_surface_key_for_test(),
                 crate::pane::SurfaceKey::Home
             );
             assert_eq!(
-                workspace.saved_thread_draft_for_test(thread),
+                workspace.saved_topic_draft_for_test(topic),
                 Some("sole-copy unfinished draft")
             );
             assert!(
@@ -719,7 +719,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                     .hand(cx)
                     .cards
                     .iter()
-                    .any(|card| card.node == rho_dealer::NodeId::Mail(thread))
+                    .any(|card| card.node == rho_dealer::NodeId::Topic(topic))
             );
         })
         .unwrap();
@@ -731,7 +731,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
             .update(cx, |workspace, window, cx| {
                 workspace.step_surface_back_for_test(window, cx);
                 assert_ne!(
-                    workspace.current_surface_key_for_test().transcript_agent(),
+                    workspace.surface_agent(&workspace.current_surface_key_for_test()),
                     Some(gone)
                 );
             })
@@ -857,7 +857,7 @@ fn open_activity(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-/// Back to the thread the frames were seeded as.
+/// Back to the topic the frames were seeded as.
 fn open_conversation(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
@@ -865,9 +865,10 @@ fn open_conversation(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContex
                 .selection
                 .selected_agent()
                 .expect("an agent is selected");
-            workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
+            let topic = workspace.test_topic(agent_id);
+            workspace.open_topic(topic, window, cx);
         })
-        .expect("open the thread");
+        .expect("open the topic");
     cx.run_until_parked();
 }
 
@@ -1238,11 +1239,8 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     let remade = |cx: &mut TestAppContext| {
         workspace
             .update(cx, |workspace, window, cx| {
-                let model = workspace.remake_thread_model_for_test(
-                    Workspace::test_thread(agent_id),
-                    window,
-                    cx,
-                );
+                let topic = workspace.test_topic(agent_id);
+                let model = workspace.remake_topic_model_for_test(topic, window, cx);
                 model.read(cx).prompt_text(cx)
             })
             .unwrap()
@@ -1253,10 +1251,12 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     assert_eq!(remade(cx), "", "a sent draft is not written again");
 }
 
-/// A new mail to an agent starts a thread: it is posted with no thread,
-/// and the thread its host names it the first of is where the user lands.
+/// `space a m` starts a topic with the agent in view: posted as a new
+/// topic in the default stream with that agent alone, named by its first
+/// line, and the topic its host names is where the user lands, even when
+/// the host answers before the chat shows the topic.
 #[gpui::test]
-fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
+fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
     use rho_agents_client::protocol::worksets::Request;
 
@@ -1284,7 +1284,7 @@ fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
-            // An agent with one thread already: the new mail is not in it.
+            // An agent in one topic already: the new message is not in it.
             story::feed(
                 workspace,
                 HostId::default(),
@@ -1293,49 +1293,81 @@ fn a_new_mail_opens_the_thread_it_starts(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.select_agent(Some(agent_id), window, cx);
-            workspace.prompt_new_mail(window, cx);
+            workspace.prompt_new_topic(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
-    cx.simulate_input(*workspace, "a fresh topic");
+    cx.simulate_input(*workspace, "a fresh topic\nwith a second line");
     cx.simulate_keystrokes(*workspace, "enter");
     cx.run_until_parked();
     let mut calls = story::calls(&mut host);
-    assert_eq!(calls.len(), 1, "one mail");
+    assert_eq!(calls.len(), 1, "one message");
     let (call, mut stream) = calls.pop().unwrap();
-    let Request::PostMail(post) = call else {
-        panic!("expected mail: {call:?}");
+    let Request::StartTopic(start) = call else {
+        panic!("expected a new topic: {call:?}");
     };
-    assert_eq!(post.to, agent_id);
-    assert_eq!(post.thread, None, "a new mail starts a thread");
+    assert_eq!(start.agents, vec![agent_id]);
+    assert_eq!(start.stream, rho_agent_types::StreamId::DEFAULT);
+    assert_eq!(start.name, "a fresh topic", "named by its first line");
     assert_eq!(
-        rho_agent_types::transcript::text_content(&post.content),
-        "a fresh topic"
+        rho_agent_types::transcript::text_content(&start.content),
+        "a fresh topic\nwith a second line"
     );
-    story::answer(
-        &mut stream,
-        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(60)),
+    let started = rho_agent_types::TopicId(rho_agent_types::ChatSeq(60));
+    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(started));
+    cx.run_until_parked();
+    let current = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, _| {
+                workspace.current_surface_key_for_test()
+            })
+            .unwrap()
+    };
+    assert_ne!(
+        current(cx),
+        crate::pane::SurfaceKey::Topic(rho_agents_client::HostTopic {
+            machine_seed: 0,
+            topic: started,
+        }),
+        "control: the chat has not shown the topic yet"
     );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::chat(vec![rho_agent_types::ChatRecord {
+                    seq: started.0,
+                    at: UnixMs(6),
+                    event: rho_agent_types::ChatEvent::TopicStarted {
+                        stream: rho_agent_types::StreamId::DEFAULT,
+                        name: start.name.clone(),
+                        by: rho_agent_types::Address::User,
+                        agents: vec![agent_id],
+                    },
+                }]),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
     assert_eq!(
-        workspace
-            .update(cx, |workspace, _, _| workspace
-                .current_surface_key_for_test())
-            .unwrap(),
-        crate::pane::SurfaceKey::Thread(rho_dealer::MailThread {
-            agent: agent_id,
-            thread: rho_agent_types::ThreadId(rho_agent_types::MailId(60)),
+        current(cx),
+        crate::pane::SurfaceKey::Topic(rho_agents_client::HostTopic {
+            machine_seed: 0,
+            topic: started,
         }),
-        "the thread the mail started, not the one the agent had"
+        "the topic the message started, not the one the agent had"
     );
 }
 
-/// Replies written while their host is down wait in their thread as
+/// Replies written while their host is down wait in their topic as
 /// unsent and go one by one, in order, when the host is back. A send the
-/// host fails keeps them, and the next try is the same mail under the same
-/// client id; only an answer takes one off the thread.
+/// host fails keeps them, and the next try is the same message under the
+/// same client id; only an answer takes one off the topic.
 ///
-/// The question the user answered stays a card until the host's mail log
+/// The question the user answered stays a card until the host's chat log
 /// has the answer, and the log is what reads it: the answer heard again
 /// (the host replaying what this client already holds) reads nothing the
 /// agent asked since.
@@ -1363,7 +1395,7 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
         workspace
             .update(cx, |workspace, _, cx| {
                 workspace.hand(cx).cards.into_iter().find(|card| {
-                    matches!(card.node, rho_dealer::NodeId::Mail(thread) if thread.agent == agent_id)
+                    matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.agents.contains_key(&agent_id)))
                 })
             })
             .unwrap()
@@ -1372,8 +1404,8 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
     feed(cx, ready_with(vec![ui_head(agent_id)], 732));
     feed(cx, story_wanting(agent_id, UnixMs(5)).into());
     let question = card(cx).expect("control: the question is a card");
-    let rho_dealer::NodeId::Mail(thread) = question.node.clone() else {
-        unreachable!("found as a mail card");
+    let rho_dealer::NodeId::Topic(topic) = question.node.clone() else {
+        unreachable!("found as a topic card");
     };
     workspace
         .update(cx, |workspace, window, cx| {
@@ -1407,13 +1439,12 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
 
     let mut sent = || {
         let mut calls = story::calls(&mut host);
-        assert_eq!(calls.len(), 1, "one mail at a time");
+        assert_eq!(calls.len(), 1, "one message at a time");
         let (call, stream) = calls.pop().unwrap();
-        let Request::PostMail(post) = call else {
-            panic!("expected mail: {call:?}");
+        let Request::Post(post) = call else {
+            panic!("expected a post: {call:?}");
         };
-        assert_eq!(post.to, agent_id);
-        assert_eq!(post.thread, Some(thread.thread), "a reply is in its thread");
+        assert_eq!(post.topic, topic.topic, "a reply is in its topic");
         let text = rho_agent_types::transcript::text_content(&post.content);
         (text, post.client_id, stream)
     };
@@ -1422,24 +1453,24 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
     assert_eq!(text, "while away", "the oldest first");
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::<rho_agent_types::MailId>::Failed {
+        rho_rpc::protocol::Answer::<rho_agent_types::MessageId>::Failed {
             reason: "worker restarting".into(),
         },
     );
     cx.run_until_parked();
     unsent(cx);
-    assert!(dealt(cx), "a mail the host refused answers nothing");
+    assert!(dealt(cx), "a message the host refused answers nothing");
 
     feed(cx, ConnEvent::Recovered.into());
     let (text, again, mut stream) = sent();
     assert_eq!(
         (text.as_str(), again),
         ("while away", first),
-        "the same mail, so the host logs it once"
+        "the same message, so the host logs it once"
     );
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(90)),
+        rho_rpc::protocol::Answer::Done(rho_agent_types::MessageId(rho_agent_types::ChatSeq(90))),
     );
     cx.run_until_parked();
     let (text, next, mut stream) = sent();
@@ -1447,10 +1478,10 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
         text, "and again",
         "the next goes once the first is answered"
     );
-    assert_ne!(next, first, "another mail, another id");
+    assert_ne!(next, first, "another message, another id");
     story::answer(
         &mut stream,
-        rho_rpc::protocol::Answer::Done(rho_agent_types::MailId(91)),
+        rho_rpc::protocol::Answer::Done(rho_agent_types::MessageId(rho_agent_types::ChatSeq(91))),
     );
     cx.run_until_parked();
     let shown_now = shown(cx);
@@ -1458,7 +1489,7 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
 
     // The host's log has the answer: what the agent asked before it is read.
     let answer = story::from_user(agent_id, "while away", UnixMs(6));
-    feed(cx, story::mails(vec![answer.clone()]).into());
+    feed(cx, story::chat(answer.clone()).into());
     assert!(!dealt(cx), "the answer reads the question");
     feed(
         cx,
@@ -1466,17 +1497,17 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
             agent_id,
             vec![story::UiStoryEvent::Sent {
                 text: "and now?".into(),
-                kind: rho_agent_types::SendKind::Ask,
+                kind: Some(rho_agent_types::MentionKind::Ask),
                 at: UnixMs(7),
             }],
         )
         .into(),
     );
     assert!(dealt(cx), "a new question after the answer is owed");
-    feed(cx, story::mails(vec![answer]).into());
+    feed(cx, story::chat(answer).into());
     assert!(
         dealt(cx),
-        "the answer heard again is the same mail and reads nothing new"
+        "the answer heard again is the same message and reads nothing new"
     );
 }
 
@@ -2466,7 +2497,7 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
                 workspace
                     .buffer_table()
                     .iter()
-                    .any(|(_, kind)| kind == "mail")
+                    .any(|(_, kind)| kind == "topic")
             );
             assert_eq!(
                 workspace.active_agent_model().unwrap().read(cx).view(),
@@ -2534,9 +2565,10 @@ fn agent_menu_switches_sibling_views_without_sending_or_losing_draft(cx: &mut Te
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.close_current_surface(window, cx);
+            let topic = workspace.test_topic(agent(1));
             assert_eq!(
                 workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Thread(Workspace::test_thread(agent(1)))
+                crate::pane::SurfaceKey::Topic(topic)
             );
         })
         .expect("close Activity without closing the thread");
@@ -3502,10 +3534,12 @@ fn uncomposed_blocks(
 ) -> usize {
     workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .thread_model_for_test(Workspace::test_thread(agent_id))
-                .read(cx)
-                .uncomposed_blocks()
+            {
+                let topic = workspace.test_topic(agent_id);
+                workspace.topic_model_for_test(topic)
+            }
+            .read(cx)
+            .uncomposed_blocks()
         })
         .expect("read how much history is composed nowhere")
 }
@@ -3518,10 +3552,12 @@ fn gap_marker_block(
 ) -> Option<usize> {
     workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .thread_model_for_test(Workspace::test_thread(agent_id))
-                .read(cx)
-                .gap_marker_block()
+            {
+                let topic = workspace.test_topic(agent_id);
+                workspace.topic_model_for_test(topic)
+            }
+            .read(cx)
+            .gap_marker_block()
         })
         .expect("read where the gap marker is")
 }
@@ -3534,11 +3570,13 @@ fn transcript_point_block(
     let editor = active_editor(workspace, cx);
     workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .thread_model_for_test(Workspace::test_thread(agent_id))
-                .read(cx)
-                .store_point(&editor, cx)
-                .map(|point| point.block)
+            {
+                let topic = workspace.test_topic(agent_id);
+                workspace.topic_model_for_test(topic)
+            }
+            .read(cx)
+            .store_point(&editor, cx)
+            .map(|point| point.block)
         })
         .expect("read the point as the store sees it")
 }
@@ -3655,12 +3693,14 @@ fn visualization_blocks(
 ) -> HashSet<CustomBlockId> {
     workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .thread_model_for_test(Workspace::test_thread(agent_id))
-                .read(cx)
-                .visualization_blocks()
-                .into_iter()
-                .collect()
+            {
+                let topic = workspace.test_topic(agent_id);
+                workspace.topic_model_for_test(topic)
+            }
+            .read(cx)
+            .visualization_blocks()
+            .into_iter()
+            .collect()
         })
         .expect("read the visualization blocks the editor shows")
 }
@@ -3781,7 +3821,8 @@ fn returning_to_a_transcript_returns_to_the_block_it_was_left_on(cx: &mut TestAp
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.open_thread(Workspace::test_thread(agent(1)), window, cx);
+            let topic = workspace.test_topic(agent(1));
+            workspace.open_topic(topic, window, cx);
         })
         .expect("open the thread again");
     cx.run_until_parked();
@@ -5070,7 +5111,6 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
         workset: None,
         kind: rho_agent_types::WorksetKind::Isolated,
         preset: None,
-        user_facing: true,
         parent: None,
         name: None,
         title: None,
@@ -5093,15 +5133,15 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::Ag
             },
             UiStoryEvent::Sent {
                 text: "which one?".to_owned(),
-                kind: rho_agent_types::SendKind::Ask,
+                kind: Some(rho_agent_types::MentionKind::Ask),
                 at,
             },
         ],
     )
 }
 
-/// The card of the agent's thread the dealer holds out, if any.
-fn dealt_thread(
+/// The card of the agent's topic the dealer holds out, if any.
+fn dealt_topic(
     workspace: &mut Workspace,
     agent_id: AgentId,
     cx: &mut gpui::Context<Workspace>,
@@ -5111,7 +5151,9 @@ fn dealt_thread(
         .cards
         .into_iter()
         .map(|card| card.node)
-        .find(|node| matches!(node, rho_dealer::NodeId::Mail(thread) if thread.agent == agent_id))
+        .find(|node| {
+            matches!(node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(*topic).is_some_and(|(_, held)| held.agents.contains_key(&agent_id)))
+        })
 }
 
 #[gpui::test]
@@ -5610,7 +5652,8 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
     let editor = active_editor(&workspace, cx);
     let model = workspace
         .update(cx, |workspace, _, _cx| {
-            workspace.thread_model_for_test(Workspace::test_thread(agent(1)))
+            let topic = workspace.test_topic(agent(1));
+            workspace.topic_model_for_test(topic)
         })
         .expect("the agent's model");
     workspace
@@ -5740,6 +5783,7 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(777);
     let old = agent(779);
+    let told = agent(781);
     let now = jiff::Timestamp::now().as_millisecond() as u64;
     workspace
         .update(cx, |workspace, window, cx| {
@@ -5750,8 +5794,8 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
                     vec![
                         story::UiAgentHead {
                             title: Some("flaky-ci".to_owned()),
-                            // A status is not a send the reader is owed, so it
-                            // does not make the agent recent.
+                            // A status mentions nobody, so it does not make
+                            // the topic recent.
                             status: Some("reading tests".to_owned()),
                             ..ui_head(agent_id)
                         },
@@ -5759,8 +5803,9 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
                             title: Some("old-docs".to_owned()),
                             ..ui_head(old)
                         },
+                        ui_head(told),
                     ],
-                    780,
+                    782,
                 ),
                 window,
                 cx,
@@ -5775,15 +5820,24 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            for (agent_id, hours) in [(agent_id, 2), (old, 5 * 24)] {
+            for (agent_id, hours, kind, text) in [
+                (agent_id, 2, rho_agent_types::MentionKind::Result, "done"),
+                (old, 5 * 24, rho_agent_types::MentionKind::Result, "done"),
+                (
+                    told,
+                    1,
+                    rho_agent_types::MentionKind::Fyi,
+                    "fyi: the cache is cold",
+                ),
+            ] {
                 story::feed(
                     workspace,
                     HostId::default(),
                     story::story(
                         agent_id,
                         vec![story::UiStoryEvent::Sent {
-                            text: "done".to_owned(),
-                            kind: rho_agent_types::SendKind::Result,
+                            text: text.to_owned(),
+                            kind: Some(kind),
                             at: UnixMs(now - hours * 3_600_000),
                         }],
                     ),
@@ -5794,13 +5848,16 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
         })
         .unwrap();
     cx.run_until_parked();
-    // The fresh result is a card in `next`, so only the faded one is
-    // recent: an agent is not listed twice.
+    // The fresh result is a card in `next`, so only the faded one and the
+    // fyi, which is never a card, are recent: a topic is not listed twice.
+    // Each is named by its first message: the status, the old result, the
+    // fyi.
     let text = home_text(&workspace, cx);
     let (next, recent) = text.split_once("recent ").expect("a recent heading");
-    assert!(next.contains("flaky-ci"), "{text:?}");
-    assert!(!next.contains("old-docs"), "{text:?}");
-    assert_eq!(recent.lines().next(), Some("▸ 1"), "{text:?}");
+    assert!(next.contains("rho › reading tests"), "{text:?}");
+    assert!(!next.contains("rho › done"), "{text:?}");
+    assert!(!next.contains("cache"), "an fyi is not a card: {text:?}");
+    assert_eq!(recent.lines().next(), Some("▸ 2"), "{text:?}");
     workspace
         .update(cx, |workspace, _, cx| {
             let home = workspace.home_view().expect("home is in view");
@@ -5811,9 +5868,13 @@ fn recent_home_rows_are_folded_until_opened(cx: &mut TestAppContext) {
     let text = home_text(&workspace, cx);
     assert_eq!(
         text.lines()
-            .skip_while(|line| *line != "recent ▾ 1")
+            .skip_while(|line| *line != "recent ▾ 2")
             .collect::<Vec<_>>(),
-        ["recent ▾ 1", "  old-docs  5.0d ago"],
+        [
+            "recent ▾ 2",
+            "  rho › fyi: the cache is cold  unread · 1.0h ago",
+            "  rho › done                    unread · 5.0d ago"
+        ],
         "{text:?}"
     );
 }
@@ -5933,7 +5994,8 @@ fn feed_frame(
             let open = workspace.is_startup_pane();
             workspace.seed_transcript_for_test(agent_id, state, window, cx);
             if open {
-                workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
+                let topic = workspace.test_topic(agent_id);
+                workspace.open_topic(topic, window, cx);
             }
         })
         .expect("update workspace");
@@ -5956,7 +6018,8 @@ fn feed_frames(
                 workspace.seed_transcript_for_test(agent_id, state, window, cx);
             }
             if let Some(agent_id) = open {
-                workspace.open_thread(Workspace::test_thread(agent_id), window, cx);
+                let topic = workspace.test_topic(agent_id);
+                workspace.open_topic(topic, window, cx);
             }
         })
         .expect("update workspace");
@@ -6074,7 +6137,7 @@ fn thread_done_writes_its_mail_cursor_and_undo_restores_the_hand(cx: &mut TestAp
                 window,
                 cx,
             );
-            let node = dealt_thread(workspace, agent_id, cx).expect("the ask is dealt");
+            let node = dealt_topic(workspace, agent_id, cx).expect("the ask is dealt");
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
@@ -6087,7 +6150,7 @@ fn thread_done_writes_its_mail_cursor_and_undo_restores_the_hand(cx: &mut TestAp
                     .marks
                     .get(&node)
                     .facts()
-                    .seen_mail()
+                    .seen_topic()
                     .is_some_and(|pos| pos > 0)
             );
             assert!(
@@ -6099,7 +6162,7 @@ fn thread_done_writes_its_mail_cursor_and_undo_restores_the_hand(cx: &mut TestAp
             );
             workspace.undo_verdict(window, cx);
             assert_eq!(
-                workspace.attention.marks.get(&node).facts().seen_mail(),
+                workspace.attention.marks.get(&node).facts().seen_topic(),
                 None
             );
             assert!(
@@ -6134,7 +6197,7 @@ fn a_future_snooze_hides_a_thread_until_the_mark_ripens(cx: &mut TestAppContext)
                 window,
                 cx,
             );
-            let node: NodeId = dealt_thread(workspace, agent_id, cx).expect("the ask is dealt");
+            let node: NodeId = dealt_topic(workspace, agent_id, cx).expect("the ask is dealt");
             workspace.write_marks(
                 vec![said(
                     &node,
@@ -6202,7 +6265,7 @@ fn a_pile_holds_its_cards_until_opened_and_deals_them_oldest_first(cx: &mut Test
                     .collect::<Vec<_>>()
             };
             let [first, second, other] = [first, second, other]
-                .map(|agent_id| dealt_thread(workspace, agent_id, cx).expect("each ask is dealt"));
+                .map(|agent_id| dealt_topic(workspace, agent_id, cx).expect("each ask is dealt"));
             for node in [&second, &first] {
                 workspace.take_verdict(node, crate::attention::Verdict::Pile("ask ada".into()), cx);
             }
@@ -6948,6 +7011,19 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
         })
         .unwrap();
     cx.run_until_parked();
+    // The agent made, its brief starts a topic with it on the same host.
+    let mut calls = story::calls(&mut on_moss);
+    assert_eq!(calls.len(), 1, "the brief follows the creation");
+    let (call, _) = calls.pop().unwrap();
+    let rho_agents_client::protocol::worksets::Request::StartTopic(start) = call else {
+        panic!("expected the brief's topic: {call:?}");
+    };
+    assert_eq!(start.agents, vec![agent(7)]);
+    assert_eq!(start.name, "first");
+    assert_eq!(
+        rho_agent_types::transcript::text_content(&start.content),
+        "first"
+    );
 
     // Nothing chosen this time: the last placement is the default.
     draft("second", &workspace, cx);

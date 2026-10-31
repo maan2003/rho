@@ -37,9 +37,9 @@ pub enum SurfaceKey {
     Usage,
     /// A note, or a label and what carries it.
     Note(rho_dealer::NodeId),
-    /// One mail thread between the user and an agent: its mails as
-    /// written, and a reply box that answers in it.
-    Thread(rho_dealer::MailThread),
+    /// One topic: its messages as written, and a reply box that posts in
+    /// it.
+    Topic(rho_agents_client::HostTopic),
     /// What one agent did: its tool calls and their output.
     Activity(AgentId),
     File {
@@ -76,11 +76,10 @@ pub enum SurfaceKey {
 }
 
 impl SurfaceKey {
-    /// The agent whose transcript this surface shows: its activity, or one
-    /// of its mail threads.
-    pub(crate) fn transcript_agent(&self) -> Option<AgentId> {
+    /// The agent whose activity this surface shows. A topic's agents are
+    /// the chat's to say: `Workspace::surface_agent`.
+    pub(crate) fn activity_agent(&self) -> Option<AgentId> {
         match self {
-            Self::Thread(thread) => Some(thread.agent),
             Self::Activity(agent_id) => Some(*agent_id),
             _ => None,
         }

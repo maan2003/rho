@@ -450,7 +450,8 @@ fn run_events_with_detached_host(
     workspace
         .update(&mut cx, |workspace, window, cx| {
             workspace.seed_transcript_for_test(agent, state.clone(), window, cx);
-            workspace.open_thread(Workspace::test_thread(agent), window, cx);
+            let topic = workspace.test_topic(agent);
+            workspace.open_topic(topic, window, cx);
         })
         .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, 0, Vec::new()))?;
     cx.run_until_parked();

@@ -522,12 +522,12 @@ impl Workspace {
     }
 
     /// The node the surface in view stands for: the note or label shown,
-    /// the mail thread, the agent whose shell, file or terminal it is, or
+    /// the topic, the agent whose shell, file or terminal it is, or
     /// the Slack conversation. Everything else stands for nothing.
     pub(crate) fn surface_node(&self, cx: &gpui::App) -> Option<NodeId> {
         match &self.active_surface().key {
             SurfaceKey::Note(node) => Some(node.clone()),
-            SurfaceKey::Thread(thread) => Some(NodeId::Mail(*thread)),
+            SurfaceKey::Topic(topic) => Some(NodeId::Topic(*topic)),
             SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => Some(NodeId::Agent(*agent_id)),

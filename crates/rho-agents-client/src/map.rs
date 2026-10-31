@@ -722,7 +722,8 @@ impl AgentMap {
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{
-        Address, AgentIdDomain, ContentPart, Mail, MailId, SendKind, UnixMs, WorksetKind, props,
+        Address, AgentIdDomain, ChatSeq, ContentPart, Message, MessageId, TopicId, UnixMs,
+        WorksetKind, props,
     };
 
     use super::*;
@@ -737,13 +738,8 @@ mod tests {
     /// parent.
     fn named(nth: u64, parent: Option<AgentId>, at: u64) -> MirroredAgent {
         let mut spec_props = Props::new();
-        match parent {
-            Some(parent) => {
-                spec_props.insert(props::PARENT.into(), parent.encoded());
-            }
-            None => {
-                spec_props.insert(props::USER_FACING.into(), "true".into());
-            }
+        if let Some(parent) = parent {
+            spec_props.insert(props::PARENT.into(), parent.encoded());
         }
         MirroredAgent::new(
             HostId::default(),
@@ -766,14 +762,13 @@ mod tests {
 
     type Props = rho_agent_types::Props;
 
-    fn to_user(id: u64, from: AgentId, kind: SendKind, text: &str) -> Mail {
-        Mail {
-            id: MailId(id),
+    fn said(id: u64, from: Address, text: &str) -> Message {
+        Message {
+            id: MessageId(ChatSeq(id)),
             at: UnixMs(id),
-            from: Address::Agent(from),
-            to: Address::User,
-            thread: rho_agent_types::ThreadId(MailId(id)),
-            kind: Some(kind),
+            topic: TopicId(ChatSeq(1)),
+            from,
+            mentions: Vec::new(),
             content: vec![ContentPart::Text { text: text.into() }],
         }
     }
@@ -806,23 +801,15 @@ mod tests {
         assert!(map.agent_facts(agent(1)).runtime.is_none());
     }
 
-    /// Whose an agent is comes from its props: user-facing is the user's,
-    /// and an agent with neither is not, whatever its parent.
+    /// An agent is the user's unless another agent made it.
     #[test]
-    fn an_agent_is_the_users_when_the_policy_says_so() {
+    fn an_agent_is_the_users_unless_an_agent_made_it() {
         let mut registry = AgentMap::default();
         registry.set_host_data(HostId::default(), 0, 3);
-        let mut neither = named(3, None, 3);
-        neither.identity.entry.spec.props.clear();
-        registry.told(vec![
-            named(1, None, 1),
-            named(2, Some(agent(1)), 2),
-            neither,
-        ]);
+        registry.told(vec![named(1, None, 1), named(2, Some(agent(1)), 2)]);
 
         assert!(registry.owned_by_user(agent(1)));
         assert!(!registry.owned_by_user(agent(2)));
-        assert!(!registry.owned_by_user(agent(3)));
         assert_eq!(registry.agent_parent(agent(2)), Some(agent(1)));
         assert_eq!(registry.agent_children(agent(1)), [agent(2)]);
     }
@@ -851,27 +838,32 @@ mod tests {
         assert!(!registry.set_agent_filings(filings));
     }
 
-    /// What the rails read is the fold of the agent's mail: the threads it
-    /// has with the user, and what each wants.
+    /// What the rails read is the fold of the agent's messages: what the
+    /// user last said to it, and when it was last active.
     #[test]
-    fn the_mail_is_what_the_rails_read() {
+    fn the_messages_are_what_the_rails_read() {
         let host = HostId::default();
         let mut registry = AgentMap::default();
         registry.set_host_data(host, 0, 1);
         let mut mirrored = named(1, None, 1);
-        mirrored.tell(&to_user(1, agent(1), SendKind::Status, "reading"));
+        mirrored
+            .digest
+            .tell(&said(1, Address::User, "which one?\nthe flaky one"));
         assert_eq!(registry.told(vec![mirrored.clone()]), [agent(1)]);
-        assert!(
-            registry.agent_digest(agent(1)).unwrap().threads.is_empty(),
-            "a status is no thread"
-        );
         assert_eq!(registry.host_of_agent(agent(1)), Some(host));
-
-        mirrored.tell(&to_user(2, agent(1), SendKind::Ask, "which one?"));
+        assert_eq!(
+            registry.agent_last_user_message(agent(1)),
+            Some("which one?")
+        );
+        mirrored
+            .digest
+            .tell(&said(5, Address::Agent(agent(1)), "this one"));
         registry.told(vec![mirrored]);
-        let digest = registry.agent_digest(agent(1)).unwrap();
-        assert_eq!(digest.threads.len(), 1);
-        assert!(digest.threads.values().all(|thread| thread.wants.is_some()));
+        assert_eq!(
+            registry.agent_last_active(agent(1)),
+            Some(UnixMs(5)),
+            "posting is activity"
+        );
 
         registry.reset_host(host);
         assert_eq!(registry.all_mirrored().len(), 0);
@@ -920,7 +912,9 @@ mod tests {
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
 
         let mut again = named(1, None, 10);
-        again.tell(&to_user(1, agent(1), SendKind::Result, "news"));
+        again
+            .digest
+            .tell(&said(1, Address::Agent(agent(1)), "news"));
         map.told(vec![again]);
         assert_eq!(map.next_agent(None, 1), Some(agent(3)));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));

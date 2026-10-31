@@ -1,8 +1,9 @@
 //! The agents, as the client holds them.
 //!
-//! An agent is its directory entry and the fold of its mail; a transcript
-//! is the fold of its workset's rows and its mail, with the host's live
-//! tail on its end. This crate owns every step of that: the host frames
+//! An agent is its directory entry and the fold of the messages it posted
+//! and received; a host's chat is the fold of its chat log; a transcript is
+//! the fold of an agent's workset rows and its messages, with the host's
+//! live tail on its end. This crate owns every step of that: the host frames
 //! that carry it, the fold on its own thread ([`model`]) and the disk copy
 //! ([`cache`]). What crosses out is agents as they now stand; nothing above
 //! needs to know there is a fold underneath. Nothing here draws: the
@@ -15,6 +16,8 @@ pub mod protocol;
 
 #[cfg(feature = "client")]
 pub mod cache;
+#[cfg(feature = "client")]
+pub mod chat;
 #[cfg(feature = "client")]
 pub mod create;
 #[cfg(feature = "client")]
@@ -45,12 +48,14 @@ pub mod stream;
 pub mod usage;
 
 #[cfg(feature = "client")]
+pub use chat::{ChatMap, HostChat, HostTopic, Topic};
+#[cfg(feature = "client")]
 pub use create::{Creation, Start, StartBase, StartFieldMode};
 #[cfg(feature = "client")]
 pub use find::AgentHit;
 #[cfg(feature = "client")]
 pub use fold::{
-    AgentIdentity, Digest, MirroredAgent, Said, TranscriptFold, TranscriptRow, one_line, transcript,
+    AgentIdentity, Digest, MirroredAgent, TranscriptFold, TranscriptRow, one_line, transcript,
 };
 #[cfg(feature = "client")]
 pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};

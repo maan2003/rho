@@ -6,8 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned};
 use rho_agent_types::{
-    Address, AgentId, AgentIdDomain, ContentPart, Mail, MailId, SendKind, UnixMs, props,
+    Address, AgentId, AgentIdDomain, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention,
+    MentionKind, StreamId, TopicId, UnixMs, props,
 };
+use rho_agents_client::chat::{HostChat, Told};
 use rho_agents_client::fold::MirroredAgent;
 use rho_agents_client::protocol::transcript::{InferenceState, RuntimeState};
 use rho_agents_client::{AgentIdentity, AgentMap, HostId};
@@ -36,10 +38,13 @@ struct World {
     host: HostId,
     /// Agents made so far, for the next one's id.
     made: u64,
-    /// The host's newest mail.
-    mail: u64,
-    /// The one thread each agent has with the user here.
-    threads: HashMap<AgentId, rho_agent_types::ThreadId>,
+    /// The host's chat log, folded, and its newest event.
+    log: HostChat,
+    seq: u64,
+    /// The topics the window holds: the host's, as the model hands it up.
+    chat: ChatMap,
+    /// The one topic each agent has with the user here, and its agent.
+    topic_agents: HashMap<NodeId, AgentId>,
     slack: Model,
     ts: u64,
     marks: Marks,
@@ -91,8 +96,10 @@ fn world_in(zone: TimeZone) -> World {
         agents,
         host,
         made: 0,
-        mail: 0,
-        threads: HashMap::new(),
+        log: HostChat::default(),
+        seq: 0,
+        chat: ChatMap::default(),
+        topic_agents: HashMap::new(),
         slack,
         ts: 0,
         marks: Marks::default(),
@@ -134,56 +141,70 @@ impl World {
         self.agents.told(vec![mirrored]);
     }
 
-    /// One mail on the host's log, folded the way the client folds it, in
-    /// the thread of the agent it is from or to.
-    fn mail(&mut self, from: Address, to: Address, kind: Option<SendKind>) {
-        self.mail += 1;
-        let thread = [from, to]
-            .into_iter()
-            .find_map(|address| match address {
-                Address::Agent(agent_id) => self.threads.get(&agent_id).copied(),
-                Address::User => None,
-            })
-            .expect("mail of an agent the world made");
-        let mail = Mail {
-            id: MailId(self.mail),
+    /// One event on the host's chat log, folded the way the client folds
+    /// it: into the host's topics, and each message into the digests of
+    /// the agents it reaches.
+    fn record(&mut self, event: ChatEvent) -> ChatSeq {
+        self.seq += 1;
+        let record = ChatRecord {
+            seq: ChatSeq(self.seq),
             at: UnixMs(self.ms()),
+            event,
+        };
+        if let Told::Topic {
+            message: Some((message, parties)),
+            ..
+        } = self.log.tell(&record)
+        {
+            for agent_id in parties {
+                if self.agents.mirrored(agent_id).is_some() {
+                    self.fold(agent_id, |mirrored| mirrored.digest.tell(&message));
+                }
+            }
+        }
+        self.chat.load(self.host, Some(0), self.log.clone());
+        record.seq
+    }
+
+    /// One message in a topic, mentioning whom it mentions.
+    fn post_in(&mut self, node: &NodeId, from: Address, mentions: Vec<Mention>) {
+        let topic = node.topic().expect("a topic").topic;
+        self.record(ChatEvent::Posted {
+            topic,
             from,
-            to,
-            thread,
-            kind,
+            mentions,
             content: vec![ContentPart::Text {
                 text: "update".into(),
             }],
-        };
-        for address in [from, to] {
-            if let Address::Agent(agent_id) = address
-                && self.agents.mirrored(agent_id).is_some()
-            {
-                self.fold(agent_id, |mirrored| {
-                    mirrored.tell(&mail);
-                });
-            }
-        }
+        });
     }
 
-    /// An agent the user's policy made: user-facing unless it has a parent.
+    /// An agent the user's policy made, and a topic the user started with
+    /// it: the user's unless it has a parent.
     fn agent_under(&mut self, name: &str, parent: Option<AgentId>) -> NodeId {
         self.made += 1;
         let agent_id = AgentId::from_counter(self.made, &AgentIdDomain(0)).unwrap();
         let spec_props = match parent {
             Some(parent) => [(props::PARENT.to_owned(), parent.encoded())].into(),
-            None => [(props::USER_FACING.to_owned(), "true".to_owned())].into(),
+            None => Default::default(),
         };
         let identity = AgentIdentity::for_test(agent_id, spec_props, UnixMs(self.ms()));
         self.agents
             .told(vec![MirroredAgent::new(self.host, identity)]);
-        let thread = rho_agent_types::ThreadId(MailId(1_000 + self.made));
-        self.threads.insert(agent_id, thread);
-        let node = NodeId::Mail(crate::node::MailThread {
-            agent: agent_id,
-            thread,
+        if self.log.streams.is_empty() {
+            self.record(ChatEvent::StreamCreated { name: "rho".into() });
+        }
+        let topic = self.record(ChatEvent::TopicStarted {
+            stream: StreamId(ChatSeq(1)),
+            name: name.into(),
+            by: Address::User,
+            agents: vec![agent_id],
         });
+        let node = NodeId::Topic(HostTopic {
+            machine_seed: 0,
+            topic: TopicId(topic),
+        });
+        self.topic_agents.insert(node.clone(), agent_id);
         self.names.insert(node.clone(), name.into());
         node
     }
@@ -192,38 +213,46 @@ impl World {
         self.agent_under(name, None)
     }
 
-    fn id(node: &NodeId) -> AgentId {
-        node.mail().unwrap().agent
+    fn id(&self, node: &NodeId) -> AgentId {
+        self.topic_agents[node]
     }
 
-    fn sends(&mut self, node: &NodeId, kind: SendKind) {
-        self.mail(Address::Agent(Self::id(node)), Address::User, Some(kind));
+    /// The topic's agent mentions the user.
+    fn sends(&mut self, node: &NodeId, kind: MentionKind) {
+        let from = Address::Agent(self.id(node));
+        self.post_in(
+            node,
+            from,
+            vec![Mention {
+                to: Address::User,
+                kind,
+            }],
+        );
     }
 
     fn finishes(&mut self, node: &NodeId) {
-        self.sends(node, SendKind::Result);
+        self.sends(node, MentionKind::Result);
     }
 
     fn asks(&mut self, node: &NodeId) {
-        self.sends(node, SendKind::Ask);
+        self.sends(node, MentionKind::Ask);
     }
 
-    /// Says what it is doing: nothing the dealer reads.
+    /// Says what it is doing, mentioning nobody: nothing the dealer reads.
     fn works(&mut self, node: &NodeId) {
-        self.sends(node, SendKind::Status);
+        let from = Address::Agent(self.id(node));
+        self.post_in(node, from, Vec::new());
     }
 
     fn writes_to(&mut self, node: &NodeId) {
-        self.mail(Address::User, Address::Agent(Self::id(node)), None);
+        self.post_in(node, Address::User, Vec::new());
     }
 
-    /// The newest mail in an agent's thread.
+    /// The newest message in a topic.
     fn newest(&self, node: &NodeId) -> u64 {
-        let thread = node.mail().unwrap();
-        self.agents
-            .agent_digest(thread.agent)
-            .and_then(|digest| digest.threads.get(&thread.thread))
-            .map_or(0, |held| held.newest.0)
+        self.log.topics[&node.topic().unwrap().topic]
+            .newest
+            .map_or(0, |(newest, _)| newest.0.0)
     }
 
     fn tell(&mut self, fact: Fact) {
@@ -240,7 +269,7 @@ impl World {
     /// How far the user has seen `node`: everything its source has.
     fn seen(&self, node: &NodeId) -> Seen {
         match node {
-            NodeId::Mail(_) => Seen::Mail(self.newest(node)),
+            NodeId::Topic(_) => Seen::Topic(self.newest(node)),
             NodeId::Slack(unit) => self
                 .slack
                 .unit(&model_unit(unit))
@@ -385,6 +414,7 @@ impl World {
     fn deal(&mut self) -> Hand {
         let sources = Sources {
             agents: &self.agents,
+            chat: &self.chat,
             slack: Some(Slack {
                 model: &self.slack,
                 mirror: None,
@@ -399,6 +429,7 @@ impl World {
     fn traced(&mut self) -> (Hand, Trace) {
         let sources = Sources {
             agents: &self.agents,
+            chat: &self.chat,
             slack: Some(Slack {
                 model: &self.slack,
                 mirror: None,
@@ -476,10 +507,10 @@ fn a2_a_result_is_below_an_ask_and_gone_in_three_days() {
 fn a3_an_fyi_is_no_card() {
     let mut w = world();
     let a = w.agent("a");
-    w.sends(&a, SendKind::Fyi);
+    w.sends(&a, MentionKind::Fyi);
     assert_eq!(w.hand(), "");
     w.finishes(&a);
-    w.sends(&a, SendKind::Fyi);
+    w.sends(&a, MentionKind::Fyi);
     assert_eq!(w.hand(), "a · result · 0m ago", "nor does it hide one");
 }
 
@@ -495,21 +526,27 @@ fn a4_a_status_is_no_card() {
 }
 
 #[test]
-fn a5_several_unread_sends_are_one_card_of_the_newest_ask_or_result() {
+fn a5_several_unseen_mentions_are_one_card_an_ask_above_a_result() {
     let mut w = world();
     let a = w.agent("a");
+    w.finishes(&a);
+    w.pass(hours(1));
+    w.sends(&a, MentionKind::Fyi);
+    assert_eq!(w.hand(), "a · result · 1.0h ago", "an fyi hides nothing");
     w.asks(&a);
     w.pass(hours(1));
     w.finishes(&a);
-    w.pass(hours(1));
-    w.sends(&a, SendKind::Fyi);
-    assert_eq!(w.hand(), "a · result · 1.0h ago");
+    assert_eq!(
+        w.hand(),
+        "a · asks · 1.0h",
+        "an ask unseen outranks a newer result, waiting from when it asked"
+    );
     w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 0m");
+    assert_eq!(w.hand(), "a · asks · 1.0h", "from the first ask unseen");
 }
 
 #[test]
-fn a6_done_or_writing_holds_until_a_newer_send_that_is_not_a_status() {
+fn a6_done_or_writing_holds_until_a_newer_mention() {
     let mut w = world();
     let a = w.agent("a");
     w.finishes(&a);
@@ -517,7 +554,11 @@ fn a6_done_or_writing_holds_until_a_newer_send_that_is_not_a_status() {
     assert_eq!(w.hand(), "");
     w.pass(hours(2));
     w.works(&a);
-    assert_eq!(w.hand(), "", "a status reads as nothing new");
+    assert_eq!(
+        w.hand(),
+        "",
+        "a message that mentions nobody is nothing new"
+    );
     w.finishes(&a);
     assert_eq!(w.hand(), "a · result · 0m ago");
     w.pass(mins(1));
@@ -526,7 +567,7 @@ fn a6_done_or_writing_holds_until_a_newer_send_that_is_not_a_status() {
 }
 
 #[test]
-fn a7_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
+fn a7_a_topic_the_user_just_wrote_in_comes_back_on_top_and_chimes() {
     let mut w = world();
     let a = w.agent("a");
     w.writes_to(&a);
@@ -539,27 +580,34 @@ fn a7_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
 }
 
 #[test]
-fn a10_an_engineer_started_for_the_user_deals_by_its_own_sends() {
+fn a10_another_agents_message_is_context_never_unread() {
     let mut w = world();
     let parent = w.agent("parent");
     let a = w.agent("a");
-    w.mail(
-        Address::Agent(World::id(&parent)),
-        Address::Agent(World::id(&a)),
-        None,
+    let (from, to) = (Address::Agent(w.id(&parent)), Address::Agent(w.id(&a)));
+    w.post_in(
+        &a,
+        from,
+        vec![Mention {
+            to,
+            kind: MentionKind::Ask,
+        }],
     );
-    assert_eq!(w.hand(), "", "its brief is context, never unread");
+    assert_eq!(w.hand(), "", "a mention of another agent is not the user's");
     w.asks(&a);
     assert_eq!(w.hand(), "a · asks · 0m");
 }
 
 #[test]
-fn a11_an_agent_made_by_an_agent_has_no_card_of_its_own() {
+fn a11_an_agent_made_by_an_agent_deals_only_by_mentioning_the_user() {
     let mut w = world();
     let parent = w.agent("parent");
-    let child = w.agent_under("child", Some(World::id(&parent)));
-    w.asks(&child);
+    let parent_id = w.id(&parent);
+    let child = w.agent_under("child", Some(parent_id));
+    w.works(&child);
     assert_eq!(w.hand(), "");
+    w.asks(&child);
+    assert_eq!(w.hand(), "child · asks · 0m", "a mention draws the user");
 }
 
 #[test]
@@ -589,35 +637,43 @@ fn a12_running_waiting_idle_or_stopped_changes_nothing() {
         },
     ] {
         for node in [&a, &b] {
+            let agent_id = w.id(node);
             w.agents.set_runtime(
-                World::id(node),
+                agent_id,
                 RuntimeState {
                     inference: inference.clone(),
                     ..Default::default()
                 },
             );
         }
-        assert_eq!(w.hand(), hand, "a stop or a retry is no mail");
+        assert_eq!(w.hand(), hand, "a stop or a retry is no message");
     }
 }
 
 #[test]
-fn a13_a_muted_agent_or_one_whose_host_is_gone_has_nothing() {
+fn a13_a_muted_topic_or_one_whose_host_or_agents_are_gone_has_nothing() {
     let mut w = world();
     let a = w.agent("a");
+    let b = w.agent("b");
     w.asks(&a);
+    w.asks(&b);
     w.say(&a, Said::Mute);
-    assert_eq!(w.hand(), "");
+    assert_eq!(w.hand(), "b · asks · 0m");
     w.say(&a, Said::Unmute);
-    assert_eq!(w.hand(), "a · asks · 0m");
-    w.agents.detach_host(w.host);
+    let both = w.hand();
+    assert!(both.contains("a · asks"), "{both}");
+    let b_id = w.id(&b);
+    w.agents.forget_agents(&[b_id].into());
+    assert_eq!(w.hand(), "a · asks · 0m", "b's agent is deleted");
+    w.chat.detach_host(w.host);
     assert_eq!(w.hand(), "");
 }
 
 /// The agent's live state, as the runtime publishes it.
 fn runtime(w: &mut World, node: &NodeId, running_tasks: u32, awaiting_human: bool, archived: bool) {
+    let agent_id = w.id(node);
     w.agents.set_runtime(
-        World::id(node),
+        agent_id,
         rho_agents_client::protocol::transcript::RuntimeState {
             running_tasks,
             awaiting_human,
@@ -1205,7 +1261,7 @@ proptest::proptest! {
                 proptest::prop_assert!(!facts.muted());
                 // Z1: nothing snoozed shows, but for an agent's quick reply.
                 if let Some(snooze) = facts.snooze() && at < snooze.until {
-                    proptest::prop_assert!(matches!(card.node, NodeId::Mail(_)));
+                    proptest::prop_assert!(matches!(card.node, NodeId::Topic(_)));
                 }
             }
             // X3: nothing arrives by itself before the next change.
