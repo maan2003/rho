@@ -32,24 +32,6 @@ impl Seq {
     }
 }
 
-/// What a send to the user is for, as the agent classed it: the dealer
-/// ranks the conversation on this alone (`rho-dealer/cases.md`, A1–A6).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum SendKind {
-    /// Asks the user for something the work needs.
-    Ask,
-    /// Delivers what the user asked for. Sends from before kinds existed
-    /// read as this.
-    #[default]
-    Result,
-    /// Acknowledgement or progress: the agent's status line until any
-    /// later message.
-    Status,
-    /// Worth keeping, but the user need not read it now: in the
-    /// conversation, never a card.
-    Fyi,
-}
-
 /// One field of a sidecar proposal. `Clear` stays distinct from
 /// `Unchanged` so a stale label can be dropped without inventing a new one.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -4,12 +4,14 @@
 //! they live below all of them. Anything shaped for one protocol belongs
 //! to that protocol's owner instead.
 
+mod chat;
 mod log;
 mod place;
 pub mod transcript;
 mod vocab;
 mod workset;
 
+pub use chat::*;
 pub use log::*;
 pub use place::*;
 pub use vocab::*;

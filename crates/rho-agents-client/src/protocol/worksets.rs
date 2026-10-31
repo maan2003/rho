@@ -1,14 +1,14 @@
 //! The agents protocol
 //! ([ARCH-agent-host](../../../../agent-host/specs/ARCH-agent-host.md)):
-//! worksets, the agent directory and mail.
+//! worksets, the agent directory and chat.
 //!
-//! The session ([`Open::Session`]) carries the mail log, the directory, the
+//! The session ([`Open::Session`]) carries the chat log, the directory, the
 //! rows of the worksets a client follows, and the live tails of the agents
 //! it looks at. Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, InputWake, Mail, MailId, Props, SendKind, ThreadId,
-    UnixMs, WorksetId, WorksetKind, Wpos,
+    AgentId, ChatRecord, ChatSeq, ContentPart, ExecMilestone, InputWake, MessageId, Props,
+    StreamId, TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -40,8 +40,11 @@ rho_rpc::calls! {
         CreateWorkset(CreateWorkset) -> CreatedWorkset;
         /// Code run in a workset's namespace; answered when it ends.
         Eval(Eval) -> EvalResult;
-        /// Mail from the user. Logged once per `client_id`.
-        PostMail(PostMail) -> MailId;
+        /// A message from the user. Logged once per `client_id`.
+        Post(Post) -> MessageId;
+        /// A topic the user starts with its first message. Logged once per
+        /// `client_id`.
+        StartTopic(StartTopic) -> TopicId;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
@@ -67,18 +70,12 @@ rho_rpc::calls! {
 pub struct CreateWorkset {
     pub kind: WorksetKind,
     pub code: String,
-    /// The user's first mail, to the first agent `code` creates. User mail
-    /// comes only from the GUI, so Python cannot write it.
-    pub message: Option<Vec<ContentPart>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Eval {
     pub workset: WorksetId,
     pub code: String,
-    /// As in [`CreateWorkset`]: mailed from the user to the first agent
-    /// `code` creates.
-    pub message: Option<Vec<ContentPart>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -87,8 +84,7 @@ pub struct EvalResult {
     pub output: String,
     /// The traceback, when it raised.
     pub error: Option<String>,
-    /// The agent the `message` was mailed to: the first one the code
-    /// created. `None` without a message, or when the code created none.
+    /// The first agent the code created, if it created one.
     pub agent: Option<AgentId>,
 }
 
@@ -100,13 +96,22 @@ pub struct CreatedWorkset {
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct PostMail {
-    /// The client's own random name for the mail, so a resend after a lost
-    /// answer is logged once.
+pub struct Post {
+    /// The client's own random name for the message, so a resend after a
+    /// lost answer is logged once.
     pub client_id: u64,
-    pub to: AgentId,
-    /// The thread to post in; `None` starts one.
-    pub thread: Option<ThreadId>,
+    pub topic: TopicId,
+    pub content: Vec<ContentPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct StartTopic {
+    /// As in [`Post`].
+    pub client_id: u64,
+    pub stream: StreamId,
+    pub name: String,
+    /// The agents that receive the topic's messages.
+    pub agents: Vec<AgentId>,
     pub content: Vec<ContentPart>,
 }
 
@@ -136,9 +141,10 @@ pub struct WorksetLogPage {
 /// What a client says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
-    /// After [`ServerFrame::Hello`]: the newest mail this client holds
-    /// (zero for none). The host sends every later mail, then each new one.
-    FollowMail { since: MailId },
+    /// After [`ServerFrame::Hello`]: the newest chat event this client
+    /// holds (zero for none). The host sends every later one, then each new
+    /// one.
+    FollowChat { since: ChatSeq },
     /// The worksets whose rows this client wants pushed as they land, each
     /// from the position it holds. Replaces the set wholesale; a workset
     /// this stream already follows goes on from the rows it sent, so none
@@ -161,8 +167,8 @@ pub enum ServerFrame {
     /// The first frame.
     Hello {
         machine_seed: u64,
-        /// The newest mail on the host.
-        mail_head: MailId,
+        /// The newest chat event on the host.
+        chat_head: ChatSeq,
         /// The last agent-id counter handed out, for short-prefix rendering.
         agent_counter: u64,
     },
@@ -184,9 +190,10 @@ pub enum ServerFrame {
     },
     /// An agent was created or its spec changed: the whole entry.
     Agent(AgentEntry),
-    /// Mail in log order: the answer to `FollowMail`, paged, then each new one.
-    Mail {
-        mails: Vec<Mail>,
+    /// Chat events in log order: the answer to `FollowChat`, paged, then
+    /// each new one.
+    Chat {
+        records: Vec<ChatRecord>,
     },
     /// Rows of a followed workset, in order, never repeated or skipped.
     Rows {
@@ -268,7 +275,7 @@ pub enum LogEvent {
     /// Something entered the agent's queue; its next request carries it.
     Input {
         agent: AgentId,
-        mail: Option<MailId>,
+        message: Option<MessageId>,
         text: String,
         wake: InputWake,
         at: UnixMs,
@@ -379,12 +386,9 @@ impl LogEvent {
     }
 }
 
-/// What a mail to the user is for, on the wire with the mail.
-pub type MailKind = SendKind;
-
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain};
+    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind};
 
     use super::*;
 
@@ -403,21 +407,25 @@ mod tests {
     fn frames_round_trip() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
         let workset: WorksetId = "0123456789ab".parse().unwrap();
-        round_trips(ClientFrame::FollowMail { since: MailId(9) });
+        round_trips(ClientFrame::FollowChat { since: ChatSeq(9) });
         round_trips(ClientFrame::FollowWorksets {
             from: vec![(workset, Wpos(3))],
         });
-        round_trips(ServerFrame::Mail {
-            mails: vec![Mail {
-                id: MailId(4),
+        round_trips(ServerFrame::Chat {
+            records: vec![ChatRecord {
+                seq: ChatSeq(4),
                 at: UnixMs(5),
-                from: Address::Agent(agent_id),
-                to: Address::User,
-                thread: ThreadId(MailId(2)),
-                kind: Some(SendKind::Ask),
-                content: vec![ContentPart::Text {
-                    text: "which branch?".into(),
-                }],
+                event: ChatEvent::Posted {
+                    topic: TopicId(ChatSeq(2)),
+                    from: Address::Agent(agent_id),
+                    mentions: vec![Mention {
+                        to: Address::User,
+                        kind: MentionKind::Ask,
+                    }],
+                    content: vec![ContentPart::Text {
+                        text: "which branch?".into(),
+                    }],
+                },
             }],
         });
         round_trips(ServerFrame::Status {
@@ -435,7 +443,7 @@ mod tests {
                 Wpos(7),
                 LogEvent::Input {
                     agent: agent_id,
-                    mail: Some(MailId(4)),
+                    message: Some(MessageId(ChatSeq(4))),
                     text: "hi".into(),
                     wake: InputWake::Person,
                     at: UnixMs(8),
@@ -448,10 +456,9 @@ mod tests {
     fn requests_round_trip() {
         let agent = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
         for request in [
-            Request::from(PostMail {
+            Request::from(Post {
                 client_id: 7,
-                to: agent,
-                thread: None,
+                topic: TopicId(ChatSeq(2)),
                 content: vec![ContentPart::Image {
                     media_type: "image/gif".to_owned(),
                     data: vec![1, 2, 3],
@@ -462,7 +469,14 @@ mod tests {
                     cwd: "/src/notes".into(),
                 },
                 code: "new_agent()".into(),
-                message: None,
+            }
+            .into(),
+            StartTopic {
+                client_id: 8,
+                stream: StreamId(ChatSeq(1)),
+                name: "Fix the flaky test".into(),
+                agents: vec![agent],
+                content: vec![ContentPart::Text { text: "go".into() }],
             }
             .into(),
             Cancel { agent }.into(),
@@ -475,6 +489,6 @@ mod tests {
         ] {
             round_trips(Open::Request(request));
         }
-        round_trips(rho_rpc::protocol::Answer::Done(MailId(3)));
+        round_trips(rho_rpc::protocol::Answer::Done(MessageId(ChatSeq(3))));
     }
 }
