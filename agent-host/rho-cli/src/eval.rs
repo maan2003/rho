@@ -7,31 +7,32 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent::entry::{Entry, Party};
-use rho_agent::{AgentEvent, StartPlace};
-use rho_agent_types::{AgentId, AgentRole, EngineerIntelligence, Place};
+use rho_agent::entry::Entry;
+use rho_agent::log::TranscriptLine;
+use rho_agent::record::{ClaudeRow, Event};
+use rho_agent::store::{Appended, StoreRead as _};
+use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
+use rho_agents_client::snippets;
 use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct EvalArgs {
-    /// Task text. Alternatively use --prompt-file (use - for stdin). With
-    /// --rewind-to and no task, the model is asked again as after a restart.
+    /// Task text. Alternatively use --prompt-file (use - for stdin).
     #[arg(
-        required_unless_present_any = ["prompt_file", "rewind_to"],
+        required_unless_present = "prompt_file",
         conflicts_with = "prompt_file"
     )]
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Engineer role. mini-eng selects GPT-6.1 Terra, high-eng selects
-    /// GPT-6 Astra; opus-eng and fable-eng
-    /// run Claude Code and need --claude-accounts. Every role works in the
-    /// Python notebook.
+    /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.1 Sol,
+    /// high-eng GPT-6 Astra; opus-eng and fable-eng run Claude Code and
+    /// need --claude-accounts. Every runtime works in the Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]
     pub role: String,
-    /// Use this LIVE working directory, a host directory with no workset,
-    /// which Claude roles cannot use. Defaults to an empty fresh workset.
+    /// Work in this LIVE directory, as a host workset. Defaults to a fresh
+    /// isolated workset.
     #[arg(long)]
     pub workdir: Option<PathBuf>,
     /// Keep the run's database and worksets in this directory instead of
@@ -45,6 +46,9 @@ pub(crate) struct EvalArgs {
     /// The account under --claude-accounts that Claude agents run on.
     #[arg(long, default_value = rho_claude::accounts::DEFAULT_ACCOUNT)]
     pub claude_account: String,
+    /// Override the OpenAI Responses base URL (isolated QA providers).
+    #[arg(long, value_name = "URL")]
+    pub openai_base_url: Option<String>,
     /// Agent execution timeout; excludes setup and blocked output writes.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
     pub timeout: u64,
@@ -58,19 +62,27 @@ pub(crate) struct EvalArgs {
     /// task text becomes its next user message.
     #[arg(long, requires = "state_dir")]
     pub resume: Option<String>,
-    /// Before resuming, rewind the agent to just after it sent its Nth
-    /// request; the task then asks the model again from there.
-    #[arg(long, requires = "resume")]
-    pub rewind_to: Option<usize>,
     /// Each time the agent sends its Nth request, snapshot --workdir, which
     /// must be a bcachefs subvolume, read-only into this directory as
-    /// r<N>: the files that request was asked about, for a later
-    /// --rewind-to N.
+    /// r<N>: the files that request was asked about.
     #[arg(long, requires = "workdir")]
     pub checkpoints: Option<PathBuf>,
     /// End the run once the agent has sent this many requests.
     #[arg(long)]
     pub max_requests: Option<usize>,
+}
+
+/// The runtime each role names, as the policy's `runtime=` takes it.
+fn role_runtime(role: &str) -> snippets::Runtime {
+    let label = match role {
+        "mini-eng" => "terra-xhigh",
+        "med-eng" => "sol-medium",
+        "high-eng" => "astra-high",
+        "opus-eng" => "opus-medium",
+        "fable-eng" => "fable-medium",
+        _ => unreachable!("clap validates evaluation roles"),
+    };
+    snippets::Runtime::parse(label).expect("every role names a runtime the policy takes")
 }
 
 enum KeptOrTemp {
@@ -102,17 +114,16 @@ fn emit(mut value: Value) -> Result<()> {
 pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
     let prompt = match (&args.prompt, &args.prompt_file) {
-        (None, None) => None,
-        (Some(prompt), _) => Some(prompt.clone()),
-        (_, Some(path)) if path.as_os_str() == "-" => {
+        (Some(prompt), _) => prompt.clone(),
+        (None, Some(path)) if path.as_os_str() == "-" => {
             let mut prompt = String::new();
             tokio::io::stdin()
                 .take(1024 * 1024 + 1)
                 .read_to_string(&mut prompt)
                 .await?;
-            Some(prompt)
+            prompt
         }
-        (_, Some(path)) => {
+        (None, Some(path)) => {
             let mut prompt = String::new();
             tokio::fs::File::open(path)
                 .await
@@ -120,13 +131,12 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 .take(1024 * 1024 + 1)
                 .read_to_string(&mut prompt)
                 .await?;
-            Some(prompt)
+            prompt
         }
+        (None, None) => unreachable!("clap requires a prompt or a prompt file"),
     };
     anyhow::ensure!(
-        prompt
-            .as_ref()
-            .is_none_or(|prompt| !prompt.trim().is_empty() && prompt.len() <= 1024 * 1024),
+        !prompt.trim().is_empty() && prompt.len() <= 1024 * 1024,
         "task must contain 1 byte through 1 MiB of text"
     );
     let started = Instant::now();
@@ -147,59 +157,17 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     )
     .await?;
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
-    let resume = match &args.resume {
-        Some(handle) => {
-            let read = db.read();
-            let domain = rho_agent_types::AgentIdDomain(read.machine_seed());
-            let id = match AgentId::from_prefix(
-                handle.trim(),
-                read.last_agent_counter() + 1,
-                &domain,
-            )? {
-                prefix_id::PrefixResolution::Unique(id) => id,
-                prefix_id::PrefixResolution::Ambiguous { .. } => {
-                    anyhow::bail!("ambiguous agent id {handle}")
-                }
-                prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {handle}"),
-            };
-            drop(read);
-            if let Some(n) = args.rewind_to {
-                let sent = requests_sent(&db, id);
-                let Some(&at) = sent.get(n.wrapping_sub(1)) else {
-                    anyhow::bail!("agent {handle} sent {} requests, not {n}", sent.len());
-                };
-                let mut write = db.write().await;
-                write.rewind_agent(rho_agent_types::UnixMs::now(), id, at.next());
-                write.commit();
-            }
-            Some(id)
-        }
-        None => None,
-    };
-    // A live workdir is a host directory, with no workset; the default is
-    // a fresh workset, which Claude roles need. A resumed agent keeps the
-    // place it recorded.
-    let place = match (resume, &args.workdir) {
-        (Some(id), _) => db.read().get_agent(id).place().clone(),
-        (None, Some(path)) => Place {
-            cwd: camino::Utf8PathBuf::try_from(
-                path.canonicalize()
-                    .context("resolve live evaluation workdir")?,
-            )?,
-            workset: None,
-        },
-        (None, None) => Place {
-            cwd: rho_fs_view::MOUNT_ROOT.into(),
-            workset: Some(worksets.create().await?.id()),
-        },
-    };
-    // Where the agent's files are, as this process sees them.
-    let workdir = match place.workset {
-        Some(workset) => worksets.open_workset(workset).await?.root().to_owned(),
-        None => place.cwd.clone(),
-    };
     rho_inference::ensure_crypto_provider();
-    let inference = rho_inference::Accounts::new(db.clone()).await?;
+    let inference = match &args.openai_base_url {
+        Some(endpoint) => {
+            rho_inference::Accounts::new_with_config(
+                db.clone(),
+                rho_inference::InferenceConfig::with_responses_base_url(endpoint.as_str())?,
+            )
+            .await?
+        }
+        None => rho_inference::Accounts::new(db.clone()).await?,
+    };
     // An eval keeps its Claude state in its own directory; only a login,
     // when asked for, comes from the user's accounts.
     let claude_home = camino::Utf8PathBuf::try_from(temp.path().join("claude"))?;
@@ -224,58 +192,95 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         std::sync::Arc::new(inference),
         worksets,
         claude,
+        None,
     )
     .await;
-    let role = AgentRole::Engineer {
-        intelligence: match args.role.as_str() {
-            "mini-eng" => EngineerIntelligence::Mini,
-            "med-eng" => EngineerIntelligence::Medium,
-            "high-eng" => EngineerIntelligence::High,
-            "opus-eng" => EngineerIntelligence::Medium1,
-            "fable-eng" => EngineerIntelligence::High1,
-            _ => unreachable!("clap validates evaluation roles"),
-        },
-    };
-    let mut feed = rho_agent::journal::feed(&db);
-    let (id, agent) = match resume {
-        Some(id) => {
-            let (id, agent, _) = pool.load(id).await?;
-            (id, agent)
+    // Subscribed before the agent exists, so none of its rows go unseen.
+    let mut feed = rho_agent::store::feed(&db);
+    let id = match &args.resume {
+        Some(handle) => {
+            let read = db.read();
+            let domain = rho_agent_types::AgentIdDomain(read.machine_seed());
+            match AgentId::from_prefix(handle.trim(), read.last_agent_counter() + 1, &domain)? {
+                prefix_id::PrefixResolution::Unique(id) if read.agent(id).is_some() => id,
+                prefix_id::PrefixResolution::Ambiguous { .. } => {
+                    anyhow::bail!("ambiguous agent id {handle}")
+                }
+                _ => anyhow::bail!("no agent with id {handle}"),
+            }
         }
+        // A live workdir is a host workset; the default is a fresh
+        // isolated one.
         None => {
-            pool.create(role, Some("CLI evaluation".into()), StartPlace::new(place))
-                .await?
+            let kind = match &args.workdir {
+                Some(path) => WorksetKind::Host {
+                    cwd: camino::Utf8PathBuf::try_from(
+                        path.canonicalize()
+                            .context("resolve live evaluation workdir")?,
+                    )?,
+                },
+                None => WorksetKind::Isolated,
+            };
+            let code = snippets::new_agent_in(
+                &rho_agent::host::pool::workset_root(&kind),
+                &role_runtime(&args.role),
+            );
+            let (workset, evaluated) = pool.create_workset(kind, code, None).await?;
+            if let Some(error) = evaluated.error {
+                anyhow::bail!("creating the evaluation agent failed: {error}");
+            }
+            *db.read()
+                .workset(workset)
+                .context("the new workset has no head")?
+                .agents
+                .first()
+                .context("the creation code made no agent")?
         }
     };
-    // Drop is also cancellation, including early output/connection failures.
-    struct CancelOnDrop(rho_agent::host::AgentClient);
-    impl Drop for CancelOnDrop {
-        fn drop(&mut self) {
-            self.0.cancel();
-        }
-    }
-    let _cancel = CancelOnDrop(agent.clone());
-    let model = match db
+    let head = db
         .read()
-        .agent_event(id, rho_agent::log::AgentEventPos::new(0))
-    {
-        Some(AgentEvent::Created { binding, .. }) => {
-            binding.deep_model().map(|model| model.as_str())
-        }
-        _ => None,
+        .agent(id)
+        .context("the evaluation agent has no head")?;
+    let workset = head.workset;
+    // Where the agent's files are, as this process sees them.
+    let workdir = match db.read().workset(workset).context("no workset")?.kind {
+        WorksetKind::Isolated => pool
+            .worksets()
+            .open_workset(workset)
+            .await?
+            .root()
+            .to_owned(),
+        WorksetKind::Host { cwd } => cwd,
     };
-    emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir.as_str()}))?;
+    let (_, agent, _) = pool.load(id).await?;
+    emit(
+        json!({"type":"start", "role":args.role, "agent":format!("{id:?}"),
+        "runtime":format!("{:?}", head.spec.runtime), "workdir":workdir.as_str()}),
+    )?;
     // Subscribed before the prompt goes, so its work is seen starting.
     let mut statuses = agent.statuses();
-    match prompt {
-        Some(prompt) => agent.send_user_message(prompt),
-        None => agent.retry(),
-    }
+    let client_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos() as u64;
+    pool.post_user_mail(
+        client_id,
+        id,
+        None,
+        vec![ContentPart::Text { text: prompt }],
+    )
+    .await?;
+    let mut watch = Watch {
+        args: &args,
+        db: &db,
+        id,
+        workset,
+        workdir: &workdir,
+        requests: 0,
+        calls: BTreeSet::new(),
+        final_answer: String::new(),
+        tokens: [0; 3],
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
-    let mut requests = 0;
-    let mut calls = BTreeSet::new();
-    let mut final_answer = String::new();
-    let mut tokens = [0u64; 3];
     let mut working = false;
     // Once the agent stops, only the rows it wrote first are left to read:
     // each was announced before the status that followed it.
@@ -285,125 +290,65 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     // staying idle this long, and its elapsed time stops where idling began.
     const SETTLE: Duration = Duration::from_secs(25);
     let mut idle_since: Option<Instant> = None;
-    let outcome = loop {
-        let event = match &finished {
-            Some(outcome) => match feed.try_recv() {
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break outcome.clone(),
-                event => event.map_err(|error| error.to_string()),
-            },
-            None => tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break Err("Evaluation timed out".to_owned()),
-                _ = tokio::signal::ctrl_c() => break Err("Evaluation interrupted".to_owned()),
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(idle_since.unwrap_or(started) + SETTLE)), if idle_since.is_some() => {
-                    finished = Some(Ok(()));
-                    continue;
-                }
-                changed = statuses.changed() => {
-                    if changed.is_err() {
-                        break Err("Evaluation agent stopped".to_owned());
+    // An early output failure leaves the loop too, and the agent is
+    // cancelled either way.
+    let outcome = async {
+        Ok::<_, anyhow::Error>(loop {
+            let event = match &finished {
+                Some(outcome) => match feed.try_recv() {
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        break outcome.clone();
                     }
-                    let runtime = statuses.borrow_and_update().runtime.clone();
-                    working |= runtime.is_working();
-                    // Between cells the agent is idle but due a check-in; it is
-                    // done only once it ends its turn, archives, stops or fails.
-                    // A turn ended over running tasks is not done: no human
-                    // answers here, but those tasks can still wake it.
-                    let responding = runtime.inference == rho_agent::InferenceState::Responding;
-                    let stopped = !runtime.is_working() && runtime.checkin_at.is_none();
-                    let ended = runtime.awaiting_human && runtime.running_tasks == 0;
-                    if let rho_agent::InferenceState::Failed { error } = runtime.inference {
-                        finished = Some(Err(error));
-                    } else if working && runtime.archived {
+                    event => event.map_err(|error| error.to_string()),
+                },
+                None => tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break Err("Evaluation timed out".to_owned()),
+                    _ = tokio::signal::ctrl_c() => break Err("Evaluation interrupted".to_owned()),
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(idle_since.unwrap_or(started) + SETTLE)), if idle_since.is_some() => {
                         finished = Some(Ok(()));
-                    } else if working && !responding && (ended || stopped) {
-                        idle_since.get_or_insert_with(Instant::now);
-                    } else {
-                        idle_since = None;
+                        continue;
                     }
-                    continue;
-                }
-                event = feed.recv() => event.map_err(|error| error.to_string()),
-            },
-        };
-        let appended = match event {
-            Ok(event) => event,
-            Err(error) => break Err(format!("Evaluation feed lost: {error}")),
-        };
-        let agent_id = appended.agent_id;
-        let Some(AgentEvent::Entry(entry)) = db.read().agent_event(agent_id, appended.pos.into())
-        else {
-            continue;
-        };
-        // Agents it spawns are part of the run: their work and tokens count.
-        let agent = format!("{agent_id:?}");
-        match entry {
-            Entry::RequestSent { report, .. } => {
-                requests += 1;
-                emit(json!({"type":"request", "agent":agent, "number":requests}))?;
-                if agent_id == id {
-                    // Numbered by the agent's own history, so a resumed run
-                    // continues the numbers it was rewound to.
-                    let n = requests_sent(&db, id).len();
-                    if let Some(dir) = &args.checkpoints {
-                        let status = std::process::Command::new("bcachefs")
-                            .args(["subvolume", "snapshot", "-r"])
-                            .arg(&workdir)
-                            .arg(dir.join(format!("r{n}")))
-                            .status()
-                            .context("run bcachefs")?;
-                        anyhow::ensure!(status.success(), "snapshot for request {n} failed");
+                    changed = statuses.changed() => {
+                        if changed.is_err() {
+                            break Err("Evaluation agent stopped".to_owned());
+                        }
+                        let runtime = statuses.borrow_and_update().runtime.clone();
+                        working |= runtime.is_working();
+                        // Between cells the agent is idle but due a check-in; it is
+                        // done only once it ends its turn, archives, stops or fails.
+                        // A turn ended over running tasks is not done: no human
+                        // answers here, but those tasks can still wake it.
+                        let responding = runtime.inference == rho_agent::InferenceState::Responding;
+                        let stopped = !runtime.is_working() && runtime.checkin_at.is_none();
+                        let ended = runtime.awaiting_human && runtime.running_tasks == 0;
+                        if let rho_agent::InferenceState::Failed { error } = runtime.inference {
+                            finished = Some(Err(error));
+                        } else if working && runtime.archived {
+                            finished = Some(Ok(()));
+                        } else if working && !responding && (ended || stopped) {
+                            idle_since.get_or_insert_with(Instant::now);
+                        } else {
+                            idle_since = None;
+                        }
+                        continue;
                     }
-                    if args.max_requests.is_some_and(|max| n > max) {
-                        break Err(format!("Stopped before request {n}"));
-                    }
-                }
-                let prior = db.read().agent_input_carry(agent_id, appended.pos.into());
-                let results = rho_inference::transcript::report_results(&report, prior.as_ref());
-                for result in results {
-                    emit(
-                        json!({"type":"notebook_report", "agent":agent, "id":result.display_id(), "output":result.text}),
-                    )?;
-                }
+                    event = feed.recv() => event.map_err(|error| error.to_string()),
+                },
+            };
+            let appended = match event {
+                Ok(event) => event,
+                Err(error) => break Err(format!("Evaluation feed lost: {error}")),
+            };
+            if let Some(stop) = watch.observe(appended)? {
+                break Err(stop);
             }
-            Entry::Step { carry, usage, .. } => {
-                for call in carry.display_calls() {
-                    calls.insert("exec".to_owned());
-                    emit(
-                        json!({"type":"tool_call", "agent":agent, "id":call.display_id(), "name":"exec", "arguments":call.code}),
-                    )?;
-                }
-                if let Some(usage) = usage {
-                    tokens[0] += usage.input_tokens;
-                    tokens[1] += usage.cache_read_tokens;
-                    tokens[2] += usage.output_tokens;
-                    emit(
-                        json!({"type":"usage", "agent":agent, "input_tokens":usage.input_tokens,
-                    "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}),
-                    )?;
-                }
-            }
-            Entry::Sent {
-                to: Party::Human,
-                text,
-                ..
-            } if agent_id == id => {
-                if !final_answer.is_empty() {
-                    final_answer.push('\n');
-                }
-                final_answer.push_str(&text);
-                emit(json!({"type":"message", "agent":agent, "text":text}))?;
-            }
-            Entry::Sent { to, text, .. } => {
-                emit(
-                    json!({"type":"message", "agent":agent, "to":format!("{to:?}"), "text":text}),
-                )?;
-            }
-            _ => {}
-        }
-    };
-    agent.cancel();
-    // Every runtime records provider usage here, Claude Code included, which
-    // reports no steps of its own.
+        })
+    }
+    .await;
+    pool.cancel(id).await?;
+    let outcome = outcome?;
+    // Every runtime records provider usage here, Claude Code included.
+    pool.flush_agent_usage(None).await;
     let usage: Vec<Value> = db
         .read()
         .global_agent_usage(Default::default())
@@ -415,6 +360,13 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             "cache_write_1h_tokens":total.cache_write_1h_tokens, "output_tokens":total.output_tokens})
         })
         .collect();
+    let Watch {
+        requests,
+        calls,
+        final_answer,
+        tokens,
+        ..
+    } = watch;
     let mut failures = outcome.err().into_iter().collect::<Vec<_>>();
     failures.extend(checks(
         &args.expect,
@@ -433,14 +385,195 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     Ok(())
 }
 
-/// Where each request the agent's visible history sent was recorded.
-fn requests_sent(db: &rho_db::RhoDb, id: AgentId) -> Vec<rho_agent::log::AgentEventPos> {
-    db.read()
-        .agent_event_records(id)
-        .1
-        .into_iter()
-        .filter(|(_, event)| matches!(event, AgentEvent::Entry(Entry::RequestSent { .. })))
-        .map(|(pos, _)| pos)
+/// What the run has seen of its workset's rows and mail.
+struct Watch<'a> {
+    args: &'a EvalArgs,
+    db: &'a rho_db::RhoDb,
+    /// The agent the task went to.
+    id: AgentId,
+    workset: WorksetId,
+    workdir: &'a camino::Utf8Path,
+    requests: usize,
+    calls: BTreeSet<String>,
+    final_answer: String,
+    tokens: [u64; 3],
+}
+
+impl Watch<'_> {
+    /// Emits what one append says; `Some` is why the run stops here.
+    fn observe(&mut self, appended: Appended) -> Result<Option<String>> {
+        match appended {
+            Appended::Row { workset, pos } if workset == self.workset => {
+                let Some(record) = self.db.read().workset_row(workset, pos) else {
+                    return Ok(None);
+                };
+                match record.event {
+                    Event::Native { agent, entry } => self.entry(agent, pos, entry),
+                    Event::Claude { agent, row } => self.claude(agent, pos, row),
+                    _ => Ok(None),
+                }
+            }
+            Appended::Mail(mail) => {
+                let Some(mail) = self.db.read().mail(mail) else {
+                    return Ok(None);
+                };
+                let Address::Agent(from) = mail.from else {
+                    return Ok(None);
+                };
+                // Agents it spawns are part of the run: their mail counts.
+                if self.db.read().agent(from).map(|head| head.workset) != Some(self.workset) {
+                    return Ok(None);
+                }
+                let text = text_of(&mail.content);
+                let agent = format!("{from:?}");
+                if from == self.id && mail.to == Address::User {
+                    if !self.final_answer.is_empty() {
+                        self.final_answer.push('\n');
+                    }
+                    self.final_answer.push_str(&text);
+                    emit(json!({"type":"message", "agent":agent, "text":text}))?;
+                } else {
+                    emit(
+                        json!({"type":"message", "agent":agent, "to":format!("{:?}", mail.to), "text":text}),
+                    )?;
+                }
+                Ok(None)
+            }
+            Appended::Row { .. } | Appended::WorksetDeleted(_) => Ok(None),
+        }
+    }
+
+    fn entry(&mut self, agent_id: AgentId, pos: Wpos, entry: Entry) -> Result<Option<String>> {
+        // Agents it spawns are part of the run: their work and tokens count.
+        let agent = format!("{agent_id:?}");
+        match entry {
+            Entry::RequestSent { report, .. } => {
+                if let Some(stop) = self.request(agent_id, pos)? {
+                    return Ok(Some(stop));
+                }
+                let rho_inference::transcript::Before {
+                    carry: prior,
+                    inputs,
+                } = rho_inference::transcript::before_at(&self.db.read(), agent_id, pos);
+                let results =
+                    rho_inference::transcript::report_results(&report, inputs, prior.as_ref());
+                for result in results {
+                    emit(
+                        json!({"type":"notebook_report", "agent":agent, "id":result.display_id(), "output":result.text}),
+                    )?;
+                }
+            }
+            Entry::Step { carry, usage, .. } => {
+                for call in carry.display_calls() {
+                    self.calls.insert("exec".to_owned());
+                    emit(
+                        json!({"type":"tool_call", "agent":agent, "id":call.display_id(), "name":"exec", "arguments":call.code}),
+                    )?;
+                }
+                if let Some(usage) = usage {
+                    self.usage(
+                        &agent,
+                        usage.input_tokens,
+                        usage.cache_read_tokens,
+                        usage.output_tokens,
+                    )?;
+                }
+            }
+            Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
+        }
+        Ok(None)
+    }
+
+    fn claude(&mut self, agent_id: AgentId, pos: Wpos, row: ClaudeRow) -> Result<Option<String>> {
+        let agent = format!("{agent_id:?}");
+        match row {
+            ClaudeRow::RequestSent { .. } => return self.request(agent_id, pos),
+            ClaudeRow::Transcript {
+                line: TranscriptLine::Assistant { calls, usage, .. },
+                ..
+            } => {
+                for call in calls {
+                    self.calls.insert(call.name.clone());
+                    emit(
+                        json!({"type":"tool_call", "agent":agent, "id":call.id, "name":call.name, "arguments":call.arguments}),
+                    )?;
+                }
+                if let Some(usage) = usage {
+                    self.usage(
+                        &agent,
+                        usage.input_tokens,
+                        usage.cache_read_tokens,
+                        usage.output_tokens,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// A request went: counted, and for the task's agent checkpointed and
+    /// held to --max-requests.
+    fn request(&mut self, agent_id: AgentId, pos: Wpos) -> Result<Option<String>> {
+        self.requests += 1;
+        emit(json!({"type":"request", "agent":format!("{agent_id:?}"), "number":self.requests}))?;
+        if agent_id != self.id {
+            return Ok(None);
+        }
+        // Numbered by the agent's own history, so a resumed run continues
+        // its numbers.
+        let n = self
+            .db
+            .read()
+            .agent_rows(agent_id, Wpos(0))
+            .into_iter()
+            .filter(|(row, record)| {
+                *row <= pos
+                    && matches!(
+                        record.event,
+                        Event::Native {
+                            entry: Entry::RequestSent { .. },
+                            ..
+                        } | Event::Claude {
+                            row: ClaudeRow::RequestSent { .. },
+                            ..
+                        }
+                    )
+            })
+            .count();
+        if let Some(dir) = &self.args.checkpoints {
+            let status = std::process::Command::new("bcachefs")
+                .args(["subvolume", "snapshot", "-r"])
+                .arg(self.workdir)
+                .arg(dir.join(format!("r{n}")))
+                .status()
+                .context("run bcachefs")?;
+            anyhow::ensure!(status.success(), "snapshot for request {n} failed");
+        }
+        Ok(self
+            .args
+            .max_requests
+            .is_some_and(|max| n > max)
+            .then(|| format!("Stopped before request {n}")))
+    }
+
+    fn usage(&mut self, agent: &str, input: u64, cached: u64, output: u64) -> Result<()> {
+        self.tokens[0] += input;
+        self.tokens[1] += cached;
+        self.tokens[2] += output;
+        emit(json!({"type":"usage", "agent":agent, "input_tokens":input,
+            "cached_input_tokens":cached, "output_tokens":output}))
+    }
+}
+
+/// The text of some content: its text parts, in order.
+fn text_of(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
         .collect()
 }
 
@@ -466,6 +599,23 @@ fn checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_role_names_a_runtime() {
+        let runtimes = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"]
+            .map(|role| role_runtime(role).label());
+        assert_eq!(
+            runtimes,
+            [
+                "terra-xhigh",
+                "sol-medium",
+                "astra-high",
+                "opus-medium",
+                "fable-medium"
+            ]
+        );
+    }
+
     #[test]
     fn checks_require_observed_tools_not_claims_in_prose() {
         assert_eq!(

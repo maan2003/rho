@@ -82,7 +82,7 @@ async fn run(command: Command) -> Result<()> {
 fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> String {
     use rho_rpc::protocol::{Protocol, describe_as};
     match open.protocol {
-        Protocol::Agents => describe_as::<agents::Open>(open, reply),
+        Protocol::Agents => "retired agents protocol".to_owned(),
         Protocol::Worksets => describe_as::<agents::rho2::Open>(open, reply),
         Protocol::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
         Protocol::Host => describe_as::<host::Open>(open, reply),

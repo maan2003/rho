@@ -5,11 +5,10 @@
 
 use rho_agent::db::usage_model_of;
 use rho_agent::entry::{Entry, Notice, Report};
-use rho_agent::inference::Carry;
 use rho_agent::log::{AgentUsageBucket, TranscriptLine};
 use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agent_types::{ContentPart, InputWake, UnixMs, Wpos};
+use rho_agent_types::{ContentPart, InputWake, UnixMs};
 use rho_agents_client::protocol::rho2::{LogEvent, SpecView};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
 
@@ -45,72 +44,6 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
         cache_write_1h_tokens: bucket.cache_write_1h_tokens,
         output_tokens: bucket.output_tokens,
     }
-}
-
-/// What a request's report is read against: the agent's newest step before
-/// it, whose calls the report answers, and whether inputs went with it.
-#[derive(Clone, Debug, Default)]
-pub struct Before {
-    pub carry: Option<Carry>,
-    pub inputs: bool,
-}
-
-impl Before {
-    /// The state after one more of the agent's visible rows.
-    pub fn observe(&mut self, event: &Event<'_>) {
-        match event {
-            Event::Input { .. } => self.inputs = true,
-            Event::Native {
-                entry: Entry::Step { carry, .. },
-                ..
-            } => self.carry = Some(carry.clone()),
-            Event::Native {
-                entry: Entry::RequestSent { .. },
-                ..
-            }
-            | Event::Claude {
-                row: ClaudeRow::RequestSent { .. },
-                ..
-            } => self.inputs = false,
-            _ => {}
-        }
-    }
-}
-
-/// The agent's state just before `pos`: its visible rows before it, folded.
-/// A rewind before `pos` hides what it took back; one after does not.
-pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: Wpos) -> Before {
-    use rho_agent::store::StoreRead as _;
-    let Some(head) = read.agent(agent) else {
-        return Before::default();
-    };
-    let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
-    let mut from = head.created;
-    while from < pos {
-        let page = read.workset_rows(head.workset, from, 4096);
-        let Some((last, _)) = page.last() else {
-            break;
-        };
-        from = last.next();
-        for (row, record) in page {
-            if row >= pos {
-                break;
-            }
-            if record.event.agent() != Some(agent) {
-                continue;
-            }
-            if let Event::Rewound { to, .. } = &record.event {
-                let keep = kept.partition_point(|(kept, _)| kept < to);
-                kept.truncate(keep);
-            }
-            kept.push((row, record));
-        }
-    }
-    let mut before = Before::default();
-    for (_, record) in &kept {
-        before.observe(&record.event);
-    }
-    before
 }
 
 /// The text of some content: its text parts, in order.
@@ -336,6 +269,8 @@ fn strip_claude(agent: rho_agent_types::AgentId, row: &ClaudeRow, at: UnixMs) ->
         | ClaudeRow::RewindPending(_) => return None,
     })
 }
+
+pub(crate) use rho_inference::transcript::{Before, before_at};
 
 /// A request's rendered notebook output belongs to the prior provider call.
 /// Without one, it is ordinary user context, not a tool result.

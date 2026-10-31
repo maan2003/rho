@@ -2049,6 +2049,9 @@ impl ClaudeLoop {
         if error.is::<StoreError>() {
             return Err(error);
         }
+        // The whole chain, as the native loop tells it: the outer context
+        // alone does not say what went wrong.
+        let error = anyhow::anyhow!("{error:#}");
 
         if let Some(host) = &mut self.python {
             host.failed(UnixMs::now(), Arc::from(error.to_string()));
