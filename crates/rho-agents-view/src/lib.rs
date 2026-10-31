@@ -28,8 +28,8 @@ gpui::actions!(
         DraftFieldSubmit,
         DraftFieldClear,
         DraftValueCycle,
-        RoleCycle,
-        RoleCycleGroup,
+        RuntimeCycle,
+        RuntimeCycleGroup,
     ]
 );
 

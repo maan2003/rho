@@ -1,4 +1,4 @@
-//! The draft compose model: pick a workdir, a role and a base, write the
+//! The draft compose model: pick a workdir, a model and a base, write the
 //! first message, then submit to create the agent.
 //!
 //! Entirely separate from [`crate::agent_view::AgentModel`] — there is no
@@ -27,11 +27,12 @@ use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
-const ROLE_LABEL_INLAY_ID: usize = 2;
+const RUNTIME_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 
-pub use rho_agents_client::create::{AUTO_BASE_REV, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
+pub use rho_agents_client::create::{AUTO_BASE_REV, DEFAULT_START, StartFieldMode};
+pub use rho_agents_client::snippets::DEFAULT_RUNTIME;
 
 impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {
@@ -50,7 +51,7 @@ trait StartFieldModeLabel {
 }
 
 /// What the host supplies for a draft editor. The crate builds the editor
-/// and owns the fields; who can complete a workdir, a role or a start is
+/// and owns the fields; who can complete a workdir, a model or a start is
 /// the host's question, so the host installs its own provider on each
 /// editor as it is built.
 ///
@@ -76,7 +77,7 @@ impl Hooks {
 #[derive(Clone, Copy)]
 pub struct Fields {
     pub workdir: gpui::EntityId,
-    pub role: gpui::EntityId,
+    pub runtime: gpui::EntityId,
     pub start: gpui::EntityId,
 }
 
@@ -96,7 +97,7 @@ pub struct DraftModel {
     hooks: Hooks,
     multi_buffer: Entity<MultiBuffer>,
     workdir_buffer: Entity<Buffer>,
-    role_buffer: Entity<Buffer>,
+    runtime_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
     /// The host the agent will run on, named in the Workdir label once
@@ -122,7 +123,7 @@ pub struct DraftModel {
 impl DraftModel {
     pub fn new(hooks: Hooks, cx: &mut Context<Self>) -> Self {
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
-        let role_buffer = cx.new(|cx| Buffer::local(DEFAULT_ROLE, cx));
+        let runtime_buffer = cx.new(|cx| Buffer::local(DEFAULT_RUNTIME, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
@@ -130,7 +131,7 @@ impl DraftModel {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
             for (key, buffer) in [
                 (0, &workdir_buffer),
-                (1, &role_buffer),
+                (1, &runtime_buffer),
                 (2, &start_buffer),
                 (3, &body_buffer),
             ] {
@@ -157,7 +158,7 @@ impl DraftModel {
                     this.note_draft_edit(cx);
                 }
             }),
-            cx.subscribe(&role_buffer, |this, _, event, cx| {
+            cx.subscribe(&runtime_buffer, |this, _, event, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.note_draft_edit(cx);
                 }
@@ -174,7 +175,7 @@ impl DraftModel {
             hooks,
             multi_buffer,
             workdir_buffer,
-            role_buffer,
+            runtime_buffer,
             start_buffer,
             start_mode: StartFieldMode::NewOn,
             workdir_host: None,
@@ -198,13 +199,13 @@ impl DraftModel {
         let multi_buffer = self.multi_buffer.clone();
         let buffers = [
             &self.workdir_buffer,
-            &self.role_buffer,
+            &self.runtime_buffer,
             &self.start_buffer,
             &self.body_buffer,
         ];
         let buffer_ids = buffers.map(|buffer| buffer.read(cx).remote_id());
         let workdir_id = self.workdir_buffer.entity_id();
-        let role_id = self.role_buffer.entity_id();
+        let runtime_id = self.runtime_buffer.entity_id();
         let start_id = self.start_buffer.entity_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
@@ -226,7 +227,7 @@ impl DraftModel {
                 &mut editor,
                 Fields {
                     workdir: workdir_id,
-                    role: role_id,
+                    runtime: runtime_id,
                     start: start_id,
                 },
                 window,
@@ -237,7 +238,7 @@ impl DraftModel {
 
         self.editors.push(editor.downgrade());
         self.insert_workdir_label_to(&editor, cx);
-        self.insert_role_label_to(&editor, cx);
+        self.insert_runtime_label_to(&editor, cx);
         self.insert_start_label_to(&editor, cx);
         self.apply_start_target_hint_to(&editor, cx);
         self.insert_body_gap_to(&editor, cx);
@@ -285,14 +286,14 @@ impl DraftModel {
         cx.notify();
     }
 
-    pub fn role_text(&self, cx: &gpui::App) -> String {
-        let buffer = self.role_buffer.read(cx);
+    pub fn runtime_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.runtime_buffer.read(cx);
         buffer.text_for_range(0..buffer.len()).collect()
     }
 
-    pub fn set_role_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub fn set_runtime_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.suppress_draft_activation = true;
-        self.role_buffer.update(cx, |buffer, cx| {
+        self.runtime_buffer.update(cx, |buffer, cx| {
             let len = buffer.len();
             buffer.edit([(0..len, text)], None, cx);
         });
@@ -353,7 +354,7 @@ impl DraftModel {
     /// message body.
     pub fn cursor_in_a_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         self.cursor_in(&self.workdir_buffer, editor, cx)
-            || self.cursor_in(&self.role_buffer, editor, cx)
+            || self.cursor_in(&self.runtime_buffer, editor, cx)
             || self.cursor_in(&self.start_buffer, editor, cx)
     }
 
@@ -365,8 +366,8 @@ impl DraftModel {
         self.cursor_in(&self.workdir_buffer, editor, cx)
     }
 
-    pub fn cursor_in_role_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
-        self.cursor_in(&self.role_buffer, editor, cx)
+    pub fn cursor_in_runtime_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.runtime_buffer, editor, cx)
     }
 
     fn cursor_in(&self, buffer: &Entity<Buffer>, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -455,7 +456,7 @@ impl DraftModel {
         }
     }
 
-    /// Tab: cycles workdir field → role field → start field → message body.
+    /// Tab: cycles workdir field → model field → start field → message body.
     pub fn toggle_field(
         &mut self,
         editor: &Entity<Editor>,
@@ -463,8 +464,8 @@ impl DraftModel {
         cx: &mut Context<Self>,
     ) {
         let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
-            Some(&self.role_buffer)
-        } else if self.cursor_in(&self.role_buffer, editor, cx) {
+            Some(&self.runtime_buffer)
+        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
             Some(&self.start_buffer)
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
             None
@@ -475,7 +476,7 @@ impl DraftModel {
     }
 
     /// Shift-Tab: the same rows the other way round, body → start field
-    /// → role field → workdir field → body.
+    /// → model field → workdir field → body.
     pub fn toggle_field_back(
         &mut self,
         editor: &Entity<Editor>,
@@ -484,10 +485,10 @@ impl DraftModel {
     ) {
         let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
             None
-        } else if self.cursor_in(&self.role_buffer, editor, cx) {
+        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
             Some(&self.workdir_buffer)
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
-            Some(&self.role_buffer)
+            Some(&self.runtime_buffer)
         } else {
             Some(&self.start_buffer)
         };
@@ -504,8 +505,8 @@ impl DraftModel {
     ) -> bool {
         let field = if self.cursor_in(&self.workdir_buffer, editor, cx) {
             self.workdir_buffer.clone()
-        } else if self.cursor_in(&self.role_buffer, editor, cx) {
-            self.role_buffer.clone()
+        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
+            self.runtime_buffer.clone()
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
             self.start_buffer.clone()
         } else {
@@ -595,17 +596,17 @@ impl DraftModel {
         });
     }
 
-    fn insert_role_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+    fn insert_runtime_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(field_start) =
-            snapshot.anchor_in_excerpt(self.role_buffer.read(cx).anchor_before(0))
+            snapshot.anchor_in_excerpt(self.runtime_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
-                vec![Inlay::custom(ROLE_LABEL_INLAY_ID, field_start, "Role: ")],
+                vec![Inlay::custom(RUNTIME_LABEL_INLAY_ID, field_start, "Model: ")],
                 cx,
             );
         });
