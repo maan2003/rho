@@ -92,6 +92,26 @@ impl Layered {
             .collect();
     }
 
+    /// Whether the agent says it is working; one that says nothing is not.
+    fn working(&self) -> bool {
+        self.tail
+            .runtime
+            .as_ref()
+            .is_some_and(RuntimeState::is_working)
+    }
+
+    /// The first call of the fold that no report has closed, or the end
+    /// of the fold: where the blocks that change with `working` start.
+    fn first_open_call(&self) -> usize {
+        self.fold
+            .blocks
+            .iter()
+            .position(|block| {
+                matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
+            })
+            .unwrap_or(self.fold.blocks.len())
+    }
+
     /// Composes from one index on, leaving the blocks before it as the
     /// pointers they already were.
     fn compose_from(&mut self, from: usize) {
@@ -99,9 +119,20 @@ impl Layered {
             .min(self.state.blocks.len())
             .min(self.fold.blocks.len());
         self.state.blocks.truncate(from);
+        let working = self.working();
         self.state
             .blocks
-            .extend(self.fold.blocks[from..].iter().cloned());
+            .extend(self.fold.blocks[from..].iter().map(|block| match &**block {
+                // A call no report has closed runs only while its agent
+                // says it is working.
+                UiBlock::Tool(tool) if tool.status == UiToolStatus::Running && !working => {
+                    Arc::new(UiBlock::Tool(UiTool {
+                        status: UiToolStatus::Ended,
+                        ..tool.clone()
+                    }))
+                }
+                _ => block.clone(),
+            }));
         self.state.blocks.extend(self.tail.response.iter().flat_map(|response| &response.items)
             .filter(|item| !matches!(item, Item::ToolCall { id, .. } if self.committed_tools.contains(id)))
             .map(|item| {
@@ -263,6 +294,12 @@ impl AgentStore {
         summary
     }
 
+    /// What the agent's runtime says it is doing, on its own: the status
+    /// every agent's host sends, not only the focused ones'.
+    pub fn set_runtime(&mut self, agent_id: AgentId, state: RuntimeState) -> FrameSummary {
+        self.change(agent_id, true, |layered| layered.tail.runtime = Some(state))
+    }
+
     /// One change to what the runtime has past the mirror.
     pub fn apply_live(&mut self, agent_id: AgentId, live: Live) -> FrameSummary {
         self.change(agent_id, true, |layered| layered.tail.apply(live))
@@ -351,18 +388,22 @@ impl AgentStore {
         change: impl FnOnce(&mut Layered),
     ) -> FrameSummary {
         let layered = self.layered(agent_id);
+        let was_working = layered.working();
+        change(layered);
         // The durable prefix cannot change on a live update. Keep its Arc
         // pointers in place and compare only the old and new live suffix:
         // O(tail blocks + their payload), independent of loaded history.
         // A replacement snapshot still has to materialize its whole tail.
-        let from = if tail_only {
-            layered.fold.blocks.len()
-        } else {
-            0
-        };
+        // The calls no report has closed are drawn as the agent's work
+        // says, so they change when it starts or stops.
+        let from = match tail_only {
+            true if layered.working() == was_working => layered.fold.blocks.len(),
+            true => layered.first_open_call(),
+            false => 0,
+        }
+        .min(layered.state.blocks.len());
         let old_status = layered.state.status;
         let old_tail = layered.state.blocks.split_off(from);
-        change(layered);
         layered.compose_from(from);
         let mut summary = summarize(&old_tail, &layered.state.blocks[from..]);
         if let Some(index) = &mut summary.first_changed_block {
@@ -608,6 +649,74 @@ mod tests {
             }
         );
         assert_eq!(store.get(&agent()).unwrap().blocks.len(), 1_000);
+    }
+
+    /// A call no report has closed runs only while the agent says it is
+    /// working: a turn's last call is reported in the next request, so it
+    /// stays open after the agent is done.
+    #[test]
+    fn an_open_call_runs_only_while_its_agent_works() {
+        let mut store = AgentStore::default();
+        let call = |id: &str, status| {
+            Arc::new(UiBlock::Tool(UiTool {
+                status,
+                ..match block(&Item::ToolCall {
+                    id: id.into(),
+                    name: "exec".into(),
+                    arguments: "end_turn()".into(),
+                    format: ArgumentsFormat::Text,
+                }) {
+                    UiBlock::Tool(tool) => tool,
+                    _ => unreachable!(),
+                }
+            }))
+        };
+        let statuses = |store: &AgentStore| {
+            store
+                .get(&agent())
+                .unwrap()
+                .blocks
+                .iter()
+                .filter_map(|block| match &**block {
+                    UiBlock::Tool(tool) => Some(tool.status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut fold = empty_state();
+        fold.blocks = vec![
+            call("reported", UiToolStatus::Reported),
+            Arc::new(UiBlock::Notice { text: "a".into() }),
+            call("open", UiToolStatus::Running),
+        ];
+        store.set_fold(agent(), fold);
+        // Nothing said: not working.
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Ended]
+        );
+        let working = RuntimeState {
+            running_tasks: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            store.set_runtime(agent(), working).first_changed_block,
+            Some(2)
+        );
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Running]
+        );
+        assert_eq!(
+            store
+                .set_runtime(agent(), RuntimeState::default())
+                .first_changed_block,
+            Some(2)
+        );
+        assert_eq!(
+            statuses(&store),
+            vec![UiToolStatus::Reported, UiToolStatus::Ended]
+        );
     }
 
     #[test]

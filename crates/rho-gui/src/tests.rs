@@ -2631,6 +2631,19 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
             Vec::new(),
         ),
     );
+    let runtime = |running_tasks| rho_agents_client::model::ModelMsg::Runtime {
+        agent_id: agent(1),
+        state: rho_agents_client::protocol::transcript::RuntimeState {
+            running_tasks,
+            ..Default::default()
+        },
+    };
+    // A call no report has closed runs only while its agent works.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_model_event(HostId::default(), runtime(1), window, cx)
+        })
+        .unwrap();
     open_activity(&workspace, cx);
     let text = display_text(&workspace, cx);
     assert!(
@@ -2663,6 +2676,20 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
     assert!(
         text.contains("$ echo ok … 1m5s"),
         "ticking should replace the previous duration: {text:?}"
+    );
+
+    // The agent stopped working with the call still unreported: the turn's
+    // last call, whose report goes with the next request.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_model_event(HostId::default(), runtime(0), window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("$ echo ok ended") && !text.contains('…'),
+        "an idle agent's unreported call is not running: {text:?}"
     );
 }
 

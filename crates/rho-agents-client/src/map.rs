@@ -78,7 +78,8 @@ pub struct AgentFiling {
 /// itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
-    /// What its host says it is doing now; `None` while unheard.
+    /// What its host says it is doing now: idle when its connected host
+    /// says nothing of it, `None` while no host is connected to say.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
     pub last_user_message_at: rho_agent_types::UnixMs,
 }
@@ -100,7 +101,10 @@ pub struct AgentMap {
     verdicts: BTreeMap<AgentId, Verdict>,
     /// Ephemeral snapshots, never part of the mirror or persisted filing.
     runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
-    disconnected_hosts: BTreeSet<HostId>,
+    /// Hosts whose stream said `Hello` and has not dropped since. Such a
+    /// host tells the status of every agent it has loaded, so one of its
+    /// agents it says nothing of is not loaded: idle.
+    connected_hosts: BTreeSet<HostId>,
     /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: muted agents, their labels,
@@ -140,14 +144,13 @@ pub struct AgentMap {
 impl AgentMap {
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
-        self.disconnected_hosts.remove(&host);
     }
 
     /// A host this client is no longer attached to: everything it told us
     /// goes with it. Returns the agents that departed, so the window can
     /// move the point off one it was in.
     pub fn detach_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
-        self.disconnected_hosts.remove(&host);
+        self.connected_hosts.remove(&host);
         if self.hosts.remove(&host).is_none() {
             return BTreeSet::new();
         }
@@ -186,6 +189,7 @@ impl AgentMap {
     /// What a host's agents stream says of it when it opens. The agents
     /// come by the directory, not here.
     pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
+        self.connected_hosts.insert(host);
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
@@ -603,7 +607,11 @@ impl AgentMap {
             return AgentFacts::default();
         };
         AgentFacts {
-            runtime: self.runtime.get(&agent_id).cloned(),
+            runtime: self.runtime.get(&agent_id).cloned().or_else(|| {
+                self.host_of_agent(agent_id)
+                    .is_some_and(|host| self.connected_hosts.contains(&host))
+                    .then(crate::protocol::transcript::RuntimeState::default)
+            }),
             last_user_message_at: digest.last_user_message_at,
         }
     }
@@ -672,15 +680,11 @@ impl AgentMap {
         agent_id: AgentId,
         state: crate::protocol::transcript::RuntimeState,
     ) -> bool {
-        let changed = self.runtime.insert(agent_id, state.clone()).as_ref() != Some(&state);
-        if let Some(host) = self.host_of_agent(agent_id) {
-            self.disconnected_hosts.remove(&host);
-        }
-        changed
+        self.runtime.insert(agent_id, state.clone()).as_ref() != Some(&state)
     }
 
     pub fn clear_host_runtime(&mut self, host: HostId) {
-        self.disconnected_hosts.insert(host);
+        self.connected_hosts.remove(&host);
         let agents = self.by_host.get(&host).cloned().unwrap_or_default();
         for agent_id in agents {
             self.runtime.remove(&agent_id);
@@ -817,6 +821,14 @@ mod tests {
         let host = HostId::default();
         let mut map = AgentMap::default();
         map.told(vec![named(1, None, 1)]);
+        // No host has said anything yet.
+        assert!(map.agent_facts(agent(1)).runtime.is_none());
+        // A connected host that says nothing of an agent has not loaded it.
+        map.set_host_data(host, 0, 1);
+        assert_eq!(
+            map.agent_facts(agent(1)).runtime,
+            Some(RuntimeState::default())
+        );
         map.set_runtime(
             agent(1),
             RuntimeState {

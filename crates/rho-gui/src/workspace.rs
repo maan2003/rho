@@ -628,6 +628,12 @@ impl Workspace {
         if !self.transcripts.seed(agent_id, &rows) {
             return false;
         }
+        // Only a change of status is sent; the one already heard rides
+        // in with the rows.
+        if let Some(state) = self.registry.agent_facts(agent_id).runtime {
+            self.transcripts
+                .apply(agent_id, TranscriptFrame::Runtime(state));
+        }
         self.note_followed();
         true
     }
@@ -1965,6 +1971,13 @@ impl Workspace {
                 self.reread_open_transcript(agent_id, window, cx);
             }
             rho_agents_client::model::ModelMsg::Runtime { agent_id, state } => {
+                if self.transcripts.state(&agent_id).is_some() {
+                    self.handle_frame_batch(
+                        vec![(agent_id, TranscriptFrame::Runtime(state.clone()))],
+                        window,
+                        cx,
+                    );
+                }
                 if self.registry.set_runtime(agent_id, state) {
                     self.invalidate_dealer_signals(cx);
                     self.refresh_home(cx);

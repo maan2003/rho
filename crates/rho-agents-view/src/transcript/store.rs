@@ -27,6 +27,8 @@ pub enum TranscriptFrame {
     Unsent(Vec<String>),
     /// What the agent says it is doing, if anything.
     Status(Option<String>),
+    /// What the agent's runtime is doing, as its host tells every agent's.
+    Runtime(rho_agents_client::protocol::transcript::RuntimeState),
 }
 
 /// What a frame did, for a caller deciding what to redraw.
@@ -151,6 +153,7 @@ impl Transcripts {
             TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
             TranscriptFrame::Unsent(texts) => (self.store.set_unsent(agent_id, texts), false),
             TranscriptFrame::Status(text) => (self.store.set_status(agent_id, text), false),
+            TranscriptFrame::Runtime(state) => (self.store.set_runtime(agent_id, state), false),
         };
         let usage_changed =
             usage_before.as_ref() != self.store.get(&agent_id).map(|state| &state.usage);
