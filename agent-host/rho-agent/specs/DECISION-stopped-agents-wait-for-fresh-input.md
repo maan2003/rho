@@ -1,4 +1,4 @@
-# DECISION-stopped-agents-wait-for-fresh-input: Fresh user input or mail revives a stopped agent
+# DECISION-stopped-agents-wait-for-fresh-input: Fresh user input or a peer message revives a stopped agent
 
 Authority: inferred
 
@@ -6,12 +6,12 @@ Authority: inferred
 
 A cancelled or failed agent starts no further requests on its own. Output from
 tools still winding down reaches history at the next boundary, but it may not
-itself cause one. Fresh user input or peer mail revives the agent;
+itself cause one. Fresh user input or a peer message revives the agent;
 output from existing work does not.
 
 Being stopped is derived rather than recorded: `Standing::Cancelled` and
 `Standing::Failed` carry the instant it happened, and the agent counts as stopped
-only while no user input or peer mail is at least that recent. Nothing writes the
+only while no user input or peer message is at least that recent. Nothing writes the
 revival down when input arrives.
 
 A failure is also not remembered across a restart. The log has no event for a
@@ -22,7 +22,7 @@ request failed and does not inherit the stop.
 
 An agent that carries on by itself is one nobody can call off. A cancelled
 tool's dying words would wake it straight back up, and a request that failed
-will fail the same way when the next tool ends. Both states wait for fresh user input or peer mail,
+will fail the same way when the next tool ends. Both states wait for fresh user input or a peer message,
 not a completion from work already underway.
 
 Persisting the failure would let an error from a process that is no longer

@@ -27,7 +27,7 @@ nothing foreground running, everything goes at once. While it is:
 The model's maximum wait (`set_max_wait`, default 120 seconds) is the most
 anything waits. It shortens nobody's patience; a model response without an
 exec call requests no timed wake. `suppress_tool_wakeups()` suppresses every
-notebook event but not the timer, user input or mail. These controls are
+notebook event but not the timer, user input or a message. These controls are
 independent and belong to the latest exec call; a newer call resets both
 to their defaults and older cells cannot override its settings.
 Patience is counted from the end of the model's last response, not from the

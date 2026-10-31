@@ -1,13 +1,13 @@
 //! An agent host's session stream, with calls on streams of their own
-//! beside it, for a harness that reads worksets and mail and drives agents
+//! beside it, for a harness that reads worksets and chat and drives agents
 //! in one loop.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_types::{AgentId, MailId, WorksetId};
+use rho_agent_types::{AgentId, ChatSeq, WorksetId};
 use rho_agents_client::protocol::worksets::{
-    ClientFrame, CreateWorkset, CreatedWorkset, Open, PostMail, ServerFrame,
+    ClientFrame, CreateWorkset, CreatedWorkset, Open, Post, ServerFrame, StartTopic,
 };
 use rho_rpc::protocol::client::Client;
 use rho_rpc::protocol::{Answer, read_frame, write_frame, write_open};
@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 /// A frame from the session or an answer, in the order it was read.
 pub enum Incoming {
     Session(ServerFrame),
-    /// The workset [`Streams::create`] asked for, and the agent its
-    /// message went to.
+    /// The workset [`Streams::create`] asked for, and the first agent its
+    /// code created.
     Created {
         workset: WorksetId,
         agent: Option<AgentId>,
@@ -33,8 +33,8 @@ pub struct Streams {
     session: WriteHalf<rho_rpc::Stream>,
     incoming_tx: mpsc::UnboundedSender<Result<Incoming>>,
     incoming: mpsc::UnboundedReceiver<Result<Incoming>>,
-    /// How far the mail ran when the session opened.
-    pub mail_head: MailId,
+    /// How far the chat ran when the session opened.
+    pub chat_head: ChatSeq,
 }
 
 impl Streams {
@@ -43,7 +43,7 @@ impl Streams {
     pub async fn open(client: Client, socket: &Path) -> Result<Self> {
         let mut session = client.into_stream();
         write_open(&mut session, &Open::Session).await?;
-        let ServerFrame::Hello { mail_head, .. } = read_frame(&mut session).await? else {
+        let ServerFrame::Hello { chat_head, .. } = read_frame(&mut session).await? else {
             bail!("the session did not open with its hello");
         };
         let (incoming_tx, incoming) = mpsc::unbounded_channel();
@@ -63,7 +63,7 @@ impl Streams {
             session,
             incoming_tx,
             incoming,
-            mail_head,
+            chat_head,
         })
     }
 
@@ -79,10 +79,15 @@ impl Streams {
         });
     }
 
-    /// Mails an agent as the user, on a call stream of its own. Only a
-    /// refusal says anything.
-    pub fn post(&self, mail: PostMail) {
-        self.call(mail, |_| None);
+    /// Posts in a topic as the user, on a call stream of its own. Only a
+    /// refusal says anything: the message arrives in the chat.
+    pub fn post(&self, post: Post) {
+        self.call(post, |_| None);
+    }
+
+    /// Starts a topic as the user, as [`Streams::post`] posts.
+    pub fn start_topic(&self, start: StartTopic) {
+        self.call(start, |_| None);
     }
 
     fn call<C: rho_rpc::protocol::Call>(

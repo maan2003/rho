@@ -18,8 +18,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_types::{ContentPart, WorksetKind};
-use rho_agents_client::protocol::worksets::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
+use rho_agent_types::{ContentPart, StreamId, WorksetKind};
+use rho_agents_client::protocol::worksets::{
+    ClientFrame, CreateWorkset, LogEvent, ServerFrame, StartTopic,
+};
 use rho_agents_client::snippets;
 use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};
@@ -1155,9 +1157,6 @@ async fn probe_async(name: &str) -> Result<()> {
         },
         code: snippets::new_agent_in(camino::Utf8Path::new("/"), &runtime)
             .replace("cwd=\"/\", ", ""),
-        message: Some(vec![ContentPart::Text {
-            text: "Complete one deterministic rig probe turn.".to_owned(),
-        }]),
     });
 
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
@@ -1167,8 +1166,22 @@ async fn probe_async(name: &str) -> Result<()> {
             .await
             .context("rig probe timed out")??;
         match message {
-            Incoming::Created { workset, error, .. } => {
+            Incoming::Created {
+                workset,
+                agent,
+                error,
+            } => {
                 anyhow::ensure!(error.is_none(), "rig creation code failed: {error:?}");
+                let agent = agent.context("the rig creation code created no agent")?;
+                client.start_topic(StartTopic {
+                    client_id: 1,
+                    stream: StreamId::DEFAULT,
+                    name: "rig probe".to_owned(),
+                    agents: vec![agent],
+                    content: vec![ContentPart::Text {
+                        text: "Complete one deterministic rig probe turn.".to_owned(),
+                    }],
+                });
                 // Followed from its start, so the turn cannot race it.
                 client
                     .send(&ClientFrame::FollowWorksets {
