@@ -112,8 +112,8 @@ thread_local! {
         RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// The event that made the default stream, first in every host's log.
-const STREAM: ChatSeq = StreamId::DEFAULT.0;
+/// The event that made stream `rho`, first in every host's log.
+const STREAM: ChatSeq = ChatSeq(1);
 
 /// Forgets every chat event handed out, for a test starting fresh.
 pub fn reset() {
@@ -129,24 +129,30 @@ fn record(at: UnixMs, event: ChatEvent) -> ChatRecord {
     ChatRecord { seq, at, event }
 }
 
-/// The topic between the user and `agent_id`, and the event that started
-/// it if this is its first message.
-pub fn topic_of(agent_id: AgentId, name: &str, at: UnixMs) -> (TopicId, Option<ChatRecord>) {
+/// The topic between the user and `agent_id`, and the events that started
+/// it and joined the agent to it if this is its first message.
+pub fn topic_of(agent_id: AgentId, name: &str, at: UnixMs) -> (TopicId, Vec<ChatRecord>) {
     if let Some(topic) = TOPICS.with(|topics| topics.borrow().get(&agent_id).copied()) {
-        return (topic, None);
+        return (topic, Vec::new());
     }
     let started = record(
         at,
         ChatEvent::TopicStarted {
-            stream: StreamId::DEFAULT,
+            stream: StreamId(STREAM),
             name: name.to_owned(),
             by: Address::User,
-            agents: vec![agent_id],
         },
     );
     let topic = TopicId(started.seq);
+    let joined = record(
+        at,
+        ChatEvent::Joined {
+            topic,
+            agent: agent_id,
+        },
+    );
     TOPICS.with(|topics| topics.borrow_mut().insert(agent_id, topic));
-    (topic, Some(started))
+    (topic, vec![started, joined])
 }
 
 /// A message between the user and an agent in the topic between them,

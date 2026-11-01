@@ -8,7 +8,7 @@
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, Hosts};
-use rho_agent_types::{WorksetId, WorksetKind};
+use rho_agent_types::{MessageId, WorksetId, WorksetKind};
 
 use crate::protocol::worksets::{CreateWorkset, Eval};
 use crate::snippets::{self, Runtime};
@@ -63,21 +63,22 @@ pub enum Creation {
 }
 
 impl Start {
-    /// The call that starts it. The user's first message starts a topic
-    /// with the agent once the host answers which agent it made.
-    pub fn creation(&self, runtime: &Runtime) -> Creation {
+    /// The call that starts it, from the message `origin` links: the
+    /// policy joins the agent to that message's topic and hands it the
+    /// message as its first input.
+    pub fn creation(&self, runtime: &Runtime, origin: Option<MessageId>) -> Creation {
         match self {
             Self::NewOn { repo, rev } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Isolated,
-                code: snippets::new_agent_on(repo, rev, runtime),
+                code: snippets::new_agent_on(repo, rev, runtime, origin),
             }),
             Self::Here { cwd } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Host { cwd: cwd.clone() },
-                code: snippets::new_agent_in(cwd, runtime),
+                code: snippets::new_agent_in(cwd, runtime, origin),
             }),
             Self::Join { workset, cwd } => Creation::Eval(Eval {
                 workset: *workset,
-                code: snippets::new_agent_in(cwd, runtime),
+                code: snippets::new_agent_in(cwd, runtime, origin),
             }),
         }
     }
@@ -443,7 +444,7 @@ mod tests {
             workset,
             cwd: "/src/rho".into(),
         }
-        .creation(&runtime);
+        .creation(&runtime, None);
         let Creation::Eval(eval) = joined else {
             panic!("joining is code in the workset joined: {joined:?}");
         };
@@ -453,7 +454,7 @@ mod tests {
         let Creation::Workset(here) = (Start::Here {
             cwd: "/home/me".into(),
         })
-        .creation(&runtime) else {
+        .creation(&runtime, None) else {
             panic!("in place is a workset of its own");
         };
         assert_eq!(
@@ -466,10 +467,38 @@ mod tests {
             repo: "https://x/y".into(),
             rev: "main".into(),
         })
-        .creation(&runtime) else {
+        .creation(&runtime, None) else {
             panic!("a new clone is a workset of its own");
         };
         assert_eq!(fresh.kind, WorksetKind::Isolated);
         assert!(fresh.code.contains("repo=\"https://x/y\", rev=\"main\""));
+        assert!(!fresh.code.contains("origin="), "{}", fresh.code);
+    }
+
+    /// An agent started from a message says which, in every kind of start.
+    #[test]
+    fn a_start_from_a_message_names_it_as_the_origin() {
+        let runtime = Runtime::parse("sol-high").unwrap();
+        let origin = Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(41)));
+        let starts = [
+            Start::Join {
+                workset: "0123456789ab".parse().unwrap(),
+                cwd: "/src/rho".into(),
+            },
+            Start::Here {
+                cwd: "/home/me".into(),
+            },
+            Start::NewOn {
+                repo: "https://x/y".into(),
+                rev: "main".into(),
+            },
+        ];
+        for start in starts {
+            let code = match start.creation(&runtime, origin) {
+                Creation::Eval(eval) => eval.code,
+                Creation::Workset(create) => create.code,
+            };
+            assert!(code.contains("origin=\"chat:41\""), "{start:?}: {code}");
+        }
     }
 }

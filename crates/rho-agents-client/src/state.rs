@@ -36,10 +36,6 @@ pub struct UiAgentUsage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "blocks are already shared behind Arc; boxing tools adds another allocation"
-)]
 pub enum UiBlock {
     UserMessage {
         text: String,
@@ -88,6 +84,8 @@ pub enum UiBlock {
     },
     /// A message in a chat topic: who posted it and whom it mentions.
     ChatMessage {
+        /// What starting an agent from it links to.
+        id: rho_agent_types::MessageId,
         from: rho_agent_types::Address,
         mentions: Vec<rho_agent_types::Mention>,
         text: String,

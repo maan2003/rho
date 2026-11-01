@@ -340,6 +340,10 @@ impl Model {
             if let Told::Topic {
                 message: Some((message, parties)),
                 ..
+            }
+            | Told::Direct {
+                message: Some((message, parties)),
+                ..
             } = slot.chat.tell(&record)
             {
                 for agent_id in parties {
@@ -746,6 +750,17 @@ impl Model {
                         delivered.push((agent_id, message.clone()));
                     }
                 }
+                Told::Direct { direct, message } => {
+                    slot.pending_chat
+                        .directs
+                        .insert(direct, slot.chat.directs[&direct].clone());
+                    let Some((message, parties)) = message else {
+                        continue;
+                    };
+                    for agent_id in parties {
+                        delivered.push((agent_id, message.clone()));
+                    }
+                }
             }
         }
         for (agent_id, message) in &delivered {
@@ -1048,8 +1063,8 @@ mod tests {
         }
     }
 
-    /// The stream at 1 and a topic at 2 with these agents.
-    fn topic_with(agents: &[AgentId]) -> Vec<ChatRecord> {
+    /// The stream at 1, a topic at 2, and `member` joining it at 3.
+    fn topic_with(member: AgentId) -> Vec<ChatRecord> {
         vec![
             record(1, ChatEvent::StreamCreated { name: "rho".into() }),
             record(
@@ -1058,7 +1073,13 @@ mod tests {
                     stream: StreamId(ChatSeq(1)),
                     name: "the topic".into(),
                     by: Address::User,
-                    agents: agents.to_vec(),
+                },
+            ),
+            record(
+                3,
+                ChatEvent::Joined {
+                    topic: TOPIC,
+                    agent: member,
                 },
             ),
         ]
@@ -1158,10 +1179,10 @@ mod tests {
                 .count()
         };
         let mut model = model();
-        model.ingest(HOST, hello(2));
-        model.ingest(HOST, chat(topic_with(&[agent(1)])));
+        model.ingest(HOST, hello(3));
+        model.ingest(HOST, chat(topic_with(agent(1))));
         // Again, with the copy at the head: nothing moves.
-        model.ingest(HOST, hello(2));
+        model.ingest(HOST, hello(3));
         let out = model.ingest(HOST, directory(&[(agent(1), workset(1))]));
         assert_eq!(told(&out), 1, "the directory finds the chat whole");
         assert_eq!(topics_moved(&out), Vec::<TopicId>::new());
@@ -1172,7 +1193,7 @@ mod tests {
     #[test]
     fn a_catch_up_says_nothing_until_the_chat_reaches_the_head() {
         let mut model = model();
-        model.ingest(HOST, hello(4));
+        model.ingest(HOST, hello(5));
         assert!(
             changed(&model.ingest(
                 HOST,
@@ -1181,11 +1202,11 @@ mod tests {
             .is_empty(),
             "the directory waits for the chat it is read with"
         );
-        let mut page = topic_with(&[agent(1)]);
-        page.push(asks(3, agent(1)));
+        let mut page = topic_with(agent(1));
+        page.push(asks(4, agent(1)));
         let out = model.ingest(HOST, chat(page));
         assert!(changed(&out).is_empty() && topics_moved(&out).is_empty());
-        let last = model.ingest(HOST, chat(vec![asks(4, agent(2))]));
+        let last = model.ingest(HOST, chat(vec![asks(5, agent(2))]));
         assert_eq!(
             changed(&last),
             vec![agent(1), agent(2)],
@@ -1194,10 +1215,10 @@ mod tests {
         assert_eq!(topics_moved(&last), [TOPIC], "and every topic");
         assert_eq!(mentions(&model), [MentionKind::Ask, MentionKind::Ask]);
         assert!(
-            model.hosts[&HOST].chat.topics[&TOPIC]
-                .agents
+            !model.hosts[&HOST].chat.topics[&TOPIC]
+                .members
                 .contains_key(&agent(2)),
-            "posting joins the topic"
+            "posting does not join the topic"
         );
     }
 
@@ -1207,14 +1228,14 @@ mod tests {
     fn messages_before_the_directory_wait_for_their_agent() {
         let mut model = model();
         model.ingest(HOST, hello(0));
-        let mut page = topic_with(&[agent(1)]);
-        page.push(posted(3, Address::User, Vec::new()));
+        let mut page = topic_with(agent(1));
+        page.push(posted(4, Address::User, Vec::new()));
         model.ingest(HOST, chat(page));
         let out = model.ingest(HOST, ServerFrame::Agent(entry(agent(1), workset(1))).into());
         assert_eq!(changed(&out), [agent(1)]);
         assert_eq!(
             model.agents[&agent(1)].digest.last_user_message_text,
-            "message 3"
+            "message 4"
         );
     }
 
@@ -1355,8 +1376,8 @@ mod tests {
             ),
         );
         assert_eq!(handed(&out), []);
-        let mut records = topic_with(&[agent(1)]);
-        records.push(asks(3, agent(1)));
+        let mut records = topic_with(agent(1));
+        records.push(asks(4, agent(1)));
         let out = model.ingest(HOST, chat(records));
         assert_eq!(
             handed(&out),
@@ -1400,7 +1421,7 @@ mod tests {
         assert_eq!(handed(&out), [(agent(1), Some(vec![8]))]);
         // Agent 2 is not in the topic: its post reaches agent 1, and
         // agent 1's own post is its own.
-        let out = model.ingest(HOST, chat(vec![asks(4, agent(2)), asks(5, agent(1))]));
+        let out = model.ingest(HOST, chat(vec![asks(5, agent(2)), asks(6, agent(1))]));
         let ids = |rows: &[TranscriptRow]| {
             rows.iter()
                 .map(|row| match row {
@@ -1410,14 +1431,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(matches!(&out[0].msg, ModelMsg::Rows { agent_id, rows }
-            if *agent_id == agent(1) && ids(rows) == [4, 5]));
+            if *agent_id == agent(1) && ids(rows) == [5, 6]));
 
         // A new stream reads again, and follows nothing until the read ends.
-        model.ingest(HOST, hello(5));
+        model.ingest(HOST, hello(6));
         assert_eq!(
             said(&stream),
             [
-                "FollowChat { since: ChatSeq(5) }".to_owned(),
+                "FollowChat { since: ChatSeq(6) }".to_owned(),
                 format!("ReadLog {} 0 #1", agent(1).encoded()),
                 "FollowWorksets { from: [] }".to_owned(),
             ]
@@ -1519,12 +1540,12 @@ mod tests {
         let mut model = model();
         model.ingest(HOST, hello(0));
         model.ingest(HOST, directory(&[(agent(1), workset(1))]));
-        let mut page = topic_with(&[agent(1)]);
+        let mut page = topic_with(agent(1));
         page.extend([
-            asks(3, agent(1)),
-            posted(4, Address::User, Vec::new()),
+            asks(4, agent(1)),
+            posted(5, Address::User, Vec::new()),
             posted(
-                5,
+                6,
                 Address::Agent(agent(1)),
                 vec![Mention {
                     to: Address::User,

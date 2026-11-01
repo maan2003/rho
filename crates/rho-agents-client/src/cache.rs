@@ -922,14 +922,13 @@ mod tests {
         TopicId(ChatSeq(seq))
     }
 
-    fn started(seq: u64, agents: Vec<AgentId>) -> ChatRecord {
+    fn started(seq: u64) -> ChatRecord {
         record(
             seq,
             ChatEvent::TopicStarted {
                 stream: StreamId(ChatSeq(1)),
                 name: format!("topic {seq}"),
                 by: Address::User,
-                agents,
             },
         )
     }
@@ -988,8 +987,8 @@ mod tests {
                 through: ChatSeq(6),
                 records: vec![
                     record(1, ChatEvent::StreamCreated { name: "rho".into() }),
-                    started(2, vec![a]),
-                    started(3, vec![b]),
+                    started(2),
+                    started(3),
                     // Interleaved in the log, kept apart by topic.
                     posted(4, 3, Address::Agent(b)),
                     posted(5, 2, Address::Agent(a)),
@@ -1049,7 +1048,7 @@ mod tests {
             mirror.send(Write::Chat {
                 host: host.into(),
                 through: ChatSeq(2),
-                records: vec![started(1, vec![]), posted(2, 1, Address::User)],
+                records: vec![started(1), posted(2, 1, Address::User)],
                 delivered: Vec::new(),
             });
         }
@@ -1075,6 +1074,7 @@ mod tests {
             7,
             Some(Outgoing {
                 at: UnixMs(1),
+                mentions: Vec::new(),
                 content: vec![ContentPart::Text {
                     text: "kept".into(),
                 }],
@@ -1174,6 +1174,7 @@ mod tests {
                         id,
                         Outgoing {
                             at: UnixMs(at),
+                            mentions: Vec::new(),
                             content: words(&format!("message {id}")),
                             to: Destination::Topic(topic(4)),
                         },
@@ -1206,6 +1207,7 @@ mod tests {
                 3,
                 Outgoing {
                     at: UnixMs(30),
+                    mentions: Vec::new(),
                     content: words("message 3"),
                     to: Destination::Topic(topic(5)),
                 },
@@ -1235,6 +1237,7 @@ mod tests {
             7,
             Some(Outgoing {
                 at: UnixMs(1),
+                mentions: Vec::new(),
                 content: Vec::new(),
                 to: Destination::Topic(topic(2)),
             }),

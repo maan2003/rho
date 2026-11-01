@@ -116,8 +116,6 @@ pub struct AgentModel {
     initial_load: Option<Task<()>>,
     /// What moved while the bulk load composed, synced once it is ready.
     pending_sync: Option<FrameSummary>,
-    /// The agent this model is of, once its bulk load has started.
-    agent_id: Option<AgentId>,
     /// What history the reader has asked for and has not been given yet.
     history_want: Option<HistoryWant>,
     /// Whether a composition loop is running; it composes a chunk, lets
@@ -141,11 +139,11 @@ pub struct AgentModel {
 /// its own state; who cares about it is not its business.
 pub enum AgentModelEvent {
     /// The transcript is composed and the screen is ready to draw.
-    Loaded(AgentId),
+    Loaded,
     /// The history the reader asked for is composed; nothing is waiting.
-    HistoryComposed(AgentId),
-    /// The user changed what they are writing to the agent.
-    DraftEdited(AgentId),
+    HistoryComposed,
+    /// The user changed what they are writing.
+    DraftEdited,
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
@@ -189,10 +187,8 @@ impl AgentModel {
         let subscriptions = vec![cx.subscribe(&prompt_buffer, |this, _, event, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
                 this.update_prompt_chrome(cx);
-                if this.view == TranscriptView::Conversation
-                    && let Some(agent_id) = this.agent_id
-                {
-                    cx.emit(AgentModelEvent::DraftEdited(agent_id));
+                if this.view == TranscriptView::Conversation {
+                    cx.emit(AgentModelEvent::DraftEdited);
                 }
             }
         })];
@@ -219,7 +215,6 @@ impl AgentModel {
             initial_load_ready: false,
             initial_load: None,
             pending_sync: None,
-            agent_id: None,
             history_want: None,
             composing: false,
             history_task: None,
@@ -242,11 +237,10 @@ impl AgentModel {
         self.initial_load_ready
     }
 
-    /// Starts the one asynchronous bulk load for a subscribed agent. Normal
-    /// streamed updates remain synchronous after this reaches Ready.
+    /// Starts the one asynchronous bulk load. Normal streamed updates
+    /// remain synchronous after this reaches Ready.
     pub fn start_initial_load(
         &mut self,
-        agent_id: AgentId,
         state: UiAgentState,
         agent_labels: HashMap<AgentId, String>,
         now_ms: u64,
@@ -256,7 +250,6 @@ impl AgentModel {
             return;
         }
         self.initial_load_started = true;
-        self.agent_id = Some(agent_id);
         let view = self.view;
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
@@ -302,7 +295,7 @@ impl AgentModel {
             }
             // Whoever opened this agent is told the transcript is ready;
             // the screen does not know who that is.
-            let _ = this.update(cx, |_, cx| cx.emit(AgentModelEvent::Loaded(agent_id)));
+            let _ = this.update(cx, |_, cx| cx.emit(AgentModelEvent::Loaded));
         }));
     }
 
@@ -560,9 +553,7 @@ impl AgentModel {
             {
                 self.place_point(&editor, point, window, cx);
             }
-            if let Some(agent_id) = self.agent_id {
-                cx.emit(AgentModelEvent::HistoryComposed(agent_id));
-            }
+            cx.emit(AgentModelEvent::HistoryComposed);
         }
         // A gap between the head and the tail is history that is on its way
         // — the reader is told so in the buffer — and it closes whether or

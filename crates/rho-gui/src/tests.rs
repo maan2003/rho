@@ -656,7 +656,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                 .hand(cx)
                 .cards
                 .into_iter()
-                .find(|card| matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.agents.contains_key(&gone))))
+                .find(|card| matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.members.contains_key(&gone))))
                 .expect("control: the agent's topic is dealt before deletion")
         })
         .unwrap();
@@ -1251,10 +1251,11 @@ fn a_draft_outlives_its_view_until_it_is_sent(cx: &mut TestAppContext) {
     assert_eq!(remade(cx), "", "a sent draft is not written again");
 }
 
-/// `space a m` starts a topic with the agent in view: posted as a new
-/// topic in the default stream with that agent alone, named by its first
-/// line, and the topic its host names is where the user lands, even when
-/// the host answers before the chat shows the topic.
+/// `space a m` starts a topic for the agent in view in the draft page:
+/// posted as a new topic in the stream of the topic in view, mentioning
+/// that agent and starting none, named by its first line; the topic its
+/// host names is where the user lands, even when the host answers before
+/// the chat shows the topic.
 #[gpui::test]
 fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
     use rho_agent_hosts::connection::ConnEvent;
@@ -1297,8 +1298,29 @@ fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
         })
         .unwrap();
     cx.run_until_parked();
-    cx.simulate_input(*workspace, "a fresh topic\nwith a second line");
-    cx.simulate_keystrokes(*workspace, "enter");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let draft = workspace.draft_model_for_test().read(cx);
+            assert_eq!(
+                draft.stream_text(cx),
+                "rho",
+                "the stream of the topic in view"
+            );
+            assert!(matches!(
+                draft.shape(),
+                rho_agents_view::draft::DraftShape::Mention { .. }
+            ));
+        })
+        .unwrap();
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("a fresh topic\nwith a second line", window, cx)
+            });
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
     let mut calls = story::calls(&mut host);
     assert_eq!(calls.len(), 1, "one message");
@@ -1306,8 +1328,11 @@ fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
     let Request::StartTopic(start) = call else {
         panic!("expected a new topic: {call:?}");
     };
-    assert_eq!(start.agents, vec![agent_id]);
-    assert_eq!(start.stream, rho_agent_types::StreamId::DEFAULT);
+    assert_eq!(start.mentions, vec![agent_id]);
+    assert_eq!(
+        start.stream,
+        rho_agent_types::StreamId(rho_agent_types::ChatSeq(1))
+    );
     assert_eq!(start.name, "a fresh topic", "named by its first line");
     assert_eq!(
         rho_agent_types::transcript::text_content(&start.content),
@@ -1316,6 +1341,10 @@ fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
     let started = rho_agent_types::TopicId(rho_agent_types::ChatSeq(60));
     story::answer(&mut stream, rho_rpc::protocol::Answer::Done(started));
     cx.run_until_parked();
+    assert!(
+        story::calls(&mut host).is_empty(),
+        "a topic for an agent that is there starts no other"
+    );
     let current = |cx: &mut TestAppContext| {
         workspace
             .update(cx, |workspace, _, _| {
@@ -1340,10 +1369,9 @@ fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
                     seq: started.0,
                     at: UnixMs(6),
                     event: rho_agent_types::ChatEvent::TopicStarted {
-                        stream: rho_agent_types::StreamId::DEFAULT,
+                        stream: start.stream,
                         name: start.name.clone(),
                         by: rho_agent_types::Address::User,
-                        agents: vec![agent_id],
                     },
                 }]),
                 window,
@@ -1395,7 +1423,7 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
         workspace
             .update(cx, |workspace, _, cx| {
                 workspace.hand(cx).cards.into_iter().find(|card| {
-                    matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.agents.contains_key(&agent_id)))
+                    matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.members.contains_key(&agent_id)))
                 })
             })
             .unwrap()
@@ -5152,7 +5180,7 @@ fn dealt_topic(
         .into_iter()
         .map(|card| card.node)
         .find(|node| {
-            matches!(node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(*topic).is_some_and(|(_, held)| held.agents.contains_key(&agent_id)))
+            matches!(node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(*topic).is_some_and(|(_, held)| held.members.contains_key(&agent_id)))
         })
 }
 
@@ -5289,49 +5317,101 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     );
 }
 
+/// `space a s` on a message starts an agent from it: the draft page asks
+/// only for the agent's rows, and the creation names the message as its
+/// origin. A refused creation keeps its cause on the draft; a made agent
+/// is followed into the topic it started from.
 #[gpui::test]
-fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(Vec::new(), 0),
-                window,
-                cx,
-            );
-            workspace.new_agent_in_area(None, window, cx);
-        })
-        .expect("open a new-agent draft");
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            editor.update(cx, |editor, cx| {
-                editor.insert("look at the readme", window, cx)
-            });
-            workspace
-                .draft_model_for_test()
-                .update(cx, |draft, cx| draft.set_workdir_text("/tmp/repo", cx));
-        })
-        .expect("write the draft");
+fn an_agent_starts_from_the_message_at_point(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let asker = agent(761);
     let mut host = workspace
         .update(cx, |workspace, _, _| {
             workspace.host_in_process_for_test(HostId::default())
         })
         .unwrap();
-
-    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    let topic = workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(asker)], 762),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(asker, UnixMs(5)),
+                window,
+                cx,
+            );
+            let topic = workspace.test_topic(asker);
+            // The topic's event, the asker's join, then the user's "go"
+            // and the asker's question.
+            let message = |seq: u64, from, text: &str| {
+                std::sync::Arc::new(rho_agents_client::state::UiBlock::ChatMessage {
+                    id: rho_agent_types::MessageId(rho_agent_types::ChatSeq(seq)),
+                    from,
+                    mentions: Vec::new(),
+                    text: text.to_owned(),
+                })
+            };
+            let mut state = rho_agents_client::chat::topic_state(&[], &[]);
+            state.blocks = vec![
+                message(topic.topic.0.0 + 2, rho_agent_types::Address::User, "go"),
+                message(
+                    topic.topic.0.0 + 3,
+                    rho_agent_types::Address::Agent(asker),
+                    "which one?",
+                ),
+            ];
+            workspace.seed_transcript_for_test(asker, state, window, cx);
+            workspace.open_topic(topic, window, cx);
+            topic
+        })
+        .unwrap();
     cx.run_until_parked();
-    let mut calls = story::calls(&mut host);
-    assert_eq!(calls.len(), 1, "the draft makes one call");
-    let (call, mut stream) = calls.pop().unwrap();
+    let first = topic.topic.0.0 + 2;
+    cx.simulate_keystrokes(*workspace, "escape g g");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.start_agent_from_message(window, cx);
+            let draft = workspace.draft_model_for_test().read(cx);
+            assert_eq!(*draft.shape(), rho_agents_view::draft::DraftShape::Origin);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .draft_model_for_test()
+                .update(cx, |draft, cx| draft.set_workdir_text("/tmp/repo", cx));
+        })
+        .unwrap();
+    let ask = |cx: &mut TestAppContext,
+               host: &mut tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>|
+     -> (
+        rho_agents_client::protocol::worksets::CreateWorkset,
+        rho_rpc::Stream,
+    ) {
+        cx.dispatch_action(*workspace, crate::SubmitPrompt);
+        cx.run_until_parked();
+        let mut calls = story::calls(host);
+        assert_eq!(calls.len(), 1, "the draft makes one call");
+        let (call, stream) = calls.pop().unwrap();
+        let rho_agents_client::protocol::worksets::Request::CreateWorkset(create) = call else {
+            panic!("the draft asked for a new agent: {call:?}");
+        };
+        (create, stream)
+    };
+    let (create, mut stream) = ask(cx, &mut host);
     assert!(
-        matches!(
-            call,
-            rho_agents_client::protocol::worksets::Request::CreateWorkset(_)
-        ),
-        "the draft asked for a new agent: {call:?}"
+        create.code.contains(&format!("origin=\"chat:{first}\"")),
+        "{}",
+        create.code
     );
     story::answer(
         &mut stream,
@@ -5356,6 +5436,40 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
             .is_some_and(|text| text.contains("no such repository")),
         "the draft keeps the agent host's whole cause: {refusal:?}"
     );
+
+    let (create, mut stream) = ask(cx, &mut host);
+    assert!(create.code.contains(&format!("origin=\"chat:{first}\"")));
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(created(agent(763))),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::head_frames(ui_head(agent(763))),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Topic(topic),
+                "the new agent is followed into the topic it started from"
+            );
+            assert_eq!(
+                *workspace.draft_model_for_test().read(cx).shape(),
+                rho_agents_view::draft::DraftShape::NewTopic,
+                "the draft is done"
+            );
+        })
+        .unwrap();
+    assert!(story::calls(&mut host).is_empty(), "no message is posted");
 }
 
 #[gpui::test]
@@ -5472,6 +5586,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
+    // From the body: the stream row, then the workdir row.
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycle);
     cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycle);
     cx.dispatch_action(*workspace, rho_agents_view::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
@@ -5678,7 +5794,7 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
             cx.subscribe(&model, move |model, event, cx| {
                 if !matches!(
                     event,
-                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(_)
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed
                 ) {
                     return;
                 }
@@ -7121,6 +7237,7 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
             .update(cx, |workspace, window, cx| {
                 editor.update(cx, |editor, cx| editor.insert(&text, window, cx));
                 workspace.draft_model_for_test().update(cx, |draft, cx| {
+                    draft.set_stream_text("rho", cx);
                     draft.set_workdir_text("https://example.com/r.git", cx)
                 });
             })
@@ -7176,8 +7293,35 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(story::calls(&mut on_fern).is_empty(), "fern was not chosen");
     let mut calls = story::calls(&mut on_moss);
-    assert_eq!(calls.len(), 1, "the chosen host gets the one call");
-    let (_, mut stream) = calls.pop().unwrap();
+    assert_eq!(calls.len(), 1, "the chosen host gets the topic first");
+    let (call, mut stream) = calls.pop().unwrap();
+    let rho_agents_client::protocol::worksets::Request::StartTopic(start) = call else {
+        panic!("expected the draft's topic: {call:?}");
+    };
+    assert_eq!(start.mentions, Vec::new(), "the agent is not made yet");
+    assert_eq!(start.name, "first");
+    assert_eq!(
+        rho_agent_types::transcript::text_content(&start.content),
+        "first"
+    );
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(rho_agent_types::TopicId(rho_agent_types::ChatSeq(60))),
+    );
+    cx.run_until_parked();
+    // The topic posted, the agent starts from its first message, on the
+    // same host.
+    let mut calls = story::calls(&mut on_moss);
+    assert_eq!(calls.len(), 1, "the agent follows the topic");
+    let (call, mut stream) = calls.pop().unwrap();
+    let rho_agents_client::protocol::worksets::Request::CreateWorkset(create) = call else {
+        panic!("expected the agent: {call:?}");
+    };
+    assert!(
+        create.code.contains("origin=\"chat:61\""),
+        "the topic's first message is the one after the topic's event: {}",
+        create.code
+    );
     story::answer(
         &mut stream,
         rho_rpc::protocol::Answer::Done(created(agent(7))),
@@ -7196,29 +7340,25 @@ fn a_draft_on_two_hosts_runs_where_it_is_placed(cx: &mut TestAppContext) {
         })
         .unwrap();
     cx.run_until_parked();
-    // The agent made, its brief starts a topic with it on the same host.
-    let mut calls = story::calls(&mut on_moss);
-    assert_eq!(calls.len(), 1, "the brief follows the creation");
-    let (call, _) = calls.pop().unwrap();
-    let rho_agents_client::protocol::worksets::Request::StartTopic(start) = call else {
-        panic!("expected the brief's topic: {call:?}");
-    };
-    assert_eq!(start.agents, vec![agent(7)]);
-    assert_eq!(start.name, "first");
-    assert_eq!(
-        rho_agent_types::transcript::text_content(&start.content),
-        "first"
-    );
+    assert!(story::calls(&mut on_moss).is_empty());
 
     // Nothing chosen this time: the last placement is the default.
     draft("second", &workspace, cx);
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
     assert!(story::calls(&mut on_fern).is_empty());
+    let mut calls = story::calls(&mut on_moss);
+    assert_eq!(calls.len(), 1, "moss is the default now");
+    let (_, mut stream) = calls.pop().unwrap();
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::Done(rho_agent_types::TopicId(rho_agent_types::ChatSeq(70))),
+    );
+    cx.run_until_parked();
     assert_eq!(
         story::calls(&mut on_moss).len(),
         1,
-        "moss is the default now"
+        "and its agent follows there"
     );
     workspace
         .update(cx, |workspace, _, cx| {

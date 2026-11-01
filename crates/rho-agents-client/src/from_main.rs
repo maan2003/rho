@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use rho_agent_hosts::HostId;
-use rho_agent_types::{AgentId, ContentPart, StreamId, TopicId, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, TopicId, UnixMs};
 
 use crate::chat::{ChatMap, HostChat, HostTopic, default_topic_name};
 use crate::outbox::{Destination, Outgoing as ChatOutgoing};
@@ -53,20 +53,19 @@ impl Carried {
     }
 }
 
+/// The stream the host's migration put the user's topics in.
+pub const MIGRATED_STREAM: &str = "rho";
+
 /// The topic the host's migration started between the user and `agent`:
-/// the oldest in the default stream that began with that agent alone. A
-/// topic between two agents began with both.
+/// the oldest in stream `rho` whose first member is that agent. The
+/// migration starts each such topic and joins its agent to it; a pair of
+/// agents became a direct, not a topic.
 pub fn user_topic(chat: &HostChat, agent: AgentId) -> Option<TopicId> {
+    let stream = chat.stream_named(MIGRATED_STREAM)?;
     chat.topics
         .iter()
-        .find(|(id, topic)| {
-            topic.stream == StreamId::DEFAULT
-                && topic
-                    .agents
-                    .iter()
-                    .filter(|(_, since)| **since == id.0)
-                    .map(|(agent, _)| *agent)
-                    .eq([agent])
+        .find(|(_, topic)| {
+            topic.stream == stream && topic.members_in_order().first() == Some(&agent)
         })
         .map(|(id, _)| *id)
 }
@@ -77,8 +76,9 @@ pub fn user_topic(chat: &HostChat, agent: AgentId) -> Option<TopicId> {
 /// user. Unsent messages go one by one under the ids `main` gave them,
 /// since the host may have taken the first and not the rest, and it
 /// answers an id it has with the message it logged: each is posted in the
-/// agent's topic with the user, or, when there is none, the first starts
-/// one with the agent and the rest follow it there.
+/// agent's topic with the user. When there is none, the first starts one
+/// in stream `rho` and the rest follow it there, each mentioning the agent
+/// so it receives them.
 pub fn carry(
     chat: &ChatMap,
     host_of: impl Fn(AgentId) -> Option<HostId>,
@@ -86,11 +86,13 @@ pub fn carry(
 ) -> Carried {
     let told = |agent: AgentId| {
         let (machine_seed, held) = chat.told_chat(host_of(agent)?)?;
-        Some((machine_seed, user_topic(held, agent)))
+        Some((machine_seed, held))
     };
     let mut carried = Carried::default();
     for (agent, text) in &leftovers.drafts {
-        if let Some((machine_seed, Some(topic))) = told(*agent) {
+        if let Some((machine_seed, Some(topic))) =
+            told(*agent).map(|(seed, held)| (seed, user_topic(held, *agent)))
+        {
             carried.drafts.push((
                 *agent,
                 HostTopic {
@@ -102,21 +104,27 @@ pub fn carry(
         }
     }
     for (agent, unsent) in &leftovers.outbox {
-        let Some((machine_seed, topic)) = told(*agent) else {
+        let Some((machine_seed, held)) = told(*agent) else {
             continue;
         };
-        let mut to = topic.map(Destination::Topic);
+        let (mut to, mentions) = match user_topic(held, *agent) {
+            Some(topic) => (Some(Destination::Topic(topic)), Vec::new()),
+            None => (None, vec![*agent]),
+        };
+        let Some(stream) = held.stream_named(MIGRATED_STREAM) else {
+            // No migration made this chat: nowhere to put them.
+            continue;
+        };
         for (id, outgoing) in unsent {
             let destination = match &to {
                 Some(to) => to.clone(),
                 None => {
                     to = Some(Destination::AfterStart(*id));
                     Destination::NewTopic {
-                        stream: StreamId::DEFAULT,
+                        stream,
                         name: default_topic_name(&rho_agent_types::transcript::text_content(
                             &outgoing.content,
                         )),
-                        agents: vec![*agent],
                     }
                 }
             };
@@ -127,6 +135,7 @@ pub fn carry(
                 ChatOutgoing {
                     at: outgoing.at,
                     content: outgoing.content.clone(),
+                    mentions: mentions.clone(),
                     to: destination,
                 },
             ));
@@ -149,7 +158,9 @@ impl Leftovers {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, ChatRecord, ChatSeq, Mention};
+    use rho_agent_types::{
+        Address, AgentIdDomain, ChatEvent, ChatRecord, ChatSeq, Mention, StreamId,
+    };
 
     use super::*;
 
@@ -165,24 +176,39 @@ mod tests {
         vec![ContentPart::Text { text: text.into() }]
     }
 
-    fn started(seq: u64, by: Address, agents: Vec<AgentId>) -> ChatRecord {
+    fn record(seq: u64, event: ChatEvent) -> ChatRecord {
         ChatRecord {
             seq: ChatSeq(seq),
             at: UnixMs(seq),
-            event: ChatEvent::TopicStarted {
-                stream: StreamId::DEFAULT,
-                name: format!("topic {seq}"),
-                by,
-                agents,
-            },
+            event,
         }
     }
 
+    fn started(seq: u64, stream: u64) -> ChatRecord {
+        record(
+            seq,
+            ChatEvent::TopicStarted {
+                stream: StreamId(ChatSeq(stream)),
+                name: format!("topic {seq}"),
+                by: Address::User,
+            },
+        )
+    }
+
+    fn joined(seq: u64, topic: u64, agent: AgentId) -> ChatRecord {
+        record(
+            seq,
+            ChatEvent::Joined {
+                topic: TopicId(ChatSeq(topic)),
+                agent,
+            },
+        )
+    }
+
     fn posted(seq: u64, topic: u64, from: Address, to: Address) -> ChatRecord {
-        ChatRecord {
-            seq: ChatSeq(seq),
-            at: UnixMs(seq),
-            event: ChatEvent::Posted {
+        record(
+            seq,
+            ChatEvent::Posted {
                 topic: TopicId(ChatSeq(topic)),
                 from,
                 mentions: vec![Mention {
@@ -191,28 +217,45 @@ mod tests {
                 }],
                 content: text("hello"),
             },
-        }
+        )
     }
 
+    /// The `rho` stream's id in [`migrated`].
+    const RHO: StreamId = StreamId(ChatSeq(2));
+
     /// What the host's migration makes of agents 1 and 2 writing to each
-    /// other first, then each to the user: the pair of agents gets the
-    /// oldest topic, which both are in, and agent 2 later posts in agent
-    /// 1's topic with the user. After the migration the user starts a
-    /// newer topic with agent 1.
+    /// other, then each to the user: the pair of agents is a direct, and
+    /// each agent's conversation with the user a topic in `rho` it joined.
+    /// Agent 2 later joins agent 1's topic. Around them: an older topic in
+    /// another stream that agent 1 joined, and a newer one the user
+    /// started with agent 1 after the migration.
     fn migrated(told: bool) -> ChatMap {
         let (one, two) = (agent(1), agent(2));
         let mut chat = HostChat::default();
         for record in [
-            ChatRecord {
-                seq: ChatSeq(1),
-                at: UnixMs(1),
-                event: ChatEvent::StreamCreated { name: "rho".into() },
-            },
-            started(2, Address::Agent(one), vec![one, two]),
-            started(3, Address::Agent(two), vec![two]),
-            started(4, Address::User, vec![one]),
-            posted(5, 4, Address::Agent(two), Address::User),
-            started(6, Address::User, vec![one]),
+            record(
+                1,
+                ChatEvent::StreamCreated {
+                    name: "work".into(),
+                },
+            ),
+            record(2, ChatEvent::StreamCreated { name: "rho".into() }),
+            started(3, 1),
+            joined(4, 3, one),
+            record(
+                5,
+                ChatEvent::DirectStarted {
+                    members: [one, two],
+                },
+            ),
+            started(6, 2),
+            joined(7, 6, two),
+            started(8, 2),
+            joined(9, 8, one),
+            posted(10, 8, Address::Agent(two), Address::User),
+            joined(11, 8, two),
+            started(12, 2),
+            joined(13, 12, one),
         ] {
             chat.tell(&record);
         }
@@ -235,9 +278,9 @@ mod tests {
         }
     }
 
-    /// Each agent's draft goes to the topic its pair with the user began
-    /// in: not the agents' topic, the older one both are in, not one the
-    /// other agent joined, and not the user's newer topic with it.
+    /// Each agent's draft goes to the topic in `rho` the migration made
+    /// for it and the user: not a topic in another stream, not one the
+    /// agent joined after another, and not the user's newer topic with it.
     #[test]
     fn a_draft_goes_to_the_agents_topic_with_the_user() {
         let leftovers = Leftovers {
@@ -248,8 +291,8 @@ mod tests {
         assert_eq!(
             carried.drafts,
             vec![
-                (agent(1), in_topic(4), "to one".into()),
-                (agent(2), in_topic(3), "to two".into()),
+                (agent(1), in_topic(8), "to one".into()),
+                (agent(2), in_topic(6), "to two".into()),
             ]
         );
         assert!(carried.outbox.is_empty());
@@ -258,7 +301,8 @@ mod tests {
     /// Unsent messages are posted one by one in the agent's topic with the
     /// user, oldest first, each under its own id: the host may have taken
     /// the first and not the second. An agent with no such topic starts one
-    /// with its first message, and the rest follow it there.
+    /// in `rho` with its first message, and the rest follow it there; each
+    /// mentions the agent, which is no member of that topic.
     #[test]
     fn unsent_messages_are_posted_in_the_agents_topic_with_the_user() {
         let message = |at, words: &str| Outgoing {
@@ -285,34 +329,38 @@ mod tests {
         let sent = |at, words: &str, to| ChatOutgoing {
             at: UnixMs(at),
             content: text(words),
+            mentions: Vec::new(),
             to,
+        };
+        let mentioning = |outgoing: ChatOutgoing| ChatOutgoing {
+            mentions: vec![agent(3)],
+            ..outgoing
         };
         let topic = |seq| Destination::Topic(TopicId(ChatSeq(seq)));
         assert_eq!(
             carried.outbox,
             vec![
-                (agent(1), SEED, 11, sent(100, "one a", topic(4))),
-                (agent(1), SEED, 12, sent(101, "one b", topic(4))),
-                (agent(2), SEED, 21, sent(102, "two", topic(3))),
+                (agent(1), SEED, 11, sent(100, "one a", topic(8))),
+                (agent(1), SEED, 12, sent(101, "one b", topic(8))),
+                (agent(2), SEED, 21, sent(102, "two", topic(6))),
                 (
                     agent(3),
                     SEED,
                     31,
-                    sent(
+                    mentioning(sent(
                         103,
                         "three a",
                         Destination::NewTopic {
-                            stream: StreamId::DEFAULT,
+                            stream: RHO,
                             name: "three a".into(),
-                            agents: vec![agent(3)],
                         }
-                    )
+                    ))
                 ),
                 (
                     agent(3),
                     SEED,
                     32,
-                    sent(104, "three b", Destination::AfterStart(31))
+                    mentioning(sent(104, "three b", Destination::AfterStart(31)))
                 ),
             ]
         );

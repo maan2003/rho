@@ -20,12 +20,8 @@ use crate::protocol::worksets::{Post, StartTopic};
 pub enum Destination {
     /// A topic the host already has.
     Topic(TopicId),
-    /// A topic this message starts, with the agents that receive it.
-    NewTopic {
-        stream: StreamId,
-        name: String,
-        agents: Vec<AgentId>,
-    },
+    /// A topic this message starts in `stream`.
+    NewTopic { stream: StreamId, name: String },
     /// The topic the message under this client id starts, once its host
     /// has said which: a message written after it in the same new topic.
     AfterStart(u64),
@@ -36,6 +32,10 @@ pub enum Destination {
 pub struct Outgoing {
     pub at: UnixMs,
     pub content: Vec<ContentPart>,
+    /// Agents that receive it without being members of its topic. A
+    /// message kept before there were mentions has none.
+    #[senax(default)]
+    pub mentions: Vec<AgentId>,
     pub to: Destination,
 }
 
@@ -53,17 +53,14 @@ impl Outgoing {
             Destination::Topic(topic) => Sending::Post(Post {
                 client_id,
                 topic: *topic,
+                mentions: self.mentions.clone(),
                 content: self.content.clone(),
             }),
-            Destination::NewTopic {
-                stream,
-                name,
-                agents,
-            } => Sending::StartTopic(StartTopic {
+            Destination::NewTopic { stream, name } => Sending::StartTopic(StartTopic {
                 client_id,
                 stream: *stream,
                 name: name.clone(),
-                agents: agents.clone(),
+                mentions: self.mentions.clone(),
                 content: self.content.clone(),
             }),
             Destination::AfterStart(_) => return None,
@@ -93,11 +90,18 @@ impl Outbox {
 
     /// Keeps a message the user wrote to the host on `machine_seed`, on
     /// disk before anything is sent. Answers its client id.
-    pub fn push(&mut self, machine_seed: u64, to: Destination, content: Vec<ContentPart>) -> u64 {
+    pub fn push(
+        &mut self,
+        machine_seed: u64,
+        to: Destination,
+        mentions: Vec<AgentId>,
+        content: Vec<ContentPart>,
+    ) -> u64 {
         let id = rand::random();
         let outgoing = Outgoing {
             at: UnixMs::now(),
             content,
+            mentions,
             to,
         };
         crate::cache::write_outgoing(machine_seed, id, Some(outgoing.clone()));
@@ -218,25 +222,29 @@ mod tests {
             topic: topic(4),
         };
         let mut outbox = Outbox::default();
-        let first = outbox.push(a, Destination::Topic(topic(4)), text("a1"));
         let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let first = outbox.push(a, Destination::Topic(topic(4)), vec![agent], text("a1"));
         outbox.push(
             b,
             Destination::NewTopic {
                 stream: rho_agent_types::StreamId(ChatSeq(1)),
                 name: "b1".into(),
-                agents: vec![agent],
             },
+            vec![agent],
             text("b1"),
         );
-        let second = outbox.push(a, Destination::Topic(topic(4)), text("a2"));
+        let second = outbox.push(a, Destination::Topic(topic(4)), Vec::new(), text("a2"));
         assert_eq!(outbox.hosts(), [a, b]);
 
-        assert_eq!(sent(outbox.next(a)), (first, "a1".to_owned()));
+        let to_a = outbox.next(a);
+        assert!(
+            matches!(&to_a, Some(Sending::Post(post)) if post.client_id == first && post.mentions == [agent]),
+            "a post mentions whom it mentions: {to_a:?}"
+        );
         assert!(outbox.next(a).is_none(), "one post at a time");
         let to_b = outbox.next(b).expect("a post");
         assert!(
-            matches!(&to_b, Sending::StartTopic(start) if start.agents == [agent] && start.name == "b1"),
+            matches!(&to_b, Sending::StartTopic(start) if start.mentions == [agent] && start.name == "b1"),
             "a new topic starts it: {to_b:?}"
         );
 
@@ -290,6 +298,7 @@ mod tests {
             Outgoing {
                 at: UnixMs(2),
                 content: text("second"),
+                mentions: vec![agent],
                 to: Destination::AfterStart(31),
             },
         );
@@ -299,10 +308,10 @@ mod tests {
             Outgoing {
                 at: UnixMs(1),
                 content: text("first"),
+                mentions: vec![agent],
                 to: Destination::NewTopic {
-                    stream: StreamId::DEFAULT,
+                    stream: StreamId(ChatSeq(1)),
                     name: "first".into(),
-                    agents: vec![agent],
                 },
             },
         );
@@ -322,8 +331,36 @@ mod tests {
             Some(Sending::Post(Post {
                 client_id: 32,
                 topic: topic(60),
+                mentions: vec![agent],
                 content: text("second"),
             }))
+        );
+    }
+
+    /// A message kept before messages had mentions reads back with none.
+    #[test]
+    fn a_message_kept_without_mentions_reads_back() {
+        #[derive(senax_encoder::Encode)]
+        struct Before {
+            at: UnixMs,
+            content: Vec<ContentPart>,
+            to: Destination,
+        }
+        let mut bytes = senax_encoder::encode(&Before {
+            at: UnixMs(5),
+            content: text("kept"),
+            to: Destination::Topic(topic(4)),
+        })
+        .unwrap();
+        let read: Outgoing = senax_encoder::decode(&mut bytes).unwrap();
+        assert_eq!(
+            read,
+            Outgoing {
+                at: UnixMs(5),
+                content: text("kept"),
+                mentions: Vec::new(),
+                to: Destination::Topic(topic(4)),
+            }
         );
     }
 }

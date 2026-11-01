@@ -241,7 +241,7 @@ mod tests {
     fn snippets_quote_what_they_splice() {
         let runtime = Runtime::parse("opus-high").unwrap();
         assert_eq!(
-            new_agent_on("https://x/\"y\"".into(), "", &runtime),
+            new_agent_on("https://x/\"y\"".into(), "", &runtime, None),
             "new_agent(repo=\"https://x/\\\"y\\\"\", rev=\"\", \
              runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"})\n"
         );

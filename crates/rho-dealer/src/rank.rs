@@ -221,10 +221,10 @@ fn rank_into(
     for (topic, _, held) in sources.chat.topics() {
         let node = NodeId::Topic(topic);
         // A13: nobody is left to answer, and what they said went with them.
-        if !held
-            .agents
-            .keys()
-            .any(|agent| sources.agents.agent_workset(*agent).is_some())
+        if held.agents().next().is_some()
+            && !held
+                .agents()
+                .any(|agent| sources.agents.agent_workset(agent).is_some())
         {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.outcome(&node, "no card: its agents are gone".to_owned());

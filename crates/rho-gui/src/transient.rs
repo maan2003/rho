@@ -76,8 +76,14 @@ pub(crate) enum Command {
     /// Home, from the verdict menu's own `tab` row.
     Home,
     AgentActivity,
-    /// A new topic with the agent: its first words, in the minibuffer.
+    /// A new topic that mentions the agent, in the draft page.
     NewTopic,
+    /// An agent started from the message at point.
+    StartFromMessage,
+    /// `@agent` in the reply of the topic in view.
+    Mention,
+    /// The conversations agents have with each other.
+    Directs,
     // Slack.
     /// Put this emoji on the message under the point, or take the
     /// reader's own off if it is already there. Slack's shortcode without
@@ -574,6 +580,13 @@ pub(crate) fn agent_menu() -> Menu {
     Menu::new("agent")
         .item("a", "activity", MenuAction::Command(Command::AgentActivity))
         .item("m", "new topic…", MenuAction::Command(Command::NewTopic))
+        .item(
+            "s",
+            "start agent from message…",
+            MenuAction::Command(Command::StartFromMessage),
+        )
+        .item("n", "mention…", MenuAction::Command(Command::Mention))
+        .item("d", "directs…", MenuAction::Command(Command::Directs))
         .item(
             "c",
             "cancel turn",

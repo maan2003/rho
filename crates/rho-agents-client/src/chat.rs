@@ -32,6 +32,8 @@ pub struct HostTopic {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserMention {
     pub message: MessageId,
+    /// The agent that posted it.
+    pub by: AgentId,
     pub kind: MentionKind,
     pub at: UnixMs,
 }
@@ -42,9 +44,10 @@ pub struct Topic {
     pub stream: StreamId,
     pub name: String,
     pub started_at: UnixMs,
-    /// Its agents, each with the event that made it one: it receives every
-    /// message after that.
-    pub agents: BTreeMap<AgentId, ChatSeq>,
+    /// Its members, each with the `Joined` that made it one: it receives
+    /// every message after that. Posting or being mentioned does not make
+    /// an agent a member.
+    pub members: BTreeMap<AgentId, ChatSeq>,
     /// The newest message in it.
     pub newest: Option<(MessageId, UnixMs)>,
     /// The newest message an agent posted in it.
@@ -56,20 +59,20 @@ pub struct Topic {
 }
 
 impl Topic {
-    /// The agent that has been in it longest: whose screen a reader of the
-    /// topic is on.
-    pub fn first_agent(&self) -> Option<AgentId> {
-        self.agents
-            .iter()
-            .min_by_key(|(agent, since)| (**since, **agent))
-            .map(|(agent, _)| *agent)
+    /// Every agent in it: its members, and the agents that mentioned the
+    /// user in it.
+    pub fn agents(&self) -> impl Iterator<Item = AgentId> + '_ {
+        self.members
+            .keys()
+            .copied()
+            .chain(self.mentions.iter().map(|mention| mention.by))
     }
 
-    /// The agents in the order they joined.
-    pub fn agents_in_order(&self) -> Vec<AgentId> {
-        let mut agents = self.agents.iter().collect::<Vec<_>>();
-        agents.sort_by_key(|(agent, since)| (**since, **agent));
-        agents.into_iter().map(|(agent, _)| *agent).collect()
+    /// The members in the order they joined.
+    pub fn members_in_order(&self) -> Vec<AgentId> {
+        let mut members = self.members.iter().collect::<Vec<_>>();
+        members.sort_by_key(|(agent, since)| (**since, **agent));
+        members.into_iter().map(|(agent, _)| *agent).collect()
     }
 
     /// How far the user has seen it: as far as they said they had, and
@@ -86,6 +89,16 @@ impl Topic {
     }
 }
 
+/// A direct conversation between two agents, folded: outside every stream,
+/// and never a card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Direct {
+    pub members: [AgentId; 2],
+    pub started_at: UnixMs,
+    /// The newest message in it.
+    pub newest: Option<(MessageId, UnixMs)>,
+}
+
 /// What telling one record moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Told {
@@ -97,6 +110,11 @@ pub enum Told {
         topic: TopicId,
         message: Option<(Message, Vec<AgentId>)>,
     },
+    /// A direct moved, the same way.
+    Direct {
+        direct: TopicId,
+        message: Option<(Message, Vec<AgentId>)>,
+    },
 }
 
 /// One host's chat, folded.
@@ -104,6 +122,9 @@ pub enum Told {
 pub struct HostChat {
     pub streams: BTreeMap<StreamId, String>,
     pub topics: BTreeMap<TopicId, Topic>,
+    /// Direct conversations, by the seq that started each; messages name
+    /// them as they name topics.
+    pub directs: BTreeMap<TopicId, Direct>,
 }
 
 impl HostChat {
@@ -119,12 +140,7 @@ impl HostChat {
                 self.streams.insert(stream, name.clone());
                 Told::Stream(stream)
             }
-            ChatEvent::TopicStarted {
-                stream,
-                name,
-                agents,
-                ..
-            } => {
+            ChatEvent::TopicStarted { stream, name, .. } => {
                 let topic = TopicId(record.seq);
                 if self.topics.contains_key(&topic) {
                     return Told::Nothing;
@@ -135,7 +151,7 @@ impl HostChat {
                         stream: *stream,
                         name: name.clone(),
                         started_at: record.at,
-                        agents: agents.iter().map(|agent| (*agent, record.seq)).collect(),
+                        members: BTreeMap::new(),
                         newest: None,
                         agent_wrote: None,
                         user_wrote: None,
@@ -147,14 +163,33 @@ impl HostChat {
                     message: None,
                 }
             }
+            ChatEvent::DirectStarted { members } => {
+                let direct = TopicId(record.seq);
+                if self.directs.contains_key(&direct) {
+                    return Told::Nothing;
+                }
+                self.directs.insert(
+                    direct,
+                    Direct {
+                        members: *members,
+                        started_at: record.at,
+                        newest: None,
+                    },
+                );
+                Told::Direct {
+                    direct,
+                    message: None,
+                }
+            }
             ChatEvent::Joined { topic, agent } => {
                 let Some(held) = self.topics.get_mut(topic) else {
                     tracing::warn!(topic = topic.0.0, "a join to a topic not heard of");
                     return Told::Nothing;
                 };
-                if !join(held, *agent, record.seq) {
+                if held.members.contains_key(agent) {
                     return Told::Nothing;
                 }
+                held.members.insert(*agent, record.seq);
                 Told::Topic {
                     topic: *topic,
                     message: None,
@@ -164,6 +199,40 @@ impl HostChat {
                 let Some(message) = Message::from_record(record) else {
                     return Told::Nothing;
                 };
+                // Every member but the sender receives it, and so does each
+                // agent it mentions.
+                let mentioned = message
+                    .mentions
+                    .iter()
+                    .filter_map(|mention| match mention.to {
+                        Address::Agent(agent) => Some(agent),
+                        Address::User => None,
+                    });
+                let reach = |members: &mut dyn Iterator<Item = AgentId>| {
+                    let mut parties = Vec::new();
+                    for agent in members.chain(mentioned.clone()) {
+                        if message.from != Address::Agent(agent) && !parties.contains(&agent) {
+                            parties.push(agent);
+                        }
+                    }
+                    // Not a recipient, but the message is in the sender's
+                    // own history.
+                    if let Address::Agent(agent) = message.from {
+                        parties.push(agent);
+                    }
+                    parties
+                };
+                if let Some(held) = self.directs.get_mut(topic) {
+                    if held.newest.is_some_and(|(newest, _)| newest >= message.id) {
+                        return Told::Nothing;
+                    }
+                    held.newest = Some((message.id, message.at));
+                    let parties = reach(&mut held.members.into_iter());
+                    return Told::Direct {
+                        direct: *topic,
+                        message: Some((message, parties)),
+                    };
+                }
                 let Some(held) = self.topics.get_mut(topic) else {
                     tracing::warn!(topic = topic.0.0, "a message in a topic not heard of");
                     return Told::Nothing;
@@ -171,41 +240,28 @@ impl HostChat {
                 if held.newest.is_some_and(|(newest, _)| newest >= message.id) {
                     return Told::Nothing;
                 }
-                // Every agent of the topic but its sender receives it, and
-                // so does each agent it mentions.
-                let mut parties = held
-                    .agents
-                    .iter()
-                    .filter(|(agent, since)| {
-                        **since < record.seq && message.from != Address::Agent(**agent)
-                    })
-                    .map(|(agent, _)| *agent)
-                    .collect::<Vec<_>>();
-                for mention in &message.mentions {
-                    if let Address::Agent(agent) = mention.to
-                        && !parties.contains(&agent)
-                        && message.from != mention.to
-                    {
-                        parties.push(agent);
-                    }
-                }
                 held.newest = Some((message.id, message.at));
                 match message.from {
                     Address::User => held.user_wrote = Some((message.id, message.at)),
-                    Address::Agent(agent) => {
-                        // Posting makes the sender one of the topic's agents.
-                        join(held, agent, record.seq);
-                        held.agent_wrote = Some((message.id, message.at));
-                        parties.push(agent);
-                    }
+                    Address::Agent(_) => held.agent_wrote = Some((message.id, message.at)),
                 }
-                if let Some(kind) = message.mentions(Address::User) {
+                if let (Some(kind), Address::Agent(by)) =
+                    (message.mentions(Address::User), message.from)
+                {
                     held.mentions.push(UserMention {
                         message: message.id,
+                        by,
                         kind,
                         at: message.at,
                     });
                 }
+                let parties = reach(
+                    &mut held
+                        .members
+                        .iter()
+                        .filter(|(_, since)| **since < record.seq)
+                        .map(|(agent, _)| *agent),
+                );
                 Told::Topic {
                     topic: *topic,
                     message: Some((message, parties)),
@@ -214,23 +270,20 @@ impl HostChat {
         }
     }
 
-    /// Takes the streams and topics the model says moved, as they now
-    /// stand.
+    /// Takes the streams, topics and directs the model says moved, as they
+    /// now stand.
     pub fn merge(&mut self, moved: HostChat) {
         self.streams.extend(moved.streams);
         self.topics.extend(moved.topics);
+        self.directs.extend(moved.directs);
     }
-}
 
-/// Makes `agent` one of the topic's agents from `seq` on, unless it
-/// already is from earlier. Says whether anything moved.
-fn join(topic: &mut Topic, agent: AgentId, seq: ChatSeq) -> bool {
-    match topic.agents.get(&agent) {
-        Some(since) if *since <= seq => false,
-        _ => {
-            topic.agents.insert(agent, seq);
-            true
-        }
+    /// A stream by its name, if the host has one.
+    pub fn stream_named(&self, name: &str) -> Option<StreamId> {
+        self.streams
+            .iter()
+            .find(|(_, held)| *held == name)
+            .map(|(stream, _)| *stream)
     }
 }
 
@@ -343,14 +396,50 @@ impl ChatMap {
             .map(String::as_str)
     }
 
-    /// The newest topic an agent is in.
+    /// The host of a conversation, a topic or a direct.
+    pub fn conversation_host(&self, conversation: HostTopic) -> Option<HostId> {
+        self.topic(conversation)
+            .map(|(host, _)| host)
+            .or_else(|| self.direct(conversation).map(|(host, _)| host))
+    }
+
+    /// A direct conversation's host as this window knows it, and the
+    /// direct.
+    pub fn direct(&self, direct: HostTopic) -> Option<(HostId, &Direct)> {
+        self.hosts.iter().find_map(|(host, held)| {
+            (held.machine_seed == Some(direct.machine_seed))
+                .then(|| held.chat.directs.get(&direct.topic))
+                .flatten()
+                .map(|held| (*host, held))
+        })
+    }
+
+    /// Every direct conversation of every host whose database is known.
+    pub fn directs(&self) -> impl Iterator<Item = (HostTopic, HostId, &Direct)> {
+        self.hosts.iter().flat_map(|(host, held)| {
+            held.machine_seed.into_iter().flat_map(move |machine_seed| {
+                held.chat.directs.iter().map(move |(direct, held)| {
+                    (
+                        HostTopic {
+                            machine_seed,
+                            topic: *direct,
+                        },
+                        *host,
+                        held,
+                    )
+                })
+            })
+        })
+    }
+
+    /// The newest topic an agent is a member of.
     pub fn newest_topic_of(&self, host: HostId, agent: AgentId) -> Option<HostTopic> {
         let held = self.hosts.get(&host)?;
         let (topic, _) = held
             .chat
             .topics
             .iter()
-            .filter(|(_, topic)| topic.agents.contains_key(&agent))
+            .filter(|(_, topic)| topic.members.contains_key(&agent))
             .max_by_key(|(id, topic)| (topic.newest.map(|(newest, _)| newest), **id))?;
         Some(HostTopic {
             machine_seed: held.machine_seed?,
@@ -363,6 +452,7 @@ impl ChatMap {
 /// user wrote in it that no host has taken yet.
 pub fn topic_state(messages: &[Message], unsent: &[String]) -> UiAgentState {
     let said = messages.iter().map(|message| UiBlock::ChatMessage {
+        id: message.id,
         from: message.from,
         mentions: message.mentions.clone(),
         text: rho_agent_types::transcript::text_content(&message.content),
@@ -406,7 +496,8 @@ mod tests {
 
     const TOPIC: TopicId = TopicId(ChatSeq(2));
 
-    fn started(agents: Vec<AgentId>) -> [ChatRecord; 2] {
+    /// A stream at 1, `TOPIC` in it at 2, and `member` joining it at 3.
+    fn started(member: AgentId) -> [ChatRecord; 3] {
         [
             record(1, ChatEvent::StreamCreated { name: "rho".into() }),
             record(
@@ -415,7 +506,13 @@ mod tests {
                     stream: StreamId(ChatSeq(1)),
                     name: "fix the flaky test".into(),
                     by: Address::User,
-                    agents,
+                },
+            ),
+            record(
+                3,
+                ChatEvent::Joined {
+                    topic: TOPIC,
+                    agent: member,
                 },
             ),
         ]
@@ -463,44 +560,92 @@ mod tests {
         MessageId(ChatSeq(seq))
     }
 
-    /// A message reaches every agent of the topic but its sender, and each
-    /// agent it mentions; posting makes the sender one of the topic's
-    /// agents from then on, so it hears the next message but not its own
-    /// or any before it.
+    /// A message reaches the topic's members, whom it mentions, and its
+    /// sender. Only a join makes a member: neither posting nor being
+    /// mentioned does, and a member hears only what comes after its join.
     #[test]
-    fn a_message_reaches_the_topics_agents_and_whom_it_mentions() {
+    fn a_message_reaches_the_members_and_whom_it_mentions() {
         let (a, b, c) = (agent(1), agent(2), agent(3));
         let mut chat = HostChat::default();
-        for record in started(vec![a]) {
+        for record in started(a) {
             chat.tell(&record);
         }
         assert_eq!(
-            parties(chat.tell(&posted(3, Address::User, &[]))),
+            parties(chat.tell(&posted(4, Address::User, &[]))),
             [a],
-            "the user's message reaches the topic's agent"
+            "the user's message reaches the member"
         );
         assert_eq!(
             parties(chat.tell(&posted(
-                4,
+                5,
                 Address::Agent(b),
-                &[(Address::Agent(c), MentionKind::Fyi)]
+                &[(Address::Agent(c), MentionKind::Ask)]
             ))),
             sorted(vec![a, b, c]),
-            "an outsider's post reaches the topic, whom it mentions, and is its own"
+            "an outsider's post reaches the members, whom it mentions, and itself"
         );
         let topic = &chat.topics[&TOPIC];
-        assert_eq!(topic.agents[&b], ChatSeq(4), "posting joined it");
-        assert!(
-            !topic.agents.contains_key(&c),
-            "a mention reaches but does not join"
-        );
+        assert!(!topic.members.contains_key(&b), "posting does not join");
+        assert!(!topic.members.contains_key(&c), "a mention does not join");
         assert_eq!(
-            parties(chat.tell(&posted(5, Address::Agent(a), &[]))),
-            sorted(vec![a, b]),
-            "the joined sender hears what comes after"
+            parties(chat.tell(&posted(6, Address::User, &[]))),
+            [a],
+            "neither the poster nor the mentioned hears what follows"
         );
-        assert_eq!(chat.topics[&TOPIC].first_agent(), Some(a));
-        assert_eq!(chat.topics[&TOPIC].agents_in_order(), [a, b]);
+        chat.tell(&record(
+            7,
+            ChatEvent::Joined {
+                topic: TOPIC,
+                agent: b,
+            },
+        ));
+        assert_eq!(
+            parties(chat.tell(&posted(8, Address::User, &[]))),
+            sorted(vec![a, b]),
+            "a join makes a member who hears what comes after"
+        );
+        assert_eq!(chat.topics[&TOPIC].members_in_order(), [a, b]);
+    }
+
+    /// A direct conversation is its two agents': each message reaches
+    /// both, and nothing in it is the user's to answer.
+    #[test]
+    fn a_direct_message_reaches_its_two_agents() {
+        let (a, b, c) = (agent(1), agent(2), agent(3));
+        let direct = TopicId(ChatSeq(1));
+        let mut chat = HostChat::default();
+        assert_eq!(
+            chat.tell(&record(1, ChatEvent::DirectStarted { members: [a, b] })),
+            Told::Direct {
+                direct,
+                message: None
+            }
+        );
+        let told = chat.tell(&record(
+            2,
+            ChatEvent::Posted {
+                topic: direct,
+                from: Address::Agent(b),
+                mentions: vec![Mention {
+                    to: Address::User,
+                    kind: MentionKind::Ask,
+                }],
+                content: Vec::new(),
+            },
+        ));
+        let Told::Direct {
+            message: Some((message, mut parties)),
+            ..
+        } = told
+        else {
+            panic!("not a direct message: {told:?}");
+        };
+        parties.sort();
+        assert_eq!(parties, sorted(vec![a, b]));
+        assert_eq!(message.id, id(2));
+        assert!(chat.topics.is_empty(), "a direct is no topic");
+        assert_eq!(chat.directs[&direct].newest, Some((id(2), UnixMs(20))));
+        assert!(!chat.directs[&direct].members.contains(&c));
     }
 
     /// The user's mentions are kept in order with their kind; what the
@@ -510,16 +655,16 @@ mod tests {
     fn the_users_mentions_are_unseen_until_seen_or_answered() {
         let a = agent(1);
         let mut chat = HostChat::default();
-        for record in started(vec![a]) {
+        for record in started(a) {
             chat.tell(&record);
         }
         chat.tell(&posted(
-            3,
+            4,
             Address::Agent(a),
             &[(Address::User, MentionKind::Fyi)],
         ));
         chat.tell(&posted(
-            4,
+            5,
             Address::Agent(a),
             &[(Address::User, MentionKind::Ask)],
         ));
@@ -532,27 +677,27 @@ mod tests {
         };
         assert_eq!(
             unseen(topic, None),
-            [(id(3), MentionKind::Fyi), (id(4), MentionKind::Ask)]
+            [(id(4), MentionKind::Fyi), (id(5), MentionKind::Ask)]
         );
-        assert_eq!(unseen(topic, Some(id(3))), [(id(4), MentionKind::Ask)]);
-        assert_eq!(unseen(topic, Some(id(4))), []);
-        assert_eq!(topic.mentions[1].at, UnixMs(40));
+        assert_eq!(unseen(topic, Some(id(4))), [(id(5), MentionKind::Ask)]);
+        assert_eq!(unseen(topic, Some(id(5))), []);
+        assert_eq!(topic.mentions[1].at, UnixMs(50));
 
-        chat.tell(&posted(5, Address::User, &[]));
+        chat.tell(&posted(6, Address::User, &[]));
         chat.tell(&posted(
-            6,
+            7,
             Address::Agent(a),
             &[(Address::User, MentionKind::Result)],
         ));
         let topic = &chat.topics[&TOPIC];
         assert_eq!(
             unseen(topic, None),
-            [(id(6), MentionKind::Result)],
+            [(id(7), MentionKind::Result)],
             "the user's own message reads what came before it"
         );
-        assert_eq!(topic.user_wrote, Some((id(5), UnixMs(50))));
-        assert_eq!(topic.newest, Some((id(6), UnixMs(60))));
-        assert_eq!(topic.agent_wrote, Some((id(6), UnixMs(60))));
+        assert_eq!(topic.user_wrote, Some((id(6), UnixMs(60))));
+        assert_eq!(topic.newest, Some((id(7), UnixMs(70))));
+        assert_eq!(topic.agent_wrote, Some((id(7), UnixMs(70))));
     }
 
     /// Telling a record again moves nothing, and a host's whole log told
@@ -560,27 +705,34 @@ mod tests {
     #[test]
     fn replays_move_nothing_and_order_across_topics_does_not_matter() {
         let (a, b) = (agent(1), agent(2));
-        let other = TopicId(ChatSeq(3));
-        let mut log = started(vec![a]).to_vec();
+        let other = TopicId(ChatSeq(4));
+        let direct = TopicId(ChatSeq(10));
+        let mut log = started(a).to_vec();
         log.push(record(
-            3,
+            4,
             ChatEvent::TopicStarted {
                 stream: StreamId(ChatSeq(1)),
                 name: "other".into(),
                 by: Address::Agent(a),
-                agents: vec![a],
             },
         ));
-        log.push(posted(4, Address::User, &[]));
         log.push(record(
             5,
+            ChatEvent::Joined {
+                topic: other,
+                agent: a,
+            },
+        ));
+        log.push(posted(6, Address::User, &[]));
+        log.push(record(
+            7,
             ChatEvent::Joined {
                 topic: TOPIC,
                 agent: b,
             },
         ));
         log.push(record(
-            6,
+            8,
             ChatEvent::Posted {
                 topic: other,
                 from: Address::Agent(a),
@@ -592,9 +744,19 @@ mod tests {
             },
         ));
         log.push(posted(
-            7,
+            9,
             Address::Agent(b),
             &[(Address::User, MentionKind::Result)],
+        ));
+        log.push(record(10, ChatEvent::DirectStarted { members: [a, b] }));
+        log.push(record(
+            11,
+            ChatEvent::Posted {
+                topic: direct,
+                from: Address::Agent(a),
+                mentions: Vec::new(),
+                content: Vec::new(),
+            },
         ));
 
         let mut in_order = HostChat::default();
@@ -630,10 +792,10 @@ mod tests {
     fn the_map_finds_a_topic_by_its_hosts_database() {
         let a = agent(1);
         let mut chat = HostChat::default();
-        for record in started(vec![a]) {
+        for record in started(a) {
             chat.tell(&record);
         }
-        chat.tell(&posted(3, Address::Agent(a), &[]));
+        chat.tell(&posted(4, Address::Agent(a), &[]));
         let mut map = ChatMap::default();
         map.merge(HostId(4), chat.clone());
         assert_eq!(map.topics().count(), 0, "no database, no topic");
@@ -663,12 +825,12 @@ mod tests {
     fn a_topic_reads_as_its_messages_then_what_waits() {
         let a = agent(1);
         let mut chat = HostChat::default();
-        for record in started(vec![a]) {
+        for record in started(a) {
             chat.tell(&record);
         }
         let messages = [
-            posted(3, Address::User, &[]),
-            posted(4, Address::Agent(a), &[(Address::User, MentionKind::Ask)]),
+            posted(4, Address::User, &[]),
+            posted(5, Address::Agent(a), &[(Address::User, MentionKind::Ask)]),
         ]
         .iter()
         .filter_map(Message::from_record)
@@ -682,17 +844,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 UiBlock::ChatMessage {
+                    id: id(4),
                     from: Address::User,
                     mentions: Vec::new(),
-                    text: "message 3".into()
+                    text: "message 4".into()
                 },
                 UiBlock::ChatMessage {
+                    id: id(5),
                     from: Address::Agent(a),
                     mentions: vec![Mention {
                         to: Address::User,
                         kind: MentionKind::Ask
                     }],
-                    text: "message 4".into()
+                    text: "message 5".into()
                 },
                 UiBlock::Unsent {
                     text: "later".into()

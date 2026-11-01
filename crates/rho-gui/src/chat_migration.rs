@@ -30,8 +30,8 @@ pub(crate) fn settle_migrated(chat: &ChatMap, marks: &Marks) -> Vec<Fact> {
         let said = marks
             .nodes()
             .filter(|(old, _)| match old {
-                NodeId::Agent(agent) => held.agents.contains_key(agent),
-                NodeId::Mail(thread) => held.agents.contains_key(&thread.agent),
+                NodeId::Agent(agent) => held.agents().any(|held| held == *agent),
+                NodeId::Mail(thread) => held.agents().any(|held| held == thread.agent),
                 _ => false,
             })
             .collect::<Vec<_>>();
@@ -41,9 +41,8 @@ pub(crate) fn settle_migrated(chat: &ChatMap, marks: &Marks) -> Vec<Fact> {
         // An agent the user muted reached them with nothing; its topics
         // do the same.
         let muted = held
-            .agents
-            .keys()
-            .all(|agent| marks.get(&NodeId::Agent(*agent)).facts().muted());
+            .agents()
+            .all(|agent| marks.get(&NodeId::Agent(agent)).facts().muted());
         if muted {
             facts.push(Fact::Mute { node });
             continue;
@@ -120,17 +119,23 @@ mod tests {
             seq += 1;
             ChatSeq(seq - 1)
         };
-        tell(0, ChatEvent::StreamCreated { name: "rho".into() });
+        let stream = StreamId(tell(0, ChatEvent::StreamCreated { name: "rho".into() }));
         for agent in agents {
             let topic = TopicId(tell(
                 0,
                 ChatEvent::TopicStarted {
-                    stream: StreamId::DEFAULT,
+                    stream,
                     name: "old".into(),
-                    by: Address::Agent(*agent),
-                    agents: vec![*agent],
+                    by: Address::User,
                 },
             ));
+            tell(
+                0,
+                ChatEvent::Joined {
+                    topic,
+                    agent: *agent,
+                },
+            );
             for (at, kind) in [(HOUR, MentionKind::Ask), (3 * HOUR, MentionKind::Result)] {
                 tell(
                     at,

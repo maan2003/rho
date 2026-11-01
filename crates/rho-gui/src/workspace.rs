@@ -38,7 +38,7 @@ use rho_agents_client::snippets::{self, Runtime};
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId, HostTopic, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
-use rho_agents_view::draft::DraftModel;
+use rho_agents_view::draft::{DraftModel, DraftShape};
 use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RuntimeCycle, RuntimeCycleGroup,
@@ -176,6 +176,44 @@ pub(crate) enum ContextId {
 
 pub use rho_agent_hosts::{AttachTarget, HostSpec};
 
+/// What the draft page writes, with what its rows do not say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DraftFor {
+    /// A topic, and an agent started from its first message.
+    NewTopic,
+    /// A topic whose first message mentions this agent (`space a m`).
+    Mention(AgentId),
+    /// An agent started from this message in this conversation.
+    Origin(HostTopic, rho_agent_types::MessageId),
+}
+
+/// An agent the user asked a host for, and where it goes once made.
+#[derive(Clone, Copy, Debug)]
+struct AgentRequest {
+    host: HostId,
+    /// The conversation the agent starts from.
+    topic: HostTopic,
+    /// Whether the draft asked and waits for the answer.
+    from_draft: bool,
+}
+
+/// A topic the draft starts: its host, its first message and whom that
+/// mentions, and the agent that starts from it.
+struct TopicStart {
+    host: HostId,
+    mentions: Vec<AgentId>,
+    content: Vec<ContentPart>,
+    agent: Option<(rho_agents_client::create::Start, Runtime)>,
+}
+
+/// An agent a new topic starts from its first message: the agent's rows
+/// from the draft.
+struct AgentForTopic {
+    host: HostId,
+    start: rho_agents_client::create::Start,
+    runtime: Runtime,
+}
+
 /// The menu on screen while it is open. Nothing here says where it is
 /// drawn: the desk pins it to the bottom edge of the window and the phone
 /// draws it as a sheet, and in neither case does the buffer change, so the
@@ -277,15 +315,13 @@ pub struct Workspace {
     /// Stands in for an editor when the surface in view has none.
     chrome_editor: Entity<editor::Editor>,
     _save_notes_on_quit: gpui::Subscription,
-    /// A NewAgent request from the draft is in flight; the draft buffer is
-    /// kept intact until the agent host confirms creation, so a rejected
-    /// request (bad working directory, say) never loses the message.
-    /// Which host the pending draft agent was sent to, so its confirmation
-    /// can be recognized and the compose surface reset, and the message
-    /// that starts the new agent's topic once it is made.
-    awaiting_draft_agent: Option<(HostId, Vec<ContentPart>)>,
-    /// The agent a draft became, answered before the directory showed it.
-    draft_became: Option<(HostId, AgentId)>,
+    /// What the draft page is writing.
+    draft_for: DraftFor,
+    /// An agent the host made, answered before the directory showed it.
+    draft_became: Option<(AgentRequest, AgentId)>,
+    /// The agents new topics start, by the outbox id of each topic's first
+    /// message: each starts once its host takes that message.
+    agents_for_topics: HashMap<u64, AgentForTopic>,
     /// The client id of a topic the user started, which opens when its
     /// host takes it.
     new_topic_post: Option<u64>,
@@ -451,19 +487,31 @@ pub struct Workspace {
 /// follows.
 const LINK_NAME_PROMPT: &str = "name host ";
 
+/// What a transcript view shows: an agent's activity, or the messages
+/// of a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelOf {
+    Activity(AgentId),
+    Topic(HostTopic),
+}
+
 impl Workspace {
-    /// A view over a transcript: an agent's activity, or `topic`'s
-    /// messages, seen from `agent_id`'s screen.
+    /// A view over a transcript: an agent's activity, or a conversation's
+    /// messages.
     fn new_agent_model(
         &mut self,
-        agent_id: AgentId,
-        topic: Option<HostTopic>,
+        of: ModelOf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
-        let view = match topic {
-            Some(_) => TranscriptView::Conversation,
-            None => TranscriptView::Activity,
+        let (view, link) = match of {
+            ModelOf::Topic(topic) => (
+                TranscriptView::Conversation,
+                self.chat
+                    .conversation_host(topic)
+                    .and_then(|host| self.agents(host)),
+            ),
+            ModelOf::Activity(agent_id) => (TranscriptView::Activity, self.agents_for(agent_id)),
         };
         let completions = crate::commands::WorkspaceCompletionProvider::new(
             cx.entity().downgrade(),
@@ -471,22 +519,24 @@ impl Workspace {
             None,
             None,
         );
-        let visualization_client = self
-            .agents_for(agent_id)
-            .unwrap_or_else(AgentsLink::detached);
+        let visualization_client = link.unwrap_or_else(AgentsLink::detached);
         let model = cx.new(|cx| AgentModel::with_view(view, completions, visualization_client, cx));
         self.agent_model_subscriptions.push(cx.subscribe_in(
             &model,
             window,
             move |workspace, loaded_model, event, window, cx| {
                 match event {
-                    rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => match topic {
-                        Some(topic) if workspace.topics.get(&topic) == Some(loaded_model) => {
+                    rho_agents_view::agent_view::AgentModelEvent::Loaded => match of {
+                        ModelOf::Topic(topic)
+                            if workspace.topics.get(&topic) == Some(loaded_model) =>
+                        {
                             workspace.sync_topic_model(topic, FrameSummary::nothing(), cx);
                             cx.notify();
                         }
-                        None if workspace.activity_models.get(agent_id) == Some(loaded_model) => {
-                            workspace.finish_activity_load(*agent_id, cx);
+                        ModelOf::Activity(agent_id)
+                            if workspace.activity_models.get(&agent_id) == Some(loaded_model) =>
+                        {
+                            workspace.finish_activity_load(agent_id, cx);
                             workspace.ensure_duration_timer(cx);
                             cx.notify();
                         }
@@ -494,17 +544,18 @@ impl Workspace {
                     },
                     // Kept even from a view no longer held: the words are the
                     // user's.
-                    rho_agents_view::agent_view::AgentModelEvent::DraftEdited(_) => {
-                        if let Some(topic) = topic {
+                    rho_agents_view::agent_view::AgentModelEvent::DraftEdited => {
+                        if let ModelOf::Topic(topic) = of {
                             workspace.draft_edited(topic, loaded_model, cx);
                         }
                     }
-                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
-                        if workspace
-                            .active_transcript()
-                            .is_some_and(|(model, _)| model == *loaded_model)
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed => {
+                        if let ModelOf::Activity(agent_id) = of
+                            && workspace
+                                .active_transcript()
+                                .is_some_and(|(model, _)| model == *loaded_model)
                         {
-                            workspace.finish_transcript_search(*agent_id, window, cx);
+                            workspace.finish_transcript_search(agent_id, window, cx);
                         }
                     }
                 }
@@ -522,7 +573,7 @@ impl Workspace {
         let model = match self.activity_models.get(&agent_id).cloned() {
             Some(model) => model,
             None => {
-                let model = self.new_agent_model(agent_id, None, window, cx);
+                let model = self.new_agent_model(ModelOf::Activity(agent_id), window, cx);
                 self.activity_models.insert(agent_id, model.clone());
                 model
             }
@@ -531,9 +582,9 @@ impl Workspace {
         (model, started)
     }
 
-    /// The view of one topic, made and loaded from its messages if it is
-    /// not open yet. `None` for a topic this window has not heard of, or
-    /// one with no agent: a view is an agent's screen.
+    /// The view of one conversation, a topic or a direct, made and loaded
+    /// from its messages if it is not open yet. `None` for one this window
+    /// has not heard of.
     fn ensure_topic_model(
         &mut self,
         topic: HostTopic,
@@ -543,8 +594,8 @@ impl Workspace {
         if let Some(model) = self.topics.get(&topic) {
             return Some(model.clone());
         }
-        let agent_id = self.topic_agent(topic)?;
-        let model = self.new_agent_model(agent_id, Some(topic), window, cx);
+        self.chat.conversation_host(topic)?;
+        let model = self.new_agent_model(ModelOf::Topic(topic), window, cx);
         if let Some(text) = self.drafts.get(&topic) {
             model.update(cx, |model, cx| model.set_prompt_text(text, cx));
         }
@@ -562,24 +613,15 @@ impl Workspace {
                 .map(|id| (id, self.registry.agent_display_label(id)))
                 .collect();
             model.update(cx, |model, cx| {
-                model.start_initial_load(agent_id, state, labels, now_ms(), cx)
+                model.start_initial_load(state, labels, now_ms(), cx)
             });
         }
         Some(model)
     }
 
-    /// The agent whose screen a topic is read on: the one in it longest.
-    fn topic_agent(&self, topic: HostTopic) -> Option<AgentId> {
-        self.chat.topic(topic)?.1.first_agent()
-    }
-
-    /// The agent a surface belongs to: the one whose activity it shows,
-    /// or whose screen its topic is read on.
+    /// The agent a surface belongs to: the one whose activity it shows.
     pub(crate) fn surface_agent(&self, key: &SurfaceKey) -> Option<AgentId> {
-        match key {
-            SurfaceKey::Topic(topic) => self.topic_agent(*topic),
-            key => key.activity_agent(),
-        }
+        key.activity_agent()
     }
 
     /// Builds a topic's state again from its messages and what waits to be
@@ -631,21 +673,6 @@ impl Workspace {
                 let summary = self.refresh_topic_state(topic);
                 self.sync_topic_model(topic, summary, cx);
             }
-        }
-    }
-
-    /// Lets go of the views of topics whose agents are all gone, and their
-    /// state.
-    fn forget_topics(&mut self, gone: impl Fn(AgentId) -> bool) {
-        let dropped = self
-            .topics
-            .keys()
-            .copied()
-            .filter(|topic| self.topic_agent(*topic).is_none_or(&gone))
-            .collect::<Vec<_>>();
-        for topic in dropped {
-            self.topics.remove(&topic);
-            self.transcripts.forget_topic(topic);
         }
     }
 
@@ -733,19 +760,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let gone_topics = self
-            .topics
-            .keys()
-            .copied()
-            .filter(|topic| {
-                self.topic_agent(*topic)
-                    .is_some_and(|id| agents.contains(&id))
-            })
-            .collect::<HashSet<_>>();
-        let gone = |key: &SurfaceKey| match key {
-            SurfaceKey::Topic(topic) => gone_topics.contains(topic),
-            key => key.activity_agent().is_some_and(|id| agents.contains(&id)),
-        };
+        // A topic is not its agents': it stays when they go.
+        let gone = |key: &SurfaceKey| key.activity_agent().is_some_and(|id| agents.contains(&id));
         let shown = gone(&self.active_surface().key);
         let keys: HashSet<SurfaceKey> = self
             .surfaces
@@ -769,7 +785,6 @@ impl Workspace {
             self.transcripts.forget(*agent_id);
             self.activity_models.remove(agent_id);
         }
-        self.forget_topics(|agent_id| agents.contains(&agent_id));
         self.surfaces
             .values_mut()
             .for_each(|surfaces| surfaces.retain(|surface| !gone(&surface.key)));
@@ -891,7 +906,7 @@ impl Workspace {
             .map(|id| (id, self.registry.agent_display_label(id)))
             .collect();
         model.update(cx, |model, cx| {
-            model.start_initial_load(agent_id, state, labels, now_ms(), cx)
+            model.start_initial_load(state, labels, now_ms(), cx)
         });
         true
     }
@@ -1155,8 +1170,9 @@ impl Workspace {
             draft_area: None,
             chrome_editor,
             _save_notes_on_quit: save_notes_on_quit,
-            awaiting_draft_agent: None,
+            draft_for: DraftFor::NewTopic,
             draft_became: None,
+            agents_for_topics: HashMap::new(),
             new_topic_post: None,
             topic_to_open: None,
             draft_host: None,
@@ -1675,10 +1691,11 @@ impl Workspace {
                     .last()
                     .map(|mention| mention.at)
                     .max(held.user_wrote.map(|(_, at)| at))?;
-                if !held
-                    .agents
-                    .keys()
-                    .any(|agent| self.registry.agent_workset(*agent).is_some())
+                // Gone with its agents, as its card is.
+                if held.agents().next().is_some()
+                    && !held
+                        .agents()
+                        .any(|agent| self.registry.agent_workset(agent).is_some())
                 {
                     return None;
                 }
@@ -2129,11 +2146,11 @@ impl Workspace {
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
-                if let Some((host, agent_id)) = self.draft_became
+                if let Some((request, agent_id)) = self.draft_became
                     && changed.contains(&agent_id)
                 {
                     self.draft_became = None;
-                    self.draft_answered(host, Ok(agent_id), window, cx);
+                    self.agent_answered(request, Ok(agent_id), window, cx);
                 }
                 self.invalidate_dealer_signals(cx);
                 // Status is workspace chrome, not part of the transcript
@@ -2358,14 +2375,8 @@ impl Workspace {
                 );
                 // Keep the ready marker so the next handshake can replay the
                 // retained session instead of treating it as first startup.
-                if self
-                    .awaiting_draft_agent
-                    .as_ref()
-                    .is_some_and(|(awaited, _)| *awaited == host)
-                {
-                    self.awaiting_draft_agent = None;
-                }
-                self.draft_became.take_if(|(waiting, _)| *waiting == host);
+                self.draft_became
+                    .take_if(|(request, _)| request.host == host);
                 if self.voice.is_on(host) {
                     self.voice.stop();
                 }
@@ -2505,12 +2516,49 @@ impl Workspace {
             return;
         };
         let Some((host, _)) = self.chat.topic(*topic) else {
+            self.notice_on(
+                None,
+                "a direct conversation is its two agents' own: nothing is posted in it",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         };
         let Some(content) = model.update(cx, |view, cx| view.take_prompt(cx)) else {
             return;
         };
-        self.handle_submit(host, Destination::Topic(topic.topic), content, window, cx);
+        let mentions = self.mentions_in(host, &content);
+        self.handle_submit(
+            host,
+            Destination::Topic(topic.topic),
+            mentions,
+            content,
+            window,
+            cx,
+        );
+    }
+
+    /// The agents on `host` a message names as `@label`, each once, in the
+    /// order it names them. A word that names no agent there is just a
+    /// word.
+    fn mentions_in(&self, host: HostId, content: &[ContentPart]) -> Vec<AgentId> {
+        let text = rho_agent_types::transcript::text_content(content);
+        let mut mentions = Vec::new();
+        for word in text.split_whitespace() {
+            let Some(label) = word.strip_prefix('@') else {
+                continue;
+            };
+            let label = label.trim_end_matches(|c: char| {
+                matches!(c, ',' | '.' | ':' | ';' | '!' | '?' | ')' | '\'' | '"')
+            });
+            if let Some(agent) = self.registry.agent_by_label(label)
+                && self.host_of(agent) == Some(host)
+                && !mentions.contains(&agent)
+            {
+                mentions.push(agent);
+            }
+        }
+        mentions
     }
 
     fn shell_interrupt(&mut self, _: &ShellInterrupt, _: &mut Window, cx: &mut Context<Self>) {
@@ -2533,8 +2581,8 @@ impl Workspace {
             cx.notify();
             return;
         }
-        // Voice talks in the topic the user is reading, to the agent whose
-        // screen it is.
+        // Voice talks in the topic the user is reading, to its first
+        // member.
         let SurfaceKey::Topic(topic) = self.active_surface().key else {
             self.notice_on(
                 None,
@@ -2544,11 +2592,14 @@ impl Workspace {
             );
             return;
         };
-        let (Some((host, _)), Some(agent_id)) = (self.chat.topic(topic), self.topic_agent(topic))
+        let Some((host, agent_id)) = self
+            .chat
+            .topic(topic)
+            .and_then(|(host, held)| Some((host, *held.members_in_order().first()?)))
         else {
             self.notice_on(
                 None,
-                "voice: this topic has no agent",
+                "voice: this topic has no member",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -2662,6 +2713,7 @@ impl Workspace {
         &mut self,
         host: HostId,
         to: Destination,
+        mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2670,17 +2722,21 @@ impl Workspace {
             self.report_refusal(host, "the host has not said which database it is", cx);
             return None;
         };
-        let agents = match &to {
+        // Who it reaches: the members of its topic and whom it mentions.
+        let mut agents = match &to {
             Destination::Topic(topic) => self
                 .chat
                 .host_chat(host)
                 .and_then(|chat| chat.topics.get(topic))
-                .map(|topic| topic.agents_in_order())
+                .map(|topic| topic.members_in_order())
                 .unwrap_or_default(),
-            Destination::NewTopic { agents, .. } => agents.clone(),
-            // Only carried from `main`'s outbox, never written here.
-            Destination::AfterStart(_) => Vec::new(),
+            Destination::NewTopic { .. } | Destination::AfterStart(_) => Vec::new(),
         };
+        for agent in &mentions {
+            if !agents.contains(agent) {
+                agents.push(*agent);
+            }
+        }
         for agent_id in &agents {
             rho_journal::record(rho_journal::Event::AgentMessageSent {
                 agent: agent_id.encoded(),
@@ -2700,7 +2756,7 @@ impl Workspace {
             }),
             Destination::NewTopic { .. } | Destination::AfterStart(_) => None,
         };
-        let id = self.outbox.push(machine_seed, to, content);
+        let id = self.outbox.push(machine_seed, to, mentions, content);
         self.refresh_topics(topic, cx);
         self.send_unsent(host, window, cx);
         // Engagement bump: keeps display-time staleness correct between
@@ -2748,6 +2804,28 @@ impl Workspace {
                     };
                     let delivered = this.outbox.delivered(machine_seed, topic.topic);
                     this.refresh_topics([topic], cx);
+                    // An agent the topic starts starts from its first
+                    // message.
+                    if let Some((id, _)) = delivered
+                        && let Some(agent) = this.agents_for_topics.remove(&id)
+                    {
+                        let request = AgentRequest {
+                            host: agent.host,
+                            topic,
+                            from_draft: false,
+                        };
+                        let origin = rho_agent_types::MessageId(rho_agent_types::ChatSeq(
+                            topic.topic.0.0 + 1,
+                        ));
+                        this.create_agent(
+                            request,
+                            &agent.start,
+                            &agent.runtime,
+                            origin,
+                            window,
+                            cx,
+                        );
+                    }
                     // A topic the user started is where they go next.
                     if let Some((id, _)) = delivered
                         && this.new_topic_post == Some(id)
@@ -2770,30 +2848,89 @@ impl Workspace {
         .detach();
     }
 
-    /// Starts a topic with `agent_id` in its host's default stream, with what
-    /// the user wrote as its first message, and opens it once the host
-    /// takes it.
+    /// Starts a topic in the stream the user named, with what they wrote
+    /// as its first message, and opens it once the host takes it. A stream
+    /// the host does not have yet is created first. With an agent to
+    /// start, the agent starts from that first message once it is posted.
     fn start_topic(
         &mut self,
-        agent_id: AgentId,
-        content: Vec<ContentPart>,
+        start: TopicStart,
+        stream: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = self.host_of(agent_id) else {
+        let host = start.host;
+        if let Some(stream) = self
+            .chat
+            .host_chat(host)
+            .and_then(|chat| chat.stream_named(stream))
+        {
+            self.post_new_topic(start, stream, window, cx);
+            return;
+        }
+        // Making a stream is asked of the host directly: it answers with
+        // the stream's id, which the topic's first message needs.
+        let Some(agents) = self.agents(host).filter(|_| self.hosts.is_online(host)) else {
+            self.refuse_draft(
+                &format!(
+                    "{} is not connected: stream `{stream}` cannot be made",
+                    self.hosts.host_label(host)
+                ),
+                cx,
+            );
             return;
         };
+        let reply = agents.call(rho_agents_client::protocol::worksets::CreateStream {
+            name: stream.to_owned(),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = reply.await;
+            this.update_in(cx, |this, window, cx| match reply {
+                Ok(stream) => this.post_new_topic(start, stream, window, cx),
+                Err(error) => {
+                    let source = this.error_source(host);
+                    this.refuse_draft(&format!("[{source} error: {error:#}]"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Puts a new topic's first message in the outbox; the draft that
+    /// wrote it is done.
+    fn post_new_topic(
+        &mut self,
+        start: TopicStart,
+        stream: rho_agent_types::StreamId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let TopicStart {
+            host,
+            mentions,
+            content,
+            agent,
+        } = start;
         let name = rho_agents_client::chat::default_topic_name(
             &rho_agent_types::transcript::text_content(&content),
         );
-        let to = Destination::NewTopic {
-            stream: rho_agent_types::StreamId::DEFAULT,
-            name,
-            agents: vec![agent_id],
+        let to = Destination::NewTopic { stream, name };
+        let Some(id) = self.handle_submit(host, to, mentions, content, window, cx) else {
+            return;
         };
-        if let Some(id) = self.handle_submit(host, to, content, window, cx) {
-            self.new_topic_post = Some(id);
+        self.new_topic_post = Some(id);
+        if let Some((start, runtime)) = agent {
+            self.agents_for_topics.insert(
+                id,
+                AgentForTopic {
+                    host,
+                    start,
+                    runtime,
+                },
+            );
         }
+        self.reset_draft(window, cx);
     }
 
     /// Keeps what the user is writing in a topic. Every edit goes to the
@@ -2836,27 +2973,112 @@ impl Workspace {
         });
     }
 
-    /// Submitting the compose surface creates the agent: the workdir field
-    /// picks the working directory, the topic is whatever the draft
-    /// inherited. The buffers are not cleared here — they survive until the
-    /// agent host confirms creation.
+    /// Submits the draft by its shape: a new topic, with an agent started
+    /// from its first message or mentioning one already there, or an agent
+    /// started from a message already written. What was written stays in
+    /// the draft until it is in the outbox or the agent is made, so a
+    /// refusal (a bad working directory, say) never loses it.
     fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Whatever refused the last submission is answered by this one.
+        self.draft_model
+            .update(cx, |draft, cx| draft.set_refusal(None, cx));
+        match self.draft_for {
+            DraftFor::Origin(topic, message) => {
+                self.submit_origin_draft(topic, message, window, cx)
+            }
+            DraftFor::NewTopic | DraftFor::Mention(_) => self.submit_topic_draft(window, cx),
+        }
+    }
+
+    fn submit_topic_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(content) = self.draft_model.read(cx).content(cx) else {
-            // Enter in the workdir field with nothing to send: jump to the
-            // body instead of submitting.
+            // Enter in a field with nothing to send: jump to the body
+            // instead of submitting.
             if let Some(editor) = self.focused_draft_editor() {
                 self.draft_model
                     .update(cx, |view, cx| view.focus_body(&editor, window, cx));
             }
             return;
         };
-        // Whatever refused the last submission is answered by this one.
-        self.draft_model
-            .update(cx, |draft, cx| draft.set_refusal(None, cx));
         if !self.connected() {
             self.refuse_draft("not connected to an agent host", cx);
             return;
         }
+        let stream = self.draft_model.read(cx).stream_text(cx).trim().to_owned();
+        if stream.is_empty() {
+            self.refuse_draft("a topic goes in a stream: name one in the Stream field", cx);
+            return;
+        }
+        let (host, agent, mut mentions) = match self.draft_for {
+            DraftFor::Mention(agent_id) => {
+                let Some(host) = self.host_of(agent_id) else {
+                    self.refuse_draft("the agent's host is not known", cx);
+                    return;
+                };
+                (host, None, vec![agent_id])
+            }
+            _ => {
+                let Some((host, start, runtime)) = self.draft_agent(cx) else {
+                    return;
+                };
+                // `n a` chose an area, and that is where the agent is
+                // filed; an ordinary draft has none and starts at the root.
+                self.pending_agent_filing = self.draft_area.take().map(|area| (host, area));
+                (host, Some((start, runtime)), Vec::new())
+            }
+        };
+        for agent_id in self.mentions_in(host, &content) {
+            if !mentions.contains(&agent_id) {
+                mentions.push(agent_id);
+            }
+        }
+        let start = TopicStart {
+            host,
+            mentions,
+            content,
+            agent,
+        };
+        self.start_topic(start, &stream, window, cx);
+    }
+
+    /// Starts an agent from a message already in a topic.
+    fn submit_origin_draft(
+        &mut self,
+        topic: HostTopic,
+        message: rho_agent_types::MessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.connected() {
+            self.refuse_draft("not connected to an agent host", cx);
+            return;
+        }
+        let Some((host, start, runtime)) = self.draft_agent(cx) else {
+            return;
+        };
+        // The origin names a message in the host's own chat.
+        if self.chat.conversation_host(topic) != Some(host) {
+            self.refuse_draft(
+                "the message is on another host: start the agent where it was written",
+                cx,
+            );
+            return;
+        }
+        self.pending_agent_filing = self.draft_area.take().map(|area| (host, area));
+        let request = AgentRequest {
+            host,
+            topic,
+            from_draft: true,
+        };
+        self.create_agent(request, &start, &runtime, message, window, cx);
+    }
+
+    /// The agent the draft's rows describe: its host, where it starts and
+    /// what it runs on, or `None` with the reason on the draft.
+    fn draft_agent(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, rho_agents_client::create::Start, Runtime)> {
         let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
@@ -2866,7 +3088,7 @@ impl Workspace {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
-                    return;
+                    return None;
                 }
             }
         };
@@ -2885,28 +3107,34 @@ impl Workspace {
                 Ok(start) => start,
                 Err(message) => {
                     self.refuse_draft(&message, cx);
-                    return;
+                    return None;
                 }
             }
         };
-        let runtime = match Runtime::parse(self.draft_model.read(cx).runtime_text(cx).trim()) {
-            Ok(runtime) => runtime,
+        match Runtime::parse(self.draft_model.read(cx).runtime_text(cx).trim()) {
+            Ok(runtime) => Some((host, start, runtime)),
             Err(message) => {
                 self.refuse_draft(&message, cx);
-                return;
+                None
             }
-        };
-        self.awaiting_draft_agent = Some((host, content));
-        // `n a` chose an area, and that is where the agent is filed; an
-        // ordinary draft has none and starts at the root.
-        self.pending_agent_filing = self.draft_area.take().map(|area| (host, area));
-        let Some(agents) = self.agents(host) else {
+        }
+    }
+
+    /// Asks the host for an agent that starts from `origin`. The host
+    /// answers with how the code ran and the first agent it made.
+    fn create_agent(
+        &mut self,
+        request: AgentRequest,
+        start: &rho_agents_client::create::Start,
+        runtime: &Runtime,
+        origin: rho_agent_types::MessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agents) = self.agents(request.host) else {
             return;
         };
-        // Either way the host answers with how the code ran and the first
-        // agent it made: the agent the draft became, whose topic the
-        // message starts.
-        let reply = match start.creation(&runtime) {
+        let reply = match start.creation(runtime, Some(origin)) {
             Creation::Workset(create) => {
                 let reply = agents.call(create);
                 async move { reply.await.map(|created| created.result) }.boxed_local()
@@ -2923,48 +3151,44 @@ impl Workspace {
                     .ok_or_else(|| anyhow::anyhow!("the creation code made no agent"))
             });
             this.update_in(cx, |this, window, cx| {
-                this.draft_answered(host, reply, window, cx)
+                this.agent_answered(request, reply, window, cx)
             })
             .ok();
         })
         .detach();
     }
 
-    /// The host's answer to the draft's submission: the agent it became,
-    /// filed and followed, or why there is none.
-    fn draft_answered(
+    /// The host's answer to a request for an agent: the agent, filed and
+    /// opened in the topic it started from, or why there is none.
+    fn agent_answered(
         &mut self,
-        host: HostId,
+        request: AgentRequest,
         reply: anyhow::Result<AgentId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let host = request.host;
         // The answer and the directory come on separate streams: an agent
         // the directory has not shown yet is opened when it does.
         if let Ok(agent_id) = &reply
             && self.registry.agent_workset(*agent_id).is_none()
         {
-            self.draft_became = Some((host, *agent_id));
+            self.draft_became = Some((request, *agent_id));
             return;
         }
-        let message = self
-            .awaiting_draft_agent
-            .take_if(|(awaited, _)| *awaited == host)
-            .map(|(_, message)| message);
-        let awaited = message.is_some();
         let filing = self
             .pending_agent_filing
             .take_if(|(filing_host, _)| *filing_host == host);
         let agent_id = match reply {
             Ok(agent_id) => agent_id,
-            // A failed creation keeps the draft buffers; the user fixes the
-            // workdir and submits again. The agent host's whole cause is what
-            // the draft shows, so the reason a creation refused is readable
-            // for longer than an echo.
+            // The agent host's whole cause is what the draft shows, so the
+            // reason a creation refused is readable for longer than an
+            // echo. An agent asked for after its topic was posted has no
+            // draft left to show it on.
             Err(error) => {
                 let source = self.error_source(host);
                 let text = format!("[{source} error: {error:#}]");
-                if awaited {
+                if request.from_draft {
                     self.refuse_draft(&text, cx);
                 } else {
                     self.notice_on(None, &text, StyleClass::SystemImportant, cx);
@@ -2977,28 +3201,72 @@ impl Workspace {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
             self.write_marks(writes, cx);
         }
-        if let Some(message) = message {
-            self.activate_agent(agent_id);
-            // The draft became this agent: reset the compose surface and
-            // follow the new agent.
-            let label = self.draft_default_label();
-            self.draft_host = None;
-            self.refresh_draft_host(cx);
-            self.draft_model.update(cx, |view, cx| {
-                view.set_body_text("", cx);
-                view.clear_attachments(cx);
-                view.set_workdir_text(&label, cx);
-                view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
-                view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-            });
-            // The draft's message starts the agent's first topic, which is
-            // where the user goes; until its host takes it, the agent's
-            // activity.
-            self.select_agent(Some(agent_id), window, cx);
-            self.start_topic(agent_id, message, window, cx);
+        self.activate_agent(agent_id);
+        if request.from_draft {
+            self.reset_draft(window, cx);
+        }
+        // The agent works from its topic, which is where the user goes.
+        match self.chat.conversation_host(request.topic) {
+            Some(_) => self.open_topic(request.topic, window, cx),
+            None => self.select_agent(Some(agent_id), window, cx),
         }
         self.invalidate_dealer_signals(cx);
         cx.notify();
+    }
+
+    /// The draft back to a new topic with nothing written, its rows at
+    /// their defaults. The stream stays: it is the one the user used last.
+    fn reset_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_for = DraftFor::NewTopic;
+        let label = self.draft_default_label();
+        self.draft_host = None;
+        self.refresh_draft_host(cx);
+        self.draft_model.update(cx, |view, cx| {
+            view.set_shape(DraftShape::NewTopic, window, cx);
+            view.set_body_text("", cx);
+            view.clear_attachments(cx);
+            view.set_workdir_text(&label, cx);
+            view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
+            view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+        });
+    }
+
+    /// Gives the draft page a purpose and the rows it needs for it. A new
+    /// topic's stream starts as the one the user is in, else the one they
+    /// wrote in last.
+    fn shape_draft(&mut self, draft_for: DraftFor, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_for = draft_for;
+        let shape = match draft_for {
+            DraftFor::NewTopic => DraftShape::NewTopic,
+            DraftFor::Mention(agent_id) => DraftShape::Mention {
+                to: self.registry.agent_display_label(agent_id),
+            },
+            DraftFor::Origin(..) => DraftShape::Origin,
+        };
+        let stream = self.default_stream();
+        self.draft_model.update(cx, |view, cx| {
+            view.set_shape(shape, window, cx);
+            if let Some(stream) = stream {
+                view.set_stream_text(&stream, cx);
+            }
+        });
+    }
+
+    /// The stream a new topic goes in unless the user names another: the
+    /// stream of the topic in view, else of the topic the user wrote in
+    /// last.
+    fn default_stream(&self) -> Option<String> {
+        if let SurfaceKey::Topic(topic) = self.active_surface().key
+            && let Some(stream) = self.chat.stream_name(topic)
+        {
+            return Some(stream.to_owned());
+        }
+        self.chat
+            .topics()
+            .filter_map(|(topic, _, held)| Some((held.user_wrote?.1, topic)))
+            .max_by_key(|(wrote, _)| *wrote)
+            .and_then(|(_, topic)| self.chat.stream_name(topic))
+            .map(str::to_owned)
     }
 
     fn paste_prompt(&mut self, _: &PastePrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -4198,23 +4466,35 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens one topic, in the context of the agent whose screen it is
-    /// read on.
+    /// Opens one topic or direct conversation, in the context of the
+    /// agent the agent commands act on there.
     pub(crate) fn open_topic(
         &mut self,
         topic: HostTopic,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.topic_agent(topic) else {
-            return;
-        };
-        self.selection.select_agent(agent_id);
-        self.active_context = self.context_for_agent(agent_id);
+        if let Some(agent_id) = self.conversation_agent(topic) {
+            self.selection.select_agent(agent_id);
+            self.active_context = self.context_for_agent(agent_id);
+        }
         let surface = self.make_surface(SurfaceKey::Topic(topic), window, cx);
         self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
+    }
+
+    /// The agent the agent commands (`space a`) act on in a topic or a
+    /// direct conversation: the member who joined first. A topic only the
+    /// user is in has none.
+    fn conversation_agent(&self, conversation: HostTopic) -> Option<AgentId> {
+        match self.chat.topic(conversation) {
+            Some((_, topic)) => topic.members_in_order().first().copied(),
+            None => self
+                .chat
+                .direct(conversation)
+                .map(|(_, direct)| direct.members[0]),
+        }
     }
 
     /// The topic an agent is in that moved last.
@@ -4222,8 +4502,17 @@ impl Workspace {
         self.chat.newest_topic_of(self.host_of(agent_id)?, agent_id)
     }
 
-    /// A topic's title: its stream and its name.
+    /// A conversation's title: a topic's stream and name, or the two
+    /// agents of a direct one.
     fn topic_title(&self, topic: HostTopic) -> String {
+        if let Some((_, direct)) = self.chat.direct(topic) {
+            let [one, other] = direct.members;
+            return format!(
+                "{} ↔ {}",
+                self.registry.agent_display_label(one),
+                self.registry.agent_display_label(other)
+            );
+        }
         let Some((_, held)) = self.chat.topic(topic) else {
             return String::new();
         };
@@ -4233,6 +4522,21 @@ impl Workspace {
         }
     }
 
+    /// Who a topic delivers to, in the order they joined: `with @a @b`,
+    /// or that nobody has joined.
+    fn topic_members(&self, topic: HostTopic) -> Option<String> {
+        let (_, held) = self.chat.topic(topic)?;
+        let members = held.members_in_order();
+        if members.is_empty() {
+            return Some("no members".to_owned());
+        }
+        let names = members
+            .into_iter()
+            .map(|agent| format!("@{}", self.registry.agent_display_label(agent)))
+            .collect::<Vec<_>>();
+        Some(format!("with {}", names.join(" ")))
+    }
+
     /// Where opening an agent lands: the newest topic it is in, or its
     /// activity when there is none.
     fn agent_surface_key(&self, agent_id: AgentId) -> SurfaceKey {
@@ -4240,36 +4544,195 @@ impl Workspace {
             .map_or(SurfaceKey::Activity(agent_id), SurfaceKey::Topic)
     }
 
-    /// Asks for the first words of a new topic with the selected agent,
-    /// and opens the topic once its host takes them.
+    /// `space a m`: a new topic for the selected agent, written in the
+    /// draft page. Its first message mentions the agent, which reaches it
+    /// without making it a member.
     pub(crate) fn prompt_new_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.selection.selected_agent() else {
             self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
             return;
         };
-        let label = self.registry.agent_display_label(agent_id);
+        self.shape_draft(DraftFor::Mention(agent_id), window, cx);
+        self.select_agent_inner(None, true, window, cx);
+        self.enter_insert_when_shown(window, cx);
+    }
+
+    /// `space a s`: an agent started from the message at point in the
+    /// conversation in view. The draft page asks where it works and what
+    /// it runs on.
+    pub(crate) fn start_agent_from_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((topic, message)) = self.message_at_point(cx) else {
+            self.notice_on(
+                None,
+                "start agent: put the point on a message in a conversation",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.shape_draft(DraftFor::Origin(topic, message), window, cx);
+        self.select_agent_inner(None, true, window, cx);
+        self.seed_draft(true, window, cx);
+    }
+
+    /// The message the point is on in the conversation in view.
+    fn message_at_point(&self, cx: &App) -> Option<(HostTopic, rho_agent_types::MessageId)> {
+        let surface = self.active_surface();
+        let (SurfaceKey::Topic(topic), SurfaceView::Transcript { model, editor }) =
+            (&surface.key, &surface.view)
+        else {
+            return None;
+        };
+        let point = model.read(cx).store_point(editor, cx)?;
+        let state = self.transcripts.topic(*topic)?;
+        match state.blocks.get(point.block)?.as_ref() {
+            rho_agents_client::state::UiBlock::ChatMessage { id, .. } => Some((*topic, *id)),
+            _ => None,
+        }
+    }
+
+    /// `space a n`: puts `@agent` in the reply of the topic in view, from
+    /// the agents on its host. The message mentions whom it names.
+    pub(crate) fn prompt_mention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let surface = self.active_surface().clone();
+        let (SurfaceKey::Topic(topic), SurfaceView::Transcript { model, .. }) =
+            (surface.key, surface.view)
+        else {
+            self.notice_on(
+                None,
+                "mention: no topic in view",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let Some((host, _)) = self.chat.topic(topic) else {
+            self.notice_on(
+                None,
+                "mention: no topic in view",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let complete = std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &App| {
+            let input = input.trim().trim_start_matches('@').to_lowercase();
+            let mut agents = workspace
+                .registry
+                .known_agents()
+                .copied()
+                .filter(|agent| workspace.host_of(*agent) == Some(host))
+                .map(|agent| {
+                    (
+                        workspace.registry.agent_id_label(agent),
+                        workspace.registry.agent_display_label(agent),
+                    )
+                })
+                .filter(|(_, name)| name.to_lowercase().contains(&input))
+                .collect::<Vec<_>>();
+            agents.sort();
+            agents
+                .into_iter()
+                .map(|(label, name)| crate::minibuffer::Candidate {
+                    value: label,
+                    description: name,
+                })
+                .collect()
+        });
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
-                  text: String,
+                  input: String,
                   window: &mut Window,
                   cx: &mut Context<Workspace>| {
-                let text = text.trim();
-                if text.is_empty() {
+                let label = input.trim().trim_start_matches('@');
+                let Some(agent) = workspace
+                    .registry
+                    .agent_by_label(label)
+                    .filter(|agent| workspace.host_of(*agent) == Some(host))
+                else {
+                    workspace.notice_on(
+                        None,
+                        &format!("no agent `{label}` on this host"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                     return;
-                }
-                let content = vec![ContentPart::Text {
-                    text: text.to_owned(),
-                }];
-                workspace.start_topic(agent_id, content, window, cx);
+                };
+                let mention = format!("@{}", workspace.registry.agent_id_label(agent));
+                model.update(cx, |model, cx| {
+                    let text = model.prompt_text(cx);
+                    let text = match text.chars().last() {
+                        None => format!("{mention} "),
+                        Some(last) if last.is_whitespace() => format!("{text}{mention} "),
+                        Some(_) => format!("{text} {mention} "),
+                    };
+                    model.set_prompt_text(&text, cx);
+                });
+                workspace.focus_active_surface(window, cx);
             },
         );
-        self.open_prompt(
-            format!("new topic with {label}:"),
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
-            window,
-            cx,
+        self.open_prompt("mention:", complete, on_submit, window, cx);
+    }
+
+    /// `space a d`: the conversations agents have with each other, newest
+    /// first. They are read here, not dealt.
+    pub(crate) fn prompt_directs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut directs = self
+            .chat
+            .directs()
+            .map(|(direct, _, held)| (held.newest, direct))
+            .collect::<Vec<_>>();
+        if directs.is_empty() {
+            self.notice_on(
+                None,
+                "no direct conversations between agents",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        directs.sort_by(|one, other| other.cmp(one));
+        let titled = directs
+            .into_iter()
+            .map(|(_, direct)| (self.topic_title(direct), direct))
+            .collect::<Vec<_>>();
+        let titles = titled.clone();
+        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &App| {
+            let input = input.trim().to_lowercase();
+            titles
+                .iter()
+                .filter(|(title, _)| title.to_lowercase().contains(&input))
+                .map(|(title, _)| crate::minibuffer::Candidate {
+                    value: title.clone(),
+                    description: "direct".to_owned(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let input = input.trim().to_lowercase();
+                let chosen = titled
+                    .iter()
+                    .find(|(title, _)| title.to_lowercase() == input)
+                    .or_else(|| {
+                        titled
+                            .iter()
+                            .find(|(title, _)| title.to_lowercase().contains(&input))
+                    });
+                if let Some((_, direct)) = chosen {
+                    workspace.open_topic(*direct, window, cx);
+                }
+            },
         );
+        self.open_prompt("direct:", complete, on_submit, window, cx);
+        if let Some(minibuffer) = &mut self.minibuffer {
+            // A title has spaces in it, so completion replaces the whole
+            // input rather than the last word.
+            minibuffer.set_complete_whole_input();
+        }
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -5625,7 +6088,8 @@ impl Workspace {
             .chat
             .host_chat(host)
             .and_then(|chat| chat.topics.keys().next_back())
-            .map_or(2, |topic| topic.0.0 + 1);
+            .map_or(2, |topic| topic.0.0 + 2);
+        let topic = rho_agent_types::TopicId(rho_agent_types::ChatSeq(seq));
         let mut moved = rho_agents_client::HostChat::default();
         for (seq, event) in [
             (
@@ -5635,10 +6099,16 @@ impl Workspace {
             (
                 seq,
                 rho_agent_types::ChatEvent::TopicStarted {
-                    stream: rho_agent_types::StreamId::DEFAULT,
+                    stream: rho_agent_types::StreamId(rho_agent_types::ChatSeq(1)),
                     name: self.registry.agent_display_label(agent_id),
                     by: rho_agent_types::Address::User,
-                    agents: vec![agent_id],
+                },
+            ),
+            (
+                seq + 1,
+                rho_agent_types::ChatEvent::Joined {
+                    topic,
+                    agent: agent_id,
                 },
             ),
         ] {
@@ -5650,10 +6120,7 @@ impl Workspace {
         }
         self.chat.merge(host, moved);
         self.chat
-            .host_topic(
-                host,
-                rho_agent_types::TopicId(rho_agent_types::ChatSeq(seq)),
-            )
+            .host_topic(host, topic)
             .expect("the topic was just started")
     }
 
@@ -5807,7 +6274,7 @@ impl Workspace {
     /// focus from it.
     pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = match &self.active_surface().key {
-            SurfaceKey::Topic(topic) => self.topic_agent(*topic),
+            SurfaceKey::Topic(topic) => self.conversation_agent(*topic),
             SurfaceKey::Activity(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
@@ -5935,7 +6402,7 @@ impl Workspace {
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         let selected = match self.active_surface().key.clone() {
             SurfaceKey::Topic(topic) => {
-                let agent_id = self.topic_agent(topic);
+                let agent_id = self.conversation_agent(topic);
                 if let Some(agent_id) = agent_id {
                     self.selection.select_agent(agent_id);
                 }
@@ -6497,6 +6964,9 @@ impl Workspace {
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
             Command::AgentActivity => self.open_activity(window, cx),
             Command::NewTopic => self.prompt_new_topic(window, cx),
+            Command::StartFromMessage => self.start_agent_from_message(window, cx),
+            Command::Mention => self.prompt_mention(window, cx),
+            Command::Directs => self.prompt_directs(window, cx),
             Command::PullCard => self.pull_card(window, cx),
             Command::CloseAndDeal => self.cmd_close_and_deal(window, cx),
             Command::OpenFile => self.prompt_open_file(window, cx),
@@ -6709,7 +7179,7 @@ impl Workspace {
             return;
         };
         let target = match &self.active_surface().key {
-            SurfaceKey::Topic(topic) if self.topic_agent(*topic) == Some(agent) => {
+            SurfaceKey::Topic(topic) if self.conversation_agent(*topic) == Some(agent) => {
                 self.topics.get(topic).cloned()
             }
             _ => None,
@@ -6958,13 +7428,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let surface = match &card.node {
-            rho_dealer::NodeId::Topic(topic) if let Some(agent_id) = self.topic_agent(*topic) => {
+            rho_dealer::NodeId::Topic(topic) if self.chat.topic(*topic).is_some() => {
                 let topic = *topic;
-                rho_journal::record(rho_journal::Event::AgentOpened {
-                    agent_id: agent_id.into(),
-                });
-                self.selection.select_agent(agent_id);
-                self.active_context = self.context_for_agent(agent_id);
+                if let Some(agent_id) = self.conversation_agent(topic) {
+                    rho_journal::record(rho_journal::Event::AgentOpened {
+                        agent_id: agent_id.into(),
+                    });
+                    self.selection.select_agent(agent_id);
+                    self.active_context = self.context_for_agent(agent_id);
+                }
                 self.make_surface(SurfaceKey::Topic(topic), window, cx)
             }
             // A Slack card is a conversation: the deal view is the
@@ -7530,6 +8002,7 @@ impl Workspace {
             })
             .map(|url| self.project_label(camino::Utf8Path::new(&url)))
             .unwrap_or_default();
+        self.shape_draft(DraftFor::NewTopic, window, cx);
         self.select_agent_inner(None, true, window, cx);
         self.draft_area = area;
         self.refresh_draft_host(cx);
@@ -8170,7 +8643,7 @@ impl Workspace {
                 };
                 let away = !matches!(
                     self.active_surface().key,
-                    SurfaceKey::Topic(viewed) if self.topic_agent(viewed) == Some(agent)
+                    SurfaceKey::Topic(viewed) if self.conversation_agent(viewed) == Some(agent)
                 );
                 div()
                     .flex()
@@ -8274,8 +8747,12 @@ impl Workspace {
         }
         let path = {
             match &self.active_surface().key {
-                // A topic is titled by where it is and what it is called.
-                SurfaceKey::Topic(topic) => self.topic_title(*topic),
+                // A topic is titled by where it is and what it is called,
+                // and says who is in it.
+                SurfaceKey::Topic(topic) => match self.topic_members(*topic) {
+                    Some(members) => format!("{} · {members}", self.topic_title(*topic)),
+                    None => self.topic_title(*topic),
+                },
                 SurfaceKey::Activity(agent_id) => {
                     let leaf = self.registry.agent_display_label(*agent_id);
                     let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {

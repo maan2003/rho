@@ -1,5 +1,7 @@
-//! The draft compose model: pick a workdir, a model and a base, write the
-//! first message, then submit to create the agent.
+//! The draft compose model. Its shape says what it writes: a new topic
+//! (its stream, the agent that starts from its first message, and that
+//! message), a new topic for an agent already there, or an agent started
+//! from a message already in a topic.
 //!
 //! Entirely separate from [`crate::agent_view::AgentModel`] — there is no
 //! transcript here. The multibuffer composes the draft fields and message body.
@@ -30,6 +32,34 @@ const WORKDIR_LABEL_INLAY_ID: usize = 1;
 const RUNTIME_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
+const STREAM_LABEL_INLAY_ID: usize = 5;
+const MENTION_HINT_INLAY_ID: usize = 6;
+
+/// Which rows the draft has, by what submitting it makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DraftShape {
+    /// A topic in a stream, and an agent started from its first message.
+    NewTopic,
+    /// A topic in a stream whose first message mentions the agent named.
+    Mention { to: String },
+    /// An agent started from a message already written: the agent's rows
+    /// and no body.
+    Origin,
+}
+
+impl DraftShape {
+    fn has_stream(&self) -> bool {
+        !matches!(self, Self::Origin)
+    }
+
+    fn has_agent(&self) -> bool {
+        !matches!(self, Self::Mention { .. })
+    }
+
+    fn has_body(&self) -> bool {
+        !matches!(self, Self::Origin)
+    }
+}
 
 pub use rho_agents_client::create::{AUTO_BASE_REV, DEFAULT_START, StartFieldMode};
 pub use rho_agents_client::snippets::DEFAULT_RUNTIME;
@@ -72,10 +102,11 @@ impl Hooks {
     }
 }
 
-/// The three field buffers an editor is built over, named so the host can
-/// tell them apart when it installs completion.
+/// The field buffers an editor is built over, named so the host can tell
+/// them apart when it installs completion.
 #[derive(Clone, Copy)]
 pub struct Fields {
+    pub stream: gpui::EntityId,
     pub workdir: gpui::EntityId,
     pub runtime: gpui::EntityId,
     pub start: gpui::EntityId,
@@ -96,6 +127,8 @@ pub struct DraftGutter;
 pub struct DraftModel {
     hooks: Hooks,
     multi_buffer: Entity<MultiBuffer>,
+    shape: DraftShape,
+    stream_buffer: Entity<Buffer>,
     workdir_buffer: Entity<Buffer>,
     runtime_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
@@ -113,6 +146,7 @@ pub struct DraftModel {
     /// reader submits again.
     refusal: Option<String>,
     refusal_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
+    gap_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     suppress_draft_activation: bool,
     /// Editors currently displaying the draft, weakly held: surfaces own
     /// their editors; the model reconciles whoever is still alive.
@@ -122,31 +156,20 @@ pub struct DraftModel {
 
 impl DraftModel {
     pub fn new(hooks: Hooks, cx: &mut Context<Self>) -> Self {
+        let stream_buffer = cx.new(|cx| Buffer::local("", cx));
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
         let runtime_buffer = cx.new(|cx| Buffer::local(DEFAULT_RUNTIME, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            for (key, buffer) in [
-                (0, &workdir_buffer),
-                (1, &runtime_buffer),
-                (2, &start_buffer),
-                (3, &body_buffer),
-            ] {
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(key),
-                    buffer.clone(),
-                    [Point::zero()..buffer.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-            }
-            multi_buffer
-        });
+        let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
 
         let subscriptions = vec![
+            cx.subscribe(&stream_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
             cx.subscribe(&body_buffer, |this, _, event, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.note_draft_edit(cx);
@@ -171,9 +194,11 @@ impl DraftModel {
             }),
         ];
 
-        Self {
+        let draft = Self {
             hooks,
             multi_buffer,
+            shape: DraftShape::NewTopic,
+            stream_buffer,
             workdir_buffer,
             runtime_buffer,
             start_buffer,
@@ -186,10 +211,90 @@ impl DraftModel {
             attachment_blocks: Vec::new(),
             refusal: None,
             refusal_blocks: Vec::new(),
+            gap_blocks: Vec::new(),
             suppress_draft_activation: false,
             editors: Vec::new(),
             _subscriptions: subscriptions,
+        };
+        draft.lay_out(cx);
+        draft
+    }
+
+    /// The rows in order, each under its place in the multibuffer, and
+    /// whether this shape has it.
+    fn rows(&self) -> [(u64, &Entity<Buffer>, bool); 5] {
+        [
+            (0, &self.stream_buffer, self.shape.has_stream()),
+            (1, &self.workdir_buffer, self.shape.has_agent()),
+            (2, &self.runtime_buffer, self.shape.has_agent()),
+            (3, &self.start_buffer, self.shape.has_agent()),
+            (4, &self.body_buffer, self.shape.has_body()),
+        ]
+    }
+
+    /// The field rows this shape has, top to bottom.
+    fn fields(&self) -> Vec<Entity<Buffer>> {
+        self.rows()[..4]
+            .iter()
+            .filter(|(_, _, shown)| *shown)
+            .map(|(_, buffer, _)| (*buffer).clone())
+            .collect()
+    }
+
+    /// Puts the rows of the shape into the multibuffer and takes the rest
+    /// out.
+    fn lay_out(&self, cx: &mut Context<Self>) {
+        let rows = self
+            .rows()
+            .map(|(key, buffer, shown)| (key, buffer.clone(), shown));
+        self.multi_buffer.update(cx, |multi_buffer, cx| {
+            for (key, buffer, shown) in rows {
+                if shown {
+                    multi_buffer.set_excerpts_for_path(
+                        PathKey::sorted(key),
+                        buffer.clone(),
+                        [Point::zero()..buffer.read(cx).max_point()],
+                        0,
+                        cx,
+                    );
+                } else {
+                    multi_buffer.remove_excerpts(PathKey::sorted(key), cx);
+                }
+            }
+        });
+    }
+
+    pub fn shape(&self) -> &DraftShape {
+        &self.shape
+    }
+
+    /// Gives the draft another shape. The rows it shares with the last
+    /// keep what was written in them.
+    pub fn set_shape(&mut self, shape: DraftShape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shape == shape {
+            return;
         }
+        self.shape = shape;
+        self.lay_out(cx);
+        for editor in self.live_editors() {
+            self.dress(&editor, cx);
+            self.focus_body(&editor, window, cx);
+        }
+        self.refresh_gap_blocks(cx);
+        self.refresh_attachment_blocks(cx);
+        self.refresh_refusal_blocks(cx);
+        cx.notify();
+    }
+
+    /// The labels, hints and chrome of the rows an editor shows.
+    fn dress(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        self.insert_stream_label_to(editor, cx);
+        self.insert_workdir_label_to(editor, cx);
+        self.insert_runtime_label_to(editor, cx);
+        self.insert_start_label_to(editor, cx);
+        self.apply_start_target_hint_to(editor, cx);
+        self.pin_autoscroll_to(editor, cx);
+        self.apply_body_chrome_to(editor, cx);
     }
 
     /// Builds an editor over the shared multibuffer — own cursor and
@@ -197,13 +302,10 @@ impl DraftModel {
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let hooks = self.hooks.clone();
         let multi_buffer = self.multi_buffer.clone();
-        let buffers = [
-            &self.workdir_buffer,
-            &self.runtime_buffer,
-            &self.start_buffer,
-            &self.body_buffer,
-        ];
-        let buffer_ids = buffers.map(|buffer| buffer.read(cx).remote_id());
+        let buffer_ids = self
+            .rows()
+            .map(|(_, buffer, _)| buffer.read(cx).remote_id());
+        let stream_id = self.stream_buffer.entity_id();
         let workdir_id = self.workdir_buffer.entity_id();
         let runtime_id = self.runtime_buffer.entity_id();
         let start_id = self.start_buffer.entity_id();
@@ -226,6 +328,7 @@ impl DraftModel {
             (hooks.0)(
                 &mut editor,
                 Fields {
+                    stream: stream_id,
                     workdir: workdir_id,
                     runtime: runtime_id,
                     start: start_id,
@@ -237,13 +340,8 @@ impl DraftModel {
         });
 
         self.editors.push(editor.downgrade());
-        self.insert_workdir_label_to(&editor, cx);
-        self.insert_runtime_label_to(&editor, cx);
-        self.insert_start_label_to(&editor, cx);
-        self.apply_start_target_hint_to(&editor, cx);
-        self.insert_body_gap_to(&editor, cx);
-        self.pin_autoscroll_to(&editor, cx);
-        self.apply_body_chrome_to(&editor, cx);
+        self.dress(&editor, cx);
+        self.refresh_gap_blocks(cx);
         self.refresh_attachment_blocks(cx);
         self.refresh_refusal_blocks(cx);
         self.focus_body(&editor, window, cx);
@@ -257,6 +355,20 @@ impl DraftModel {
             .iter()
             .filter_map(|editor| editor.upgrade())
             .collect()
+    }
+
+    pub fn stream_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.stream_buffer.read(cx);
+        buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn set_stream_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
+        self.stream_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+        self.suppress_draft_activation = false;
     }
 
     pub fn workdir_text(&self, cx: &gpui::App) -> String {
@@ -353,9 +465,9 @@ impl DraftModel {
     /// Whether the cursor sits in one of the header rows rather than in the
     /// message body.
     pub fn cursor_in_a_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
-        self.cursor_in(&self.workdir_buffer, editor, cx)
-            || self.cursor_in(&self.runtime_buffer, editor, cx)
-            || self.cursor_in(&self.start_buffer, editor, cx)
+        self.fields()
+            .iter()
+            .any(|field| self.cursor_in(field, editor, cx))
     }
 
     pub fn cursor_in_start_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -456,43 +568,43 @@ impl DraftModel {
         }
     }
 
-    /// Tab: cycles workdir field → model field → start field → message body.
+    /// The field the cursor is in, by its place among the shape's fields.
+    fn field_at_cursor(&self, editor: &Entity<Editor>, cx: &gpui::App) -> Option<usize> {
+        self.fields()
+            .iter()
+            .position(|field| self.cursor_in(field, editor, cx))
+    }
+
+    /// Tab: walks the fields top to bottom, then the message body.
     pub fn toggle_field(
         &mut self,
         editor: &Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
-            Some(&self.runtime_buffer)
-        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
-            Some(&self.start_buffer)
-        } else if self.cursor_in(&self.start_buffer, editor, cx) {
-            None
-        } else {
-            Some(&self.workdir_buffer)
+        let fields = self.fields();
+        let target = match self.field_at_cursor(editor, cx) {
+            Some(at) => fields.get(at + 1).cloned(),
+            None => fields.first().cloned(),
         };
-        self.go_to_field(target.cloned(), editor, window, cx);
+        self.go_to_field(target, editor, window, cx);
     }
 
-    /// Shift-Tab: the same rows the other way round, body → start field
-    /// → model field → workdir field → body.
+    /// Shift-Tab: the same rows the other way round, body → last field
+    /// → … → first field → body.
     pub fn toggle_field_back(
         &mut self,
         editor: &Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
-            None
-        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
-            Some(&self.workdir_buffer)
-        } else if self.cursor_in(&self.start_buffer, editor, cx) {
-            Some(&self.runtime_buffer)
-        } else {
-            Some(&self.start_buffer)
+        let fields = self.fields();
+        let target = match self.field_at_cursor(editor, cx) {
+            Some(0) => None,
+            Some(at) => fields.get(at - 1).cloned(),
+            None => fields.last().cloned(),
         };
-        self.go_to_field(target.cloned(), editor, window, cx);
+        self.go_to_field(target, editor, window, cx);
     }
 
     /// Empties the header row the cursor is on and leaves the cursor in it,
@@ -503,15 +615,10 @@ impl DraftModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let field = if self.cursor_in(&self.workdir_buffer, editor, cx) {
-            self.workdir_buffer.clone()
-        } else if self.cursor_in(&self.runtime_buffer, editor, cx) {
-            self.runtime_buffer.clone()
-        } else if self.cursor_in(&self.start_buffer, editor, cx) {
-            self.start_buffer.clone()
-        } else {
+        let Some(at) = self.field_at_cursor(editor, cx) else {
             return false;
         };
+        let field = self.fields()[at].clone();
         self.suppress_draft_activation = true;
         field.update(cx, |buffer, cx| {
             let len = buffer.len();
@@ -545,13 +652,19 @@ impl DraftModel {
         self.select_range(editor, end..end, window, cx);
     }
 
-    /// Puts the viewport's cursor at the end of the message body.
+    /// Puts the viewport's cursor at the end of the message body, or of
+    /// the last field when the shape has no body.
     pub fn focus_body(
         &mut self,
         editor: &Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.shape.has_body() {
+            let last = self.fields().last().cloned();
+            self.go_to_field(last, editor, window, cx);
+            return;
+        }
         self.select_range(editor, self.body_end..self.body_end, window, cx);
     }
 
@@ -573,6 +686,40 @@ impl DraftModel {
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
                 selections.select_anchor_ranges([start..end]);
             });
+        });
+    }
+
+    /// `Stream: `, and after the field the agent a mention draft is to.
+    fn insert_stream_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let stream = self.stream_buffer.read(cx);
+        let (Some(field_start), Some(field_end)) = (
+            snapshot.anchor_in_excerpt(stream.anchor_before(0)),
+            snapshot.anchor_in_excerpt(stream.anchor_after(stream.len())),
+        ) else {
+            return;
+        };
+        let mut inlays = vec![Inlay::custom(
+            STREAM_LABEL_INLAY_ID,
+            field_start,
+            "Stream: ",
+        )];
+        if let DraftShape::Mention { to } = &self.shape {
+            inlays.push(Inlay::custom(
+                MENTION_HINT_INLAY_ID,
+                field_end,
+                format!("  to @{to}"),
+            ));
+        }
+        editor.update(cx, |editor, cx| {
+            editor.splice_inlays(
+                &[
+                    InlayId::Custom(STREAM_LABEL_INLAY_ID),
+                    InlayId::Custom(MENTION_HINT_INLAY_ID),
+                ],
+                inlays,
+                cx,
+            );
         });
     }
 
@@ -605,7 +752,7 @@ impl DraftModel {
         };
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(
-                &[],
+                &[InlayId::Custom(RUNTIME_LABEL_INLAY_ID)],
                 vec![Inlay::custom(
                     RUNTIME_LABEL_INLAY_ID,
                     field_start,
@@ -665,28 +812,49 @@ impl DraftModel {
         });
     }
 
-    /// A blank line's worth of breathing room between the workdir field and
-    /// the message body.
-    fn insert_body_gap_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let Some(body_start) =
-            snapshot.anchor_in_excerpt(self.body_buffer.read(cx).anchor_before(0))
+    /// A blank line's worth of breathing room between the fields and the
+    /// message body.
+    fn refresh_gap_blocks(&mut self, cx: &mut Context<Self>) {
+        for (editor, block_id) in self.gap_blocks.drain(..) {
+            if let Some(editor) = editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(
+                        std::iter::once(block_id).collect::<HashSet<_>>(),
+                        None,
+                        cx,
+                    );
+                });
+            }
+        }
+        if !self.shape.has_body() {
+            return;
+        }
+        let Some(body_start) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.body_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
-        editor.update(cx, |editor, cx| {
-            editor.insert_blocks(
-                [editor::display_map::BlockProperties {
-                    placement: editor::display_map::BlockPlacement::Above(body_start),
-                    height: Some(1),
-                    style: editor::display_map::BlockStyle::Fixed,
-                    render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
-                    priority: 0,
-                }],
-                None,
-                cx,
-            );
-        });
+        for editor in self.live_editors() {
+            let ids = editor.update(cx, |editor, cx| {
+                editor.insert_blocks(
+                    [editor::display_map::BlockProperties {
+                        placement: editor::display_map::BlockPlacement::Above(body_start),
+                        height: Some(1),
+                        style: editor::display_map::BlockStyle::Fixed,
+                        render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+                        priority: 0,
+                    }],
+                    None,
+                    cx,
+                )
+            });
+            if let Some(block_id) = ids.into_iter().next() {
+                self.gap_blocks.push((editor.downgrade(), block_id));
+            }
+        }
     }
 
     fn pin_autoscroll_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {

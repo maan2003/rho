@@ -198,7 +198,10 @@ impl World {
             stream: StreamId(ChatSeq(1)),
             name: name.into(),
             by: Address::User,
-            agents: vec![agent_id],
+        });
+        self.record(ChatEvent::Joined {
+            topic: TopicId(topic),
+            agent: agent_id,
         });
         let node = NodeId::Topic(HostTopic {
             machine_seed: 0,

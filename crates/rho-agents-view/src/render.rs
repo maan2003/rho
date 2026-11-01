@@ -465,6 +465,7 @@ pub fn render_block_with_agent_labels(
             from,
             mentions,
             text,
+            ..
         } => {
             if text.is_empty() {
                 return invisible(kind);
@@ -860,6 +861,7 @@ mod tests {
             text_of(
                 &render_block_with_agent_labels(
                     &UiBlock::ChatMessage {
+                        id: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
                         from,
                         mentions,
                         text: "words".into(),
