@@ -153,6 +153,14 @@ def start_topic(sender, stream, name, text, *, mentions=None):
         return _start(sender, stream, name, text, mentions or [])
 
 
+def resolve_agent(prefix):
+    with STATE.lock:
+        found = [id for id in [*STATE.agents, *STATE.elsewhere] if id.startswith(prefix)] if prefix else []
+    if len(found) != 1:
+        raise RuntimeError(f"no agent {prefix} on this host" if not found else f"{prefix} names {len(found)} agents; give more of its id")
+    return found[0]
+
+
 def direct(sender, other):
     with STATE.lock:
         assert sender in STATE.agents and sender != other

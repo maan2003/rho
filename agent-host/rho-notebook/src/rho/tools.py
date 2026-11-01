@@ -61,17 +61,20 @@ def advisor_runtime(asker: dict) -> dict:
 
 
 def resolve(handle: str) -> str:
-    """The agent id a handle names: "eng-<id>", "adv-<id>" or the bare id.
-    A prefix must match the agent's role."""
+    """The agent id a handle names: "eng-<id>", "adv-<id>" or the bare id,
+    where <id> may be any prefix of the id that names one agent of the
+    host. A role prefix must match the agent's role."""
     handle = handle.strip()
-    prefix, dash, raw = handle.partition("-")
-    if not (dash and prefix in ("eng", "adv")):
-        return handle
-    known = _rho.agents()
-    if raw in known and label(raw) != handle:
-        raise ValueError(f"{handle} names {label(raw)}, whose role prefix differs")
-    return raw
-
+    role, dash, raw = handle.partition("-")
+    if not (dash and role in ("eng", "adv")):
+        role, raw = None, handle
+    try:
+        agent = _rho.resolve_agent(raw)
+    except RuntimeError as error:
+        raise ValueError(str(error)) from None
+    if role is not None and agent in _rho.agents() and not label(agent).startswith(role + "-"):
+        raise ValueError(f"{handle} names {label(agent)}, whose role prefix differs")
+    return agent
 
 def _spawner_of(props: dict) -> str | None:
     return props.get("parent") or props.get("started_by")

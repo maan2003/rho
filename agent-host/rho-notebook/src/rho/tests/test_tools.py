@@ -223,11 +223,17 @@ class Tools(WorksetCase):
             chat.join(conversation)
         with self.assertRaisesRegex(ValueError, "yourself"):
             ns["agents"].message(agent_id=self.root, message="hi")
-        with self.assertRaisesRegex(ValueError, "does not exist"):
+        with self.assertRaisesRegex(ValueError, "no agent nobody on this host"):
             ns["agents"].message(agent_id="eng-nobody", message="hi")
-        self.state.elsewhere.add("far")
-        run(lambda: ns["agents"].message(agent_id="far", message="From another workset."))
-        self.assertEqual(self.state.topics[self.state.messages[-1]["topic"]]["agents"], sorted([self.root, "far"]))
+        # Any prefix that names one agent of the host will do, in any
+        # workset; one that names several is refused.
+        self.state.elsewhere.update({"farther1", "farthest"})
+        with self.assertRaisesRegex(ValueError, "names 2 agents"):
+            ns["agents"].message(agent_id="eng-farth", message="Which?")
+        printed, _ = run(lambda: ns["agents"].message(agent_id="eng-farthes", message="From another workset."))
+        self.assertEqual(printed, "Sent to farthest.\n")
+        self.assertEqual(self.state.topics[self.state.messages[-1]["topic"]]["agents"], sorted([self.root, "farthest"]))
+
         self.assertFalse(hasattr(chat, "direct"), "chat is the user's")
         # Join and read.
         printed, _ = run(lambda: cns["chat"].join(started))

@@ -183,6 +183,25 @@ impl AgentPool {
         self.process(workset).await
     }
 
+    /// The one agent of the host, in any workset, whose id starts with
+    /// `prefix`: agents name each other by a short prefix of the id.
+    fn resolve_agent(&self, prefix: &str) -> anyhow::Result<AgentId> {
+        anyhow::ensure!(!prefix.is_empty(), "no agent id given");
+        let found = self
+            .db
+            .read()
+            .agents()
+            .into_iter()
+            .map(|(agent, _)| agent)
+            .filter(|agent| agent.encoded().starts_with(prefix))
+            .collect::<Vec<_>>();
+        match found[..] {
+            [agent] => Ok(agent),
+            [] => anyhow::bail!("no agent {prefix} on this host"),
+            _ => anyhow::bail!("{prefix} names {} agents; give more of its id", found.len()),
+        }
+    }
+
     fn workset_of(&self, agent: AgentId) -> anyhow::Result<WorksetId> {
         Ok(self
             .db
@@ -649,7 +668,10 @@ impl AgentPool {
         let agents = self.agents.lock().await;
         for agent_id in agent_ids {
             if let Some(agent) = agents.get(&agent_id) {
-                statuses.put(agent_id, self.shown(agent_id, &agent.status_cell().borrow()));
+                statuses.put(
+                    agent_id,
+                    self.shown(agent_id, &agent.status_cell().borrow()),
+                );
             }
         }
     }
@@ -1302,8 +1324,13 @@ impl AgentPool {
                         name,
                     },
                 };
-                let topic =
-                    write.move_messages(UnixMs::now(), messages, to, Address::Agent(agent), None)?;
+                let topic = write.move_messages(
+                    UnixMs::now(),
+                    messages,
+                    to,
+                    Address::Agent(agent),
+                    None,
+                )?;
                 write.commit();
                 PyReply::Seq(topic.0)
             }
@@ -1351,6 +1378,7 @@ impl AgentPool {
                 PyReply::Done
             }
             PyRequest::Models => PyReply::Models(models()),
+            PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
         })
     }
 

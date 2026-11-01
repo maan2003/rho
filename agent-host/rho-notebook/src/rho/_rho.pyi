@@ -132,7 +132,11 @@ def start_topic(
     """Start a topic named `name` in the stream named `stream`, made if new,
     with `text` as its first message; returns `(topic, message)`."""
 def direct(sender: str, other: str) -> int:
-    """The direct conversation of two agents, started if new."""
+    """The direct conversation of two agents, started if new. They may be
+    in different worksets."""
+def resolve_agent(prefix: str) -> str:
+    """The id of the one agent of the host, in any workset, whose id starts
+    with `prefix`. Raises when none or several do."""
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""

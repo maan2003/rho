@@ -335,6 +335,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(change_topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
@@ -653,6 +654,15 @@ fn start_topic(
             [first] => Ok((first.topic.0.0, first.id.0.0)),
             _ => Err(unexpected()),
         },
+        _ => Err(unexpected()),
+    }
+}
+
+/// The one agent of the host whose id starts with `prefix`.
+#[pyfunction]
+fn resolve_agent(py: Python<'_>, prefix: &str) -> PyResult<String> {
+    match PyHost::block(py, PyRequest::ResolveAgent(prefix.to_owned()))? {
+        PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
         _ => Err(unexpected()),
     }
 }

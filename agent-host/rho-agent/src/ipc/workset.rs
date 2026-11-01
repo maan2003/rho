@@ -128,6 +128,8 @@ pub(crate) enum PyRequest {
         rev: String,
     },
     Models,
+    /// The one agent of the host whose id starts with this.
+    ResolveAgent(String),
 }
 
 /// Where a move from Python puts messages.
@@ -135,7 +137,10 @@ pub(crate) enum PyRequest {
 pub(crate) enum PyMoveTo {
     Topic(rho_agent_types::TopicId),
     /// A new topic in the stream of that name, created if there is none.
-    NewTopic { stream: String, name: String },
+    NewTopic {
+        stream: String,
+        name: String,
+    },
 }
 
 #[derive(Encode, Decode)]
