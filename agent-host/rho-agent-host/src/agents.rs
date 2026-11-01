@@ -459,7 +459,16 @@ async fn follow(
                         .collect();
                     befores.clear();
                 }
-                Some(Follow::Focus(agents)) => focus = agents,
+                Some(Follow::Focus(agents)) => {
+                    // The pool made them live before this ask was sent, but
+                    // a status it told then may have been taken while they
+                    // were not yet in focus, and one live through another
+                    // connection is not told again. Each newly focused agent
+                    // goes out now, on the next turn of this loop.
+                    let added = agents.difference(&focus).copied().collect::<Vec<_>>();
+                    services.pool.resend_statuses(&statuses, added).await;
+                    focus = agents;
+                }
             },
         }
     }

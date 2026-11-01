@@ -622,6 +622,22 @@ impl AgentPool {
         self.status_changed(agent_id, agent.status_cell());
     }
 
+    /// Puts the current status of each loaded agent named into one
+    /// connection's statuses again, so an agent it newly focuses shows its
+    /// response and draft at once rather than at its next change.
+    pub async fn resend_statuses(
+        &self,
+        statuses: &Statuses,
+        agent_ids: impl IntoIterator<Item = AgentId>,
+    ) {
+        let agents = self.agents.lock().await;
+        for agent_id in agent_ids {
+            if let Some(agent) = agents.get(&agent_id) {
+                statuses.put(agent_id, self.shown(agent_id, &agent.status_cell().borrow()));
+            }
+        }
+    }
+
     /// Every loaded agent's status now, and each status that changes from
     /// now on, for one GUI connection. Its statuses go when it drops them.
     pub async fn watch_statuses(&self) -> Arc<Statuses> {
