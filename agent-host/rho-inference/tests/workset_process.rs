@@ -211,7 +211,7 @@ async fn create(
     if let Some(text) = message {
         pool.start_user_topic(
             client_id(),
-            rho_agent_types::StreamId::DEFAULT,
+            pool.create_stream("test".to_owned()).await.unwrap(),
             "test".to_owned(),
             agents.clone(),
             vec![rho_agent_types::ContentPart::Text {
@@ -412,7 +412,7 @@ async fn streaming_crash() {
     );
     pool.start_user_topic(
         client_id(),
-        rho_agent_types::StreamId::DEFAULT,
+        pool.create_stream("test".to_owned()).await.unwrap(),
         "inspect".to_owned(),
         vec![id],
         vec![rho_agent_types::ContentPart::Text {
