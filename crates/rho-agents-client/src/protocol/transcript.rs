@@ -65,8 +65,16 @@ pub enum Live {
         response: Option<StreamingResponse>,
         /// Host-computed draft retained while the originating cell runs.
         #[senax(default)]
-        draft: Option<String>,
+        draft: Option<Draft>,
     },
+}
+
+/// A message an agent is still writing, as far as its code shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct Draft {
+    /// The topic its post names, when the code names it as a number.
+    pub topic: Option<rho_agent_types::TopicId>,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -40,7 +40,7 @@ pub struct AgentStatus {
     /// Tentative outgoing text, retained across provider completion until
     /// its originating cell sends or the cell is replaced.
     #[senax(default)]
-    pub draft: Option<String>,
+    pub draft: Option<rho_agents_client::protocol::transcript::Draft>,
     /// Inputs waiting to enter model context.
     pub queued: usize,
 }

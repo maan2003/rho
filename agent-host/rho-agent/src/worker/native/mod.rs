@@ -1270,7 +1270,7 @@ impl Agent {
         })
     }
 
-    fn draft(&self) -> Option<String> {
+    fn draft(&self) -> Option<rho_agents_client::protocol::transcript::Draft> {
         self.cell
             .as_ref()
             .filter(|latest| {

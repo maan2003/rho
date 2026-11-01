@@ -11,7 +11,7 @@ pub(crate) fn tool_preview(
     name: &str,
     arguments: &str,
     format: rho_agents_client::protocol::transcript::ArgumentsFormat,
-) -> Option<String> {
+) -> Option<rho_agents_client::protocol::transcript::Draft> {
     use rho_agents_client::protocol::transcript::ArgumentsFormat;
     let source = match (name, format) {
         ("exec", ArgumentsFormat::Text) => arguments.to_owned(),
@@ -32,7 +32,22 @@ pub(crate) fn tool_preview(
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .ok()?;
-    preview(&mut parser, &source)
+    let text = preview(&mut parser, &source)?;
+    Some(rho_agents_client::protocol::transcript::Draft {
+        topic: post_topic(&mut parser, &source),
+        text,
+    })
+}
+
+/// The topic the latest post names, when it names it as a number: where
+/// the draft will land.
+fn post_topic(parser: &mut Parser, source: &str) -> Option<rho_agent_types::TopicId> {
+    let tree = parser.parse(source, None)?;
+    let at = last_send(tree.root_node(), source)? + SEND.len();
+    let rest = source[at..].trim_start().strip_prefix('(')?;
+    let (topic, _) = rest.split_once(',')?;
+    let topic = topic.trim().parse().ok()?;
+    Some(rho_agent_types::TopicId(rho_agent_types::ChatSeq(topic)))
 }
 
 pub(crate) fn preview(parser: &mut Parser, source: &str) -> Option<String> {
@@ -507,6 +522,27 @@ mod tests {
                 "{source:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_draft_names_the_topic_its_post_names() {
+        use rho_agent_types::{ChatSeq, TopicId};
+        use rho_agents_client::protocol::transcript::ArgumentsFormat;
+        let draft = |source: &str| tool_preview("exec", source, ArgumentsFormat::Text);
+        let topic = |draft: Option<rho_agents_client::protocol::transcript::Draft>| {
+            draft.map(|draft| (draft.topic, draft.text))
+        };
+        assert_eq!(
+            topic(draft(
+                "chat.post(7, 'old', mention='user', kind='fyi')\nchat.post( 41 , 'Hel"
+            )),
+            Some((Some(TopicId(ChatSeq(41))), "Hel".to_owned()))
+        );
+        assert_eq!(
+            topic(draft("chat.post(topic, 'Hel")),
+            Some((None, "Hel".to_owned())),
+            "a topic named by a variable is not known"
+        );
     }
 
     #[test]

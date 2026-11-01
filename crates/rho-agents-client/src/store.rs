@@ -139,10 +139,10 @@ impl Layered {
                 }
                 Arc::new(block)
             }));
-        if let Some(text) = &self.tail.draft {
-            self.state
-                .blocks
-                .push(Arc::new(UiBlock::MessageDraft { text: text.clone() }));
+        if let Some(draft) = &self.tail.draft {
+            self.state.blocks.push(Arc::new(UiBlock::MessageDraft {
+                text: draft.text.clone(),
+            }));
         }
         self.state.status = match self.tail.runtime.as_ref() {
             Some(RuntimeState {
@@ -177,7 +177,7 @@ impl Layered {
 struct Tail {
     runtime: Option<RuntimeState>,
     response: Option<StreamingResponse>,
-    draft: Option<String>,
+    draft: Option<crate::protocol::transcript::Draft>,
 }
 
 impl Tail {
@@ -687,7 +687,10 @@ mod tests {
                     format: ArgumentsFormat::Text,
                 }],
             }),
-            draft: Some(draft.into()),
+            draft: Some(crate::protocol::transcript::Draft {
+                topic: None,
+                text: draft.into(),
+            }),
         };
         store.apply_live(agent(), live("human.send('Hel", "Hel"));
         assert_eq!(
@@ -725,7 +728,10 @@ mod tests {
                     format: ArgumentsFormat::Text,
                 }],
             }),
-            draft: draft.map(str::to_owned),
+            draft: draft.map(|text| crate::protocol::transcript::Draft {
+                topic: None,
+                text: text.to_owned(),
+            }),
         };
         store.apply_live(agent(), live(Some("human.send('Hel"), Some("Hel")));
         let text = |store: &AgentStore| {
