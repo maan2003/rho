@@ -400,7 +400,7 @@ impl Workspace {
                 }
             }
         }
-        found.sort_by(|one, other| (other.at, other.id).cmp(&(one.at, one.id)));
+        found.sort_by_key(|one| std::cmp::Reverse((one.at, one.id)));
         let found = std::rc::Rc::new(found);
         let rows = |found: &[Found], input: &str| {
             let words = input
@@ -520,7 +520,7 @@ impl Workspace {
             ));
         }
         let newest_first = |mut topics: Vec<(UnixMs, TopicRow)>| {
-            topics.sort_by(|one, other| (other.0, other.1.topic).cmp(&(one.0, one.1.topic)));
+            topics.sort_by_key(|(at, row)| std::cmp::Reverse((*at, row.topic)));
             topics.into_iter().map(|(_, row)| row).collect::<Vec<_>>()
         };
         let streams = streams
