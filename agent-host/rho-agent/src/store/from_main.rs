@@ -1305,7 +1305,7 @@ mod tests {
         );
 
         // The rewind to the second message hides it and what answered it;
-        // the inputs say what the model was shown, and name their mail.
+        // the inputs say what the model was shown, and name their messages.
         let visible = read.agent_rows(a, Wpos::ZERO);
         let inputs = visible
             .iter()

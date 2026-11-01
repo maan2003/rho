@@ -535,7 +535,7 @@ impl ClaudeLoop {
                             self.queued_turns.clear();
                             // An exit without a result leaves the turn open;
                             // settle it as an error so the turn end is
-                            // observable (attention, parent mail).
+                            // observable (attention, the parent's message).
                             let mid_turn =
                                 matches!(self.inference_state, InferenceState::Responding);
                             if mid_turn {
@@ -2596,7 +2596,7 @@ mod tests {
             row(3, notice(a, Notice::Archived)),
             row(4, input(a, "quiet", InputWake::Quiet)),
             row(5, notice(a, Notice::FreshNotebook)),
-            row(6, input(a, "mail", InputWake::Agent)),
+            row(6, input(a, "message", InputWake::Agent)),
         ];
         let (archived, unread) = recover(&rows);
         assert!(!archived, "a fresh notebook revives the agent");
@@ -2613,7 +2613,7 @@ mod tests {
                 Unread {
                     at: UnixMs(6),
                     content: vec![ContentPart::Text {
-                        text: "mail".into()
+                        text: "message".into()
                     }],
                     wake: InputWake::Agent,
                 },
@@ -2629,14 +2629,14 @@ mod tests {
     #[test]
     fn a_rewind_counts_only_peoples_inputs_and_finds_the_turn_that_carried_them() {
         let a = agent(1);
-        let (first, mail, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (first, message, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let rows = vec![
             row(1, input(a, "first", InputWake::Person)),
             row(2, sent(a)),
             row(3, echo(a, first)),
-            row(4, input(a, "mail", InputWake::Agent)),
+            row(4, input(a, "message", InputWake::Agent)),
             row(5, sent(a)),
-            row(6, echo(a, mail)),
+            row(6, echo(a, message)),
             row(7, input(a, "quiet", InputWake::Quiet)),
             row(8, input(a, "second", InputWake::Person)),
             row(9, sent(a)),

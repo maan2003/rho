@@ -62,7 +62,7 @@ enum DebugCommand {
         socket_path: Option<PathBuf>,
     },
     /// Permanently delete worksets: their logs, agents, Claude sessions and
-    /// directories. Mail stays. Runs through the host, which stops their
+    /// directories. Chat stays. Runs through the host, which stops their
     /// processes first. Use --socket-path to select a host, not --db-path.
     DeleteWorksets {
         /// Workset ids.

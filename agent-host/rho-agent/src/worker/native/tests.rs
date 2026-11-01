@@ -132,7 +132,7 @@ impl Harness {
     }
 
     /// What the model posted, oldest first, with how it mentions the user.
-    fn mail(&self) -> Vec<(String, Option<MentionKind>)> {
+    fn posted(&self) -> Vec<(String, Option<MentionKind>)> {
         self.db
             .read()
             .chat_since(ChatSeq::ZERO, usize::MAX)
@@ -149,7 +149,7 @@ impl Harness {
     }
 
     fn sent(&self) -> Vec<String> {
-        self.mail().into_iter().map(|(text, _)| text).collect()
+        self.posted().into_iter().map(|(text, _)| text).collect()
     }
 
     /// The visible log, once `done` holds of it.
@@ -168,7 +168,7 @@ impl Harness {
         }
     }
 
-    /// Until the model has mailed the user `text`.
+    /// Until the model has posted `text`.
     async fn until_sent(&self, text: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -178,7 +178,7 @@ impl Harness {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for the mail {text:?}: {sent:?} {:#?}",
+                "timed out waiting for the post {text:?}: {sent:?} {:#?}",
                 self.entries()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -295,7 +295,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     );
     harness.until_sent("reading").await;
     assert_eq!(
-        harness.mail(),
+        harness.posted(),
         [
             ("hello there".to_owned(), Some(MentionKind::Result)),
             ("reading".to_owned(), None),
@@ -640,7 +640,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
 }
 
 #[tokio::test]
-async fn a_send_outside_simplified_technical_english_raises_and_is_not_mailed() {
+async fn a_post_outside_simplified_technical_english_raises_and_is_not_posted() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script

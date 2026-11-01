@@ -257,7 +257,8 @@ mod tests {
             Decision::Later(Some(UnixMs(12_000)))
         );
         assert_eq!(decide(&soon, UnixMs(12_000)), Decision::Now(Wake::Message));
-        // Agent mail long after the response: at once, not 15 seconds on.
+        // An agent's message long after the response: at once, not 15 seconds
+        // on.
         assert_eq!(
             decide(
                 &Facts {

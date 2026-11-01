@@ -43,7 +43,8 @@ validated_string_type!(
 );
 
 /// Who authored a message entering an agent's context. Providers render both
-/// as user-role input; UIs render agent mail distinctly from user messages.
+/// as user-role input; UIs render agents' messages distinctly from user
+/// messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum MessageSender {
     User,

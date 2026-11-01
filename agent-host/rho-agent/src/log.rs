@@ -139,7 +139,8 @@ pub enum WakeTrigger {
     /// A failed request's own clock.
     Retry,
     User,
-    Mail,
+    /// A chat message from an agent.
+    AgentMessage,
     /// A cell's `notify()`.
     Notify,
     /// A job ended, or a cell returned with output.
@@ -195,7 +196,7 @@ pub enum InputKind {
 /// whole: the wire strips them.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum TranscriptLine {
-    /// The person spoke (an agent's mail reaches Claude the same way).
+    /// The person spoke (an agent's chat message reaches Claude the same way).
     User { text: String },
     /// The model spoke or called. One line per content block, so a text
     /// and the call after it are two rows. Usage rides on the first row

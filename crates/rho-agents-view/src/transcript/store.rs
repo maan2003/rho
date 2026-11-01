@@ -86,7 +86,7 @@ impl Transcripts {
     }
 
     /// Opens an agent's transcript from what the client has read of it:
-    /// its rows and mail, interleaved. An agent with nothing read yet opens
+    /// its rows and messages, interleaved. An agent with nothing read yet opens
     /// empty, so the rows that follow land in it. The live frame rides on
     /// its tail.
     ///
@@ -106,7 +106,7 @@ impl Transcripts {
     }
 
     /// An open transcript folded again from everything read of it, when
-    /// its log's past has been read: the rows came after mail newer than
+    /// its log's past has been read: the rows came after messages newer than
     /// them, so they are put in time order with it rather than appended.
     /// Answers the state to land as a [`TranscriptFrame::Fold`]; nothing
     /// for an agent not open.
@@ -118,10 +118,11 @@ impl Transcripts {
         Some(fold.state())
     }
 
-    /// Rows and mail of an agent whose transcript is open, folded into the
-    /// copy behind it. Positions and mail already held are skipped, so what
-    /// the reader's own open read already picked up costs nothing. Answers
-    /// with the rows the telling moved, and nothing when it moved none.
+    /// Rows and messages of an agent whose transcript is open, folded into
+    /// the copy behind it. Positions and messages already held are skipped, so
+    /// what the reader's own open read already picked up costs nothing.
+    /// Answers with the rows the telling moved, and nothing when it moved
+    /// none.
     pub fn refold(
         &mut self,
         agent_id: AgentId,
@@ -296,15 +297,15 @@ mod tests {
         assert!(transcripts.open_agents().is_empty());
     }
 
-    /// The log's past read after newer mail lands before it, in time
+    /// The log's past read after newer messages land before it, in time
     /// order, when the transcript is read again whole.
     #[test]
-    fn a_reread_puts_the_past_before_newer_mail() {
+    fn a_reread_puts_the_past_before_newer_messages() {
         let mut transcripts = Transcripts::default();
         let agent_id = agent();
         let first = turn(0, 0, "first", 1);
         let second = turn(1, 2, "second", 5);
-        // Opened with the mail on disk and none of the rows yet.
+        // Opened with the messages on disk and none of the rows yet.
         assert!(transcripts.seed(agent_id, &[first[0].clone(), second[0].clone()]));
         let all = rho_agents_client::fold::interleave(
             agent_id,

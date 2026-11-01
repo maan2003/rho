@@ -368,7 +368,7 @@ fn output(text: String, images: Vec<ImageContent>) -> ToolOutput {
 fn trigger(why: Wake) -> WakeTrigger {
     match why {
         Wake::Message => WakeTrigger::User,
-        Wake::AgentMessage => WakeTrigger::Mail,
+        Wake::AgentMessage => WakeTrigger::AgentMessage,
         Wake::Notify => WakeTrigger::Notify,
         Wake::Returned | Wake::Failure => WakeTrigger::Finished,
         Wake::Checkin => WakeTrigger::Checkin,
@@ -491,7 +491,7 @@ mod tests {
         assert!(!host.prose_correction());
         assert!(matches!(
             host.decide(true, None, Some(UnixMs(0)), false, false, UnixMs(100_000)),
-            Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
+            Boundary::Now { wake } if wake.trigger == WakeTrigger::AgentMessage
         ));
         host.shutdown().await.unwrap();
     }
@@ -525,7 +525,7 @@ mod tests {
         ));
         assert!(matches!(
             host.decide(true, None, Some(UnixMs(t0 + 2_000)), false, false, UnixMs(t0 + 1_000_000)),
-            Boundary::Now { wake } if wake.trigger == WakeTrigger::Mail
+            Boundary::Now { wake } if wake.trigger == WakeTrigger::AgentMessage
         ));
         // The next exec is a new turn.
         assert!(

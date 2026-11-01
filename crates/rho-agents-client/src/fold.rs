@@ -256,7 +256,7 @@ pub struct TranscriptFold {
     queue: Vec<(Wpos, Waiting, UiBlock)>,
     /// Messages the agent received that no input has handed it yet; drawn
     /// last.
-    mailbox: Vec<(MessageId, UiBlock)>,
+    inbox: Vec<(MessageId, UiBlock)>,
     /// Messages an input has handed over, so a message heard after its
     /// input is not shown waiting.
     handed: BTreeSet<MessageId>,
@@ -299,7 +299,7 @@ impl TranscriptFold {
             blocks: Vec::new(),
             told_at: Vec::new(),
             queue: Vec::new(),
-            mailbox: Vec::new(),
+            inbox: Vec::new(),
             handed: BTreeSet::new(),
             senders: HashMap::new(),
             errored: false,
@@ -336,7 +336,7 @@ impl TranscriptFold {
         self.queue
             .iter()
             .map(|(_, _, queued)| queued)
-            .chain(self.mailbox.iter().map(|(_, waiting)| waiting))
+            .chain(self.inbox.iter().map(|(_, waiting)| waiting))
             .map(|block| Arc::new(block.clone()))
     }
 
@@ -473,8 +473,8 @@ impl TranscriptFold {
             return;
         }
         self.errored = false;
-        self.touch(self.queue_end() + self.mailbox.len());
-        self.mailbox.push((
+        self.touch(self.queue_end() + self.inbox.len());
+        self.inbox.push((
             message.id,
             UiBlock::QueuedMessage {
                 text: text(message),
@@ -511,10 +511,10 @@ impl TranscriptFold {
                         self.handed.insert(*id);
                         // The message as its sender wrote it; the row's text
                         // is what the policy made of it for the model.
-                        match self.mailbox.iter().position(|(waiting, _)| waiting == id) {
+                        match self.inbox.iter().position(|(waiting, _)| waiting == id) {
                             Some(index) => {
                                 self.touch(self.queue_end() + index);
-                                self.mailbox.remove(index).1
+                                self.inbox.remove(index).1
                             }
                             None => UiBlock::QueuedMessage {
                                 text: text.clone(),

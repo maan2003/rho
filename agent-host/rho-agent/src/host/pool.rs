@@ -953,7 +953,7 @@ impl AgentPool {
     }
 
     /// Stop each workset's process and erase it: its log, heads, usage,
-    /// Claude sessions and directory. Mail stays. Every workset is checked
+    /// Claude sessions and directory. Chat stays. Every workset is checked
     /// first, so none is deleted when one is missing.
     pub async fn delete_worksets(self: &Arc<Self>, ids: Vec<WorksetId>) -> anyhow::Result<()> {
         let pool = self.clone();

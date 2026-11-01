@@ -1,5 +1,7 @@
-//! Recover the literal prefix of a live Python `mail.send("user", …)` call:
-//! the mail to the user the model is writing.
+//! Recover the literal prefix of a live Python `chat.post(topic, …,
+//! mention="user", …)` call: the message to the user the model is writing.
+//! While the text streams its mention is not written yet, so any post is
+//! shown; a finished post that does not mention the user is not.
 //! This is presentation only: the notebook remains the authority on actual
 //! sends.
 
@@ -128,9 +130,14 @@ fn preview_from_start(
     let repaired = format!("{prefix}{suffix}");
     let tree = parser.parse(&repaired, None)?;
     let string = send_string(tree.root_node(), &repaired, Some(prefix.len()), start_at)?;
-    let completed = send_string(original.root_node(), source, None, start_at)
-        .and_then(|arg| arg.parent()?.parent())
-        .map(|call| call.end_byte());
+    let completed_call = send_string(original.root_node(), source, None, start_at)
+        .and_then(|arg| arg.parent()?.parent());
+    if completed_call.is_some_and(|call| !mentions_user(call, source))
+        || (completed_call.is_none() && finished_post_at(original.root_node(), source, start_at))
+    {
+        return Some(None);
+    }
+    let completed = completed_call.map(|call| call.end_byte());
     let content_start = string.named_child(0)?.end_byte();
     let first = decode(&source[content_start..content_end], is_fstring, is_raw).unwrap_or_default();
     if interpolation.is_some() || string_end.is_none() {
@@ -140,7 +147,6 @@ fn preview_from_start(
         known_sum(
             original.root_node(),
             &source[..completed.map_or(source.len(), |end| end - 1)],
-            completed.is_some(),
             string_end?.end_byte(),
             first,
         )
@@ -163,8 +169,50 @@ fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usiz
     }
 }
 
-/// The notebook's mail tool; its first argument names the recipient.
-const SEND: &str = "mail.send";
+/// The notebook's chat tool: a topic, the text, then keywords, among them
+/// the mention that reaches the user.
+const SEND: &str = "chat.post";
+
+/// Whether a finished post mentions the user: `mention="user"`, or a list
+/// or tuple of handles with "user" in it.
+fn mentions_user(call: Node<'_>, source: &str) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let is_user = |node: Node<'_>| matches!(&source[node.byte_range()], "\"user\"" | "'user'");
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor).any(|arg| {
+        arg.kind() == "keyword_argument"
+            && arg
+                .child_by_field_name("name")
+                .is_some_and(|name| &source[name.byte_range()] == "mention")
+            && arg.child_by_field_name("value").is_some_and(|value| {
+                is_user(value)
+                    || (matches!(value.kind(), "list" | "tuple") && {
+                        let mut cursor = value.walk();
+                        value.named_children(&mut cursor).any(is_user)
+                    })
+            })
+    })
+}
+
+/// Whether the literal at `start_at` is in a post that is finished but
+/// not shaped as a message: a post is a topic, the text, then keywords.
+fn finished_post_at(node: Node<'_>, source: &str, start_at: usize) -> bool {
+    if node.kind() == "call"
+        && !node.has_error()
+        && node.byte_range().contains(&start_at)
+        && source.as_bytes().get(node.end_byte().saturating_sub(1)) == Some(&b')')
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|callee| &source[callee.byte_range()] == SEND)
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| finished_post_at(child, source, start_at))
+}
 
 fn last_send(node: Node<'_>, source: &str) -> Option<usize> {
     let mut latest = (node.kind() == "attribute" && &source[node.byte_range()] == SEND)
@@ -212,21 +260,15 @@ fn start_at(node: Node<'_>, offset: usize) -> Option<Node<'_>> {
     None
 }
 
-fn known_sum(
-    tree: Node<'_>,
-    source: &str,
-    call_ended: bool,
-    mut i: usize,
-    mut text: String,
-) -> Option<String> {
+fn known_sum(tree: Node<'_>, source: &str, mut i: usize, mut text: String) -> Option<String> {
     let bytes = source.as_bytes();
     loop {
         while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n')) {
             i += 1;
         }
-        // The text argument ends at the call's end, or at the keywords of a
-        // call known to be a send.
-        if i == bytes.len() || (call_ended && bytes[i] == b',') {
+        // The text argument ends at the call's end, or at the comma before
+        // its keywords, which are still streaming when the call is not done.
+        if i == bytes.len() || bytes[i] == b',' {
             return Some(text);
         }
         let plus = bytes[i] == b'+';
@@ -311,16 +353,16 @@ fn send_string<'a>(
             .is_some_and(|callee| &source[callee.byte_range()] == SEND)
     {
         let args = node.child_by_field_name("arguments")?;
-        // To the user, the text, then only keywords (`kind=`).
+        // A topic, the text, then only keywords (`mention=`, `kind=`).
         let mut cursor = args.walk();
         let keywords_only = args
             .named_children(&mut cursor)
             .skip(2)
             .all(|child| child.kind() == "keyword_argument");
-        let to_user = args
+        let topic = args
             .named_child(0)
-            .is_some_and(|to| matches!(&source[to.byte_range()], "\"user\"" | "'user'"));
-        if args.named_child_count() >= 2 && to_user && keywords_only {
+            .is_some_and(|topic| topic.kind() != "keyword_argument");
+        if args.named_child_count() >= 2 && topic && keywords_only {
             let arg = args.named_child(1)?;
             if !arg.has_error() {
                 if synthetic_boundary.is_some()
@@ -442,20 +484,20 @@ mod tests {
             .unwrap();
         for (source, expected) in [
             (
-                "import os\nx = {'a': [1, 2]}\nmail.send('user', \"Hel",
+                "import os\nx = {'a': [1, 2]}\nchat.post(12, \"Hel",
                 Some("Hel"),
             ),
             (
-                "def f():\n    return {'a': 'mail.send('user', \\\"fake\\\")'}\nmail.send('user', 'real",
+                "def f():\n    return {'a': 'chat.post(12, \\\"fake\\\")'}\nchat.post(12, 'real",
                 Some("real"),
             ),
+            ("chat.post(12, 'old')\nchat.post(12, 'new", Some("new")),
             (
-                "mail.send('user', 'old')\nmail.send('user', 'new",
-                Some("new"),
+                "chat.post(12, 'done', mention='user', kind='result')",
+                Some("done"),
             ),
-            ("mail.send('user', 'done', kind='result')", Some("done")),
             (
-                "end_turn()\nfor item in items:\n    print(item)\nmail.send('user', \"After work",
+                "end_turn()\nfor item in items:\n    print(item)\nchat.post(12, \"After work",
                 Some("After work"),
             ),
         ] {
@@ -474,21 +516,23 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for source in [
-            "mail.send('user', value)",
-            "mail.send('eng-abc', 'to an agent",
-            "mail.send('user', 'old')\nmail.send(peer, 'to an agent",
-            "mail.send(to, 'unknown recipient",
-            "mail.send('user', 'text', value)",
-            "mail.send('user', 'old')\nmail.send('user', name + 'suffix",
-            "# mail.send('user', 'comment",
-            "print('mail.send('user', \\\"string')",
-            "x =\nmail.send('user', 'invalid prior line", // The tree makes this an assignment RHS.
-            "async def work():\n    x = await other(3)\n    if x:\n        mail.send('user', \"nested",
-            "if False:\n    mail.send('user', 'untaken",
-            "if False: mail.send('user', 'inline branch",
-            "for item in items:\n    mail.send('user', 'loop body",
-            "def f():\n    mail.send('user', 'function body",
-            "class C:\n    mail.send('user', 'class body",
+            "chat.post(12, value)",
+            // Finished posts that do not mention the user.
+            "chat.post(12, 'to the topic')",
+            "chat.post(12, 'old', mention='user', kind='fyi')\nchat.post(12, 'to an agent', mention='eng-abc', kind='ask')",
+            "chat.post(12, 'to agents', mention=['eng-a', 'eng-b'], kind='fyi')",
+            "chat.post(12, 'to someone', mention=who, kind='fyi')",
+            "chat.post(12, 'text', value)",
+            "chat.post(12, 'old')\nchat.post(12, name + 'suffix",
+            "# chat.post(12, 'comment",
+            "print('chat.post(12, \\\"string')",
+            "x =\nchat.post(12, 'invalid prior line", // The tree makes this an assignment RHS.
+            "async def work():\n    x = await other(3)\n    if x:\n        chat.post(12, \"nested",
+            "if False:\n    chat.post(12, 'untaken",
+            "if False: chat.post(12, 'inline branch",
+            "for item in items:\n    chat.post(12, 'loop body",
+            "def f():\n    chat.post(12, 'function body",
+            "class C:\n    chat.post(12, 'class body",
         ] {
             assert_eq!(preview(&mut parser, source), None, "{source:?}");
         }
@@ -501,22 +545,25 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("mail.send('user', 'Hi ' + name", Some("Hi ")),
-            ("mail.send('user', 'Hi ' +", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + 'there'", Some("Hi there")),
-            ("mail.send('user', 'Hi ' + 'the", Some("Hi the")),
-            ("mail.send('user', '' + 'Hello", Some("Hello")),
-            ("mail.send('user', 'Hi ' + '\\x0", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + f'{name}", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + b'bytes", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + 'there' + name", Some("Hi there")),
-            ("mail.send('user', 'Hi ' + name + 'later'", Some("Hi ")),
-            ("mail.send('user', 'Hi ' + str(name)", Some("Hi ")),
-            ("mail.send('user', name + 'suffix'", None),
-            ("mail.send('user', 'Hi ' * 0", None),
-            ("mail.send('user', 'Hi ' + name)", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + name", Some("Hi ")),
+            ("chat.post(12, 'Hi ' +", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + 'there'", Some("Hi there")),
+            ("chat.post(12, 'Hi ' + 'the", Some("Hi the")),
+            ("chat.post(12, '' + 'Hello", Some("Hello")),
+            ("chat.post(12, 'Hi ' + '\\x0", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + f'{name}", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + b'bytes", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + 'there' + name", Some("Hi there")),
+            ("chat.post(12, 'Hi ' + name + 'later'", Some("Hi ")),
+            ("chat.post(12, 'Hi ' + str(name)", Some("Hi ")),
+            ("chat.post(12, name + 'suffix'", None),
+            ("chat.post(12, 'Hi ' * 0", None),
             (
-                "mail.send('user', 'Hi ' + 'there' + name)",
+                "chat.post(12, 'Hi ' + name, mention='user', kind='result')",
+                Some("Hi "),
+            ),
+            (
+                "chat.post(12, 'Hi ' + 'there' + name, mention='user', kind='result')",
                 Some("Hi there"),
             ),
         ] {
@@ -535,17 +582,17 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("mail.send('user', \"foo\" \"bar", Some("foobar")),
-            ("mail.send('user', \"foo\"\n \"bar", Some("foobar")),
-            ("mail.send('user', \"foo\" f\"bar {name", Some("foobar ")),
-            ("mail.send('user', \"foo\" r\"\\n", Some("foo\\n")),
+            ("chat.post(12, \"foo\" \"bar", Some("foobar")),
+            ("chat.post(12, \"foo\"\n \"bar", Some("foobar")),
+            ("chat.post(12, \"foo\" f\"bar {name", Some("foobar ")),
+            ("chat.post(12, \"foo\" r\"\\n", Some("foo\\n")),
+            ("chat.post(12, \"foo\" + \"bar\" \"baz", Some("foobarbaz")),
             (
-                "mail.send('user', \"foo\" + \"bar\" \"baz",
-                Some("foobarbaz"),
+                "chat.post(12, \"foo\" \"bar\", mention='user', kind='result')",
+                Some("foobar"),
             ),
-            ("mail.send('user', \"foo\" \"bar\")", Some("foobar")),
-            ("mail.send('user', \"foo\" name", None),
-            ("mail.send('user', \"foo\" b\"bar", None),
+            ("chat.post(12, \"foo\" name", None),
+            ("chat.post(12, \"foo\" b\"bar", None),
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -562,23 +609,26 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for (source, expected) in [
-            ("mail.send('user', \"Line\\nnext\\x21", Some("Line\nnext!")),
-            ("mail.send('user', '''α\nbeta", Some("α\nbeta")),
-            ("mail.send('user', \"pending\\u00", Some("pending")),
-            ("mail.send('user', \"pending\\", Some("pending")),
-            ("mail.send('user', f\"Hello {{name}}", Some("Hello {name}")),
-            ("mail.send('user', f\"Hello {name", Some("Hello ")),
-            ("mail.send('user', f\"Hello {", Some("Hello ")),
+            ("chat.post(12, \"Line\\nnext\\x21", Some("Line\nnext!")),
+            ("chat.post(12, '''α\nbeta", Some("α\nbeta")),
+            ("chat.post(12, \"pending\\u00", Some("pending")),
+            ("chat.post(12, \"pending\\", Some("pending")),
+            ("chat.post(12, f\"Hello {{name}}", Some("Hello {name}")),
+            ("chat.post(12, f\"Hello {name", Some("Hello ")),
+            ("chat.post(12, f\"Hello {", Some("Hello ")),
             (
-                "mail.send('user', f\"Hello {{name}} {name",
+                "chat.post(12, f\"Hello {{name}} {name",
                 Some("Hello {name} "),
             ),
-            ("mail.send('user', f\"Hello {name} later", Some("Hello ")),
-            ("mail.send('user', f\"Hello {name} later\"", Some("Hello ")),
-            ("print(1)\nmail.send('user', f\"Hello {name", Some("Hello ")),
-            ("mail.send('user', f\"Hello {name} later\")", Some("Hello ")),
+            ("chat.post(12, f\"Hello {name} later", Some("Hello ")),
+            ("chat.post(12, f\"Hello {name} later\"", Some("Hello ")),
+            ("print(1)\nchat.post(12, f\"Hello {name", Some("Hello ")),
             (
-                "mail.send('user', f\"Hello {name} later\")\nx = 2",
+                "chat.post(12, f\"Hello {name} later\", mention='user', kind='result')",
+                Some("Hello "),
+            ),
+            (
+                "chat.post(12, f\"Hello {name} later\", mention='user', kind='result')\nx = 2",
                 Some("Hello "),
             ),
         ] {
@@ -593,10 +643,10 @@ mod tests {
     #[test]
     fn all_prefixes_after_visible_text_keep_draft() {
         let cases = [
-            "import asyncio\nawait asyncio.sleep(10)\nmail.send('user', \"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\")",
-            "mail.send('user', 'Hello, world!')",
-            "mail.send('user', \"One line\\nThe next!\")",
-            "mail.send('user', 'first' + ' second' + ' third')",
+            "import asyncio\nawait asyncio.sleep(10)\nchat.post(12, \"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\", mention='user', kind='result')",
+            "chat.post(12, 'Hello, world!', mention='user', kind='result')",
+            "chat.post(12, \"One line\\nThe next!\", mention='user', kind='result')",
+            "chat.post(12, 'first' + ' second' + ' third', mention='user', kind='result')",
         ];
         let mut parser = Parser::new();
         parser
@@ -623,31 +673,31 @@ mod tests {
     fn multiline_triple_quoted_prefixes_keep_their_known_text() {
         let cases = [
             (
-                "mail.send('user', \"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\")",
+                "chat.post(12, \"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\", mention='user', kind='result')",
                 "First line\n\nSecond line with \"quotes\" and α.",
             ),
             (
-                "mail.send('user', \n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n)",
+                "chat.post(12, \n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n, mention='user', kind='result')",
                 "\nFirst line\nSecond line\n",
             ),
             (
-                "mail.send('user', '''First line\nSecond line with 'quotes'.''')",
+                "chat.post(12, '''First line\nSecond line with 'quotes'.''', mention='user', kind='result')",
                 "First line\nSecond line with 'quotes'.",
             ),
             (
-                "mail.send('user', f\"\"\"First line\nSecond line {name}!\"\"\")",
+                "chat.post(12, f\"\"\"First line\nSecond line {name}!\"\"\", mention='user', kind='result')",
                 "First line\nSecond line ",
             ),
             (
-                "mail.send('user', r\"\"\"First line\nSecond line\\n\"\"\")",
+                "chat.post(12, r\"\"\"First line\nSecond line\\n\"\"\", mention='user', kind='result')",
                 "First line\nSecond line\\n",
             ),
             (
-                "mail.send('user', \"\"\"First line\"\"\" + \"\"\"Second line\"\"\")",
+                "chat.post(12, \"\"\"First line\"\"\" + \"\"\"Second line\"\"\", mention='user', kind='result')",
                 "First lineSecond line",
             ),
             (
-                "mail.send('user', \"\"\"Before (\"A Python\"). After.\"\"\")",
+                "chat.post(12, \"\"\"Before (\"A Python\"). After.\"\"\", mention='user', kind='result')",
                 "Before (\"A Python\"). After.",
             ),
         ];
@@ -691,12 +741,12 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .unwrap();
         for source in [
-            "mail.send('user', \"\"\"Hello\"",
-            "mail.send('user', \"\"\"Hello\"\"",
-            "mail.send('user', \"\"\"Hello\"\"\")",
-            "mail.send('user', '''Hello'",
-            "mail.send('user', '''Hello''",
-            "mail.send('user', '''Hello''')",
+            "chat.post(12, \"\"\"Hello\"",
+            "chat.post(12, \"\"\"Hello\"\"",
+            "chat.post(12, \"\"\"Hello\"\"\", mention='user', kind='result')",
+            "chat.post(12, '''Hello'",
+            "chat.post(12, '''Hello''",
+            "chat.post(12, '''Hello''', mention='user', kind='result')",
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -708,7 +758,7 @@ mod tests {
 
     #[test]
     fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
-        let source = "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
+        let source = "chat.post(12, \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\", mention='user', kind='result')";
         let arguments = serde_json::json!({"source": source}).to_string();
         let mut visible = false;
         for (i, _) in arguments

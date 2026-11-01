@@ -112,8 +112,8 @@ async fn agents_fold_only_their_own_rows_and_rewinds_hide_only_theirs() {
         .map(|(p, _)| p)
         .collect();
     assert_eq!(b_rows, vec![Wpos(2), b_input]);
-    // Delivery is the newest mail an input handed over, rewound or not:
-    // mail once handed over is not handed over again.
+    // Delivery is the newest message an input handed over, rewound or
+    // not: a message once handed over is not handed over again.
     assert_eq!(read.agent(a).unwrap().delivered, ChatSeq(3));
     assert_eq!(read.agent(b).unwrap().delivered, ChatSeq(4));
 }

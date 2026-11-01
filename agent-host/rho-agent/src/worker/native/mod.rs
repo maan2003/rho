@@ -1243,7 +1243,7 @@ impl Agent {
             // Starting a cell changes occupancy; subsequent fragments do not.
             *self.status.write().expect("poison") = self.status();
         } else {
-            // Notebook and mail events publish runtime independently. A code
+            // Notebook and chat events publish runtime independently. A code
             // frame changes the response and its derived draft, not runtime.
             let response = self.response();
             let draft = self.draft();
