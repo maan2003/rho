@@ -107,8 +107,9 @@ impl Outbox {
         id
     }
 
-    /// A message carried from `main`'s outbox, already on disk under its
-    /// old id; it waits in the order it was written.
+    /// A message already on disk under its id; it waits in the order it
+    /// was written.
+    #[cfg(test)]
     pub fn adopt(&mut self, machine_seed: u64, id: u64, outgoing: Outgoing) {
         let at = self
             .waiting

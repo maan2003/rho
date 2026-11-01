@@ -323,15 +323,7 @@ impl Workspace {
             LedgerEvent::Appended(mut items) => {
                 items.retain(|item| matches!(item.channel, Channel::Facts));
                 let touched = self.attention.marks.apply(read_entries(&items));
-                // What another device said about an agent may settle the
-                // topics a migrated host made of it.
-                let about_agents = touched
-                    .iter()
-                    .any(|node| matches!(node, NodeId::Agent(_)));
                 self.marks_moved(touched, cx);
-                if about_agents {
-                    self.settle_migrated_topics(cx);
-                }
             }
             LedgerEvent::Note(arrived) => {
                 let Some(theirs) = NoteRev::decode(&arrived.plain) else {

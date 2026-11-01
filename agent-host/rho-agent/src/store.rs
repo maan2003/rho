@@ -508,7 +508,6 @@ pub fn wake_of(from: Address) -> InputWake {
 
 pub(crate) mod agent_rows;
 pub mod chat;
-pub(crate) mod from_main;
 
 pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
 #[cfg(test)]

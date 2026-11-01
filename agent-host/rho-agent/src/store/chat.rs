@@ -181,9 +181,8 @@ pub trait ChatWrite {
         first: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<(TopicId, MessageId)>;
-    /// A topic with no message yet, for a writer that must have members
-    /// join before the first one: the migration from `main`. Everything
-    /// else starts a topic with its message ([`ChatWrite::start_topic`]).
+    /// A topic with no message yet: the start of [`ChatWrite::start_topic`],
+    /// and the new topic of a move.
     fn open_topic(
         &mut self,
         at: UnixMs,

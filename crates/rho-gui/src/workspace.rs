@@ -281,9 +281,6 @@ pub struct Workspace {
     /// What the user is writing in each topic, kept on disk as it is
     /// typed: a restart or a dropped view puts it back.
     drafts: HashMap<HostTopic, String>,
-    /// Temporary: the user's words a GUI that ran `main` kept by agent,
-    /// until each agent's host has told its chat.
-    from_main: rho_agents_client::from_main::Leftovers,
     /// Every host's streams and topics, as the model folded them.
     pub(crate) chat: rho_agents_client::ChatMap,
     /// Pairing links that came while the user was naming another link's host:
@@ -678,90 +675,6 @@ impl Workspace {
                 let summary = self.refresh_topic_state(topic);
                 self.sync_topic_model(topic, summary, cx);
             }
-        }
-    }
-
-    /// Settles the topics a migrated host made of conversations the user
-    /// had already handled (`chat_migration`). Temporary, with it.
-    /// Temporary: carries what the user was writing to agents under
-    /// `main` into their topics, as each host's chat arrives.
-    fn carry_from_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.from_main.is_empty() {
-            return;
-        }
-        let carried = rho_agents_client::from_main::carry(
-            &self.chat,
-            |agent| self.host_of(agent),
-            &self.from_main,
-        );
-        if carried.is_empty() {
-            return;
-        }
-        tracing::info!(
-            drafts = carried.drafts.len(),
-            unsent = carried.outbox.len(),
-            "carried the user's words from main into topics"
-        );
-        self.from_main.without(&carried);
-        let mut topics = Vec::new();
-        for (_, topic, text) in &carried.drafts {
-            let text = match self.drafts.get(topic) {
-                Some(held) if !held.is_empty() => format!("{text}\n\n{held}"),
-                _ => text.clone(),
-            };
-            self.drafts.insert(*topic, text);
-            topics.push(*topic);
-        }
-        let mut hosts = Vec::new();
-        for (agent, machine_seed, id, outgoing) in &carried.outbox {
-            if let Destination::Topic(topic) = outgoing.to {
-                topics.push(HostTopic {
-                    machine_seed: *machine_seed,
-                    topic,
-                });
-            }
-            self.outbox.adopt(*machine_seed, *id, outgoing.clone());
-            hosts.extend(self.host_of(*agent));
-        }
-        rho_agents_client::cache::carry_from_main(carried);
-        self.refresh_topics(topics, cx);
-        for host in hosts {
-            self.send_unsent(host, window, cx);
-        }
-    }
-
-    pub(crate) fn settle_migrated_topics(&mut self, cx: &mut Context<Self>) {
-        self.name_migrated_topics(cx);
-        let facts = crate::chat_migration::settle_migrated(&self.chat, &self.attention.marks);
-        if facts.is_empty() {
-            return;
-        }
-        tracing::info!(
-            count = facts.len(),
-            "settled topics the user had handled before chat"
-        );
-        self.write_marks(facts.into_iter().map(Into::into).collect(), cx);
-    }
-
-    /// Names each migrated topic as the user named its agent. A host that
-    /// is offline is asked the next time this runs; a change to the name a
-    /// topic already has logs nothing.
-    fn name_migrated_topics(&mut self, cx: &mut Context<Self>) {
-        let registry = &self.registry;
-        let changes = crate::chat_migration::names_from_desk(&self.chat, &self.attention.marks, |agent| {
-            registry.mirrored(agent).and_then(|agent| agent.title()).map(str::to_owned)
-        });
-        for (host, change) in changes {
-            let Some(agents) = self.agents(host).filter(|_| self.hosts.is_online(host)) else {
-                continue;
-            };
-            let reply = agents.call(change);
-            cx.spawn(async move |_, _| {
-                if let Err(error) = reply.await {
-                    tracing::warn!("name a migrated topic: {error:#}");
-                }
-            })
-            .detach();
         }
     }
 
@@ -1183,7 +1096,6 @@ impl Workspace {
             drafts: rho_agents_client::cache::read_drafts()
                 .into_iter()
                 .collect(),
-            from_main: rho_agents_client::cache::read_main_leftovers(),
             chat: rho_agents_client::ChatMap::default(),
             waiting_links: Default::default(),
             registry: AgentMap::default(),
@@ -2144,7 +2056,6 @@ impl Workspace {
                 self.push_agent_marks(&agents);
                 let open = self.topics.keys().copied().collect::<Vec<_>>();
                 self.refresh_topics(open, cx);
-                self.settle_migrated_topics(cx);
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
@@ -2153,8 +2064,6 @@ impl Workspace {
                 if changed.is_empty() {
                     return;
                 }
-                // An agent's host is known from here on.
-                self.carry_from_main(window, cx);
                 for agent_id in &changed {
                     rho_journal::record(rho_journal::Event::AgentChanged {
                         agent: agent_id.encoded(),
@@ -2208,8 +2117,6 @@ impl Workspace {
                         None => self.open_topic(topic, window, cx),
                     }
                 }
-                self.carry_from_main(window, cx);
-                self.settle_migrated_topics(cx);
                 self.invalidate_dealer_signals(cx);
                 self.refresh_home(cx);
                 cx.notify();
@@ -5224,14 +5131,6 @@ impl Workspace {
     ) {
         assert!(self.transcripts.seed(agent_id, rows));
         self.note_followed();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn carry_from_main_for_test(
-        &mut self,
-        leftovers: rho_agents_client::from_main::Leftovers,
-    ) {
-        self.from_main = leftovers;
     }
 
     #[cfg(test)]

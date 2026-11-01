@@ -50,11 +50,8 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
-/// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)). A store from before
-/// worksets is migrated ([`crate::store::from_main`]).
+/// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 const CURRENT_AGENT_DB_FORMAT: &str = "0adc0ed8";
-#[cfg(test)]
-pub(crate) const CURRENT_FORMAT: &str = CURRENT_AGENT_DB_FORMAT;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -388,29 +385,6 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
-    if stored.as_deref() == Some(crate::store::from_main::MAIN_FORMAT) {
-        // Temporary (`temp-migration`): `rho debug rollback` puts the store
-        // back from this savepoint.
-        let hop = format!(
-            "{}->{CURRENT_AGENT_DB_FORMAT}",
-            crate::store::from_main::MAIN_FORMAT
-        );
-        db.persistent_savepoint(|write, id| {
-            write.open_table(RECOVERY).insert(hop, id);
-        })
-        .await;
-        if let Err(error) = db.read_ahead() {
-            eprintln!("rho: read ahead of the migration: {error}");
-        }
-        let mut write = db.write().await;
-        crate::store::from_main::migrate(&mut write);
-        write
-            .open_table(FORMAT)
-            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
-        write.init_agent_tables();
-        write.commit();
-        return;
-    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
