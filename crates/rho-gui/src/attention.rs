@@ -327,7 +327,7 @@ impl Workspace {
                 // topics a migrated host made of it.
                 let about_agents = touched
                     .iter()
-                    .any(|node| matches!(node, NodeId::Agent(_) | NodeId::Mail(_)));
+                    .any(|node| matches!(node, NodeId::Agent(_)));
                 self.marks_moved(touched, cx);
                 if about_agents {
                     self.settle_migrated_topics(cx);

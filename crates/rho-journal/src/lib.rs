@@ -106,11 +106,6 @@ pub enum NodeIdentity {
         host: u64,
         path: String,
     },
-    /// A mail thread: the agent it is with, and the mail that started it.
-    Mail {
-        agent: String,
-        thread: u64,
-    },
     /// A chat topic: its host's database seed, and the event that started
     /// it there.
     Topic {
@@ -138,10 +133,6 @@ impl From<rho_dealer::NodeId> for NodeIdentity {
                 thread: unit.thread,
             },
             NodeId::PullRequest { repo, number } => Self::PullRequest { repo, number },
-            NodeId::Mail(thread) => Self::Mail {
-                agent: thread.agent.encoded(),
-                thread: thread.thread,
-            },
             NodeId::Topic(topic) => Self::Topic {
                 machine_seed: topic.machine_seed,
                 topic: topic.topic.0.0,
@@ -197,9 +188,6 @@ pub enum DealerCardKind {
     /// read back.
     Agent,
     Thread,
-    /// A mail thread card, which no build deals any more; kept so old
-    /// journals read back.
-    Mail,
     Topic,
 }
 
@@ -317,6 +305,9 @@ pub enum SurfaceIdentity {
         machine_seed: u64,
         topic: u64,
     },
+    /// The streams and their topics. Last: journals decode by variant
+    /// order.
+    Topics,
 }
 
 /// Who ignored the thread: this rho, or Slack telling rho that another

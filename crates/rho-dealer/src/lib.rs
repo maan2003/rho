@@ -20,6 +20,6 @@ pub mod rank;
 pub mod until;
 
 pub use marks::Marks;
-pub use node::{MailThread, NodeId, SlackUnit};
+pub use node::{NodeId, SlackUnit};
 pub use rank::{Card, CardKind, Hand, Skips, rank};
 pub use until::Until;

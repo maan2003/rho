@@ -13,17 +13,6 @@ pub struct SlackUnit {
     pub thread: Option<String>,
 }
 
-/// A mail thread between the user and an agent, as ledger entries said
-/// before chat replaced mail: the agent, and the id of the mail that
-/// started the thread. Read only by the pass that carries what the user
-/// had handled over to topics (`rho-gui`'s `chat_migration`), and goes
-/// with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MailThread {
-    pub agent: AgentId,
-    pub thread: u64,
-}
-
 /// A thing in the user's world. Notes and labels are made by rho; every
 /// other node exists because its source says so.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,7 +25,6 @@ pub enum NodeId {
         repo: String,
         number: u64,
     },
-    Mail(MailThread),
     /// A chat topic.
     Topic(HostTopic),
 }
@@ -54,9 +42,6 @@ impl NodeId {
                 None => format!("slack:{}/{}", unit.workspace, unit.channel),
             },
             Self::PullRequest { repo, number } => format!("pr:{repo}#{number}"),
-            Self::Mail(MailThread { agent, thread }) => {
-                format!("mail:{}/{thread}", agent.encoded())
-            }
             Self::Topic(HostTopic {
                 machine_seed,
                 topic,
@@ -88,13 +73,6 @@ impl NodeId {
                     repo: repo.to_owned(),
                     number: number.parse().ok()?,
                 }
-            }
-            "mail" => {
-                let (agent, thread) = rest.split_once('/')?;
-                Self::Mail(MailThread {
-                    agent: AgentId::from_encoded(agent).ok()?,
-                    thread: thread.parse().ok()?,
-                })
             }
             "topic" => {
                 let (machine_seed, topic) = rest.split_once('/')?;
@@ -177,10 +155,6 @@ mod tests {
                 repo: "maan2003/rho".into(),
                 number: 42,
             },
-            NodeId::Mail(MailThread {
-                agent: AgentId::from_encoded("00jvj4xuk96p").unwrap(),
-                thread: 17,
-            }),
             NodeId::Topic(HostTopic {
                 machine_seed: u64::MAX - 3,
                 topic: TopicId(ChatSeq(17)),
@@ -195,13 +169,5 @@ mod tests {
             assert_eq!(NodeId::parse(&node.key()), Some(node));
         }
         assert_eq!(NodeId::parse("gadget:1"), None);
-        assert_eq!(
-            NodeId::parse("mail:00jvj4xuk96p/17"),
-            Some(NodeId::Mail(MailThread {
-                agent: AgentId::from_encoded("00jvj4xuk96p").unwrap(),
-                thread: 17,
-            })),
-            "what the mail era wrote still reads"
-        );
     }
 }

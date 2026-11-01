@@ -620,7 +620,6 @@ pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String 
             .unwrap_or_default()
             .trim()
             .to_owned(),
-        NodeId::Mail(thread) => format!("mail {}", thread.thread),
         NodeId::Topic(topic) => sources
             .chat
             .topic(*topic)

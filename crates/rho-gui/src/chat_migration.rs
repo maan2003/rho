@@ -6,11 +6,10 @@
 //! agent into one topic, and every message to the user that asked or
 //! answered becomes a mention of them. Unread, those mentions would deal
 //! every old conversation again. What the GUI holds about them is the
-//! ledger's facts on the agent itself (`NodeId::Agent`, from `main`) and on
-//! its mail threads (`NodeId::Mail`, from `rho2`): when the user settled it
-//! or made it a todo, and whether they muted it. Their seen positions count
-//! in logs that are gone, so the time each was said is what carries over:
-//! a mention from before it was handled.
+//! ledger's facts on the agent itself (`NodeId::Agent`, from `main`): when
+//! the user settled it or made it a todo, and whether they muted it. Their seen
+//! positions count in logs that are gone, so the time each was said is what
+//! carries over: a mention from before it was handled.
 
 use rho_agents_client::ChatMap;
 use rho_dealer::NodeId;
@@ -31,7 +30,6 @@ pub(crate) fn settle_migrated(chat: &ChatMap, marks: &Marks) -> Vec<Fact> {
             .nodes()
             .filter(|(old, _)| match old {
                 NodeId::Agent(agent) => held.agents().any(|held| held == *agent),
-                NodeId::Mail(thread) => held.agents().any(|held| held == thread.agent),
                 _ => false,
             })
             .collect::<Vec<_>>();
@@ -93,7 +91,6 @@ mod tests {
         MentionKind, StreamId, TopicId, UnixMs,
     };
     use rho_agents_client::{HostChat, HostTopic};
-    use rho_dealer::MailThread;
     use rho_dealer::facts::Device;
 
     use super::*;
@@ -199,11 +196,8 @@ mod tests {
             said(
                 4 * HOUR,
                 Fact::Settled {
-                    node: NodeId::Mail(MailThread {
-                        agent: late,
-                        thread: 9,
-                    }),
-                    seen: Seen::Mail(9),
+                    node: NodeId::Agent(late),
+                    seen: Seen::Agent(9),
                 },
             ),
         ]);

@@ -160,8 +160,7 @@ pub enum Fact {
         label: uuid::Uuid,
         host: Option<String>,
     },
-    /// Read this far: what the user had in front of them when they last
-    /// looked, done or not. Unlike a done it takes nothing back; it only
+    /// Marked read this far. Unlike a done it takes nothing back; it only
     /// says where unread starts. Later still than `Host`.
     Read {
         node: NodeId,
@@ -197,17 +196,13 @@ impl Fact {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Seen {
     /// An agent's story, through this position: what agent cards read
-    /// before mail threads replaced them. Nothing reads it; it stays so
-    /// the ledger's older entries still decode.
+    /// before topics replaced them. Only the migration to topics reads
+    /// it; it stays so `main`'s entries still decode.
     Agent(u64),
     /// A Slack unit, through this message.
     Slack(String),
     /// A note or a label: there is nothing more to see.
     Whole,
-    /// A mail thread, through this mail: what thread cards read before
-    /// topics replaced them. Nothing reads it; it stays so older entries
-    /// still decode.
-    Mail(u64),
     /// A chat topic, through this message. Last: entries decode by variant
     /// order.
     Topic(u64),
@@ -267,8 +262,8 @@ impl<'a> Facts<'a> {
             .max()
     }
 
-    /// The newest message of a topic the user had in front of them, done
-    /// with it or only reading.
+    /// The newest message of a topic the user marked read, or had seen
+    /// when done with it.
     pub fn read_topic(self) -> Option<u64> {
         self.0
             .iter()
