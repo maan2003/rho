@@ -39,21 +39,6 @@ impl TranscriptView {
         label: &impl Fn(AgentId) -> String,
     ) -> RenderedBlock {
         if self.visible(block) {
-            if self == Self::Conversation
-                && let UiBlock::MessageDraft { text } = block
-            {
-                let mut rendered = render_block_with_agent_labels(
-                    &UiBlock::MessageSent {
-                        to: None,
-                        text: text.to_owned(),
-                    },
-                    previous,
-                    now_ms,
-                    label,
-                );
-                rendered.kind = block_kind(block);
-                return rendered;
-            }
             render_block_with_agent_labels(block, previous, now_ms, label)
         } else {
             invisible(block_kind(block))
@@ -172,7 +157,7 @@ pub fn block_visible(block: &UiBlock) -> bool {
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageSent { text, .. }
-        | UiBlock::MessageDraft { text }
+        | UiBlock::MessageDraft { text, .. }
         | UiBlock::Notice { text }
         | UiBlock::AgentMessage { text, .. }
         | UiBlock::QueuedMessage { text, .. }
@@ -390,7 +375,25 @@ pub fn render_block_with_agent_labels(
             }
             spans.push(Span::new(text, StyleClass::Default));
         }
-        UiBlock::Reasoning { .. } | UiBlock::MessageDraft { .. } => return invisible(kind),
+        UiBlock::Reasoning { .. } => return invisible(kind),
+        // What an agent is still writing, where its post will land: who,
+        // and that it is not posted yet.
+        UiBlock::MessageDraft { from, text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            spans.push(Span::new(
+                format!("{} · writing…\n", agent_label(*from)),
+                StyleClass::AgentLabel,
+            ));
+            markdown = true;
+            let mut text = text.clone();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            spans.push(Span::new(text, StyleClass::Default));
+        }
         UiBlock::Tool(tool) => {
             spans.extend(separator(prev, kind));
             // A call is what was run, shown as it was run: no markdown
@@ -1133,33 +1136,26 @@ mod tests {
     fn host_draft_shows_in_conversation_while_activity_keeps_the_source() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
-        exec.arguments = "human.send('Hello')".into();
+        exec.arguments = "chat.post(2, 'Hello')".into();
         let source = UiBlock::Tool(exec);
+        let writer = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let draft = UiBlock::MessageDraft {
+            from: writer,
             text: "Hello".into(),
         };
-        let label = |_| String::new();
+        let label = |agent: AgentId| if agent == writer { "Ann" } else { "Bob" }.to_owned();
         assert!(!TranscriptView::Conversation.visible(&source));
         assert!(TranscriptView::Activity.visible(&source));
         assert!(TranscriptView::Conversation.visible(&draft));
         assert!(!TranscriptView::Activity.visible(&draft));
         let conversation = TranscriptView::Conversation.render(&draft, None, 0, &label);
-        assert_eq!(text_of(&conversation.spans), "Hello\n");
+        assert_eq!(text_of(&conversation.spans), "Ann · writing…\nHello\n");
         assert!(conversation.markdown);
-        assert_eq!(conversation.spans[0].class, StyleClass::Default);
-        let sent = TranscriptView::Conversation.render(
-            &UiBlock::MessageSent {
-                to: None,
-                text: "Hello".into(),
-            },
-            None,
-            0,
-            &label,
-        );
-        assert_eq!(conversation.spans, sent.spans);
+        assert_eq!(conversation.spans[0].class, StyleClass::AgentLabel);
+        assert_eq!(conversation.spans[1].class, StyleClass::Default);
         let activity = TranscriptView::Activity.render(&source, None, 0, &label);
-        assert!(text_of(&activity.spans).contains("human.send('Hello')"));
-        assert!(!text_of(&activity.spans).contains("draft"));
+        assert!(text_of(&activity.spans).contains("chat.post(2, 'Hello')"));
+        assert!(!text_of(&activity.spans).contains("writing"));
     }
 
     #[test]

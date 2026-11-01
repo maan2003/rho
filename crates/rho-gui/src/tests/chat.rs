@@ -495,3 +495,98 @@ fn enter_on_a_link_opens_what_it_names(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(current, SurfaceKey::Topic(host_topic(target_topic)));
 }
+
+/// What `agent`'s runtime says it is writing, as its host streams it.
+fn drafting(
+    agent: AgentId,
+    draft: Option<(TopicId, &str)>,
+) -> rho_agents_client::stream::AgentFrame {
+    use rho_agents_client::protocol::transcript::{Draft, Live, RuntimeState};
+    rho_agents_client::stream::AgentFrame::Server(
+        rho_agents_client::protocol::worksets::ServerFrame::Live {
+            agent_id: agent,
+            live: Live::Snapshot {
+                state: RuntimeState::default(),
+                response: None,
+                draft: draft.map(|(topic, text)| Draft {
+                    topic: Some(topic),
+                    text: text.to_owned(),
+                }),
+            },
+        },
+    )
+}
+
+/// A member's live draft shows after the messages of the topic it names,
+/// under the member's name, while it is written: it leaves when it names
+/// another topic, and when the member stops writing it. The topic on
+/// screen asks its host for its members' live frames.
+#[gpui::test]
+fn a_draft_shows_in_the_topic_it_names_while_it_is_written(cx: &mut TestAppContext) {
+    let member = agent(961);
+    let (workspace, _host) = attached(cx, member);
+    let here = started("here", 1);
+    let here_topic = TopicId(here.seq);
+    let joined = story::record(
+        UnixMs(2),
+        ChatEvent::Joined {
+            topic: here_topic,
+            agent: member,
+        },
+    );
+    let elsewhere = started("elsewhere", 3);
+    let elsewhere_topic = TopicId(elsewhere.seq);
+    feed(&workspace, cx, vec![here, joined, elsewhere]);
+    let said = MessageId(ChatSeq(40));
+    open_at(
+        &workspace,
+        cx,
+        host_topic(here_topic),
+        &[(said, Address::User, "go on")],
+        said,
+    );
+    let focused = workspace
+        .update(cx, |workspace, _, _| workspace.focused_agents())
+        .unwrap();
+    assert!(
+        focused.contains(&member),
+        "the topic on screen focuses its member"
+    );
+
+    let tell = |cx: &mut TestAppContext, draft| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    drafting(member, draft),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        super::buffer_text(&workspace, cx)
+    };
+
+    let text = tell(cx, Some((here_topic, "half a thought")));
+    let header = text.find("· writing…").expect("the draft's header");
+    assert!(
+        text.find("go on").unwrap() < header,
+        "after the messages: {text}"
+    );
+    assert!(text[header..].contains("half a thought"), "{text}");
+
+    let text = tell(cx, Some((elsewhere_topic, "other words")));
+    assert!(
+        !text.contains("half a thought"),
+        "left for another topic: {text}"
+    );
+    assert!(!text.contains("other words"), "not this topic's: {text}");
+
+    let text = tell(cx, Some((here_topic, "again")));
+    assert!(text.contains("again"), "{text}");
+    let text = tell(cx, None);
+    assert!(!text.contains("writing…"), "stopped: {text}");
+    assert!(text.contains("go on"), "the messages stay: {text}");
+}

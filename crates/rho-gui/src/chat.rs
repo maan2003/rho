@@ -295,7 +295,7 @@ impl Workspace {
         }
         match self.message_conversation(host, MessageId(ChatSeq(n))) {
             Some(conversation) => {
-                self.open_topic_at(conversation, MessageId(ChatSeq(n)), window, cx)
+                self.open_topic_at(conversation, MessageId(ChatSeq(n)), window, cx);
             }
             None => self.notice_on(
                 None,
@@ -352,28 +352,31 @@ impl Workspace {
             .collect()
     }
 
-    /// Opens a conversation with the point on one of its messages.
+    /// Opens a conversation with the point on one of its messages, and
+    /// answers whether the view holds that message to put the point on.
     pub(crate) fn open_topic_at(
         &mut self,
         conversation: HostTopic,
         id: MessageId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.open_topic(conversation, window, cx);
         let Some((_, model, editor)) = self.topic_in_view() else {
-            return;
+            return false;
         };
         let block = self.transcripts.topic(conversation).and_then(|state| {
             state.blocks.iter().position(
                 |block| matches!(block.as_ref(), UiBlock::ChatMessage { id: at, .. } if *at == id),
             )
         });
-        if let Some(block) = block {
-            model.update(cx, |model, cx| {
-                model.go_to_store_point(&editor, StorePoint { block, offset: 0 }, window, cx)
-            });
-        }
+        let Some(block) = block else {
+            return false;
+        };
+        model.update(cx, |model, cx| {
+            model.go_to_store_point(&editor, StorePoint { block, offset: 0 }, window, cx)
+        });
+        true
     }
 
     /// `space o /`: the messages this GUI holds, every host's, newest
@@ -453,7 +456,7 @@ impl Workspace {
                     });
                 match chosen {
                     Some(found) => {
-                        workspace.open_topic_at(found.conversation, found.id, window, cx)
+                        workspace.open_topic_at(found.conversation, found.id, window, cx);
                     }
                     None => workspace.notice_on(
                         None,
@@ -1058,15 +1061,23 @@ impl Workspace {
                         host,
                         reply,
                         move |workspace, to, window, cx| {
-                            // Where they went is where the reader follows.
-                            if let Some(to) = workspace.chat.host_topic(host, to) {
-                                workspace.notice_on(
-                                    None,
-                                    &format!("moved {count} to {}", workspace.topic_title(to)),
-                                    StyleClass::SystemInfo,
-                                    cx,
-                                );
-                                workspace.open_topic_at(to, first, window, cx);
+                            // Where they went is where the reader follows,
+                            // once the chat has told the move.
+                            let Some(machine_seed) = workspace.chat.machine_seed(host) else {
+                                return;
+                            };
+                            let to = HostTopic {
+                                machine_seed,
+                                topic: to,
+                            };
+                            let known = workspace.chat.topic(to).is_some();
+                            let notice = match known {
+                                true => format!("moved {count} to {}", workspace.topic_title(to)),
+                                false => format!("moved {count}"),
+                            };
+                            workspace.notice_on(None, &notice, StyleClass::SystemInfo, cx);
+                            if !(known && workspace.open_topic_at(to, first, window, cx)) {
+                                workspace.topic_to_open = Some((to, Some(first)));
                             }
                         },
                         window,

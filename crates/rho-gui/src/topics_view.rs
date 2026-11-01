@@ -292,6 +292,11 @@ fn browser_items(
     for stream in &rows.streams {
         hidden += stream.topics.iter().filter(|topic| topic.resolved).count();
         let topics = stream.topics.iter().filter(shown).collect::<Vec<_>>();
+        // A stream whose every topic is hidden says nothing a heading
+        // could; one with no topics yet is still a stream to know of.
+        if topics.is_empty() && !stream.topics.is_empty() {
+            continue;
+        }
         let unread = topics.iter().map(|topic| topic.unread).sum::<usize>();
         items.push(heading(
             BrowserKey::Stream(stream.name.clone()),
@@ -312,7 +317,7 @@ fn browser_items(
             items.push(topic_line(topic, column));
         }
     }
-    if items.is_empty() {
+    if items.is_empty() && hidden == 0 {
         let text = "no streams yet";
         items.push(
             Item::new(BrowserKey::Empty, text.to_owned())
@@ -452,6 +457,32 @@ mod tests {
         assert_eq!(
             texts(&rows, true),
             vec!["rho  8", "  deploy        3 · 2m", "  ✔ flaky test  5 · 2m"]
+        );
+    }
+
+    #[test]
+    fn a_stream_with_every_topic_hidden_shows_no_heading() {
+        let rows = BrowserRows {
+            streams: vec![
+                StreamRows {
+                    name: "done".to_owned(),
+                    topics: vec![row(2, "shipped", 1, true)],
+                },
+                StreamRows {
+                    name: "new".to_owned(),
+                    topics: Vec::new(),
+                },
+            ],
+            directs: Vec::new(),
+        };
+        assert_eq!(
+            texts(&rows, false),
+            vec!["new", "1 resolved hidden · t shows them"],
+            "a stream with no topics yet keeps its heading"
+        );
+        assert_eq!(
+            texts(&rows, true),
+            vec!["done  1", "  ✔ shipped  1 · 2m", "new"]
         );
     }
 }

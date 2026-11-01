@@ -326,9 +326,10 @@ pub struct Workspace {
     /// The client id of a topic the user started, which opens when its
     /// host takes it.
     new_topic_post: Option<u64>,
-    /// A topic the user started that its host took before the chat showed
-    /// it: it opens when the chat does.
-    topic_to_open: Option<HostTopic>,
+    /// A topic to open when the chat next tells it, at a message when one
+    /// is named: a topic the user started that its host took before the
+    /// chat showed it, or where messages the user moved went.
+    pub(crate) topic_to_open: Option<(HostTopic, Option<rho_agent_types::MessageId>)>,
     /// The host chosen in the draft (ctrl-tab in the Workdir field), until
     /// the draft becomes an agent.
     draft_host: Option<HostId>,
@@ -637,7 +638,8 @@ impl Workspace {
             None => Vec::new(),
         };
         let unsent = self.outbox.texts(topic);
-        let state = rho_agents_client::chat::topic_state(&messages, &unsent);
+        let mut state = rho_agents_client::chat::topic_state(&messages, &unsent);
+        state.blocks.extend(self.topic_drafts(topic));
         self.transcripts.set_topic(topic, state)
     }
 
@@ -1568,6 +1570,7 @@ impl Workspace {
             method: rho_journal::SurfaceShowMethod::Mru,
         });
         self.rebuild_home_when_shown(&surface.key, cx);
+        self.focus_shown(&surface.key, cx);
         cx.notify();
     }
 
@@ -2169,11 +2172,18 @@ impl Workspace {
                     .filter_map(|topic| self.chat.host_topic(host, topic))
                     .collect::<Vec<_>>();
                 self.refresh_topics(moved_topics.iter().copied(), cx);
-                if let Some(topic) = self.topic_to_open
+                // Who can write into the topic on screen may have changed.
+                self.send_agent_focus();
+                if let Some((topic, at)) = self.topic_to_open
                     && moved_topics.contains(&topic)
                 {
                     self.topic_to_open = None;
-                    self.open_topic(topic, window, cx);
+                    match at {
+                        Some(at) => {
+                            self.open_topic_at(topic, at, window, cx);
+                        }
+                        None => self.open_topic(topic, window, cx),
+                    }
                 }
                 self.carry_from_main(window, cx);
                 self.settle_migrated_topics(cx);
@@ -2239,7 +2249,12 @@ impl Workspace {
         let mut changes: HashMap<AgentId, FrameSummary> = HashMap::new();
         let mut live_changed = false;
 
+        let mut drafted = HashSet::new();
         for (agent_id, frame) in frames {
+            let live = matches!(frame, TranscriptFrame::Live(_));
+            if live {
+                drafted.extend(self.draft_topic(agent_id));
+            }
             if let TranscriptFrame::Live(rho_agents_client::protocol::transcript::Live::Snapshot {
                 state,
                 ..
@@ -2250,6 +2265,9 @@ impl Workspace {
                 self.refresh_home(cx);
             }
             let (summary, became_live) = self.apply_frame_state(agent_id, frame);
+            if live {
+                drafted.extend(self.draft_topic(agent_id));
+            }
             live_changed |= became_live;
             changes
                 .entry(agent_id)
@@ -2263,6 +2281,9 @@ impl Workspace {
         if live_changed {
             self.refresh_draft_agent_targets(cx);
         }
+        // A draft shows in the conversation it names, and leaves the one it
+        // named before.
+        self.redraw_drafts(drafted, cx);
 
         for agent_id in order {
             if let Some(activity) = self.activity_models.get(&agent_id).cloned() {
@@ -2364,6 +2385,8 @@ impl Workspace {
                     }
                 }
                 self.registry.clear_host_runtime(host);
+                let held = self.topics.keys().copied().collect::<Vec<_>>();
+                self.redraw_drafts(held, cx);
                 self.refresh_home(cx);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
@@ -2832,7 +2855,7 @@ impl Workspace {
                         this.new_topic_post = None;
                         match this.chat.topic(topic) {
                             Some(_) => this.open_topic(topic, window, cx),
-                            None => this.topic_to_open = Some(topic),
+                            None => this.topic_to_open = Some((topic, None)),
                         }
                     }
                     this.send_unsent(host, window, cx);
@@ -4406,21 +4429,106 @@ impl Workspace {
     }
 
     /// Tells every host which of its agents this client wants live frames
-    /// for: the active set, replaced whole. Nothing durable travels on it,
-    /// so a set that lags by one frame costs nothing.
+    /// for, replaced whole, and lets go of the live tails no frame will
+    /// come for any more. Nothing durable travels on it, so a set that lags
+    /// by one frame costs nothing.
     fn send_agent_focus(&mut self) {
         for host in self.hosts.ids() {
             self.send_agent_focus_to(host);
         }
+        let focused = self.focused_agents();
+        self.transcripts
+            .forget_live_except(|agent_id| focused.contains(&agent_id));
     }
 
     fn send_agent_focus_to(&mut self, host: HostId) {
         let agent_ids = self
-            .active
-            .iter()
+            .focused_agents()
+            .into_iter()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect();
         self.agents_client.focus(host, agent_ids);
+    }
+
+    /// The agents whose live frames this client wants: the active set,
+    /// and the members of the topic on screen, whose drafts it shows.
+    pub(crate) fn focused_agents(&self) -> std::collections::BTreeSet<AgentId> {
+        let mut agents = self
+            .active
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(SurfaceKey::Topic(topic)) = self
+            .history
+            .as_ref()
+            .map(|history| &history.current().surface.key)
+            && let Some((_, held)) = self.chat.topic(*topic)
+        {
+            agents.extend(held.members.keys().copied());
+        }
+        agents
+    }
+
+    /// What a surface just shown needs live: the agents it focuses, and
+    /// for a topic, the drafts being written into it now.
+    fn focus_shown(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
+        self.send_agent_focus();
+        if let SurfaceKey::Topic(topic) = key {
+            self.redraw_drafts([*topic], cx);
+        }
+    }
+
+    /// The messages agents are writing into a conversation, in agent
+    /// order: each agent of its host whose live draft names it.
+    fn topic_drafts(
+        &self,
+        topic: HostTopic,
+    ) -> Vec<std::sync::Arc<rho_agents_client::state::UiBlock>> {
+        let Some(host) = self.chat.conversation_host(topic) else {
+            return Vec::new();
+        };
+        let mut drafts = self
+            .transcripts
+            .drafts()
+            .filter(|(agent_id, draft)| {
+                draft.topic == Some(topic.topic)
+                    && self.registry.host_of_agent(*agent_id) == Some(host)
+            })
+            .map(|(agent_id, draft)| (agent_id, draft.text.clone()))
+            .collect::<Vec<_>>();
+        drafts.sort_by_key(|(agent_id, _)| *agent_id);
+        drafts
+            .into_iter()
+            .map(|(from, text)| {
+                std::sync::Arc::new(rho_agents_client::state::UiBlock::MessageDraft { from, text })
+            })
+            .collect()
+    }
+
+    /// Open conversations drawn again with the drafts being written into
+    /// them now.
+    fn redraw_drafts(
+        &mut self,
+        topics: impl IntoIterator<Item = HostTopic>,
+        cx: &mut Context<Self>,
+    ) {
+        for topic in topics {
+            if self.topics.contains_key(&topic) {
+                let drafts = self.topic_drafts(topic);
+                let summary = self.transcripts.set_topic_drafts(topic, drafts);
+                self.sync_topic_model(topic, summary, cx);
+            }
+        }
+    }
+
+    /// The conversation an agent's live draft names, as this window keys
+    /// it.
+    fn draft_topic(&self, agent_id: AgentId) -> Option<HostTopic> {
+        let topic = self.transcripts.draft(&agent_id)?.topic?;
+        let host = self.registry.host_of_agent(agent_id)?;
+        Some(HostTopic {
+            machine_seed: self.chat.machine_seed(host)?,
+            topic,
+        })
     }
 
     /// Lets go of everything held for an agent that left the active set:
@@ -5624,6 +5732,7 @@ impl Workspace {
             method,
         });
         self.rebuild_home_when_shown(&shown.key, cx);
+        self.focus_shown(&shown.key, cx);
     }
 
     /// Put a surface at the head of history in a named context, without any

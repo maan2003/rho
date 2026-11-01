@@ -70,6 +70,7 @@ impl FrameSummary {
 
 /// One agent's transcript: the fold, the live tail, and the two composed.
 struct Layered {
+    agent_id: AgentId,
     fold: UiAgentState,
     tail: Tail,
     state: UiAgentState,
@@ -141,6 +142,7 @@ impl Layered {
             }));
         if let Some(draft) = &self.tail.draft {
             self.state.blocks.push(Arc::new(UiBlock::MessageDraft {
+                from: self.agent_id,
                 text: draft.text.clone(),
             }));
         }
@@ -315,8 +317,28 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
+    /// The message an agent's live tail says it is writing.
+    pub fn draft(&self, agent_id: &AgentId) -> Option<&crate::protocol::transcript::Draft> {
+        self.states.get(agent_id)?.tail.draft.as_ref()
+    }
+
+    /// Every agent with a draft in its live tail, and the draft.
+    pub fn drafts(
+        &self,
+    ) -> impl Iterator<Item = (AgentId, &crate::protocol::transcript::Draft)> + '_ {
+        self.states
+            .iter()
+            .filter_map(|(agent_id, layered)| Some((*agent_id, layered.tail.draft.as_ref()?)))
+    }
+
+    /// Keeps the agents `keep` names and drops the rest.
+    pub fn retain(&mut self, mut keep: impl FnMut(AgentId) -> bool) {
+        self.states.retain(|agent_id, _| keep(*agent_id));
+    }
+
     fn layered(&mut self, agent_id: AgentId) -> &mut Layered {
         self.states.entry(agent_id).or_insert_with(|| Layered {
+            agent_id,
             fold: empty_state(),
             tail: Tail::default(),
             state: empty_state(),
@@ -741,7 +763,7 @@ mod tests {
                 .blocks
                 .iter()
                 .find_map(|block| match block.as_ref() {
-                    UiBlock::MessageDraft { text } => Some(text.clone()),
+                    UiBlock::MessageDraft { text, .. } => Some(text.clone()),
                     _ => None,
                 })
         };

@@ -49,6 +49,8 @@ pub enum UiBlock {
     },
     /// Host-owned tentative outgoing text while its notebook cell has not sent.
     MessageDraft {
+        /// The agent writing it.
+        from: rho_agent_types::AgentId,
         text: String,
     },
     Tool(UiTool),

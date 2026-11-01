@@ -89,9 +89,15 @@ impl AgentCommands {
     }
 
     /// The agents whose live frames this host should stream: every open
-    /// pane, replaced wholesale.
+    /// pane, replaced wholesale. The set the host already has is not sent
+    /// again.
     pub fn focus(&self, agent_ids: Vec<AgentId>) {
-        *self.focus.lock().unwrap() = Some(agent_ids.clone());
+        let mut focus = self.focus.lock().unwrap();
+        if focus.as_ref() == Some(&agent_ids) {
+            return;
+        }
+        *focus = Some(agent_ids.clone());
+        drop(focus);
         self.send(ClientFrame::Focus { agent_ids });
     }
 }

@@ -7,10 +7,12 @@
 //! rows about, so it is answered here.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use rho_agent_types::AgentId;
 use rho_agents_client::fold::TranscriptRow;
-use rho_agents_client::state::UiAgentState;
+use rho_agents_client::protocol::transcript::Draft;
+use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{AgentStore, FrameSummary};
 use rho_agents_client::{HostTopic, TranscriptFold};
 
@@ -73,6 +75,45 @@ impl Transcripts {
 
     pub fn topic(&self, topic: HostTopic) -> Option<&UiAgentState> {
         self.topics.get(&topic)
+    }
+
+    /// A held topic with `drafts` after its messages, in place of the
+    /// drafts it had there, and what moved.
+    pub fn set_topic_drafts(
+        &mut self,
+        topic: HostTopic,
+        drafts: Vec<Arc<UiBlock>>,
+    ) -> FrameSummary {
+        let Some(held) = self.topics.get(&topic) else {
+            return FrameSummary::nothing();
+        };
+        let said = held
+            .blocks
+            .iter()
+            .rposition(|block| !matches!(**block, UiBlock::MessageDraft { .. }))
+            .map_or(0, |last| last + 1);
+        let mut state = held.clone();
+        state.blocks.truncate(said);
+        state.blocks.extend(drafts);
+        self.set_topic(topic, state)
+    }
+
+    /// Every agent whose live tail has a draft, and the draft.
+    pub fn drafts(&self) -> impl Iterator<Item = (AgentId, &Draft)> + '_ {
+        self.store.drafts()
+    }
+
+    pub fn draft(&self, agent_id: &AgentId) -> Option<&Draft> {
+        self.store.draft(agent_id)
+    }
+
+    /// Drops the live tails of agents that have no transcript open and
+    /// that `keep` does not name: no live frame comes for them any more,
+    /// so what their tail says has gone stale.
+    pub fn forget_live_except(&mut self, keep: impl Fn(AgentId) -> bool) {
+        let open = &self.open;
+        self.store
+            .retain(|agent_id| open.contains_key(&agent_id) || keep(agent_id));
     }
 
     pub fn forget_topic(&mut self, topic: HostTopic) {
