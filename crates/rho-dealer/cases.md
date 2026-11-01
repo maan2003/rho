@@ -31,10 +31,10 @@ read it now:
 ```
 
 The user sees a topic explicitly: a done, or a message of their own in
-it, sees it through to its newest message. Opening it sees nothing; the
-user marks it read, through its newest message or through one they pick.
-Reading is all a result wants, but an ask waits for an answer. A card is titled by the topic's name, and its
-context is its stream.
+it, sees it through to its newest message. Opening it sees nothing. Done
+is also how the user says they read a topic, through its newest message
+or through one they pick: there is no separate read. A card is titled by
+the topic's name, and its context is its stream.
 
 | # | History and facts | Card |
 |---|---|---|
@@ -45,7 +45,7 @@ context is its stream.
 | A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
 | A6 | Seen | nothing until a newer ask or result |
 | A7 | The user wrote in the topic within the hour before the mention | a bonus, fading over the hour |
-| A8 | Marked read since the mention | a result: nothing until a newer one; an ask: still "asks" |
+| A8 | Done through a message before the mention | the mention still deals |
 | A10 | Another agent's message in the topic, mentioning the topic's agent | context, never unread; the topic deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not chat |

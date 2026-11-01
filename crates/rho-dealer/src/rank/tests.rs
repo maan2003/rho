@@ -313,7 +313,16 @@ impl World {
         self.say(node, Said::Done);
     }
 
-    /// The user had the topic in front of them through its newest message.
+    /// Done with the topic through `seen`, which may be short of its
+    /// newest message.
+    fn done_through(&mut self, node: &NodeId, seen: Seen) {
+        self.tell(Fact::Settled {
+            node: node.clone(),
+            seen,
+        });
+    }
+
+    /// What an older build wrote for "marked read".
     fn reads(&mut self, node: &NodeId) {
         self.tell(Fact::Read {
             node: node.clone(),
@@ -591,29 +600,23 @@ fn a7_a_topic_the_user_just_wrote_in_comes_back_on_top_and_chimes() {
 }
 
 #[test]
-fn a8_reading_handles_a_result_but_not_an_ask() {
+fn a8_done_through_a_message_leaves_the_mentions_after_it() {
     let mut w = world();
     let a = w.agent("a");
     let b = w.agent("b");
     w.finishes(&a);
-    w.asks(&b);
-    w.finishes(&b);
-    w.reads(&a);
-    w.reads(&b);
-    assert_eq!(
-        w.hand(),
-        "b · asks · 0m",
-        "the read result is handled; the ask waits for an answer"
-    );
+    let result = w.seen(&a);
     w.pass(mins(1));
-    w.finishes(&a);
-    assert_eq!(
-        w.hand(),
-        "b · asks · 1m\na · result · 0m ago",
-        "a result after the read is new"
-    );
-    w.writes_to(&b);
-    assert_eq!(w.hand(), "a · result · 0m ago", "writing answers the ask");
+    w.asks(&a);
+    w.done_through(&a, result);
+    assert_eq!(w.hand(), "a · asks · 0m", "the ask came after the done");
+    w.done(&a);
+    assert_eq!(w.hand(), "");
+    // An older build's "marked read" is a done that takes nothing back:
+    // it handles an ask as well as a result.
+    w.asks(&b);
+    w.reads(&b);
+    assert_eq!(w.hand(), "");
 }
 
 #[test]

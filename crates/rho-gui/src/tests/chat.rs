@@ -192,7 +192,7 @@ fn unread_counts_others_after_the_read_and_never_the_users_own(cx: &mut TestAppC
         .collect::<Vec<_>>();
     assert_eq!(listed, vec![("newer", 1), ("older", 0)], "newest first");
     workspace
-        .update(cx, |workspace, _, cx| workspace.mark_topic_read(cx))
+        .update(cx, |workspace, _, cx| workspace.topic_done(cx))
         .unwrap();
     assert_eq!(unread(&workspace, cx), (0, 0));
     let read = workspace
@@ -203,13 +203,13 @@ fn unread_counts_others_after_the_read_and_never_the_users_own(cx: &mut TestAppC
                 .get(&NodeId::Topic(host_topic(newer_topic)))
                 .facts
                 .iter()
-                .filter(|entry| matches!(entry.fact, Fact::Read { .. }))
+                .filter(|entry| matches!(entry.fact, Fact::Settled { .. }))
                 .count()
         })
         .unwrap();
     assert_eq!(read, 1);
     workspace
-        .update(cx, |workspace, _, cx| workspace.mark_topic_read(cx))
+        .update(cx, |workspace, _, cx| workspace.topic_done(cx))
         .unwrap();
     let again = workspace
         .update(cx, |workspace, _, _| {
@@ -221,13 +221,73 @@ fn unread_counts_others_after_the_read_and_never_the_users_own(cx: &mut TestAppC
                 .len()
         })
         .unwrap();
-    assert_eq!(again, 1, "marking it read again says nothing new");
+    assert_eq!(again, 1, "done again says nothing new");
 }
 
-/// "Mark read through here" reads up to the message at point and no
-/// further: what came after it stays unread.
+/// Done on a topic the user already read still takes its todo back, and
+/// `shift-u` puts the todo back.
 #[gpui::test]
-fn marking_read_through_a_message_leaves_the_later_ones_unread(cx: &mut TestAppContext) {
+fn done_takes_back_a_todo_on_a_read_topic_and_undo_restores_it(cx: &mut TestAppContext) {
+    let member = agent(912);
+    let (workspace, _host) = attached(cx, member);
+    let start = started("chores", 1);
+    let topic = TopicId(start.seq);
+    feed(
+        &workspace,
+        cx,
+        vec![start, posted(topic, Address::User, "remind me", 2)],
+    );
+    let node = NodeId::Topic(host_topic(topic));
+    let todo = |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, _| {
+                workspace
+                    .attention
+                    .marks
+                    .get(&node)
+                    .facts()
+                    .todo()
+                    .is_some()
+            })
+            .unwrap()
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.write_marks(
+                vec![
+                    Fact::Todo {
+                        node: node.clone(),
+                        start: None,
+                        seen: rho_dealer::facts::Seen::Topic(0),
+                    }
+                    .into(),
+                ],
+                cx,
+            );
+            workspace.open_topic(host_topic(topic), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(todo(&workspace, cx));
+    workspace
+        .update(cx, |workspace, _, cx| workspace.topic_done(cx))
+        .unwrap();
+    assert!(
+        !todo(&workspace, cx),
+        "the user wrote last, and done still settles"
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.undo_verdict(window, cx)
+        })
+        .unwrap();
+    assert!(todo(&workspace, cx), "undo takes the done back");
+}
+
+/// "Done through here" reads up to the message at point and no further:
+/// what came after it stays unread.
+#[gpui::test]
+fn done_through_a_message_leaves_the_later_ones_unread(cx: &mut TestAppContext) {
     let member = agent(911);
     let (workspace, _host) = attached(cx, member);
     let start = started("steps", 1);
@@ -253,7 +313,7 @@ fn marking_read_through_a_message_leaves_the_later_ones_unread(cx: &mut TestAppC
     let unread = workspace
         .update(cx, |workspace, _, cx| {
             let before = workspace.unread(host_topic(topic));
-            workspace.mark_read_through_here(cx);
+            workspace.topic_done_through_here(cx);
             (before, workspace.unread(host_topic(topic)))
         })
         .unwrap();

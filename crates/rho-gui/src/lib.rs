@@ -113,7 +113,7 @@ actions!(
         HomeOpenRow,
         TopicFollowLink,
         TopicsOpenRow,
-        TopicsMarkRead,
+        TopicsDone,
         TopicsToggleResolved,
     ]
 );
@@ -365,13 +365,13 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("enter", TopicFollowLink, Some(&context)),
         ]);
     }
-    // The streams and topics read like Home: `enter` opens the row, `r`
-    // marks it read, `t` shows or hides the resolved topics, `q` closes.
+    // The streams and topics read like Home: `enter` opens the row, `d`
+    // is done with it, `t` shows or hides the resolved topics, `q` closes.
     for mode in ["normal", "helix_normal"] {
         let context = format!("RhoTopics > Editor && vim_mode == {mode} && !VimDeal");
         cx.bind_keys([
             KeyBinding::new("enter", TopicsOpenRow, Some(&context)),
-            KeyBinding::new("r", TopicsMarkRead, Some(&context)),
+            KeyBinding::new("d", TopicsDone, Some(&context)),
             KeyBinding::new("t", TopicsToggleResolved, Some(&context)),
             KeyBinding::new("q", SurfaceClose, Some(&context)),
         ]);

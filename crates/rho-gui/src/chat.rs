@@ -2,10 +2,10 @@
 //! browser, search over the messages this GUI holds, `#N` links, and the
 //! edits a topic takes (its name, stream, resolved, members, messages).
 //!
-//! Read state is a fact in the ledger ([`Fact::Read`]), so every device
+//! Read state is a done in the ledger ([`Fact::Settled`]), so every device
 //! agrees on it, and only the user says it: opening a topic marks nothing.
-//! Unread is everything after the newest of what the user marked read,
-//! what they settled, and what they wrote, less their own messages.
+//! Unread is everything after the newer of what the user was done with
+//! and what they wrote, less their own messages.
 
 use std::collections::BTreeMap;
 
@@ -41,15 +41,15 @@ impl Workspace {
         }
     }
 
-    /// Where unread starts: the newest of what the user read, settled, and
-    /// wrote.
+    /// Where unread starts: the newer of what the user was done with and
+    /// what they wrote.
     pub(crate) fn read_through(&self, conversation: HostTopic) -> Option<MessageId> {
         let read = self
             .attention
             .marks
             .get(&NodeId::Topic(conversation))
             .facts()
-            .read_topic()
+            .seen_topic()
             .map(|read| MessageId(ChatSeq(read)));
         let wrote = self
             .chat
@@ -58,27 +58,41 @@ impl Workspace {
         read.max(wrote)
     }
 
-    /// The conversation is read through `through`. Said only when that
-    /// moves where it is read, so saying it again writes nothing.
-    pub(crate) fn mark_read(
+    /// The user is done with the conversation through `through`: it is
+    /// read that far, and its todo, deadline and snooze are taken back.
+    /// Said only when that changes something, so saying it again writes
+    /// nothing.
+    pub(crate) fn done_through(
         &mut self,
         conversation: HostTopic,
         through: MessageId,
         cx: &mut Context<Self>,
     ) {
-        if self.read_through(conversation) >= Some(through) {
+        let node = NodeId::Topic(conversation);
+        let facts = self.attention.marks.get(&node).facts();
+        let pending =
+            facts.todo().is_some() || facts.deadline().is_some() || facts.snooze().is_some();
+        if !pending && self.read_through(conversation) >= Some(through) {
             return;
         }
-        self.write_marks(
+        let takeback = self.write_marks(
             vec![
-                Fact::Read {
-                    node: NodeId::Topic(conversation),
+                Fact::Settled {
+                    node,
                     seen: Seen::Topic(through.0.0),
                 }
                 .into(),
             ],
             cx,
         );
+        self.attention.push_undo(crate::attention::Undo {
+            sequence: 0,
+            verb: "done".to_owned(),
+            takeback,
+            card: None,
+            slack_cursors: Vec::new(),
+            slack_muted: None,
+        });
     }
 }
 
@@ -613,27 +627,27 @@ impl Workspace {
             .or_else(|| self.browser_target(cx))
     }
 
-    /// `space o r`, and `r` in the browser: the topic is read through its
-    /// newest message.
-    pub(crate) fn mark_topic_read(&mut self, cx: &mut Context<Self>) {
+    /// `space o r`, and `d` in the browser: done with the topic through
+    /// its newest message.
+    pub(crate) fn topic_done(&mut self, cx: &mut Context<Self>) {
         let Some(conversation) = self.chat_subject(cx) else {
-            self.notice_on(None, "mark read: no topic here", StyleClass::SystemInfo, cx);
+            self.notice_on(None, "done: no topic here", StyleClass::SystemInfo, cx);
             return;
         };
         let Some(newest) = self.newest_message(conversation) else {
             return;
         };
-        self.mark_read(conversation, newest, cx);
+        self.done_through(conversation, newest, cx);
     }
 
-    /// `space o shift-r`: the topic in view is read through the message at
-    /// point.
-    pub(crate) fn mark_read_through_here(&mut self, cx: &mut Context<Self>) {
+    /// `space o shift-r`: done with the topic in view through the message
+    /// at point. A mention after it still deals.
+    pub(crate) fn topic_done_through_here(&mut self, cx: &mut Context<Self>) {
         let Some((conversation, id, _)) = self.message_here(cx) else {
             self.notice_on(None, "no message at point", StyleClass::SystemInfo, cx);
             return;
         };
-        self.mark_read(conversation, id, cx);
+        self.done_through(conversation, id, cx);
     }
 }
 

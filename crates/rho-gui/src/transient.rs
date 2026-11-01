@@ -95,10 +95,10 @@ pub(crate) enum Command {
     YankMessageLink,
     /// The message at point, quoted in the reply.
     QuoteMessage,
-    /// The topic read through its newest message.
-    MarkRead,
-    /// The topic read through the message at point.
-    MarkReadHere,
+    /// Done with the topic through its newest message.
+    TopicDone,
+    /// Done with the topic through the message at point.
+    TopicDoneHere,
     RenameTopic,
     TopicStream,
     ToggleResolved,
@@ -612,11 +612,11 @@ pub(crate) fn chat_menu() -> Menu {
             "search messages…",
             MenuAction::Command(Command::SearchChat),
         )
-        .item("r", "mark read", MenuAction::Command(Command::MarkRead))
+        .item("r", "done", MenuAction::Command(Command::TopicDone))
         .item(
             "shift-r",
-            "mark read through here",
-            MenuAction::Command(Command::MarkReadHere),
+            "done through here",
+            MenuAction::Command(Command::TopicDoneHere),
         )
         .item(
             "y",

@@ -7047,8 +7047,8 @@ impl Workspace {
             Command::SearchChat => self.prompt_search_chat(window, cx),
             Command::YankMessageLink => self.yank_message_link(cx),
             Command::QuoteMessage => self.quote_message(window, cx),
-            Command::MarkRead => self.mark_topic_read(cx),
-            Command::MarkReadHere => self.mark_read_through_here(cx),
+            Command::TopicDone => self.topic_done(cx),
+            Command::TopicDoneHere => self.topic_done_through_here(cx),
             Command::RenameTopic => self.prompt_rename_topic(window, cx),
             Command::TopicStream => self.prompt_topic_stream(window, cx),
             Command::ToggleResolved => self.toggle_resolved(window, cx),
@@ -9284,8 +9284,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::TopicsOpenRow, window, cx| {
                 this.browser_open_row(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::TopicsMarkRead, _, cx| {
-                this.mark_topic_read(cx);
+            .on_action(cx.listener(|this, _: &crate::TopicsDone, _, cx| {
+                this.topic_done(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::TopicsToggleResolved, _, cx| {
                 this.browser_toggle_resolved(cx);

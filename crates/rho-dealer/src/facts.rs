@@ -160,8 +160,9 @@ pub enum Fact {
         label: uuid::Uuid,
         host: Option<String>,
     },
-    /// Marked read this far. Unlike a done it takes nothing back; it only
-    /// says where unread starts. Later still than `Host`.
+    /// Marked read this far. Older builds wrote it and none writes it
+    /// now: done is how the user says they read a topic. It still counts
+    /// as seen, and takes nothing back. Later still than `Host`.
     Read {
         node: NodeId,
         seen: Seen,
@@ -247,12 +248,15 @@ impl<'a> Facts<'a> {
 
     fn seen(self) -> impl Iterator<Item = &'a Seen> {
         self.0.iter().filter_map(|entry| match &entry.fact {
-            Fact::Settled { seen, .. } | Fact::Todo { seen, .. } => Some(seen),
+            Fact::Settled { seen, .. } | Fact::Todo { seen, .. } | Fact::Read { seen, .. } => {
+                Some(seen)
+            }
             _ => None,
         })
     }
 
-    /// The newest message of a topic the user had seen when done with it.
+    /// The newest message of a topic the user had seen when done with it:
+    /// where its unread starts, and what its card has handled.
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
@@ -260,22 +264,6 @@ impl<'a> Facts<'a> {
                 _ => None,
             })
             .max()
-    }
-
-    /// The newest message of a topic the user marked read, or had seen
-    /// when done with it.
-    pub fn read_topic(self) -> Option<u64> {
-        self.0
-            .iter()
-            .filter_map(|entry| match &entry.fact {
-                Fact::Read {
-                    seen: Seen::Topic(id),
-                    ..
-                } => Some(*id),
-                _ => None,
-            })
-            .max()
-            .max(self.seen_topic())
     }
 
     /// The newest Slack message the user had seen when done with a unit.
