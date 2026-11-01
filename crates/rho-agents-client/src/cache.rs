@@ -46,9 +46,6 @@ const DELIVERED: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("gui
 /// The topic each message is in now, by host and position: where a move
 /// finds it, and where a link to it leads.
 const WHERE: TableDefinition<(&str, u64), u64> = TableDefinition::new("gui_chat_where_v1");
-/// Temporary: the agents' messages before [`WHERE`], with their topic.
-const DELIVERED_V1: TableDefinition<(AgentId, u64), u64> =
-    TableDefinition::new("gui_chat_agent_v1");
 /// The rows of each agent whose transcript was opened, by position.
 const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
     TableDefinition::new("gui_agent_rows_v1");
@@ -70,56 +67,15 @@ const MAIN_OUTBOX: TableDefinition<(AgentId, u64), Lenient<from_main::Outgoing>>
     TableDefinition::new("gui_agent_outbox_v1");
 const MAIN_DRAFTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_draft_v1");
 
-/// Tables nothing reads: the per-agent journal mirror the workset log
-/// replaced, the mail the chat replaced, and their retired formats.
-/// Dropped on open, every open.
-const RETIRED_TABLES: [&str; 41] = [
-    // Mail, which the chat replaced; the host keeps all of it as chat.
-    // Thread drafts were never shipped, so they held no one's words.
-    "gui_host_v1",
-    "gui_mail_v1",
-    "gui_thread_draft_v1",
-    // The rows of whole worksets; a transcript reads its agent's alone.
-    "gui_workset_rows_v1",
-    // A copy of the dealer's marks per agent, which only agent cards read.
-    "gui_agent_verdict_v2",
+/// `main`'s copy, which nothing reads: a host moved from `main` sends its
+/// chat again from the start. Dropped on open, every open. `main` dropped
+/// its own older tables itself.
+const RETIRED_TABLES: [&str; 5] = [
     "gui_mirror_host_v10",
     "gui_mirror_events_v10",
     "gui_agent_digest_v7",
     "gui_agent_host_v5",
-    // Verdicts counted journal positions; now the conversation counts.
     "gui_agent_verdict_v1",
-    "gui_mirror_host_v9",
-    "gui_mirror_events_v9",
-    "gui_agent_digest_v6",
-    "gui_mirror_host_v8",
-    "gui_mirror_events_v8",
-    "gui_agent_digest_v5",
-    "gui_mirror_host_v7",
-    "gui_mirror_events_v7",
-    "gui_mirror_host_v6",
-    "gui_mirror_events_v6",
-    "gui_agent_host_v4",
-    "gui_agent_digest_v4",
-    "gui_agent_host_v2",
-    "gui_agent_digest_v2",
-    "gui_mirror_host_v4",
-    "gui_mirror_events_v4",
-    "gui_agent_head_v1",
-    "gui_agent_story_v1",
-    "gui_agent_attention_v1",
-    "gui_mirror_events_v1",
-    "gui_mirror_host_v1",
-    "gui_mirror_events_v2",
-    "gui_mirror_host_v2",
-    "gui_mirror_host_v3",
-    "gui_mirror_events_v3",
-    "gui_agent_host_v1",
-    "gui_agent_digest_v1",
-    "gui_mirror_host_v5",
-    "gui_mirror_events_v5",
-    "gui_agent_host_v3",
-    "gui_agent_digest_v3",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -243,7 +199,6 @@ impl Mirror {
             open_or_rebuild(&mut write, DELIVERED);
             open_or_rebuild(&mut write, WHERE);
             open_or_rebuild(&mut write, ROWS);
-            index_before_where(&mut write);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
             for table in RETIRED_TABLES {
@@ -648,39 +603,6 @@ fn apply(
             }
         }
         Write::Flush(done) => flushed.push(done),
-    }
-}
-
-/// Temporary: a copy written before [`WHERE`] gets it from the keys of
-/// [`MESSAGES`], and its [`DELIVERED_V1`] rows lose the topic.
-fn index_before_where(write: &mut rho_db::WriteTxn) {
-    let held = write.open_table(WHERE).iter().next().is_some();
-    if !held {
-        let keys = write
-            .open_table(MESSAGES)
-            .iter()
-            .map(|(key, _)| {
-                let (host, topic, seq) = key.value();
-                (host.to_owned(), topic, seq)
-            })
-            .collect::<Vec<_>>();
-        let mut index = write.open_table(WHERE);
-        for (host, topic, seq) in keys {
-            index.insert((host.as_str(), seq), topic);
-        }
-    }
-    if write.try_open_table(DELIVERED_V1).is_some() {
-        let keys = write
-            .open_table(DELIVERED_V1)
-            .iter()
-            .map(|(key, _)| key.value())
-            .collect::<Vec<_>>();
-        let mut delivered = write.open_table(DELIVERED);
-        for key in keys {
-            delivered.insert(key, ());
-        }
-        drop(delivered);
-        write.delete_table(DELIVERED_V1.name());
     }
 }
 

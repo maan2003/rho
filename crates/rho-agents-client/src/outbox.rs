@@ -32,9 +32,7 @@ pub enum Destination {
 pub struct Outgoing {
     pub at: UnixMs,
     pub content: Vec<ContentPart>,
-    /// Agents that receive it without being members of its topic. A
-    /// message kept before there were mentions has none.
-    #[senax(default)]
+    /// Agents that receive it without being members of its topic.
     pub mentions: Vec<AgentId>,
     pub to: Destination,
 }
@@ -334,33 +332,6 @@ mod tests {
                 mentions: vec![agent],
                 content: text("second"),
             }))
-        );
-    }
-
-    /// A message kept before messages had mentions reads back with none.
-    #[test]
-    fn a_message_kept_without_mentions_reads_back() {
-        #[derive(senax_encoder::Encode)]
-        struct Before {
-            at: UnixMs,
-            content: Vec<ContentPart>,
-            to: Destination,
-        }
-        let mut bytes = senax_encoder::encode(&Before {
-            at: UnixMs(5),
-            content: text("kept"),
-            to: Destination::Topic(topic(4)),
-        })
-        .unwrap();
-        let read: Outgoing = senax_encoder::decode(&mut bytes).unwrap();
-        assert_eq!(
-            read,
-            Outgoing {
-                at: UnixMs(5),
-                content: text("kept"),
-                mentions: Vec::new(),
-                to: Destination::Topic(topic(4)),
-            }
         );
     }
 }
