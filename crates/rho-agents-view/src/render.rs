@@ -9,6 +9,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use rho_agent_types::{Address, AgentId, Mention};
+use rho_agents_client::chat::Membership;
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
@@ -134,9 +135,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         | UiBlock::MessageDraft { .. }
         | UiBlock::Tool(_)
         | UiBlock::Notice { .. } => BlockKind::Response { working: true },
-        UiBlock::QueuedMessage { .. } | UiBlock::Unsent { .. } | UiBlock::Status { .. } => {
-            BlockKind::QueuedUser
-        }
+        UiBlock::QueuedMessage { .. }
+        | UiBlock::Unsent { .. }
+        | UiBlock::Status { .. }
+        | UiBlock::Member { .. } => BlockKind::QueuedUser,
         UiBlock::AgentMessage { .. } => BlockKind::User,
         UiBlock::ChatMessage { from, .. } => match from {
             Address::User => BlockKind::User,
@@ -164,6 +166,7 @@ pub fn block_visible(block: &UiBlock) -> bool {
         | UiBlock::Unsent { text }
         | UiBlock::Status { text }
         | UiBlock::ChatMessage { text, .. } => !text.is_empty(),
+        UiBlock::Member { .. } => true,
     }
 }
 
@@ -493,6 +496,19 @@ pub fn render_block_with_agent_labels(
                     spans.push(Span::new(text, StyleClass::Default));
                 }
             }
+        }
+        // A line apart, like a status: who reads the topic from here.
+        UiBlock::Member { agent, change } => {
+            spans.extend(separator(prev, kind));
+            let verb = match change {
+                Membership::Joined => "joined",
+                Membership::Left => "left",
+            };
+            spans.push(Span::new(
+                format!("{} {verb}", agent_label(*agent)),
+                StyleClass::SystemInfo,
+            ));
+            spans.push(Span::new("\n\n", StyleClass::Default));
         }
         UiBlock::Status { text } => {
             if text.is_empty() {
@@ -922,6 +938,22 @@ mod tests {
             after(Some(BlockKind::User), Address::Agent(b), Vec::new(), true),
             "Bob\nwords\n",
             "the user's message already ends with a blank line"
+        );
+        let member = |prev, change| {
+            text_of(
+                &render_block_with_agent_labels(
+                    &UiBlock::Member { agent: b, change },
+                    prev,
+                    0,
+                    &label,
+                )
+                .spans,
+            )
+        };
+        assert_eq!(member(response, Membership::Joined), "\nBob joined\n\n");
+        assert_eq!(
+            member(Some(BlockKind::User), Membership::Left),
+            "Bob left\n\n"
         );
     }
 

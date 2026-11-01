@@ -1229,9 +1229,7 @@ mod tests {
         assert_eq!(topics_moved(&last), [TOPIC], "and every topic");
         assert_eq!(mentions(&model), [MentionKind::Ask, MentionKind::Ask]);
         assert!(
-            !model.hosts[&HOST].chat.topics[&TOPIC]
-                .members
-                .contains_key(&agent(2)),
+            !model.hosts[&HOST].chat.topics[&TOPIC].is_member(agent(2)),
             "posting does not join the topic"
         );
     }

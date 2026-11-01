@@ -106,7 +106,7 @@ fn open_at(
 ) {
     workspace
         .update(cx, |workspace, window, cx| {
-            let mut state = rho_agents_client::chat::topic_state(&[], &[]);
+            let mut state = rho_agents_client::chat::topic_state(&[], &[], &[]);
             state.blocks = messages
                 .iter()
                 .map(|(id, from, text)| {
@@ -437,6 +437,57 @@ fn removing_a_member_sends_leave(cx: &mut TestAppContext) {
         panic!("removing a member: {call:?}");
     };
     assert_eq!((leave.topic, leave.agent), (topic, member));
+}
+
+/// A topic shows each join and leave where it happened, and `space o w`
+/// tells who is in it now.
+#[gpui::test]
+fn a_topic_shows_who_joined_and_left_and_tells_its_members(cx: &mut TestAppContext) {
+    let (stays, goes) = (agent(961), agent(962));
+    let (workspace, _host) = attached(cx, stays);
+    let start = started("with two", 1);
+    let topic = TopicId(start.seq);
+    let change = |at, event| story::record(UnixMs(at), event);
+    feed(
+        &workspace,
+        cx,
+        vec![
+            start,
+            change(2, ChatEvent::Joined { topic, agent: goes }),
+            change(
+                3,
+                ChatEvent::Joined {
+                    topic,
+                    agent: stays,
+                },
+            ),
+            change(4, ChatEvent::Left { topic, agent: goes }),
+        ],
+    );
+    let labels = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_topic(host_topic(topic), window, cx);
+            workspace.show_members(cx);
+            [stays, goes].map(|agent| workspace.registry.agent_short_label(agent))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let [stays, goes] = labels;
+    let echo = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.echo_text_for_test().map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(echo.as_deref(), Some(format!("members: {stays}").as_str()));
+    let editor = super::active_editor(&workspace, cx);
+    let text = workspace
+        .update(cx, |_, _, cx| editor.read(cx).text(cx))
+        .unwrap();
+    assert_eq!(
+        text.trim_end(),
+        format!("{goes} joined\n\n{stays} joined\n\n{goes} left"),
+        "in the order they happened"
+    );
 }
 
 /// `enter` on `#N` in a topic opens topic N; on `#M` for a message in the

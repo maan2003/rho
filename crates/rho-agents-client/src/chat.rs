@@ -15,6 +15,7 @@ use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ChatSeq, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs,
 };
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::fold::one_line;
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock};
@@ -46,10 +47,10 @@ pub struct Topic {
     /// Done with: a resolved topic's work is finished.
     pub resolved: bool,
     pub started_at: UnixMs,
-    /// Its members, each with the `Joined` that made it one: it receives
-    /// every message after that. Posting or being mentioned does not make
-    /// an agent a member.
-    pub members: BTreeMap<AgentId, ChatSeq>,
+    /// Every join and leave, oldest first: who its members are at any
+    /// point. A member receives every message after its join. Posting or
+    /// being mentioned does not make an agent a member.
+    pub membership: Vec<MemberChange>,
     /// The newest message in it.
     pub newest: Option<(MessageId, UnixMs)>,
     /// The newest message an agent posted in it.
@@ -61,6 +62,21 @@ pub struct Topic {
     /// Every message in it not from the user, oldest first: what can be
     /// unread.
     pub others: Vec<MessageId>,
+}
+
+/// An agent joining or leaving a topic, where its log says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberChange {
+    pub at: ChatSeq,
+    pub agent: AgentId,
+    pub change: Membership,
+}
+
+/// Which way a [`MemberChange`] goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Membership {
+    Joined,
+    Left,
 }
 
 /// What the fold keeps of each message of a topic, so a move can work out
@@ -77,17 +93,31 @@ impl Topic {
     /// Every agent in it: its members, and the agents that mentioned the
     /// user in it.
     pub fn agents(&self) -> impl Iterator<Item = AgentId> + '_ {
-        self.members
-            .keys()
-            .copied()
+        self.members_in_order()
+            .into_iter()
             .chain(self.mentions.iter().map(|mention| mention.by))
     }
 
     /// The members in the order they joined.
     pub fn members_in_order(&self) -> Vec<AgentId> {
-        let mut members = self.members.iter().collect::<Vec<_>>();
-        members.sort_by_key(|(agent, since)| (**since, **agent));
-        members.into_iter().map(|(agent, _)| *agent).collect()
+        self.members_before(ChatSeq(u64::MAX))
+    }
+
+    /// The members just before the record at `seq`, in the order they
+    /// joined.
+    fn members_before(&self, seq: ChatSeq) -> Vec<AgentId> {
+        let mut members = Vec::new();
+        for change in self.membership.iter().take_while(|change| change.at < seq) {
+            match change.change {
+                Membership::Joined => members.push(change.agent),
+                Membership::Left => members.retain(|agent| *agent != change.agent),
+            }
+        }
+        members
+    }
+
+    pub fn is_member(&self, agent: AgentId) -> bool {
+        self.members_in_order().contains(&agent)
     }
 
     /// How far the user has seen it: as far as they said they had, and
@@ -177,7 +207,7 @@ impl HostChat {
                         name: name.clone(),
                         resolved: false,
                         started_at: record.at,
-                        members: BTreeMap::new(),
+                        membership: Vec::new(),
                         newest: None,
                         agent_wrote: None,
                         user_wrote: None,
@@ -214,10 +244,14 @@ impl HostChat {
                     tracing::warn!(topic = topic.0.0, "a join to a topic not heard of");
                     return Told::Nothing;
                 };
-                if held.members.contains_key(agent) {
+                if held.is_member(*agent) {
                     return Told::Nothing;
                 }
-                held.members.insert(*agent, record.seq);
+                held.membership.push(MemberChange {
+                    at: record.seq,
+                    agent: *agent,
+                    change: Membership::Joined,
+                });
                 Told::Topic {
                     topic: *topic,
                     message: None,
@@ -228,9 +262,14 @@ impl HostChat {
                     tracing::warn!(topic = topic.0.0, "a leave from a topic not heard of");
                     return Told::Nothing;
                 };
-                if held.members.remove(agent).is_none() {
+                if !held.is_member(*agent) {
                     return Told::Nothing;
                 }
+                held.membership.push(MemberChange {
+                    at: record.seq,
+                    agent: *agent,
+                    change: Membership::Left,
+                });
                 Told::Topic {
                     topic: *topic,
                     message: None,
@@ -370,13 +409,7 @@ impl HostChat {
                         at: message.at,
                     });
                 }
-                let parties = reach(
-                    &mut held
-                        .members
-                        .iter()
-                        .filter(|(_, since)| **since < record.seq)
-                        .map(|(agent, _)| *agent),
-                );
+                let parties = reach(&mut held.members_before(record.seq).into_iter());
                 Told::Topic {
                     topic: *topic,
                     message: Some((message, parties)),
@@ -585,7 +618,7 @@ impl ChatMap {
             .chat
             .topics
             .iter()
-            .filter(|(_, topic)| topic.members.contains_key(&agent))
+            .filter(|(_, topic)| topic.is_member(agent))
             .max_by_key(|(id, topic)| (topic.newest.map(|(newest, _)| newest), **id))?;
         Some(HostTopic {
             machine_seed: held.machine_seed?,
@@ -594,9 +627,14 @@ impl ChatMap {
     }
 }
 
-/// A topic's messages as they were written, oldest first, then what the
-/// user wrote in it that no host has taken yet.
-pub fn topic_state(messages: &[Message], unsent: &[String]) -> UiAgentState {
+/// A topic's messages as they were written, oldest first, with each join
+/// and leave where it happened, then what the user wrote in it that no
+/// host has taken yet.
+pub fn topic_state(
+    messages: &[Message],
+    membership: &[MemberChange],
+    unsent: &[String],
+) -> UiAgentState {
     let mut writers = messages.iter().filter_map(|message| match message.from {
         Address::Agent(agent) => Some(agent),
         Address::User => None,
@@ -604,29 +642,47 @@ pub fn topic_state(messages: &[Message], unsent: &[String]) -> UiAgentState {
     let first = writers.next();
     let several = writers.any(|agent| Some(agent) != first);
     let mut last: Option<AgentId> = None;
-    let said = messages.iter().map(move |message| {
+    let mut changes = membership.iter().peekable();
+    let mut said = Vec::new();
+    for message in messages {
+        // A join or leave sits among the messages where the log has it.
+        while let Some(change) = changes.next_if(|change| change.at < message.id.0) {
+            said.push(member_block(change));
+        }
         let named = match message.from {
             Address::Agent(agent) => several && last.replace(agent) != Some(agent),
             Address::User => false,
         };
-        UiBlock::ChatMessage {
+        said.push(UiBlock::ChatMessage {
             id: message.id,
             from: message.from,
             mentions: message.mentions.clone(),
             text: rho_agent_types::transcript::text_content(&message.content),
             named,
-        }
-    });
+        });
+    }
+    said.extend(changes.map(member_block));
     let waiting = unsent
         .iter()
         .map(|text| UiBlock::Unsent { text: text.clone() });
     UiAgentState {
         exec_timings: std::sync::Arc::default(),
-        blocks: said.chain(waiting).map(std::sync::Arc::new).collect(),
+        blocks: said
+            .into_iter()
+            .chain(waiting)
+            .map(std::sync::Arc::new)
+            .collect(),
         status: UiAgentStatus::Idle,
         runtime: None,
         context_used: None,
         usage: UiAgentUsage::default(),
+    }
+}
+
+fn member_block(change: &MemberChange) -> UiBlock {
+    UiBlock::Member {
+        agent: change.agent,
+        change: change.change,
     }
 }
 
@@ -745,8 +801,8 @@ mod tests {
             "an outsider's post reaches the members, whom it mentions, and itself"
         );
         let topic = &chat.topics[&TOPIC];
-        assert!(!topic.members.contains_key(&b), "posting does not join");
-        assert!(!topic.members.contains_key(&c), "a mention does not join");
+        assert!(!topic.is_member(b), "posting does not join");
+        assert!(!topic.is_member(c), "a mention does not join");
         assert_eq!(
             parties(chat.tell(&posted(6, Address::User, &[]))),
             [a],
@@ -765,6 +821,90 @@ mod tests {
             "a join makes a member who hears what comes after"
         );
         assert_eq!(chat.topics[&TOPIC].members_in_order(), [a, b]);
+    }
+
+    /// Read back from disk, a topic's joins and leaves are all told before
+    /// its messages: each message still reaches who was a member when it
+    /// was posted, and the topic reads with each change where it happened.
+    #[test]
+    fn a_message_reaches_its_members_then_when_changes_are_told_first() {
+        let (a, b) = (agent(1), agent(2));
+        let mut chat = HostChat::default();
+        let change = |seq, agent, change| match change {
+            Membership::Joined => record(
+                seq,
+                ChatEvent::Joined {
+                    topic: TOPIC,
+                    agent,
+                },
+            ),
+            Membership::Left => record(
+                seq,
+                ChatEvent::Left {
+                    topic: TOPIC,
+                    agent,
+                },
+            ),
+        };
+        let changes = [
+            change(5, b, Membership::Joined),
+            change(7, a, Membership::Left),
+            change(9, a, Membership::Joined),
+        ];
+        for record in started(a).iter().chain(&changes) {
+            chat.tell(record);
+        }
+        let posts = [
+            posted(4, Address::User, &[]),
+            posted(6, Address::Agent(b), &[]),
+            posted(8, Address::User, &[]),
+        ];
+        let reached = posts
+            .iter()
+            .map(|post| parties(chat.tell(post)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reached,
+            [vec![a], sorted(vec![a, b]), vec![b]],
+            "a member that left later still heard what came before"
+        );
+        assert_eq!(
+            chat.topics[&TOPIC].members_in_order(),
+            [b, a],
+            "a rejoin counts from the new join"
+        );
+
+        let messages = posts
+            .iter()
+            .filter_map(Message::from_record)
+            .collect::<Vec<_>>();
+        let state = topic_state(&messages, &chat.topics[&TOPIC].membership, &[]);
+        let read = state
+            .blocks
+            .iter()
+            .map(|block| match &**block {
+                UiBlock::ChatMessage { id, named, .. } => {
+                    format!("#{}{}", id.0.0, ["", "*"][*named as usize])
+                }
+                UiBlock::Member { agent, change } => {
+                    format!("{}{change:?}", ["", "a", "b"][agent_n(*agent, a, b)])
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            ["aJoined", "#4", "bJoined", "#6", "aLeft", "#8", "aJoined"],
+            "and only one agent wrote, so nobody is named"
+        );
+    }
+
+    fn agent_n(agent: AgentId, a: AgentId, b: AgentId) -> usize {
+        match agent {
+            agent if agent == a => 1,
+            agent if agent == b => 2,
+            _ => 0,
+        }
     }
 
     /// An agent that left hears only what mentions it; a change renames,
@@ -1073,7 +1213,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(n, from)| Message::from_record(&posted(n as u64 + 4, *from, &[])))
                 .collect::<Vec<_>>();
-            topic_state(&messages, &[])
+            topic_state(&messages, &[], &[])
                 .blocks
                 .iter()
                 .map(|block| matches!(**block, UiBlock::ChatMessage { named: true, .. }))
@@ -1084,7 +1224,11 @@ mod tests {
             named(&[a, u, a, b, u, b, a]),
             [true, false, false, true, false, false, true]
         );
-        assert_eq!(named(&[u, a, u, a]), [false; 4], "one agent: its topic names it");
+        assert_eq!(
+            named(&[u, a, u, a]),
+            [false; 4],
+            "one agent: its topic names it"
+        );
     }
 
     /// A topic reads as its messages, each with who posted it and whom it
@@ -1103,7 +1247,7 @@ mod tests {
         .iter()
         .filter_map(Message::from_record)
         .collect::<Vec<_>>();
-        let state = topic_state(&messages, &["later".to_owned()]);
+        let state = topic_state(&messages, &[], &["later".to_owned()]);
         assert_eq!(
             state
                 .blocks

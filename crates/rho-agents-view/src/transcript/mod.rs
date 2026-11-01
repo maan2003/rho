@@ -929,27 +929,8 @@ impl TranscriptModel {
         self.visible.truncate(first_changed);
         for block in &state.blocks[first_changed..] {
             self.visible.push(self.view.visible(block));
-            if let UiBlock::AgentMessage { sender, .. }
-            | UiBlock::MessageSent {
-                to: Some(sender), ..
-            }
-            | UiBlock::QueuedMessage {
-                sender: Some(sender),
-                ..
-            } = &**block
-            {
-                self.agent_labels.insert(*sender, agent_label(*sender));
-            }
-            if let UiBlock::ChatMessage { from, mentions, .. } = &**block {
-                let agents = std::iter::once(*from)
-                    .chain(mentions.iter().map(|mention| mention.to))
-                    .filter_map(|address| match address {
-                        rho_agent_types::Address::Agent(agent) => Some(agent),
-                        rho_agent_types::Address::User => None,
-                    });
-                for agent in agents {
-                    self.agent_labels.insert(agent, agent_label(agent));
-                }
+            for agent in block.agents() {
+                self.agent_labels.insert(agent, agent_label(agent));
             }
             self.blocks.push(block.clone());
         }

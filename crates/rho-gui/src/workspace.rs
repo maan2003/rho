@@ -607,10 +607,12 @@ impl Workspace {
             self.refresh_topic_state(topic);
         }
         if let Some(state) = self.transcripts.topic(topic).cloned() {
+            // An agent no longer known still wrote or joined in it.
             let labels = self
                 .registry
                 .known_agents()
                 .copied()
+                .chain(state.blocks.iter().flat_map(|block| block.agents()))
                 .map(|id| (id, self.registry.agent_short_label(id)))
                 .collect();
             model.update(cx, |model, cx| {
@@ -628,14 +630,16 @@ impl Workspace {
     /// Builds a topic's state again from its messages and what waits to be
     /// sent in it, and answers what moved.
     fn refresh_topic_state(&mut self, topic: HostTopic) -> FrameSummary {
-        let messages = match self.chat.topic(topic) {
-            Some((host, _)) => self
-                .agents_client
-                .read_topic(self.registry.host_name(host), topic.topic),
-            None => Vec::new(),
+        let (messages, membership) = match self.chat.topic(topic) {
+            Some((host, held)) => (
+                self.agents_client
+                    .read_topic(self.registry.host_name(host), topic.topic),
+                held.membership.clone(),
+            ),
+            None => (Vec::new(), Vec::new()),
         };
         let unsent = self.outbox.texts(topic);
-        let mut state = rho_agents_client::chat::topic_state(&messages, &unsent);
+        let mut state = rho_agents_client::chat::topic_state(&messages, &membership, &unsent);
         state.blocks.extend(self.topic_drafts(topic));
         self.transcripts.set_topic(topic, state)
     }
@@ -4393,7 +4397,7 @@ impl Workspace {
             .map(|history| &history.current().surface.key)
             && let Some((_, held)) = self.chat.topic(*topic)
         {
-            agents.extend(held.members.keys().copied());
+            agents.extend(held.members_in_order());
         }
         agents
     }
@@ -7027,6 +7031,7 @@ impl Workspace {
             Command::RenameTopic => self.prompt_rename_topic(window, cx),
             Command::TopicStream => self.prompt_topic_stream(window, cx),
             Command::ToggleResolved => self.toggle_resolved(window, cx),
+            Command::Members => self.show_members(cx),
             Command::RemoveMember => self.prompt_remove_member(window, cx),
             Command::MoveMessages(mode) => self.prompt_move_messages(mode, window, cx),
             Command::PullCard => self.pull_card(window, cx),

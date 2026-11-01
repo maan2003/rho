@@ -894,6 +894,23 @@ impl Workspace {
         self.open_prompt("move topic to stream:", complete, on_submit, window, cx);
     }
 
+    /// `space o w`: who the topic delivers to, in the order they joined.
+    pub(crate) fn show_members(&mut self, cx: &mut Context<Self>) {
+        let Some((_, _, held)) = self.topic_subject("members", cx) else {
+            return;
+        };
+        let members = held
+            .members_in_order()
+            .into_iter()
+            .map(|agent| self.registry.agent_short_label(agent))
+            .collect::<Vec<_>>();
+        let text = match members.is_empty() {
+            true => "members: nobody has joined".to_owned(),
+            false => format!("members: {}", members.join(", ")),
+        };
+        self.echo(&text, StyleClass::SystemInfo, cx);
+    }
+
     /// `space o l`: takes a member out of the topic.
     pub(crate) fn prompt_remove_member(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((topic, host, held)) = self.topic_subject("remove member", cx) else {

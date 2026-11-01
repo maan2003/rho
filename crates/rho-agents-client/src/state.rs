@@ -96,6 +96,36 @@ pub enum UiBlock {
         /// than one agent wrote in.
         named: bool,
     },
+    /// An agent joined or left a chat topic.
+    Member {
+        agent: rho_agent_types::AgentId,
+        change: crate::chat::Membership,
+    },
+}
+
+impl UiBlock {
+    /// The agents it names: whose label drawing it needs.
+    pub fn agents(&self) -> Vec<rho_agent_types::AgentId> {
+        match self {
+            UiBlock::AgentMessage { sender, .. }
+            | UiBlock::MessageSent {
+                to: Some(sender), ..
+            }
+            | UiBlock::QueuedMessage {
+                sender: Some(sender),
+                ..
+            } => vec![*sender],
+            UiBlock::Member { agent, .. } => vec![*agent],
+            UiBlock::ChatMessage { from, mentions, .. } => std::iter::once(*from)
+                .chain(mentions.iter().map(|mention| mention.to))
+                .filter_map(|address| match address {
+                    rho_agent_types::Address::Agent(agent) => Some(agent),
+                    rho_agent_types::Address::User => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

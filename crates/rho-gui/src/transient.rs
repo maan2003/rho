@@ -102,6 +102,8 @@ pub(crate) enum Command {
     RenameTopic,
     TopicStream,
     ToggleResolved,
+    /// Who the topic in view delivers to, told in the echo line.
+    Members,
     RemoveMember,
     MoveMessages(crate::chat::MoveMode),
     // Slack.
@@ -640,6 +642,7 @@ pub(crate) fn chat_menu() -> Menu {
             "resolve / unresolve",
             MenuAction::Command(Command::ToggleResolved),
         )
+        .item("w", "who is in it", MenuAction::Command(Command::Members))
         .item(
             "l",
             "remove member…",

@@ -657,7 +657,7 @@ fn check_durable_deletion(cx: &mut TestAppContext, activity: bool) {
                 .hand(cx)
                 .cards
                 .into_iter()
-                .find(|card| matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.members.contains_key(&gone))))
+                .find(|card| matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.is_member(gone))))
                 .expect("control: the agent's topic is dealt before deletion")
         })
         .unwrap();
@@ -1577,7 +1577,7 @@ fn messages_written_offline_wait_and_go_one_by_one_under_their_ids(cx: &mut Test
         workspace
             .update(cx, |workspace, _, cx| {
                 workspace.hand(cx).cards.into_iter().find(|card| {
-                    matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.members.contains_key(&agent_id)))
+                    matches!(card.node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(topic).is_some_and(|(_, held)| held.is_member(agent_id)))
                 })
             })
             .unwrap()
@@ -5334,7 +5334,7 @@ fn dealt_topic(
         .into_iter()
         .map(|card| card.node)
         .find(|node| {
-            matches!(node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(*topic).is_some_and(|(_, held)| held.members.contains_key(&agent_id)))
+            matches!(node, rho_dealer::NodeId::Topic(topic) if workspace.chat.topic(*topic).is_some_and(|(_, held)| held.is_member(agent_id)))
         })
 }
 
@@ -5513,7 +5513,7 @@ fn an_agent_starts_from_the_message_at_point(cx: &mut TestAppContext) {
                     named: false,
                 })
             };
-            let mut state = rho_agents_client::chat::topic_state(&[], &[]);
+            let mut state = rho_agents_client::chat::topic_state(&[], &[], &[]);
             state.blocks = vec![
                 message(topic.topic.0.0 + 2, rho_agent_types::Address::User, "go"),
                 message(
