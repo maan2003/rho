@@ -115,9 +115,22 @@ enum DebugCommand {
         mention: Vec<String>,
         text: String,
     },
+    /// Wake an agent with a message from the user, in a new topic of the
+    /// stream `debug` that mentions it, so it joins the topic and answers
+    /// there. Needs no topic id.
+    SendMessage {
+        /// Full agent id, as in `$RHO_AGENT_ID`.
+        agent: String,
+        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
+        /// user's agent host.
+        #[arg(long = "socket-path")]
+        socket_path: Option<PathBuf>,
+        text: String,
+    },
 }
 
-/// Where `rho debug create-workset` puts the topic of its message.
+/// Where `rho debug create-workset` and `send-message` put the topic of
+/// their message.
 const DEBUG_STREAM: &str = "debug";
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
@@ -172,18 +185,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             if let Some(agent) = created.result.agent {
                 println!("agent {}", agent.encoded());
                 if let Some(text) = message {
-                    let stream = rho_agents_client::protocol::worksets::CreateStream {
-                        name: DEBUG_STREAM.to_owned(),
-                    };
-                    let stream = rho_rpc::protocol::client::call(socket.clone(), stream).await?;
-                    let call = rho_agents_client::protocol::worksets::StartTopic {
-                        client_id: uuid::Uuid::new_v4().as_u64_pair().0,
-                        stream,
-                        name: text.lines().next().unwrap_or_default().to_owned(),
-                        mentions: vec![agent],
-                        content: vec![rho_agent_types::ContentPart::Text { text }],
-                    };
-                    let topic = rho_rpc::protocol::client::call(socket, call).await?;
+                    let topic = start_debug_topic(&socket, agent, text).await?;
                     println!("topic {}", topic.0.0);
                 }
             }
@@ -216,7 +218,39 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             println!("message {}", id.0.0);
             Ok(())
         }
+        DebugCommand::SendMessage {
+            agent,
+            socket_path,
+            text,
+        } => {
+            let agent = rho_agent_types::parse_full_handle(&agent)
+                .with_context(|| format!("agent id {agent}"))?;
+            let topic = start_debug_topic(&host_socket(socket_path)?, agent, text).await?;
+            println!("topic {}", topic.0.0);
+            Ok(())
+        }
     }
+}
+
+/// A topic of the user's in the stream `debug`, named by the first line of
+/// `text`, whose first message is `text` and mentions `agent`.
+async fn start_debug_topic(
+    socket: &Path,
+    agent: rho_agent_types::AgentId,
+    text: String,
+) -> anyhow::Result<rho_agent_types::TopicId> {
+    let stream = rho_agents_client::protocol::worksets::CreateStream {
+        name: DEBUG_STREAM.to_owned(),
+    };
+    let stream = rho_rpc::protocol::client::call(socket, stream).await?;
+    let call = rho_agents_client::protocol::worksets::StartTopic {
+        client_id: uuid::Uuid::new_v4().as_u64_pair().0,
+        stream,
+        name: text.lines().next().unwrap_or_default().to_owned(),
+        mentions: vec![agent],
+        content: vec![rho_agent_types::ContentPart::Text { text }],
+    };
+    rho_rpc::protocol::client::call(socket, call).await
 }
 
 fn host_socket(socket_path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
