@@ -11,7 +11,8 @@ pub use crate::minibuffer::{Candidate, token_start};
 use crate::workspace::Workspace;
 
 /// Completion candidates for the text before the cursor: `@` mentions of
-/// live agents. Values replace the current whitespace-delimited token.
+/// live agents. Values replace the current whitespace-delimited token, so
+/// each keeps its `@`.
 pub fn completions_for(text_before_cursor: &str, live_agents: &[Candidate]) -> Vec<Candidate> {
     let Some(mention) = mention_prefix(text_before_cursor) else {
         return Vec::new();
@@ -21,7 +22,10 @@ pub fn completions_for(text_before_cursor: &str, live_agents: &[Candidate]) -> V
         .filter(|agent| {
             fuzzy_contains(&agent.value, mention) || fuzzy_contains(&agent.description, mention)
         })
-        .cloned()
+        .map(|agent| Candidate {
+            value: format!("@{}", agent.value),
+            description: agent.description.clone(),
+        })
         .collect()
 }
 
@@ -259,7 +263,10 @@ mod tests {
         ];
         let candidates = completions_for("ask @w", &live);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "worker");
+        assert_eq!(
+            candidates[0].value, "@worker",
+            "the token it replaces had an `@`"
+        );
     }
 
     #[test]

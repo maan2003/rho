@@ -8,7 +8,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_types::{Address, AgentId, Mention, MentionKind};
+use rho_agent_types::{Address, AgentId, Mention};
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
@@ -168,8 +168,8 @@ pub fn block_visible(block: &UiBlock) -> bool {
 }
 
 /// Who a chat message is from and whom it mentions, as its header line
-/// says it: `eng-x · asks you · fyi for eng-y`. Empty for the user's own
-/// message that mentions nobody.
+/// says it: `eng-x @eng-y`. Empty for the user's own message, whose text
+/// already says whom it mentions.
 pub fn chat_header(
     from: Address,
     mentions: &[Mention],
@@ -181,8 +181,8 @@ pub fn chat_header(
         parts.push(agent_label(sender));
     }
     // A mention of the user and its kind are for the dealer; a mention of
-    // an agent says who else reads it.
-    for mention in mentions {
+    // an agent says who else reads it. The user typed theirs in the text.
+    for mention in mentions.iter().filter(|_| from != Address::User) {
         if let Address::Agent(agent) = mention.to {
             parts.push(format!("@{}", agent_label(agent)));
         }
@@ -469,6 +469,11 @@ pub fn render_block_with_agent_labels(
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
+            // A named message starts another agent's run: a blank line
+            // parts it from the run above, as a new turn would.
+            if *named && matches!(prev, Some(BlockKind::Response { .. })) {
+                spans.push(Span::new("\n", StyleClass::Default));
+            }
             let header = chat_header(*from, mentions, *named, agent_label);
             if !header.is_empty() {
                 spans.push(Span::new(format!("{header}\n"), StyleClass::AgentLabel));
@@ -843,19 +848,20 @@ fn json_text_field(arguments: &str, key: &str, format: ArgumentsFormat) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{MentionKind, UnixMs};
 
     use super::*;
 
     /// A topic's message names its sender only when told to, and names
     /// the agents it mentions; a mention of the user and every kind say
-    /// nothing here.
+    /// nothing here, and the user's own mentions are already in its text.
+    /// A named message after another agent's run starts with a blank line.
     #[test]
     fn a_chat_message_names_its_sender_and_mentions() {
         let a = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let b = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let label = |agent: AgentId| if agent == a { "Ann" } else { "Bob" }.to_owned();
-        let rendered = |from, mentions: Vec<Mention>, named| {
+        let after = |prev, from, mentions: Vec<Mention>, named| {
             text_of(
                 &render_block_with_agent_labels(
                     &UiBlock::ChatMessage {
@@ -865,29 +871,57 @@ mod tests {
                         text: "words".into(),
                         named,
                     },
-                    None,
+                    prev,
                     0,
                     &label,
                 )
                 .spans,
             )
         };
+        let rendered = |from, mentions, named| after(None, from, mentions, named);
         let mention = |to, kind| Mention { to, kind };
         let both = vec![
             mention(Address::User, MentionKind::Ask),
             mention(Address::Agent(b), MentionKind::Fyi),
         ];
         assert_eq!(rendered(Address::User, Vec::new(), false), "words\n\n");
-        assert_eq!(rendered(Address::Agent(a), both.clone(), true), "Ann @Bob\nwords\n");
+        assert_eq!(
+            rendered(Address::Agent(a), both.clone(), true),
+            "Ann @Bob\nwords\n"
+        );
         assert_eq!(rendered(Address::Agent(a), both, false), "@Bob\nwords\n");
         assert_eq!(
-            rendered(Address::Agent(a), vec![mention(Address::User, MentionKind::Result)], false),
+            rendered(
+                Address::Agent(a),
+                vec![mention(Address::User, MentionKind::Result)],
+                false
+            ),
             "words\n",
             "a result for the user is the dealer's"
         );
         assert_eq!(
-            rendered(Address::User, vec![mention(Address::Agent(b), MentionKind::Ask)], false),
-            "@Bob\nwords\n\n"
+            rendered(
+                Address::User,
+                vec![mention(Address::Agent(b), MentionKind::Ask)],
+                false
+            ),
+            "words\n\n",
+            "the user typed the mention into the text"
+        );
+        let response = Some(BlockKind::Response { working: false });
+        assert_eq!(
+            after(response, Address::Agent(b), Vec::new(), true),
+            "\nBob\nwords\n"
+        );
+        assert_eq!(
+            after(response, Address::Agent(a), Vec::new(), false),
+            "words\n",
+            "a run goes on without a gap"
+        );
+        assert_eq!(
+            after(Some(BlockKind::User), Address::Agent(b), Vec::new(), true),
+            "Bob\nwords\n",
+            "the user's message already ends with a blank line"
         );
     }
 
