@@ -21,6 +21,7 @@ use story::ready_with;
 
 mod agent_status;
 mod call_punctuation;
+mod chat;
 mod editor_shutdown;
 mod elision_block_geometry;
 mod elision_caret;

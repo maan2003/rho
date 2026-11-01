@@ -3,6 +3,7 @@
 pub mod application;
 pub(crate) mod attention;
 pub(crate) mod browser;
+pub(crate) mod chat;
 pub(crate) mod chat_migration;
 pub(crate) mod chime;
 pub(crate) mod commands;
@@ -22,6 +23,7 @@ mod selection;
 pub mod slack;
 mod slack_navigation;
 pub mod telemetry;
+pub mod topics_view;
 #[doc(hidden)]
 pub mod transient;
 pub(crate) mod usage;
@@ -110,6 +112,10 @@ actions!(
         NoteOpenRow,
         MessagesOpen,
         HomeOpenRow,
+        TopicFollowLink,
+        TopicsOpenRow,
+        TopicsMarkRead,
+        TopicsToggleResolved,
     ]
 );
 
@@ -355,6 +361,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("n", SearchRepeat, Some(&context)),
             KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
+            // `#N` in a topic is a link: `enter` on it goes there. Off a
+            // link the key is vim's.
+            KeyBinding::new("enter", TopicFollowLink, Some(&context)),
+        ]);
+    }
+    // The streams and topics read like Home: `enter` opens the row, `r`
+    // marks it read, `t` shows or hides the resolved topics, `q` closes.
+    for mode in ["normal", "helix_normal"] {
+        let context = format!("RhoTopics > Editor && vim_mode == {mode} && !VimDeal");
+        cx.bind_keys([
+            KeyBinding::new("enter", TopicsOpenRow, Some(&context)),
+            KeyBinding::new("r", TopicsMarkRead, Some(&context)),
+            KeyBinding::new("t", TopicsToggleResolved, Some(&context)),
+            KeyBinding::new("q", SurfaceClose, Some(&context)),
         ]);
     }
     // Slack reads the same way: `enter` opens the row or the thread the

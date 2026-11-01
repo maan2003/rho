@@ -121,7 +121,8 @@ pub fn reset() {
     TOPICS.with(|topics| topics.borrow_mut().clear());
 }
 
-fn record(at: UnixMs, event: ChatEvent) -> ChatRecord {
+/// A record past the last event told.
+pub fn record(at: UnixMs, event: ChatEvent) -> ChatRecord {
     let seq = CHAT_HEAD.with(|head| {
         head.set(head.get() + 1);
         ChatSeq(head.get())

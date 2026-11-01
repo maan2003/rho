@@ -40,6 +40,8 @@ pub enum SurfaceKey {
     /// One topic: its messages as written, and a reply box that posts in
     /// it.
     Topic(rho_agents_client::HostTopic),
+    /// Every stream and its topics, with what is unread.
+    Topics,
     /// What one agent did: its tool calls and their output.
     Activity(AgentId),
     File {

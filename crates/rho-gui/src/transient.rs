@@ -46,6 +46,8 @@ pub(crate) enum MenuId {
     Input,
     Agent,
     Chat,
+    /// `space o x`: which messages a move takes.
+    MoveMessages,
     New,
     Status,
     /// `space s u`: which usage chart to look at.
@@ -85,6 +87,23 @@ pub(crate) enum Command {
     Mention,
     /// The conversations agents have with each other.
     Directs,
+    /// The streams and their topics.
+    Topics,
+    /// The messages this GUI holds, searched.
+    SearchChat,
+    /// The `#N` of the message at point, on the clipboard.
+    YankMessageLink,
+    /// The message at point, quoted in the reply.
+    QuoteMessage,
+    /// The topic read through its newest message.
+    MarkRead,
+    /// The topic read through the message at point.
+    MarkReadHere,
+    RenameTopic,
+    TopicStream,
+    ToggleResolved,
+    RemoveMember,
+    MoveMessages(crate::chat::MoveMode),
     // Slack.
     /// Put this emoji on the message under the point, or take the
     /// reader's own off if it is already there. Slack's shortcode without
@@ -581,6 +600,57 @@ pub(crate) fn status_menu() -> Menu {
 pub(crate) fn chat_menu() -> Menu {
     Menu::new("chat")
         .item(
+            "o",
+            "streams & topics",
+            MenuAction::Command(Command::Topics),
+        )
+        .item(
+            "/",
+            "search messages…",
+            MenuAction::Command(Command::SearchChat),
+        )
+        .item("r", "mark read", MenuAction::Command(Command::MarkRead))
+        .item(
+            "shift-r",
+            "mark read through here",
+            MenuAction::Command(Command::MarkReadHere),
+        )
+        .item(
+            "y",
+            "yank #id",
+            MenuAction::Command(Command::YankMessageLink),
+        )
+        .item(
+            "q",
+            "quote in reply",
+            MenuAction::Command(Command::QuoteMessage),
+        )
+        .item(
+            "n",
+            "rename topic…",
+            MenuAction::Command(Command::RenameTopic),
+        )
+        .item(
+            "t",
+            "move topic to stream…",
+            MenuAction::Command(Command::TopicStream),
+        )
+        .item(
+            "v",
+            "resolve / unresolve",
+            MenuAction::Command(Command::ToggleResolved),
+        )
+        .item(
+            "l",
+            "remove member…",
+            MenuAction::Command(Command::RemoveMember),
+        )
+        .item(
+            "x",
+            "move messages…",
+            MenuAction::Open(MenuId::MoveMessages),
+        )
+        .item(
             "s",
             "start agent from message…",
             MenuAction::Command(Command::StartFromMessage),
@@ -591,6 +661,27 @@ pub(crate) fn chat_menu() -> Menu {
             MenuAction::Command(Command::Mention),
         )
         .item("d", "directs…", MenuAction::Command(Command::Directs))
+}
+
+/// `space o x`: which messages a move takes, as Zulip offers them.
+pub(crate) fn move_messages_menu() -> Menu {
+    use crate::chat::MoveMode;
+    Menu::new("move messages")
+        .item(
+            "m",
+            "this message",
+            MenuAction::Command(Command::MoveMessages(MoveMode::This)),
+        )
+        .item(
+            "l",
+            "this and later",
+            MenuAction::Command(Command::MoveMessages(MoveMode::ThisAndLater)),
+        )
+        .item(
+            "a",
+            "the whole topic",
+            MenuAction::Command(Command::MoveMessages(MoveMode::Topic)),
+        )
 }
 
 /// `space a`: driving the current agent.

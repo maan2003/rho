@@ -575,11 +575,26 @@ impl AgentModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Before the bulk load there is nothing to compose towards: the
+        // point waits for the load ([`Self::place_pending_point`]).
+        if !self.initial_load_ready && self.initial_load_started {
+            self.pending_point = Some((editor.downgrade(), point));
+            return;
+        }
         if self.place_point(editor, point, window, cx) {
             return;
         }
         self.pending_point = Some((editor.downgrade(), point));
         self.request_history(HistoryWant::ToBlock(point.block), window, cx);
+    }
+
+    /// Places a point asked for before the bulk load, once it is in.
+    pub fn place_pending_point(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((editor, point)) = self.pending_point.take()
+            && let Some(editor) = editor.upgrade()
+        {
+            self.go_to_store_point(&editor, point, window, cx);
+        }
     }
 
     /// Where the point of an editor over this model is, as the store sees

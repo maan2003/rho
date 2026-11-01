@@ -111,6 +111,7 @@ pub(crate) enum SurfaceView {
         editor: Entity<editor::Editor>,
     },
     Home(Entity<crate::home::HomeView>),
+    Topics(Entity<crate::topics_view::TopicsView>),
     Messages(Entity<editor::Editor>),
     Usage(Entity<crate::usage::UsageView>),
     Note(Entity<editor::Editor>),
@@ -139,7 +140,7 @@ impl SurfaceView {
             Self::Draft { .. } => SurfaceKind::Draft,
             // Home stands where the desk map stood, and is read the same
             // way, so it counts as the same kind of screen.
-            Self::Home(_) => SurfaceKind::Dashboard,
+            Self::Home(_) | Self::Topics(_) => SurfaceKind::Dashboard,
             Self::Messages(_) => SurfaceKind::Messages,
             Self::Usage(_) => SurfaceKind::Usage,
             Self::Note(_) => SurfaceKind::Dashboard,
@@ -274,7 +275,7 @@ pub struct Workspace {
     /// Every transcript this client holds open, and the rendered state a
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
-    transcripts: rho_agents_view::Transcripts,
+    pub(crate) transcripts: rho_agents_view::Transcripts,
     /// What the user wrote that no host has taken yet.
     outbox: rho_agents_client::outbox::Outbox,
     /// What the user is writing in each topic, kept on disk as it is
@@ -531,6 +532,8 @@ impl Workspace {
                             if workspace.topics.get(&topic) == Some(loaded_model) =>
                         {
                             workspace.sync_topic_model(topic, FrameSummary::nothing(), cx);
+                            loaded_model
+                                .update(cx, |model, cx| model.place_pending_point(window, cx));
                             cx.notify();
                         }
                         ModelOf::Activity(agent_id)
@@ -638,7 +641,7 @@ impl Workspace {
         self.transcripts.set_topic(topic, state)
     }
 
-    fn sync_topic_model(
+    pub(crate) fn sync_topic_model(
         &mut self,
         topic: HostTopic,
         summary: FrameSummary,
@@ -1422,7 +1425,7 @@ impl Workspace {
     }
 
     /// A host's agents, while the host is attached.
-    fn agents(&self, host: HostId) -> Option<AgentsLink> {
+    pub(crate) fn agents(&self, host: HostId) -> Option<AgentsLink> {
         let connection = self.hosts.connection(host)?;
         Some(AgentsLink::new(connection.link()))
     }
@@ -1666,6 +1669,8 @@ impl Workspace {
     /// Rebuilds Home from the dealer's own hand. Called wherever the dealer
     /// is invalidated, so nothing here polls.
     pub(crate) fn refresh_home(&mut self, cx: &mut Context<Self>) {
+        // The browser lists what Home does, by stream.
+        self.refresh_browser(cx);
         let Some(view) = self.home_view() else {
             return;
         };
@@ -1705,13 +1710,7 @@ impl Workspace {
                 if facts.put_away(now) {
                     return None;
                 }
-                let seen = held.seen(
-                    facts
-                        .seen_topic()
-                        .map(|seen| rho_agent_types::MessageId(rho_agent_types::ChatSeq(seen))),
-                );
-                let unread = held.unseen(seen).next().is_some();
-                Some((at, topic, host, unread))
+                Some((at, topic, host, self.unread(topic) > 0))
             })
             .collect()
     }
@@ -2434,7 +2433,7 @@ impl Workspace {
 
     /// How an agent host names itself in error text: bare when it is the only
     /// one, otherwise by host.
-    fn error_source(&self, host: HostId) -> String {
+    pub(crate) fn error_source(&self, host: HostId) -> String {
         match self.hosts.len() > 1 {
             true => format!("rho-agent-host {}", self.hosts.host_label(host)),
             false => "rho-agent-host".to_owned(),
@@ -4504,7 +4503,7 @@ impl Workspace {
 
     /// A conversation's title: a topic's stream and name, or the two
     /// agents of a direct one.
-    fn topic_title(&self, topic: HostTopic) -> String {
+    pub(crate) fn topic_title(&self, topic: HostTopic) -> String {
         if let Some((_, direct)) = self.chat.direct(topic) {
             let [one, other] = direct.members;
             return format!(
@@ -4516,9 +4515,14 @@ impl Workspace {
         let Some((_, held)) = self.chat.topic(topic) else {
             return String::new();
         };
+        // A resolved topic says so before its name, as Zulip's does.
+        let name = match held.resolved {
+            true => format!("✔ {}", held.name),
+            false => held.name.clone(),
+        };
         match self.chat.stream_name(topic) {
-            Some(stream) => format!("{stream} › {}", held.name),
-            None => held.name.clone(),
+            Some(stream) => format!("{stream} › {name}"),
+            None => name,
         }
     }
 
@@ -5186,6 +5190,7 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Home => "home".to_owned(),
+            SurfaceKey::Topics => "topics".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
@@ -5228,6 +5233,7 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Home => "home",
+            SurfaceKey::Topics => "topics",
             SurfaceKey::Messages => "messages",
             SurfaceKey::Usage => "usage",
             SurfaceKey::Note(_) => "note",
@@ -5387,6 +5393,7 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
             SurfaceKey::Home => SurfaceIdentity::Home,
+            SurfaceKey::Topics => SurfaceIdentity::Topics,
             SurfaceKey::Messages => SurfaceIdentity::Messages,
             SurfaceKey::Usage => SurfaceIdentity::Usage,
             SurfaceKey::Note(node) => SurfaceIdentity::DeskNode {
@@ -5470,6 +5477,10 @@ impl Workspace {
         let pane = self.active_pane();
         let position = match &pane.current().surface.view {
             SurfaceView::Home(view) => {
+                let editor = view.read(cx).editor().clone();
+                editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+            }
+            SurfaceView::Topics(view) => {
                 let editor = view.read(cx).editor().clone();
                 editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
             }
@@ -6214,6 +6225,7 @@ impl Workspace {
         match &self.active_surface().view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Home(view) => view.read(cx).editor().clone(),
+            SurfaceView::Topics(view) => view.read(cx).editor().clone(),
             SurfaceView::Messages(editor) => editor.clone(),
             SurfaceView::Usage(view) => view.read(cx).editor().clone(),
             SurfaceView::Note(editor) => editor.clone(),
@@ -6266,6 +6278,7 @@ impl Workspace {
         match &self.active_surface().view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Home(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::Topics(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
             SurfaceView::Usage(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Note(editor) => editor.focus_handle(cx),
@@ -6293,6 +6306,7 @@ impl Workspace {
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
             | SurfaceKey::Home
+            | SurfaceKey::Topics
             | SurfaceKey::Messages
             | SurfaceKey::Usage
             | SurfaceKey::Note(_) => None,
@@ -6338,6 +6352,12 @@ impl Workspace {
             }
             SurfaceKey::Home => {
                 SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
+            }
+            SurfaceKey::Topics => {
+                let view = cx.new(|cx| crate::topics_view::TopicsView::new(window, cx));
+                let rows = self.browser_rows();
+                view.update(cx, |view, cx| view.set_rows(rows, cx));
+                SurfaceView::Topics(view)
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
@@ -6435,6 +6455,7 @@ impl Workspace {
             }
             // Files and chat keep whatever agent context was current.
             SurfaceKey::Home
+            | SurfaceKey::Topics
             | SurfaceKey::Note(_)
             | SurfaceKey::Messages
             | SurfaceKey::Usage
@@ -6927,6 +6948,7 @@ impl Workspace {
             MenuId::Input => crate::transient::input_menu(),
             MenuId::Agent => crate::transient::agent_menu(),
             MenuId::Chat => crate::transient::chat_menu(),
+            MenuId::MoveMessages => crate::transient::move_messages_menu(),
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
@@ -6980,6 +7002,17 @@ impl Workspace {
             Command::StartFromMessage => self.start_agent_from_message(window, cx),
             Command::Mention => self.prompt_mention(window, cx),
             Command::Directs => self.prompt_directs(window, cx),
+            Command::Topics => self.open_browser(window, cx),
+            Command::SearchChat => self.prompt_search_chat(window, cx),
+            Command::YankMessageLink => self.yank_message_link(cx),
+            Command::QuoteMessage => self.quote_message(window, cx),
+            Command::MarkRead => self.mark_topic_read(cx),
+            Command::MarkReadHere => self.mark_read_through_here(cx),
+            Command::RenameTopic => self.prompt_rename_topic(window, cx),
+            Command::TopicStream => self.prompt_topic_stream(window, cx),
+            Command::ToggleResolved => self.toggle_resolved(window, cx),
+            Command::RemoveMember => self.prompt_remove_member(window, cx),
+            Command::MoveMessages(mode) => self.prompt_move_messages(mode, window, cx),
             Command::PullCard => self.pull_card(window, cx),
             Command::CloseAndDeal => self.cmd_close_and_deal(window, cx),
             Command::OpenFile => self.prompt_open_file(window, cx),
@@ -8919,6 +8952,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            SurfaceView::Topics(view) => div()
+                .id("rho-surface-topics")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::Messages(editor) => div()
                 .id("rho-surface-messages")
                 .size_full()
@@ -9197,6 +9236,20 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &HomeOpenRow, window, cx| {
                 this.home_open_row(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TopicFollowLink, window, cx| {
+                if !this.follow_link(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::TopicsOpenRow, window, cx| {
+                this.browser_open_row(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TopicsMarkRead, _, cx| {
+                this.mark_topic_read(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TopicsToggleResolved, _, cx| {
+                this.browser_toggle_resolved(cx);
             }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
                 // The rail was the map's; leaving the browser lands on
