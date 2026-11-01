@@ -380,7 +380,16 @@ struct Created {
 pub(crate) fn migrate(write: &mut WriteTxn) {
     write.init_store_tables();
     let (surveys, messages) = survey(write);
-    let message_ids = post_chat(write, &messages);
+    // An agent's topic with the user is named as the agent was: its name,
+    // else its generated title.
+    let names = surveys
+        .iter()
+        .filter_map(|(id, survey)| {
+            let named = survey.created.as_ref()?.spec.props.get("name").cloned();
+            Some((*id, named.or_else(|| survey.title.clone())?))
+        })
+        .collect::<HashMap<_, _>>();
+    let message_ids = post_chat(write, &messages, &names);
 
     let mut agents = Vec::new();
     for (id, survey) in surveys {
@@ -725,6 +734,7 @@ const MIGRATED_STREAM: &str = "rho";
 fn post_chat(
     write: &mut WriteTxn,
     messages: &HashMap<u64, Message>,
+    names: &HashMap<AgentId, String>,
 ) -> HashMap<u64, ChatMessageId> {
     write.init_chat_tables();
     let mut order = messages.iter().collect::<Vec<_>>();
@@ -753,7 +763,10 @@ fn post_chat(
                     .open_topic(
                         message.at,
                         stream,
-                        topic_name(&message.content),
+                        names
+                            .get(&agent)
+                            .cloned()
+                            .unwrap_or_else(|| topic_name(&message.content)),
                         Address::User,
                     )
                     .expect("a migrated topic has a name");
@@ -1477,7 +1490,7 @@ mod tests {
             .collect::<Vec<_>>();
         // In time order, the send to the child once; the user and each
         // agent in one topic of `rho` that the agent is a member of, named
-        // by its first message; two agents in their direct conversation;
+        // as the agent is: its spawn name, else its title; two agents in their direct conversation;
         // only a send to the user that was no status mentions them.
         let result = vec![Mention {
             to: Address::User,
@@ -1487,10 +1500,10 @@ mod tests {
             summary,
             vec![
                 "stream rho".to_owned(),
-                "topic \"review\"".to_owned(),
+                "topic \"advisor\"".to_owned(),
                 format!("{c:?} joins 2"),
                 format!("review in 2 from {user:?} []"),
-                "topic \"first\"".to_owned(),
+                "topic \"Fix the bug\"".to_owned(),
                 format!("{a:?} joins 5"),
                 format!("first in 5 from {user:?} []"),
                 format!("done one in 5 from {aa:?} {result:?}"),
