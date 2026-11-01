@@ -67,6 +67,24 @@ class Delivery(WorksetCase):
         self.assertEqual(self.inputs(self.a)[-1], (f"{header(2, 'Fix it')} Message from the user:\nlater", "person", id))
         self.assertEqual(len(self.inputs(self.b)), 2)
 
+    def test_the_users_mention_joins_and_the_joins_hook_decides(self):
+        wait_for(lambda: len(self.inputs(self.b)) == 2, "delivery to b")
+        mention = fake_rho.post_user(self.mine, "b, take this", [self.b])
+        wait_for(lambda: len(self.inputs(self.b)) == 3, "the mention")
+        self.assertEqual(self.state.topics[self.mine]["agents"], [self.a, self.b])
+        later = fake_rho.post_user(self.mine, "and this")
+        wait_for(lambda: len(self.inputs(self.b)) == 4, "a later message")
+        self.assertEqual([m for *_, m in self.inputs(self.b)[2:]], [mention, later])
+        # A policy that never joins: a user's mention only reaches.
+        from rho import hooks
+
+        _, error = rho._eval("rho.hooks.joins = lambda agent, record: False")
+        self.assertIsNone(error)
+        topic, first = fake_rho.start_user_topic("ops", "Other", "adv, look", [self.adv])
+        wait_for(lambda: len(self.inputs(self.adv)) == 2, "the mention")
+        self.assertEqual(self.state.topics[topic]["agents"], [])
+        self.assertIsNot(hooks.joins, rho.default.joins)
+
     def test_later_agents(self):
         output, error = rho._eval(
             f"c = rho.agents.create({claude()!r}, {{'preset': 'child', 'parent': {self.a!r}, 'cwd': '/'}})\n"

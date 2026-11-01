@@ -65,7 +65,10 @@ worksets, and it survives workset deletion.
 Chat and agents are separate hierarchies. They meet only through a topic's
 members and through mentions. A message reaches its conversation's members and
 every agent it mentions, never its sender. A topic's members are the agents
-that joined it; neither posting nor a mention joins. Who receives a message is
+that joined it. Only Python joins agents to topics, so the host never
+joins anyone on its own: the default policy joins an agent to the topic it
+was started from and to a topic where the user mentions it, and a policy
+replaces that rule with `rho.hooks.joins`. A mention by an agent only reaches. Who receives a message is
 fixed when it is posted, so a later member reads older messages, not receives
 them. Two agents talk in their direct conversation, which is a conversation
 outside every stream. Its members are its two agents, only they post in it,
