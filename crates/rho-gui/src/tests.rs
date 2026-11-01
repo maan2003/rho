@@ -5273,8 +5273,8 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
     });
 }
 
-/// A new workset's answer: its code made `agent_id` and mailed it the
-/// draft.
+/// A new workset's answer: its code made `agent_id` and posted the draft
+/// to it.
 fn created(agent_id: AgentId) -> rho_agents_client::protocol::worksets::CreatedWorkset {
     rho_agents_client::protocol::worksets::CreatedWorkset {
         workset: story::own_workset(agent_id),
@@ -6570,10 +6570,11 @@ fn long_working_text() -> String {
     "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n".to_owned()
 }
 
-/// A done verdict records the mail it saw, not only a local hidden card.
-/// Undo takes that exact ledger mark back and the same thread asks again.
+/// A done verdict records the message it saw, not only a local hidden
+/// card. Undo takes that exact ledger mark back and the same topic asks
+/// again.
 #[gpui::test]
-fn thread_done_writes_its_mail_cursor_and_undo_restores_the_hand(cx: &mut TestAppContext) {
+fn topic_done_writes_its_message_cursor_and_undo_restores_the_hand(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(701);
     workspace

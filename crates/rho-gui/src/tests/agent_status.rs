@@ -11,7 +11,8 @@ fn label(runtime: &RuntimeState, now_ms: i64) -> Option<String> {
 }
 
 /// Waiting on the user, running tasks, a check-in, archiving and idling
-/// are no words of the activity's: what wants the user is unread mail.
+/// are no words of the activity's: what wants the user is a mention of
+/// them in a topic.
 #[test]
 fn an_agent_has_no_attention_state() {
     let now_ms = 1_757_000_000_000;

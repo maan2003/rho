@@ -817,7 +817,7 @@ impl Workspace {
     }
 
     /// Shows an agent's transcript from what the client already holds of
-    /// it: the rows of its workset read before and its mail, for a reader
+    /// it: the rows of its workset read before and its messages, for a reader
     /// who opened it before any live frame, or with the agent host down.
     /// Following it reads the rest. The live frame rides on its tail.
     fn seed_transcript_from_mirror(&mut self, agent_id: AgentId) -> bool {
@@ -8821,8 +8821,8 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
-        // Only the activity says what the runtime is doing: a thread is
-        // mail, and what wants the user is its unread mail.
+        // Only the activity says what the runtime is doing: a topic is
+        // chat, and what wants the user is a mention of them in it.
         let state = match &self.active_surface().key {
             SurfaceKey::Activity(agent_id) if echo.is_none() => self
                 .registry

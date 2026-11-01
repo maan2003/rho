@@ -191,13 +191,25 @@ impl TopicsView {
         self.relayout(cx);
     }
 
+    /// Lays the rows out again with the cursor on the topic it was on, or
+    /// on the first topic if that one is gone.
     fn relayout(&mut self, cx: &mut Context<Self>) {
+        let held = self.cursor_target(cx);
         let items = self.items();
         self.reconcile(items, cx);
-        if self.cursor_target(cx) == BrowserTarget::None {
-            self.focus_first_row(cx);
+        match held {
+            BrowserTarget::Topic(_) if self.row_of(&held, cx).is_some() => {
+                let row = self.row_of(&held, cx).unwrap_or(0);
+                self.put_cursor(row, cx);
+            }
+            _ => self.focus_first_row(cx),
         }
         cx.notify();
+    }
+
+    fn row_of(&self, target: &BrowserTarget, cx: &App) -> Option<u32> {
+        let last = self.transcript.buffer().read(cx).snapshot().max_point().row;
+        (0..=last).find(|row| self.transcript.line_meta(*row, cx) == Some(target))
     }
 
     fn focus_first_row(&mut self, cx: &mut Context<Self>) {
@@ -210,6 +222,10 @@ impl TopicsView {
                 )
             })
             .unwrap_or(0);
+        self.put_cursor(row, cx);
+    }
+
+    fn put_cursor(&mut self, row: u32, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             editor.selections.change_with(&snapshot, |selections| {

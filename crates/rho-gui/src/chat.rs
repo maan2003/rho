@@ -234,7 +234,10 @@ impl Workspace {
             };
             model.set_prompt_text(&text, cx);
         });
-        self.focus_active_surface(window, cx);
+        let editor = self.topic_in_view().map(|(_, _, editor)| editor);
+        if let Some(editor) = editor {
+            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
+        }
     }
 
     /// Enter on `#N` in a topic: opens topic N, or the topic of message N
