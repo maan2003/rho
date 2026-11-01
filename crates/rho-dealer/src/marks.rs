@@ -174,7 +174,8 @@ impl Marks {
                 | Fact::Deadline { .. }
                 | Fact::Settled { .. }
                 | Fact::Mute { .. }
-                | Fact::Unmute { .. } => marks.facts.push(entry.clone()),
+                | Fact::Unmute { .. }
+                | Fact::Read { .. } => marks.facts.push(entry.clone()),
                 Fact::Label { name, parent, .. } => {
                     marks.name = Some(name.clone());
                     marks.parent = *parent;

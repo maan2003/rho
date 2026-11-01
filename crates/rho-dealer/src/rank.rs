@@ -231,11 +231,16 @@ fn rank_into(
             }
             continue;
         }
-        let said = marks.get(&node).facts().seen_topic();
-        let seen = held.seen(said.map(|seen| MessageId(ChatSeq(seen))));
+        let facts = marks.get(&node).facts();
+        let message = |seen: u64| MessageId(ChatSeq(seen));
+        // An ask holds until it is answered: done, or the user wrote. A
+        // result only wanted reading.
+        let seen = held.seen(facts.seen_topic().map(message));
+        let read = held.seen(facts.read_topic().map(message));
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(&node, "mentions", format!("{:?}", held.mentions));
             trace.input(&node, "seen through", format!("{seen:?}"));
+            trace.input(&node, "read through", format!("{read:?}"));
         }
         let unseen = held.unseen(seen).collect::<Vec<_>>();
         let asks = unseen
@@ -243,7 +248,7 @@ fn rank_into(
             .filter(|mention| mention.kind == MentionKind::Ask);
         let results = unseen
             .iter()
-            .filter(|mention| mention.kind == MentionKind::Result);
+            .filter(|mention| mention.kind == MentionKind::Result && Some(mention.message) > read);
         // An ask waits from the first one unanswered; a result fades from
         // the newest.
         let (mention, curve, reason) = if let Some(ask) = asks.clone().next() {

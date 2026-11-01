@@ -160,6 +160,13 @@ pub enum Fact {
         label: uuid::Uuid,
         host: Option<String>,
     },
+    /// Read this far: what the user had in front of them when they last
+    /// looked, done or not. Unlike a done it takes nothing back; it only
+    /// says where unread starts. Later still than `Host`.
+    Read {
+        node: NodeId,
+        seen: Seen,
+    },
 }
 
 impl Fact {
@@ -175,7 +182,8 @@ impl Fact {
             | Self::Unmute { node }
             | Self::Labeled { node, .. }
             | Self::Named { node, .. }
-            | Self::About { node, .. } => Some(node.clone()),
+            | Self::About { node, .. }
+            | Self::Read { node, .. } => Some(node.clone()),
             Self::Label { label, .. }
             | Self::Unlabel { label }
             | Self::Repository { label, .. }
@@ -257,6 +265,22 @@ impl<'a> Facts<'a> {
                 _ => None,
             })
             .max()
+    }
+
+    /// The newest message of a topic the user had in front of them, done
+    /// with it or only reading.
+    pub fn read_topic(self) -> Option<u64> {
+        self.0
+            .iter()
+            .filter_map(|entry| match &entry.fact {
+                Fact::Read {
+                    seen: Seen::Topic(id),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .max()
+            .max(self.seen_topic())
     }
 
     /// The newest Slack message the user had seen when done with a unit.

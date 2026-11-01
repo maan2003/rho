@@ -313,6 +313,14 @@ impl World {
         self.say(node, Said::Done);
     }
 
+    /// The user had the topic in front of them through its newest message.
+    fn reads(&mut self, node: &NodeId) {
+        self.tell(Fact::Read {
+            node: node.clone(),
+            seen: self.seen(node),
+        });
+    }
+
     fn todo(&mut self, node: &NodeId, start: Option<Until>) {
         self.tell(Fact::Todo {
             node: node.clone(),
@@ -580,6 +588,32 @@ fn a7_a_topic_the_user_just_wrote_in_comes_back_on_top_and_chimes() {
     assert_eq!(w.top().as_deref(), Some("a"));
     assert!(w.priority(&a).unwrap() >= CHIME_THRESHOLD);
     assert!(w.priority(&d).is_some());
+}
+
+#[test]
+fn a8_reading_handles_a_result_but_not_an_ask() {
+    let mut w = world();
+    let a = w.agent("a");
+    let b = w.agent("b");
+    w.finishes(&a);
+    w.asks(&b);
+    w.finishes(&b);
+    w.reads(&a);
+    w.reads(&b);
+    assert_eq!(
+        w.hand(),
+        "b · asks · 0m",
+        "the read result is handled; the ask waits for an answer"
+    );
+    w.pass(mins(1));
+    w.finishes(&a);
+    assert_eq!(
+        w.hand(),
+        "b · asks · 1m\na · result · 0m ago",
+        "a result after the read is new"
+    );
+    w.writes_to(&b);
+    assert_eq!(w.hand(), "a · result · 0m ago", "writing answers the ask");
 }
 
 #[test]
