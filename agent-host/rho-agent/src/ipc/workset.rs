@@ -89,6 +89,21 @@ pub(crate) enum PyRequest {
         topic: rho_agent_types::TopicId,
         agent: rho_agent_types::AgentId,
     },
+    /// Gives a topic its whole head, for `agent`. The stream of that name
+    /// is created if there is none.
+    ChangeTopic {
+        agent: rho_agent_types::AgentId,
+        topic: rho_agent_types::TopicId,
+        stream: String,
+        name: String,
+        resolved: bool,
+    },
+    /// Moves messages for `agent`; answered with the topic they are in.
+    Move {
+        agent: rho_agent_types::AgentId,
+        messages: Vec<rho_agent_types::MessageId>,
+        to: PyMoveTo,
+    },
     /// The direct conversation of `sender` and `other`, started if needed.
     Direct {
         sender: rho_agent_types::AgentId,
@@ -113,6 +128,14 @@ pub(crate) enum PyRequest {
         rev: String,
     },
     Models,
+}
+
+/// Where a move from Python puts messages.
+#[derive(Encode, Decode)]
+pub(crate) enum PyMoveTo {
+    Topic(rho_agent_types::TopicId),
+    /// A new topic in the stream of that name, created if there is none.
+    NewTopic { stream: String, name: String },
 }
 
 #[derive(Encode, Decode)]

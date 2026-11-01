@@ -25,7 +25,7 @@ use crate::inference::PromptCacheKey;
 use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::ipc::protocol::Control;
 use crate::ipc::transport::{Port, Sender};
-use crate::ipc::workset::{Message, PyReply, PyRequest, encode};
+use crate::ipc::workset::{Message, PyMoveTo, PyReply, PyRequest, encode};
 use crate::record::{AgentSpec, Runtime};
 
 /// How long a hook may take before the loop goes on without it.
@@ -332,6 +332,8 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(start_topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(change_topic, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
@@ -719,6 +721,65 @@ fn leave(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
     };
     match PyHost::block(py, request)? {
         PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// Gives a topic its whole head, for `agent`: the stream of that name,
+/// created if new, its name, and whether it is resolved.
+#[pyfunction]
+fn change_topic(
+    py: Python<'_>,
+    agent: &str,
+    topic: u64,
+    stream: String,
+    name: String,
+    resolved: bool,
+) -> PyResult<()> {
+    let request = PyRequest::ChangeTopic {
+        agent: agent_id(agent)?,
+        topic: TopicId(ChatSeq(topic)),
+        stream,
+        name,
+        resolved,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// Moves messages for `agent` to topic `to`, or to a new topic named
+/// `name` in `stream`; returns the topic they are in.
+#[pyfunction]
+#[pyo3(signature = (agent, messages, to=None, *, stream=None, name=None))]
+fn move_messages(
+    py: Python<'_>,
+    agent: &str,
+    messages: Vec<u64>,
+    to: Option<u64>,
+    stream: Option<String>,
+    name: Option<String>,
+) -> PyResult<u64> {
+    let to = match (to, stream, name) {
+        (Some(topic), None, None) => PyMoveTo::Topic(TopicId(ChatSeq(topic))),
+        (None, Some(stream), Some(name)) => PyMoveTo::NewTopic { stream, name },
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "move to a topic id, or to a new topic with stream= and name=",
+            ));
+        }
+    };
+    let request = PyRequest::Move {
+        agent: agent_id(agent)?,
+        messages: messages
+            .into_iter()
+            .map(|id| MessageId(ChatSeq(id)))
+            .collect(),
+        to,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Seq(topic) => Ok(topic.0),
         _ => Err(unexpected()),
     }
 }

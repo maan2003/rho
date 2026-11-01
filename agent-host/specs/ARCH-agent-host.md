@@ -66,9 +66,10 @@ Chat and agents are separate hierarchies. They meet only through a topic's
 members and through mentions. A message reaches its conversation's members and
 every agent it mentions, never its sender. A topic's members are the agents
 that joined it. Only Python joins agents to topics, so the host never
-joins anyone on its own: the default policy joins an agent to the topic it
-was started from and to a topic where the user mentions it, and a policy
-replaces that rule with `rho.hooks.joins`. A mention by an agent only reaches. Who receives a message is
+joins anyone on its own. The default delivery (`rho.hooks.deliver`) joins an
+agent to the topic it was started from and to a topic where the user
+mentions it. A mention by an agent only reaches. A policy with other rules
+replaces the whole delivery, not one rule of it. Who receives a message is
 fixed when it is posted, so a later member reads older messages, not receives
 them. Two agents talk in their direct conversation, which is a conversation
 outside every stream. Its members are its two agents, only they post in it,
@@ -76,9 +77,10 @@ and no one joins it. The GUI lists direct conversations apart from streams and
 makes no cards for them.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
-The user may rename a topic, move it to another stream, or resolve it when
-its work is done; each change logs the topic's whole head. The user may also
-move messages to another topic, which may be new. A move delivers nothing
+The user, or an agent of the topic through Python, may rename a topic, move
+it to another stream, or resolve it when its work is done; each change logs
+the topic's whole head. They may also move messages to another topic, which
+may be new. The default tools let an agent edit only topics it is in. A move delivers nothing
 again, and a message is read in the topic it is in now, so `#41` always
 leads to it. A direct conversation is never renamed, moved or resolved, and
 its messages stay in it. What the user has read is the user's, not the

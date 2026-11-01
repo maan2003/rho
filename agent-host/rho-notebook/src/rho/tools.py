@@ -154,6 +154,47 @@ class Chat:
         rho_chat.leave(int(topic), self._agent)
         return report(f"Left #{int(topic)}.")
 
+    def resolve(self, topic, resolved=True):
+        """Mark a topic you are in as done, or with `resolved=False` as open
+        again."""
+        self._member(topic)
+        rho_chat.change(self._agent, int(topic), resolved=bool(resolved))
+        return report(f"#{int(topic)} is {'resolved' if resolved else 'open'}.")
+
+    def rename(self, topic, name, *, stream=None):
+        """Give a topic you are in a new name, and with `stream` move it to
+        that stream."""
+        self._member(topic)
+        rho_chat.change(self._agent, int(topic), name=str(name), stream=None if stream is None else str(stream))
+        return report(f"Renamed #{int(topic)}.")
+
+    def move(self, messages, to=None, *, stream=None, name=None):
+        """Move messages of topics you are in to topic `to`, or to a new topic
+        `name` in `stream`. Returns the topic they are in now."""
+        ids = [int(id) for id in ([messages] if isinstance(messages, int) else messages)]
+        for id in ids:
+            record = rho_chat.message(id)
+            if record is None:
+                raise ValueError(f"no message #{id}")
+            self._member(record["topic"])
+        if (to is None) == (stream is None or name is None):
+            raise ValueError("move to a topic id, or to a new topic with stream= and name=")
+        if to is None:
+            topic = rho_chat.move(self._agent, ids, stream=str(stream), name=str(name))
+        else:
+            topic = rho_chat.move(self._agent, ids, int(to))
+        print(f"Moved {len(ids)} message(s) to #{topic}.")
+        return topic
+
+    def _member(self, topic):
+        head = rho_chat.topic(int(topic))
+        if head is None:
+            raise ValueError(f"no topic #{int(topic)}")
+        if head["stream"] is None:
+            raise ValueError("a direct conversation is not renamed, moved or resolved")
+        if self._agent not in head["agents"]:
+            raise ValueError(f"you are not in #{int(topic)}: join it first")
+
     def read(self, id, last=20):
         """Show what `#id` names: a topic's `last` newest messages, or a
         message among the `last` around it."""

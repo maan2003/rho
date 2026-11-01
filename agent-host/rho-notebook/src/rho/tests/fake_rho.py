@@ -181,18 +181,26 @@ def leave(topic, agent):
             head["agents"].remove(agent)
 
 
-def change_topic(topic, stream, name, resolved):
-    """What the host does with the GUI's ChangeTopic."""
+def change_topic(agent, topic, stream, name, resolved):
     with STATE.lock:
+        if STATE.topics[topic]["stream"] is None:
+            raise ValueError("a direct conversation is not renamed, moved or resolved")
+        if stream not in STATE.streams:
+            STATE.streams[stream] = _event()
         STATE.topics[topic].update(stream=stream, name=name, resolved=resolved)
 
 
-def move(messages, to):
-    """What the host does with the GUI's MoveMessages to a topic."""
+def move_messages(agent, messages, to=None, *, stream=None, name=None):
     with STATE.lock:
+        if to is None:
+            if stream not in STATE.streams:
+                STATE.streams[stream] = _event()
+            to = _event()
+            STATE.topics[to] = {"id": to, "name": name, "stream": stream, "resolved": False, "agents": []}
         for message in STATE.messages:
             if message["id"] in messages:
                 message["topic"] = to
+        return to
 
 
 def topic(id):

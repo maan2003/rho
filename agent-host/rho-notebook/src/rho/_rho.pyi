@@ -107,8 +107,9 @@ def new_cache_key(agent: str) -> None:
 # agent it mentions, never its sender. A topic's members are the agents that
 # joined it; neither posting nor a mention joins. A direct conversation's
 # members are its two agents, and only they post in it. Messages from the
-# user come only from the GUI, so Python cannot forge them. The user may also
-# rename, move and resolve a topic, and move messages between topics.
+# user come only from the GUI, so Python cannot forge them. The user and
+# agents may rename, move and resolve a topic, and move messages between
+# topics.
 
 def post(
     sender: str,
@@ -138,9 +139,23 @@ def join(topic: int, agent: str) -> None:
 def leave(topic: int, agent: str) -> None:
     """`agent` stops being a member of the topic. Not for a direct
     conversation."""
+def change_topic(agent: str, topic: int, stream: str, name: str, resolved: bool) -> None:
+    """Give a topic its whole head, for `agent`: the stream of that name,
+    made if new, its name, and whether it is resolved. Not for a direct
+    conversation."""
+def move_messages(
+    agent: str,
+    messages: list[int],
+    to: int | None = None,
+    *,
+    stream: str | None = None,
+    name: str | None = None,
+) -> int:
+    """Move messages for `agent` to topic `to`, or to a new topic `name` in
+    `stream`; returns the topic they are in. A move delivers nothing again."""
 def topic(id: int) -> TopicRecord | None: ...
 def message(id: int) -> MessageRecord | None:
-    """A message, in the topic it is in now: the user may move messages."""
+    """A message, in the topic it is in now: messages may be moved."""
 def read(topic: int, last: int) -> list[MessageRecord]:
     """The conversation's `last` newest messages, oldest first."""
 async def inbox(agent: str, after: int) -> list[MessageRecord]:

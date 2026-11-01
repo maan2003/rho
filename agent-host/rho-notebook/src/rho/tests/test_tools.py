@@ -244,14 +244,44 @@ class Tools(WorksetCase):
         self.assertEqual(printed.splitlines()[1:], [f"→ #{first} user: Do it.", f"#{ids[0]} user: m0", f"#{ids[1]} user: m1"])
         # The user moved one away and resolved the old topic.
         other, _ = fake_rho.start_user_topic("ops", "Aside", "Aside.")
-        fake_rho.move([ids[4]], other)
-        fake_rho.change_topic(topic, "rho", "Done it", True)
+        fake_rho.move_messages("user", [ids[4]], other)
+        fake_rho.change_topic("user", topic, "rho", "Done it", True)
         printed, _ = run(lambda: chat.read(ids[4], last=1))
         self.assertEqual(printed, f"[#{other} ops › Aside]\n→ #{ids[4]} user: m4\n")
         printed, _ = run(lambda: chat.read(topic, last=1))
         self.assertEqual(printed, f"[#{topic} rho › ✔ Done it]\n#{ids[3]} user: m3\n")
         with self.assertRaisesRegex(ValueError, "names no topic or message"):
             chat.read(999)
+
+    def test_an_agent_resolves_renames_and_moves_only_in_its_topics(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        topic, first = fake_rho.start_user_topic("rho", "Do it", "Do it.")
+        ids = [fake_rho.post_user(topic, f"m{i}") for i in range(3)]
+        with self.assertRaisesRegex(ValueError, "join it first"):
+            chat.resolve(topic)
+        run(lambda: chat.join(topic))
+        run(lambda: chat.rename(topic, "Did it", stream="ops"))
+        run(lambda: chat.resolve(topic))
+        self.assertEqual(
+            {k: self.state.topics[topic][k] for k in ("stream", "name", "resolved")},
+            {"stream": "ops", "name": "Did it", "resolved": True},
+        )
+        # A rename keeps the resolved mark and the stream it does not name.
+        run(lambda: chat.rename(topic, "Done"))
+        self.assertEqual(
+            {k: self.state.topics[topic][k] for k in ("stream", "name", "resolved")},
+            {"stream": "ops", "name": "Done", "resolved": True},
+        )
+        printed, aside = run(lambda: chat.move([ids[1], ids[2]], stream="rho", name="Aside"))
+        self.assertEqual(printed, f"Moved 2 message(s) to #{aside}.\n")
+        self.assertEqual([m["topic"] for m in self.state.messages if m["id"] in ids], [topic, aside, aside])
+        self.assertEqual(self.state.topics[aside]["name"], "Aside")
+        # The agent is not in the new topic, so it moves nothing out of it.
+        with self.assertRaisesRegex(ValueError, "join it first"):
+            chat.move(ids[1], topic)
+        with self.assertRaisesRegex(ValueError, "stream= and name="):
+            chat.move(ids[0], stream="rho")
 
     def test_skills_load_keeps_only_skills_that_ask_and_compaction_rereads_them(self):
         ns, _ = self.notebook(self.root)

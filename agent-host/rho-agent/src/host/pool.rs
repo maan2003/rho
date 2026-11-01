@@ -1258,6 +1258,39 @@ impl AgentPool {
                 write.commit();
                 PyReply::Done
             }
+            PyRequest::ChangeTopic {
+                agent,
+                topic,
+                stream,
+                name,
+                resolved,
+            } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                let stream = write.stream(UnixMs::now(), stream)?;
+                write.change_topic(UnixMs::now(), topic, stream, name, resolved)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Move {
+                agent,
+                messages,
+                to,
+            } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                let to = match to {
+                    crate::ipc::workset::PyMoveTo::Topic(topic) => MoveTo::Topic(topic),
+                    crate::ipc::workset::PyMoveTo::NewTopic { stream, name } => MoveTo::NewTopic {
+                        stream: write.stream(UnixMs::now(), stream)?,
+                        name,
+                    },
+                };
+                let topic =
+                    write.move_messages(UnixMs::now(), messages, to, Address::Agent(agent), None)?;
+                write.commit();
+                PyReply::Seq(topic.0)
+            }
             PyRequest::Topic(topic) => {
                 let read = self.db.read();
                 PyReply::Topic(read.topic(topic).map(|head| {

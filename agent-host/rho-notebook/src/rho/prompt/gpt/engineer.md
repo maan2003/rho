@@ -172,6 +172,9 @@ chat.start(stream, name, text, *, mention=None, kind=None) → int  Start a topi
 chat.join(topic)        Receive every later message of a topic. A mention reaches you without it.
 chat.read(id, last=20)  Show what `#id` names: a topic's newest messages, or the messages around a message.
 chat.leave(topic)       Stop receiving a topic's messages, for example when your part in it is done.
+chat.resolve(topic)     Mark a topic you are in as done; `resolved=False` opens it again.
+chat.rename(topic, name, *, stream=None)  Rename a topic you are in, or move it to another stream.
+chat.move(messages, to=None, *, stream=None, name=None) → int  Move messages to a topic, or to a new topic `name` in `stream`.
 chat.direct(agent, text) → int  Post to an agent in your direct conversation with it.
 end_turn()              End your turn when this exec returns; you then wait on the user.
 archive()               Shut down the notebook and stay quiet until the user writes.

@@ -42,6 +42,30 @@ def leave(topic: int, agent: str) -> None:
     _rho.leave(topic, agent)
 
 
+def change(agent: str, topic: int, *, stream: str | None = None, name: str | None = None, resolved: bool | None = None) -> None:
+    """Change a topic for `agent`: what is not given stays as it is."""
+    head = _rho.topic(topic)
+    if head is None:
+        raise ValueError(f"no topic {topic}")
+    if head["stream"] is None:
+        raise ValueError("a direct conversation is not renamed, moved or resolved")
+    _rho.change_topic(
+        agent,
+        topic,
+        head["stream"] if stream is None else stream,
+        head["name"] if name is None else name,
+        head["resolved"] if resolved is None else resolved,
+    )
+
+
+def move(agent: str, messages: list[int], to: int | None = None, *, stream: str | None = None, name: str | None = None) -> int:
+    """Move messages for `agent` to topic `to`, or to a new topic `name` in
+    `stream`; returns the topic they are in."""
+    if to is None:
+        return _rho.move_messages(agent, list(messages), stream=stream, name=name)
+    return _rho.move_messages(agent, list(messages), to)
+
+
 def topic(id: int) -> dict | None:
     """The conversation's name, its stream's name, whether it is resolved,
     and its members. Name and stream are None for a direct conversation."""
