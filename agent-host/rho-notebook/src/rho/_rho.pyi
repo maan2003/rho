@@ -44,6 +44,7 @@ class TopicRecord(TypedDict):
     id: int
     name: str | None  # None for a direct conversation
     stream: str | None  # its stream's name; None for a direct conversation
+    resolved: bool  # its work is done; False for a direct conversation
     agents: list[str]  # its members: who joined a topic, or a direct's two
 
 class AgentsFile(TypedDict):
@@ -106,7 +107,8 @@ def new_cache_key(agent: str) -> None:
 # agent it mentions, never its sender. A topic's members are the agents that
 # joined it; neither posting nor a mention joins. A direct conversation's
 # members are its two agents, and only they post in it. Messages from the
-# user come only from the GUI, so Python cannot forge them.
+# user come only from the GUI, so Python cannot forge them. The user may also
+# rename, move and resolve a topic, and move messages between topics.
 
 def post(
     sender: str,
@@ -133,8 +135,12 @@ def direct(sender: str, other: str) -> int:
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""
+def leave(topic: int, agent: str) -> None:
+    """`agent` stops being a member of the topic. Not for a direct
+    conversation."""
 def topic(id: int) -> TopicRecord | None: ...
-def message(id: int) -> MessageRecord | None: ...
+def message(id: int) -> MessageRecord | None:
+    """A message, in the topic it is in now: the user may move messages."""
 def read(topic: int, last: int) -> list[MessageRecord]:
     """The conversation's `last` newest messages, oldest first."""
 async def inbox(agent: str, after: int) -> list[MessageRecord]:

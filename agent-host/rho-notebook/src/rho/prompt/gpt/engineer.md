@@ -170,7 +170,8 @@ not your code, output, or reasoning.
 chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. Mention "user" with a kind to reach the user.
 chat.start(stream, name, text, *, mention=None, kind=None) → int  Start a topic in a stream for a new subject and join it; returns its id.
 chat.join(topic)        Receive every later message of a topic. A mention reaches you without it.
-chat.read(topic, last=20)  Show a topic's newest messages.
+chat.read(id, last=20)  Show what `#id` names: a topic's newest messages, or the messages around a message.
+chat.leave(topic)       Stop receiving a topic's messages, for example when your part in it is done.
 chat.direct(agent, text) → int  Post to an agent in your direct conversation with it.
 end_turn()              End your turn when this exec returns; you then wait on the user.
 archive()               Shut down the notebook and stay quiet until the user writes.

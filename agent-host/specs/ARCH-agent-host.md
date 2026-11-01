@@ -75,6 +75,15 @@ outside every stream. Its members are its two agents, only they post in it,
 and no one joins it. The GUI lists direct conversations apart from streams and
 makes no cards for them.
 
+An agent leaves a topic itself (`chat.leave`), or the user takes it out.
+The user may rename a topic, move it to another stream, or resolve it when
+its work is done; each change logs the topic's whole head. The user may also
+move messages to another topic, which may be new. A move delivers nothing
+again, and a message is read in the topic it is in now, so `#41` always
+leads to it. A direct conversation is never renamed, moved or resolved, and
+its messages stay in it. What the user has read is the user's, not the
+host's: it lives with the dealer's marks in the GUI's synced desk.
+
 A mention carries a kind (`ask`, `result`, `fyi`); a mention of the user is
 the only way a message asks for the user's attention, so a message has no kind
 of its own. The user's mentions of agents are `ask`.

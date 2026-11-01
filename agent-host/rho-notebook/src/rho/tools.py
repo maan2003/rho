@@ -149,15 +149,30 @@ class Chat:
         rho_chat.join(int(topic), self._agent)
         return report(f"Joined #{int(topic)}.")
 
-    def read(self, topic, last=20):
-        """Show the `last` newest messages of `topic`."""
-        head = rho_chat.topic(int(topic))
-        if head is None:
-            raise ValueError(f"no topic #{int(topic)}")
-        lines = [_where(int(topic), head, self._agent)]
-        for record in rho_chat.read(int(topic), int(last)):
+    def leave(self, topic):
+        """Stop receiving `topic`'s messages; a mention still reaches you."""
+        rho_chat.leave(int(topic), self._agent)
+        return report(f"Left #{int(topic)}.")
+
+    def read(self, id, last=20):
+        """Show what `#id` names: a topic's `last` newest messages, or a
+        message among the `last` around it."""
+        id, last = int(id), int(last)
+        head = rho_chat.topic(id)
+        if head is not None:
+            topic, records = id, rho_chat.read(id, last)
+        else:
+            message = rho_chat.message(id)
+            if message is None:
+                raise ValueError(f"#{id} names no topic or message")
+            topic = message["topic"]
+            head = rho_chat.topic(topic)
+            records = _around(rho_chat.read(topic, 1 << 31), id, last)
+        lines = [where(topic, head, self._agent)]
+        for record in records:
             sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
-            lines.append(f"#{record['id']} {sender}: {record['text']}")
+            mark = "→ " if record["id"] == id else ""
+            lines.append(f"{mark}#{record['id']} {sender}: {record['text']}")
         return report("\n".join(lines))
 
     def __repr__(self):
@@ -171,12 +186,24 @@ def _text(text):
     return text
 
 
-def _where(topic, head, reader):
+def _around(records, id, last):
+    """`last` records with message `id` among them, centered."""
+    at = next(i for i, record in enumerate(records) if record["id"] == id)
+    start = max(0, min(at - last // 2, len(records) - last))
+    return records[start : start + last]
+
+
+def where(topic, head, reader):
     """The header of a conversation as `reader` sees it."""
     if head["stream"] is None:
+        if reader not in head["agents"]:
+            a, b = (label(member) for member in head["agents"])
+            return f"[#{topic} direct of {a} and {b}]"
         other = next(member for member in head["agents"] if member != reader)
         return f"[#{topic} direct with {label(other)}]"
-    return f"[#{topic} {head['stream']} › {head['name']}]"
+    done = "✔ " if head["resolved"] else ""
+    return f"[#{topic} {head['stream']} › {done}{head['name']}]"
+
 
 
 class Agents:

@@ -130,7 +130,7 @@ def _start(sender, stream, name, text, mentions):
     if stream not in STATE.streams:
         STATE.streams[stream] = _event()
     topic = _event()
-    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "agents": []}
+    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "resolved": False, "agents": []}
     return topic, _post(sender, topic, text, mentions)
 
 
@@ -158,7 +158,7 @@ def direct(sender, other):
         pair = tuple(sorted((sender, other)))
         if pair not in STATE.directs:
             topic = _event()
-            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "agents": list(pair)}
+            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "resolved": False, "agents": list(pair)}
             STATE.directs[pair] = topic
         return STATE.directs[pair]
 
@@ -170,6 +170,29 @@ def join(topic, agent):
             raise ValueError("no one joins a direct conversation")
         if agent not in head["agents"]:
             head["agents"].append(agent)
+
+
+def leave(topic, agent):
+    with STATE.lock:
+        head = STATE.topics[topic]
+        if head["stream"] is None:
+            raise ValueError("no one leaves a direct conversation")
+        if agent in head["agents"]:
+            head["agents"].remove(agent)
+
+
+def change_topic(topic, stream, name, resolved):
+    """What the host does with the GUI's ChangeTopic."""
+    with STATE.lock:
+        STATE.topics[topic].update(stream=stream, name=name, resolved=resolved)
+
+
+def move(messages, to):
+    """What the host does with the GUI's MoveMessages to a topic."""
+    with STATE.lock:
+        for message in STATE.messages:
+            if message["id"] in messages:
+                message["topic"] = to
 
 
 def topic(id):

@@ -93,12 +93,7 @@ async def hand(agent, record: dict) -> None:
 def render(record: dict, reader: str) -> str:
     """A message as `reader` reads it: its conversation first, so the model
     knows where to answer."""
-    topic = chat.topic(record["topic"])
-    if topic["stream"] is None:
-        other = next(member for member in topic["agents"] if member != reader)
-        where = f"[#{record['topic']} direct with {prompt.label(other)}]"
-    else:
-        where = f"[#{record['topic']} {topic['stream']} › {topic['name']}]"
+    where = tools.where(record["topic"], chat.topic(record["topic"]), reader)
     sender = record["sender"]
     if sender == chat.USER:
         return f"{where} Message from the user:\n{record['text']}"

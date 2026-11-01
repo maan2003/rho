@@ -85,6 +85,12 @@ class Delivery(WorksetCase):
         self.assertEqual(self.state.topics[topic]["agents"], [])
         self.assertIsNot(hooks.joins, rho.default.joins)
 
+    def test_a_direct_reads_from_outside_as_both_its_agents(self):
+        wait_for(lambda: len(self.inputs(self.adv)) == 1, "delivery to the advisor")
+        id = fake_rho.post(self.b, self.child, "adv, see this", mentions=[(self.adv, "fyi")])
+        wait_for(lambda: len(self.inputs(self.adv)) == 2, "the mention")
+        self.assertEqual(self.inputs(self.adv)[-1][0].splitlines()[0], f"[#{self.child} direct of eng-{self.a} and eng-{self.b}]")
+
     def test_later_agents(self):
         output, error = rho._eval(
             f"c = rho.agents.create({claude()!r}, {{'preset': 'child', 'parent': {self.a!r}, 'cwd': '/'}})\n"

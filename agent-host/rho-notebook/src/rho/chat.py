@@ -38,9 +38,13 @@ def join(topic: int, agent: str) -> None:
     _rho.join(topic, agent)
 
 
+def leave(topic: int, agent: str) -> None:
+    _rho.leave(topic, agent)
+
+
 def topic(id: int) -> dict | None:
-    """The conversation's name, its stream's name and its members. Name and
-    stream are None for a direct conversation."""
+    """The conversation's name, its stream's name, whether it is resolved,
+    and its members. Name and stream are None for a direct conversation."""
     return _rho.topic(id)
 
 

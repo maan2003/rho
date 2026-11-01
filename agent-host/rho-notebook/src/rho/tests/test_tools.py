@@ -62,7 +62,7 @@ class Tools(WorksetCase):
             "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
         })
         # The brief goes in their direct conversation.
-        self.assertEqual(self.state.topics[topic], {"id": topic, "name": None, "stream": None, "agents": sorted([self.root, child])})
+        self.assertEqual(self.state.topics[topic], {"id": topic, "name": None, "stream": None, "resolved": False, "agents": sorted([self.root, child])})
         [brief] = self.state.messages
         self.assertEqual((brief["topic"], brief["sender"], brief["text"], brief["mentions"]), (topic, self.root, "Fix it.", []))
         self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive in your direct conversation #{topic}. It works in {work}. Post in #{topic} to follow up.')
@@ -207,7 +207,7 @@ class Tools(WorksetCase):
         printed, started = run(lambda: chat.start("ops", "side", "Look.", mention=f"eng-{child}", kind="ask"))
         self.assertEqual(printed, f"Started topic #{started}.\n")
         # Its starter joins it; the mentioned child does not.
-        self.assertEqual(self.state.topics[started], {"id": started, "name": "side", "stream": "ops", "agents": [self.root]})
+        self.assertEqual(self.state.topics[started], {"id": started, "name": "side", "stream": "ops", "resolved": False, "agents": [self.root]})
         self.assertEqual(self.state.messages[-1]["_to"], {child})
         # Direct conversations.
         printed, conversation = run(lambda: chat.direct(f"eng-{child}", "Psst."))
@@ -226,6 +226,32 @@ class Tools(WorksetCase):
         self.assertEqual(printed, f"[#{conversation} direct with eng-{self.root}]\n#{self.state.messages[-1]['id']} eng-{child}: Yes?\n")
         printed, _ = run(lambda: chat.read(topic))
         self.assertEqual(printed, f"[#{topic} rho › Do it]\n#{topic + 1} user: Do it.\n")
+
+    def test_leave_and_read_by_any_id(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        topic, first = fake_rho.start_user_topic("rho", "Do it", "Do it.")
+        ids = [fake_rho.post_user(topic, f"m{i}") for i in range(5)]
+        run(lambda: chat.join(topic))
+        printed, _ = run(lambda: chat.leave(topic))
+        self.assertEqual(printed, f"Left #{topic}.\n")
+        self.assertEqual(self.state.topics[topic]["agents"], [])
+        # A message id shows the messages around it, marked.
+        printed, _ = run(lambda: chat.read(ids[2], last=3))
+        self.assertEqual(printed, f"[#{topic} rho › Do it]\n#{ids[1]} user: m1\n→ #{ids[2]} user: m2\n#{ids[3]} user: m3\n")
+        # At the start of a topic the window does not run off its end.
+        printed, _ = run(lambda: chat.read(first, last=3))
+        self.assertEqual(printed.splitlines()[1:], [f"→ #{first} user: Do it.", f"#{ids[0]} user: m0", f"#{ids[1]} user: m1"])
+        # The user moved one away and resolved the old topic.
+        other, _ = fake_rho.start_user_topic("ops", "Aside", "Aside.")
+        fake_rho.move([ids[4]], other)
+        fake_rho.change_topic(topic, "rho", "Done it", True)
+        printed, _ = run(lambda: chat.read(ids[4], last=1))
+        self.assertEqual(printed, f"[#{other} ops › Aside]\n→ #{ids[4]} user: m4\n")
+        printed, _ = run(lambda: chat.read(topic, last=1))
+        self.assertEqual(printed, f"[#{topic} rho › ✔ Done it]\n#{ids[3]} user: m3\n")
+        with self.assertRaisesRegex(ValueError, "names no topic or message"):
+            chat.read(999)
 
     def test_skills_load_keeps_only_skills_that_ask_and_compaction_rereads_them(self):
         ns, _ = self.notebook(self.root)
