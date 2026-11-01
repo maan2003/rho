@@ -1209,6 +1209,7 @@ mod tests {
                     topic.0.0
                 ),
                 ChatEvent::Joined { topic, agent } => format!("{agent:?} joins {}", topic.0.0),
+                other => panic!("the migration logs no {other:?}"),
             })
             .collect::<Vec<_>>();
         // In time order, the send to the child once; the user and each

@@ -85,6 +85,10 @@ pub(crate) enum PyRequest {
         topic: rho_agent_types::TopicId,
         agent: rho_agent_types::AgentId,
     },
+    Leave {
+        topic: rho_agent_types::TopicId,
+        agent: rho_agent_types::AgentId,
+    },
     /// The direct conversation of `sender` and `other`, started if needed.
     Direct {
         sender: rho_agent_types::AgentId,

@@ -14,9 +14,9 @@ use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, Works
 use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
-    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateStream, CreateWorkset,
-    CreatedWorkset, DeleteWorksets, Eval, EvalResult, LogEvent, LogNext, Open, Post, Request,
-    ServerFrame, StartTopic, WorksetEntry,
+    AgentEntry, AgentLog, AgentLogPage, Cancel, ChangeTopic, ClientFrame, CreateStream,
+    CreateWorkset, CreatedWorkset, DeleteWorksets, Eval, EvalResult, Leave, LogEvent, LogNext,
+    MoveMessages, MoveTo, Open, Post, Request, ServerFrame, StartTopic, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -670,6 +670,50 @@ where
             respond(writer, call, |CreateStream { name }| async move {
                 services.pool.create_stream(name).await
             })
+            .await
+        }
+        Request::Leave(call) => {
+            respond(writer, call, |Leave { topic, agent }| async move {
+                services.pool.leave_user(topic, agent).await
+            })
+            .await
+        }
+        Request::ChangeTopic(call) => {
+            respond(
+                writer,
+                call,
+                |ChangeTopic {
+                     topic,
+                     stream,
+                     name,
+                     resolved,
+                 }| async move {
+                    services
+                        .pool
+                        .change_topic(topic, stream, name, resolved)
+                        .await
+                },
+            )
+            .await
+        }
+        Request::MoveMessages(call) => {
+            respond(
+                writer,
+                call,
+                |MoveMessages {
+                     client_id,
+                     messages,
+                     to,
+                 }| async move {
+                    let to = match to {
+                        MoveTo::Topic(topic) => rho_agent::store::MoveTo::Topic(topic),
+                        MoveTo::NewTopic { stream, name } => {
+                            rho_agent::store::MoveTo::NewTopic { stream, name }
+                        }
+                    };
+                    services.pool.move_messages(client_id, messages, to).await
+                },
+            )
             .await
         }
         Request::Cancel(call) => {

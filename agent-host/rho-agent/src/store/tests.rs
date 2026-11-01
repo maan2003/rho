@@ -383,3 +383,171 @@ async fn chat_delivers_to_members_and_the_mentioned_but_never_the_sender() {
     assert!(read.agent(a).is_none());
     assert!(read.workset_rows(ws, Wpos::ZERO, 10).is_empty());
 }
+
+/// A leave stops what a topic delivers but not what mentions; a change is
+/// logged only when it changes something; a move takes messages out of
+/// their topics, delivers nothing again, and a resend under its client id
+/// starts no second topic.
+#[tokio::test]
+async fn chat_leaves_changes_and_moves() {
+    let (_dir, db) = db().await;
+    let (a, b) = (agent(1), agent(2));
+    let mut write = db.write().await;
+    let rho = write.stream(UnixMs(1), "rho".into()).unwrap();
+    let ops = write.stream(UnixMs(1), "ops".into()).unwrap();
+    let (topic, first) = write
+        .start_topic(
+            UnixMs(2),
+            rho,
+            "Fix it".into(),
+            said(Address::User, "go"),
+            None,
+        )
+        .unwrap();
+    write.join(UnixMs(3), topic, a).unwrap();
+    let kept = write
+        .post(UnixMs(4), topic, said(Address::User, "one"), None)
+        .unwrap();
+    write.leave(UnixMs(5), topic, a).unwrap();
+    // Leaving twice logs once.
+    write.leave(UnixMs(5), topic, a).unwrap();
+    let unheard = write
+        .post(UnixMs(6), topic, said(Address::User, "two"), None)
+        .unwrap();
+    let mention = write
+        .post(
+            UnixMs(7),
+            topic,
+            NewMessage {
+                mentions: vec![Mention {
+                    to: Address::Agent(a),
+                    kind: MentionKind::Ask,
+                }],
+                ..said(Address::User, "a, look")
+            },
+            None,
+        )
+        .unwrap();
+    write
+        .change_topic(UnixMs(8), topic, ops, " Fixed ".into(), true)
+        .unwrap();
+    let head = db_head(&mut write);
+    write
+        .change_topic(UnixMs(8), topic, ops, "Fixed".into(), true)
+        .unwrap();
+    assert_eq!(
+        db_head(&mut write),
+        head,
+        "a change to nothing logs nothing"
+    );
+    assert!(
+        write
+            .change_topic(UnixMs(8), topic, StreamId(ChatSeq(99)), "x".into(), false)
+            .is_err()
+    );
+    let direct = write.direct(UnixMs(9), a, b).unwrap();
+    let in_direct = write
+        .post(UnixMs(9), direct, said(Address::Agent(a), "psst"), None)
+        .unwrap();
+    assert!(write.leave(UnixMs(9), direct, a).is_err());
+    assert!(
+        write
+            .change_topic(UnixMs(9), direct, rho, "x".into(), false)
+            .is_err()
+    );
+    // Out of a direct conversation, or into one: refused, and logs nothing.
+    let before = db_head(&mut write);
+    for (messages, to) in [
+        (vec![in_direct], MoveTo::Topic(topic)),
+        (vec![kept], MoveTo::Topic(direct)),
+        (vec![MessageId(ChatSeq(999))], MoveTo::Topic(topic)),
+        (Vec::new(), MoveTo::Topic(topic)),
+    ] {
+        assert!(
+            write
+                .move_messages(UnixMs(10), messages, to, Address::User, None)
+                .is_err()
+        );
+    }
+    assert_eq!(db_head(&mut write), before);
+    // Two to a new topic, under a client id; the resend is the same.
+    let aside = write
+        .move_messages(
+            UnixMs(10),
+            vec![mention, unheard],
+            MoveTo::NewTopic {
+                stream: rho,
+                name: "aside".into(),
+            },
+            Address::User,
+            Some(5),
+        )
+        .unwrap();
+    assert_eq!(
+        write
+            .move_messages(
+                UnixMs(11),
+                vec![mention, unheard],
+                MoveTo::NewTopic {
+                    stream: rho,
+                    name: "aside".into(),
+                },
+                Address::User,
+                Some(5),
+            )
+            .unwrap(),
+        aside
+    );
+    // And one of them back where it was posted.
+    write
+        .move_messages(
+            UnixMs(12),
+            vec![unheard],
+            MoveTo::Topic(topic),
+            Address::User,
+            None,
+        )
+        .unwrap();
+    write.commit();
+
+    let read = db.read();
+    let ids = |topic| {
+        read.topic_messages(topic, 10)
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(topic), [first, kept, unheard]);
+    assert_eq!(ids(aside), [mention]);
+    assert_eq!(read.message(mention).unwrap().topic, aside);
+    assert_eq!(read.message(unheard).unwrap().topic, topic);
+    assert_eq!(
+        read.topic(topic).unwrap().place,
+        chat::Place::Stream {
+            stream: ops,
+            name: "Fixed".into(),
+            resolved: true
+        }
+    );
+    assert!(read.topic(topic).unwrap().agents.is_empty());
+    // `a` heard what came while it was a member, and the mention; the
+    // moves delivered nothing.
+    assert_eq!(received(&read, a, 0), vec![kept.0.0, mention.0.0]);
+    let moves = read
+        .chat_since(ChatSeq::ZERO, 100)
+        .into_iter()
+        .filter(|record| matches!(record.event, ChatEvent::Moved { .. }))
+        .count();
+    assert_eq!(moves, 2, "the resend logged no second move");
+}
+
+fn db_head(write: &mut rho_db::WriteTxn) -> u64 {
+    write
+        .open_table(redb::TableDefinition::<
+            u64,
+            rho_db::Sen<rho_agent_types::ChatRecord>,
+        >::new("chat_log"))
+        .iter()
+        .next_back()
+        .map_or(0, |(key, _)| key.value())
+}

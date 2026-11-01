@@ -46,6 +46,13 @@ rho_rpc::calls! {
         /// `client_id`.
         StartTopic(StartTopic) -> TopicId;
         CreateStream(CreateStream) -> StreamId;
+        /// The user takes an agent out of a topic.
+        Leave(Leave) -> ();
+        /// Renames a topic, moves it to another stream, or resolves it.
+        ChangeTopic(ChangeTopic) -> ();
+        /// Moves messages to a topic, which may be new; answered with the
+        /// topic they are in. Logged once per `client_id`.
+        MoveMessages(MoveMessages) -> TopicId;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
@@ -124,6 +131,42 @@ pub struct StartTopic {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct CreateStream {
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Leave {
+    pub topic: TopicId,
+    pub agent: AgentId,
+}
+
+/// A topic as it is to be, whole. Not for a direct conversation.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ChangeTopic {
+    pub topic: TopicId,
+    pub stream: StreamId,
+    pub name: String,
+    pub resolved: bool,
+}
+
+/// Messages of topics, in any order, to one topic. A direct conversation's
+/// messages stay where they are.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct MoveMessages {
+    /// As in [`Post`]: a resend after a lost answer starts no second topic.
+    pub client_id: u64,
+    pub messages: Vec<MessageId>,
+    pub to: MoveTo,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum MoveTo {
+    Topic(TopicId),
+    /// A topic started for them, with no members: its first message is the
+    /// oldest one moved.
+    NewTopic {
+        stream: StreamId,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -502,6 +545,27 @@ mod tests {
             }
             .into(),
             CreateStream { name: "rho".into() }.into(),
+            Leave {
+                topic: TopicId(ChatSeq(2)),
+                agent,
+            }
+            .into(),
+            ChangeTopic {
+                topic: TopicId(ChatSeq(2)),
+                stream: StreamId(ChatSeq(1)),
+                name: "Fixed the flaky test".into(),
+                resolved: true,
+            }
+            .into(),
+            MoveMessages {
+                client_id: 9,
+                messages: vec![MessageId(ChatSeq(5)), MessageId(ChatSeq(3))],
+                to: MoveTo::NewTopic {
+                    stream: StreamId(ChatSeq(1)),
+                    name: "aside".into(),
+                },
+            }
+            .into(),
             Cancel { agent }.into(),
             super::super::QuotaUsage.into(),
             super::super::SetAuthAccountEnabled {

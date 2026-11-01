@@ -105,7 +105,28 @@ pub enum ChatEvent {
         topic: TopicId,
         agent: AgentId,
     },
-    /// A message in `topic`. Its content never changes. Every member but
+    /// An agent stops being a member of a topic: it receives only the
+    /// messages that mention it from here on.
+    Left {
+        topic: TopicId,
+        agent: AgentId,
+    },
+    /// A topic as it now is, whole: renamed, moved to another stream, or
+    /// resolved (done) or not.
+    TopicChanged {
+        topic: TopicId,
+        stream: StreamId,
+        name: String,
+        resolved: bool,
+    },
+    /// Messages now in topic `to`, wherever they were. A move delivers
+    /// nothing again: who received a message was fixed when it was posted.
+    Moved {
+        messages: Vec<MessageId>,
+        to: TopicId,
+    },
+    /// A message in `topic`, the topic it was posted in: a later `Moved`
+    /// says where it is now. Its content never changes. Every member but
     /// its sender receives it, and so does each agent it mentions. Neither
     /// posting nor a mention makes anyone a member.
     Posted {
@@ -124,7 +145,7 @@ pub struct ChatRecord {
     pub event: ChatEvent,
 }
 
-/// A posted message, with where it is.
+/// A posted message, with where it is now.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Message {
     pub id: MessageId,
@@ -136,7 +157,8 @@ pub struct Message {
 }
 
 impl Message {
-    /// The message a record posts, if it posts one.
+    /// The message a record posts, if it posts one, in the topic it was
+    /// posted in.
     pub fn from_record(record: &ChatRecord) -> Option<Self> {
         let ChatEvent::Posted {
             topic,

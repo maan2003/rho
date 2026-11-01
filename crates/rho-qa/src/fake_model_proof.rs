@@ -393,6 +393,11 @@ async fn run_async(args: Args) -> Result<()> {
                     last_seq = record.seq;
                     match record.event {
                         ChatEvent::StreamCreated { .. } | ChatEvent::Joined { .. } => {}
+                        ChatEvent::Left { .. }
+                        | ChatEvent::TopicChanged { .. }
+                        | ChatEvent::Moved { .. } => {
+                            bail!("nobody leaves, changes or moves in this proof")
+                        }
                         ChatEvent::TopicStarted {
                             by: Address::User, ..
                         } => {}

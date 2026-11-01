@@ -39,10 +39,16 @@ const CHAT: TableDefinition<(&str, u64), Sen<ChatRecord>> = TableDefinition::new
 /// topic and nothing else.
 const MESSAGES: TableDefinition<(&str, u64, u64), Sen<ChatRecord>> =
     TableDefinition::new("gui_chat_message_v1");
-/// The messages each agent posted or received, by agent and position,
-/// with the topic each is in: what its transcript reads. Written with the
-/// messages, as the fold decided who they reached.
-const DELIVERED: TableDefinition<(AgentId, u64), u64> = TableDefinition::new("gui_chat_agent_v1");
+/// The messages each agent posted or received, by agent and position:
+/// what its transcript reads. Written with the messages, as the fold
+/// decided who they reached.
+const DELIVERED: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("gui_chat_agent_v2");
+/// The topic each message is in now, by host and position: where a move
+/// finds it, and where a link to it leads.
+const WHERE: TableDefinition<(&str, u64), u64> = TableDefinition::new("gui_chat_where_v1");
+/// Temporary: the agents' messages before [`WHERE`], with their topic.
+const DELIVERED_V1: TableDefinition<(AgentId, u64), u64> =
+    TableDefinition::new("gui_chat_agent_v1");
 /// The rows of each agent whose transcript was opened, by position.
 const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
     TableDefinition::new("gui_agent_rows_v1");
@@ -167,7 +173,7 @@ enum Write {
         host: String,
         through: ChatSeq,
         records: Vec<ChatRecord>,
-        delivered: Vec<(AgentId, MessageId, TopicId)>,
+        delivered: Vec<(AgentId, MessageId)>,
     },
     /// Directory entries as they now stand.
     Agents(Vec<(AgentId, StoredAgent)>),
@@ -235,7 +241,9 @@ impl Mirror {
             open_or_rebuild(&mut write, CHAT);
             open_or_rebuild(&mut write, MESSAGES);
             open_or_rebuild(&mut write, DELIVERED);
+            open_or_rebuild(&mut write, WHERE);
             open_or_rebuild(&mut write, ROWS);
+            index_before_where(&mut write);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
             for table in RETIRED_TABLES {
@@ -329,13 +337,25 @@ impl Mirror {
             return Vec::new();
         };
         let messages = read.open_table(MESSAGES);
+        let index = read.open_table(WHERE);
         read.open_table(DELIVERED)
             .range((agent_id, 0)..=(agent_id, u64::MAX))
-            .filter_map(|(key, topic)| {
-                let record = messages.get((host.as_str(), topic.value(), key.value().1))?;
+            .filter_map(|(key, _)| {
+                let seq = key.value().1;
+                let topic = index.get((host.as_str(), seq))?.value();
+                let record = messages.get((host.as_str(), topic, seq))?;
                 Message::from_record(&record.value().into_owned())
             })
             .collect()
+    }
+
+    /// The conversation a message is in now, if the copy holds it.
+    pub fn message_topic(&self, host: &str, message: MessageId) -> Option<TopicId> {
+        self.db
+            .read()
+            .open_table(WHERE)
+            .get((host, message.0.0))
+            .map(|topic| TopicId(ChatSeq(topic.value())))
     }
 
     /// The rows held of an agent, oldest first.
@@ -499,30 +519,33 @@ fn apply(
             records,
             delivered,
         } => {
-            let (posted, events): (Vec<_>, Vec<_>) = records
-                .iter()
-                .partition(|record| matches!(record.event, ChatEvent::Posted { .. }));
-            {
-                let mut chat = transaction.open_table(CHAT);
-                for record in events {
-                    chat.insert((host.as_str(), record.seq.0), SenValue::borrowed(record));
-                }
-            }
-            {
-                let mut messages = transaction.open_table(MESSAGES);
-                for record in posted {
-                    if let ChatEvent::Posted { topic, .. } = &record.event {
-                        messages.insert(
+            // In log order: a move finds what it moves where an earlier
+            // record of the run put it.
+            for record in &records {
+                match &record.event {
+                    ChatEvent::Posted { topic, .. } => {
+                        transaction.open_table(MESSAGES).insert(
                             (host.as_str(), topic.0.0, record.seq.0),
                             SenValue::borrowed(record),
                         );
+                        transaction
+                            .open_table(WHERE)
+                            .insert((host.as_str(), record.seq.0), topic.0.0);
+                    }
+                    ChatEvent::Moved { messages, to } => {
+                        move_messages(transaction, &host, messages, *to);
+                    }
+                    _ => {
+                        transaction
+                            .open_table(CHAT)
+                            .insert((host.as_str(), record.seq.0), SenValue::borrowed(record));
                     }
                 }
             }
             {
                 let mut table = transaction.open_table(DELIVERED);
-                for (agent_id, message, topic) in &delivered {
-                    table.insert((*agent_id, message.0.0), topic.0.0);
+                for (agent_id, message) in &delivered {
+                    table.insert((*agent_id, message.0.0), ());
                 }
             }
             let mut hosts = transaction.open_table(HOSTS);
@@ -604,6 +627,16 @@ fn apply(
                     messages.remove((host.as_str(), topic, seq));
                 }
             }
+            {
+                let mut index = transaction.open_table(WHERE);
+                let held = index
+                    .range((host.as_str(), 0)..=(host.as_str(), u64::MAX))
+                    .map(|(key, _)| key.value().1)
+                    .collect::<Vec<_>>();
+                for seq in held {
+                    index.remove((host.as_str(), seq));
+                }
+            }
             let departed = transaction
                 .open_table(AGENTS)
                 .iter()
@@ -615,6 +648,39 @@ fn apply(
             }
         }
         Write::Flush(done) => flushed.push(done),
+    }
+}
+
+/// Temporary: a copy written before [`WHERE`] gets it from the keys of
+/// [`MESSAGES`], and its [`DELIVERED_V1`] rows lose the topic.
+fn index_before_where(write: &mut rho_db::WriteTxn) {
+    let held = write.open_table(WHERE).iter().next().is_some();
+    if !held {
+        let keys = write
+            .open_table(MESSAGES)
+            .iter()
+            .map(|(key, _)| {
+                let (host, topic, seq) = key.value();
+                (host.to_owned(), topic, seq)
+            })
+            .collect::<Vec<_>>();
+        let mut index = write.open_table(WHERE);
+        for (host, topic, seq) in keys {
+            index.insert((host.as_str(), seq), topic);
+        }
+    }
+    if write.try_open_table(DELIVERED_V1).is_some() {
+        let keys = write
+            .open_table(DELIVERED_V1)
+            .iter()
+            .map(|(key, _)| key.value())
+            .collect::<Vec<_>>();
+        let mut delivered = write.open_table(DELIVERED);
+        for key in keys {
+            delivered.insert(key, ());
+        }
+        drop(delivered);
+        write.delete_table(DELIVERED_V1.name());
     }
 }
 
@@ -668,6 +734,33 @@ fn carry(transaction: &mut rho_db::WriteTxn, carried: &from_main::Carried) {
     }
     drop_if_empty(transaction, MAIN_DRAFTS);
     drop_if_empty(transaction, MAIN_OUTBOX);
+}
+
+/// A move is kept as its outcome: each message rewritten into the topic it
+/// is in now, so reading the copy back folds it there.
+fn move_messages(transaction: &mut rho_db::WriteTxn, host: &str, ids: &[MessageId], to: TopicId) {
+    for id in ids {
+        let Some(from) = transaction
+            .open_table(WHERE)
+            .get((host, id.0.0))
+            .map(|topic| topic.value())
+        else {
+            continue;
+        };
+        let mut messages = transaction.open_table(MESSAGES);
+        let Some(mut record) = messages
+            .remove((host, from, id.0.0))
+            .map(|record| record.value().into_owned())
+        else {
+            continue;
+        };
+        if let ChatEvent::Posted { topic, .. } = &mut record.event {
+            *topic = to;
+        }
+        messages.insert((host, to.0.0, id.0.0), SenValue::borrowed(&record));
+        drop(messages);
+        transaction.open_table(WHERE).insert((host, id.0.0), to.0.0);
+    }
 }
 
 /// Only host-owned copies go away: the agent, what reached it, and its
@@ -780,6 +873,10 @@ pub fn read_topic(host: &str, topic: TopicId) -> Vec<Message> {
     read(|mirror| mirror.read_topic(host, topic))
 }
 
+pub fn message_topic(host: &str, message: MessageId) -> Option<TopicId> {
+    read(|mirror| mirror.message_topic(host, message))
+}
+
 pub fn read_agent_messages(agent_id: AgentId) -> Vec<Message> {
     read(|mirror| mirror.read_agent_messages(agent_id))
 }
@@ -803,7 +900,7 @@ pub fn write_chat(
     host: &str,
     through: ChatSeq,
     records: Vec<ChatRecord>,
-    delivered: Vec<(AgentId, MessageId, TopicId)>,
+    delivered: Vec<(AgentId, MessageId)>,
 ) {
     send(Write::Chat {
         host: host.to_owned(),
@@ -995,9 +1092,9 @@ mod tests {
                     posted(6, 3, Address::User),
                 ],
                 delivered: vec![
-                    (b, MessageId(ChatSeq(4)), topic(3)),
-                    (a, MessageId(ChatSeq(5)), topic(2)),
-                    (b, MessageId(ChatSeq(6)), topic(3)),
+                    (b, MessageId(ChatSeq(4))),
+                    (a, MessageId(ChatSeq(5))),
+                    (b, MessageId(ChatSeq(6))),
                 ],
             });
             mirror.send(Write::Rows {
@@ -1031,6 +1128,100 @@ mod tests {
         assert_eq!(mirror.read_rows(a).len(), 2);
         assert_eq!(mirror.rows_next(a), Wpos(3));
         assert_eq!(mirror.rows_next(b), Wpos::ZERO);
+    }
+
+    /// A move is kept where the messages now are: the topics read back
+    /// without them or with them, a link finds them, an agent's transcript
+    /// keeps them, and the copy folds back to what the live fold made.
+    #[test]
+    fn a_move_is_kept_where_the_messages_now_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = agent_id(2);
+        let first = vec![
+            record(1, ChatEvent::StreamCreated { name: "rho".into() }),
+            started(2),
+            started(3),
+            posted(4, 3, Address::Agent(b)),
+            posted(5, 2, Address::User),
+            posted(6, 3, Address::Agent(b)),
+        ];
+        // 4 joins 2, and 6 a topic started for it at 7, in one run with
+        // a message posted after.
+        let second = vec![
+            record(
+                7,
+                ChatEvent::Moved {
+                    messages: vec![MessageId(ChatSeq(4))],
+                    to: topic(2),
+                },
+            ),
+            started(8),
+            record(
+                9,
+                ChatEvent::Moved {
+                    messages: vec![MessageId(ChatSeq(6))],
+                    to: topic(8),
+                },
+            ),
+            posted(10, 3, Address::Agent(b)),
+        ];
+        let mut live = crate::chat::HostChat::default();
+        for record in first.iter().chain(&second) {
+            live.tell(record);
+        }
+        {
+            let mirror = Mirror::open(dir.path()).unwrap();
+            mirror.send(Write::Host {
+                host: "fern".into(),
+                machine_seed: 9,
+            });
+            mirror.send(Write::Agents(vec![(b, stored(b, "fern", workset(1)))]));
+            mirror.send(Write::Chat {
+                host: "fern".into(),
+                through: ChatSeq(6),
+                records: first,
+                delivered: vec![(b, MessageId(ChatSeq(4))), (b, MessageId(ChatSeq(6)))],
+            });
+            mirror.send(Write::Chat {
+                host: "fern".into(),
+                through: ChatSeq(10),
+                records: second,
+                delivered: vec![(b, MessageId(ChatSeq(10)))],
+            });
+            mirror.flush();
+        }
+        let mirror = Mirror::open(dir.path()).unwrap();
+        assert_eq!(ids(&mirror.read_topic("fern", topic(2))), [4, 5]);
+        assert_eq!(ids(&mirror.read_topic("fern", topic(3))), [10]);
+        assert_eq!(ids(&mirror.read_topic("fern", topic(8))), [6]);
+        assert!(
+            mirror
+                .read_topic("fern", topic(2))
+                .iter()
+                .all(|message| message.topic == topic(2)),
+            "a moved message names the topic it is in now"
+        );
+        assert_eq!(
+            mirror.message_topic("fern", MessageId(ChatSeq(6))),
+            Some(topic(8))
+        );
+        assert_eq!(
+            mirror.message_topic("fern", MessageId(ChatSeq(5))),
+            Some(topic(2))
+        );
+        assert_eq!(mirror.message_topic("oak", MessageId(ChatSeq(5))), None);
+        assert_eq!(ids(&mirror.read_agent_messages(b)), [4, 6, 10]);
+        let mut again = crate::chat::HostChat::default();
+        for record in mirror.read_chat("fern") {
+            again.tell(&record);
+        }
+        assert_eq!(again.topics, live.topics);
+        assert_eq!(again.topics[&topic(2)].others, [MessageId(ChatSeq(4))]);
+        assert_eq!(again.topics[&topic(3)].others, [MessageId(ChatSeq(10))]);
+        assert_eq!(
+            again.topics[&topic(3)].newest.map(|(id, _)| id.0.0),
+            Some(10)
+        );
     }
 
     /// A host with another database starts its copy over; the user's own

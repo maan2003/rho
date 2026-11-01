@@ -26,7 +26,7 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, NewMessage, Place, StoreRead as _, StoreWrite as _,
+    ChatRead as _, ChatWrite as _, MoveTo, NewMessage, Place, StoreRead as _, StoreWrite as _,
 };
 
 /// How many agents stay loaded. Past this the least recently used one
@@ -855,6 +855,43 @@ impl AgentPool {
         Ok(stream)
     }
 
+    /// The user takes `agent` out of `topic`.
+    pub async fn leave_user(&self, topic: TopicId, agent: AgentId) -> anyhow::Result<()> {
+        let mut write = self.db.write().await;
+        write.leave(UnixMs::now(), topic, agent)?;
+        write.commit();
+        Ok(())
+    }
+
+    /// The user renames a topic, moves it to a stream, or resolves it.
+    pub async fn change_topic(
+        &self,
+        topic: TopicId,
+        stream: StreamId,
+        name: String,
+        resolved: bool,
+    ) -> anyhow::Result<()> {
+        let mut write = self.db.write().await;
+        write.change_topic(UnixMs::now(), topic, stream, name, resolved)?;
+        write.commit();
+        Ok(())
+    }
+
+    /// The user moves messages to a topic. A resend under the same
+    /// `client_id` is the same move.
+    pub async fn move_messages(
+        &self,
+        client_id: u64,
+        messages: Vec<MessageId>,
+        to: MoveTo,
+    ) -> anyhow::Result<TopicId> {
+        let mut write = self.db.write().await;
+        let topic =
+            write.move_messages(UnixMs::now(), messages, to, Address::User, Some(client_id))?;
+        write.commit();
+        Ok(topic)
+    }
+
     /// The user's mentions of agents: each asks the agent to read it.
     fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
         let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
@@ -1195,6 +1232,13 @@ impl AgentPool {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
                 write.join(UnixMs::now(), topic, agent)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Leave { topic, agent } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.leave(UnixMs::now(), topic, agent)?;
                 write.commit();
                 PyReply::Done
             }

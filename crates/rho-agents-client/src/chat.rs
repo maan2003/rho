@@ -43,6 +43,8 @@ pub struct UserMention {
 pub struct Topic {
     pub stream: StreamId,
     pub name: String,
+    /// Done with: a resolved topic's work is finished.
+    pub resolved: bool,
     pub started_at: UnixMs,
     /// Its members, each with the `Joined` that made it one: it receives
     /// every message after that. Posting or being mentioned does not make
@@ -56,6 +58,19 @@ pub struct Topic {
     pub user_wrote: Option<(MessageId, UnixMs)>,
     /// Every mention of the user in it, oldest first.
     pub mentions: Vec<UserMention>,
+    /// Every message in it not from the user, oldest first: what can be
+    /// unread.
+    pub others: Vec<MessageId>,
+}
+
+/// What the fold keeps of each message of a topic, so a move can work out
+/// both topics again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Brief {
+    topic: TopicId,
+    at: UnixMs,
+    from: Address,
+    user: Option<MentionKind>,
 }
 
 impl Topic {
@@ -97,6 +112,8 @@ pub struct Direct {
     pub started_at: UnixMs,
     /// The newest message in it.
     pub newest: Option<(MessageId, UnixMs)>,
+    /// Every message in it, oldest first: none is from the user.
+    pub others: Vec<MessageId>,
 }
 
 /// What telling one record moved.
@@ -115,6 +132,12 @@ pub enum Told {
         direct: TopicId,
         message: Option<(Message, Vec<AgentId>)>,
     },
+    /// Messages moved to `to`: the topics they left, and `to`, moved.
+    Moved {
+        messages: Vec<MessageId>,
+        to: TopicId,
+        topics: Vec<TopicId>,
+    },
 }
 
 /// One host's chat, folded.
@@ -125,6 +148,8 @@ pub struct HostChat {
     /// Direct conversations, by the seq that started each; messages name
     /// them as they name topics.
     pub directs: BTreeMap<TopicId, Direct>,
+    /// Each message of a topic, where it is now.
+    briefs: BTreeMap<MessageId, Brief>,
 }
 
 impl HostChat {
@@ -150,12 +175,14 @@ impl HostChat {
                     Topic {
                         stream: *stream,
                         name: name.clone(),
+                        resolved: false,
                         started_at: record.at,
                         members: BTreeMap::new(),
                         newest: None,
                         agent_wrote: None,
                         user_wrote: None,
                         mentions: Vec::new(),
+                        others: Vec::new(),
                     },
                 );
                 Told::Topic {
@@ -174,6 +201,7 @@ impl HostChat {
                         members: *members,
                         started_at: record.at,
                         newest: None,
+                        others: Vec::new(),
                     },
                 );
                 Told::Direct {
@@ -195,10 +223,83 @@ impl HostChat {
                     message: None,
                 }
             }
-            ChatEvent::Posted { topic, .. } => {
+            ChatEvent::Left { topic, agent } => {
+                let Some(held) = self.topics.get_mut(topic) else {
+                    tracing::warn!(topic = topic.0.0, "a leave from a topic not heard of");
+                    return Told::Nothing;
+                };
+                if held.members.remove(agent).is_none() {
+                    return Told::Nothing;
+                }
+                Told::Topic {
+                    topic: *topic,
+                    message: None,
+                }
+            }
+            ChatEvent::TopicChanged {
+                topic,
+                stream,
+                name,
+                resolved,
+            } => {
+                let Some(held) = self.topics.get_mut(topic) else {
+                    tracing::warn!(topic = topic.0.0, "a change to a topic not heard of");
+                    return Told::Nothing;
+                };
+                if (held.stream, held.name.as_str(), held.resolved) == (*stream, name, *resolved) {
+                    return Told::Nothing;
+                }
+                held.stream = *stream;
+                held.name = name.clone();
+                held.resolved = *resolved;
+                Told::Topic {
+                    topic: *topic,
+                    message: None,
+                }
+            }
+            ChatEvent::Moved { messages, to } => {
+                if !self.topics.contains_key(to) {
+                    tracing::warn!(topic = to.0.0, "a move to a topic not heard of");
+                    return Told::Nothing;
+                }
+                let mut topics = Vec::new();
+                let mut moved = Vec::new();
+                for message in messages {
+                    // A message the fold has not heard of yet is posted where
+                    // it is now: the disk copy keeps it there.
+                    let Some(brief) = self.briefs.get_mut(message) else {
+                        continue;
+                    };
+                    if brief.topic == *to {
+                        continue;
+                    }
+                    if !topics.contains(&brief.topic) {
+                        topics.push(brief.topic);
+                    }
+                    brief.topic = *to;
+                    moved.push(*message);
+                }
+                if moved.is_empty() {
+                    return Told::Nothing;
+                }
+                topics.push(*to);
+                for topic in &topics {
+                    self.refold(*topic);
+                }
+                Told::Moved {
+                    messages: moved,
+                    to: *to,
+                    topics,
+                }
+            }
+            ChatEvent::Posted { .. } => {
                 let Some(message) = Message::from_record(record) else {
                     return Told::Nothing;
                 };
+                if self.briefs.contains_key(&message.id) {
+                    return Told::Nothing;
+                }
+                let topic = &message.topic.clone();
                 // Every member but the sender receives it, and so does each
                 // agent it mentions.
                 let mentioned = message
@@ -227,6 +328,7 @@ impl HostChat {
                         return Told::Nothing;
                     }
                     held.newest = Some((message.id, message.at));
+                    held.others.push(message.id);
                     let parties = reach(&mut held.members.into_iter());
                     return Told::Direct {
                         direct: *topic,
@@ -240,10 +342,23 @@ impl HostChat {
                 if held.newest.is_some_and(|(newest, _)| newest >= message.id) {
                     return Told::Nothing;
                 }
+                self.briefs.insert(
+                    message.id,
+                    Brief {
+                        topic: *topic,
+                        at: message.at,
+                        from: message.from,
+                        user: message.mentions(Address::User),
+                    },
+                );
+                let held = self.topics.get_mut(topic).expect("checked above");
                 held.newest = Some((message.id, message.at));
                 match message.from {
                     Address::User => held.user_wrote = Some((message.id, message.at)),
-                    Address::Agent(_) => held.agent_wrote = Some((message.id, message.at)),
+                    Address::Agent(_) => {
+                        held.agent_wrote = Some((message.id, message.at));
+                        held.others.push(message.id);
+                    }
                 }
                 if let (Some(kind), Address::Agent(by)) =
                     (message.mentions(Address::User), message.from)
@@ -270,12 +385,43 @@ impl HostChat {
         }
     }
 
+    /// Works a topic's messages out again from where each now is.
+    fn refold(&mut self, topic: TopicId) {
+        let Some(held) = self.topics.get_mut(&topic) else {
+            return;
+        };
+        held.newest = None;
+        held.agent_wrote = None;
+        held.user_wrote = None;
+        held.mentions.clear();
+        held.others.clear();
+        for (id, brief) in self.briefs.iter().filter(|(_, brief)| brief.topic == topic) {
+            held.newest = Some((*id, brief.at));
+            match brief.from {
+                Address::User => held.user_wrote = Some((*id, brief.at)),
+                Address::Agent(by) => {
+                    held.agent_wrote = Some((*id, brief.at));
+                    held.others.push(*id);
+                    if let Some(kind) = brief.user {
+                        held.mentions.push(UserMention {
+                            message: *id,
+                            by,
+                            kind,
+                            at: brief.at,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Takes the streams, topics and directs the model says moved, as they
     /// now stand.
     pub fn merge(&mut self, moved: HostChat) {
         self.streams.extend(moved.streams);
         self.topics.extend(moved.topics);
         self.directs.extend(moved.directs);
+        self.briefs.extend(moved.briefs);
     }
 
     /// A stream by its name, if the host has one.
@@ -605,6 +751,89 @@ mod tests {
             "a join makes a member who hears what comes after"
         );
         assert_eq!(chat.topics[&TOPIC].members_in_order(), [a, b]);
+    }
+
+    /// An agent that left hears only what mentions it; a change renames,
+    /// moves and resolves a topic whole; a move takes the mentions and the
+    /// unread ids with the messages, and a replayed move moves nothing.
+    #[test]
+    fn leaving_changing_and_moving() {
+        let (a, b) = (agent(1), agent(2));
+        let other = TopicId(ChatSeq(5));
+        let mut chat = HostChat::default();
+        for record in started(a) {
+            chat.tell(&record);
+        }
+        chat.tell(&posted(
+            4,
+            Address::Agent(b),
+            &[(Address::User, MentionKind::Ask)],
+        ));
+        chat.tell(&record(
+            5,
+            ChatEvent::TopicStarted {
+                stream: StreamId(ChatSeq(1)),
+                name: "aside".into(),
+                by: Address::User,
+            },
+        ));
+        chat.tell(&record(
+            6,
+            ChatEvent::Left {
+                topic: TOPIC,
+                agent: a,
+            },
+        ));
+        assert_eq!(
+            parties(chat.tell(&posted(7, Address::User, &[]))),
+            Vec::<AgentId>::new()
+        );
+        assert_eq!(
+            parties(chat.tell(&posted(
+                8,
+                Address::User,
+                &[(Address::Agent(a), MentionKind::Ask)]
+            ))),
+            [a],
+            "a mention still reaches an agent that left"
+        );
+        chat.tell(&record(
+            9,
+            ChatEvent::TopicChanged {
+                topic: TOPIC,
+                stream: StreamId(ChatSeq(1)),
+                name: "fixed".into(),
+                resolved: true,
+            },
+        ));
+        let held = &chat.topics[&TOPIC];
+        assert_eq!((held.name.as_str(), held.resolved), ("fixed", true));
+        let moved = record(
+            10,
+            ChatEvent::Moved {
+                messages: vec![id(8), id(4)],
+                to: other,
+            },
+        );
+        assert_eq!(
+            chat.tell(&moved),
+            Told::Moved {
+                messages: vec![id(8), id(4)],
+                to: other,
+                topics: vec![TOPIC, other],
+            }
+        );
+        let (from, to) = (&chat.topics[&TOPIC], &chat.topics[&other]);
+        assert_eq!(from.newest.map(|(message, _)| message), Some(id(7)));
+        assert!(from.mentions.is_empty(), "the ask went with its message");
+        assert_eq!(from.others, Vec::<MessageId>::new());
+        assert_eq!(
+            to.mentions.iter().map(|m| m.message).collect::<Vec<_>>(),
+            [id(4)]
+        );
+        assert_eq!(to.others, [id(4)]);
+        assert_eq!(to.user_wrote.map(|(message, _)| message), Some(id(8)));
+        assert_eq!(chat.tell(&moved), Told::Nothing);
     }
 
     /// A direct conversation is its two agents': each message reaches

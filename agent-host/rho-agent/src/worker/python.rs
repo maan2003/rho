@@ -331,6 +331,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(start_topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
@@ -710,6 +711,18 @@ fn join(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
     }
 }
 
+#[pyfunction]
+fn leave(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
+    let request = PyRequest::Leave {
+        topic: TopicId(ChatSeq(topic)),
+        agent: agent_id(agent)?,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
 /// A conversation: its stream's name and its name for a topic, None for
 /// both in a direct conversation, and its members; None for no topic.
 #[pyfunction]
@@ -719,11 +732,12 @@ fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
         PyReply::Topic(Some((head, stream))) => {
             let out = PyDict::new(py);
             out.set_item("id", id)?;
-            let name = match head.place {
-                crate::store::Place::Stream { name, .. } => Some(name),
-                crate::store::Place::Direct => None,
+            let (name, resolved) = match head.place {
+                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved),
+                crate::store::Place::Direct => (None, false),
             };
             out.set_item("name", name)?;
+            out.set_item("resolved", resolved)?;
             out.set_item("stream", stream)?;
             out.set_item(
                 "agents",

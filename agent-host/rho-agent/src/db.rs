@@ -52,7 +52,7 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)). A store from before
 /// worksets is migrated ([`crate::store::from_main`]).
-const CURRENT_AGENT_DB_FORMAT: &str = "4abe2b23";
+const CURRENT_AGENT_DB_FORMAT: &str = "0adc0ed8";
 #[cfg(test)]
 pub(crate) const CURRENT_FORMAT: &str = CURRENT_AGENT_DB_FORMAT;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;

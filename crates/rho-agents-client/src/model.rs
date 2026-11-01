@@ -731,6 +731,7 @@ impl Model {
         let slot = self.hosts.get_mut(&host).expect("the host is here");
         let mut rows: BTreeMap<AgentId, Vec<TranscriptRow>> = BTreeMap::new();
         let mut delivered: Vec<(AgentId, Message)> = Vec::new();
+        let mut moved = false;
         for record in &records {
             match slot.chat.tell(record) {
                 Told::Nothing => {}
@@ -761,6 +762,14 @@ impl Model {
                         delivered.push((agent_id, message.clone()));
                     }
                 }
+                Told::Moved { topics, .. } => {
+                    moved = true;
+                    for topic in topics {
+                        slot.pending_chat
+                            .topics
+                            .insert(topic, slot.chat.topics[&topic].clone());
+                    }
+                }
             }
         }
         for (agent_id, message) in &delivered {
@@ -788,9 +797,14 @@ impl Model {
             records,
             delivered
                 .iter()
-                .map(|(agent_id, message)| (*agent_id, message.id, message.topic))
+                .map(|(agent_id, message)| (*agent_id, message.id))
                 .collect(),
         );
+        // The workspace reads a moved topic back from the copy: the move
+        // is there before it hears of it.
+        if moved {
+            crate::cache::flush();
+        }
         let mut out = rows
             .into_iter()
             .map(|(agent_id, rows)| ModelEvent {
