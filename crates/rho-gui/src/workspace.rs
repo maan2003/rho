@@ -4564,21 +4564,6 @@ impl Workspace {
         }
     }
 
-    /// Who a topic delivers to, in the order they joined: `with @a @b`,
-    /// or that nobody has joined.
-    fn topic_members(&self, topic: HostTopic) -> Option<String> {
-        let (_, held) = self.chat.topic(topic)?;
-        let members = held.members_in_order();
-        if members.is_empty() {
-            return Some("no members".to_owned());
-        }
-        let names = members
-            .into_iter()
-            .map(|agent| format!("@{}", self.registry.agent_display_label(agent)))
-            .collect::<Vec<_>>();
-        Some(format!("with {}", names.join(" ")))
-    }
-
     /// Where opening an agent lands: the newest topic it is in, or its
     /// activity when there is none.
     fn agent_surface_key(&self, agent_id: AgentId) -> SurfaceKey {
@@ -8816,7 +8801,7 @@ impl Workspace {
         // that dealt it: the card says why the dealer raised the agent, and
         // a running agent has no card at all, which left the line blank.
         let agent_in_view = self.surface_agent(&self.active_surface().key);
-        // A conversation's line is its title and members, like an agent's.
+        // A conversation's line is its title, like an agent's.
         let titled_in_view =
             agent_in_view.is_some() || matches!(self.active_surface().key, SurfaceKey::Topic(_));
         if let Some(card) = self.open_card_in_view(cx)
@@ -8827,12 +8812,8 @@ impl Workspace {
         }
         let path = {
             match &self.active_surface().key {
-                // A topic is titled by where it is and what it is called,
-                // and says who is in it.
-                SurfaceKey::Topic(topic) => match self.topic_members(*topic) {
-                    Some(members) => format!("{} · {members}", self.topic_title(*topic)),
-                    None => self.topic_title(*topic),
-                },
+                // A topic is titled by where it is and what it is called.
+                SurfaceKey::Topic(topic) => self.topic_title(*topic),
                 SurfaceKey::Activity(agent_id) => {
                     let leaf = self.registry.agent_display_label(*agent_id);
                     let path = match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
