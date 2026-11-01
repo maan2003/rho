@@ -2474,7 +2474,7 @@ impl Workspace {
         let Some((host, _)) = self.chat.topic(*topic) else {
             self.notice_on(
                 None,
-                "a direct conversation is its two agents' own: nothing is posted in it",
+                "this topic is gone: nothing is posted in it",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -4528,7 +4528,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens one topic or direct conversation, in the context of the
+    /// Opens one topic, in the context of the
     /// agent the agent commands act on there.
     pub(crate) fn open_topic(
         &mut self,
@@ -4546,17 +4546,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The agent the agent commands (`space a`) act on in a topic or a
-    /// direct conversation: the member who joined first. A topic only the
-    /// user is in has none.
+    /// The agent the agent commands (`space a`) act on in a topic: the
+    /// member who joined first. A topic only the user is in has none.
     fn conversation_agent(&self, conversation: HostTopic) -> Option<AgentId> {
-        match self.chat.topic(conversation) {
-            Some((_, topic)) => topic.members_in_order().first().copied(),
-            None => self
-                .chat
-                .direct(conversation)
-                .map(|(_, direct)| direct.members[0]),
-        }
+        let (_, topic) = self.chat.topic(conversation)?;
+        topic.members_in_order().first().copied()
     }
 
     /// The topic an agent is in that moved last.
@@ -4564,17 +4558,8 @@ impl Workspace {
         self.chat.newest_topic_of(self.host_of(agent_id)?, agent_id)
     }
 
-    /// A conversation's title: a topic's stream and name, or the two
-    /// agents of a direct one.
+    /// A topic's title: its stream and name.
     pub(crate) fn topic_title(&self, topic: HostTopic) -> String {
-        if let Some((_, direct)) = self.chat.direct(topic) {
-            let [one, other] = direct.members;
-            return format!(
-                "{} ↔ {}",
-                self.registry.agent_display_label(one),
-                self.registry.agent_display_label(other)
-            );
-        }
         let Some((_, held)) = self.chat.topic(topic) else {
             return String::new();
         };
@@ -4736,67 +4721,6 @@ impl Workspace {
             .into_iter()
             .map(|(_, _, agent, name)| (agent, name))
             .collect()
-    }
-
-    /// `space o d`: the conversations agents have with each other, newest
-    /// first. They are read here, not dealt.
-    pub(crate) fn prompt_directs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut directs = self
-            .chat
-            .directs()
-            .map(|(direct, _, held)| (held.newest, direct))
-            .collect::<Vec<_>>();
-        if directs.is_empty() {
-            self.notice_on(
-                None,
-                "no direct conversations between agents",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        directs.sort_by(|one, other| other.cmp(one));
-        let titled = directs
-            .into_iter()
-            .map(|(_, direct)| (self.topic_title(direct), direct))
-            .collect::<Vec<_>>();
-        let titles = titled.clone();
-        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &App| {
-            let input = input.trim().to_lowercase();
-            titles
-                .iter()
-                .filter(|(title, _)| title.to_lowercase().contains(&input))
-                .map(|(title, _)| crate::minibuffer::Candidate {
-                    value: title.clone(),
-                    description: "direct".to_owned(),
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let input = input.trim().to_lowercase();
-                let chosen = titled
-                    .iter()
-                    .find(|(title, _)| title.to_lowercase() == input)
-                    .or_else(|| {
-                        titled
-                            .iter()
-                            .find(|(title, _)| title.to_lowercase().contains(&input))
-                    });
-                if let Some((_, direct)) = chosen {
-                    workspace.open_topic(*direct, window, cx);
-                }
-            },
-        );
-        self.open_prompt("direct:", complete, on_submit, window, cx);
-        if let Some(minibuffer) = &mut self.minibuffer {
-            // A title has spaces in it, so completion replaces the whole
-            // input rather than the last word.
-            minibuffer.set_complete_whole_input();
-        }
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -7042,7 +6966,6 @@ impl Workspace {
             Command::NewTopic => self.prompt_new_topic(window, cx),
             Command::StartFromMessage => self.start_agent_from_message(window, cx),
             Command::Mention => self.prompt_mention(window, cx),
-            Command::Directs => self.prompt_directs(window, cx),
             Command::Topics => self.open_browser(window, cx),
             Command::SearchChat => self.prompt_search_chat(window, cx),
             Command::YankMessageLink => self.yank_message_link(cx),

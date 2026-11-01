@@ -30,15 +30,10 @@ use crate::topics_view::{BrowserRows, BrowserTarget, StreamRows, TopicRow, Topic
 use crate::workspace::{SurfaceView, Workspace, now_ms};
 
 impl Workspace {
-    /// The newest message of a topic or a direct conversation.
+    /// The newest message of a topic.
     pub(crate) fn newest_message(&self, conversation: HostTopic) -> Option<MessageId> {
-        match self.chat.topic(conversation) {
-            Some((_, topic)) => topic.newest.map(|(message, _)| message),
-            None => self
-                .chat
-                .direct(conversation)
-                .and_then(|(_, direct)| direct.newest.map(|(message, _)| message)),
-        }
+        let (_, topic) = self.chat.topic(conversation)?;
+        topic.newest.map(|(message, _)| message)
     }
 
     /// Where unread starts: the newer of what the user was done with and
@@ -282,12 +277,7 @@ impl Workspace {
         let Some(n) = link_at(&line, column) else {
             return false;
         };
-        let Some((host, _)) = self
-            .chat
-            .topic(topic)
-            .map(|(host, _)| ((host), ()))
-            .or_else(|| self.chat.direct(topic).map(|(host, _)| (host, ())))
-        else {
+        let Some((host, _)) = self.chat.topic(topic) else {
             return false;
         };
         self.open_link(host, n, window, cx);
@@ -320,7 +310,7 @@ impl Workspace {
         }
     }
 
-    /// The topic or direct conversation a message is in now: the one in
+    /// The topic a message is in now: the one in
     /// view if it holds it, else where the copy says it is.
     fn message_conversation(&self, host: HostId, id: MessageId) -> Option<HostTopic> {
         let in_view = self
@@ -351,18 +341,12 @@ impl Workspace {
         ids
     }
 
-    /// Every topic and direct conversation of a host.
+    /// Every topic of a host.
     fn conversations(&self, host: HostId) -> Vec<HostTopic> {
         self.chat
             .topics()
             .filter(|(_, on, _)| *on == host)
             .map(|(topic, _, _)| topic)
-            .chain(
-                self.chat
-                    .directs()
-                    .filter(|(_, on, _)| *on == host)
-                    .map(|(direct, _, _)| direct),
-            )
             .collect()
     }
 
@@ -491,20 +475,17 @@ impl Workspace {
     /// user after where it is read through.
     pub(crate) fn unread(&self, conversation: HostTopic) -> usize {
         let from = self.read_through(conversation);
-        let others = match self.chat.topic(conversation) {
-            Some((_, topic)) => &topic.others,
-            None => match self.chat.direct(conversation) {
-                Some((_, direct)) => &direct.others,
-                None => return 0,
-            },
+        let Some((_, topic)) = self.chat.topic(conversation) else {
+            return 0;
         };
-        others
+        topic
+            .others
             .iter()
             .filter(|message| Some(**message) > from)
             .count()
     }
 
-    /// Every stream with its topics newest first, and the directs.
+    /// Every stream with its topics newest first.
     pub(crate) fn browser_rows(&self) -> BrowserRows {
         let now = now_ms() as i64;
         let age = |at: UnixMs| crate::home::elapsed_label(at.0 as i64, now);
@@ -547,27 +528,7 @@ impl Workspace {
                 topics: newest_first(topics),
             })
             .collect();
-        let directs = self
-            .chat
-            .directs()
-            .map(|(direct, _, held)| {
-                let moved = held.newest.map_or(held.started_at, |(_, at)| at);
-                (
-                    moved,
-                    TopicRow {
-                        topic: direct,
-                        name: self.topic_title(direct),
-                        unread: self.unread(direct),
-                        resolved: false,
-                        age: age(moved),
-                    },
-                )
-            })
-            .collect();
-        BrowserRows {
-            streams,
-            directs: newest_first(directs),
-        }
+        BrowserRows { streams }
     }
 
     fn browser_view(&self) -> Option<Entity<TopicsView>> {

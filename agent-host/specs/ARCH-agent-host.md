@@ -76,8 +76,8 @@ outside every stream. Its members are its two agents, only they post in it,
 and no one joins it. The two may be in different worksets of the host. The
 default tools name it `agents.message`, not chat: an agent reads a message in
 it as a message from the other agent, with no conversation id. Chat is the
-user's. The GUI lists direct conversations apart from streams and makes no
-cards for them.
+user's. The GUI neither lists direct conversations nor makes cards for them:
+each agent's own transcript shows what it sent and received.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move

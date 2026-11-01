@@ -575,40 +575,9 @@ impl ChatMap {
             .map(String::as_str)
     }
 
-    /// The host of a conversation, a topic or a direct.
+    /// The host of a topic.
     pub fn conversation_host(&self, conversation: HostTopic) -> Option<HostId> {
-        self.topic(conversation)
-            .map(|(host, _)| host)
-            .or_else(|| self.direct(conversation).map(|(host, _)| host))
-    }
-
-    /// A direct conversation's host as this window knows it, and the
-    /// direct.
-    pub fn direct(&self, direct: HostTopic) -> Option<(HostId, &Direct)> {
-        self.hosts.iter().find_map(|(host, held)| {
-            (held.machine_seed == Some(direct.machine_seed))
-                .then(|| held.chat.directs.get(&direct.topic))
-                .flatten()
-                .map(|held| (*host, held))
-        })
-    }
-
-    /// Every direct conversation of every host whose database is known.
-    pub fn directs(&self) -> impl Iterator<Item = (HostTopic, HostId, &Direct)> {
-        self.hosts.iter().flat_map(|(host, held)| {
-            held.machine_seed.into_iter().flat_map(move |machine_seed| {
-                held.chat.directs.iter().map(move |(direct, held)| {
-                    (
-                        HostTopic {
-                            machine_seed,
-                            topic: *direct,
-                        },
-                        *host,
-                        held,
-                    )
-                })
-            })
-        })
+        self.topic(conversation).map(|(host, _)| host)
     }
 
     /// The newest topic an agent is a member of.

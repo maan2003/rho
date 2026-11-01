@@ -1462,10 +1462,10 @@ fn a_reply_mentions_the_agents_it_names(cx: &mut TestAppContext) {
     assert_eq!(post.mentions, vec![named], "the member needs no mention");
 }
 
-/// The agents' direct conversations are a list of their own: no card
-/// deals one, and choosing one opens it, titled by its two agents.
+/// The agents' direct conversations are theirs: the GUI deals no card for
+/// one and lists none, even when a message in it mentions the user.
 #[gpui::test]
-fn a_direct_opens_from_the_list_and_deals_no_card(cx: &mut TestAppContext) {
+fn a_direct_deals_no_card_and_is_not_listed(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     let (one, other) = (agent(781), agent(782));
@@ -1513,7 +1513,7 @@ fn a_direct_opens_from_the_list_and_deals_no_card(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, window, cx| {
+        .update(cx, |workspace, _, cx| {
             assert!(
                 !workspace.hand(cx).cards.iter().any(|card| matches!(
                     card.node,
@@ -1521,25 +1521,11 @@ fn a_direct_opens_from_the_list_and_deals_no_card(cx: &mut TestAppContext) {
                 )),
                 "a direct is no card"
             );
-            workspace.prompt_directs(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Topic(rho_agents_client::HostTopic {
-                    machine_seed: 0,
-                    topic: direct,
-                }),
-                "enter takes the first row"
+            let rows = workspace.browser_rows();
+            assert!(
+                rows.streams.iter().all(|stream| stream.topics.is_empty()),
+                "a direct is in no list"
             );
-            let title = workspace.current_surface_name_for_test();
-            let names = [one, other].map(|agent| workspace.registry.agent_display_label(agent));
-            assert_eq!(title, format!("{} ↔ {}", names[0], names[1]));
         })
         .unwrap();
 }

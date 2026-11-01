@@ -85,8 +85,6 @@ pub(crate) enum Command {
     StartFromMessage,
     /// `@agent` in the reply of the topic in view.
     Mention,
-    /// The conversations agents have with each other.
-    Directs,
     /// The streams and their topics.
     Topics,
     /// The messages this GUI holds, searched.
@@ -664,7 +662,6 @@ pub(crate) fn chat_menu() -> Menu {
             "mention in reply…",
             MenuAction::Command(Command::Mention),
         )
-        .item("d", "directs…", MenuAction::Command(Command::Directs))
 }
 
 /// `space o x`: which messages a move takes, as Zulip offers them.

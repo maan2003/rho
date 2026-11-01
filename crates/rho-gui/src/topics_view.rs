@@ -1,7 +1,6 @@
 //! The streams and their topics, the way Zulip's left sidebar lists them:
 //! every stream a heading, its topics under it newest first, each with how
 //! many messages are unread. A resolved topic is hidden until asked for.
-//! The agents' direct conversations are a section of their own.
 //!
 //! Like Home, the surface is one keyed transcript: a row is an item keyed
 //! by the topic it lists, so a new message edits its row and leaves the
@@ -22,7 +21,7 @@ use theme::ActiveTheme as _;
 /// The browser's highlight-key space, clear of Home's at a third.
 const TOPICS_KEY_BASE: usize = usize::MAX / 3 + usize::MAX / 12;
 
-/// One topic or direct conversation as a row.
+/// One topic as a row.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TopicRow {
     pub topic: HostTopic,
@@ -44,7 +43,6 @@ pub(crate) struct StreamRows {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BrowserRows {
     pub streams: Vec<StreamRows>,
-    pub directs: Vec<TopicRow>,
 }
 
 /// What a row offers the cursor.
@@ -57,7 +55,6 @@ pub(crate) enum BrowserTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum BrowserKey {
     Stream(String),
-    Directs,
     Topic(HostTopic),
     Hidden,
     Empty,
@@ -271,8 +268,8 @@ impl TopicsView {
     }
 }
 
-/// The rows as items: each stream with the topics it shows, the directs,
-/// and how many resolved topics are hidden.
+/// The rows as items: each stream with the topics it shows, and how many
+/// resolved topics are hidden.
 fn browser_items(
     rows: &BrowserRows,
     show_resolved: bool,
@@ -284,7 +281,6 @@ fn browser_items(
         .streams
         .iter()
         .flat_map(|stream| stream.topics.iter().filter(shown))
-        .chain(&rows.directs)
         .map(|topic| title(topic).chars().count())
         .max()
         .unwrap_or(0)
@@ -309,13 +305,6 @@ fn browser_items(
     }
     if show_resolved {
         hidden = 0;
-    }
-    if !rows.directs.is_empty() {
-        let unread = rows.directs.iter().map(|topic| topic.unread).sum::<usize>();
-        items.push(heading(BrowserKey::Directs, "directs", unread));
-        for topic in &rows.directs {
-            items.push(topic_line(topic, column));
-        }
     }
     if items.is_empty() && hidden == 0 {
         let text = "no streams yet";
@@ -443,7 +432,6 @@ mod tests {
                 name: "rho".to_owned(),
                 topics: vec![row(2, "deploy", 3, false), row(4, "flaky test", 5, true)],
             }],
-            directs: Vec::new(),
         };
         assert_eq!(
             texts(&rows, false),
@@ -473,7 +461,6 @@ mod tests {
                     topics: Vec::new(),
                 },
             ],
-            directs: Vec::new(),
         };
         assert_eq!(
             texts(&rows, false),
