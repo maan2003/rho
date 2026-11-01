@@ -45,6 +45,7 @@ rho_rpc::calls! {
         /// A topic the user starts with its first message. Logged once per
         /// `client_id`.
         StartTopic(StartTopic) -> TopicId;
+        CreateStream(CreateStream) -> StreamId;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
@@ -101,6 +102,9 @@ pub struct Post {
     /// lost answer is logged once.
     pub client_id: u64,
     pub topic: TopicId,
+    /// Agents the message reaches whether or not they are members. It
+    /// does not make them members.
+    pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
 }
 
@@ -110,9 +114,16 @@ pub struct StartTopic {
     pub client_id: u64,
     pub stream: StreamId,
     pub name: String,
-    /// The agents that receive the topic's messages.
-    pub agents: Vec<AgentId>,
+    /// As in [`Post`].
+    pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
+}
+
+/// The stream of that name, created if the host has none. A stream's name
+/// is unique on its host, so a resend finds the one it made.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct CreateStream {
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -469,6 +480,7 @@ mod tests {
             Request::from(Post {
                 client_id: 7,
                 topic: TopicId(ChatSeq(2)),
+                mentions: vec![agent],
                 content: vec![ContentPart::Image {
                     media_type: "image/gif".to_owned(),
                     data: vec![1, 2, 3],
@@ -485,10 +497,11 @@ mod tests {
                 client_id: 8,
                 stream: StreamId(ChatSeq(1)),
                 name: "Fix the flaky test".into(),
-                agents: vec![agent],
+                mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: "go".into() }],
             }
             .into(),
+            CreateStream { name: "rho".into() }.into(),
             Cancel { agent }.into(),
             super::super::QuotaUsage.into(),
             super::super::SetAuthAccountEnabled {

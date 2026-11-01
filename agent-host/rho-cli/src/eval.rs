@@ -224,6 +224,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             let code = snippets::new_agent_in(
                 &rho_agent::host::pool::workset_root(&kind),
                 &role_runtime(&args.role),
+                None,
             );
             let (workset, evaluated) = pool.create_workset(kind, code).await?;
             if let Some(error) = evaluated.error {
@@ -263,9 +264,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
     let name = prompt.lines().next().unwrap_or("Evaluation").to_owned();
+    let stream = pool.create_stream("eval".to_owned()).await?;
     pool.start_user_topic(
         client_id,
-        rho_agent_types::StreamId::DEFAULT,
+        stream,
         name,
         vec![id],
         vec![ContentPart::Text { text: prompt }],

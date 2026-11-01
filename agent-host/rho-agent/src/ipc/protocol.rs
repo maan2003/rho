@@ -8,7 +8,7 @@ use crate::log::AgentUsageBucket;
 use crate::record::Record;
 use crate::store::{AgentHead, NativeCursor};
 
-pub(crate) const VERSION: u32 = 26;
+pub(crate) const VERSION: u32 = 27;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host

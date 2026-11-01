@@ -26,7 +26,7 @@ use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
 
 use super::StoreWrite as _;
-use super::chat::{ChatWrite as _, DEFAULT_STREAM, NewMessage};
+use super::chat::{ChatWrite as _, NewMessage};
 use crate::entry::{Block, Notice, RequestNotice, ResponseUsage, Wake};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{Carry, PromptCacheKey};
@@ -598,18 +598,20 @@ fn mentions(message: &Message) -> Vec<Mention> {
     }]
 }
 
-/// Posts the messages in time order; one topic per pair of
-/// correspondents.
+/// The stream the migration puts the user's conversations in.
+const MIGRATED_STREAM: &str = "rho";
+
+/// Posts the messages in time order: the user's with each agent in one
+/// topic of [`MIGRATED_STREAM`] that the agent is a member of, and two
+/// agents' in their direct conversation.
 fn post_chat(
     write: &mut WriteTxn,
     messages: &HashMap<u64, Message>,
 ) -> HashMap<u64, ChatMessageId> {
     write.init_chat_tables();
-    let stream: StreamId = write
-        .chat_stream_named(DEFAULT_STREAM)
-        .expect("a chat has its default stream");
     let mut order = messages.iter().collect::<Vec<_>>();
     order.sort_by_key(|(id, message)| (message.at, **id));
+    let mut stream: Option<StreamId> = None;
     let mut topics: HashMap<(Address, Address), TopicId> = HashMap::new();
     let mut ids = HashMap::new();
     for (main_id, message) in order {
@@ -618,6 +620,33 @@ fn post_chat(
         } else {
             (message.to, message.from)
         };
+        let topic = match (topics.get(&pair), pair) {
+            (Some(topic), _) => *topic,
+            (None, (Address::Agent(a), Address::Agent(b))) => write
+                .direct(message.at, a, b)
+                .expect("two agents' messages are between two agents"),
+            (None, (Address::User, Address::Agent(agent))) => {
+                let stream = *stream.get_or_insert_with(|| {
+                    write
+                        .stream(message.at, MIGRATED_STREAM.to_owned())
+                        .expect("the migrated stream has a name")
+                });
+                let topic = write
+                    .open_topic(
+                        message.at,
+                        stream,
+                        topic_name(&message.content),
+                        Address::User,
+                    )
+                    .expect("a migrated topic has a name");
+                write
+                    .join(message.at, topic, agent)
+                    .expect("an agent joins a topic");
+                topic
+            }
+            (None, pair) => unreachable!("main mails between an agent and another: {pair:?}"),
+        };
+        topics.insert(pair, topic);
         let new = NewMessage {
             from: message.from,
             mentions: mentions(message),
@@ -626,26 +655,9 @@ fn post_chat(
         // The user's message keeps the id the GUI gave it, so a GUI that
         // sends it again from main's outbox finds it posted.
         let client_id = (message.from == Address::User).then_some(*main_id);
-        let id = match topics.get(&pair) {
-            Some(topic) => write
-                .post(message.at, *topic, new, client_id)
-                .expect("a migrated message has content"),
-            None => {
-                let agents = [pair.0, pair.1]
-                    .into_iter()
-                    .filter_map(|address| match address {
-                        Address::Agent(agent) => Some(agent),
-                        Address::User => None,
-                    })
-                    .collect();
-                let name = topic_name(&message.content);
-                let (topic, first) = write
-                    .start_topic(message.at, stream, name, agents, new, client_id)
-                    .expect("a migrated topic has a name and content");
-                topics.insert(pair, topic);
-                first
-            }
-        };
+        let id = write
+            .post(message.at, topic, new, client_id)
+            .expect("a migrated message has content");
         ids.insert(*main_id, id);
     }
     ids
@@ -1184,9 +1196,8 @@ mod tests {
             .iter()
             .map(|record| match &record.event {
                 ChatEvent::StreamCreated { name } => format!("stream {name}"),
-                ChatEvent::TopicStarted { name, agents, .. } => {
-                    format!("topic {name:?} {agents:?}")
-                }
+                ChatEvent::TopicStarted { name, .. } => format!("topic {name:?}"),
+                ChatEvent::DirectStarted { members } => format!("direct {members:?}"),
                 ChatEvent::Posted {
                     topic,
                     from,
@@ -1197,12 +1208,13 @@ mod tests {
                     text(content),
                     topic.0.0
                 ),
-                ChatEvent::Joined { .. } => "joined".to_owned(),
+                ChatEvent::Joined { topic, agent } => format!("{agent:?} joins {}", topic.0.0),
             })
             .collect::<Vec<_>>();
-        // In time order, the send to the child once; one topic per pair,
-        // named by its first message; only a send to the user that was no
-        // status mentions them.
+        // In time order, the send to the child once; the user and each
+        // agent in one topic of `rho` that the agent is a member of, named
+        // by its first message; two agents in their direct conversation;
+        // only a send to the user that was no status mentions them.
         let result = vec![Mention {
             to: Address::User,
             kind: MentionKind::Result,
@@ -1211,20 +1223,22 @@ mod tests {
             summary,
             vec![
                 "stream rho".to_owned(),
-                format!("topic \"review\" {:?}", vec![c]),
+                "topic \"review\"".to_owned(),
+                format!("{c:?} joins 2"),
                 format!("review in 2 from {user:?} []"),
-                format!("topic \"first\" {:?}", vec![a]),
-                format!("first in 4 from {user:?} []"),
-                format!("done one in 4 from {aa:?} {result:?}"),
-                format!("topic \"help me\" {:?}", vec![a, b]),
-                format!("help me in 7 from {aa:?} []"),
-                format!("second in 4 from {user:?} []"),
-                format!("looking in 4 from {aa:?} []"),
+                "topic \"first\"".to_owned(),
+                format!("{a:?} joins 5"),
+                format!("first in 5 from {user:?} []"),
+                format!("done one in 5 from {aa:?} {result:?}"),
+                format!("direct {:?}", [a, b]),
+                format!("help me in 9 from {aa:?} []"),
+                format!("second in 5 from {user:?} []"),
+                format!("looking in 5 from {aa:?} []"),
             ]
         );
-        assert_eq!(received_by(&read, b), vec![8]);
-        assert_eq!(received_by(&read, a), vec![5, 9]);
-        assert_eq!(received_by(&read, c), vec![3]);
+        assert_eq!(received_by(&read, b), vec![10]);
+        assert_eq!(received_by(&read, a), vec![7, 11]);
+        assert_eq!(received_by(&read, c), vec![4]);
 
         let worksets = read.worksets();
         assert_eq!(worksets.len(), 2);
@@ -1259,7 +1273,7 @@ mod tests {
                 .join(" ")
         };
         assert_eq!(props(&ha), "cwd=/src/repo name=Fix the bug preset=engineer");
-        assert_eq!(ha.delivered, ChatSeq(9));
+        assert_eq!(ha.delivered, ChatSeq(11));
         let hb = read.agent(b).unwrap();
         assert!(matches!(
             hb.spec.runtime,
@@ -1307,7 +1321,7 @@ mod tests {
         assert_eq!(
             inputs,
             vec![(
-                Some(ChatMessageId(ChatSeq(5))),
+                Some(ChatMessageId(ChatSeq(7))),
                 "Message from the human:\nfirst".into(),
                 InputWake::Person
             )]
@@ -1341,7 +1355,7 @@ mod tests {
         assert_eq!(
             b_inputs,
             vec![(
-                Some(ChatMessageId(ChatSeq(8))),
+                Some(ChatMessageId(ChatSeq(10))),
                 format!("Message from agent {}:\nhelp me", a.encoded()),
                 InputWake::Agent
             )]
@@ -1397,30 +1411,30 @@ mod tests {
         let head = db.read().chat_head();
         assert_eq!(
             write
-                .post(UnixMs(99), TopicId(ChatSeq(4)), again("second"), Some(903))
+                .post(UnixMs(99), TopicId(ChatSeq(5)), again("second"), Some(903))
                 .unwrap(),
-            ChatMessageId(ChatSeq(9))
+            ChatMessageId(ChatSeq(11))
         );
-        let stream = StreamId::DEFAULT;
+        // A topic resent: its message is not the event after the topic's,
+        // since the migration had its agent join between them.
         assert_eq!(
             write
                 .start_topic(
                     UnixMs(99),
-                    stream,
+                    StreamId(ChatSeq(1)),
                     "review".into(),
-                    vec![c],
                     again("review"),
                     Some(904)
                 )
                 .unwrap(),
-            (TopicId(ChatSeq(2)), ChatMessageId(ChatSeq(3)))
+            (TopicId(ChatSeq(2)), ChatMessageId(ChatSeq(4)))
         );
         write.commit();
         assert_eq!(db.read().chat_head(), head, "nothing was posted twice");
         let mut write = db.write().await;
         assert_eq!(
             write
-                .post(UnixMs(99), TopicId(ChatSeq(4)), again("new"), Some(902))
+                .post(UnixMs(99), TopicId(ChatSeq(5)), again("new"), Some(902))
                 .unwrap(),
             ChatMessageId(ChatSeq(head.0 + 1))
         );

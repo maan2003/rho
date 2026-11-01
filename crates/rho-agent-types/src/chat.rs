@@ -3,8 +3,12 @@
 //!
 //! A host's chat is one log of [`ChatEvent`]s, dense from one. Everything
 //! chat names is named by the position of the event that made it: a
-//! [`StreamId`] by its `StreamCreated`, a [`TopicId`] by its `TopicStarted`,
-//! a [`MessageId`] by its `Posted`. A client holds the whole log and folds
+//! [`StreamId`] by its `StreamCreated`, a [`TopicId`] by its `TopicStarted`
+//! or `DirectStarted`, a [`MessageId`] by its `Posted`.
+//!
+//! Chat and the agents are two hierarchies that meet only here: an agent
+//! receives a message because it is a member of the conversation or
+//! because the message mentions it. A client holds the whole log and folds
 //! it; the host folds the same events into its indexes in the commit that
 //! appends them.
 
@@ -42,14 +46,10 @@ chat_id!(
     StreamId
 );
 chat_id!(
-    /// A topic, named by the event that started it.
+    /// A conversation, named by the event that started it: a topic in a
+    /// stream, or a direct conversation between agents.
     TopicId
 );
-
-impl StreamId {
-    /// Every host's first chat event creates this stream, named `rho`.
-    pub const DEFAULT: Self = Self(ChatSeq(1));
-}
 chat_id!(
     /// A message, named by the event that posted it.
     MessageId
@@ -88,21 +88,26 @@ pub enum ChatEvent {
     StreamCreated {
         name: String,
     },
-    /// A topic in `stream`; its agents receive every message in it.
+    /// A topic in `stream`, with no members yet.
     TopicStarted {
         stream: StreamId,
         name: String,
         by: Address,
-        agents: Vec<AgentId>,
     },
-    /// An agent joins a topic and receives its messages from here on.
+    /// A conversation of two agents and no one else: its members are
+    /// fixed, and no one joins it.
+    DirectStarted {
+        members: [AgentId; 2],
+    },
+    /// An agent becomes a member of a topic: it receives the topic's
+    /// messages from here on.
     Joined {
         topic: TopicId,
         agent: AgentId,
     },
-    /// A message in `topic`. Its content never changes. Every agent of the
-    /// topic but its sender receives it, and so does each agent it
-    /// mentions; posting makes an agent sender one of the topic's agents.
+    /// A message in `topic`. Its content never changes. Every member but
+    /// its sender receives it, and so does each agent it mentions. Neither
+    /// posting nor a mention makes anyone a member.
     Posted {
         topic: TopicId,
         from: Address,

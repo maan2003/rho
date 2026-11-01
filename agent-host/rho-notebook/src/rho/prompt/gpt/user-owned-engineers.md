@@ -1,12 +1,15 @@
 ### Engineers the user manages
 
 ```python
-agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
+agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str, stream: str | None = None) → Awaitable[str]
 ```
 
 Start an Engineer that the user manages as its own thread. It appears in the user's agent list, and
 the user reads and directs it from then on. Its responses go to the user, not to you, but it may
 ask you for more context. Returns its identity.
+
+The prompt is the first message of a new topic named task_name. The topic is in `stream`, or in the
+stream you were started in. The message mentions the user, so write it as you write to the user.
 
 Give it its own checkout: create a git worktree in the workset with `git worktree add` and pass it
 as workdir, so its edits do not collide with yours or other Engineers'.

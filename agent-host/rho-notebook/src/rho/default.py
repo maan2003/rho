@@ -39,11 +39,11 @@ def on_compaction(agent) -> list[str]:
 
 
 def on_turn_end(agent, outcome) -> None:
-    """A child that failed tells its parent, in the topic it was started
-    in; whatever else it has to say it posts itself."""
-    topic = agent.props.get("topic")
-    if outcome["reason"] == "failed" and agent.props.get("parent") is not None and topic is not None:
-        chat.post(agent.id, int(topic), f"Agent hit an error and stopped: {outcome['error']}")
+    """A child that failed tells its parent, in their direct conversation;
+    whatever else it has to say it posts itself."""
+    parent = agent.props.get("parent")
+    if outcome["reason"] == "failed" and parent is not None:
+        chat.post(agent.id, chat.direct(agent.id, parent), f"Agent hit an error and stopped: {outcome['error']}")
 
 
 async def on_agent(agent) -> None:
@@ -52,14 +52,19 @@ async def on_agent(agent) -> None:
 
 async def deliver(agent) -> None:
     """Hand the agent what it receives, in order, forever. It resumes after
-    the newest message the agent's log says it was handed."""
+    the newest message the agent's log says it was handed. An agent started
+    from a message first joins its topic and is handed that message."""
     while True:
         try:
             after = _rho.delivered(agent.id)
+            if after == 0 and (origin := chat.origin_message(agent.props)) is not None:
+                record = chat.message(origin)
+                chat.join(record["topic"], agent.id)
+                await hand(agent, record)
+                after = record["id"]
             while True:
                 for record in await chat.inbox(agent.id, after):
-                    wake = "person" if record["sender"] == chat.USER else "agent"
-                    await asyncio.to_thread(agent.input, render(record), wake=wake, message=record["id"])
+                    await hand(agent, record)
                     after = record["id"]
         except Exception:
             print(f"rho: delivering messages to {agent.id}:", file=sys.stderr)
@@ -67,11 +72,20 @@ async def deliver(agent) -> None:
             await asyncio.sleep(RETRY_SECONDS)
 
 
-def render(record: dict) -> str:
-    """A message as the model reads it: its topic first, so the model knows
-    where to answer."""
+async def hand(agent, record: dict) -> None:
+    wake = "person" if record["sender"] == chat.USER else "agent"
+    await asyncio.to_thread(agent.input, render(record, agent.id), wake=wake, message=record["id"])
+
+
+def render(record: dict, reader: str) -> str:
+    """A message as `reader` reads it: its conversation first, so the model
+    knows where to answer."""
     topic = chat.topic(record["topic"])
-    where = f"[#{record['topic']} {topic['stream']} › {topic['name']}]"
+    if topic["stream"] is None:
+        other = next(member for member in topic["agents"] if member != reader)
+        where = f"[#{record['topic']} direct with {prompt.label(other)}]"
+    else:
+        where = f"[#{record['topic']} {topic['stream']} › {topic['name']}]"
     sender = record["sender"]
     if sender == chat.USER:
         return f"{where} Message from the user:\n{record['text']}"
@@ -79,13 +93,20 @@ def render(record: dict) -> str:
     return f"{where}\nMessage Type: MESSAGE\nSender: {label}\nPayload:\n{record['text']}"
 
 
-def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer") -> str:
+def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer", origin: str | None = None) -> str:
     """Create an agent the user manages; returns its id. With `repo`, clone
     it at `rev` into the workset as the directory its URL names, and work
-    there; otherwise work in `cwd`, or the workset's root. The GUI then
-    starts a topic with it."""
+    there; otherwise work in `cwd`, or the workset's root. With `origin`,
+    `chat:<message id>`, the agent joins that message's topic and starts
+    from it."""
     if preset not in ("engineer", "advisor"):
         raise ValueError(f'preset is "engineer" or "advisor", not {preset!r}')
+    props = {"preset": preset}
+    if origin is not None:
+        props[chat.ORIGIN] = origin
+        message = chat.origin_message(props)
+        if chat.message(message) is None:
+            raise ValueError(f"no message {message} for origin {origin}")
     if repo is not None:
         if cwd is not None:
             raise ValueError("give repo or cwd, not both")
@@ -98,5 +119,5 @@ def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None,
         cwd = workset.root
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise ValueError(f"cwd is not an absolute directory: {cwd}")
-    props = {"preset": preset, "cwd": cwd}
+    props["cwd"] = cwd
     return agents.create(runtime, props).id

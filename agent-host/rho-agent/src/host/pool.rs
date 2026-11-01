@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Message, MessageId, StreamId, TopicId, UnixMs,
-    WorksetKind,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
+    TopicId, UnixMs, WorksetKind,
 };
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
@@ -25,7 +25,9 @@ use crate::ipc::protocol::Control;
 use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
-use crate::store::{ChatRead as _, ChatWrite as _, NewMessage, StoreRead as _, StoreWrite as _};
+use crate::store::{
+    ChatRead as _, ChatWrite as _, NewMessage, Place, StoreRead as _, StoreWrite as _,
+};
 
 /// How many agents stay loaded. Past this the least recently used one
 /// that is settled and nobody is looking at is dropped; its log is the
@@ -807,11 +809,12 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         topic: TopicId,
+        mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
         let message = NewMessage {
             from: Address::User,
-            mentions: Vec::new(),
+            mentions: self.user_mentions(mentions)?,
             content,
         };
         let mut write = self.db.write().await;
@@ -828,23 +831,46 @@ impl AgentPool {
         client_id: u64,
         stream: StreamId,
         name: String,
-        agents: Vec<AgentId>,
+        mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<TopicId> {
-        for agent in &agents {
-            self.workset_of(*agent)?;
-        }
         let first = NewMessage {
             from: Address::User,
-            mentions: Vec::new(),
+            mentions: self.user_mentions(mentions)?,
             content,
         };
         let mut write = self.db.write().await;
         let (topic, first) =
-            write.start_topic(UnixMs::now(), stream, name, agents, first, Some(client_id))?;
+            write.start_topic(UnixMs::now(), stream, name, first, Some(client_id))?;
         write.commit();
         self.wake_receivers(first, None);
         Ok(topic)
+    }
+
+    /// The stream named `name`, created if there is none.
+    pub async fn create_stream(&self, name: String) -> anyhow::Result<StreamId> {
+        let mut write = self.db.write().await;
+        let stream = write.stream(UnixMs::now(), name)?;
+        write.commit();
+        Ok(stream)
+    }
+
+    /// The user's mentions of agents: each asks the agent to read it.
+    fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
+        let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
+        for agent in agents {
+            self.workset_of(agent)?;
+            if mentions
+                .iter()
+                .all(|mention| mention.to != Address::Agent(agent))
+            {
+                mentions.push(Mention {
+                    to: Address::Agent(agent),
+                    kind: MentionKind::Ask,
+                });
+            }
+        }
+        Ok(mentions)
     }
 
     /// Start the process of every workset with an agent that receives
@@ -1127,31 +1153,43 @@ impl AgentPool {
                 sender,
                 stream,
                 name,
-                agents,
                 mentions,
                 content,
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
-                for agent in &agents {
-                    self.workset_of(*agent)?;
-                }
-                let stream = self
-                    .db
-                    .read()
-                    .stream_named(&stream)
-                    .with_context(|| format!("no stream {stream:?}"))?;
                 let first = NewMessage {
                     from: Address::Agent(sender),
                     mentions,
                     content,
                 };
                 let mut write = self.db.write().await;
-                let (topic, first) =
-                    write.start_topic(UnixMs::now(), stream, name, agents, first, None)?;
+                let stream = write.stream(UnixMs::now(), stream)?;
+                let (_, first) = write.start_topic(UnixMs::now(), stream, name, first, None)?;
                 write.commit();
                 self.wake_receivers(first, Some(workset));
+                let first = self
+                    .db
+                    .read()
+                    .message(first)
+                    .expect("a message just posted");
+                PyReply::Messages(vec![first])
+            }
+            PyRequest::Direct { sender, other } => {
+                self.own_agent(workset, sender)?;
+                self.workset_of(other)?;
+                let mut write = self.db.write().await;
+                let topic = write.direct(UnixMs::now(), sender, other)?;
+                write.commit();
                 PyReply::Seq(topic.0)
+            }
+            PyRequest::Message(id) => {
+                PyReply::Messages(self.db.read().message(id).into_iter().collect())
+            }
+            PyRequest::Read { topic, last } => {
+                let read = self.db.read();
+                anyhow::ensure!(read.topic(topic).is_some(), "no topic {}", topic.0.0);
+                PyReply::Messages(read.topic_messages(topic, last as usize))
             }
             PyRequest::Join { topic, agent } => {
                 self.own_agent(workset, agent)?;
@@ -1163,9 +1201,12 @@ impl AgentPool {
             PyRequest::Topic(topic) => {
                 let read = self.db.read();
                 PyReply::Topic(read.topic(topic).map(|head| {
-                    let stream = read
-                        .stream_name(head.stream)
-                        .expect("a topic's stream exists");
+                    let stream = match &head.place {
+                        Place::Stream { stream, .. } => {
+                            Some(read.stream_name(*stream).expect("a topic's stream exists"))
+                        }
+                        Place::Direct => None,
+                    };
                     (head, stream)
                 }))
             }

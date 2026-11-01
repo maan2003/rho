@@ -42,9 +42,9 @@ class MessageRecord(TypedDict):
 
 class TopicRecord(TypedDict):
     id: int
-    name: str
-    stream: str  # its stream's name
-    agents: list[str]  # the agents that receive its messages
+    name: str | None  # None for a direct conversation
+    stream: str | None  # its stream's name; None for a direct conversation
+    agents: list[str]  # its members: who joined a topic, or a direct's two
 
 class AgentsFile(TypedDict):
     path: str
@@ -100,11 +100,13 @@ def new_cache_key(agent: str) -> None:
 
 # -- chat --------------------------------------------------------------------
 #
-# The host's chat: streams of topics of messages. Every id is the position of
-# the event that made it in the host's chat log. A message reaches every
-# agent of its topic and every agent it mentions, never its sender; posting
-# makes the sender one of the topic's agents. Messages from the user come
-# only from the GUI, so Python cannot forge them.
+# The host's chat: streams of topics of messages, and direct conversations of
+# two agents. Every id is the position of the event that made it in the
+# host's chat log. A message reaches its conversation's members and every
+# agent it mentions, never its sender. A topic's members are the agents that
+# joined it; neither posting nor a mention joins. A direct conversation's
+# members are its two agents, and only they post in it. Messages from the
+# user come only from the GUI, so Python cannot forge them.
 
 def post(
     sender: str,
@@ -122,14 +124,19 @@ def start_topic(
     name: str,
     text: str,
     *,
-    agents: list[str] = [],
     mentions: list[tuple[str, MentionKind]] | None = None,
-) -> int:
-    """Start a topic named `name` in the stream named `stream`, with `text`
-    as its first message and `agents` receiving it; returns the topic id."""
+) -> tuple[int, int]:
+    """Start a topic named `name` in the stream named `stream`, made if new,
+    with `text` as its first message; returns `(topic, message)`."""
+def direct(sender: str, other: str) -> int:
+    """The direct conversation of two agents, started if new."""
 def join(topic: int, agent: str) -> None:
-    """Make `agent` one of the topic's agents from now on."""
+    """Make `agent` a member of the topic from now on. Not for a direct
+    conversation."""
 def topic(id: int) -> TopicRecord | None: ...
+def message(id: int) -> MessageRecord | None: ...
+def read(topic: int, last: int) -> list[MessageRecord]:
+    """The conversation's `last` newest messages, oldest first."""
 async def inbox(agent: str, after: int) -> list[MessageRecord]:
     """What `agent` receives after message `after`, waiting until there is
     some."""

@@ -12,7 +12,9 @@ class State:
     def __init__(self):
         self.kind = "isolated"
         self.agents = {}
-        self.events = 1  # the chat log's newest seq: 1 is the default stream
+        self.events = 0  # the chat log's newest seq
+        self.streams = {}  # name -> id
+        self.directs = {}  # (a, b), a < b -> topic
         self.topics = {}  # id -> TopicRecord
         self.messages = []  # MessageRecord, in order
         self.inputs = []  # (agent, text, wake, message)
@@ -97,32 +99,43 @@ def new_cache_key(agent):
     STATE.calls.append(("new_cache_key", (agent,)))
 
 
+def _event():
+    STATE.events += 1
+    return STATE.events
+
+
 def _post(sender, topic, text, mentions):
-    """With the lock held."""
+    """With the lock held. Who receives a message is fixed when it is
+    posted, as the host's inbox index fixes it."""
     if topic not in STATE.topics:
         raise ValueError(f"no topic {topic}")
     if not text.strip():
         raise ValueError("a message needs text")
+    head = STATE.topics[topic]
+    if head["stream"] is None and sender not in head["agents"]:
+        raise ValueError("only its two agents post in a direct conversation")
     for address, kind in mentions:
         assert kind in ("ask", "result", "fyi"), kind
         assert address == "user" or address in STATE.agents, address
-    agents = STATE.topics[topic]["agents"]
-    if sender != "user" and sender not in agents:
-        agents.append(sender)
-    STATE.events += 1
-    STATE.messages.append({"id": STATE.events, "at": 0, "topic": topic, "sender": sender, "mentions": list(mentions), "text": text})
-    return STATE.events
+    to = [agent for agent in head["agents"] + [address for address, _ in mentions] if agent not in ("user", sender)]
+    id = _event()
+    STATE.messages.append({"id": id, "at": 0, "topic": topic, "sender": sender, "mentions": list(mentions), "text": text, "_to": set(to)})
+    return id
 
 
-def _start(sender, stream, name, text, agents, mentions):
-    assert stream == "rho", stream
-    if not name.strip():
-        raise ValueError("a topic needs a name")
-    STATE.events += 1
-    topic = STATE.events
-    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "agents": list(dict.fromkeys(agents))}
-    _post(sender, topic, text, mentions)
-    return topic
+def _start(sender, stream, name, text, mentions):
+    stream, name = stream.strip(), name.strip()
+    if not stream or not name:
+        raise ValueError("a topic needs a stream and a name")
+    if stream not in STATE.streams:
+        STATE.streams[stream] = _event()
+    topic = _event()
+    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "agents": []}
+    return topic, _post(sender, topic, text, mentions)
+
+
+def _public(message):
+    return {key: value for key, value in copy.deepcopy(message).items() if not key.startswith("_")}
 
 
 def post(sender, topic, text, *, mentions=None):
@@ -132,49 +145,64 @@ def post(sender, topic, text, *, mentions=None):
         return _post(sender, topic, text, mentions or [])
 
 
-def start_topic(sender, stream, name, text, *, agents=[], mentions=None):
+def start_topic(sender, stream, name, text, *, mentions=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        return _start(sender, stream, name, text, agents, mentions or [])
+        return _start(sender, stream, name, text, mentions or [])
+
+
+def direct(sender, other):
+    with STATE.lock:
+        assert sender in STATE.agents and other in STATE.agents and sender != other
+        pair = tuple(sorted((sender, other)))
+        if pair not in STATE.directs:
+            topic = _event()
+            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "agents": list(pair)}
+            STATE.directs[pair] = topic
+        return STATE.directs[pair]
 
 
 def join(topic, agent):
     with STATE.lock:
-        agents = STATE.topics[topic]["agents"]
-        if agent not in agents:
-            agents.append(agent)
+        head = STATE.topics[topic]
+        if head["stream"] is None:
+            raise ValueError("no one joins a direct conversation")
+        if agent not in head["agents"]:
+            head["agents"].append(agent)
 
 
 def topic(id):
     with STATE.lock:
-        found = STATE.topics.get(id)
-        return copy.deepcopy(found)
+        return copy.deepcopy(STATE.topics.get(id))
 
 
-def post_user(topic, text):
-    """What the host does with the GUI's Post."""
+def message(id):
     with STATE.lock:
-        return _post("user", topic, text, [])
+        return next((_public(m) for m in STATE.messages if m["id"] == id), None)
 
 
-def start_user_topic(name, text, agents):
+def read(topic, last):
+    with STATE.lock:
+        return [_public(m) for m in STATE.messages if m["topic"] == topic][-last:] if last else []
+
+
+def post_user(topic, text, mentions=()):
+    """What the host does with the GUI's Post: the user's mentions ask."""
+    with STATE.lock:
+        return _post("user", topic, text, [(agent, "ask") for agent in mentions])
+
+
+def start_user_topic(stream, name, text, mentions=()):
     """What the host does with the GUI's StartTopic."""
     with STATE.lock:
-        return _start("user", "rho", name, text, agents, [])
-
-
-def _receives(agent, message):
-    if message["sender"] == agent:
-        return False
-    mentioned = any(address == agent for address, _ in message["mentions"])
-    return mentioned or agent in STATE.topics[message["topic"]]["agents"]
+        return _start("user", stream, name, text, [(agent, "ask") for agent in mentions])
 
 
 async def inbox(agent, after):
     while True:
         with STATE.lock:
-            found = [copy.deepcopy(m) for m in STATE.messages if m["id"] > after and _receives(agent, m)]
+            found = [_public(m) for m in STATE.messages if m["id"] > after and agent in m["_to"]]
         if found:
             return found
         await asyncio.sleep(0.005)

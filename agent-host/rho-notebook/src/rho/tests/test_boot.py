@@ -147,7 +147,7 @@ class Init(unittest.TestCase):
         # The default delivery runs for the existing agent.
         from . import fake_rho
 
-        fake_rho.start_user_topic("hello", "hello", ["agent1"])
+        fake_rho.start_user_topic("rho", "hello", "hello", ["agent1"])
         wait_for(lambda: ws.state.inputs, "delivery")
 
     def test_init_may_await(self):

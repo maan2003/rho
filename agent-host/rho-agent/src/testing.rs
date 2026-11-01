@@ -117,7 +117,7 @@ def on_notebook(agent, ns):
             if topic:
                 _rho.post(agent.id, topic[0], text, mentions=mentions)
             else:
-                topic.append(_rho.start_topic(agent.id, "rho", "test", text, mentions=mentions))
+                topic.append(_rho.start_topic(agent.id, "rho", "test", text, mentions=mentions)[0])
     ns["human"] = Human()
 
 hooks.on_notebook = on_notebook
@@ -197,25 +197,27 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         sender,
                         stream,
                         name,
-                        agents,
                         mentions,
                         content,
                     } => {
                         let db = db(sender)?;
                         let mut write = db.write().await;
-                        let stream = write
-                            .chat_stream_named(&stream)
-                            .ok_or_else(|| anyhow::anyhow!("no stream {stream:?}"))?;
+                        let now = rho_agent_types::UnixMs::now();
                         let first = NewMessage {
                             from: rho_agent_types::Address::Agent(sender),
                             mentions,
                             content,
                         };
-                        let now = rho_agent_types::UnixMs::now();
-                        match write.start_topic(now, stream, name, agents, first, None) {
-                            Ok((topic, _)) => {
+                        let started = write
+                            .stream(now, stream)
+                            .and_then(|stream| write.start_topic(now, stream, name, first, None));
+                        match started {
+                            Ok((topic, first)) => {
                                 write.commit();
-                                PyReply::Seq(topic.0)
+                                let message = crate::store::ChatRead::message(&db.read(), first)
+                                    .expect("just posted");
+                                debug_assert_eq!(message.topic, topic);
+                                PyReply::Messages(vec![message])
                             }
                             Err(error) => PyReply::Error(format!("{error:#}")),
                         }

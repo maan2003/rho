@@ -71,12 +71,13 @@ pub(crate) enum PyRequest {
         mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
     },
-    /// A topic an agent starts, with its first message.
+    /// A topic an agent starts, with its first message, in the stream of
+    /// that name: created if there is none. Answered with the message.
+    /// (`Messages` of one).
     StartTopic {
         sender: rho_agent_types::AgentId,
         stream: String,
         name: String,
-        agents: Vec<rho_agent_types::AgentId>,
         mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
     },
@@ -84,7 +85,19 @@ pub(crate) enum PyRequest {
         topic: rho_agent_types::TopicId,
         agent: rho_agent_types::AgentId,
     },
+    /// The direct conversation of `sender` and `other`, started if needed.
+    Direct {
+        sender: rho_agent_types::AgentId,
+        other: rho_agent_types::AgentId,
+    },
     Topic(rho_agent_types::TopicId),
+    /// One message: `Messages` with it, or with none.
+    Message(rho_agent_types::MessageId),
+    /// A conversation's `last` newest messages, oldest first.
+    Read {
+        topic: rho_agent_types::TopicId,
+        last: u64,
+    },
     /// What `agent` receives after `after`, answered once there is some.
     Inbox {
         agent: rho_agent_types::AgentId,
@@ -104,8 +117,8 @@ pub(crate) enum PyReply {
     Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
     Seq(rho_agent_types::ChatSeq),
     Messages(Vec<rho_agent_types::Message>),
-    /// A topic and the name of its stream.
-    Topic(Option<(crate::store::TopicHead, String)>),
+    /// A conversation, and the name of its stream if it is a topic.
+    Topic(Option<(crate::store::TopicHead, Option<String>)>),
     Models(Vec<crate::record::Runtime>),
     Done,
     Error(String),

@@ -342,13 +342,20 @@ async fn create_agent(
     );
     let agent = rho_agent_types::AgentId::from_encoded(created.result.output.trim())?;
     if let Some(text) = message {
+        let stream = rho_rpc::protocol::client::call(
+            socket_path,
+            rho_agents_client::protocol::worksets::CreateStream {
+                name: "test".to_owned(),
+            },
+        )
+        .await?;
         rho_rpc::protocol::client::call(
             socket_path,
             rho_agents_client::protocol::worksets::StartTopic {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
-                stream: rho_agent_types::StreamId::DEFAULT,
+                stream,
                 name: text.to_owned(),
-                agents: vec![agent],
+                mentions: vec![agent],
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: text.to_owned(),
                 }],

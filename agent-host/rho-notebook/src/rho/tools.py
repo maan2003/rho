@@ -78,9 +78,10 @@ def _spawner_of(props: dict) -> str | None:
 
 
 class Chat:
-    """Posting in the host's chat. Every message is in a topic; it reaches
-    the topic's agents and the agents it mentions. The user is reached by a
-    mention."""
+    """Posting in the host's chat. A message reaches the members of its
+    conversation and the agents it mentions. Agents join a topic to follow
+    it; two agents talk in their direct conversation. The user is reached
+    by a mention."""
 
     def __init__(self, agent: str):
         self._agent = agent
@@ -99,7 +100,7 @@ class Chat:
                 props = rho_agents.Agent(self._agent).props
                 if props.get("preset") != "engineer":
                     parent = props.get("parent")
-                    raise ValueError(f"you report to your parent agent {label(parent)}; post in your topic without a mention")
+                    raise ValueError(f"you report to your parent agent {label(parent)}; use chat.direct({label(parent)!r}, text)")
                 mentions.append((rho_chat.USER, kind))
                 continue
             agent = resolve(str(handle))
@@ -111,29 +112,71 @@ class Chat:
     def post(self, topic, text, *, mention=None, kind=None):
         """Post `text` in `topic`, the id each message arrives with. To reach
         the user, mention "user" with a kind: "ask", "result" or "fyi"."""
-        text = str(text)
-        if not text.strip():
-            raise ValueError("a message needs text")
+        text = _text(text)
         mentions = self._mentions(mention, kind)
         rho_chat.post(self._agent, int(topic), text, mentions)
         if any(address == rho_chat.USER for address, _ in mentions):
             return Reply("")
         return report(f"Posted in #{int(topic)}.")
 
-    def start(self, name, text, *, agents=(), mention=None, kind=None):
-        """Start a topic named `name` with `text` as its first message, for a
-        new subject. `agents` receive its messages; returns its id."""
-        text = str(text)
-        if not text.strip():
-            raise ValueError("a message needs text")
+    def start(self, stream, name, text, *, mention=None, kind=None):
+        """Start a topic named `name` in `stream`, with `text` as its first
+        message, for a new subject. You join it; others follow it when they
+        join or are mentioned. Returns its id."""
+        text = _text(text)
         mentions = self._mentions(mention, kind)
-        members = [resolve(str(agent)) for agent in agents]
-        topic = rho_chat.start(self._agent, str(name), text, agents=members, mentions=mentions)
+        topic, _ = rho_chat.start(self._agent, str(stream), str(name), text, mentions)
+        rho_chat.join(topic, self._agent)
         print(f"Started topic #{topic}.")
         return topic
 
+    def direct(self, agent, text):
+        """Post `text` to `agent` in your direct conversation with it;
+        returns that conversation's id."""
+        text = _text(text)
+        other = resolve(str(agent))
+        if other == self._agent:
+            raise ValueError("cannot talk to yourself")
+        if other not in _rho.agents():
+            raise ValueError(f"no agent {agent} in this workset")
+        topic = rho_chat.direct(self._agent, other)
+        rho_chat.post(self._agent, topic, text)
+        print(f"Posted to {label(other)} in #{topic}.")
+        return topic
+
+    def join(self, topic):
+        """Receive every later message of `topic`."""
+        rho_chat.join(int(topic), self._agent)
+        return report(f"Joined #{int(topic)}.")
+
+    def read(self, topic, last=20):
+        """Show the `last` newest messages of `topic`."""
+        head = rho_chat.topic(int(topic))
+        if head is None:
+            raise ValueError(f"no topic #{int(topic)}")
+        lines = [_where(int(topic), head, self._agent)]
+        for record in rho_chat.read(int(topic), int(last)):
+            sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
+            lines.append(f"#{record['id']} {sender}: {record['text']}")
+        return report("\n".join(lines))
+
     def __repr__(self):
         return "<chat>"
+
+
+def _text(text):
+    text = str(text)
+    if not text.strip():
+        raise ValueError("a message needs text")
+    return text
+
+
+def _where(topic, head, reader):
+    """The header of a conversation as `reader` sees it."""
+    if head["stream"] is None:
+        other = next(member for member in head["agents"] if member != reader)
+        return f"[#{topic} direct with {label(other)}]"
+    return f"[#{topic} {head['stream']} › {head['name']}]"
 
 
 class Agents:
@@ -154,13 +197,13 @@ class Agents:
                 raise RuntimeError(f"spawn depth limit ({MAX_SPAWN_DEPTH}) reached")
             cursor = _spawner_of(known[cursor]["props"])
 
-    def _spawn(self, runtime, props, name, prompt, mentions=()):
-        """Create an agent and brief it in a new topic with this one. The
-        topic is the agent's `topic` prop, where a failure is told."""
+    def _spawn(self, runtime, props, prompt):
+        """Create an agent and brief it in its direct conversation with this
+        one, where it reports."""
         self._check_depth()
         agent = rho_agents.create(runtime, props)
-        topic = rho_chat.start(self._agent, name, prompt, agents=[self._agent, agent.id], mentions=mentions)
-        agent.set_props({**props, "topic": str(topic)})
+        topic = rho_chat.direct(self._agent, agent.id)
+        rho_chat.post(self._agent, topic, prompt)
         return agent, topic
 
     def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
@@ -170,11 +213,11 @@ class Agents:
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
         props = {"name": task_name, "preset": "child", "parent": me.id, "cwd": cwd}
-        child, topic = self._spawn(engineer_runtime(me.runtime), props, task_name, prompt)
+        child, topic = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
-            f'Spawned agent {label(child.id)} for task "{task_name}" in topic #{topic}. It is '
-            f"working now; its results will arrive in that topic. It works in {cwd}. Post in "
-            f"#{topic} to follow up."
+            f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
+            f"results will arrive in your direct conversation #{topic}. It works in {cwd}. "
+            f"Post in #{topic} to follow up."
         )
 
     def spawn_new_advisor(self, msg):
@@ -184,10 +227,10 @@ class Agents:
         me = self._me()
         # The Advisor reads what the asker sees: the same directory.
         props = {"name": "advisor", "preset": "advisor", "parent": me.id, "cwd": me.props["cwd"]}
-        advisor, topic = self._spawn(advisor_runtime(me.runtime), props, "Advisor: " + _first_line(msg), msg)
+        advisor, topic = self._spawn(advisor_runtime(me.runtime), props, str(msg))
         return report(
-            f"Advisor {label(advisor.id)} is considering the question in topic #{topic}. Its "
-            "answer will arrive in that topic."
+            f"Advisor {label(advisor.id)} is considering the question. Its answer will arrive "
+            f"in your direct conversation #{topic}."
         )
 
     def cancel(self, *, agent_id):
@@ -218,33 +261,39 @@ class Agents:
 class UserAgents(Agents):
     """An Engineer the user manages may also start Engineers for the user."""
 
-    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None):
+    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None, stream=None):
         """Start an Engineer the user manages; it reports to the user, not to
-        you. The user learns of it by a mention of its topic."""
+        you. Its brief is the first message of a new topic in `stream`, or
+        the stream you were started in, and mentions the user."""
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
+        stream = stream or _origin_stream(me.props)
+        if stream is None:
+            raise ValueError("you were not started from a stream; pass stream=")
+        self._check_depth()
+        topic, message = rho_chat.start(me.id, str(stream), str(task_name), str(prompt), [(rho_chat.USER, "fyi")])
         props = {
             "name": task_name,
             "preset": "engineer",
             "started_by": me.id,
             "cwd": cwd,
+            rho_chat.ORIGIN: rho_chat.origin(message),
         }
-        agent, topic = self._spawn(engineer_runtime(me.runtime), props, task_name, prompt, mentions=[(rho_chat.USER, "fyi")])
+        agent = rho_agents.create(engineer_runtime(me.runtime), props)
         return report(
             f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}" in topic '
             f"#{topic}. It works in {cwd}. It reports to the user, not to you."
         )
 
 
-#: The longest topic name a tool makes from a message.
-TOPIC_NAME_CHARS = 60
-
-
-def _first_line(text):
-    line = next((line.strip() for line in str(text).splitlines() if line.strip()), "")
-    return line if len(line) <= TOPIC_NAME_CHARS else line[: TOPIC_NAME_CHARS - 1] + "…"
+def _origin_stream(props):
+    """The stream of the topic an agent was started from, if any."""
+    message = rho_chat.origin_message(props)
+    if message is None:
+        return None
+    return rho_chat.topic(rho_chat.message(message)["topic"])["stream"]
 
 
 def _workdir(workdir):

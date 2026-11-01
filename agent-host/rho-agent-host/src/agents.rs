@@ -14,9 +14,9 @@ use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, Works
 use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
-    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
-    DeleteWorksets, Eval, EvalResult, LogEvent, LogNext, Open, Post, Request, ServerFrame,
-    StartTopic, WorksetEntry,
+    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateStream, CreateWorkset,
+    CreatedWorkset, DeleteWorksets, Eval, EvalResult, LogEvent, LogNext, Open, Post, Request,
+    ServerFrame, StartTopic, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -634,10 +634,14 @@ where
                 |Post {
                      client_id,
                      topic,
+                     mentions,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
-                    services.pool.post_user(client_id, topic, content).await
+                    services
+                        .pool
+                        .post_user(client_id, topic, mentions, content)
+                        .await
                 },
             )
             .await
@@ -650,16 +654,22 @@ where
                      client_id,
                      stream,
                      name,
-                     agents,
+                     mentions,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .start_user_topic(client_id, stream, name, agents, content)
+                        .start_user_topic(client_id, stream, name, mentions, content)
                         .await
                 },
             )
+            .await
+        }
+        Request::CreateStream(call) => {
+            respond(writer, call, |CreateStream { name }| async move {
+                services.pool.create_stream(name).await
+            })
             .await
         }
         Request::Cancel(call) => {

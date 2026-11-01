@@ -178,6 +178,7 @@ where
                             .post_user(
                                 uuid::Uuid::new_v4().as_u64_pair().0,
                                 topic,
+                                Vec::new(),
                                 vec![ContentPart::Text { text: message }],
                             )
                             .await;

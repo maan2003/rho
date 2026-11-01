@@ -40,7 +40,8 @@ The log holds what each model saw and what each agent is: workset creation and
 evaluated code, agent creation and whole-spec changes, inputs, and the runtime
 rows of each loop. An agent's spec is its typed runtime (native or Claude,
 model, effort, and the runtime's session identity) plus string props that
-Python sets and the GUI reads (name, title, parent, the topic it was briefed in).
+Python sets and the GUI reads (name, title, parent, and `origin`, the message
+it was started from as `chat:<message id>`).
 Instructions are recomputed by Python before each request and are not logged
 ([DECISION-instructions-are-code](../rho-agent/specs/DECISION-instructions-are-code.md)).
 
@@ -55,20 +56,38 @@ before ([DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sou
 Chat is how people and agents talk, shaped like Zulip: streams hold topics,
 and topics hold messages. Each host owns one append-only chat log, dense from
 1; a stream, topic or message is named by the sequence number of the event
-that made it, and the log opens with the default stream `rho`. Hosts never
-talk to each other: a GUI attached to several hosts shows each host's streams.
-The log lives on the host because the GUI is often offline and chat crosses
+that made it. A fresh log is empty: there is no default stream, and whoever
+starts a topic names its stream, which is made on first use. Hosts never talk
+to each other: a GUI attached to several hosts shows each host's streams. The
+log lives on the host because the GUI is often offline and chat crosses
 worksets, and it survives workset deletion.
 
-A message reaches every agent of its topic and every agent it mentions, never
-its sender, and posting makes the sender an agent of the topic. A mention
-carries a kind (`ask`, `result`, `fyi`); a mention of the user is the only way
-a message asks for the user's attention, so a message has no kind of its own.
-Agents post with `rho.chat`, always naming the topic. Policy Python reads each
-agent's inbox and hands each message to the agent as an `Input` that names
-it. The delivery position is derived from those rows, so the chat log keeps
-no cursors. Slack is not chat: agents reach it through the host's Slack
-server as Python, as before.
+Chat and agents are separate hierarchies. They meet only through a topic's
+members and through mentions. A message reaches its conversation's members and
+every agent it mentions, never its sender. A topic's members are the agents
+that joined it; neither posting nor a mention joins. Who receives a message is
+fixed when it is posted, so a later member reads older messages, not receives
+them. Two agents talk in their direct conversation, which is a conversation
+outside every stream. Its members are its two agents, only they post in it,
+and no one joins it. The GUI lists direct conversations apart from streams and
+makes no cards for them.
+
+A mention carries a kind (`ask`, `result`, `fyi`); a mention of the user is
+the only way a message asks for the user's attention, so a message has no kind
+of its own. The user's mentions of agents are `ask`.
+
+The message comes first and the agent second. The GUI starts an agent from an
+existing message, and Python records that message as the agent's `origin` prop
+(`chat:<message id>`), not as a host field, so other origins such as Slack can
+follow. The default policy then joins the agent to the message's topic and
+hands it that message first. An Engineer's child or Advisor is briefed in their
+direct conversation with it, and reports there.
+
+Agents post with `rho.chat`, always naming the conversation. Policy Python
+reads each agent's inbox and hands each message to the agent as an `Input`
+that names it. The delivery position is derived from those rows, so the chat
+log keeps no cursors. Slack is not chat: agents reach it through the host's
+Slack server as Python, as before.
 
 ## GUI sync
 

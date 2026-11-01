@@ -5,12 +5,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_types::{AgentId, ChatSeq, WorksetId};
+use rho_agent_types::{AgentId, ChatSeq, StreamId, WorksetId};
 use rho_agents_client::protocol::worksets::{
-    ClientFrame, CreateWorkset, CreatedWorkset, Open, Post, ServerFrame, StartTopic,
+    ClientFrame, CreateStream, CreateWorkset, CreatedWorkset, Open, Post, ServerFrame, StartTopic,
 };
 use rho_rpc::protocol::client::Client;
-use rho_rpc::protocol::{Answer, read_frame, write_frame, write_open};
+use rho_rpc::protocol::{Answer, Call as _, read_frame, write_frame, write_open};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
@@ -88,6 +88,20 @@ impl Streams {
     /// Starts a topic as the user, as [`Streams::post`] posts.
     pub fn start_topic(&self, start: StartTopic) {
         self.call(start, |_| None);
+    }
+
+    /// Finds or creates the stream named `name`, waiting for its id: a
+    /// topic needs it before it can start.
+    pub async fn create_stream(&self, name: &str) -> Result<StreamId> {
+        let call = CreateStream {
+            name: name.to_owned(),
+        };
+        let mut client = Client::connect(&self.socket).await?;
+        client.open(&call.open()).await?;
+        match client.recv::<Answer<StreamId>>().await? {
+            Answer::Done(stream) => Ok(stream),
+            Answer::Failed { reason } => bail!("the agent host refused stream {name}: {reason}"),
+        }
     }
 
     fn call<C: rho_rpc::protocol::Call>(

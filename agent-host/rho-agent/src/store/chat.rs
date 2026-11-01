@@ -1,8 +1,8 @@
 //! The host's chat ([`rho_agent_types::ChatEvent`]): one log, dense from
 //! one, and the indexes folded from it in the commit of every append.
 //!
-//! Each topic keeps its agents; a message is in the inbox of every agent of
-//! its topic and every agent it mentions, but not its sender's. The inbox is
+//! Each conversation keeps its members; a message is in the inbox of every
+//! member and every agent it mentions, but not its sender's. The inbox is
 //! written with the message, so an agent's delivery reads only its own.
 
 use redb::TableDefinition;
@@ -26,16 +26,24 @@ const INBOX: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("chat_in
 /// The user's posts by the client's own id for them, so a resend is
 /// logged once: the seq of the event the post made.
 const CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("chat_client_ids");
+/// `(a, b)` with `a < b`: the direct conversation of two agents.
+const DIRECTS: TableDefinition<(AgentId, AgentId), u64> = TableDefinition::new("chat_directs");
 
-/// The name of [`StreamId::DEFAULT`].
-pub const DEFAULT_STREAM: &str = "rho";
+/// Where a conversation is.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Place {
+    /// A topic: anyone may post in it, and agents join it.
+    Stream { stream: StreamId, name: String },
+    /// Two agents' own conversation: only they post in it.
+    Direct,
+}
 
-/// A topic as the log has made it.
+/// A conversation as the log has made it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TopicHead {
-    pub stream: StreamId,
-    pub name: String,
-    /// The agents that receive its messages, in the order they joined.
+    pub place: Place,
+    /// Who receives its messages: a topic's in the order they joined, a
+    /// direct conversation's two.
     pub agents: Vec<AgentId>,
 }
 
@@ -135,18 +143,31 @@ impl ChatRead for ReadTxn {
 
 pub trait ChatWrite {
     fn init_chat_tables(&mut self);
-    fn create_stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId>;
-    /// A topic with its first message. With `client_id`, a topic already
-    /// started under that id is returned instead of a second one.
+    /// The stream named `name`, created if there is none.
+    fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId>;
+    /// A topic with its first message, and no members. With `client_id`, a
+    /// topic already started under that id is returned instead of a second
+    /// one.
     fn start_topic(
         &mut self,
         at: UnixMs,
         stream: StreamId,
         name: String,
-        agents: Vec<AgentId>,
         first: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<(TopicId, MessageId)>;
+    /// A topic with no message yet, for a writer that must have members
+    /// join before the first one: the migration from `main`. Everything
+    /// else starts a topic with its message ([`ChatWrite::start_topic`]).
+    fn open_topic(
+        &mut self,
+        at: UnixMs,
+        stream: StreamId,
+        name: String,
+        by: Address,
+    ) -> anyhow::Result<TopicId>;
+    /// The direct conversation of `a` and `b`, started if they have none.
+    fn direct(&mut self, at: UnixMs, a: AgentId, b: AgentId) -> anyhow::Result<TopicId>;
     fn join(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()>;
     /// With `client_id`, as in [`ChatWrite::start_topic`].
     fn post(
@@ -177,6 +198,13 @@ fn append(write: &mut WriteTxn, at: UnixMs, event: ChatEvent) -> ChatSeq {
     seq
 }
 
+fn has_content(content: &[ContentPart]) -> bool {
+    content.iter().any(|part| match part {
+        ContentPart::Text { text } => !text.trim().is_empty(),
+        _ => true,
+    })
+}
+
 fn sent_before(write: &mut WriteTxn, client_id: Option<u64>) -> Option<ChatSeq> {
     let client_id = client_id?;
     write
@@ -200,20 +228,15 @@ impl ChatWrite for WriteTxn {
         self.open_table(TOPIC_MESSAGES);
         self.open_table(INBOX);
         self.open_table(CLIENT_IDS);
-        if self.open_table(CHAT_LOG).iter().next().is_none() {
-            let stream = self
-                .create_stream(UnixMs::now(), DEFAULT_STREAM.to_owned())
-                .expect("an empty chat has no streams");
-            assert_eq!(stream, StreamId::DEFAULT);
-        }
+        self.open_table(DIRECTS);
     }
 
-    fn create_stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId> {
-        anyhow::ensure!(!name.trim().is_empty(), "a stream needs a name");
-        anyhow::ensure!(
-            self.open_table(STREAM_NAMES).get(name.clone()).is_none(),
-            "a stream named {name:?} exists"
-        );
+    fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId> {
+        let name = name.trim().to_owned();
+        anyhow::ensure!(!name.is_empty(), "a stream needs a name");
+        if let Some(stream) = self.chat_stream_named(&name) {
+            return Ok(stream);
+        }
         let seq = append(self, at, ChatEvent::StreamCreated { name: name.clone() });
         self.open_table(STREAMS).insert(seq.0, name.clone());
         self.open_table(STREAM_NAMES).insert(name, seq.0);
@@ -225,28 +248,39 @@ impl ChatWrite for WriteTxn {
         at: UnixMs,
         stream: StreamId,
         name: String,
-        agents: Vec<AgentId>,
         first: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<(TopicId, MessageId)> {
         if let Some(seq) = sent_before(self, client_id) {
-            // A client id names a message, and a topic's first message is
-            // the event after the topic's.
-            return Ok((TopicId(ChatSeq(seq.0 - 1)), MessageId(seq)));
+            // A client id names a message.
+            let record = self
+                .open_table(CHAT_LOG)
+                .get(seq.0)
+                .expect("a client id names a logged message")
+                .value()
+                .into_owned();
+            let message = Message::from_record(&record).expect("a client id names a message");
+            return Ok((message.topic, message.id));
         }
+        anyhow::ensure!(has_content(&first.content), "a message needs content");
+        let topic = self.open_topic(at, stream, name, first.from)?;
+        let first = self.post(at, topic, first, client_id)?;
+        Ok((topic, first))
+    }
+
+    fn open_topic(
+        &mut self,
+        at: UnixMs,
+        stream: StreamId,
+        name: String,
+        by: Address,
+    ) -> anyhow::Result<TopicId> {
         anyhow::ensure!(
             self.open_table(STREAMS).get(stream.0.0).is_some(),
             "no stream {}",
             stream.0.0
         );
         anyhow::ensure!(!name.trim().is_empty(), "a topic needs a name");
-        let mut unique = Vec::with_capacity(agents.len());
-        for agent in agents {
-            if !unique.contains(&agent) {
-                unique.push(agent);
-            }
-        }
-        let by = first.from;
         let seq = append(
             self,
             at,
@@ -254,26 +288,45 @@ impl ChatWrite for WriteTxn {
                 stream,
                 name: name.clone(),
                 by,
-                agents: unique.clone(),
             },
         );
-        let topic = TopicId(seq);
         self.open_table(TOPICS).insert(
             seq.0,
             SenValue::borrowed(&TopicHead {
-                stream,
-                name,
-                agents: unique,
+                place: Place::Stream { stream, name },
+                agents: Vec::new(),
             }),
         );
-        let first = self.post(at, topic, first, client_id)?;
-        Ok((topic, first))
+        Ok(TopicId(seq))
+    }
+
+    fn direct(&mut self, at: UnixMs, a: AgentId, b: AgentId) -> anyhow::Result<TopicId> {
+        anyhow::ensure!(a != b, "an agent has no direct conversation with itself");
+        let members = if a < b { [a, b] } else { [b, a] };
+        if let Some(seq) = self.open_table(DIRECTS).get((members[0], members[1])) {
+            return Ok(TopicId(ChatSeq(seq.value())));
+        }
+        let seq = append(self, at, ChatEvent::DirectStarted { members });
+        self.open_table(TOPICS).insert(
+            seq.0,
+            SenValue::borrowed(&TopicHead {
+                place: Place::Direct,
+                agents: members.to_vec(),
+            }),
+        );
+        self.open_table(DIRECTS)
+            .insert((members[0], members[1]), seq.0);
+        Ok(TopicId(seq))
     }
 
     fn join(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()> {
         let mut head = self
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
+        anyhow::ensure!(
+            head.place != Place::Direct,
+            "no one joins a direct conversation"
+        );
         if head.agents.contains(&agent) {
             return Ok(());
         }
@@ -294,16 +347,16 @@ impl ChatWrite for WriteTxn {
         if let Some(seq) = sent_before(self, client_id) {
             return Ok(MessageId(seq));
         }
-        let mut head = self
+        let head = self
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            message.content.iter().any(|part| match part {
-                ContentPart::Text { text } => !text.trim().is_empty(),
-                _ => true,
-            }),
-            "a message needs content"
-        );
+        anyhow::ensure!(has_content(&message.content), "a message needs content");
+        if head.place == Place::Direct {
+            anyhow::ensure!(
+                matches!(message.from, Address::Agent(agent) if head.agents.contains(&agent)),
+                "only its two agents post in a direct conversation"
+            );
+        }
         let NewMessage {
             from,
             mentions,
@@ -319,11 +372,6 @@ impl ChatWrite for WriteTxn {
         }
         if let Address::Agent(sender) = from {
             receivers.retain(|agent| *agent != sender);
-            if !head.agents.contains(&sender) {
-                head.agents.push(sender);
-                self.open_table(TOPICS)
-                    .insert(topic.0.0, SenValue::borrowed(&head));
-            }
         }
         let seq = append(
             self,

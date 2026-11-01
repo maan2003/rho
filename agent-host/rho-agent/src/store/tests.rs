@@ -216,7 +216,7 @@ fn received(read: &rho_db::ReadTxn, agent: AgentId, after: u64) -> Vec<u64> {
 }
 
 #[tokio::test]
-async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender() {
+async fn chat_delivers_to_members_and_the_mentioned_but_never_the_sender() {
     let (_dir, db) = db().await;
     let ws = WorksetId([4; 6]);
     let (a, b, c) = (agent(1), agent(2), agent(3));
@@ -241,18 +241,19 @@ async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender
             )
             .unwrap();
     }
-    // A new store's chat starts with its default stream.
-    let rho = write.chat_stream_named(chat::DEFAULT_STREAM).unwrap();
+    // A new store's chat is empty: the first stream is its first event,
+    // and asking for it by name again makes no second one.
+    let rho = write.stream(UnixMs(3), "rho".into()).unwrap();
+    assert_eq!(write.stream(UnixMs(3), " rho ".into()).unwrap(), rho);
     assert_eq!(rho, StreamId(ChatSeq(1)));
 
-    // The user starts a topic with `a`; a resend under its client id is the
-    // same topic and logs nothing.
+    // The user starts a topic; it has no members, and a resend under its
+    // client id is the same topic and logs nothing.
     let (topic, first) = write
         .start_topic(
             UnixMs(3),
             rho,
             "Fix it".into(),
-            vec![a, a],
             said(Address::User, "go"),
             Some(77),
         )
@@ -263,15 +264,15 @@ async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender
             UnixMs(4),
             rho,
             "Fix it".into(),
-            vec![a],
             said(Address::User, "go!"),
             Some(77),
         )
         .unwrap();
     assert_eq!(again, (topic, first));
 
-    // `b` was not in the topic: posting puts it there, and it does not get
-    // its own message.
+    // `a` joins after the first message, so it does not get it.
+    write.join(UnixMs(4), topic, a).unwrap();
+    // `b` is no member: posting reaches `a` and does not make `b` one.
     let from_b = write
         .post(UnixMs(5), topic, said(Address::Agent(b), "me too"), None)
         .unwrap();
@@ -284,8 +285,7 @@ async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender
             .unwrap(),
         from_user
     );
-    // `a` mentions `c`, which is not in the topic: `c` gets that message
-    // only, and stays out of the topic.
+    // `a` mentions `c`: `c` gets that message only and is no member.
     let mention_c = write
         .post(
             UnixMs(8),
@@ -307,31 +307,42 @@ async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender
         )
         .unwrap();
     // Refused posts take no seq.
-    assert!(
-        write
-            .post(
-                UnixMs(9),
-                TopicId(ChatSeq(99)),
-                said(Address::User, "x"),
-                None
-            )
-            .is_err()
-    );
-    assert!(
-        write
-            .post(UnixMs(9), topic, said(Address::User, "  "), None)
-            .is_err()
-    );
-    assert!(
-        write
-            .post(UnixMs(9), TopicId(first.0), said(Address::User, "x"), None)
-            .is_err()
-    );
+    for (to, text) in [
+        (TopicId(ChatSeq(99)), "x"),
+        (topic, "  "),
+        (TopicId(first.0), "x"),
+    ] {
+        assert!(
+            write
+                .post(UnixMs(9), to, said(Address::User, text), None)
+                .is_err()
+        );
+    }
     // Joining twice logs once.
-    write.join(UnixMs(10), topic, c).unwrap();
-    write.join(UnixMs(11), topic, c).unwrap();
-    let after_join = write
-        .post(UnixMs(12), topic, said(Address::User, "all"), None)
+    write.join(UnixMs(10), topic, a).unwrap();
+
+    // Two agents' direct conversation is one, whichever asks; only they
+    // post in it, and no one joins it.
+    let direct = write.direct(UnixMs(11), a, b).unwrap();
+    assert_eq!(write.direct(UnixMs(11), b, a).unwrap(), direct);
+    assert!(write.direct(UnixMs(11), a, a).is_err());
+    let in_direct = write
+        .post(UnixMs(12), direct, said(Address::Agent(a), "brief"), None)
+        .unwrap();
+    assert!(
+        write
+            .post(UnixMs(12), direct, said(Address::User, "hi"), None)
+            .is_err()
+    );
+    assert!(
+        write
+            .post(UnixMs(12), direct, said(Address::Agent(c), "hi"), None)
+            .is_err()
+    );
+    assert!(write.join(UnixMs(12), direct, c).is_err());
+
+    let after = write
+        .post(UnixMs(13), topic, said(Address::User, "all"), None)
         .unwrap();
     assert!(write.delete_workset(ws));
     write.commit();
@@ -339,24 +350,27 @@ async fn chat_delivers_to_a_topics_agents_and_the_mentioned_but_never_the_sender
     let read = db.read();
     let seq = |id: MessageId| id.0.0;
     assert_eq!(
-        (seq(from_b), seq(from_user), seq(mention_c), seq(after_join)),
-        (4, 5, 6, 8),
-        "dense, and the refused posts took none"
+        (
+            seq(from_b),
+            seq(from_user),
+            seq(mention_c),
+            direct.0.0,
+            seq(in_direct),
+            seq(after)
+        ),
+        (5, 6, 7, 8, 9, 10),
+        "dense, and the refused posts and repeats took none"
     );
-    assert_eq!(received(&read, a, 0), vec![3, 4, 5, 8]);
-    assert_eq!(
-        received(&read, b, 0),
-        vec![3, 5, 6, 8]
-            .into_iter()
-            .filter(|s| *s != 3)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(received(&read, c, 0), vec![6, 8]);
-    assert_eq!(received(&read, a, 4), vec![5, 8]);
-    assert_eq!(read.topic(topic).unwrap().agents, vec![a, b, c]);
+    assert_eq!(received(&read, a, 0), vec![5, 6, 10]);
+    assert_eq!(received(&read, b, 0), vec![9]);
+    assert_eq!(received(&read, c, 0), vec![7]);
+    assert_eq!(received(&read, a, 5), vec![6, 10]);
+    assert_eq!(read.topic(topic).unwrap().agents, vec![a]);
+    assert_eq!(read.topic(direct).unwrap().place, chat::Place::Direct);
     let events: Vec<_> = read.chat_since(ChatSeq::ZERO, 100);
-    assert_eq!(events.len(), 8);
-    assert!(matches!(&events[6].event, ChatEvent::Joined { agent, .. } if *agent == c));
+    assert_eq!(events.len(), 10);
+    assert!(matches!(&events[3].event, ChatEvent::Joined { agent, .. } if *agent == a));
+    assert!(matches!(&events[7].event, ChatEvent::DirectStarted { members } if *members == [a, b]));
     // Chat outlives the workset.
     let kept = read.message(mention_c).unwrap();
     assert_eq!(kept.mentions(Address::User), Some(MentionKind::Result));

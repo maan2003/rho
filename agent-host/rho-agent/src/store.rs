@@ -510,6 +510,6 @@ pub(crate) mod agent_rows;
 pub mod chat;
 pub(crate) mod from_main;
 
-pub use chat::{ChatRead, ChatWrite, NewMessage, TopicHead};
+pub use chat::{ChatRead, ChatWrite, NewMessage, Place, TopicHead};
 #[cfg(test)]
 mod tests;

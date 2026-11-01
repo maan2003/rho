@@ -10,3 +10,4 @@
 /.isolate
 /rho-agent-host-profile.folded*
 /rho-gui-profile.folded*
+__pycache__/

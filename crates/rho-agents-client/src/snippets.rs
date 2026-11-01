@@ -8,7 +8,7 @@
 //! acts on one.
 
 use camino::Utf8Path;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, MessageId};
 
 use crate::protocol::transcript::RuntimeKind;
 
@@ -103,23 +103,38 @@ pub fn cycle_runtime(current: &str) -> &'static str {
 
 /// The first agent of a new isolated workset, on a clone of `repo` at
 /// `rev` (empty: the remote's default branch).
-pub fn new_agent_on(repo: &Utf8Path, rev: &str, runtime: &Runtime) -> String {
+pub fn new_agent_on(
+    repo: &Utf8Path,
+    rev: &str,
+    runtime: &Runtime,
+    origin: Option<MessageId>,
+) -> String {
     format!(
-        "new_agent(repo={}, rev={}, runtime={})\n",
+        "new_agent(repo={}, rev={}, runtime={}{})\n",
         py_str(repo.as_str()),
         py_str(rev),
-        runtime.python()
+        runtime.python(),
+        origin_arg(origin)
     )
 }
 
 /// An agent working in `cwd` of the workset the code runs in: the first
 /// of a host workset, or another beside an agent already there.
-pub fn new_agent_in(cwd: &Utf8Path, runtime: &Runtime) -> String {
+pub fn new_agent_in(cwd: &Utf8Path, runtime: &Runtime, origin: Option<MessageId>) -> String {
     format!(
-        "new_agent(cwd={}, runtime={})\n",
+        "new_agent(cwd={}, runtime={}{})\n",
         py_str(cwd.as_str()),
-        runtime.python()
+        runtime.python(),
+        origin_arg(origin)
     )
+}
+
+/// `origin=`: the chat message an agent starts from. Policy keeps it as
+/// the agent's `origin` prop, joins its topic, and hands it the message.
+fn origin_arg(origin: Option<MessageId>) -> String {
+    origin.map_or_else(String::new, |message| {
+        format!(", origin={}", py_str(&format!("chat:{}", message.0.0)))
+    })
 }
 
 fn agent(agent: AgentId, call: &str) -> String {

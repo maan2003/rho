@@ -46,8 +46,8 @@ def label(agent_id: str) -> str:
 
 def started_by_note(by: str) -> str:
     return (
-        f"Engineer {by} started you for the user; ask it in your topic with chat.post if you need "
-        "more context."
+        f"Engineer {by} started you for the user; ask it with chat.direct({by!r}, text) if you "
+        "need more context."
     )
 
 
@@ -59,7 +59,8 @@ def team(agent_id: str, props: dict) -> str:
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
             f"agent id is {me}; your parent agent is {label(parent)}.\n\nMessages from your "
-            "parent define your task. Report to your parent in that topic with chat.post."
+            "parent define your task. Report to your parent in your direct conversation with "
+            f"chat.direct({label(parent)!r}, text)."
         )
     else:
         identity = (
@@ -70,9 +71,9 @@ def team(agent_id: str, props: dict) -> str:
     if preset == "advisor":
         return (
             f"{identity}\n\n"
-            "Complete your independent analysis and post it to your parent in your topic with "
-            "chat.post. Ask a known agent for context the same way, and end your turn when blocked "
-            "on a reply.\n"
+            "Complete your independent analysis and post it to your parent with "
+            f"chat.direct({label(parent)!r}, text). Ask a known agent for context the same way, "
+            "and end your turn when blocked on a reply.\n"
         )
     started_by = props.get("started_by")
     if preset == "child":
@@ -90,16 +91,16 @@ def team(agent_id: str, props: dict) -> str:
 
 {ownership}
 
-You will receive agent messages in this format, after the topic they are in:
+You will receive agent messages in this format, after the conversation they are in:
 ```
-[#<topic id> <stream> › <topic name>]
+[#<topic id> <stream> › <topic name>]   or   [#<topic id> direct with <agent id>]
 Message Type: MESSAGE
 Sender: <agent id>
 Payload:
 <payload text>
 ```
 
-Answer an agent in its topic with `chat.post(topic, text)`.
+Answer in that conversation with `chat.post(topic, text)`.
 
 """
 

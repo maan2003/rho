@@ -331,6 +331,9 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(start_topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
@@ -623,33 +626,74 @@ fn post(
 }
 
 #[pyfunction]
-#[pyo3(signature = (sender, stream, name, text, *, agents = Vec::new(), mentions = None))]
+#[pyo3(signature = (sender, stream, name, text, *, mentions = None))]
 fn start_topic(
     py: Python<'_>,
     sender: &str,
     stream: String,
     name: String,
     text: String,
-    agents: Vec<String>,
     mentions: Option<Vec<(String, String)>>,
-) -> PyResult<u64> {
+) -> PyResult<(u64, u64)> {
     let sender = agent_id(sender)?;
-    let agents = agents
-        .iter()
-        .map(|agent| agent_id(agent))
-        .collect::<PyResult<Vec<_>>>()?;
     let mentions = self::mentions(mentions)?;
     let content = message_content(text, &mentions)?;
     let request = PyRequest::StartTopic {
         sender,
         stream,
         name,
-        agents,
         mentions,
         content,
     };
     match PyHost::block(py, request)? {
+        PyReply::Messages(messages) => match &messages[..] {
+            [first] => Ok((first.topic.0.0, first.id.0.0)),
+            _ => Err(unexpected()),
+        },
+        _ => Err(unexpected()),
+    }
+}
+
+/// The direct conversation of `sender` and `other`, started if needed.
+#[pyfunction]
+fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
+    let request = PyRequest::Direct {
+        sender: agent_id(sender)?,
+        other: agent_id(other)?,
+    };
+    match PyHost::block(py, request)? {
         PyReply::Seq(seq) => Ok(seq.0),
+        _ => Err(unexpected()),
+    }
+}
+
+/// One message as a dict, or None.
+#[pyfunction]
+fn message(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
+    match PyHost::block(py, PyRequest::Message(MessageId(ChatSeq(id))))? {
+        PyReply::Messages(messages) => messages
+            .first()
+            .map(|message| Ok(message_to_py(py, message)?.into_any().unbind()))
+            .transpose(),
+        _ => Err(unexpected()),
+    }
+}
+
+/// A conversation's `last` newest messages, oldest first.
+#[pyfunction]
+fn read(py: Python<'_>, topic: u64, last: u64) -> PyResult<Py<PyAny>> {
+    let request = PyRequest::Read {
+        topic: TopicId(ChatSeq(topic)),
+        last,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Messages(messages) => {
+            let list = pyo3::types::PyList::empty(py);
+            for message in &messages {
+                list.append(message_to_py(py, message)?)?;
+            }
+            Ok(list.into_any().unbind())
+        }
         _ => Err(unexpected()),
     }
 }
@@ -666,7 +710,8 @@ fn join(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
     }
 }
 
-/// A topic: its name, its stream's name and its agents; None for no topic.
+/// A conversation: its stream's name and its name for a topic, None for
+/// both in a direct conversation, and its members; None for no topic.
 #[pyfunction]
 fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
     match PyHost::block(py, PyRequest::Topic(TopicId(ChatSeq(id))))? {
@@ -674,7 +719,11 @@ fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
         PyReply::Topic(Some((head, stream))) => {
             let out = PyDict::new(py);
             out.set_item("id", id)?;
-            out.set_item("name", head.name)?;
+            let name = match head.place {
+                crate::store::Place::Stream { name, .. } => Some(name),
+                crate::store::Place::Direct => None,
+            };
+            out.set_item("name", name)?;
             out.set_item("stream", stream)?;
             out.set_item(
                 "agents",

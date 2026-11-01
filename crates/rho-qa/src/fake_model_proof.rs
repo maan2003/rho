@@ -14,7 +14,7 @@ use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId,
-    StreamId, TopicId, WorksetId, WorksetKind, Wpos,
+    TopicId, WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
 use rho_agents_client::protocol::worksets::{
@@ -188,9 +188,10 @@ async fn run_async(args: Args) -> Result<()> {
 
     let mut client = Streams::open(connect(&socket).await?, &socket).await?;
     ensure!(
-        client.chat_head == StreamId::DEFAULT.0,
-        "fresh isolated agent host chat held more than its default stream"
+        client.chat_head == ChatSeq::ZERO,
+        "fresh isolated agent host chat was not empty"
     );
+    let stream = client.create_stream("qa").await?;
     println!(
         "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
         tree_commit,
@@ -216,7 +217,7 @@ async fn run_async(args: Args) -> Result<()> {
     for _ in 0..agent_count {
         client.create(CreateWorkset {
             kind: WorksetKind::Isolated,
-            code: snippets::new_agent_on(&repo, "HEAD", &runtime),
+            code: snippets::new_agent_on(&repo, "HEAD", &runtime, None),
         });
     }
     // The client id of each user post: the host logs a name once.
@@ -329,9 +330,9 @@ async fn run_async(args: Args) -> Result<()> {
                 agents.insert(agent);
                 client.start_topic(StartTopic {
                     client_id: client_id(),
-                    stream: StreamId::DEFAULT,
+                    stream,
                     name: format!("QA agent {briefed}"),
-                    agents: vec![agent],
+                    mentions: vec![agent],
                     content: prompt(briefed, 0),
                 });
                 briefed += 1;
@@ -376,6 +377,7 @@ async fn run_async(args: Args) -> Result<()> {
                     client.post(Post {
                         client_id: client_id(),
                         topic,
+                        mentions: vec![agent_id],
                         content: prompt(0, *cycle),
                     });
                 }
@@ -392,26 +394,37 @@ async fn run_async(args: Args) -> Result<()> {
                     match record.event {
                         ChatEvent::StreamCreated { .. } | ChatEvent::Joined { .. } => {}
                         ChatEvent::TopicStarted {
-                            by: Address::User,
-                            agents,
-                            ..
-                        } => {
-                            let [agent] = agents[..] else {
-                                bail!("the proof started a topic with agents {agents:?}");
-                            };
-                            ensure!(
-                                user_topics.insert(agent, TopicId(record.seq)).is_none(),
-                                "agent {} got a second topic",
-                                agent.encoded()
-                            );
-                        }
+                            by: Address::User, ..
+                        } => {}
                         ChatEvent::TopicStarted { by, .. } => {
                             bail!("fake agent {by:?} started a topic")
                         }
+                        ChatEvent::DirectStarted { members } => {
+                            bail!("fake agents {members:?} talked directly")
+                        }
                         ChatEvent::Posted {
+                            topic,
                             from: Address::User,
+                            mentions,
                             ..
                         } => {
+                            // Each brief mentions its one agent, and that
+                            // agent's topic is the one the first brief opened.
+                            let [
+                                Mention {
+                                    to: Address::Agent(agent),
+                                    ..
+                                },
+                            ] = mentions[..]
+                            else {
+                                bail!("the proof posted with mentions {mentions:?}");
+                            };
+                            let known = *user_topics.entry(agent).or_insert(topic);
+                            ensure!(
+                                known == topic,
+                                "agent {} got a second topic",
+                                agent.encoded()
+                            );
                             posted.insert(MessageId(record.seq));
                         }
                         ChatEvent::Posted {

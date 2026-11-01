@@ -20,21 +20,23 @@ GPT, CLAUDE = "gpt", "claude"
 #: Every change from the Rust templates: the model talks through `chat`.
 CHANGES = [
     ('not change the active task, answer briefly with human.send and continue the work.', 'not change the active task, answer briefly with chat.post and continue the work.'),
-    ('human.send(text, *, kind)  Send the user a message.', 'chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. Mention "user" with a kind to reach the user.\nchat.start(name, text, *, agents=()) → int  Start a topic for a new subject; returns its id.'),
-    ('Every send has a kind. Ask yourself: does the user need to read this now?', 'Every message arrives after its topic, for example `[#12 rho › Fix the flaky test]`. Answer in\nthat topic: `chat.post(12, text)`. A message reaches the user only when it mentions them with a\nkind. Ask yourself: does the user need to read this now?'),
+    ('human.send(text, *, kind)  Send the user a message.', 'chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. Mention "user" with a kind to reach the user.\nchat.start(stream, name, text, *, mention=None, kind=None) → int  Start a topic in a stream for a new subject and join it; returns its id.\nchat.join(topic)        Receive every later message of a topic. A mention reaches you without it.\nchat.read(topic, last=20)  Show a topic\'s newest messages.\nchat.direct(agent, text) → int  Post to an agent in your direct conversation with it.'),
+    ('Every send has a kind. Ask yourself: does the user need to read this now?', 'Every message arrives after its conversation: a topic, for example `[#12 rho › Fix the flaky\ntest]`, or a direct conversation with an agent, for example `[#15 direct with eng-a]`. Answer\nthere: `chat.post(12, text)`. A message reaches the user only when it mentions them with a\nkind. Ask yourself: does the user need to read this now?'),
     ('   follow-through is still pending. They\'ll read it the next time they open the conversation.\n4. "status": no, and it\'s passing: "on it", "tests running". Your next message replaces it, and\n   it isn\'t kept.', '   follow-through is still pending. They\'ll read it the next time they open the topic.\n\nPost passing progress, such as "on it" or "tests running", without a mention.'),
-    ("later as agent mail, not as this call's return value.", "later as a message in a new topic, not as this call's return value."),
-    ('identity; it reports back to you with agents.message, which arrives as agent mail.', 'identity and the topic it starts with you; it reports back to you in that topic.'),
-    ('Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.', "Use `chat.post` in an agent's topic to send findings, questions, or a scoped next action to it."),
-    ('agents.message(*, agent_id: str, message: str) -> Awaitable[str]', 'chat.post(topic: int, text: str) -> Awaitable[str]'),
+    ("later as agent mail, not as this call's return value.", "later as a message in your direct conversation with it, not as this call's return value."),
+    ('identity; it reports back to you with agents.message, which arrives as agent mail.', 'identity and your direct conversation with it; it reports back to you there.'),
+    ('Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.', 'Use `chat.direct` to send findings, questions, or a scoped next action to an agent.'),
+    ('agents.message(*, agent_id: str, message: str) -> Awaitable[str]', 'chat.direct(agent: str, text: str) -> int'),
     ('Write "ask", "result" and "fyi" messages in Simplified Technical English (ASD-STE100). human.send\nrejects a sentence of more than 25 words, a contraction, a semicolon, or an -ing verb after a', 'Write messages that mention the user in Simplified Technical English (ASD-STE100). chat.post\nrejects one with a sentence of more than 25 words, a contraction, a semicolon, or an -ing verb after a'),
     ('a quoted word or example in a code span. A rejected send raises ValueError with the findings and stops the rest of the cell. Rewrite the', 'a quoted word or example in a code span. A rejected post raises ValueError with the findings and stops the rest of the cell. Rewrite the'),
     ('send it with agents.message, not your code, output, or reasoning.', 'post it with chat.post, not your code, output, or reasoning.'),
     ('agents.message(*, agent_id: str, message: str) → Awaitable[str]', 'chat.post(topic: int, text: str) → Awaitable[str]'),
-    ('You can exchange follow-up messages with the requesting Engineer through `agents.message`. Ask a', 'You can exchange follow-up messages with the requesting Engineer with `chat.post` in your topic. Ask a'),
+    ('You can exchange follow-up messages with the requesting Engineer through `agents.message`. Ask a', 'You can exchange follow-up messages with the requesting Engineer with `chat.post` in your direct conversation. Ask a'),
     ('Advisors cannot spawn subagents. Use `agents.message` when a known agent has context you cannot', 'Advisors cannot spawn subagents. Use `chat.post` when a known agent has context you cannot'),
     ('Send the requesting Engineer one self-contained and focused result with agents.message — a clear', 'Send the requesting Engineer one self-contained and focused result with chat.post — a clear'),
     ('status request does not change the active task, answer briefly with human.send and continue the', 'status request does not change the active task, answer briefly with chat.post and continue the'),
+    ('agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]', 'agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str, stream: str | None = None) → Awaitable[str]'),
+    ('ask you for more context. Returns its identity.', 'ask you for more context. Returns its identity.\n\nThe prompt is the first message of a new topic named task_name. The topic is in `stream`, or in the\nstream you were started in. The message mentions the user, so write it as you write to the user.'),
 ]
 
 #: sha256 of each Rust template at d03660c6.
@@ -93,7 +95,7 @@ class Templates(unittest.TestCase):
         collaboration = between(text, "## Working with other agents", "## Working with the user")
         self.assertTrue(collaboration.startswith("\n\nTEAM_SENTINEL\n\n"))
         self.assertLess(collaboration.index("### Advisor"), collaboration.index("### Engineers"))
-        self.assertLess(collaboration.index("chat.post(topic: int, text: str)"), collaboration.index("### Briefing and integrating work"))
+        self.assertLess(collaboration.index("chat.direct(agent: str, text: str)"), collaboration.index("### Briefing and integrating work"))
         for needle in ["agents.spawn_new_advisor(msg: str)", "agents.spawn_new_engineer(*, task_name:",
                        "task_name is a short kebab-case label", "agents.cancel(",
                        "loads applicable AGENTS.md guidance and the skill catalogue",
@@ -103,7 +105,7 @@ class Templates(unittest.TestCase):
         self.assertIn("A message reaches the user only when it mentions them with a\nkind.", text)
         self.assertIn("answer briefly with chat.post and continue the work", text)
         self.assertIn("(ASD-STE100). chat.post\nrejects one with a sentence of more than 25 words", text)
-        self.assertIn("it reports back to you in that topic", text)
+        self.assertIn("it reports back to you there", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)
         self.assertIn("def papercut(", text)
         self.assertTrue(text.endswith("WORKSPACE_SENTINEL"))
@@ -140,7 +142,7 @@ class Templates(unittest.TestCase):
             communication = text.split("# Working with other agents", 1)[1]
             for rule in ["send findings, questions, or a scoped next action", "say whether another reply is needed",
                          "Stop exchanging messages when\nthe requested work is complete",
-                         "do not create acknowledgment loops", "Use `chat.post` in an agent's topic to send findings"]:
+                         "do not create acknowledgment loops", "Use `chat.direct` to send findings"]:
                 self.assertIn(rule, communication)
         for text in [gpt("advisor"), claude_t("advisor")]:
             self.assertNotIn("When to use an Engineer:", text)
@@ -232,8 +234,8 @@ class Instructions(unittest.TestCase):
         team = (
             f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
             "\n\nYou were started directly and own the user\'s technical outcome."
-            "\n\nYou will receive agent messages in this format, after the topic they are in:\n```\n[#<topic id> <stream> › <topic name>]\nMessage Type: MESSAGE\nSender: <agent id>\nPayload:\n<payload text>\n```"
-            "\n\nAnswer an agent in its topic with `chat.post(topic, text)`.\n\n"
+            "\n\nYou will receive agent messages in this format, after the conversation they are in:\n```\n[#<topic id> <stream> › <topic name>]   or   [#<topic id> direct with <agent id>]\nMessage Type: MESSAGE\nSender: <agent id>\nPayload:\n<payload text>\n```"
+            "\n\nAnswer in that conversation with `chat.post(topic, text)`.\n\n"
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -256,7 +258,7 @@ class Instructions(unittest.TestCase):
         for runtime in [native(), claude()]:
             child = self.agent(runtime, preset="child", parent=parent.id)
             text = prompt.instructions(child)
-            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent in that topic with chat.post.", text)
+            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent in your direct conversation with chat.direct('eng-{parent.id}', text).", text)
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
             for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
                               "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
@@ -269,8 +271,9 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(advisor)
             self.assertIn(
                 f"Your agent id is adv-{advisor.id}; your parent agent is eng-{parent.id}."
-                "\n\nMessages from your parent define your task. Report to your parent in that topic with chat.post."
-                "\n\nComplete your independent analysis and post it to your parent in your topic with chat.post. "
+                "\n\nMessages from your parent define your task. Report to your parent in your direct conversation with "
+                f"chat.direct('eng-{parent.id}', text)."
+                f"\n\nComplete your independent analysis and post it to your parent with chat.direct('eng-{parent.id}', text). "
                 "Ask a known agent for context the same way, and end your turn when blocked on a reply.\n",
                 text,
             )
@@ -286,8 +289,8 @@ class Instructions(unittest.TestCase):
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
             self.assertIn("chat.post(topic, text, *, mention=None, kind=None)", text)
-        note = (f"Engineer eng-{direct.id} started you for the user; ask it in your topic with chat.post if you need "
-                "more context. You own the user\'s technical outcome.")
+        note = (f"Engineer eng-{direct.id} started you for the user; ask it with chat.direct('eng-{direct.id}', text) if you "
+                "need more context. You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))
         self.assertNotIn("started you for the user", prompt.instructions(direct))
         native_text = gpt("engineer", "", template(GPT, "user-owned-engineers"))
