@@ -4557,7 +4557,7 @@ impl Workspace {
         self.enter_insert_when_shown(window, cx);
     }
 
-    /// `space a s`: an agent started from the message at point in the
+    /// `space o s`: an agent started from the message at point in the
     /// conversation in view. The draft page asks where it works and what
     /// it runs on.
     pub(crate) fn start_agent_from_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4591,7 +4591,7 @@ impl Workspace {
         }
     }
 
-    /// `space a n`: puts `@agent` in the reply of the topic in view, from
+    /// `space o m`: puts `@agent` in the reply of the topic in view, from
     /// the agents on its host. The message mentions whom it names.
     pub(crate) fn prompt_mention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let surface = self.active_surface().clone();
@@ -4616,25 +4616,11 @@ impl Workspace {
             return;
         };
         let complete = std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &App| {
-            let input = input.trim().trim_start_matches('@').to_lowercase();
-            let mut agents = workspace
-                .registry
-                .known_agents()
-                .copied()
-                .filter(|agent| workspace.host_of(*agent) == Some(host))
-                .map(|agent| {
-                    (
-                        workspace.registry.agent_id_label(agent),
-                        workspace.registry.agent_display_label(agent),
-                    )
-                })
-                .filter(|(_, name)| name.to_lowercase().contains(&input))
-                .collect::<Vec<_>>();
-            agents.sort();
-            agents
+            workspace
+                .mention_candidates(host, input)
                 .into_iter()
-                .map(|(label, name)| crate::minibuffer::Candidate {
-                    value: label,
+                .map(|(agent, name)| crate::minibuffer::Candidate {
+                    value: workspace.registry.agent_id_label(agent),
                     description: name,
                 })
                 .collect()
@@ -4644,15 +4630,15 @@ impl Workspace {
                   input: String,
                   window: &mut Window,
                   cx: &mut Context<Workspace>| {
-                let label = input.trim().trim_start_matches('@');
-                let Some(agent) = workspace
-                    .registry
-                    .agent_by_label(label)
-                    .filter(|agent| workspace.host_of(*agent) == Some(host))
+                // Enter takes the first row, as on every picker.
+                let Some((agent, _)) = workspace
+                    .mention_candidates(host, &input)
+                    .into_iter()
+                    .next()
                 else {
                     workspace.notice_on(
                         None,
-                        &format!("no agent `{label}` on this host"),
+                        &format!("no agent `{}` on this host", input.trim()),
                         StyleClass::SystemInfo,
                         cx,
                     );
@@ -4674,7 +4660,33 @@ impl Workspace {
         self.open_prompt("mention:", complete, on_submit, window, cx);
     }
 
-    /// `space a d`: the conversations agents have with each other, newest
+    /// The agents on `host` whose label or name holds what was typed,
+    /// the one it names exactly first, then by label: each with the name
+    /// it is shown by.
+    fn mention_candidates(&self, host: HostId, input: &str) -> Vec<(AgentId, String)> {
+        let input = input.trim().trim_start_matches('@').to_lowercase();
+        let mut agents = self
+            .registry
+            .known_agents()
+            .copied()
+            .filter(|agent| self.host_of(*agent) == Some(host))
+            .map(|agent| {
+                let label = self.registry.agent_id_label(agent);
+                let name = self.registry.agent_display_label(agent);
+                (label.to_lowercase() != input, label, agent, name)
+            })
+            .filter(|(_, label, _, name)| {
+                label.to_lowercase().contains(&input) || name.to_lowercase().contains(&input)
+            })
+            .collect::<Vec<_>>();
+        agents.sort();
+        agents
+            .into_iter()
+            .map(|(_, _, agent, name)| (agent, name))
+            .collect()
+    }
+
+    /// `space o d`: the conversations agents have with each other, newest
     /// first. They are read here, not dealt.
     pub(crate) fn prompt_directs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut directs = self
@@ -6914,6 +6926,7 @@ impl Workspace {
             MenuId::VerdictSnooze => crate::transient::verdict_snooze_menu(),
             MenuId::Input => crate::transient::input_menu(),
             MenuId::Agent => crate::transient::agent_menu(),
+            MenuId::Chat => crate::transient::chat_menu(),
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
@@ -8739,9 +8752,12 @@ impl Workspace {
         // that dealt it: the card says why the dealer raised the agent, and
         // a running agent has no card at all, which left the line blank.
         let agent_in_view = self.surface_agent(&self.active_surface().key);
+        // A conversation's line is its title and members, like an agent's.
+        let titled_in_view =
+            agent_in_view.is_some() || matches!(self.active_surface().key, SurfaceKey::Topic(_));
         if let Some(card) = self.open_card_in_view(cx)
             && echo.is_none()
-            && agent_in_view.is_none()
+            && !titled_in_view
         {
             return self.render_deal_why(&card, text_style, window, cx);
         }
@@ -8807,6 +8823,10 @@ impl Workspace {
                 .child(format!("{unseen} new"))
         });
         let desktops = agent_in_view
+            .or_else(|| match self.active_surface().key {
+                SurfaceKey::Topic(topic) => self.conversation_agent(topic),
+                _ => None,
+            })
             .map(|agent| self.available_desktops(agent).len())
             .unwrap_or(0);
         let available = (desktops > 0).then(|| {

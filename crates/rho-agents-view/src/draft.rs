@@ -584,7 +584,13 @@ impl DraftModel {
     ) {
         let fields = self.fields();
         let target = match self.field_at_cursor(editor, cx) {
-            Some(at) => fields.get(at + 1).cloned(),
+            // Past the last field is the body, or the first field again
+            // when the shape has none.
+            Some(at) => fields.get(at + 1).cloned().or_else(|| {
+                (!self.shape.has_body())
+                    .then(|| fields.first().cloned())
+                    .flatten()
+            }),
             None => fields.first().cloned(),
         };
         self.go_to_field(target, editor, window, cx);
@@ -600,9 +606,9 @@ impl DraftModel {
     ) {
         let fields = self.fields();
         let target = match self.field_at_cursor(editor, cx) {
-            Some(0) => None,
+            Some(0) if self.shape.has_body() => None,
+            Some(0) | None => fields.last().cloned(),
             Some(at) => fields.get(at - 1).cloned(),
-            None => fields.last().cloned(),
         };
         self.go_to_field(target, editor, window, cx);
     }
