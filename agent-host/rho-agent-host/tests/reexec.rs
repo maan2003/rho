@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use rho_agent_types::AgentId;
 use rho_rpc::protocol::{Opened, read_frame, write_frame, write_open};
 use rho_terminal::protocol as term;
@@ -210,6 +211,45 @@ async fn work_outlives_reexec(
         "the turn was still running at the re-exec"
     );
     assert_eq!(children(host), workers, "the same workset processes");
+
+    // An explicit workset restart has the opposite lifetime contract from
+    // host re-exec: discard this workset's live shell, preserve its saved
+    // agent, and leave the other workset's process and files alone.
+    rho_rpc::protocol::client::call(
+        socket_path,
+        rho_agents_client::protocol::worksets::RestartWorkset { agent: agent_id },
+    )
+    .await?;
+    let restarted = children(host);
+    assert_eq!(restarted.len(), workers.len());
+    assert_eq!(
+        restarted.iter().filter(|pid| workers.contains(pid)).count(),
+        workers.len() - 1,
+        "restart replaces only the selected workset process"
+    );
+    let terminals = rho_rpc::protocol::client::call(
+        socket_path,
+        TerminalList {
+            agent: Some(agent_id.encoded()),
+        },
+    )
+    .await?;
+    assert!(terminals.is_empty(), "restart ends live terminals");
+    let mut stream = open_terminal(socket_path, agent_id, true).await?;
+    write_frame(
+        &mut stream,
+        &TermClientFrame::Input(b"exec bash --norc --noprofile\r".to_vec()),
+    )
+    .await?;
+    wait_for_line(&mut stream, "bash-").await?;
+    write_frame(
+        &mut stream,
+        &TermClientFrame::Input(b"echo \"fresh-\"\"${kept-unset}\"\r".to_vec()),
+    )
+    .await?;
+    wait_for_line(&mut stream, "fresh-unset").await?;
+    assert_eq!(rounds(state_dir), Some(ROUNDS), "saved files survive");
+    println!("workset restart replaced one worker and discarded its live shell");
     Ok(())
 }
 
@@ -313,7 +353,8 @@ async fn wait_for_line(stream: &mut rho_rpc::Stream, needle: &str) -> anyhow::Re
             }
         }
     })
-    .await?
+    .await
+    .with_context(|| format!("terminal did not show {needle:?}"))?
 }
 
 /// A new isolated workset with one agent on a clone of `repo`, made by

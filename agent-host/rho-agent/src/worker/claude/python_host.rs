@@ -384,7 +384,7 @@ fn trigger(why: Wake) -> WakeTrigger {
 mod tests {
     use super::*;
 
-    fn host(directory: &std::path::Path) -> PythonHost {
+    async fn host(directory: &std::path::Path) -> PythonHost {
         let notify = Arc::new(Notify::new());
         let notebook = Notebook::new(
             rho_tool_shell::ShellTools::in_directory(
@@ -395,6 +395,7 @@ mod tests {
             Arc::clone(&notify),
             None,
         )
+        .await
         .unwrap();
         PythonHost::new(notebook, notify)
     }
@@ -415,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn an_open_call_returns_when_its_cell_finishes() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         assert!(
             host.exec(
                 "request".into(),
@@ -447,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_refuses_exec_until_the_user_speaks_and_retained_output_still_goes_out() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         host.cancel(UnixMs(10));
         assert!(!host.can_admit());
         assert!(
@@ -477,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn prose_correction_is_bounded_and_only_human_revives_it() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         for count in 1..=Progress::MAX_PROSE {
             host.turn_ended(UnixMs(count as u64 * 1000), false);
             assert_eq!(host.prose_correction(), count < Progress::MAX_PROSE);
@@ -499,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn an_ended_turn_still_answers_its_call_then_wakes_only_for_news() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         let t0 = UnixMs::now().0;
         assert!(
             host.exec(
@@ -546,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn an_open_call_is_answered_before_the_cli_times_it_out() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         assert!(
             host.exec(
                 "request".into(),
@@ -578,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn checkin_continues_after_result_without_an_open_mcp_call() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         host.turn_ended(UnixMs(10_000), true);
         assert_eq!(host.checkin_at(), Some(UnixMs(130_000)));
         assert!(matches!(
@@ -596,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn retirement_requires_no_running_cells_and_no_armed_checkin() {
         let temp = tempfile::tempdir().unwrap();
-        let mut host = host(temp.path());
+        let mut host = host(temp.path()).await;
         assert!(host.retire_settled());
         host.turn_ended(UnixMs(10), true);
         assert!(

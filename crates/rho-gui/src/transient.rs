@@ -167,6 +167,7 @@ pub(crate) enum Command {
     SecretPhrase,
     // The agent under the point.
     AgentCancel,
+    AgentRestartWorkset,
     AgentRuntime,
     VerdictName,
     AgentCompact,
@@ -713,6 +714,11 @@ pub(crate) fn agent_menu() -> Menu {
             "shift-k",
             "new prompt cache key",
             MenuAction::Command(Command::AgentCacheKey),
+        )
+        .item(
+            "shift-r",
+            "restart whole workset (ends work)",
+            MenuAction::Command(Command::AgentRestartWorkset),
         )
 }
 

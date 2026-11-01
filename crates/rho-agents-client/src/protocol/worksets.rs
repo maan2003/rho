@@ -56,6 +56,9 @@ rho_rpc::calls! {
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
+        /// End everything in the agent's shared workset, replace its worker
+        /// with the host's current build, and reload the agent.
+        RestartWorkset(RestartWorkset) -> ();
         DeleteWorksets(DeleteWorksets) -> ();
         /// Bulk: one agent's rows from `from`, a page at a time.
         AgentLog(AgentLog) -> AgentLogPage, priority None;
@@ -171,6 +174,11 @@ pub enum MoveTo {
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Cancel {
+    pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RestartWorkset {
     pub agent: AgentId,
 }
 

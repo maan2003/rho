@@ -827,6 +827,7 @@ impl Agent {
                 Arc::clone(&self.wake),
                 Some(python::on_notebook(self.agent_id)),
             )
+            .await
             .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
             self.notebook = Some(notebook);
         }

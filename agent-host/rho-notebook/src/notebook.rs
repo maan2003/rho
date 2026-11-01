@@ -181,9 +181,22 @@ impl Report {
 impl Notebook {
     /// A notebook whose thread works in `shell`'s view, with `exports` among
     /// its globals. `wake` is notified whenever something changes.
-    /// `on_start` runs on the notebook's thread with its globals, before
-    /// any cell; its error fails the start.
-    pub fn new(
+    /// `on_start` runs on that thread before any cell; its error fails startup.
+    ///
+    /// Startup hooks can call back through the async executor, so it must
+    /// remain available while the constructor waits for them.
+    pub async fn new(
+        shell: ShellTools,
+        exports: Vec<Export>,
+        wake: Arc<Notify>,
+        on_start: Option<OnStart>,
+    ) -> Result<Self, String> {
+        tokio::task::spawn_blocking(move || Self::new_blocking(shell, exports, wake, on_start))
+            .await
+            .map_err(|error| format!("notebook startup task failed: {error}"))?
+    }
+
+    fn new_blocking(
         shell: ShellTools,
         exports: Vec<Export>,
         wake: Arc<Notify>,

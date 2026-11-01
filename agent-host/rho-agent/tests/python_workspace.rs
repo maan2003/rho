@@ -36,6 +36,7 @@ fn main() {
             wake.clone(),
             None,
         )
+        .await
         .unwrap();
         let cell = notebook.run("assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into());
         tokio::time::timeout(Duration::from_secs(10), async {

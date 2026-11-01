@@ -414,12 +414,28 @@ impl AgentPool {
             .map(|(agent_id, _, _)| *agent_id)
             .collect::<Vec<_>>();
         drop((current, admission, agents));
+        let mut reload_error = None;
         for agent_id in ids {
             if let Err(error) = self.load(agent_id).await {
-                eprintln!("rho-agent: reloading {}: {error:#}", agent_id.encoded());
+                let error = error.context(format!("reload agent {}", agent_id.encoded()));
+                eprintln!("rho-agent: {error:#}");
+                reload_error.get_or_insert(error);
             }
         }
+        if let Some(error) = reload_error {
+            return Err(error);
+        }
         Ok(replace)
+    }
+
+    /// User-requested recovery must work without the workset's Python. A
+    /// failed or unloaded selected agent is loaded even if there was no live
+    /// worker to replace. Saved tool calls are not replayed.
+    pub async fn restart_agent_workset(self: &Arc<Self>, agent: AgentId) -> anyhow::Result<()> {
+        let workset = self.workset_of(agent)?;
+        self.restart_workset(workset, true).await?;
+        self.load(agent).await?;
+        Ok(())
     }
 
     /// Replaces stale workset processes as they fall quiet, checking every

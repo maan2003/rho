@@ -642,3 +642,140 @@ fn a_draft_shows_in_the_topic_it_names_while_it_is_written(cx: &mut TestAppConte
     assert!(!text.contains("writing…"), "stopped: {text}");
     assert!(text.contains("go on"), "the messages stay: {text}");
 }
+
+/// The agent transient restarts the selected agent's whole workset, not
+/// another agent's, and reports completion only when the host acknowledges it.
+#[gpui::test]
+fn restart_workset_dispatches_for_the_subject_and_waits_for_the_host(cx: &mut TestAppContext) {
+    let first = agent(951);
+    let selected = agent(952);
+    let (workspace, mut host) = attached(cx, first);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(first), ui_head(selected)], 900),
+                window,
+                cx,
+            );
+            workspace.select_agent(Some(selected), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape space a shift-r");
+    cx.run_until_parked();
+
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "Space a Shift-R sends exactly one call");
+    let (call, mut stream) = calls.pop().unwrap();
+    let Request::RestartWorkset(restart) = call else {
+        panic!("the transient must request a workset restart: {call:?}");
+    };
+    assert_eq!(
+        restart.agent, selected,
+        "the selected subject, not the first agent"
+    );
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.menu_title_for_test(), None);
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                None,
+                "sending is not success"
+            );
+        })
+        .unwrap();
+
+    story::answer(&mut stream, rho_rpc::protocol::Answer::Done(()));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("restarted whole workset; running work ended, saved agents reloaded")
+            );
+        })
+        .unwrap();
+}
+
+/// A connected host cannot restart an absent subject, and another host
+/// being online does not make an offline subject actionable.
+#[gpui::test]
+fn restart_workset_requires_an_online_subject(cx: &mut TestAppContext) {
+    let member = agent(961);
+    let (workspace, mut host) = attached(cx, member);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(None, window, cx);
+            workspace.cmd_restart_workset(window, cx);
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("restart-workset: no agent in focus")
+            );
+            let other = workspace.attach_host(
+                crate::workspace::HostSpec {
+                    name: "other".to_owned(),
+                    target: crate::workspace::AttachTarget::Unix(
+                        std::env::temp_dir().join("rho-gui-restart-other-nonexistent.sock"),
+                    ),
+                },
+                cx,
+            );
+            story::feed(workspace, other, ready_with(Vec::new(), 0), window, cx);
+            workspace.select_agent(Some(member), window, cx);
+            workspace.hosts.set_status(
+                HostId::default(),
+                rho_agent_hosts::HostStatus::Disconnected("test offline".to_owned()),
+            );
+            assert!(
+                workspace.hosts.any_online(),
+                "the unrelated host is still online"
+            );
+            workspace.cmd_restart_workset(window, cx);
+            assert!(
+                workspace
+                    .echo_text_for_test()
+                    .is_some_and(|text| text.starts_with("not connected to ")),
+                "an offline subject gets a connection notice"
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        story::calls(&mut host).is_empty(),
+        "neither case may send a restart"
+    );
+}
+
+/// A refused restart is not reported as completed.
+#[gpui::test]
+fn restart_workset_reports_host_failure_instead_of_success(cx: &mut TestAppContext) {
+    let member = agent(971);
+    let (workspace, mut host) = attached(cx, member);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(member), window, cx);
+            workspace.cmd_restart_workset(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1);
+    let (call, mut stream) = calls.pop().unwrap();
+    assert!(matches!(call, Request::RestartWorkset(_)));
+    story::answer(
+        &mut stream,
+        rho_rpc::protocol::Answer::<()>::Failed {
+            reason: "could not reload saved agents".to_owned(),
+        },
+    );
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            let echo = workspace.echo_text_for_test().expect("host error is shown");
+            assert!(echo.contains("could not reload saved agents"), "{echo}");
+            assert!(!echo.contains("restarted whole workset"), "{echo}");
+        })
+        .unwrap();
+}

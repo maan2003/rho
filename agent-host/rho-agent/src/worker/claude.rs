@@ -1236,7 +1236,7 @@ impl ClaudeLoop {
         let mut options = ClaudeCodeOptions::new(cwd.clone(), model, effort, self.session_id);
         options.session = session;
         options.set_env("RHO_AGENT_ID", self.agent_id.encoded().to_string());
-        self.ensure_python()?;
+        self.ensure_python().await?;
         // SDK-hosted tools use their bare names, matching Rho's native exec.
         options.set_env("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", "1");
         // Tool search would defer the one tool behind a lookup; the deny
@@ -1285,7 +1285,7 @@ impl ClaudeLoop {
 
     /// Builds the notebook on the first spawn. It lives as long as the
     /// loop: a respawned CLI finds the same globals and running cells.
-    fn ensure_python(&mut self) -> anyhow::Result<()> {
+    async fn ensure_python(&mut self) -> anyhow::Result<()> {
         if self.python.is_some() {
             return Ok(());
         }
@@ -1304,6 +1304,7 @@ impl ClaudeLoop {
             Arc::clone(&notify),
             Some(python::on_notebook(self.agent_id)),
         )
+        .await
         .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
         self.python = Some(python_host::PythonHost::new(notebook, notify));
         Ok(())
@@ -2746,6 +2747,7 @@ mod tests {
             Arc::clone(&notify),
             None,
         )
+        .await
         .unwrap();
         let mut python = python_host::PythonHost::new(notebook, notify);
         let mut blocks = BTreeMap::new();

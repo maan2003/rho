@@ -7,11 +7,13 @@ use tokio::sync::Notify;
 
 use crate::{CellHandle, Notebook};
 
-fn notebook() -> (Notebook, Arc<Notify>) {
+async fn notebook() -> (Notebook, Arc<Notify>) {
     let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
     let wake = Arc::new(Notify::new());
     (
-        Notebook::new(shell, Vec::new(), Arc::clone(&wake), None).unwrap(),
+        Notebook::new(shell, Vec::new(), Arc::clone(&wake), None)
+            .await
+            .unwrap(),
         wake,
     )
 }
@@ -32,7 +34,7 @@ async fn finished(wake: &Notify, cell: &CellHandle) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn selected_ghapi_sources_are_importable_in_the_notebook() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         r#"import ghapi, sys
 from ghapi.all import GhApi
@@ -53,7 +55,7 @@ print("ghapi import ready")"#
 
 #[tokio::test(flavor = "multi_thread")]
 async fn adapted_slack_sdk_is_importable_in_the_notebook() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         r#"from slack_sdk import WebClient
 from slack_sdk.web.async_client import AsyncWebClient
@@ -79,7 +81,7 @@ print("slack_sdk import ready")"#
 
 #[tokio::test(flavor = "multi_thread")]
 async fn python_ls_xdir_is_available_in_the_notebook() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         r#"from python_ls import xdir
 class Example:
@@ -98,7 +100,7 @@ print("xdir ready")"#
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cell_that_ends_first_speaks_plainly() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("print(6 * 7)".into());
     finished(&wake, &cell).await;
     assert_eq!(notebook.report().unwrap().render().text, "42");
@@ -112,7 +114,7 @@ async fn a_cell_that_ends_first_speaks_plainly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_raise_is_the_cells_output() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("raise ValueError('nope')".into());
     finished(&wake, &cell).await;
     assert!(cell.facts().finished.unwrap().failed);
@@ -128,7 +130,7 @@ async fn a_raise_is_the_cells_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_statements_run_as_they_arrive() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.stream();
     cell.feed("print('first')\n".into(), false).unwrap();
     // The first statement is whole only once the next one starts.
@@ -143,7 +145,7 @@ async fn streamed_statements_run_as_they_arrive() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_stream_keeps_what_ran() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.stream();
     cell.feed("a = 1\nb = ".into(), false).unwrap();
     until(&wake, || cell.progress().settled > 0).await;
@@ -157,7 +159,7 @@ async fn an_interrupted_stream_keeps_what_ran() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("job = command('read line; echo got $line', stdin=True)".into());
     until(&wake, || cell.facts().returned.is_some()).await;
     assert!(cell.facts().finished.is_none());
@@ -191,7 +193,7 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_reads_dev_null_unless_it_asks_for_stdin() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     // An open pipe would leave cat waiting until timeout kills it (124).
     let cell = notebook.run(
         "job = command('timeout 5 cat; echo cat=$?; readlink /proc/self/fd/0')\n\
@@ -209,7 +211,7 @@ async fn a_command_reads_dev_null_unless_it_asks_for_stdin() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_background_task_outlives_its_return() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         "import asyncio\nasync def later():\n    await asyncio.sleep(0.2)\n    print('late')\nasyncio.create_task(later())\nprint('now')".into(),
     );
@@ -234,7 +236,7 @@ async fn a_background_task_outlives_its_return() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn created_tasks_own_output_and_return_values() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("import asyncio\nasync def fetch():\n    await asyncio.sleep(0.1)\n    print('child')\n    return 73\nt = asyncio.create_task(fetch())\nprint('parent')".into());
     finished(&wake, &cell).await;
     let first = notebook.report().unwrap().render().text;
@@ -249,7 +251,7 @@ async fn created_tasks_own_output_and_return_values() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_raised_task_does_not_wait_for_its_command() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("job = command('sleep 1'); raise ValueError('bad')".into());
     finished(&wake, &cell).await;
     assert!(
@@ -265,7 +267,7 @@ async fn a_raised_task_does_not_wait_for_its_command() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_a_task_kills_its_command_quietly() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("job = command('sleep 5')\nawait job".into());
     until(&wake, || {
         notebook
@@ -299,7 +301,7 @@ async fn cancelling_a_task_kills_its_command_quietly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caught_created_task_exception_is_not_reported() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('specific')\nt = asyncio.create_task(broken())\ntry:\n    await t\nexcept ValueError:\n    print('caught')".into());
     finished(&wake, &cell).await;
     let text = notebook.report().unwrap().render().text;
@@ -309,7 +311,7 @@ async fn a_caught_created_task_exception_is_not_reported() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn budgets_above_ten_thousand_tokens_return_whole_output() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         "print('p' * 100000, max_tokens=30000)\njob = command(\"head -c 100000 /dev/zero | tr '\\\\0' c\", max_tokens=30000)"
             .into(),
@@ -323,7 +325,7 @@ async fn budgets_above_ten_thousand_tokens_return_whole_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook
         .run("for _ in range(110): print('a' * 40000, max_tokens=10000)\nprint('b' * 100)".into());
     finished(&wake, &cell).await;
@@ -337,7 +339,7 @@ async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn notebook_retention_discards_oldest_command_log() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell =
         notebook.run("jobs = [command('head -c 4194304 /dev/zero') for _ in range(14)]".into());
     finished(&wake, &cell).await;
@@ -356,7 +358,7 @@ async fn notebook_retention_discards_oldest_command_log() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_failure_reports_once_after_twenty_seconds() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('unclaimed')\nt = asyncio.create_task(broken())".into());
     finished(&wake, &cell).await;
     assert!(
@@ -408,7 +410,7 @@ fn task_label(notebook: &Notebook) -> crate::SessionId {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_task_that_ended_before_the_lookup_still_answers() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         "import asyncio\nasync def work():\n    return 42\nt = asyncio.create_task(work())".into(),
     );
@@ -422,7 +424,7 @@ async fn a_task_that_ended_before_the_lookup_still_answers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn awaiting_an_exec_waits_for_its_commands() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     // Synchronous code: the exec has no asyncio task, only its command.
     let first = notebook.run("command('sleep 0.5; echo slept')".into());
     let label = first.session_id();
@@ -443,7 +445,7 @@ async fn awaiting_an_exec_waits_for_its_commands() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_result_awaits_to_itself() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("r = await command('exit 3')\nr = await r\nprint(r.exit_code)".into());
     finished(&wake, &cell).await;
     let text = notebook.report().unwrap().render().text;
@@ -452,7 +454,7 @@ async fn a_command_result_awaits_to_itself() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_a_failed_commands_exit_code_takes_its_failure() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let failed = || {
         notebook
             .facts()
@@ -493,7 +495,7 @@ async fn reading_a_failed_commands_exit_code_takes_its_failure() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         "import asyncio, threading\ncallback_gate = asyncio.get_running_loop().create_future()\ncallback_gate.add_done_callback(lambda _: print('callback'))\nthread_gate = threading.Event()\nthreading.Thread(target=lambda: (thread_gate.wait(), print('thread'))).start()".into(),
     );
@@ -526,7 +528,7 @@ async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn command_handle_and_await_result_use_scrambled_session_id() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run("job = command('exit 7')\nprint(job.id, (await job).id)".into());
     finished(&wake, &cell).await;
     let command = notebook
@@ -542,7 +544,7 @@ async fn command_handle_and_await_result_use_scrambled_session_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_start_in_the_notebook_cwd() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     let cell = notebook.run(
         r#"import os, tempfile
 root = os.path.realpath(tempfile.mkdtemp())
@@ -564,7 +566,7 @@ print("cwd ok")"#
 
 #[tokio::test(flavor = "multi_thread")]
 async fn checkin_remains_configurable_without_tool_suppression() {
-    let (notebook, wake) = notebook();
+    let (notebook, wake) = notebook().await;
     assert_eq!(notebook.checkin(), Duration::from_secs(120));
     let cell =
         notebook.run("print('suppress_tool_wakeups' in globals())\nset_max_wait(317)".into());
@@ -577,17 +579,50 @@ async fn checkin_remains_configurable_without_tool_suppression() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reports_from_new_notebooks_with_reused_session_labels_stay_separate() {
-    let (first, wake) = notebook();
+    let (first, wake) = notebook().await;
     let cell = first.run("print('first lifetime')".into());
     finished(&wake, &cell).await;
     let label = cell.session_id();
     let mut report = first.report().unwrap();
     drop(first);
 
-    let (second, wake) = notebook();
+    let (second, wake) = notebook().await;
     let cell = second.run("print('second lifetime')".into());
     finished(&wake, &cell).await;
     assert_eq!(cell.session_id(), label);
     report.merge(second.report().unwrap());
     assert_eq!(report.render().text, "first lifetime\n\nsecond lifetime");
+}
+
+/// A startup hook can require IPC or timers on the same async executor that
+/// creates the notebook. A blocking constructor stalls that executor.
+#[tokio::test]
+async fn async_startup_keeps_the_executor_available_to_its_hook() {
+    let runtime = tokio::runtime::Handle::current();
+    let hook: crate::OnStart = Box::new(move |py, namespace| {
+        let value = py.detach(|| {
+            runtime
+                .block_on(runtime.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    17
+                }))
+                .unwrap()
+        });
+        use pyo3::types::PyDictMethods as _;
+        namespace.set_item("startup_value", value)?;
+        Ok(())
+    });
+    let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
+    let wake = Arc::new(Notify::new());
+    let notebook = tokio::time::timeout(
+        Duration::from_secs(5),
+        Notebook::new(shell, Vec::new(), wake.clone(), Some(hook)),
+    )
+    .await
+    .expect("startup blocked its own executor")
+    .unwrap();
+    let cell = notebook.run("print(startup_value)".into());
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "17");
+    notebook.shutdown().await.unwrap();
 }

@@ -3357,6 +3357,27 @@ impl Workspace {
         }
     }
 
+    /// Forcibly restarts the whole workset, ending running work and reloading
+    /// its saved agents. Acknowledgement comes from the host, not from sending.
+    pub(crate) fn cmd_restart_workset(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("restart-workset", window, cx) {
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            if let Some(host) = self.host_of(agent_id) {
+                let restart = agents::worksets::RestartWorkset { agent: agent_id };
+                self.call(host, restart, cx, move |this, (), cx| {
+                    this.notice_on(
+                        Some(&agent_id),
+                        "restarted whole workset; running work ended, saved agents reloaded",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                });
+            }
+        }
+    }
+
     pub(crate) fn cmd_rewind(&mut self, turns: u32, window: &Window, cx: &mut Context<Self>) {
         if let Some(agent_id) = self.subject_agent_or_notice("rewind", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
@@ -7095,6 +7116,7 @@ impl Workspace {
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
             Command::Version => self.cmd_version(cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
+            Command::AgentRestartWorkset => self.cmd_restart_workset(window, cx),
             Command::AgentRuntime => self.prompt_change_agent_runtime(window, cx),
             Command::VerdictName => self.cmd_verdict_name(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
