@@ -611,7 +611,7 @@ impl Workspace {
                 .registry
                 .known_agents()
                 .copied()
-                .map(|id| (id, self.registry.agent_display_label(id)))
+                .map(|id| (id, self.registry.agent_short_label(id)))
                 .collect();
             model.update(cx, |model, cx| {
                 model.start_initial_load(state, labels, now_ms(), cx)
@@ -657,7 +657,7 @@ impl Workspace {
                 state,
                 summary,
                 now_ms(),
-                &|id| self.registry.agent_display_label(id),
+                &|id| self.registry.agent_short_label(id),
                 cx,
             )
         });

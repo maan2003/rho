@@ -597,11 +597,25 @@ impl ChatMap {
 /// A topic's messages as they were written, oldest first, then what the
 /// user wrote in it that no host has taken yet.
 pub fn topic_state(messages: &[Message], unsent: &[String]) -> UiAgentState {
-    let said = messages.iter().map(|message| UiBlock::ChatMessage {
-        id: message.id,
-        from: message.from,
-        mentions: message.mentions.clone(),
-        text: rho_agent_types::transcript::text_content(&message.content),
+    let mut writers = messages.iter().filter_map(|message| match message.from {
+        Address::Agent(agent) => Some(agent),
+        Address::User => None,
+    });
+    let first = writers.next();
+    let several = writers.any(|agent| Some(agent) != first);
+    let mut last: Option<AgentId> = None;
+    let said = messages.iter().map(move |message| {
+        let named = match message.from {
+            Address::Agent(agent) => several && last.replace(agent) != Some(agent),
+            Address::User => false,
+        };
+        UiBlock::ChatMessage {
+            id: message.id,
+            from: message.from,
+            mentions: message.mentions.clone(),
+            text: rho_agent_types::transcript::text_content(&message.content),
+            named,
+        }
     });
     let waiting = unsent
         .iter()
@@ -1048,6 +1062,31 @@ mod tests {
         assert_eq!(map.topic(topic), None, "a load replaces the host's chat");
     }
 
+    /// A sender's name heads each run of its messages, the user's in
+    /// between not counted, and only once a second agent wrote in the topic.
+    #[test]
+    fn a_name_heads_each_agents_run_in_a_topic_of_several() {
+        let (a, b) = (agent(1), agent(2));
+        let named = |from: &[Address]| {
+            let messages = from
+                .iter()
+                .enumerate()
+                .filter_map(|(n, from)| Message::from_record(&posted(n as u64 + 4, *from, &[])))
+                .collect::<Vec<_>>();
+            topic_state(&messages, &[])
+                .blocks
+                .iter()
+                .map(|block| matches!(**block, UiBlock::ChatMessage { named: true, .. }))
+                .collect::<Vec<_>>()
+        };
+        let (u, a, b) = (Address::User, Address::Agent(a), Address::Agent(b));
+        assert_eq!(
+            named(&[a, u, a, b, u, b, a]),
+            [true, false, false, true, false, false, true]
+        );
+        assert_eq!(named(&[u, a, u, a]), [false; 4], "one agent: its topic names it");
+    }
+
     /// A topic reads as its messages, each with who posted it and whom it
     /// mentions, then what waits to be sent.
     #[test]
@@ -1076,7 +1115,8 @@ mod tests {
                     id: id(4),
                     from: Address::User,
                     mentions: Vec::new(),
-                    text: "message 4".into()
+                    text: "message 4".into(),
+                    named: false,
                 },
                 UiBlock::ChatMessage {
                     id: id(5),
@@ -1085,7 +1125,8 @@ mod tests {
                         to: Address::User,
                         kind: MentionKind::Ask
                     }],
-                    text: "message 5".into()
+                    text: "message 5".into(),
+                    named: false,
                 },
                 UiBlock::Unsent {
                     text: "later".into()

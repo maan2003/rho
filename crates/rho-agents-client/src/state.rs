@@ -91,6 +91,10 @@ pub enum UiBlock {
         from: rho_agent_types::Address,
         mentions: Vec<rho_agent_types::Mention>,
         text: String,
+        /// Its sender's name heads it: an agent's message after another
+        /// agent's, the user's in between not counted, in a topic more
+        /// than one agent wrote in.
+        named: bool,
     },
 }
 

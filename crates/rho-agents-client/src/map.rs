@@ -592,6 +592,11 @@ impl AgentMap {
             .filter(|name| !name.is_empty())
             .or_else(|| self.mirror.get(&agent_id).and_then(MirroredAgent::title))
     }
+    /// What a topic calls an agent: its name, or its id when it has none.
+    pub fn agent_short_label(&self, agent_id: AgentId) -> String {
+        self.agent_display_name(agent_id)
+            .map_or_else(|| self.agent_id_label(agent_id), str::to_owned)
+    }
     pub fn agent_display_label(&self, agent_id: AgentId) -> String {
         let id = self.agent_id_label(agent_id);
         self.agent_display_name(agent_id)

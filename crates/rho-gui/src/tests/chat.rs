@@ -115,6 +115,7 @@ fn open_at(
                         from: *from,
                         mentions: Vec::new(),
                         text: (*text).to_owned(),
+                        named: false,
                     })
                 })
                 .collect();

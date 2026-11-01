@@ -5510,6 +5510,7 @@ fn an_agent_starts_from_the_message_at_point(cx: &mut TestAppContext) {
                     from,
                     mentions: Vec::new(),
                     text: text.to_owned(),
+                    named: false,
                 })
             };
             let mut state = rho_agents_client::chat::topic_state(&[], &[]);

@@ -173,27 +173,21 @@ pub fn block_visible(block: &UiBlock) -> bool {
 pub fn chat_header(
     from: Address,
     mentions: &[Mention],
+    named: bool,
     agent_label: &impl Fn(AgentId) -> String,
 ) -> String {
     let mut parts = Vec::new();
-    if let Address::Agent(sender) = from {
+    if let (true, Address::Agent(sender)) = (named, from) {
         parts.push(agent_label(sender));
     }
+    // A mention of the user and its kind are for the dealer; a mention of
+    // an agent says who else reads it.
     for mention in mentions {
-        let to = match mention.to {
-            Address::User => "you".to_owned(),
-            Address::Agent(agent) => agent_label(agent),
-        };
-        parts.push(match mention.kind {
-            MentionKind::Ask => format!("asks {to}"),
-            MentionKind::Result => format!("result for {to}"),
-            MentionKind::Fyi => format!("fyi for {to}"),
-        });
+        if let Address::Agent(agent) = mention.to {
+            parts.push(format!("@{}", agent_label(agent)));
+        }
     }
-    if from == Address::User && !parts.is_empty() {
-        parts.insert(0, "you".to_owned());
-    }
-    parts.join(" · ")
+    parts.join(" ")
 }
 
 /// Separator inserted before a block, given the previous visible block's kind.
@@ -468,13 +462,14 @@ pub fn render_block_with_agent_labels(
             from,
             mentions,
             text,
+            named,
             ..
         } => {
             if text.is_empty() {
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            let header = chat_header(*from, mentions, agent_label);
+            let header = chat_header(*from, mentions, *named, agent_label);
             if !header.is_empty() {
                 spans.push(Span::new(format!("{header}\n"), StyleClass::AgentLabel));
             }
@@ -852,15 +847,15 @@ mod tests {
 
     use super::*;
 
-    /// A topic's message says who wrote it and whom it mentions, by
-    /// name: the user's own message by itself, an agent's under its name,
-    /// and each mention with its kind and who it is for.
+    /// A topic's message names its sender only when told to, and names
+    /// the agents it mentions; a mention of the user and every kind say
+    /// nothing here.
     #[test]
     fn a_chat_message_names_its_sender_and_mentions() {
         let a = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let b = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let label = |agent: AgentId| if agent == a { "Ann" } else { "Bob" }.to_owned();
-        let rendered = |from, mentions: Vec<Mention>| {
+        let rendered = |from, mentions: Vec<Mention>, named| {
             text_of(
                 &render_block_with_agent_labels(
                     &UiBlock::ChatMessage {
@@ -868,6 +863,7 @@ mod tests {
                         from,
                         mentions,
                         text: "words".into(),
+                        named,
                     },
                     None,
                     0,
@@ -877,25 +873,22 @@ mod tests {
             )
         };
         let mention = |to, kind| Mention { to, kind };
-        assert_eq!(rendered(Address::User, Vec::new()), "words\n\n");
+        let both = vec![
+            mention(Address::User, MentionKind::Ask),
+            mention(Address::Agent(b), MentionKind::Fyi),
+        ];
+        assert_eq!(rendered(Address::User, Vec::new(), false), "words\n\n");
+        assert_eq!(rendered(Address::Agent(a), both.clone(), true), "Ann @Bob\nwords\n");
+        assert_eq!(rendered(Address::Agent(a), both, false), "@Bob\nwords\n");
         assert_eq!(
-            rendered(
-                Address::Agent(a),
-                vec![
-                    mention(Address::User, MentionKind::Ask),
-                    mention(Address::Agent(b), MentionKind::Fyi),
-                ],
-            ),
-            "Ann · asks you · fyi for Bob\nwords\n"
+            rendered(Address::Agent(a), vec![mention(Address::User, MentionKind::Result)], false),
+            "words\n",
+            "a result for the user is the dealer's"
         );
         assert_eq!(
-            rendered(
-                Address::User,
-                vec![mention(Address::Agent(b), MentionKind::Result)]
-            ),
-            "you · result for Bob\nwords\n\n"
+            rendered(Address::User, vec![mention(Address::Agent(b), MentionKind::Ask)], false),
+            "@Bob\nwords\n\n"
         );
-        assert_eq!(rendered(Address::Agent(b), Vec::new()), "Bob\nwords\n");
     }
 
     fn tool(status: UiToolStatus) -> UiTool {
