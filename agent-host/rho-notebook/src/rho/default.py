@@ -40,8 +40,8 @@ def on_compaction(agent) -> list[str]:
 
 
 def on_turn_end(agent, outcome) -> None:
-    """A child that failed tells its parent, in their direct conversation;
-    whatever else it has to say it posts itself."""
+    """A child that failed tells its parent with a message; whatever else
+    it has to say it sends itself."""
     parent = agent.props.get("parent")
     if outcome["reason"] == "failed" and parent is not None:
         chat.post(agent.id, chat.direct(agent.id, parent), f"Agent hit an error and stopped: {outcome['error']}")
@@ -83,14 +83,16 @@ async def hand(agent, record: dict) -> None:
 
 
 def render(record: dict, reader: str) -> str:
-    """A message as `reader` reads it: its conversation first, so the model
-    knows where to answer."""
-    where = tools.where(record["topic"], chat.topic(record["topic"]), reader)
+    """A message as `reader` reads it: where it is first, so the model knows
+    where to answer. A message between two agents has no topic; it is
+    answered with `agents.message`."""
+    head = chat.topic(record["topic"])
     sender = record["sender"]
-    if sender == chat.USER:
-        return f"{where} Message from the user:\n{record['text']}"
-    label = prompt.label(sender)
-    return f"{where}\nMessage Type: MESSAGE\nSender: {label}\nPayload:\n{record['text']}"
+    if head["stream"] is None:
+        return f"[message from {prompt.label(sender)}]\n{record['text']}"
+    where = tools.where(record["topic"], head, reader)
+    who = "the user" if sender == chat.USER else prompt.label(sender)
+    return f"{where} Message from {who}:\n{record['text']}"
 
 
 def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer", origin: str | None = None) -> str:

@@ -79,9 +79,8 @@ def _spawner_of(props: dict) -> str | None:
 
 class Chat:
     """Posting in the host's chat. A message reaches the members of its
-    conversation and the agents it mentions. Agents join a topic to follow
-    it; two agents talk in their direct conversation. The user is reached
-    by a mention."""
+    topic and the agents it mentions. Agents join a topic to follow it. The
+    user is reached by a mention; another agent, by `agents.message`."""
 
     def __init__(self, agent: str):
         self._agent = agent
@@ -100,7 +99,7 @@ class Chat:
                 props = rho_agents.Agent(self._agent).props
                 if props.get("preset") != "engineer":
                     parent = props.get("parent")
-                    raise ValueError(f"you report to your parent agent {label(parent)}; use chat.direct({label(parent)!r}, text)")
+                    raise ValueError(f"you report to your parent agent {label(parent)}; use agents.message(agent_id={label(parent)!r}, message=text)")
                 mentions.append((rho_chat.USER, kind))
                 continue
             agent = resolve(str(handle))
@@ -128,20 +127,6 @@ class Chat:
         topic, _ = rho_chat.start(self._agent, str(stream), str(name), text, mentions)
         rho_chat.join(topic, self._agent)
         print(f"Started topic #{topic}.")
-        return topic
-
-    def direct(self, agent, text):
-        """Post `text` to `agent` in your direct conversation with it;
-        returns that conversation's id."""
-        text = _text(text)
-        other = resolve(str(agent))
-        if other == self._agent:
-            raise ValueError("cannot talk to yourself")
-        if other not in _rho.agents():
-            raise ValueError(f"no agent {agent} in this workset")
-        topic = rho_chat.direct(self._agent, other)
-        rho_chat.post(self._agent, topic, text)
-        print(f"Posted to {label(other)} in #{topic}.")
         return topic
 
     def join(self, topic):
@@ -247,11 +232,28 @@ def where(topic, head, reader):
 
 
 
-class Agents:
-    """Starting and stopping other agents."""
+class Messages:
+    """Talking to other agents, outside the user's chat."""
 
     def __init__(self, agent: str):
         self._agent = agent
+
+    def message(self, *, agent_id, message):
+        """Send `message` to the agent `agent_id`, any agent on this host. It
+        arrives as a message from you, and its answer as a message from it."""
+        text = _text(message)
+        other = resolve(str(agent_id))
+        if other == self._agent:
+            raise ValueError("cannot message yourself")
+        rho_chat.post(self._agent, rho_chat.direct(self._agent, other), text)
+        return report(f"Sent to {label(other)}.")
+
+    def __repr__(self):
+        return "<agents>"
+
+
+class Agents(Messages):
+    """Talking to, starting and stopping other agents."""
 
     def _me(self):
         return rho_agents.Agent(self._agent)
@@ -266,13 +268,12 @@ class Agents:
             cursor = _spawner_of(known[cursor]["props"])
 
     def _spawn(self, runtime, props, prompt):
-        """Create an agent and brief it in its direct conversation with this
-        one, where it reports."""
+        """Create an agent and brief it with a message, which it answers
+        the same way."""
         self._check_depth()
         agent = rho_agents.create(runtime, props)
-        topic = rho_chat.direct(self._agent, agent.id)
-        rho_chat.post(self._agent, topic, prompt)
-        return agent, topic
+        rho_chat.post(self._agent, rho_chat.direct(self._agent, agent.id), prompt)
+        return agent
 
     def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
         """Start an Engineer on `prompt`, in `workdir` or your directory."""
@@ -281,24 +282,24 @@ class Agents:
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
         props = {"name": task_name, "preset": "child", "parent": me.id, "cwd": cwd}
-        child, topic = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
+        child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
             f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
-            f"results will arrive in your direct conversation #{topic}. It works in {cwd}. "
-            f"Post in #{topic} to follow up."
+            f"results will arrive as messages from it. It works in {cwd}. Follow up with "
+            f"agents.message(agent_id={label(child.id)!r}, message=text)."
         )
 
     def spawn_new_advisor(self, msg):
-        """Ask an independent Advisor; its findings arrive in a new topic."""
+        """Ask an independent Advisor; its findings arrive as a message."""
         if not str(msg).strip():
             raise ValueError("message must not be empty")
         me = self._me()
         # The Advisor reads what the asker sees: the same directory.
         props = {"name": "advisor", "preset": "advisor", "parent": me.id, "cwd": me.props["cwd"]}
-        advisor, topic = self._spawn(advisor_runtime(me.runtime), props, str(msg))
+        advisor = self._spawn(advisor_runtime(me.runtime), props, str(msg))
         return report(
             f"Advisor {label(advisor.id)} is considering the question. Its answer will arrive "
-            f"in your direct conversation #{topic}."
+            f"as a message from it."
         )
 
     def cancel(self, *, agent_id):
@@ -321,9 +322,6 @@ class Agents:
         return report(
             f"Engineer {label(target)} interrupted. It remains available for follow-up messages."
         )
-
-    def __repr__(self):
-        return "<agents>"
 
 
 class UserAgents(Agents):
@@ -392,11 +390,14 @@ class Skills:
 
 
 def exports(agent) -> dict:
-    """The tools for `agent`, by global name. Advisors start no agents."""
+    """The tools for `agent`, by global name. Advisors only message
+    agents; they start none."""
     preset = agent.props["preset"]
     tools = {"chat": Chat(agent.id), "skills": Skills(agent.id)}
     if preset == "engineer":
         tools["agents"] = UserAgents(agent.id)
     elif preset == "child":
         tools["agents"] = Agents(agent.id)
+    else:
+        tools["agents"] = Messages(agent.id)
     return tools

@@ -10,8 +10,8 @@ def header(topic, name):
     return f"[#{topic} rho › {name}]"
 
 
-def direct(topic, other):
-    return f"[#{topic} direct with {other}]"
+def from_agent(sender, text):
+    return f"[message from {sender}]\n{text}"
 
 
 class Delivery(WorksetCase):
@@ -46,18 +46,18 @@ class Delivery(WorksetCase):
         self.assertEqual(self.inputs(self.a), [
             ("first", "person", 3),
             ("second", "person", 4),
-            (f"{direct(5, 'eng-' + self.b)}\nMessage Type: MESSAGE\nSender: eng-{self.b}\nPayload:\nfrom the child", "agent", 7),
-            (f"{direct(8, 'adv-' + self.adv)}\nMessage Type: MESSAGE\nSender: adv-{self.adv}\nPayload:\nadvice", "agent", 10),
+            (from_agent(f"eng-{self.b}", "from the child"), "agent", 7),
+            (from_agent(f"adv-{self.adv}", "advice"), "agent", 10),
             (f"{header(2, 'Fix it')} Message from the user:\nthird", "person", 11),
         ])
         wait_for(lambda: len(self.inputs(self.b)) == 2, "delivery to b")
         self.assertEqual(self.inputs(self.b), [
-            (f"{direct(5, 'eng-' + self.a)}\nMessage Type: MESSAGE\nSender: eng-{self.a}\nPayload:\ndo x", "agent", 6),
-            (f"{header(2, 'Fix it')}\nMessage Type: MESSAGE\nSender: eng-{self.a}\nPayload:\nb, look", "agent", 12),
+            (from_agent(f"eng-{self.a}", "do x"), "agent", 6),
+            (f"{header(2, 'Fix it')} Message from eng-{self.a}:\nb, look", "agent", 12),
         ])
         wait_for(lambda: self.inputs(self.adv), "delivery to the advisor")
         self.assertEqual(self.inputs(self.adv), [
-            (f"{direct(8, 'eng-' + self.a)}\nMessage Type: MESSAGE\nSender: eng-{self.a}\nPayload:\nq", "agent", 9),
+            (from_agent(f"eng-{self.a}", "q"), "agent", 9),
         ])
 
     def test_a_mention_does_not_join(self):
@@ -80,7 +80,7 @@ class Delivery(WorksetCase):
         wait_for(lambda: len(self.inputs(self.adv)) == 1, "delivery to the advisor")
         id = fake_rho.post(self.b, self.child, "adv, see this", mentions=[(self.adv, "fyi")])
         wait_for(lambda: len(self.inputs(self.adv)) == 2, "the mention")
-        self.assertEqual(self.inputs(self.adv)[-1][0].splitlines()[0], f"[#{self.child} direct of eng-{self.a} and eng-{self.b}]")
+        self.assertEqual(self.inputs(self.adv)[-1][0].splitlines()[0], f"[message from eng-{self.b}]")
 
     def test_later_agents(self):
         output, error = rho._eval(
@@ -91,7 +91,7 @@ class Delivery(WorksetCase):
         self.assertIsNone(error)
         new, topic, message = output.split()
         wait_for(lambda: self.inputs(new), "delivery to a new agent")
-        self.assertEqual(self.inputs(new), [(f"{direct(int(topic), 'eng-' + self.a)}\nMessage Type: MESSAGE\nSender: eng-{self.a}\nPayload:\ngo", "agent", int(message))])
+        self.assertEqual(self.inputs(new), [(from_agent(f"eng-{self.a}", "go"), "agent", int(message))])
 
     def test_an_agent_started_from_a_message_joins_its_topic_and_starts_from_it(self):
         topic, origin = fake_rho.start_user_topic("ops", "Deploy", "deploy it")

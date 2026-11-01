@@ -46,7 +46,7 @@ def label(agent_id: str) -> str:
 
 def started_by_note(by: str) -> str:
     return (
-        f"Engineer {by} started you for the user; ask it with chat.direct({by!r}, text) if you "
+        f"Engineer {by} started you for the user; ask it with agents.message(agent_id={by!r}, message=text) if you "
         "need more context."
     )
 
@@ -59,8 +59,8 @@ def team(agent_id: str, props: dict) -> str:
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
             f"agent id is {me}; your parent agent is {label(parent)}.\n\nMessages from your "
-            "parent define your task. Report to your parent in your direct conversation with "
-            f"chat.direct({label(parent)!r}, text)."
+            "parent define your task. Report to your parent with "
+            f"agents.message(agent_id={label(parent)!r}, message=text)."
         )
     else:
         identity = (
@@ -71,8 +71,8 @@ def team(agent_id: str, props: dict) -> str:
     if preset == "advisor":
         return (
             f"{identity}\n\n"
-            "Complete your independent analysis and post it to your parent with "
-            f"chat.direct({label(parent)!r}, text). Ask a known agent for context the same way, "
+            "Complete your independent analysis and send it to your parent with "
+            f"agents.message(agent_id={label(parent)!r}, message=text). Ask a known agent for context the same way, "
             "and end your turn when blocked on a reply.\n"
         )
     started_by = props.get("started_by")
@@ -91,16 +91,13 @@ def team(agent_id: str, props: dict) -> str:
 
 {ownership}
 
-You will receive agent messages in this format, after the conversation they are in:
+Another agent's message to you arrives in this format:
 ```
-[#<topic id> <stream> › <topic name>]   or   [#<topic id> direct with <agent id>]
-Message Type: MESSAGE
-Sender: <agent id>
-Payload:
-<payload text>
+[message from <agent id>]
+<text>
 ```
 
-Answer in that conversation with `chat.post(topic, text)`.
+Answer it with `agents.message(agent_id="<agent id>", message=text)`. An agent's post in a topic arrives like any chat message, after its topic.
 
 """
 

@@ -12,6 +12,7 @@ class State:
     def __init__(self):
         self.kind = "isolated"
         self.agents = {}
+        self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
         self.streams = {}  # name -> id
         self.directs = {}  # (a, b), a < b -> topic
@@ -154,7 +155,9 @@ def start_topic(sender, stream, name, text, *, mentions=None):
 
 def direct(sender, other):
     with STATE.lock:
-        assert sender in STATE.agents and other in STATE.agents and sender != other
+        assert sender in STATE.agents and sender != other
+        if other not in STATE.agents and other not in STATE.elsewhere:
+            raise ValueError("agent was deleted or does not exist")
         pair = tuple(sorted((sender, other)))
         if pair not in STATE.directs:
             topic = _event()

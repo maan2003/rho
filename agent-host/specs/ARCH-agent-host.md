@@ -73,8 +73,11 @@ replaces the whole delivery, not one rule of it. Who receives a message is
 fixed when it is posted, so a later member reads older messages, not receives
 them. Two agents talk in their direct conversation, which is a conversation
 outside every stream. Its members are its two agents, only they post in it,
-and no one joins it. The GUI lists direct conversations apart from streams and
-makes no cards for them.
+and no one joins it. The two may be in different worksets of the host. The
+default tools name it `agents.message`, not chat: an agent reads a message in
+it as a message from the other agent, with no conversation id. Chat is the
+user's. The GUI lists direct conversations apart from streams and makes no
+cards for them.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move
@@ -95,7 +98,7 @@ existing message, and Python records that message as the agent's `origin` prop
 (`chat:<message id>`), not as a host field, so other origins such as Slack can
 follow. The default policy then joins the agent to the message's topic and
 hands it that message first. An Engineer's child or Advisor is briefed in their
-direct conversation with it, and reports there.
+direct conversation with it, and reports there with `agents.message`.
 
 Agents post with `rho.chat`, always naming the conversation. Policy Python
 reads each agent's inbox and hands each message to the agent as an `Input`
