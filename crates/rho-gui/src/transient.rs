@@ -45,6 +45,7 @@ pub(crate) enum MenuId {
     VerdictSnooze,
     Input,
     Agent,
+    Chat,
     New,
     Status,
     /// `space s u`: which usage chart to look at.
@@ -275,6 +276,7 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             "agent…",
             MenuAction::Open(MenuId::Agent),
         )
+        .item("o", "chat…", MenuAction::Open(MenuId::Chat))
         .item(
             "b",
             "switch buffer…",
@@ -575,18 +577,27 @@ pub(crate) fn status_menu() -> Menu {
         )
 }
 
-/// `space a`: driving the current agent.
-pub(crate) fn agent_menu() -> Menu {
-    Menu::new("agent")
-        .item("a", "activity", MenuAction::Command(Command::AgentActivity))
-        .item("m", "new topic…", MenuAction::Command(Command::NewTopic))
+/// `space o`: the conversations, apart from any one agent.
+pub(crate) fn chat_menu() -> Menu {
+    Menu::new("chat")
         .item(
             "s",
             "start agent from message…",
             MenuAction::Command(Command::StartFromMessage),
         )
-        .item("n", "mention…", MenuAction::Command(Command::Mention))
+        .item(
+            "m",
+            "mention in reply…",
+            MenuAction::Command(Command::Mention),
+        )
         .item("d", "directs…", MenuAction::Command(Command::Directs))
+}
+
+/// `space a`: driving the current agent.
+pub(crate) fn agent_menu() -> Menu {
+    Menu::new("agent")
+        .item("a", "activity", MenuAction::Command(Command::AgentActivity))
+        .item("m", "new topic…", MenuAction::Command(Command::NewTopic))
         .item(
             "c",
             "cancel turn",

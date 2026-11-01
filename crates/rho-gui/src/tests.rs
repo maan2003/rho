@@ -1390,6 +1390,159 @@ fn a_new_topic_opens_once_its_host_takes_it(cx: &mut TestAppContext) {
     );
 }
 
+/// A reply mentions the agents on its host it names as `@label`, each
+/// once; a word that names no agent there, or one on another host, is
+/// just a word.
+#[gpui::test]
+fn a_reply_mentions_the_agents_it_names(cx: &mut TestAppContext) {
+    use rho_agents_client::protocol::worksets::Request;
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let (member, named, elsewhere) = (agent(771), agent(772), agent(773));
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
+    let topic = workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(member), ui_head(named)], 774),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId(1),
+                ready_with(vec![ui_head(elsewhere)], 775),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(member, UnixMs(5)),
+                window,
+                cx,
+            );
+            let topic = workspace.test_topic(member);
+            workspace.open_topic(topic, window, cx);
+            topic
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let labels = workspace
+        .update(cx, |workspace, _, _| {
+            [named, elsewhere].map(|agent| workspace.registry.agent_id_label(agent))
+        })
+        .unwrap();
+    let editor = active_editor(&workspace, cx);
+    let text = format!(
+        "@{0}, look; @{1} too, and @{0} again, @nobody",
+        labels[0], labels[1]
+    );
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert(&text, window, cx));
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "one reply");
+    let (call, _) = calls.pop().unwrap();
+    let Request::Post(post) = call else {
+        panic!("expected a post: {call:?}");
+    };
+    assert_eq!(post.topic, topic.topic);
+    assert_eq!(post.mentions, vec![named], "the member needs no mention");
+}
+
+/// The agents' direct conversations are a list of their own: no card
+/// deals one, and choosing one opens it, titled by its two agents.
+#[gpui::test]
+fn a_direct_opens_from_the_list_and_deals_no_card(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let (one, other) = (agent(781), agent(782));
+    let direct = rho_agent_types::TopicId(rho_agent_types::ChatSeq(500));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(one), ui_head(other)], 783),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story::chat(vec![
+                    rho_agent_types::ChatRecord {
+                        seq: direct.0,
+                        at: UnixMs(5),
+                        event: rho_agent_types::ChatEvent::DirectStarted {
+                            members: [one, other],
+                        },
+                    },
+                    rho_agent_types::ChatRecord {
+                        seq: rho_agent_types::ChatSeq(501),
+                        at: UnixMs(6),
+                        event: rho_agent_types::ChatEvent::Posted {
+                            topic: direct,
+                            from: rho_agent_types::Address::Agent(one),
+                            mentions: vec![rho_agent_types::Mention {
+                                to: rho_agent_types::Address::User,
+                                kind: rho_agent_types::MentionKind::Ask,
+                            }],
+                            content: vec![rho_agent_types::ContentPart::Text {
+                                text: "brief".into(),
+                            }],
+                        },
+                    },
+                ]),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(
+                !workspace.hand(cx).cards.iter().any(|card| matches!(
+                    card.node,
+                    rho_dealer::NodeId::Topic(topic) if topic.topic == direct
+                )),
+                "a direct is no card"
+            );
+            workspace.prompt_directs(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Topic(rho_agents_client::HostTopic {
+                    machine_seed: 0,
+                    topic: direct,
+                }),
+                "enter takes the first row"
+            );
+            let title = workspace.current_surface_name_for_test();
+            let names = [one, other].map(|agent| workspace.registry.agent_display_label(agent));
+            assert_eq!(title, format!("{} ↔ {}", names[0], names[1]));
+        })
+        .unwrap();
+}
+
 /// Replies written while their host is down wait in their topic as
 /// unsent and go one by one, in order, when the host is back. A send the
 /// host fails keeps them, and the next try is the same message under the
@@ -5317,7 +5470,7 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     );
 }
 
-/// `space a s` on a message starts an agent from it: the draft page asks
+/// `space o s` on a message starts an agent from it: the draft page asks
 /// only for the agent's rows, and the creation names the message as its
 /// origin. A refused creation keeps its cause on the draft; a made agent
 /// is followed into the topic it started from.
