@@ -105,6 +105,7 @@ impl AgentClient {
             services.ready.send_replace(true);
         }
         let ready = services.ready.subscribe();
+        let pid = process.pid;
         tokio::spawn(async move {
             let mut service = tokio::spawn({
                 let services = services.clone();
@@ -125,6 +126,10 @@ impl AgentClient {
             };
             is_stopping.store(true, Ordering::Release);
             if done && !services.stopped.load(Ordering::Acquire) {
+                eprintln!(
+                    "rho-agent: {agent:?}: stopping workset worker {}: {error}",
+                    process.pid
+                );
                 process.stop();
                 let _ = process.closed.clone().wait_for(|closed| *closed).await;
             }
@@ -144,6 +149,10 @@ impl AgentClient {
                     Ok(Ok(()))
                 ) {
                     // A stuck interpreter is a workset-wide failure domain.
+                    eprintln!(
+                        "rho-agent: {agent:?}: stop failed to drain within 5s: stopping workset worker {}",
+                        process.pid
+                    );
                     process.stop();
                     let _ = process.closed.clone().wait_for(|closed| *closed).await;
                     if !joined {
@@ -165,6 +174,7 @@ impl AgentClient {
             _ = tokio::time::sleep(Duration::from_secs(30)) => Err(anyhow::anyhow!("agent startup timed out")),
         };
         if let Err(error) = result {
+            eprintln!("rho-agent: {agent:?}: startup in workset worker {pid} failed: {error:#}");
             handle.shutdown().await;
             return Err(error);
         }
