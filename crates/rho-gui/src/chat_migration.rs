@@ -11,7 +11,11 @@
 //! positions count in logs that are gone, so the time each was said is what
 //! carries over: a mention from before it was handled.
 
+use rho_agent_hosts::HostId;
+use rho_agent_types::AgentId;
 use rho_agents_client::ChatMap;
+use rho_agents_client::from_main::MIGRATED_STREAM;
+use rho_agents_client::protocol::worksets::ChangeTopic;
 use rho_dealer::NodeId;
 use rho_dealer::facts::{Entry, Fact, Seen};
 use rho_dealer::marks::Marks;
@@ -81,6 +85,48 @@ pub(crate) fn settle_migrated(chat: &ChatMap, marks: &Marks) -> Vec<Fact> {
         });
     }
     facts
+}
+
+/// Each migrated topic named as the user named its agent in `main`. The
+/// host named it as the host knows the agent (`host_name`); a topic whose
+/// name is anything else was renamed since, and is left alone, which also
+/// makes this once per topic.
+pub(crate) fn names_from_desk(
+    chat: &ChatMap,
+    marks: &Marks,
+    host_name: impl Fn(AgentId) -> Option<String>,
+) -> Vec<(HostId, ChangeTopic)> {
+    let mut changes = Vec::new();
+    for (topic, host, held) in chat.topics() {
+        if chat.stream_name(topic) != Some(MIGRATED_STREAM) {
+            continue;
+        }
+        let Some(&agent) = held.members_in_order().first() else {
+            continue;
+        };
+        let Some(name) = marks
+            .get(&NodeId::Agent(agent))
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if name == held.name || host_name(agent).as_deref().map(str::trim) != Some(held.name.trim()) {
+            continue;
+        }
+        changes.push((
+            host,
+            ChangeTopic {
+                topic: topic.topic,
+                stream: held.stream,
+                name: name.to_owned(),
+                resolved: held.resolved,
+            },
+        ));
+    }
+    changes
 }
 
 #[cfg(test)]
@@ -292,5 +338,34 @@ mod tests {
         );
         marks.apply(facts.into_iter().map(|fact| said(7 * HOUR, fact)));
         assert_eq!(settle_migrated(&chat, &marks), Vec::new());
+    }
+
+    /// A topic takes the agent's name from the desk only while it still has
+    /// the name the host gave it.
+    #[test]
+    fn a_topic_takes_the_name_the_user_gave_its_agent() {
+        let (named, renamed, unnamed) = (agent(1), agent(2), agent(3));
+        let chat = migrated(&[named, renamed, unnamed]);
+        let mut marks = Marks::default();
+        for agent in [named, renamed] {
+            marks.apply([said(
+                HOUR,
+                Fact::Named {
+                    node: NodeId::Agent(agent),
+                    name: Some(" python-core ".into()),
+                },
+            )]);
+        }
+        // The host still calls `renamed` "old", but the user renamed its
+        // topic since: here, the host's name for it moved on.
+        let host_name = |agent: AgentId| Some(if agent == renamed { "new" } else { "old" }.to_owned());
+        let changes = names_from_desk(&chat, &marks, host_name);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(_, change)| (change.topic, change.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(topic(&chat, named).topic, "python-core")]
+        );
     }
 }

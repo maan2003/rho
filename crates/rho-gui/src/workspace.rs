@@ -731,6 +731,7 @@ impl Workspace {
     }
 
     pub(crate) fn settle_migrated_topics(&mut self, cx: &mut Context<Self>) {
+        self.name_migrated_topics(cx);
         let facts = crate::chat_migration::settle_migrated(&self.chat, &self.attention.marks);
         if facts.is_empty() {
             return;
@@ -740,6 +741,28 @@ impl Workspace {
             "settled topics the user had handled before chat"
         );
         self.write_marks(facts.into_iter().map(Into::into).collect(), cx);
+    }
+
+    /// Names each migrated topic as the user named its agent. A host that
+    /// is offline is asked the next time this runs; a change to the name a
+    /// topic already has logs nothing.
+    fn name_migrated_topics(&mut self, cx: &mut Context<Self>) {
+        let registry = &self.registry;
+        let changes = crate::chat_migration::names_from_desk(&self.chat, &self.attention.marks, |agent| {
+            registry.mirrored(agent).and_then(|agent| agent.title()).map(str::to_owned)
+        });
+        for (host, change) in changes {
+            let Some(agents) = self.agents(host).filter(|_| self.hosts.is_online(host)) else {
+                continue;
+            };
+            let reply = agents.call(change);
+            cx.spawn(async move |_, _| {
+                if let Err(error) = reply.await {
+                    tracing::warn!("name a migrated topic: {error:#}");
+                }
+            })
+            .detach();
+        }
     }
 
     /// What the model holds for a host is now all there is of it: the disk
