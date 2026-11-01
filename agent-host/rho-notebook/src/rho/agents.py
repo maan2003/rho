@@ -72,7 +72,7 @@ class Agent:
 
 
 def create(runtime: dict, props: dict) -> Agent:
-    """Create an agent and start its loop. `hooks.on_agent` runs for it on
+    """Create an agent and start its loop. `hooks.deliver` starts for it on
     the workset loop."""
     agent = Agent(_rho.create_agent({"runtime": runtime, "props": props}))
     from . import _boot

@@ -20,8 +20,7 @@ def install() -> None:
     hooks.on_notebook = on_notebook
     hooks.on_compaction = on_compaction
     hooks.on_turn_end = on_turn_end
-    hooks.on_agent = on_agent
-    hooks.joins = joins
+    hooks.deliver = deliver
     workset.namespace["rho"] = sys.modules["rho"]
     workset.namespace["new_agent"] = new_agent
     workset.namespace["join"] = chat.join
@@ -48,14 +47,12 @@ def on_turn_end(agent, outcome) -> None:
         chat.post(agent.id, chat.direct(agent.id, parent), f"Agent hit an error and stopped: {outcome['error']}")
 
 
-async def on_agent(agent) -> None:
-    await deliver(agent)
-
-
 async def deliver(agent) -> None:
     """Hand the agent what it receives, in order, forever. It resumes after
     the newest message the agent's log says it was handed. An agent started
-    from a message first joins its topic and is handed that message."""
+    from a message first joins its topic and is handed that message. A
+    policy with other rules replaces this whole function, and may reuse
+    `hand` and `render`."""
     while True:
         try:
             after = _rho.delivered(agent.id)
@@ -73,18 +70,13 @@ async def deliver(agent) -> None:
             await asyncio.sleep(RETRY_SECONDS)
 
 
-def joins(agent, record: dict) -> bool:
-    """An agent follows the topic it was started from, and a topic where
-    the user mentions it. A mention by an agent only reaches it."""
-    if record["id"] == chat.origin_message(agent.props):
-        return True
-    return record["sender"] == chat.USER and any(address == agent.id for address, _ in record["mentions"])
-
-
 async def hand(agent, record: dict) -> None:
-    """Hand one message to the agent, after it joins the message's topic if
-    `hooks.joins` says so."""
-    if chat.topic(record["topic"])["stream"] is not None and hooks.joins(agent, record):
+    """Hand one message to the agent. It first joins the message's topic if
+    the message is its origin, or if the user wrote it and mentions it. A
+    mention by an agent only reaches it."""
+    origin = record["id"] == chat.origin_message(agent.props)
+    by_user = record["sender"] == chat.USER and any(address == agent.id for address, _ in record["mentions"])
+    if chat.topic(record["topic"])["stream"] is not None and (origin or by_user):
         chat.join(record["topic"], agent.id)
     wake = "person" if record["sender"] == chat.USER else "agent"
     await asyncio.to_thread(agent.input, render(record, agent.id), wake=wake, message=record["id"])

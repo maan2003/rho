@@ -67,7 +67,7 @@ class Delivery(WorksetCase):
         self.assertEqual(self.inputs(self.a)[-1], (f"{header(2, 'Fix it')} Message from the user:\nlater", "person", id))
         self.assertEqual(len(self.inputs(self.b)), 2)
 
-    def test_the_users_mention_joins_and_the_joins_hook_decides(self):
+    def test_the_users_mention_joins(self):
         wait_for(lambda: len(self.inputs(self.b)) == 2, "delivery to b")
         mention = fake_rho.post_user(self.mine, "b, take this", [self.b])
         wait_for(lambda: len(self.inputs(self.b)) == 3, "the mention")
@@ -75,15 +75,6 @@ class Delivery(WorksetCase):
         later = fake_rho.post_user(self.mine, "and this")
         wait_for(lambda: len(self.inputs(self.b)) == 4, "a later message")
         self.assertEqual([m for *_, m in self.inputs(self.b)[2:]], [mention, later])
-        # A policy that never joins: a user's mention only reaches.
-        from rho import hooks
-
-        _, error = rho._eval("rho.hooks.joins = lambda agent, record: False")
-        self.assertIsNone(error)
-        topic, first = fake_rho.start_user_topic("ops", "Other", "adv, look", [self.adv])
-        wait_for(lambda: len(self.inputs(self.adv)) == 2, "the mention")
-        self.assertEqual(self.state.topics[topic]["agents"], [])
-        self.assertIsNot(hooks.joins, rho.default.joins)
 
     def test_a_direct_reads_from_outside_as_both_its_agents(self):
         wait_for(lambda: len(self.inputs(self.adv)) == 1, "delivery to the advisor")
@@ -143,3 +134,32 @@ class Delivery(WorksetCase):
             wait_for(lambda: len(self.inputs(self.a)) == 6, "retried message")
         self.assertEqual(failures, [retry])
         self.assertEqual(self.inputs(self.a)[-1], (retry, "person", id))
+
+
+class OwnDelivery(WorksetCase):
+    """init.py replaces the whole delivery: here, one that never joins."""
+
+    init = """
+import asyncio
+import rho
+from rho import chat, default
+
+async def deliver(agent):
+    after = 0
+    while True:
+        for record in await chat.inbox(agent.id, after):
+            text = default.render(record, agent.id)
+            await asyncio.to_thread(agent.input, text, wake="person", message=record["id"])
+            after = record["id"]
+
+rho.hooks.deliver = deliver
+"""
+
+    def seed(self, state):
+        self.a = add_agent(state, native(), preset="engineer", cwd="/")
+
+    def test_a_policy_delivers_its_own_way(self):
+        topic, first = fake_rho.start_user_topic("ops", "Other", "a, look", [self.a])
+        wait_for(lambda: self.state.inputs, "the mention")
+        self.assertEqual([(a, m) for a, _, _, m in self.state.inputs], [(self.a, first)])
+        self.assertEqual(self.state.topics[topic]["agents"], [])

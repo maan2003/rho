@@ -123,7 +123,7 @@ def on_notebook(agent, ns):
 hooks.on_notebook = on_notebook
 hooks.on_compaction = lambda agent: [f"Kept after compaction: {agent.id}"]
 hooks.on_turn_end = lambda agent, outcome: None
-hooks.on_agent = lambda agent: None
+hooks.deliver = lambda agent: None
 "#;
 
 /// The stores of the agents tests registered, by agent.

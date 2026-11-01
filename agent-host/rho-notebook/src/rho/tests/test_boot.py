@@ -134,14 +134,14 @@ class Init(unittest.TestCase):
 
     def test_a_failing_init_reports_and_keeps_the_default_policy(self):
         ws = self.start(
-            "import rho\nrho.hooks.instructions = lambda agent: \'custom\'\nrho.hooks.on_agent = None\nmotto = \'hi\'\nraise RuntimeError(\'bad init\')\n",
+            "import rho\nrho.hooks.instructions = lambda agent: \'custom\'\nrho.hooks.deliver = None\nmotto = \'hi\'\nraise RuntimeError(\'bad init\')\n",
             lambda state: add_agent(state, native(), preset="engineer", cwd="/"),
         )
         [error] = ws.ready
         self.assertIn("init.py", error)
         self.assertIn("RuntimeError: bad init", error)
         self.assertIs(hooks.instructions, prompt.instructions)
-        self.assertIs(hooks.on_agent, default.on_agent)
+        self.assertIs(hooks.deliver, default.deliver)
         self.assertNotIn("motto", workset.namespace)
         self.assertIn("new_agent", workset.namespace)
         # The default delivery runs for the existing agent.

@@ -25,7 +25,7 @@ from . import agents, default, hooks, workset
 
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: int | None = None
-#: Agents `hooks.on_agent` ran for, so each gets it once.
+#: Agents `hooks.deliver` started for, so each gets it once.
 _announced: set[str] = set()
 #: Where the running `_eval`'s output goes; unset elsewhere.
 _output: contextvars.ContextVar = contextvars.ContextVar("rho_eval_output", default=None)
@@ -110,7 +110,7 @@ def _on_notebook(agent_id: str, ns: dict) -> None:
 
 
 def announce_soon(agent_id: str) -> None:
-    """Run `hooks.on_agent` for a new agent on the workset loop, from any
+    """Start `hooks.deliver` for a new agent on the workset loop, from any
     thread."""
     _loop.call_soon_threadsafe(_announce, agent_id)
 
@@ -120,7 +120,7 @@ def _announce(agent_id: str) -> None:
         return
     _announced.add(agent_id)
     try:
-        result = hooks.on_agent(agents.Agent(agent_id))
+        result = hooks.deliver(agents.Agent(agent_id))
         if inspect.isawaitable(result):
             spawn(result)
     except Exception:
