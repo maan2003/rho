@@ -8,11 +8,12 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use redb::{
     AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle, TypeName,
 };
@@ -28,14 +29,16 @@ pub struct Sen<T>(pub T);
 
 pub enum SenValue<'a, T> {
     Owned(T),
-    Borrowed(&'a dyn senax_encoder::Encoder),
+    /// A value to write, encoded once: redb asks for a value's bytes more
+    /// than once per insert, and a large row would be encoded each time.
+    Encoded(Bytes, PhantomData<&'a ()>),
 }
 
 impl<T: Debug> Debug for SenValue<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(value) => f.debug_tuple("Owned").field(value).finish(),
-            Self::Borrowed(_) => f.write_str("Borrowed(..)"),
+            Self::Encoded(..) => f.write_str("Encoded(..)"),
         }
     }
 }
@@ -45,14 +48,18 @@ impl<'a, T> SenValue<'a, T> {
         Self::Owned(value)
     }
 
+    /// A value to write, encoded now.
     pub fn borrowed(value: &'a impl senax_encoder::Encoder) -> Self {
-        Self::Borrowed(value)
+        Self::Encoded(
+            senax_encoder::encode(value).expect("senax encode rho-db value"),
+            PhantomData,
+        )
     }
 
     fn owned_ref(&self) -> &T {
         match self {
             Self::Owned(value) => value,
-            Self::Borrowed(_) => panic!("borrowed sen value has no owned reference"),
+            Self::Encoded(..) => panic!("an encoded sen value has no owned reference"),
         }
     }
 }
@@ -67,7 +74,7 @@ impl<T: Clone> SenValue<'_, T> {
     pub fn into_owned(self) -> T {
         match self {
             Self::Owned(value) => value,
-            Self::Borrowed(_) => panic!("borrowed sen value cannot be converted to owned"),
+            Self::Encoded(..) => panic!("an encoded sen value cannot be converted to owned"),
         }
     }
 }
@@ -163,7 +170,7 @@ where
         Self: 'a;
 
     type AsBytes<'a>
-        = BytesMut
+        = Bytes
     where
         Self: 'a;
 
@@ -183,13 +190,12 @@ where
     where
         Self: 'b,
     {
-        let mut bytes = BytesMut::new();
         match value {
-            SenValue::Owned(value) => value.encode(&mut bytes),
-            SenValue::Borrowed(value) => value.encode(&mut bytes),
+            SenValue::Owned(value) => {
+                senax_encoder::encode(value).expect("senax encode rho-db value")
+            }
+            SenValue::Encoded(bytes, _) => bytes.clone(),
         }
-        .expect("senax encode rho-db value");
-        bytes
     }
 
     /// `T`'s name without module paths, so a type can move between
@@ -344,6 +350,17 @@ impl RhoDb {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reads the whole file once, in order, so that the OS caches it. A
+    /// pass over every row, as a migration makes, otherwise reads a cold
+    /// file page by page out of order: 84 s rather than 2 s for 9 GB of rows.
+    pub fn read_ahead(&self) -> std::io::Result<()> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(&*self.path)?;
+        let mut buffer = vec![0; 16 << 20];
+        while file.read(&mut buffer)? != 0 {}
+        Ok(())
     }
 
     /// Leaves the file in a state that reopens at once, and commits nothing

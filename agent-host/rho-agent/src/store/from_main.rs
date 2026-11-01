@@ -30,7 +30,7 @@ use super::chat::{ChatWrite as _, NewMessage};
 use crate::entry::{Block, Notice, RequestNotice, ResponseUsage, Wake};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{Carry, PromptCacheKey};
-use crate::log::{ClaudeOutputBatch, ClaudeRewind, TranscriptLine, WakeFacts};
+use crate::log::{ClaudeRewind, TranscriptLine, WakeEvent};
 use crate::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 
 pub(crate) const MAIN_FORMAT: &str = "6967c9bb";
@@ -210,6 +210,10 @@ enum Entry {
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 enum AgentEvent<'a> {
+    /// The user erased the agent: its only row, at position zero.
+    Deleted {
+        at: UnixMs,
+    },
     Retired {
         at: UnixMs,
     },
@@ -275,9 +279,77 @@ enum AgentEvent<'a> {
         id: Uuid,
         at: UnixMs,
     },
+    /// The model loaded a skill. `main` showed every loaded skill again
+    /// after each compaction.
+    SkillLoaded {
+        dir: SkillDir,
+        at: UnixMs,
+    },
     #[senax(rename = "TypedEntry")]
     Entry(Entry),
 }
+
+/// Notebook output handed to Claude, as `main` wrote it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+struct ClaudeOutputBatch {
+    id: Uuid,
+    outputs: Vec<(
+        rho_agent_types::transcript::ExecId,
+        rho_agent_types::transcript::ToolOutput,
+    )>,
+    wake: WakeFacts,
+    at: UnixMs,
+}
+
+/// Why a Claude request went out, as `main` wrote it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+struct WakeFacts {
+    trigger: WakeTrigger,
+    events: Vec<WakeEvent>,
+    foreground_running: u64,
+    background_running: u64,
+    tools_suppressed: bool,
+    checkin_at: Option<UnixMs>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
+enum WakeTrigger {
+    Delivery,
+    Asked,
+    Retry,
+    User,
+    Mail,
+    Notify,
+    Finished,
+    Checkin,
+}
+
+impl WakeFacts {
+    fn convert(&self) -> crate::log::WakeFacts {
+        use crate::log::WakeTrigger as Now;
+        crate::log::WakeFacts {
+            trigger: match self.trigger {
+                WakeTrigger::Delivery => Now::Delivery,
+                WakeTrigger::Asked => Now::Asked,
+                WakeTrigger::Retry => Now::Retry,
+                WakeTrigger::User => Now::User,
+                WakeTrigger::Mail => Now::AgentMessage,
+                WakeTrigger::Notify => Now::Notify,
+                WakeTrigger::Finished => Now::Finished,
+                WakeTrigger::Checkin => Now::Checkin,
+            },
+            events: self.events.clone(),
+            foreground_running: self.foreground_running,
+            background_running: self.background_running,
+            tools_suppressed: self.tools_suppressed,
+            checkin_at: self.checkin_at,
+        }
+    }
+}
+
+/// A loaded skill's directory, absolute.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+struct SkillDir(Utf8PathBuf);
 
 // -- the conversion -----------------------------------------------------------
 
@@ -288,6 +360,8 @@ struct Survey {
     title: Option<String>,
     /// A row of it did not decode: its rows are set aside, not converted.
     undecodable: bool,
+    /// The user erased it: nothing of it is converted or kept.
+    deleted: bool,
 }
 
 struct Created {
@@ -301,7 +375,8 @@ struct Created {
 /// Rewrites the `main` tables as worksets and chat, then drops them.
 /// The agents of a `main` workset share one workset, each agent's
 /// rows in order, the agents in creation order. Agents a row of which no
-/// decoder knows keep their rows as they were, in [`SET_ASIDE`].
+/// decoder knows keep their rows as they were, in [`SET_ASIDE`]. An agent
+/// the user erased is left out.
 pub(crate) fn migrate(write: &mut WriteTxn) {
     write.init_store_tables();
     let (surveys, messages) = survey(write);
@@ -310,10 +385,12 @@ pub(crate) fn migrate(write: &mut WriteTxn) {
     let mut agents = Vec::new();
     for (id, survey) in surveys {
         match survey {
+            Survey { deleted: true, .. } => {}
             Survey {
                 created: Some(created),
                 undecodable: false,
                 title,
+                deleted: false,
             } => agents.push((id, created, title)),
             _ => {
                 eprintln!(
@@ -362,62 +439,103 @@ fn set_aside(write: &mut WriteTxn, agent: AgentId) {
 fn survey(write: &mut WriteTxn) -> (BTreeMap<AgentId, Survey>, HashMap<u64, Message>) {
     let mut surveys: BTreeMap<AgentId, Survey> = BTreeMap::new();
     let mut messages = HashMap::new();
-    for (key, value) in write.open_table(AGENT_LOG).iter() {
-        let (agent, _) = key.value();
-        let survey = surveys.entry(agent).or_insert(Survey {
-            created: None,
-            title: None,
-            undecodable: false,
-        });
-        let event = match decode(value.value()) {
-            Ok(event) => event,
-            Err(_) => {
+    let mut batch: Vec<(AgentId, Vec<u8>)> = Vec::new();
+    let mut batch_bytes = 0;
+    let table = write.open_table(AGENT_LOG);
+    let mut rows = table.iter().peekable();
+    while rows.peek().is_some() {
+        // A batch at a time, decoded on every core: decoding is most of
+        // the pass.
+        for (key, value) in rows.by_ref() {
+            let bytes = value.value().to_vec();
+            batch_bytes += bytes.len();
+            batch.push((key.value().0, bytes));
+            if batch_bytes >= BATCH_BYTES {
+                break;
+            }
+        }
+        let events = decode_each(batch.iter().map(|(_, bytes)| bytes.as_slice()));
+        for ((agent, _), event) in batch.drain(..).zip(events) {
+            let survey = surveys.entry(agent).or_insert(Survey {
+                created: None,
+                title: None,
+                undecodable: false,
+                deleted: false,
+            });
+            let Ok(event) = event else {
                 survey.undecodable = true;
                 continue;
-            }
-        };
-        match &event {
-            AgentEvent::Created {
-                role,
-                binding,
-                runtime,
-                place,
-                spawned_by,
-                spawn_name,
-                created_at,
-                parent,
-            } => {
-                survey.created = Some(created(
-                    *role,
-                    *binding,
+            };
+            match &event {
+                AgentEvent::Created {
+                    role,
+                    binding,
                     runtime,
                     place,
-                    *spawned_by,
+                    spawned_by,
                     spawn_name,
-                    *created_at,
-                    *parent,
-                ))
-            }
-            AgentEvent::Titled {
-                title: Some(title), ..
-            } => survey.title = Some(title.clone()),
-            AgentEvent::Entry(entry) => {
-                if let Some((id, message)) = message(agent, entry) {
-                    messages
-                        .entry(id)
-                        .and_modify(|known: &mut Message| {
-                            // The sender's row knows the kind; keep the
-                            // earlier time.
-                            known.kind = known.kind.or(message.kind);
-                            known.at = known.at.min(message.at);
-                        })
-                        .or_insert(message);
+                    created_at,
+                    parent,
+                } => {
+                    survey.created = Some(created(
+                        *role,
+                        *binding,
+                        runtime,
+                        place,
+                        *spawned_by,
+                        spawn_name,
+                        *created_at,
+                        *parent,
+                    ))
                 }
+                AgentEvent::Titled {
+                    title: Some(title), ..
+                } => survey.title = Some(title.clone()),
+                AgentEvent::Deleted { .. } => survey.deleted = true,
+                AgentEvent::Entry(entry) => {
+                    if let Some((id, message)) = message(agent, entry) {
+                        messages
+                            .entry(id)
+                            .and_modify(|known: &mut Message| {
+                                // The sender's row knows the kind; keep the
+                                // earlier time.
+                                known.kind = known.kind.or(message.kind);
+                                known.at = known.at.min(message.at);
+                            })
+                            .or_insert(message);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+        batch_bytes = 0;
     }
     (surveys, messages)
+}
+
+/// How much of the log one decoding batch holds.
+const BATCH_BYTES: usize = 256 << 20;
+
+/// Each row decoded, in order, split across every core.
+fn decode_each<'a>(
+    rows: impl Iterator<Item = &'a [u8]>,
+) -> Vec<senax_encoder::Result<AgentEvent<'static>>> {
+    let rows = rows.collect::<Vec<_>>();
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    // A thread for fewer rows costs more than it saves.
+    let chunk = rows.len().div_ceil(threads).max(64);
+    std::thread::scope(|scope| {
+        let parts = rows
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || part.iter().map(|bytes| decode(bytes)).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        parts
+            .into_iter()
+            .flat_map(|part| part.join().expect("a decoding thread panicked"))
+            .collect()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -715,8 +833,10 @@ fn convert_agent(
     let mut spec = created.spec.clone();
     let mut placed: BTreeMap<u64, Wpos> = BTreeMap::new();
     let mut at = created.at;
-    for (pos, bytes) in rows {
-        let event = decode(&bytes).expect("the survey decoded every row of this agent");
+    let events = decode_each(rows.iter().map(|(_, bytes)| bytes.as_slice()));
+    for ((pos, _), event) in rows.iter().zip(events) {
+        let pos = *pos;
+        let event = event.expect("the survey decoded every row of this agent");
         // A row without a time goes with the one before it.
         at = at_of(&event).unwrap_or(at);
         let Some(record) = convert(agent, created, &event, at, &mut spec, &placed, message_ids)
@@ -740,7 +860,9 @@ fn convert_agent(
 /// When the row was written; `None` for one that carries no time.
 fn at_of(event: &AgentEvent<'_>) -> Option<UnixMs> {
     Some(match event {
-        AgentEvent::Retired { at }
+        AgentEvent::Deleted { at }
+        | AgentEvent::Retired { at }
+        | AgentEvent::SkillLoaded { at, .. }
         | AgentEvent::TitleAttempted { at }
         | AgentEvent::Titled { at, .. }
         | AgentEvent::Rewound { at, .. }
@@ -797,6 +919,20 @@ fn changed_spec(event: &AgentEvent<'_>, current: &AgentSpec) -> Option<AgentSpec
             Runtime::Claude { session_id, .. } => *session_id = *new,
             Runtime::Native { .. } => return None,
         },
+        // rho keeps such skills in the `skills` prop (`rho/skills.py`): one
+        // directory per line, in the order loaded.
+        AgentEvent::SkillLoaded { dir, .. } => {
+            let dir = dir.0.as_str();
+            let skills = spec.props.get("skills").map_or("", String::as_str);
+            if !skills.split('\n').any(|known| known == dir) {
+                let skills = if skills.is_empty() {
+                    dir.to_owned()
+                } else {
+                    format!("{skills}\n{dir}")
+                };
+                spec.props.insert("skills".into(), skills);
+            }
+        }
         _ => return None,
     }
     (spec != *current).then_some(spec)
@@ -822,7 +958,9 @@ fn convert(
                 spec: created.spec.clone(),
             })
         }
-        AgentEvent::RoleChanged { .. } | AgentEvent::RuntimeRebound { .. } => {
+        AgentEvent::RoleChanged { .. }
+        | AgentEvent::RuntimeRebound { .. }
+        | AgentEvent::SkillLoaded { .. } => {
             if let AgentEvent::RuntimeRebound {
                 change: RuntimeChange::ClaudeRewindPending(pending),
                 ..
@@ -839,7 +977,9 @@ fn convert(
                 spec: spec.clone(),
             })
         }
-        AgentEvent::Retired { .. }
+        // The survey leaves an erased agent out.
+        AgentEvent::Deleted { .. }
+        | AgentEvent::Retired { .. }
         | AgentEvent::TitleAttempted { .. }
         | AgentEvent::Titled { .. }
         // Told ahead of a user message `main` no longer sends; nothing
@@ -867,7 +1007,7 @@ fn convert(
             row: ClaudeRow::Transcript {
                 uuid: *uuid,
                 line: line.clone(),
-                wake: wake.clone(),
+                wake: wake.as_ref().map(WakeFacts::convert),
             },
         }),
         AgentEvent::ExecObserved { id: exec, milestone, .. } => record(Event::ExecObserved {
@@ -882,7 +1022,12 @@ fn convert(
         AgentEvent::ClaudeOutput { batch } => record(Event::Claude {
             agent: id,
             row: ClaudeRow::Output {
-                batch: batch.clone(),
+                batch: crate::log::ClaudeOutputBatch {
+                    id: batch.id,
+                    outputs: batch.outputs.clone(),
+                    wake: batch.wake.convert(),
+                    at: batch.at,
+                },
             },
         }),
         AgentEvent::ClaudeOutputHandedOff { id: handed, .. } => record(Event::Claude {
@@ -1079,6 +1224,124 @@ mod tests {
             .iter()
             .map(|message| message.id.0.0)
             .collect()
+    }
+
+    /// A skill `main` showed again after each compaction is kept in the
+    /// `skills` prop, once, in load order. An agent the user erased leaves
+    /// nothing behind, and is not set aside. A Claude wake `main` called
+    /// `Mail` is one from an agent's message.
+    #[tokio::test]
+    async fn main_rows_rho_renamed_or_dropped_still_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("db"));
+        let (a, e, f) = (agent(1), agent(2), agent(3));
+        let skill = |dir: &str, at| AgentEvent::SkillLoaded {
+            dir: SkillDir(dir.into()),
+            at: UnixMs(at),
+        };
+        let mail = WakeFacts {
+            trigger: WakeTrigger::Mail,
+            events: Vec::new(),
+            foreground_running: 0,
+            background_running: 0,
+            tools_suppressed: false,
+            checkin_at: None,
+        };
+        {
+            let mut write = db.write().await;
+            write
+                .open_table(crate::db::FORMAT)
+                .insert((), MAIN_FORMAT.to_owned());
+            write_main(
+                &mut write,
+                a,
+                vec![
+                    created(
+                        SessionBinding::ResponsesSol(PROFILE),
+                        AgentRuntime::Rho {
+                            prompt_cache_key: PromptCacheKey::generate(),
+                        },
+                        "0a1b2c3d4e5f",
+                        AgentSpawnedBy::Direct,
+                        None,
+                        10,
+                    ),
+                    skill("/s/two", 11),
+                    skill("/s/one", 12),
+                    skill("/s/two", 13),
+                ],
+            );
+            write_main(&mut write, e, vec![AgentEvent::Deleted { at: UnixMs(5) }]);
+            write_main(
+                &mut write,
+                f,
+                vec![
+                    created(
+                        SessionBinding::ClaudeOpus {
+                            effort: ClaudeEffort::Xhigh,
+                        },
+                        AgentRuntime::Claude {
+                            session_id: Uuid::new_v4(),
+                        },
+                        "",
+                        AgentSpawnedBy::Direct,
+                        None,
+                        20,
+                    ),
+                    AgentEvent::Transcript {
+                        uuid: Uuid::new_v4(),
+                        line: TranscriptLine::User { text: "hi".into() },
+                        at: UnixMs(21),
+                        wake: Some(mail.clone()),
+                    },
+                    AgentEvent::ClaudeOutput {
+                        batch: ClaudeOutputBatch {
+                            id: Uuid::new_v4(),
+                            outputs: Vec::new(),
+                            wake: mail,
+                            at: UnixMs(22),
+                        },
+                    },
+                ],
+            );
+            write.commit();
+        }
+
+        crate::db::prepare(&db).await;
+
+        let read = db.read();
+        let head = read.agent(a).unwrap();
+        assert_eq!(
+            head.spec.props.get("skills").map(String::as_str),
+            Some("/s/two\n/s/one")
+        );
+        let changes = read
+            .agent_rows(a, Wpos::ZERO)
+            .into_iter()
+            .filter(|(_, record)| matches!(record.event, Event::AgentChanged { .. }))
+            .count();
+        assert_eq!(changes, 2, "a skill loaded again changes nothing");
+        assert!(read.agent(e).is_none());
+        let triggers = read
+            .agent_rows(f, Wpos::ZERO)
+            .into_iter()
+            .filter_map(|(_, record)| match record.event {
+                Event::Claude {
+                    row: ClaudeRow::Transcript { wake, .. },
+                    ..
+                } => wake.map(|wake| wake.trigger),
+                Event::Claude {
+                    row: ClaudeRow::Output { batch },
+                    ..
+                } => Some(batch.wake.trigger),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(triggers, vec![crate::log::WakeTrigger::AgentMessage; 2]);
+        assert!(
+            !read.has_table("main_agent_log_set_aside"),
+            "nothing is set aside"
+        );
     }
 
     /// A `main` store: an engineer and its child in one workset, a Claude

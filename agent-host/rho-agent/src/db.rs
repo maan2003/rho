@@ -399,6 +399,9 @@ pub async fn prepare(db: &rho_db::RhoDb) {
             write.open_table(RECOVERY).insert(hop, id);
         })
         .await;
+        if let Err(error) = db.read_ahead() {
+            eprintln!("rho: read ahead of the migration: {error}");
+        }
         let mut write = db.write().await;
         crate::store::from_main::migrate(&mut write);
         write
