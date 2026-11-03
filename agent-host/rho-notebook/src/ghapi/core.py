@@ -10,7 +10,7 @@ from dataclasses import replace
 import os
 import stat
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx2
 from fastcore.all import *
@@ -277,3 +277,23 @@ async def upload_attachment(self:GhApi, path, *, owner=UNSET, repo=UNSET):
                       query={"name": path.name, "content_type": content_type,
                              "repository_id": repository.id},
                       headers={"Content-Type": "application/octet-stream"}, data=body)
+
+
+@patch
+async def download_attachment(self:GhApi, url:str, path):
+    """Download one issue/PR attachment URL through Octo into `path` and return the path.
+
+    Accepts `https://github.com/user-attachments/files/<id>/<name>` and
+    `https://github.com/user-attachments/assets/<uuid>`, as they appear in issue,
+    PR and comment bodies. Fails if `path` exists. The bytes are untrusted input.
+    """
+    parts = urlsplit(url)
+    if (parts.scheme, parts.netloc) != ("https", "github.com") or parts.query or parts.fragment \
+            or not parts.path.startswith(("/user-attachments/files/", "/user-attachments/assets/")):
+        raise ValueError(f"Not a GitHub attachment URL: {url}")
+    path = Path(path)
+    response = await self.transport.request("GET", self.gh_host + parts.path, raw=True,
+                                            headers={"Accept": "application/octet-stream"})
+    with path.open("xb") as file:
+        file.write(response.content)
+    return path

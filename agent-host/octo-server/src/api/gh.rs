@@ -29,6 +29,14 @@ pub fn router() -> Router<Arc<AppState>> {
             "/repos/{owner}/{repo}/pulls/{number}/merge-queue-entry",
             get(get_merge_queue_entry),
         )
+        .route(
+            "/user-attachments/files/{id}/{name}",
+            get(download_file_attachment).fallback(unavailable),
+        )
+        .route(
+            "/user-attachments/assets/{id}",
+            get(download_asset_attachment).fallback(unavailable),
+        )
         .route("/{*path}", any(rest))
         .layer(DefaultBodyLimit::disable())
 }
@@ -82,6 +90,20 @@ fn denied(reason: &str) -> Response {
 
 fn forbidden() -> Response {
     denied("GitHub operation unavailable through Octo")
+}
+
+async fn unavailable() -> Response {
+    forbidden()
+}
+
+fn bad_gateway(reason: &str) -> Response {
+    (StatusCode::BAD_GATEWAY, Json(json!({"message": reason}))).into_response()
+}
+
+fn contains_token(bytes: &[u8], token: &str) -> bool {
+    bytes
+        .windows(token.len())
+        .any(|part| part == token.as_bytes())
 }
 
 fn positive(id: &str) -> bool {
@@ -279,24 +301,9 @@ async fn relay(
         if !download_operation(op) {
             return StatusCode::BAD_GATEWAY.into_response();
         }
-        let Some(location) = upstream
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-        else {
+        let Some(url) = signed_location(&state, &upstream) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
-        let Ok(url) = reqwest::Url::parse(location) else {
-            return StatusCode::BAD_GATEWAY.into_response();
-        };
-        if url.scheme() != state.github_api_url.scheme()
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || !matches!(url.scheme(), "https" | "http")
-        {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
         // A known GitHub download operation may return a signed URL. Fetch
         // once, without credentials, and never expose Location or
         // follow another redirect.
@@ -313,10 +320,7 @@ async fn relay(
             Ok(bytes) => bytes,
             Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
         };
-        if bytes
-            .windows(token.len())
-            .any(|part| part == token.as_bytes())
-        {
+        if contains_token(&bytes, token) {
             return StatusCode::BAD_GATEWAY.into_response();
         }
         return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
@@ -328,14 +332,24 @@ async fn relay(
     if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
         redact(&mut value, token);
         (status, headers, Json(value)).into_response()
-    } else if bytes
-        .windows(token.len())
-        .any(|part| part == token.as_bytes())
-    {
+    } else if contains_token(&bytes, token) {
         StatusCode::BAD_GATEWAY.into_response()
     } else {
         (status, headers, bytes).into_response()
     }
+}
+
+/// The signed URL a GitHub download redirect points to. It is a capability:
+/// fetch it on the host without credentials and never relay it.
+fn signed_location(state: &AppState, upstream: &reqwest::Response) -> Option<reqwest::Url> {
+    let location = upstream.headers().get(header::LOCATION)?.to_str().ok()?;
+    let url = reqwest::Url::parse(location).ok()?;
+    (url.scheme() == state.github_api_url.scheme()
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.scheme(), "https" | "http"))
+    .then_some(url)
 }
 
 fn download_operation(op: &Operation) -> bool {
@@ -357,6 +371,151 @@ fn github_error(status: StatusCode, bytes: &[u8]) -> Response {
         .unwrap_or_else(|_| "GitHub request failed".into());
     (status, Json(json!({"message": message}))).into_response()
 }
+
+/// GitHub's largest issue/PR attachment (a video on a paid plan).
+const ATTACHMENT_LIMIT: usize = 100 * 1024 * 1024;
+
+/// One issue/PR attachment on GitHub's web origin, validated from the Octo
+/// path before any credential is read. Only these two URL shapes exist.
+enum Attachment {
+    /// `user-attachments/files/{id}/{name}`: documents and archives.
+    File { id: u64, name: String },
+    /// `user-attachments/assets/{uuid}`: images and videos.
+    Asset { uuid: String },
+}
+
+impl Attachment {
+    fn file(id: &str, name: String) -> Option<Self> {
+        let id = id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| id.parse::<u64>().ok())
+            .flatten()
+            .filter(|id| *id > 0)?;
+        // Axum decodes the component, so reject what would change the path.
+        let plain = !name.is_empty()
+            && name.len() <= 255
+            && !matches!(name.as_str(), "." | "..")
+            && !name
+                .chars()
+                .any(|c| c == '/' || c == '\\' || c.is_control());
+        plain.then_some(Self::File { id, name })
+    }
+
+    fn asset(uuid: String) -> Option<Self> {
+        let groups: Vec<_> = uuid.split('-').map(str::len).collect();
+        let canonical = groups == [8, 4, 4, 4, 12]
+            && uuid
+                .bytes()
+                .all(|byte| byte == b'-' || matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        canonical.then_some(Self::Asset { uuid })
+    }
+
+    fn url(&self, state: &AppState) -> reqwest::Url {
+        let mut url = state.github_web_url();
+        let mut segments = url
+            .path_segments_mut()
+            .expect("GitHub base is hierarchical");
+        segments.clear().push("user-attachments");
+        match self {
+            Self::File { id, name } => segments.extend(["files", &id.to_string(), name]),
+            Self::Asset { uuid } => segments.extend(["assets", uuid]),
+        };
+        drop(segments);
+        url
+    }
+}
+
+async fn download_file_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    uri: Uri,
+) -> Response {
+    match Attachment::file(&id, name) {
+        Some(attachment) if uri.query().is_none() => download_attachment(&state, attachment).await,
+        _ => forbidden(),
+    }
+}
+
+async fn download_asset_attachment(
+    State(state): State<Arc<AppState>>,
+    Path(uuid): Path<String>,
+    uri: Uri,
+) -> Response {
+    match Attachment::asset(uuid) {
+        Some(attachment) if uri.query().is_none() => download_attachment(&state, attachment).await,
+        _ => forbidden(),
+    }
+}
+
+/// GitHub answers an authorized attachment request with a redirect to a
+/// short-lived signed URL. The token goes only to GitHub's web origin; the
+/// signed URL is fetched once without credentials and never reaches agents.
+async fn download_attachment(state: &AppState, attachment: Attachment) -> Response {
+    let token = match state.get_token().await {
+        Ok(token) => token,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let upstream = match state
+        .client
+        .get(attachment.url(state))
+        .header(header::AUTHORIZATION, format!("token {token}"))
+        .header(header::USER_AGENT, "octo-gh")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    match upstream.status() {
+        StatusCode::FOUND | StatusCode::TEMPORARY_REDIRECT => {}
+        StatusCode::NOT_FOUND => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "Attachment not found, or the host's GitHub token cannot read it"})),
+            )
+                .into_response();
+        }
+        _ => return bad_gateway("GitHub did not redirect to the attachment"),
+    }
+    let Some(url) = signed_location(state, &upstream) else {
+        return bad_gateway("GitHub did not redirect to the attachment");
+    };
+    let downloaded = match state.client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => return bad_gateway("Attachment storage did not return the file"),
+    };
+    let Some(bytes) = read_limited(downloaded, ATTACHMENT_LIMIT).await else {
+        return bad_gateway("Attachment is larger than 100 MiB or its download failed");
+    };
+    if contains_token(&bytes, &token) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+}
+
+/// The whole body, or `None` once it would exceed `limit` bytes.
+async fn read_limited(response: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    use futures_util::StreamExt as _;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.ok()?;
+        if body.len() + chunk.len() > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
 #[derive(Serialize)]
 struct ReviewDecision {
     review_decision: String,
@@ -1556,6 +1715,92 @@ mod tests {
             (Method::POST, "user-attachments/assets/7", json!({})),
             (Method::POST, "user-attachments/assets/../other", json!({})),
             (Method::POST, "user-attachments/%2e%2e/assets", json!({})),
+            (Method::GET, "user-attachments/files/1", Value::Null),
+            (
+                Method::GET,
+                "user-attachments/files/0/a.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/files/+1/a.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/files/0x1/a.tar.gz",
+                Value::Null,
+            ),
+            (Method::GET, "user-attachments/files//a.tar.gz", Value::Null),
+            (
+                Method::GET,
+                "user-attachments/files/1/a/b.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/files/1/a%2Fb.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/files/1/a%5Cb.tar.gz",
+                Value::Null,
+            ),
+            (Method::GET, "user-attachments/files/1/%2e%2e", Value::Null),
+            (Method::GET, "user-attachments/files/1/%2e", Value::Null),
+            (Method::GET, "user-attachments/files/1/a%0Ab", Value::Null),
+            (
+                Method::GET,
+                "user-attachments/files/1/a.tar.gz?x=1",
+                Value::Null,
+            ),
+            (
+                Method::POST,
+                "user-attachments/files/1/a.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::DELETE,
+                "user-attachments/files/1/a.tar.gz",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/assets/not-a-uuid",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/assets/8A3E9B6A-93A6-4CF7-AD47-96F3FA0E85D0",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/assets/8a3e9b6a93a64cf7ad4796f3fa0e85d0",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0/x",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0?x=1",
+                Value::Null,
+            ),
+            (
+                Method::PUT,
+                "user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0",
+                Value::Null,
+            ),
+            (
+                Method::GET,
+                "user-attachments/other/1/a.tar.gz",
+                Value::Null,
+            ),
+            (Method::GET, "fedibtc/fedi/files/1/a.tar.gz", Value::Null),
             (
                 Method::PUT,
                 "repos/acme/widget/pulls/7/update-branch",
@@ -1992,5 +2237,214 @@ mod tests {
         task.abort();
         upstream_task.abort();
         download_task.abort();
+    }
+
+    #[tokio::test]
+    async fn attachment_downloads_follow_one_signed_redirect_without_credentials() {
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let seen = downloads.clone();
+        let (storage, storage_task) = serve(Router::new().fallback(any(
+            move |uri: Uri, headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    // The token never follows the redirect to another host.
+                    assert!(!headers.contains_key(header::AUTHORIZATION));
+                    assert!(!headers.contains_key(header::COOKIE));
+                    assert_eq!(uri.query(), Some("X-Amz-Signature=signed"));
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    match uri.path() {
+                        "/again" => (
+                            StatusCode::FOUND,
+                            [(header::LOCATION, "https://evil.example/secret")],
+                        )
+                            .into_response(),
+                        "/secret" => "prefix host-token-test suffix".into_response(),
+                        // Chunked, so only the streaming bound can stop it.
+                        "/huge" => axum::body::Body::from_stream(futures_util::stream::iter(
+                            (0..=ATTACHMENT_LIMIT / 65536).map(|_| {
+                                Ok::<_, std::convert::Infallible>(Bytes::from(vec![0u8; 65536]))
+                            }),
+                        ))
+                        .into_response(),
+                        "/missing" => StatusCode::FORBIDDEN.into_response(),
+                        _ => (
+                            [(header::CONTENT_TYPE, "text/html")],
+                            b"\x1f\x8b\x08\x00tar\xff".to_vec(),
+                        )
+                            .into_response(),
+                    }
+                }
+            },
+        )))
+        .await;
+        let requested = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = requested.clone();
+        let (upstream, upstream_task) = serve(Router::new().fallback(any(
+            move |method: Method, uri: Uri, headers: HeaderMap| {
+                let storage = storage.clone();
+                let captured = captured.clone();
+                async move {
+                    assert_eq!(method, Method::GET);
+                    assert_eq!(
+                        headers.get(header::AUTHORIZATION).unwrap(),
+                        "token host-token-test"
+                    );
+                    assert!(!headers.contains_key(header::COOKIE));
+                    captured.lock().await.push(uri.to_string());
+                    let redirect = |target: &str| {
+                        (
+                            StatusCode::FOUND,
+                            [(
+                                header::LOCATION,
+                                format!("{storage}/{target}?X-Amz-Signature=signed"),
+                            )],
+                        )
+                            .into_response()
+                    };
+                    let id = uri.path().split('/').nth(3).unwrap().to_owned();
+                    match id.as_str() {
+                        "2" => StatusCode::NOT_FOUND.into_response(),
+                        "3" => redirect("huge"),
+                        "4" => redirect("secret"),
+                        "5" => redirect("again"),
+                        "6" => "<html>sign in</html>".into_response(),
+                        "7" => (
+                            StatusCode::FOUND,
+                            [(
+                                header::LOCATION,
+                                format!("{}/file", storage.replace("://", "://user:pw@")),
+                            )],
+                        )
+                            .into_response(),
+                        "8" => redirect("missing"),
+                        "9" => (
+                            StatusCode::MOVED_PERMANENTLY,
+                            [(
+                                header::LOCATION,
+                                format!("{storage}/file?X-Amz-Signature=signed"),
+                            )],
+                        )
+                            .into_response(),
+                        _ => redirect("file"),
+                    }
+                }
+            },
+        )))
+        .await;
+        let (base, task) = serve(crate::router(token_provider(), upstream.parse().unwrap())).await;
+        let client = reqwest::Client::new();
+        let get = |path: &str| {
+            client
+                .get(format!("{base}/{path}"))
+                .header(header::AUTHORIZATION, "Bearer agent-token")
+                .header(header::COOKIE, "user_session=agent")
+                .send()
+        };
+        for path in [
+            "user-attachments/files/25453870/56494f88-8ff6-49ee-ad7c-39651cbec55b.tar.gz",
+            "user-attachments/files/1/incident%20log%20(1).txt",
+            "user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0",
+        ] {
+            let response = get(path).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream"
+            );
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                b"\x1f\x8b\x08\x00tar\xff"
+            );
+            assert_eq!(requested.lock().await.last().unwrap(), &format!("/{path}"));
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 3);
+
+        let response = get("user-attachments/files/2/gone.txt").await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for id in ["3", "4", "5", "6", "7", "8", "9"] {
+            let response = get(&format!("user-attachments/files/{id}/a.bin"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "case {id}");
+            assert!(!response.headers().contains_key(header::LOCATION));
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("host-token-test") && !body.contains("Signature"));
+        }
+        // huge, secret, again and missing reach storage once each; the rest
+        // never do.
+        assert_eq!(downloads.load(Ordering::SeqCst), 7);
+        task.abort();
+        upstream_task.abort();
+        storage_task.abort();
+    }
+
+    #[tokio::test]
+    async fn attachment_size_limit_is_inclusive_with_or_without_content_length() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (storage, storage_task) = serve(Router::new().fallback(any(|uri: Uri| async move {
+            let size: usize = uri.path()[1..].parse().unwrap();
+            if uri.query() == Some("chunked") {
+                axum::body::Body::from_stream(futures_util::stream::iter(
+                    vec![0u8; size]
+                        .chunks(3)
+                        .map(|chunk| {
+                            Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(chunk))
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+                .into_response()
+            } else {
+                vec![0u8; size].into_response()
+            }
+        })))
+        .await;
+        let client = reqwest::Client::new();
+        for query in ["sized", "chunked"] {
+            for (size, fits) in [(9, true), (10, true), (11, false)] {
+                let response = client
+                    .get(format!("{storage}/{size}?{query}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.content_length().is_some(),
+                    query == "sized",
+                    "{query}"
+                );
+                let body = read_limited(response, 10).await;
+                assert_eq!(
+                    body.map(|body| body.len()),
+                    fits.then_some(size),
+                    "{query} {size}"
+                );
+            }
+        }
+        storage_task.abort();
+    }
+
+    #[test]
+    fn attachment_urls_target_the_web_origin_with_reencoded_names() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let state = AppState {
+            client: reqwest::Client::new(),
+            token_provider: token_provider(),
+            github_api_url: "https://api.github.com".parse().unwrap(),
+        };
+        let file = Attachment::file("25453870", "incident log #1?.tar.gz".into()).unwrap();
+        assert_eq!(
+            file.url(&state).as_str(),
+            "https://github.com/user-attachments/files/25453870/incident%20log%20%231%3F.tar.gz"
+        );
+        let asset = Attachment::asset("8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0".into()).unwrap();
+        assert_eq!(
+            asset.url(&state).as_str(),
+            "https://github.com/user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0"
+        );
+        assert!(Attachment::asset("8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d".into()).is_none());
+        assert!(Attachment::asset("8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85dg".into()).is_none());
+        assert!(Attachment::file("18446744073709551616", "a".into()).is_none());
+        assert!(Attachment::file("1", "a".repeat(256)).is_none());
+        assert!(Attachment::file("1", "a".repeat(255)).is_some());
     }
 }

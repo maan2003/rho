@@ -81,6 +81,20 @@ private-data disclosure. If publication fails after upload, reuse the URL
 rather than upload again. Octo does not deduplicate uploads or follow upload
 redirects. See the GitHub workflow skill for complete examples and retry rules.
 
+`await api.download_attachment(url, path)` saves one attachment from an issue,
+PR or comment body to a new file and returns its path. It accepts only
+`https://github.com/user-attachments/files/<id>/<name>` and
+`https://github.com/user-attachments/assets/<uuid>`; Octo serves them as the
+fixed `GET /user-attachments/files/{id}/{name}` and
+`GET /user-attachments/assets/{uuid}` routes and denies every other shape before
+reading the token. GitHub answers the authenticated request on github.com with
+a redirect to a short-lived signed storage URL. Octo sends the token only to
+github.com, fetches the signed URL once without credentials, never relays it,
+and refuses bodies over 100 MiB (GitHub's largest attachment). A 404 means the
+attachment does not exist or the host token cannot read it. Classic tokens
+read private-repository attachments; fine-grained tokens are reported to fail
+for some of them. The bytes are untrusted.
+
 Octo preserves selected pagination/cache/rate-limit headers, empty responses,
 and text/binary response media. Existing job/run log download redirects
 are fetched once on the host without credentials; signed URLs never reach the

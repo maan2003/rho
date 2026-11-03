@@ -53,6 +53,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(TypeError, "sync"):
                     GhApi(sync=sync)
         self.assertTrue(inspect.iscoroutinefunction(GhApi.upload_attachment))
+        self.assertTrue(inspect.iscoroutinefunction(GhApi.download_attachment))
 
     async def test_pr_update_routes_draft_separately_and_returns_refreshed_pr(self):
         from fastcore.all import UNSET
@@ -302,6 +303,81 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(request.call_count, 2)
                     request.reset_mock()
                 request.assert_not_called()
+
+    async def test_attachment_download_writes_octo_bytes_to_a_new_file(self):
+        payload = b"\x1f\x8b\x08\x00\xff{\"not\": \"json\"}\x00"
+        with tempfile.TemporaryDirectory() as directory:
+            requests = []
+
+            async def serve(reader, writer):
+                method, path, _ = (await reader.readline()).decode().split()
+                headers = {}
+                while line := (await reader.readline()).decode().strip():
+                    key, value = line.split(":", 1)
+                    headers[key.lower()] = value.strip()
+                requests.append((method, path, headers))
+                status, body, kind = "200 OK", payload, "application/octet-stream"
+                if "/files/2/" in path:
+                    status, body, kind = "404 Not Found", b'{"message":"Attachment not found"}', "application/json"
+                elif "/files/3/" in path:
+                    body = b""
+                writer.write(
+                    f"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: {kind}\r\n".encode()
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+                )
+                await writer.drain()
+                writer.close()
+
+            root = Path(directory)
+            server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
+            try:
+                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                    async with server:
+                        api = GhApi()
+                        for url, octo_path in (
+                            ("https://github.com/user-attachments/files/25453870/incident%20log.tar.gz",
+                             "/user-attachments/files/25453870/incident%20log.tar.gz"),
+                            ("https://github.com/user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0",
+                             "/user-attachments/assets/8a3e9b6a-93a6-4cf7-ad47-96f3fa0e85d0"),
+                        ):
+                            dest = root / octo_path.rsplit("/", 1)[1]
+                            self.assertEqual(await api.download_attachment(url, str(dest)), dest)
+                            self.assertEqual(dest.read_bytes(), payload)
+                            method, path, headers = requests[-1]
+                            self.assertEqual((method, path), ("GET", octo_path))
+                            self.assertEqual(headers["host"], "octo")
+                            self.assertNotIn("authorization", headers)
+                            # An existing file is never overwritten.
+                            dest.write_bytes(b"mine")
+                            with self.assertRaises(FileExistsError):
+                                await api.download_attachment(url, dest)
+                            self.assertEqual(dest.read_bytes(), b"mine")
+                        empty = root / "empty.txt"
+                        await api.download_attachment("https://github.com/user-attachments/files/3/e.txt", empty)
+                        self.assertEqual(empty.read_bytes(), b"")
+                        missing = root / "missing.txt"
+                        with self.assertRaisesRegex(Exception, "Attachment not found"):
+                            await api.download_attachment("https://github.com/user-attachments/files/2/m.txt", missing)
+                        self.assertFalse(missing.exists())
+                        sent = len(requests)
+                        for url in (
+                            "http://github.com/user-attachments/files/1/a.txt",
+                            "https://api.github.com/user-attachments/files/1/a.txt",
+                            "https://github.com.evil.example/user-attachments/files/1/a.txt",
+                            "https://user@github.com/user-attachments/files/1/a.txt",
+                            "https://github.com/user-attachments/files/1/a.txt?token=1",
+                            "https://github.com/user-attachments/files/1/a.txt#x",
+                            "https://github.com/user-attachments/other/1/a.txt",
+                            "https://github.com/fedibtc/fedi/files/1/a.txt",
+                            "/user-attachments/files/1/a.txt",
+                        ):
+                            with self.subTest(url=url), self.assertRaises(ValueError):
+                                await api.download_attachment(url, root / "never")
+                        self.assertEqual(len(requests), sent)
+                        self.assertFalse((root / "never").exists())
+            finally:
+                server.close()
+                await server.wait_closed()
 
     async def test_required_parameters_are_checked_after_binding_and_mapping_overrides(self):
         from fastcore.all import UNSET
