@@ -13,12 +13,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn github_git_url(&self, owner: &str, repo: &str, endpoint: &str) -> Result<Url> {
+    /// The web origin (github.com) that serves git and user attachments.
+    pub(crate) fn github_web_url(&self) -> Url {
         let mut url = self.github_api_url.clone();
         if url.host_str() == Some("api.github.com") {
-            url.set_host(Some("github.com"))?;
+            url.set_host(Some("github.com"))
+                .expect("fixed GitHub web host is valid");
             url.set_path("");
         }
+        url
+    }
+
+    pub(crate) fn github_git_url(&self, owner: &str, repo: &str, endpoint: &str) -> Result<Url> {
+        let mut url = self.github_web_url();
         let repo = format!("{repo}.git");
         let mut segments = url
             .path_segments_mut()
