@@ -53,10 +53,12 @@ class Agent:
         """Replace the props; the runtime stays."""
         self.set_spec(self.runtime, props)
 
-    def input(self, text: str, *, wake: str, message: int | None = None) -> None:
+    def input(self, text: str, *, role: str, message: int | None = None) -> None:
         """Queue `text` for the model; returns once its `Input` row is
-        durable. `message` names the chat message it hands over."""
-        _rho.input(self.id, text, wake=wake, message=message)
+        durable. `role` says who speaks: `user` for what a person typed,
+        `tool` for anything else nobody at Rho wrote, `system` for Rho's own
+        words. `message` names the chat message it hands over."""
+        _rho.input(self.id, text, role=role, message=message)
 
     def cancel(self) -> None:
         _rho.cancel(self.id)

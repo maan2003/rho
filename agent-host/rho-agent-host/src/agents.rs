@@ -1172,7 +1172,7 @@ mod tests {
     use rho_agent::entry::{Entry, Notice, Report, RequestNotice};
     use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
     use rho_agent::store::StoreWrite as _;
-    use rho_agent_types::{InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
+    use rho_agent_types::{Role, UnixMs, WorksetId, WorksetKind, Wpos};
     use rho_agents_client::protocol::worksets::{AgentLog, LogEvent, LogNext};
 
     use super::{agent_log_page, detail, detail_result};
@@ -1241,13 +1241,13 @@ mod tests {
                 Event::Input {
                     message,
                     content,
-                    wake,
+                    role,
                     ..
                 } => Event::Input {
                     agent,
                     message,
                     content,
-                    wake,
+                    role,
                 },
                 Event::Claude { row, .. } => Event::Claude { agent, row },
                 event => event,
@@ -1355,7 +1355,7 @@ mod tests {
                     content: vec![rho_agent_types::ContentPart::Text {
                         text: spoken.to_owned(),
                     }],
-                    wake: InputWake::Person,
+                    role: Role::User,
                 },
                 native(Entry::Notice {
                     notice: Notice::Restarted,
@@ -1392,7 +1392,7 @@ mod tests {
                         agent,
                         message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(3))),
                         text: "🎤 fix <b>".into(),
-                        wake: InputWake::Person,
+                        role: Role::User,
                         at: UnixMs(1),
                     }
                 ),
@@ -1682,7 +1682,7 @@ mod tests {
                     agent,
                     message: None,
                     content: Vec::new(),
-                    wake: InputWake::Person,
+                    role: Role::User,
                 },
                 _ if rows[which].len() > 1 => {
                     let to = rows[which][1 + next(rows[which].len() - 1)];

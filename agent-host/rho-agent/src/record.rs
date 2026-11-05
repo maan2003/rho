@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse};
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, InputWake, MessageId, Props, UnixMs, WorksetKind, Wpos,
+    AgentId, ContentPart, ExecMilestone, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -39,15 +39,16 @@ pub enum Event<'a> {
     AgentChanged { agent: AgentId, spec: AgentSpec },
 
     /// Something entered the agent's queue: delivered by the agent's next
-    /// request, and by every request after a position before it. Written
-    /// by the agent's own loop, so its order against that loop's requests
-    /// is true.
+    /// request that can carry its role, and by every such request after a
+    /// position before it. Written by the agent's own loop, so its order
+    /// against that loop's requests is true.
     Input {
         agent: AgentId,
         /// The message it hands over, if it is one.
         message: Option<MessageId>,
         content: Vec<ContentPart>,
-        wake: InputWake,
+        #[senax(rename = "wake")]
+        role: Role,
     },
 
     /// Every row of this agent from `to` up to here is no longer its history.
@@ -168,11 +169,96 @@ pub enum ClaudeRow {
     /// A rewind whose destination transcript is not verified yet; `None`
     /// withdraws it. On success the new session is an `AgentChanged`.
     RewindPending(Option<ClaudeRewind>),
-    /// A turn handed to Claude Code. Like the native one, it delivers every
-    /// input of the agent logged before it.
+    /// A turn or an exec result handed to Claude Code. It delivers every
+    /// input logged before it, except `tool` inputs when `no_call`: only an
+    /// exec result carries them
+    /// ([DECISION-roles](../specs/DECISION-roles.md)).
     RequestSent {
         why: crate::entry::Wake,
         report: crate::entry::Report,
+        #[senax(default)]
+        no_call: bool,
     },
     Notice(crate::entry::Notice),
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::{AgentId, AgentIdDomain, ContentPart, Role};
+    use senax_encoder::{decode, encode};
+
+    use super::*;
+
+    /// Rows as they were written before the roles.
+    mod before_roles {
+        use rho_agent_types::{AgentId, ContentPart, MessageId};
+        use senax_encoder::Encode;
+
+        #[derive(Encode)]
+        pub enum ClaudeRow {
+            RequestSent {
+                why: crate::entry::Wake,
+                report: crate::entry::Report,
+            },
+        }
+
+        #[derive(Encode)]
+        pub enum InputWake {
+            Person,
+            Agent,
+            Quiet,
+        }
+
+        #[derive(Encode)]
+        pub enum Event {
+            Input {
+                agent: AgentId,
+                message: Option<MessageId>,
+                content: Vec<ContentPart>,
+                wake: InputWake,
+            },
+        }
+    }
+
+    #[test]
+    fn a_request_row_from_before_the_roles_delivered_everything() {
+        let bytes = encode(&before_roles::ClaudeRow::RequestSent {
+            why: crate::entry::Wake::Message,
+            report: crate::entry::Report::default(),
+        })
+        .unwrap();
+        let row: ClaudeRow = decode(&mut bytes.as_ref()).unwrap();
+        assert_eq!(
+            row,
+            ClaudeRow::RequestSent {
+                why: crate::entry::Wake::Message,
+                report: crate::entry::Report::default(),
+                no_call: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_input_row_from_before_the_roles_keeps_who_spoke() {
+        let agent = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        let content = vec![ContentPart::Text { text: "hi".into() }];
+        for (wake, role) in [
+            (before_roles::InputWake::Person, Role::User),
+            (before_roles::InputWake::Agent, Role::Tool),
+            (before_roles::InputWake::Quiet, Role::System),
+        ] {
+            let bytes = encode(&before_roles::Event::Input {
+                agent,
+                message: None,
+                content: content.clone(),
+                wake,
+            })
+            .unwrap();
+            let event: Event<'static> = decode(&mut bytes.as_ref()).unwrap();
+            assert!(
+                matches!(event, Event::Input { role: decoded, .. } if decoded == role),
+                "{event:?}"
+            );
+        }
+    }
 }

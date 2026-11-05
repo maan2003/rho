@@ -130,8 +130,7 @@ pub enum Item {
     CompactionTrigger,
     /// What an earlier step's `exec` call produced.
     Result(CallResult),
-    /// Anything else the model is told: messages, and a report on a step
-    /// that made no call.
+    /// What a person typed, and Rho's own words.
     User { text: String, images: Vec<Image> },
 }
 

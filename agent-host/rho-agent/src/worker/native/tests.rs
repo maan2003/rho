@@ -126,7 +126,7 @@ impl Harness {
     /// Whether a person's input with `text` is still history.
     fn received(&self, text: &str) -> bool {
         self.events().iter().any(|event| {
-            matches!(event, Event::Input { wake: InputWake::Person, content, .. }
+            matches!(event, Event::Input { role: Role::User, content, .. }
                 if rho_agent_types::transcript::text_content(content) == text)
         })
     }
@@ -190,7 +190,7 @@ async fn say(handle: &AgentHandle, text: &str) {
     handle
         .input(
             vec![ContentPart::Text { text: text.into() }],
-            InputWake::Person,
+            Role::User,
             None,
         )
         .await
@@ -261,6 +261,66 @@ async fn wait_for(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// A peer's message reads as the output of the call the model waits in, never
+/// as a person's words, and an agent's first message tells it only to call
+/// exec.
+#[tokio::test]
+async fn a_peers_message_reaches_the_model_in_the_calls_result() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('reading')")
+        .then("print('more')\nend_turn()")
+        .then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    handle
+        .input(words("the-brief"), Role::Tool, None)
+        .await
+        .unwrap();
+    let first = requests(&script, 1).await;
+    assert!(
+        first[0]
+            .items()
+            .iter()
+            .all(|item| !matches!(item, Item::User { text, .. } if text.contains("the-brief"))),
+        "{:?}",
+        first[0].items()
+    );
+    assert!(told(&first[0]).contains(crate::entry::WAITING));
+
+    let second = requests(&script, 2).await;
+    let result = second[1]
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            Item::Report { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the call's result");
+    assert!(
+        result.contains("the-brief") && result.contains("reading"),
+        "{result}"
+    );
+
+    wait_for("the wait", || handle.status().runtime.awaiting_human).await;
+    handle
+        .input(words("from-the-peer"), Role::Tool, None)
+        .await
+        .unwrap();
+    let all = requests(&script, 3).await;
+    let new = all[2]
+        .items()
+        .iter()
+        .rposition(|item| matches!(item, Item::Step { .. }))
+        .unwrap();
+    assert!(
+        matches!(&all[2].items()[new + 1..], [Item::Report { text, .. }] if text.contains("from-the-peer") && text.contains("more")),
+        "{:?}",
+        &all[2].items()[new + 1..]
+    );
+}
+
 #[tokio::test]
 async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let harness = Harness::new().await;
@@ -290,7 +350,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
         second[1]
             .items()
             .iter()
-            .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
+            .any(|item| matches!(item, Item::Report {reply_to: carry,..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
     harness.until_sent("reading").await;
@@ -893,10 +953,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     agent.session = Arc::new(Controlled(submitted));
     let instructions: Arc<str> = "test instructions".into();
     for text in ["first-message", "second-message"] {
-        agent
-            .receive(words(text), InputWake::Person, None)
-            .await
-            .unwrap();
+        agent.receive(words(text), Role::User, None).await.unwrap();
         agent
             .wake_with(
                 Wake::Message,
@@ -912,14 +969,14 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         );
     }
     agent
-        .receive(words("third-message"), InputWake::Person, None)
+        .receive(words("third-message"), Role::User, None)
         .await
         .unwrap();
     let control = async {
         reconnect.await.unwrap();
         handle.compact();
         handle
-            .input(words("late-message"), InputWake::Agent, None)
+            .input(words("late-message"), Role::User, None)
             .await
             .unwrap();
         resume.send(()).unwrap();
@@ -969,7 +1026,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .await
         .unwrap();
     agent
-        .receive(words("initial-message"), InputWake::Person, None)
+        .receive(words("initial-message"), Role::User, None)
         .await
         .unwrap();
     let first = Report {
@@ -983,7 +1040,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     assert!(agent.backoff.is_some());
 
     agent
-        .receive(words("arrived-after-failure"), InputWake::Person, None)
+        .receive(words("arrived-after-failure"), Role::User, None)
         .await
         .unwrap();
     let second = Report {
@@ -1004,7 +1061,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
             Item::Report {
                 text,
                 images,
-                reply_to: Some(carry),
+                reply_to: carry,
             } => Some((text, images, carry)),
             _ => None,
         })
@@ -1042,7 +1099,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("old-discarded"), InputWake::Person, None)
+        .receive(words("old-discarded"), Role::User, None)
         .await
         .unwrap();
     agent
@@ -1058,7 +1115,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("during-compaction"), InputWake::Person, None)
+        .receive(words("during-compaction"), Role::User, None)
         .await
         .unwrap();
     agent
@@ -1071,7 +1128,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("after-compaction"), InputWake::Agent, None)
+        .receive(words("after-compaction"), Role::Tool, None)
         .await
         .unwrap();
     agent.shutdown().await.unwrap();
@@ -1088,9 +1145,9 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         agent
             .unread
             .iter()
-            .map(|(wake, _)| *wake)
+            .map(|(role, _)| *role)
             .collect::<Vec<_>>(),
-        [InputWake::Person, InputWake::Agent],
+        [Role::User, Role::Tool],
         "the inputs after the compacting request are unread"
     );
 
@@ -1108,7 +1165,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .receive(words("too-late"), InputWake::Person, None)
+        .receive(words("too-late"), Role::User, None)
         .await
         .unwrap();
     agent
@@ -1134,10 +1191,15 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     let request = turn.request(&harness.host).await.unwrap();
     let text = format!("{:?}", request.items());
     assert!(text.contains("retained-compaction"), "{text}");
-    for message in ["during-compaction", "after-compaction"] {
-        assert_eq!(text.matches(message).count(), 1, "{text}");
-    }
-    for excluded in ["old-discarded", "too-late", "later-compaction"] {
+    assert_eq!(text.matches("during-compaction").count(), 1, "{text}");
+    // The compaction took the call; the peer's message waits for the next one.
+    assert!(text.contains(crate::entry::WAITING), "{text}");
+    for excluded in [
+        "old-discarded",
+        "too-late",
+        "later-compaction",
+        "after-compaction",
+    ] {
         assert!(!text.contains(excluded), "{text}");
     }
     agent.shutdown().await.unwrap();
@@ -1204,10 +1266,12 @@ async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
     let all = requests(&script, 3).await;
     let next = told_new(&all[2]);
     assert!(next.contains("next"), "{next}");
-    assert!(next.contains("cell-output-77"), "{next}");
+    // The compaction took the call, so the output waits for the next one.
+    assert!(next.contains(crate::entry::WAITING), "{next}");
+    assert!(!next.contains("cell-output-77"), "{next}");
 }
 
-/// A compaction owes the model what policy gives back: the texts are quiet
+/// A compaction owes the model what policy gives back: the texts are `system`
 /// inputs logged after the compaction and before the next request, which
 /// tells them to the model once.
 #[tokio::test]
@@ -1252,7 +1316,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
     let quiet = events
         .iter()
         .position(|event| {
-            matches!(event, Event::Input { wake: InputWake::Quiet, content, .. }
+            matches!(event, Event::Input { role: Role::System, content, .. }
                 if rho_agent_types::transcript::text_content(content) == restored)
         })
         .expect("the restored text is a quiet input");
@@ -1276,7 +1340,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
             .filter(|event| matches!(
                 event,
                 Event::Input {
-                    wake: InputWake::Quiet,
+                    role: Role::System,
                     ..
                 }
             ))

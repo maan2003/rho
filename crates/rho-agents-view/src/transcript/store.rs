@@ -200,7 +200,7 @@ impl Transcripts {
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{
-        Address, ChatSeq, ContentPart, InputWake, Message, MessageId, TopicId, UnixMs, Wpos,
+        Address, ChatSeq, ContentPart, Role, Message, MessageId, TopicId, UnixMs, Wpos,
     };
     use rho_agents_client::protocol::worksets::LogEvent;
 
@@ -234,7 +234,7 @@ mod tests {
                     agent: agent(),
                     message: Some(MessageId(ChatSeq(message))),
                     text: text.to_owned(),
-                    wake: InputWake::Person,
+                    role: Role::User,
                     at: UnixMs(at),
                 },
             ),

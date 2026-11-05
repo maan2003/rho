@@ -7,7 +7,7 @@ use rho_agent::entry::{Entry, Notice, Report};
 use rho_agent::log::{AgentUsageBucket, TranscriptLine};
 use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agent_types::{ContentPart, InputWake, UnixMs};
+use rho_agent_types::{ContentPart, Role, UnixMs};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
 use rho_agents_client::protocol::worksets::{LogEvent, SpecView};
 
@@ -75,7 +75,7 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
             agent,
             message,
             content,
-            wake,
+            role,
         } => {
             let text = content_text(content);
             LogEvent::Input {
@@ -83,11 +83,11 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
                 message: *message,
                 // A spoken request reads as what was asked, not as the
                 // markup the agent is handed.
-                text: match wake {
-                    InputWake::Person => crate::realtime::shown_to_reader(&text).unwrap_or(text),
+                text: match role {
+                    Role::User => crate::realtime::shown_to_reader(&text).unwrap_or(text),
                     _ => text,
                 },
-                wake: *wake,
+                role: *role,
                 at,
             }
         }

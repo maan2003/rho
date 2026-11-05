@@ -31,9 +31,10 @@ impl Progress {
         wake::Facts {
             // A cell that raised has returned too: its failure is not news
             // to wait for.
+            // The cell that ended the turn returns to nobody.
             finished: latest
                 .and_then(|cell| cell.facts().finished)
-                .filter(|_| !self.told_returned)
+                .filter(|_| !self.told_returned && !self.ended)
                 .map(|end| end.at),
             notified: sources
                 .iter()

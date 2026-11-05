@@ -7,7 +7,7 @@
 //! Deleting a workset removes its log and heads; chat stays.
 
 use redb::TableDefinition;
-use rho_agent_types::{Address, AgentId, ChatSeq, InputWake, UnixMs, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{Address, AgentId, ChatSeq, Role, UnixMs, WorksetId, WorksetKind, Wpos};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
@@ -498,11 +498,11 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         .insert(agent, SenValue::borrowed(&head));
 }
 
-/// The wake an input from `from` gets.
-pub fn wake_of(from: Address) -> InputWake {
+/// The role of an input from `from`.
+pub fn role_of(from: Address) -> Role {
     match from {
-        Address::User => InputWake::Person,
-        Address::Agent(_) => InputWake::Agent,
+        Address::User => Role::User,
+        Address::Agent(_) => Role::Tool,
     }
 }
 

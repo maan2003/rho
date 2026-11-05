@@ -1294,7 +1294,7 @@ mod tests {
             agent: agent_id,
             message: None,
             text: "go".into(),
-            wake: rho_agent_types::InputWake::Quiet,
+            role: rho_agent_types::Role::System,
             at: UnixMs(at),
         }
     }

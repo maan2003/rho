@@ -71,24 +71,29 @@ impl Report {
         self.notices.is_empty() && self.notebook.is_empty()
     }
 
-    /// The report as the model reads it. `inputs`: the request also
-    /// delivers inputs, which follow it.
-    pub fn render(&self, inputs: bool) -> rho_notebook::RenderedReport {
-        let mut rendered = self.notebook.render();
+    /// The notices as the model reads them. `inputs`: the request also
+    /// delivers inputs, so it has news whatever the notices say.
+    pub fn notices(&self, inputs: bool) -> Vec<String> {
         let substantive = !self.notebook.is_empty()
             || inputs
             || self
                 .notices
                 .iter()
                 .any(|n| !matches!(n, RequestNotice::Checkin | RequestNotice::NothingNew));
-        let mut parts: Vec<String> = self
-            .notices
+        self.notices
             .iter()
             .filter(|n| {
                 !substantive || !matches!(n, RequestNotice::Checkin | RequestNotice::NothingNew)
             })
             .map(|notice| notice.text().into_owned())
-            .collect();
+            .collect()
+    }
+
+    /// The report as the model reads it. `inputs`: the request also
+    /// delivers inputs, which follow it.
+    pub fn render(&self, inputs: bool) -> rho_notebook::RenderedReport {
+        let mut rendered = self.notebook.render();
+        let mut parts = self.notices(inputs);
         if !rendered.text.is_empty() {
             parts.push(rendered.text);
         }
@@ -99,6 +104,11 @@ impl Report {
         rendered
     }
 }
+
+/// What a model with no call open is told when `tool` text waits for one
+/// ([DECISION-roles](../specs/DECISION-roles.md)).
+pub const WAITING: &str =
+    "Notebook output or agent messages are waiting. Your next exec result carries them.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum RequestNotice {

@@ -19,7 +19,7 @@ mod tests;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, ContentPart, InputWake, MessageId, UnixMs, Wpos};
+use rho_agent_types::{AgentId, ContentPart, MessageId, Role, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -102,12 +102,12 @@ impl AgentHandle {
     pub async fn input(
         &self,
         content: Vec<ContentPart>,
-        wake: InputWake,
+        role: Role,
         message: Option<MessageId>,
     ) -> anyhow::Result<()> {
         self.send(|done| Control::Input {
             content,
-            wake,
+            role,
             message,
             done: Some(done),
         })
@@ -186,7 +186,7 @@ enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
     Input {
         content: Vec<ContentPart>,
-        wake: InputWake,
+        role: Role,
         message: Option<MessageId>,
         done: Option<oneshot::Sender<()>>,
     },
@@ -293,7 +293,7 @@ pub(crate) struct Agent {
     /// The latest step was cut off part-way through its cell.
     interrupted: bool,
     /// Inputs that wake the model and it has not seen, oldest first.
-    unread: Vec<(InputWake, UnixMs)>,
+    unread: Vec<(Role, UnixMs)>,
     progress: Progress,
     awaiting: bool,
     /// The notebook went with a restart since the model's last wake: tell
@@ -409,8 +409,8 @@ impl Agent {
         self.compaction_owed = false;
         for (_, record) in rows {
             match &record.event {
-                Event::Input { wake, .. } if *wake != InputWake::Quiet => {
-                    self.unread.push((*wake, record.at));
+                Event::Input { role, .. } if *role != Role::System => {
+                    self.unread.push((*role, record.at));
                 }
                 Event::Native { entry, .. } => match entry {
                     Entry::RequestSent { .. } => {
@@ -529,11 +529,11 @@ impl Agent {
             Control::TellTail => self.host.tell_tail(),
             Control::Input {
                 content,
-                wake,
+                role,
                 message,
                 done,
             } => {
-                self.receive(content, wake, message).await?;
+                self.receive(content, role, message).await?;
                 if let Some(done) = done {
                     self.flush().await?;
                     let _ = done.send(());
@@ -622,7 +622,7 @@ impl Agent {
                 matches!(
                     record.event,
                     Event::Input {
-                        wake: InputWake::Person,
+                        role: Role::User,
                         ..
                     }
                 )
@@ -703,11 +703,11 @@ impl Agent {
     async fn receive(
         &mut self,
         content: Vec<ContentPart>,
-        wake: InputWake,
+        role: Role,
         message: Option<MessageId>,
     ) -> anyhow::Result<()> {
         let at = UnixMs::now();
-        if wake == InputWake::Person {
+        if role == Role::User {
             if self.archived && !self.responding {
                 self.fresh_notebook().await?;
             }
@@ -715,17 +715,17 @@ impl Agent {
             self.awaiting = false;
             self.stopped = None;
         }
-        if wake != InputWake::Quiet {
+        if role != Role::System {
             if let Some(backoff) = &mut self.backoff {
                 backoff.at = at;
             }
-            self.unread.push((wake, at));
+            self.unread.push((role, at));
         }
         self.log(Event::Input {
             agent: self.agent_id,
             message,
             content,
-            wake,
+            role,
         })
         .await
     }
@@ -789,17 +789,15 @@ impl Agent {
             self.notebook.as_ref(),
             self.cell.as_ref().map(|latest| &latest.cell),
         );
-        let first = |wake| {
+        let first = |role| {
             self.unread
                 .iter()
-                .find(|(from, _)| *from == wake)
+                .find(|(from, _)| *from == role)
                 .map(|(_, at)| *at)
         };
         Facts {
-            // The cell that ended the turn returns to nobody.
-            finished: notebook.finished.filter(|_| !self.progress.ended),
-            human: first(InputWake::Person),
-            agent: first(InputWake::Agent),
+            human: first(Role::User),
+            agent: first(Role::Tool),
             prose: self.progress.prose > 0 || self.retry,
             rewound: self.rewound,
             compaction: self.compaction.pending,
@@ -862,7 +860,7 @@ impl Agent {
                 agent,
                 message: None,
                 content: vec![ContentPart::Text { text }],
-                wake: InputWake::Quiet,
+                role: Role::System,
             })
             .await?;
         }
@@ -1164,12 +1162,7 @@ impl Agent {
 
     /// The user wrote to an archived agent while it was responding.
     async fn revive_if_written(&mut self) -> anyhow::Result<()> {
-        if self.archived
-            && self
-                .unread
-                .iter()
-                .any(|(wake, _)| *wake == InputWake::Person)
-        {
+        if self.archived && self.unread.iter().any(|(role, _)| *role == Role::User) {
             self.fresh_notebook().await?;
         }
         Ok(())

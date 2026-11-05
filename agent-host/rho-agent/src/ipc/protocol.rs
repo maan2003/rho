@@ -1,7 +1,7 @@
 //! Private agent messages shared by the host and worker.
 use std::io;
 
-use rho_agent_types::{ContentPart, InputWake, MessageId, Wpos};
+use rho_agent_types::{ContentPart, MessageId, Role, Wpos};
 use senax_encoder::{Decode, Encode};
 
 use crate::log::AgentUsageBucket;
@@ -21,7 +21,7 @@ pub(crate) enum Control {
     /// Log this input as the agent's own row; the ack follows the commit.
     Input {
         content: Vec<ContentPart>,
-        wake: InputWake,
+        role: Role,
         message: Option<MessageId>,
     },
     TellTail,

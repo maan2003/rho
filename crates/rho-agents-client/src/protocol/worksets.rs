@@ -7,8 +7,8 @@
 //! it looks at. Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, ExecMilestone, InputWake, MessageId, Props,
-    StreamId, TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
+    AgentId, ChatRecord, ChatSeq, ContentPart, ExecMilestone, MessageId, Props, Role, StreamId,
+    TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -349,7 +349,8 @@ pub enum LogEvent {
         agent: AgentId,
         message: Option<MessageId>,
         text: String,
-        wake: InputWake,
+        #[senax(rename = "wake")]
+        role: Role,
         at: UnixMs,
     },
     CompactionRequested {
@@ -517,7 +518,7 @@ mod tests {
                     agent: agent_id,
                     message: Some(MessageId(ChatSeq(4))),
                     text: "hi".into(),
-                    wake: InputWake::Person,
+                    role: Role::User,
                     at: UnixMs(8),
                 },
             )],

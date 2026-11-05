@@ -5,9 +5,11 @@
 //! `tools/call` of `exec` starts a cell and holds the reply until the Rho
 //! runtime's wake rules ([`wake::decide`]) say the model should look: the
 //! cell finished, it notified, a task failed, the check-in came due, or a
-//! user message is waiting. Everything the notebook has said since the
-//! model last looked rides along with that reply. With no call open, the
-//! same rules say when an idle model is woken with a message instead.
+//! user message is waiting. A cell that called `end_turn()` keeps its call
+//! open, so the model waits inside it. Everything the notebook has said since
+//! the model last looked rides along with that reply. With no call open, the
+//! same rules say when an idle model is woken, with a fixed line that sends
+//! it back to exec ([DECISION-roles](../../../../specs/DECISION-roles.md)).
 
 use std::sync::Arc;
 
@@ -50,24 +52,20 @@ pub(crate) struct PythonHost {
     latest: Option<(ExecId, CellHandle)>,
     /// The model has been told the latest cell finished.
     progress: Progress,
-    /// The user stopped the agent, or its requests failed, since anything
-    /// was asked of it: only the user wakes it again.
-    stopped: bool,
+    /// The user stopped the agent, or its requests failed, at this time,
+    /// since anything was asked of it: only fresh input wakes it again.
+    stopped: Option<UnixMs>,
 }
 
 /// Everything waiting for the model at one boundary.
 pub(crate) struct Drained {
     /// The open call's own answer, when there was one.
     pub own: Option<(ExecId, ToolOutput)>,
-    /// What the notebook said with no call open to carry it.
+    /// What an earlier call's answer left behind.
     pub updates: Vec<(ExecId, ToolOutput)>,
 }
 
 impl Drained {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.own.is_none() && self.updates.is_empty()
-    }
-
     pub(crate) fn into_mcp_result(self) -> Value {
         rho_claude::mcp::exec_result(self.own.map(|(_, output)| output), self.updates)
     }
@@ -81,7 +79,7 @@ impl PythonHost {
             pending: None,
             latest: None,
             progress: Progress::default(),
-            stopped: false,
+            stopped: None,
         }
     }
 
@@ -132,10 +130,17 @@ impl PythonHost {
         None
     }
 
-    /// The user spoke: a stop, if there was one, is lifted.
-    pub(crate) fn user_spoke(&mut self) {
-        self.stopped = false;
+    /// A person or another agent wrote: a stop, if there was one, is lifted.
+    /// The model must be able to call exec, the only way it reads an agent's
+    /// message.
+    pub(crate) fn input_arrived(&mut self) {
+        self.stopped = None;
         self.progress.prose = 0;
+    }
+
+    /// When the agent stopped, while it is stopped.
+    pub(crate) fn stopped_at(&self) -> Option<UnixMs> {
+        self.stopped
     }
 
     /// A CLI result is not a user answer. Prose with no exec triggers a
@@ -147,8 +152,8 @@ impl PythonHost {
         }
     }
 
-    /// The open exec ends the turn: its answer tells the CLI to stop, and
-    /// the idle model is woken only by news.
+    /// The model waits inside the open exec: its cell's return tells it
+    /// nothing, and only news answers the call.
     pub(crate) fn end_turn(&mut self) {
         self.progress.ended = true;
     }
@@ -175,7 +180,10 @@ impl PythonHost {
     }
 
     pub(crate) fn checkin_at(&self) -> Option<UnixMs> {
-        if self.stopped || self.progress.prose >= Progress::MAX_PROSE || self.progress.ended {
+        if self.stopped.is_some()
+            || self.progress.prose >= Progress::MAX_PROSE
+            || self.progress.ended
+        {
             None
         } else {
             self.progress
@@ -185,17 +193,17 @@ impl PythonHost {
     }
 
     pub(crate) fn retire_settled(&self) -> bool {
-        self.stopped
+        self.stopped.is_some()
             || self.progress.prose >= Progress::MAX_PROSE
             || (self.running_tasks() == 0 && self.checkin_at().is_none())
     }
 
     pub(crate) fn can_admit(&self) -> bool {
-        self.pending.is_none() && !self.stopped
+        self.pending.is_none() && self.stopped.is_none()
     }
 
-    pub(crate) fn failed(&mut self, _at: UnixMs, _error: Arc<str>) {
-        self.stopped = true;
+    pub(crate) fn failed(&mut self, at: UnixMs, _error: Arc<str>) {
+        self.stopped = Some(at);
     }
 
     /// Whether an exec call is open, waiting on the wake rules.
@@ -207,12 +215,16 @@ impl PythonHost {
     /// call is open, or the model is idle and can be sent a message. A model
     /// in the middle of a turn with no call open hears everything at its
     /// next call or turn end. `retained_output` is an earlier answer that
-    /// never reached the CLI, which goes out as soon as it can.
+    /// never reached the CLI, which goes out as soon as it can. News from
+    /// before `since` wakes nothing: the model was told of it, or the agent
+    /// stopped after it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decide(
         &mut self,
         available: bool,
         user_oldest_at: Option<UnixMs>,
         agent_oldest_at: Option<UnixMs>,
+        since: Option<UnixMs>,
         archived: bool,
         retained_output: bool,
         now: UnixMs,
@@ -220,15 +232,18 @@ impl PythonHost {
         if !available {
             return Boundary::No { recheck: None };
         }
-        let sources = self.notebook.facts();
         let mut facts = self.progress.facts(
             Some(&self.notebook),
             self.latest.as_ref().map(|(_, cell)| cell),
         );
+        let fresh = |at: &UnixMs| since.is_none_or(|since| *at >= since);
         facts.human = user_oldest_at;
         facts.agent = agent_oldest_at;
+        facts.finished = facts.finished.filter(fresh);
+        facts.notified = facts.notified.filter(fresh);
+        facts.failure = facts.failure.filter(fresh);
         facts.archived = archived;
-        facts.prose_silenced = self.stopped || self.progress.prose >= Progress::MAX_PROSE;
+        facts.prose_silenced = self.stopped.is_some() || self.progress.prose >= Progress::MAX_PROSE;
         // Answer an open call before the CLI's own timeout fails it.
         if self.pending.is_some()
             && let Some(opened) = self.progress.last_response
@@ -243,24 +258,20 @@ impl PythonHost {
             Decision::Later(_) if retained_output => None,
             Decision::Later(recheck) => return Boundary::No { recheck },
         };
-        let running = sources
-            .iter()
-            .filter(|facts| {
-                matches!(
-                    facts.kind,
-                    rho_notebook::Kind::Cell | rho_notebook::Kind::Task
-                ) && facts.finished.is_none()
-            })
-            .count() as u64;
         Boundary::Now {
-            wake: WakeFacts {
-                trigger: why.map_or(WakeTrigger::Delivery, trigger),
-                events: Vec::new(),
-                foreground_running: running,
-                background_running: 0,
-                tools_suppressed: false,
-                checkin_at,
-            },
+            wake: self.wake_facts(why.map_or(WakeTrigger::Delivery, trigger), checkin_at),
+        }
+    }
+
+    /// A wake as the log tells it.
+    pub(crate) fn wake_facts(&self, trigger: WakeTrigger, checkin_at: Option<UnixMs>) -> WakeFacts {
+        WakeFacts {
+            trigger,
+            events: Vec::new(),
+            foreground_running: self.running_tasks() as u64,
+            background_running: 0,
+            tools_suppressed: false,
+            checkin_at,
         }
     }
 
@@ -290,26 +301,6 @@ impl PythonHost {
                 updates: Vec::new(),
             },
         ))
-    }
-
-    /// Everything waiting, for a model with no call open.
-    pub(crate) fn drain_idle(&mut self) -> Drained {
-        let id = self.latest.as_ref().map(|(id, _)| id.clone());
-        Drained {
-            own: None,
-            updates: self
-                .report()
-                .map(|output| {
-                    (
-                        id.unwrap_or_else(|| {
-                            ExecId::try_from("notebook".to_owned()).expect("valid id")
-                        }),
-                        output,
-                    )
-                })
-                .into_iter()
-                .collect(),
-        }
     }
 
     /// The notebook's report, which it forgets once taken.
@@ -342,9 +333,9 @@ impl PythonHost {
     /// Stops every cell and forgets the open call, which the caller answers
     /// or lets the CLI abandon. Until the user speaks again, nothing the
     /// cells say on their way out wakes the model.
-    pub(crate) fn cancel(&mut self, _now: UnixMs) -> Option<PendingExec> {
+    pub(crate) fn cancel(&mut self, now: UnixMs) -> Option<PendingExec> {
         self.notebook.cancel();
-        self.stopped = true;
+        self.stopped = Some(now);
         self.pending.take()
     }
 
@@ -404,7 +395,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Boundary::Now { wake } =
-                host.decide(true, None, None, false, false, UnixMs::now())
+                host.decide(true, None, None, None, false, false, UnixMs::now())
             {
                 return wake;
             }
@@ -439,7 +430,43 @@ mod tests {
         assert!(host.can_admit());
         // Told once: the finished cell does not wake the model again.
         assert!(matches!(
-            host.decide(true, None, None, false, false, UnixMs::now()),
+            host.decide(true, None, None, None, false, false, UnixMs::now()),
+            Boundary::No { .. }
+        ));
+        host.shutdown().await.unwrap();
+    }
+
+    /// With no call open, news the model was told of wakes it once; only
+    /// later news wakes it again.
+    #[tokio::test]
+    async fn news_from_before_since_wakes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path()).await;
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(1),
+                "call".try_into().unwrap(),
+                "notify('hello')".into(),
+                UnixMs::now(),
+            )
+            .is_none()
+        );
+        host.take_pending();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let far = UnixMs::now() + std::time::Duration::from_secs(60);
+        loop {
+            if matches!(
+                host.decide(true, None, None, None, false, false, far),
+                Boundary::Now { .. }
+            ) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never woke");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(matches!(
+            host.decide(true, None, None, Some(far), false, false, far),
             Boundary::No { .. }
         ));
         host.shutdown().await.unwrap();
@@ -463,14 +490,14 @@ mod tests {
         );
         assert!(host.latest.is_none());
         assert!(matches!(
-            host.decide(true, None, None, false, false, UnixMs(11)),
+            host.decide(true, None, None, None, false, false, UnixMs(11)),
             Boundary::No { recheck: None }
         ));
         assert!(matches!(
-            host.decide(true, None, None, false, true, UnixMs(11)),
+            host.decide(true, None, None, None, false, true, UnixMs(11)),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::Delivery
         ));
-        host.user_spoke();
+        host.input_arrived();
         assert!(host.can_admit());
         host.shutdown().await.unwrap();
     }
@@ -484,21 +511,29 @@ mod tests {
             assert_eq!(host.prose_correction(), count < Progress::MAX_PROSE);
         }
         assert!(matches!(
-            host.decide(true, None, Some(UnixMs(0)), false, false, UnixMs(100_000)),
+            host.decide(
+                true,
+                None,
+                Some(UnixMs(0)),
+                None,
+                false,
+                false,
+                UnixMs(100_000)
+            ),
             Boundary::No { recheck: None }
         ));
         assert_eq!(host.checkin_at(), None);
-        host.user_spoke();
+        host.input_arrived();
         assert!(!host.prose_correction());
         assert!(matches!(
-            host.decide(true, None, Some(UnixMs(0)), false, false, UnixMs(100_000)),
+            host.decide(true, None, Some(UnixMs(0)), None, false, false, UnixMs(100_000)),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::AgentMessage
         ));
         host.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn an_ended_turn_still_answers_its_call_then_wakes_only_for_news() {
+    async fn a_cell_that_ended_the_turn_holds_its_call_until_news() {
         let temp = tempfile::tempdir().unwrap();
         let mut host = host(temp.path()).await;
         let t0 = UnixMs::now().0;
@@ -513,21 +548,27 @@ mod tests {
             .is_none()
         );
         host.end_turn();
-        let wake = settle(&mut host).await;
-        assert_eq!(wake.trigger, WakeTrigger::Finished);
-        assert!(host.answer_pending().is_some());
-        assert!(host.ended(), "the answer carries the end of the turn");
-        host.acknowledge();
-        host.turn_ended(UnixMs(t0 + 1_000), true);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while host.running_tasks() > 0 {
+            assert!(tokio::time::Instant::now() < deadline, "never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Its return tells the model nothing; the call stays open.
         assert_eq!(host.checkin_at(), None);
         assert!(matches!(
-            host.decide(true, None, None, false, false, UnixMs(t0 + 1_000_000)),
-            Boundary::No { recheck: None }
+            host.decide(true, None, None, None, false, false, UnixMs(t0 + 1_000_000)),
+            Boundary::No { .. }
         ));
+        assert!(host.has_pending());
+        // News answers it, with what the cell printed.
         assert!(matches!(
-            host.decide(true, None, Some(UnixMs(t0 + 2_000)), false, false, UnixMs(t0 + 1_000_000)),
+            host.decide(true, None, Some(UnixMs(t0 + 2_000)), None, false, false, UnixMs(t0 + 1_000_000)),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::AgentMessage
         ));
+        let (_, drained) = host.answer_pending().unwrap();
+        let (_, output) = drained.own.unwrap();
+        assert!(output.output.contains("done"), "{}", output.output);
+        host.acknowledge();
         // The next exec is a new turn.
         assert!(
             host.exec(
@@ -566,11 +607,11 @@ mod tests {
         let limit =
             UnixMs(10_000) + (rho_claude::mcp::EXEC_TIMEOUT - std::time::Duration::from_secs(60));
         assert!(matches!(
-            host.decide(true, None, None, false, false, UnixMs(limit.0 - 1)),
+            host.decide(true, None, None, None, false, false, UnixMs(limit.0 - 1)),
             Boundary::No { recheck: Some(at) } if at == limit
         ));
         assert!(matches!(
-            host.decide(true, None, None, false, false, limit),
+            host.decide(true, None, None, None, false, false, limit),
             Boundary::Now { wake } if wake.trigger == WakeTrigger::Checkin
         ));
         host.shutdown().await.unwrap();
@@ -583,13 +624,13 @@ mod tests {
         host.turn_ended(UnixMs(10_000), true);
         assert_eq!(host.checkin_at(), Some(UnixMs(130_000)));
         assert!(matches!(
-            host.decide(true, None, None, false, false, UnixMs(129_999)),
+            host.decide(true, None, None, None, false, false, UnixMs(129_999)),
             Boundary::No {
                 recheck: Some(UnixMs(130_000))
             }
         ));
         assert!(
-            matches!(host.decide(true, None, None, false, false, UnixMs(130_000)), Boundary::Now { wake } if wake.trigger == WakeTrigger::Checkin)
+            matches!(host.decide(true, None, None, None, false, false, UnixMs(130_000)), Boundary::Now { wake } if wake.trigger == WakeTrigger::Checkin)
         );
         host.shutdown().await.unwrap();
     }
@@ -606,7 +647,7 @@ mod tests {
         );
         host.failed(UnixMs(20), Arc::from("stopped"));
         assert!(host.retire_settled());
-        host.user_spoke();
+        host.input_arrived();
         assert!(!host.retire_settled());
         host.shutdown().await.unwrap();
     }

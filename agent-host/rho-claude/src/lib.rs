@@ -339,6 +339,13 @@ impl ClaudeCode {
             return Ok(());
         }
 
+        self.kill().await
+    }
+
+    /// Ends the process at once. Use it while an exec call is open: when its
+    /// transport closes, the CLI reports the call as interrupted and samples
+    /// the model again before it exits. Its session file loses nothing.
+    pub async fn kill(mut self) -> Result<()> {
         self.child.start_kill().context("kill Claude Code")?;
         tokio::time::timeout(KILL_EXIT_TIMEOUT, self.wait())
             .await

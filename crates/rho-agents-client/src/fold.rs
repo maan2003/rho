@@ -804,7 +804,7 @@ mod tests {
             agent: me(),
             message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
             text: text.to_owned(),
-            wake: rho_agent_types::InputWake::Person,
+            role: rho_agent_types::Role::User,
             at: UnixMs(at),
         }
     }

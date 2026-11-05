@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId,
+    Address, AgentId, ChatEvent, ChatSeq, ContentPart, Role, Mention, MentionKind, MessageId,
     TopicId, WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
@@ -487,12 +487,12 @@ async fn run_async(args: Args) -> Result<()> {
                             agent,
                             message,
                             text,
-                            wake,
+                            role,
                             ..
                         } => {
                             let message = message.context("an input that is not a message")?;
                             ensure!(
-                                wake == InputWake::Person,
+                                role == Role::User,
                                 "unexpected peer input in isolated proof"
                             );
                             ensure!(!text.is_empty(), "empty user input");

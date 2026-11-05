@@ -120,10 +120,14 @@ fn request_input(request: agent::Request) -> Request {
                 images,
                 reply_to,
             } => {
-                let results =
-                    reply_to.map_or_else(Vec::new, |carry| super::reply(&carry, &text, &images));
+                let results = super::reply(&reply_to, &text, &images);
                 if results.is_empty() {
-                    vec![Item::User { text, images }]
+                    // The provider's replay lost the call: a compaction or
+                    // eviction took it. No call is left to pair the text with.
+                    vec![Item::User {
+                        text: format!("Exec output, not from the user:\n{text}"),
+                        images,
+                    }]
                 } else {
                     results.into_iter().map(Item::Result).collect()
                 }
@@ -192,7 +196,7 @@ mod tests {
                         media_type: "image/png".into(),
                         data: vec![3, 8],
                     }],
-                    reply_to: Some(start),
+                    reply_to: start,
                 },
             ],
             agent::CacheKey::from_u128(2),
@@ -249,12 +253,14 @@ mod tests {
             vec![agent::Item::Report {
                 text: "ordinary update".into(),
                 images: vec![],
-                reply_to: Some(carry),
+                reply_to: carry,
             }],
             agent::CacheKey::from_u128(3),
             agent::Continuation::new("previous".into()),
         ));
         assert_eq!(request.previous_response_id.as_deref(), Some("previous"));
-        assert!(matches!(&request.items[0],Item::User{text,..} if text=="ordinary update"));
+        assert!(
+            matches!(&request.items[0],Item::User{text,..} if text=="Exec output, not from the user:\nordinary update")
+        );
     }
 }

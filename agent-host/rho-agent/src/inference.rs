@@ -101,11 +101,13 @@ pub enum Item {
         exec: Option<String>,
     },
     CompactionTrigger,
+    /// The answer to the open call: everything in the `tool` role.
     Report {
         text: String,
         images: Vec<Image>,
-        reply_to: Option<Carry>,
+        reply_to: Carry,
     },
+    /// What a person typed, and Rho's own words.
     User {
         text: String,
         images: Vec<Image>,

@@ -586,7 +586,7 @@ mod tests {
                                 agent,
                                 message: None,
                                 content: Vec::new(),
-                                wake: rho_agent_types::InputWake::Agent,
+                                role: rho_agent_types::Role::Tool,
                             },
                         },
                     )
@@ -627,7 +627,7 @@ mod tests {
                             content: vec![rho_agent_types::ContentPart::Text {
                                 text: "x".repeat(64 * 1024),
                             }],
-                            wake: rho_agent_types::InputWake::Agent,
+                            role: rho_agent_types::Role::Tool,
                         },
                     },
                 )

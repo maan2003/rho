@@ -78,8 +78,8 @@ async def hand(agent, record: dict) -> None:
     by_user = record["sender"] == chat.USER and any(address == agent.id for address, _ in record["mentions"])
     if chat.topic(record["topic"])["stream"] is not None and (origin or by_user):
         chat.join(record["topic"], agent.id)
-    wake = "person" if record["sender"] == chat.USER else "agent"
-    await asyncio.to_thread(agent.input, render(record, agent.id), wake=wake, message=record["id"])
+    role = "user" if record["sender"] == chat.USER else "tool"
+    await asyncio.to_thread(agent.input, render(record, agent.id), role=role, message=record["id"])
 
 
 def render(record: dict, reader: str) -> str:

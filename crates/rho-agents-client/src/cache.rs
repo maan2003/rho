@@ -774,7 +774,7 @@ pub fn flush() {
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{
-        Address, ContentPart, InputWake, Mention, MentionKind, StreamId, UnixMs, WorksetId,
+        Address, ContentPart, Mention, MentionKind, Role, StreamId, UnixMs, WorksetId,
     };
 
     use super::*;
@@ -855,7 +855,7 @@ mod tests {
             agent,
             message: None,
             text: "go".into(),
-            wake: InputWake::Quiet,
+            role: Role::System,
             at: UnixMs(1),
         }
     }

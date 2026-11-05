@@ -48,6 +48,8 @@ Instructions are recomputed by Python before each request and are not logged
 An input enters a model's context only as an `Input` row, written by the loop
 of the receiving agent. Every input before an agent's request in the log is
 delivered by it, so the receiver writes its own inputs to keep that order true.
+The exception is `tool` text with no call open, which waits for an `exec` result
+([DECISION-roles](../rho-agent/specs/DECISION-roles.md)).
 Tool output is drained at the boundary and carried inside the request, as
 before ([DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sources.md)).
 

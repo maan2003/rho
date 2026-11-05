@@ -414,14 +414,14 @@ mod tests {
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: "queue this".into(),
                 }],
-                wake: rho_agent_types::InputWake::Agent,
+                role: rho_agent_types::Role::Tool,
                 message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))),
             },
         };
         let decoded = decode(&encode(&input).unwrap()).unwrap();
         assert!(matches!(
             decoded,
-            Message::Control { id: 1, body: Control::Input { content, wake: rho_agent_types::InputWake::Agent, message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))) } }
+            Message::Control { id: 1, body: Control::Input { content, role: rho_agent_types::Role::Tool, message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))) } }
             if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this")
         ));
         let cancel = Message::Control {
@@ -540,7 +540,7 @@ mod tests {
                             content: vec![rho_agent_types::ContentPart::Text {
                                 text: "a".repeat(count),
                             }],
-                            wake: rho_agent_types::InputWake::Person,
+                            role: rho_agent_types::Role::User,
                         },
                     }),
                 })

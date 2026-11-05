@@ -1,7 +1,7 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId, StreamId,
+    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, StreamId,
     TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
@@ -44,7 +44,7 @@ fn input(agent: AgentId, message: Option<u64>) -> Record<'static> {
             agent,
             message: message.map(|seq| MessageId(ChatSeq(seq))),
             content: vec![ContentPart::Text { text: "hi".into() }],
-            wake: InputWake::Person,
+            role: Role::User,
         },
     }
 }

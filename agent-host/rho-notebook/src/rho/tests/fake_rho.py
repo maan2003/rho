@@ -18,7 +18,7 @@ class State:
         self.directs = {}  # (a, b), a < b -> topic
         self.topics = {}  # id -> TopicRecord
         self.messages = []  # MessageRecord, in order
-        self.inputs = []  # (agent, text, wake, message)
+        self.inputs = []  # (agent, text, role, message)
         self.calls = []  # (name, args)
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
@@ -72,11 +72,11 @@ def set_spec(agent, spec):
         STATE.agents[agent] = copy.deepcopy(spec)
 
 
-def input(agent, text, *, wake, message=None):
-    assert wake in ("person", "agent", "quiet"), wake
+def input(agent, text, *, role, message=None):
+    assert role in ("user", "tool", "system"), role
     with STATE.lock:
         assert agent in STATE.agents, agent
-        STATE.inputs.append((agent, text, wake, message))
+        STATE.inputs.append((agent, text, role, message))
 
 
 def delivered(agent):

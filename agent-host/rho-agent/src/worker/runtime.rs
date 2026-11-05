@@ -24,11 +24,11 @@ impl Controller {
             },
             Control::Input {
                 content,
-                wake,
+                role,
                 message,
             } => match self {
-                Self::Rho(agent) => agent.input(content, wake, message).await?,
-                Self::Claude(agent) => agent.input(content, wake, message).await?,
+                Self::Rho(agent) => agent.input(content, role, message).await?,
+                Self::Claude(agent) => agent.input(content, role, message).await?,
             },
             Control::TellTail => match self {
                 Self::Rho(agent) => agent.tell_tail(),
