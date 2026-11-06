@@ -48,14 +48,18 @@ def on_turn_end(agent, outcome) -> None:
 
 
 async def deliver(agent) -> None:
-    """Hand the agent what it receives, in order, forever. It resumes after
-    the newest message the agent's log says it was handed. An agent started
-    from a message first joins its topic and is handed that message. A
-    policy with other rules replaces this whole function, and may reuse
-    `hand` and `render`."""
+    """Hand the agent what it receives, in order, forever. It starts after the
+    newest message a request carried, since what the process had waiting died
+    with it. A failure retries after the last message it handed: what the agent
+    has waiting is in no row yet, and must not be handed twice. An agent started
+    from a message first joins its topic and is handed that message. A policy
+    with other rules replaces this whole function, and may reuse `hand` and
+    `render`."""
+    after = None
     while True:
         try:
-            after = _rho.delivered(agent.id)
+            if after is None:
+                after = _rho.delivered(agent.id)
             if after == 0 and (origin := chat.origin_message(agent.props)) is not None:
                 record = chat.message(origin)
                 await hand(agent, record)

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rho_agent_types::ContentPart;
 
-use crate::entry::{Entry, RequestNotice, add_output, compose, plain_text};
+use crate::entry::{RequestNotice, add_output, compose, plain_text};
 use crate::inference::{CacheKey, Carry, Image, Item, Request};
 use crate::record::{Event, Input};
 
@@ -48,10 +48,7 @@ impl Context {
                 }
                 self.compact |= compact;
             }
-            Event::Native {
-                entry: Entry::Step { carry, .. },
-                ..
-            } => {
+            Event::Step { carry, .. } => {
                 self.notices.clear();
                 self.pending = Some(carry.clone());
                 self.output.clear();
@@ -104,11 +101,7 @@ pub(crate) fn request<'a>(
     let mut context = Context::default();
     let mut items = Vec::new();
     for event in events {
-        if let Event::Native {
-            entry: Entry::Step { carry, exec, .. },
-            ..
-        } = event
-        {
+        if let Event::Step { carry, exec, .. } = event {
             // Compaction is an instruction for the current attempt, not a
             // historical conversation item to request again on every replay.
             items.extend(
@@ -149,25 +142,20 @@ mod tests {
     use rho_agent_types::{AgentId, AgentIdDomain, Role};
 
     use super::*;
-    use crate::entry::{Notice, Wake};
+    use crate::entry::Notice;
     use crate::inference::Call;
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(7)).unwrap()
     }
-    fn native(entry: Entry) -> Event<'static> {
-        Event::Native {
-            agent: agent(),
-            entry,
-        }
-    }
     fn response(id: &str) -> Event<'static> {
-        native(Entry::Step {
+        Event::Step {
+            agent: agent(),
             exec: Some("pass".into()),
             prose: String::new(),
             carry: crate::worker::native::scripted::carry(Call::new(id, "pass".into())),
             usage: None,
-        })
+        }
     }
     fn image_part(bytes: Vec<u8>) -> ContentPart {
         ContentPart::Image {
@@ -199,7 +187,6 @@ mod tests {
     ) -> Event<'static> {
         Event::Request {
             agent: agent(),
-            why: Wake::Notify,
             output,
             inputs,
             notices,
@@ -241,12 +228,13 @@ mod tests {
     }
 
     fn prose() -> Event<'static> {
-        native(Entry::Step {
+        Event::Step {
+            agent: agent(),
             exec: None,
             prose: "words".into(),
             carry: crate::inference::Carry::new(serde_json::json!({}), vec![], false),
             usage: None,
-        })
+        }
     }
     fn results(items: &[Item]) -> Vec<String> {
         items
@@ -323,9 +311,10 @@ mod tests {
                 vec![person("steer-left")],
                 vec![RequestNotice::Restarted],
             ),
-            native(Entry::Notice {
+            Event::Notice {
+                agent: agent(),
                 notice: Notice::Error("retry".into()),
-            }),
+            },
             carrying(
                 output("beta", vec![9, 2, 8]),
                 vec![person("steer-right")],
@@ -394,12 +383,13 @@ mod tests {
             ]
         );
 
-        events.push(native(Entry::Step {
+        events.push(Event::Step {
+            agent: agent(),
             exec: None,
             prose: String::new(),
             usage: None,
             carry: Carry::new(serde_json::json!("script-compaction"), vec![], true),
-        }));
+        });
         events.push(carrying(
             Vec::new(),
             vec![person("after-compaction")],

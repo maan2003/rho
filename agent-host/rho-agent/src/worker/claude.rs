@@ -20,19 +20,19 @@ use uuid::Uuid;
 use crate::entry::{Notice, RequestNotice, Wake, compose, output_content};
 use crate::inference::Inference;
 use crate::log::ClaudeRewind;
-use crate::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
+use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
 use crate::worker::shared::waiting::Waiting;
-use crate::{AgentStatus, InferenceState, RuntimeState, TranscriptLine};
+use crate::{AgentStatus, InferenceState, RuntimeState};
 
 pub(crate) mod projection;
 pub(crate) mod python_host;
 
 use projection::{
-    ClaudeStreamItem, Projection, assistant_row, compacted_row, live_response, user_row,
+    ClaudeStreamItem, Line, Projection, assistant_row, compacted_row, live_response, user_row,
 };
 
 #[derive(Clone)]
@@ -182,7 +182,8 @@ pub(crate) struct ClaudeLoop {
     waiting: Waiting,
     /// Why the notebook last spoke, until the transcript row it produced
     /// arrives to carry it.
-    python_wake: Option<crate::WakeFacts>,
+    /// The call a request answered last: its row holds what the echo says.
+    answered: Option<rho_agent_types::transcript::ExecId>,
     /// When the boundary said to ask it again, if it can change by itself.
     python_recheck: Option<UnixMs>,
     pending_response: PendingInferenceResponse,
@@ -367,9 +368,9 @@ impl ClaudeLoop {
                     session_id,
                     ..rewind
                 };
-                host.append(Event::Claude {
+                host.append(Event::RewindPending {
                     agent: agent_id,
-                    row: ClaudeRow::RewindPending(Some(rewind.clone())),
+                    rewind: Some(rewind.clone()),
                 })
                 .await?;
                 let source = rho_claude::read_session_messages_by_id(
@@ -432,7 +433,7 @@ impl ClaudeLoop {
             ended: false,
             archived,
             waiting: Waiting::default(),
-            python_wake: None,
+            answered: None,
             python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
             response_id: None,
@@ -593,8 +594,7 @@ impl ClaudeLoop {
                 || (self.execution_generation != initial_execution_generation
                     && !current.is_working());
             if settled && let InferenceState::Failed { error } = &current.inference {
-                self.claude_row(ClaudeRow::Notice(Notice::Stopped(error.clone())))
-                    .await?;
+                self.notice(Notice::Stopped(error.clone())).await?;
             }
             if settled && std::mem::take(&mut self.ended) {
                 self.turn_ended(TurnEnd::EndTurn, None);
@@ -618,6 +618,7 @@ impl ClaudeLoop {
         match control {
             ClaudeControl::Retire(reply) => {
                 if self.snapshot().settled()
+                    && self.waiting.is_empty()
                     && (self.archived
                         || self
                             .python
@@ -663,18 +664,8 @@ impl ClaudeLoop {
                 }];
                 // A model waiting in its call would never get to the command.
                 if self.waiting_in_call() {
-                    let wake = self
-                        .python
-                        .as_ref()
-                        .expect("a call is open")
-                        .wake_facts(crate::WakeTrigger::Asked, None);
                     return self
-                        .request(
-                            Wake::Compaction,
-                            vec![RequestNotice::NothingNew],
-                            Some(wake),
-                            Some(compact),
-                        )
+                        .request(vec![RequestNotice::NothingNew], Some(compact))
                         .await;
                 }
                 if let Err(error) = self.ensure_process().await {
@@ -749,12 +740,7 @@ impl ClaudeLoop {
         {
             return Ok(());
         }
-        let why = if person {
-            Wake::Message
-        } else {
-            Wake::AgentMessage
-        };
-        self.request(why, Vec::new(), None, None).await
+        self.request(Vec::new(), None).await
     }
 
     /// Sends one request: it pulls what the notebook has said and what waits,
@@ -765,9 +751,7 @@ impl ClaudeLoop {
     /// has it.
     async fn request(
         &mut self,
-        why: Wake,
         mut notices: Vec<RequestNotice>,
-        wake: Option<crate::WakeFacts>,
         command: Option<Vec<ContentPart>>,
     ) -> anyhow::Result<()> {
         let mut steps = Steps::new();
@@ -836,11 +820,10 @@ impl ClaudeLoop {
             }
         }
         steps.mark("written");
-        self.python_wake = wake;
+        self.answered = handed.clone();
         self.host
             .append(Event::Request {
                 agent: self.agent_id,
-                why,
                 output: taken.output,
                 inputs: taken.inputs,
                 notices,
@@ -860,7 +843,7 @@ impl ClaudeLoop {
     }
 
     /// The boundary says to look, with no call open.
-    async fn wake_idle_model(&mut self, why: Wake, wake: crate::WakeFacts) -> anyhow::Result<()> {
+    async fn wake_idle_model(&mut self, why: Wake) -> anyhow::Result<()> {
         let person = self.waiting.oldest(Role::User).is_some();
         let correction = self
             .python
@@ -875,8 +858,7 @@ impl ClaudeLoop {
         } else {
             Some(RequestNotice::NothingNew)
         };
-        self.request(why, notice.into_iter().collect(), Some(wake), None)
-            .await
+        self.request(notice.into_iter().collect(), None).await
     }
 
     /// Writes one turn to the running process. A failed write fails the
@@ -914,11 +896,11 @@ impl ClaudeLoop {
         }
     }
 
-    async fn claude_row(&self, row: ClaudeRow) -> anyhow::Result<()> {
+    async fn notice(&self, notice: Notice) -> anyhow::Result<()> {
         self.host
-            .append(Event::Claude {
+            .append(Event::Notice {
                 agent: self.agent_id,
-                row,
+                notice,
             })
             .await?;
         Ok(())
@@ -942,7 +924,7 @@ impl ClaudeLoop {
             Outbound::EndTurn => {}
             Outbound::Archive => {
                 self.archived = true;
-                self.claude_row(ClaudeRow::Notice(Notice::Archived)).await?;
+                self.notice(Notice::Archived).await?;
                 self.close_process().await?;
                 if let Some(mut python) = self.python.take() {
                     python.shutdown().await?;
@@ -972,8 +954,7 @@ impl ClaudeLoop {
     async fn fresh_notebook(&mut self) -> anyhow::Result<()> {
         self.archived = false;
         self.python = None;
-        self.claude_row(ClaudeRow::Notice(Notice::FreshNotebook))
-            .await?;
+        self.notice(Notice::FreshNotebook).await?;
         self.published();
         Ok(())
     }
@@ -1216,13 +1197,13 @@ impl ClaudeLoop {
                 agent: self.agent_id,
                 to,
             },
-            Event::Claude {
+            Event::RewindPending {
                 agent: self.agent_id,
-                row: ClaudeRow::RewindPending(Some(ClaudeRewind {
+                rewind: Some(ClaudeRewind {
                     source_session_id,
                     session_id: new_session_id,
                     resume_at,
-                })),
+                }),
             },
         ])
         .await?;
@@ -1647,13 +1628,15 @@ impl ClaudeLoop {
                             )
                         } else {
                             let now = UnixMs::now();
-                            self.claude_row(ClaudeRow::ExecAdmitted {
-                                call: rho_agent_types::transcript::ExecCall {
-                                    id: exec_id.clone(),
-                                    source: source.clone(),
-                                },
-                            })
-                            .await?;
+                            self.host
+                                .append(Event::ExecAdmitted {
+                                    agent: self.agent_id,
+                                    call: rho_agent_types::transcript::ExecCall {
+                                        id: exec_id.clone(),
+                                        source: source.clone(),
+                                    },
+                                })
+                                .await?;
                             match self.python.as_mut().expect("checked above").exec(
                                 request_id.clone(),
                                 id,
@@ -1713,7 +1696,7 @@ impl ClaudeLoop {
             return Ok(());
         };
         let open = host.has_pending();
-        let (why, wake) = match host.decide(
+        let why = match host.decide(
             open || idle,
             self.waiting.oldest(Role::User),
             self.waiting.oldest(Role::Tool),
@@ -1724,12 +1707,12 @@ impl ClaudeLoop {
                 self.python_recheck = recheck;
                 return Ok(());
             }
-            python_host::Boundary::Now { why, wake } => (why, wake),
+            python_host::Boundary::Now { why } => why,
         };
         self.python_recheck = None;
         if !open {
             return if idle {
-                self.wake_idle_model(why, wake).await
+                self.wake_idle_model(why).await
             } else {
                 Ok(())
             };
@@ -1739,14 +1722,14 @@ impl ClaudeLoop {
         // model with no call open.
         if self.waiting_in_call() && self.launched.as_ref() != Some(&self.launch().await?) {
             self.release_waiting_call().await?;
-            return self.wake_idle_model(why, wake).await;
+            return self.wake_idle_model(why).await;
         }
         let notice = if why == Wake::Checkin {
             RequestNotice::Checkin
         } else {
             RequestNotice::NothingNew
         };
-        self.request(why, vec![notice], Some(wake), None).await
+        self.request(vec![notice], None).await
     }
 
     /// Stops the notebook's cells and answers an open exec call as
@@ -1817,20 +1800,37 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    /// One row of the conversation, from the stream: appended, with why
-    /// the notebook spoke when the row is what it said.
-    async fn tell_line(&mut self, uuid: Uuid, line: TranscriptLine) -> anyhow::Result<()> {
-        // The notebook's reason for speaking rides on the row it produced:
-        // an exec call's results, or the message of output an idle model
-        // was woken with.
-        let wake = match &line {
-            TranscriptLine::ToolResults { .. } | TranscriptLine::User { .. } => {
-                self.python_wake.take()
+    /// One row of the conversation, from the stream.
+    async fn tell_line(&mut self, uuid: Uuid, line: Line) -> anyhow::Result<()> {
+        let agent = self.agent_id;
+        let event = match line {
+            Line::Reply {
+                text,
+                calls,
+                usage,
+                context_used,
+            } => Event::ClaudeReply {
+                agent,
+                text,
+                calls,
+                usage,
+                context_used,
+            },
+            Line::Echo => Event::ClaudeEcho { agent, uuid },
+            Line::Results { mut results } => {
+                results.retain(|result| self.answered.as_ref() != Some(&result.call_id));
+                if results.is_empty() {
+                    return Ok(());
+                }
+                Event::ClaudeResults { agent, results }
             }
-            TranscriptLine::Assistant { .. } | TranscriptLine::Compacted { .. } => None,
+            Line::Compacted { context_used } => Event::ClaudeCompacted {
+                agent,
+                context_used,
+            },
         };
-        self.claude_row(ClaudeRow::Transcript { uuid, line, wake })
-            .await
+        self.host.append(event).await?;
+        Ok(())
     }
 
     /// The block's row is in: its streamed copy leaves the tail, which
@@ -1915,12 +1915,17 @@ impl ClaudeLoop {
             ClaudeStartMode::Resume => return Ok(()),
         };
         self.session_id = Uuid::new_v4();
-        self.claude_row(ClaudeRow::RewindPending(Some(ClaudeRewind {
-            source_session_id,
-            session_id: self.session_id,
-            resume_at,
-        })))
-        .await
+        self.host
+            .append(Event::RewindPending {
+                agent: self.agent_id,
+                rewind: Some(ClaudeRewind {
+                    source_session_id,
+                    session_id: self.session_id,
+                    resume_at,
+                }),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn recover_pending_rewind(&mut self) -> anyhow::Result<()> {
@@ -2206,12 +2211,12 @@ fn archived_in(rows: &[(Wpos, Record<'_>)]) -> bool {
     let mut archived = false;
     for (_, record) in rows {
         match &record.event {
-            Event::Claude {
-                row: ClaudeRow::Notice(Notice::Archived),
+            Event::Notice {
+                notice: Notice::Archived,
                 ..
             } => archived = true,
-            Event::Claude {
-                row: ClaudeRow::Notice(Notice::FreshNotebook),
+            Event::Notice {
+                notice: Notice::FreshNotebook,
                 ..
             } => archived = false,
             _ => {}
@@ -2235,15 +2240,7 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Option
     let echo = rows[index..]
         .iter()
         .find_map(|(_, record)| match &record.event {
-            Event::Claude {
-                row:
-                    ClaudeRow::Transcript {
-                        uuid,
-                        line: TranscriptLine::User { .. },
-                        ..
-                    },
-                ..
-            } => Some(*uuid),
+            Event::ClaudeEcho { uuid, .. } => Some(*uuid),
             _ => None,
         });
     Some((rows[index].0, echo))
@@ -2290,9 +2287,9 @@ async fn finish_rewind(
         },
         Record {
             at,
-            event: Event::Claude {
+            event: Event::RewindPending {
                 agent,
-                row: ClaudeRow::RewindPending(None),
+                rewind: None,
             },
         },
     ])
@@ -2407,21 +2404,11 @@ mod tests {
     }
 
     fn echo(agent: AgentId, uuid: Uuid) -> Event<'static> {
-        Event::Claude {
-            agent,
-            row: ClaudeRow::Transcript {
-                uuid,
-                line: TranscriptLine::User { text: "x".into() },
-                wake: None,
-            },
-        }
+        Event::ClaudeEcho { agent, uuid }
     }
 
     fn notice(agent: AgentId, notice: Notice) -> Event<'static> {
-        Event::Claude {
-            agent,
-            row: ClaudeRow::Notice(notice),
-        }
+        Event::Notice { agent, notice }
     }
 
     #[tokio::test]

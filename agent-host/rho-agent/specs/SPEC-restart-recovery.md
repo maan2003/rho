@@ -52,9 +52,8 @@ It emits, ahead of everything the sources drain:
 
 Settling at the first request rather than at load means reading history never
 writes placeholder tool answers, and it puts the note beside the request it
-explains. It also makes recovery idempotent: those call ids appear in a
-`ToolResults` block of the resulting `NativeEvent::RequestStarted`, so a second restart
-derives an `owed` without them.
+explains. It also makes recovery idempotent: the resulting `Request` answers
+those calls, so a second restart derives an `owed` without them.
 
 Nothing else may consume `owed`. In particular `boundary` never reads it: what a
 request must carry is not a reason to make one.

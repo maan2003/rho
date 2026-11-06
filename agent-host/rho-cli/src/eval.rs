@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent::entry::Entry;
-use rho_agent::log::TranscriptLine;
-use rho_agent::record::{ClaudeRow, Event};
+use rho_agent::entry::{compose, plain_text};
+use rho_agent::record::Event;
 use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
 use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::snippets;
@@ -422,23 +421,60 @@ impl Watch<'_> {
                         if let Some(stop) = self.request(agent, pos)? {
                             return Ok(Some(stop));
                         }
-                        let carry =
-                            rho_inference::transcript::carry_before(&self.db.read(), agent, pos);
-                        let results = rho_inference::transcript::report_results(
-                            carry.as_ref(),
-                            &notices,
-                            &output,
-                            &inputs,
-                        );
-                        for result in results {
+                        let result = compose(true, &notices, &output, &inputs).result;
+                        if !result.is_empty() {
                             emit(
-                                json!({"type":"notebook_report", "agent":format!("{agent:?}"), "id":result.display_id(), "output":result.text}),
+                                json!({"type":"notebook_report", "agent":format!("{agent:?}"), "output":plain_text(&result)}),
                             )?;
                         }
                         Ok(None)
                     }
-                    Event::Native { agent, entry } => self.entry(agent, entry),
-                    Event::Claude { agent, row } => self.claude(agent, row),
+                    Event::Step {
+                        agent,
+                        carry,
+                        usage,
+                        ..
+                    } => {
+                        let name = format!("{agent:?}");
+                        for call in carry.display_calls() {
+                            self.calls.insert("exec".to_owned());
+                            emit(
+                                json!({"type":"tool_call", "agent":name, "id":call.display_id(), "name":"exec", "arguments":call.code}),
+                            )?;
+                        }
+                        if let Some(usage) = usage {
+                            self.usage(
+                                &name,
+                                usage.input_tokens,
+                                usage.cache_read_tokens,
+                                usage.output_tokens,
+                            )?;
+                        }
+                        Ok(None)
+                    }
+                    Event::ClaudeReply {
+                        agent,
+                        calls,
+                        usage,
+                        ..
+                    } => {
+                        let name = format!("{agent:?}");
+                        for call in calls {
+                            self.calls.insert(call.name.clone());
+                            emit(
+                                json!({"type":"tool_call", "agent":name, "id":call.id, "name":call.name, "arguments":call.arguments}),
+                            )?;
+                        }
+                        if let Some(usage) = usage {
+                            self.usage(
+                                &name,
+                                usage.input_tokens,
+                                usage.cache_read_tokens,
+                                usage.output_tokens,
+                            )?;
+                        }
+                        Ok(None)
+                    }
                     _ => Ok(None),
                 }
             }
@@ -470,56 +506,6 @@ impl Watch<'_> {
             }
             Appended::Row { .. } | Appended::WorksetDeleted(_) => Ok(None),
         }
-    }
-
-    fn entry(&mut self, agent_id: AgentId, entry: Entry) -> Result<Option<String>> {
-        // Agents it spawns are part of the run: their work and tokens count.
-        let agent = format!("{agent_id:?}");
-        match entry {
-            Entry::Step { carry, usage, .. } => {
-                for call in carry.display_calls() {
-                    self.calls.insert("exec".to_owned());
-                    emit(
-                        json!({"type":"tool_call", "agent":agent, "id":call.display_id(), "name":"exec", "arguments":call.code}),
-                    )?;
-                }
-                if let Some(usage) = usage {
-                    self.usage(
-                        &agent,
-                        usage.input_tokens,
-                        usage.cache_read_tokens,
-                        usage.output_tokens,
-                    )?;
-                }
-            }
-            Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
-        }
-        Ok(None)
-    }
-
-    fn claude(&mut self, agent_id: AgentId, row: ClaudeRow) -> Result<Option<String>> {
-        let agent = format!("{agent_id:?}");
-        if let ClaudeRow::Transcript {
-            line: TranscriptLine::Assistant { calls, usage, .. },
-            ..
-        } = row
-        {
-            for call in calls {
-                self.calls.insert(call.name.clone());
-                emit(
-                    json!({"type":"tool_call", "agent":agent, "id":call.id, "name":call.name, "arguments":call.arguments}),
-                )?;
-            }
-            if let Some(usage) = usage {
-                self.usage(
-                    &agent,
-                    usage.input_tokens,
-                    usage.cache_read_tokens,
-                    usage.output_tokens,
-                )?;
-            }
-        }
-        Ok(None)
     }
 
     /// A request went: counted, and for the task's agent checkpointed and

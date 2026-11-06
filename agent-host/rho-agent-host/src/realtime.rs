@@ -270,19 +270,13 @@ fn stopped_at(
     workset: rho_agent_types::WorksetId,
     pos: rho_agent_types::Wpos,
 ) -> Option<String> {
-    use rho_agent::entry::{Entry, Notice};
-    use rho_agent::record::{ClaudeRow, Event};
+    use rho_agent::entry::Notice;
+    use rho_agent::record::Event;
     let record = services.pool.db().read().workset_row(workset, pos)?;
     match record.event {
-        Event::Native {
+        Event::Notice {
             agent,
-            entry: Entry::Notice {
-                notice: Notice::Stopped(error),
-            },
-        }
-        | Event::Claude {
-            agent,
-            row: ClaudeRow::Notice(Notice::Stopped(error)),
+            notice: Notice::Stopped(error),
         } if agent == agent_id => Some(error),
         _ => None,
     }

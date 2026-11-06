@@ -11,7 +11,7 @@ run on the asyncio loop of the caller's thread.
 
 from typing import Literal, TypedDict
 
-Wake = Literal["person", "agent", "quiet"]
+Role = Literal["user", "tool", "system"]
 
 class NativeRuntime(TypedDict):
     kind: Literal["native"]
@@ -85,17 +85,21 @@ def agents() -> dict[str, Spec]:
 def set_spec(agent: str, spec: Spec) -> None:
     """Log `AgentChanged` with the whole new spec. A model change keeps the
     cache key and the Claude session."""
-def input(agent: str, text: str, *, wake: Wake, message: int | None = None) -> None:
-    """Queue an input for the agent. Its loop logs the `Input` row; this
-    returns once that row is durable. `message` names the chat message it
-    hands over."""
+def input(agent: str, text: str, *, role: Role, message: int | None = None) -> None:
+    """Give the agent an input: it waits in memory until a request can carry
+    it, and that request's row holds it. This returns once the agent has it. A
+    crash loses it unless it is a chat message, which is handed again. `role`
+    says who speaks: "user" for what a person typed, "tool" for anything else
+    nobody at Rho wrote, "system" for Rho's own words. `message` names the chat
+    message it hands over."""
 def delivered(agent: str) -> int:
-    """The newest message id handed to the agent by `input`, or 0."""
+    """The newest message id a request carried to the agent, or 0. What waits
+    in the agent is not counted."""
 def cancel(agent: str) -> None: ...
 def compact(agent: str) -> None: ...
 def rewind(agent: str, turns: int) -> None:
-    """Branch the agent's history before its `turns`-th last input from the
-    user. The notebook stays."""
+    """Branch the agent's history before its `turns`-th last request that
+    carried a person's input. The notebook stays."""
 def new_cache_key(agent: str) -> None:
     """Give a native agent a fresh prompt cache key (an `AgentChanged`)."""
 

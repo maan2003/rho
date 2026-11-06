@@ -862,7 +862,7 @@ mod tests {
                 text: "go".into(),
                 role: Role::System,
             }],
-            calls: Vec::new(),
+            answers: true,
             compaction: false,
             at: UnixMs(1),
         }

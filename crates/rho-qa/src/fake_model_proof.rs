@@ -76,7 +76,7 @@ struct Children(Vec<Child>);
 #[derive(Clone)]
 enum ExpectedDetail {
     Response(Vec<rho_agents_client::protocol::transcript::Item>),
-    Report(Vec<String>),
+    Report,
 }
 
 impl Drop for Children {
@@ -237,7 +237,8 @@ async fn run_async(args: Args) -> Result<()> {
     let mut awaiting = HashSet::new();
     let mut posted = HashSet::new();
     let mut delivered_ids = HashSet::new();
-    let mut reported_calls = HashSet::new();
+    let mut reported_calls = 0;
+    let mut open_calls = HashSet::new();
     let mut messages_sent = 0usize;
     let mut reported_output_sizes = Vec::new();
     let mut pending_details = HashMap::new();
@@ -276,7 +277,7 @@ async fn run_async(args: Args) -> Result<()> {
                 calls,
                 compacted,
                 clarifying,
-                reported_calls.len(),
+                reported_calls,
                 messages_sent,
                 &latencies,
             ))
@@ -484,7 +485,7 @@ async fn run_async(args: Args) -> Result<()> {
                         LogEvent::Request {
                             agent,
                             inputs,
-                            calls: answered,
+                            answers,
                             at,
                             ..
                         } => {
@@ -501,15 +502,9 @@ async fn run_async(args: Args) -> Result<()> {
                                     "message delivered twice"
                                 );
                             }
-                            for id in &answered {
-                                ensure!(
-                                    reported_calls.insert((agent, id.clone())),
-                                    "provider call was answered twice"
-                                );
-                            }
-                            if !answered.is_empty() {
-                                pending_details
-                                    .insert((workset, pos), ExpectedDetail::Report(answered));
+                            if answers && open_calls.remove(&agent) {
+                                reported_calls += 1;
+                                pending_details.insert((workset, pos), ExpectedDetail::Report);
                                 client
                                     .send(&ClientFrame::Detail {
                                         workset,
@@ -537,10 +532,14 @@ async fn run_async(args: Args) -> Result<()> {
                                 .context("Replied without preceding Request")?;
                             latencies.push(at.saturating_duration_since(*started));
                             replies += 1;
-                            calls += items
+                            let called = items
                                 .iter()
                                 .filter(|item| matches!(item, Item::ToolCall { .. }))
                                 .count();
+                            calls += called;
+                            if called > 0 {
+                                open_calls.insert(agent);
+                            }
                             compacted += u64::from(did_compact);
                             if !items.is_empty() {
                                 ensure!(
@@ -584,28 +583,19 @@ async fn run_async(args: Args) -> Result<()> {
                             "response detail did not match visible code calls"
                         );
                     }
-                    (ExpectedDetail::Report(ids), DetailBody::Results(results)) => {
-                        ensure!(results.len() == ids.len(), "report detail omitted calls");
-                        for (result, id) in results.iter().zip(ids) {
+                    (ExpectedDetail::Report, DetailBody::Report(output)) => {
+                        ensure!(
+                            !output.is_empty(),
+                            "empty notebook report for a provider call"
+                        );
+                        if args.scenario == Scenario::RealToolRounds {
+                            let step = reported_output_sizes.len() + 1;
                             ensure!(
-                                result.id == id,
-                                "report detail named a different provider call"
+                                output.contains(&format!("rho-e2e-step-{step}:ok")),
+                                "real shell command did not report its expected step marker"
                             );
-                            ensure!(result.status == rho_agents_client::protocol::transcript::ToolStatus::Reported,
-                                "notebook report was mistaken for a successful tool result");
-                            ensure!(
-                                !result.output.is_empty(),
-                                "empty notebook report for a provider call"
-                            );
-                            if args.scenario == Scenario::RealToolRounds {
-                                let step = reported_output_sizes.len() + 1;
-                                ensure!(
-                                    result.output.contains(&format!("rho-e2e-step-{step}:ok")),
-                                    "real shell command did not report its expected step marker"
-                                );
-                            }
-                            reported_output_sizes.push(result.output.len());
                         }
+                        reported_output_sizes.push(output.len());
                     }
                     _ => bail!("agent host Detail body did not match its row"),
                 }
@@ -689,7 +679,7 @@ async fn run_async(args: Args) -> Result<()> {
             calls,
             compacted,
             clarifying,
-            reported_calls: reported_calls.len(),
+            reported_calls: reported_calls,
             messages_sent,
             latencies: &latencies,
             model_result_max: metrics.max_input_tool_output_bytes,
@@ -709,7 +699,7 @@ async fn run_async(args: Args) -> Result<()> {
         calls,
         compacted,
         clarifying,
-        reported_calls.len(),
+        reported_calls,
         messages_sent,
         delivered_ids.len(),
         metrics.max_input_tool_output_bytes,

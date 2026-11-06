@@ -33,24 +33,6 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
-/// How one call ended. The output is a body; ask for it by position.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct ToolOutcome {
-    pub id: String,
-    pub status: ToolStatus,
-    pub started_at: UnixMs,
-    pub finished_at: UnixMs,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum ToolStatus {
-    Success,
-    /// A notebook report was delivered; the underlying task may continue.
-    Reported,
-    Error,
-    Cancelled,
-}
-
 /// What a runtime has that the log does not yet, told as it changes:
 /// the response in flight and the phase. Everything else a reader wants
 /// is a row: the queue is `Message` rows no `Sent` has carried, a call
@@ -159,7 +141,9 @@ pub enum TextPhase {
 pub enum DetailBody {
     /// The event is not there, or has no body worth asking for.
     Nothing,
-    /// A `Sent`: the results, output and all.
+    /// A `Request`: what it answers the open call with.
+    Report(String),
+    /// A `CallsEnded`: what the calls came back with.
     Results(Vec<DetailResult>),
     /// A `Replied`: the response whole, reasoning and arguments included.
     Response(Vec<Item>),
@@ -168,7 +152,5 @@ pub enum DetailBody {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct DetailResult {
     pub id: String,
-    pub status: ToolStatus,
     pub output: String,
-    pub error: Option<String>,
 }

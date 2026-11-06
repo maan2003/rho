@@ -24,7 +24,7 @@ use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::entry::{Entry, Notice, RequestNotice, ResponseUsage, Wake, output_content};
+use crate::entry::{Notice, RequestNotice, ResponseUsage, Wake, output_content};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey, Request,
@@ -408,10 +408,7 @@ impl Agent {
         for (_, record) in rows {
             match &record.event {
                 Event::Request { .. } => self.compaction_owed = false,
-                Event::Native {
-                    entry: Entry::Step { carry, .. },
-                    ..
-                } if carry.has_compaction() => self.compaction_owed = true,
+                Event::Step { carry, .. } if carry.has_compaction() => self.compaction_owed = true,
                 _ => {}
             }
         }
@@ -558,11 +555,12 @@ impl Agent {
         Ok(())
     }
 
-    /// Nothing in motion, nothing waiting to be seen.
+    /// Nothing in motion and nothing waiting, even what the model was told
+    /// of: what waits is in memory, and unloading would lose it.
     fn settled(&self) -> bool {
         !self.responding
             && self.backoff.is_none()
-            && !self.waiting.has_news()
+            && self.waiting.is_empty()
             && self.notebook.as_ref().is_none_or(|notebook| {
                 notebook
                     .facts()
@@ -638,16 +636,19 @@ impl Agent {
 
     async fn compact(&mut self) -> anyhow::Result<()> {
         if !self.archived && !self.compaction.pending {
-            self.append(Entry::CompactionTrigger { manual: true })
-                .await?;
+            self.log(Event::CompactionTrigger {
+                agent: self.agent_id,
+                manual: true,
+            })
+            .await?;
         }
         Ok(())
     }
 
-    async fn append(&mut self, entry: Entry) -> anyhow::Result<()> {
-        self.log(Event::Native {
+    async fn notice(&mut self, notice: Notice) -> anyhow::Result<()> {
+        self.log(Event::Notice {
             agent: self.agent_id,
-            entry,
+            notice,
         })
         .await
     }
@@ -670,15 +671,14 @@ impl Agent {
                 self.compaction
                     .observe_request(*compact, !notices.is_empty());
             }
-            Event::Native { entry, .. } => {
-                if let Entry::Step { carry, .. } = entry {
-                    self.continuation = None;
-                    if carry.has_compaction() {
-                        self.compaction_owed = true;
-                    }
+            Event::Step { carry, usage, .. } => {
+                self.continuation = None;
+                if carry.has_compaction() {
+                    self.compaction_owed = true;
                 }
-                self.compaction.observe(entry);
+                self.compaction.observe_step(carry, usage.as_ref());
             }
+            Event::CompactionTrigger { manual, .. } => self.compaction.observe_trigger(*manual),
             _ => {}
         }
         Ok(())
@@ -721,10 +721,7 @@ impl Agent {
         self.fresh = true;
         self.cell = None;
         self.progress = Progress::default();
-        self.append(Entry::Notice {
-            notice: Notice::FreshNotebook,
-        })
-        .await
+        self.notice(Notice::FreshNotebook).await
     }
 
     async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
@@ -738,10 +735,7 @@ impl Agent {
                 }
                 self.cell = None;
                 self.awaiting = false;
-                self.append(Entry::Notice {
-                    notice: Notice::Archived,
-                })
-                .await?;
+                self.notice(Notice::Archived).await?;
                 self.turn_ended(TurnEnd::Archived, None);
                 Ok(())
             }
@@ -852,10 +846,6 @@ impl Agent {
         }
         let mut notices = Vec::new();
         if self.restarted {
-            self.append(Entry::Notice {
-                notice: Notice::Restarted,
-            })
-            .await?;
             notices.push(RequestNotice::Restarted);
         }
         match why {
@@ -917,12 +907,14 @@ impl Agent {
             .is_some_and(|used| used >= AUTO_COMPACT_TOKENS)
             && !self.compaction.pending
         {
-            self.append(Entry::CompactionTrigger { manual: false })
-                .await?;
+            self.log(Event::CompactionTrigger {
+                agent: self.agent_id,
+                manual: false,
+            })
+            .await?;
         }
         self.log(Event::Request {
             agent: self.agent_id,
-            why,
             output: taken.output,
             inputs: taken.inputs,
             notices,
@@ -1040,10 +1032,7 @@ impl Agent {
                 Err(error) => {
                     let retryable = crate::inference::is_retryable(&error);
                     let error = format!("{error:#}");
-                    self.append(Entry::Notice {
-                        notice: Notice::Error(error.clone()),
-                    })
-                    .await?;
+                    self.notice(Notice::Error(error.clone())).await?;
                     // Code that already ran cannot be taken back: it stands
                     // as the step, and the model hears it was cut off.
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
@@ -1077,7 +1066,8 @@ impl Agent {
                 carry.set_exec(&code);
                 self.interrupted = true;
                 self.progress.prose = 0;
-                self.append(Entry::Step {
+                self.log(Event::Step {
+                    agent: self.agent_id,
                     exec: Some(code),
                     prose: String::new(),
                     carry,
@@ -1098,7 +1088,8 @@ impl Agent {
         let continuation = step.continuation;
         let compacted = step.carry.has_compaction();
         let usage = step.usage;
-        self.append(Entry::Step {
+        self.log(Event::Step {
+            agent: self.agent_id,
             exec: step.call.as_ref().map(|call| call.code.clone()),
             prose: step.prose,
             carry: step.carry,
@@ -1176,7 +1167,8 @@ impl Agent {
             let mut carry = streaming.carry;
             let code = streaming.code;
             carry.set_exec(&code);
-            self.append(Entry::Step {
+            self.log(Event::Step {
+                agent: self.agent_id,
                 exec: Some(code),
                 prose: String::new(),
                 carry,
@@ -1320,7 +1312,7 @@ impl Agent {
         if working != self.working {
             if !working && let Some(Stopped::Failed(error)) = &self.stopped {
                 let notice = Notice::Stopped(error.to_string());
-                self.append(Entry::Notice { notice }).await?;
+                self.notice(notice).await?;
             }
             self.flush().await?;
             self.working = working;

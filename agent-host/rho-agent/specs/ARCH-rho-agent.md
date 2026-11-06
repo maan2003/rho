@@ -186,7 +186,13 @@ facts that woke the model, so it never wakes the model twice. Historical
 function-call evidence remains replay data, not an active tool capability. Claude
 logs after transport and puts back what a failed handoff did not carry, for the
 next exec result; it never replays its source. Transport handoff is not proof of
-consumption.
+consumption. An agent that holds anything in memory does not unload, because
+nothing would hand it again.
+
+The `Request` row is the only copy of what Rho answered a call with. Claude Code's
+echo of that answer is not logged. Its echo of handed text logs only the uuid a
+rewind forks at. `ClaudeResults` holds what no request answered: Claude Code's own
+tools, a call Rho refused, or a call cut off.
 
 One initial reply answers an exec; subsequent contributions are reports
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).
@@ -215,7 +221,6 @@ status and peer completion delivery remain independent of naming.
 Native and Claude observations share the GUI projection, not a conversation
 writer. Timing identifies provider first block, argument completion, response
 completion, boundary, and transport handoff. It does not measure Python execution.
-`WakeFacts` separately records source occurrence, observation, deadline, and trigger.
 Native argument completion observes the provider's argument-end event, not
 item completion or Python EOF. Live and committed tool rows use the same observed timing; later output must not
 rewrite the original result's status or duration.

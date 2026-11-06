@@ -63,6 +63,11 @@ impl Waiting {
             .min()
     }
 
+    /// Nothing waits, not even what the model was told of.
+    pub fn is_empty(&self) -> bool {
+        self.output.is_empty() && self.held.is_empty()
+    }
+
     pub fn has_news(&self) -> bool {
         self.news() > 0
     }

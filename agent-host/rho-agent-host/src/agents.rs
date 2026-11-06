@@ -9,15 +9,14 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent::record::{Event, Record};
+use rho_agent::record::Event;
 use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, WorksetHead};
 use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
     AgentEntry, AgentLog, AgentLogPage, Cancel, ChangeTopic, ClientFrame, CreateStream,
-    CreateWorkset, CreatedWorkset, DeleteWorksets, Eval, EvalResult, Leave, LogEvent, LogNext,
-    MoveMessages, MoveTo, Open, Post, Request, RestartWorkset, ServerFrame, StartTopic,
-    WorksetEntry,
+    CreateWorkset, CreatedWorkset, DeleteWorksets, Eval, EvalResult, Leave, LogNext, MoveMessages,
+    MoveTo, Open, Post, Request, RestartWorkset, ServerFrame, StartTopic, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -379,7 +378,6 @@ async fn follow(
     let mut chat: Option<ChatSeq> = None;
     let mut worksets: HashMap<WorksetId, Wpos> = HashMap::new();
     let mut focus: HashSet<AgentId> = HashSet::new();
-    let mut carries = Carries::new();
     loop {
         // Taken before the rows are read: an agent's status arrives after
         // the rows it reflects commit, so they go out first.
@@ -390,7 +388,7 @@ async fn follow(
             return;
         }
         for (workset, next) in &mut worksets {
-            if !send_rows_from(&services.db, &outgoing_tx, &mut carries, *workset, next).await {
+            if !send_rows_from(&services.db, &outgoing_tx, *workset, next).await {
                 return;
             }
         }
@@ -458,7 +456,6 @@ async fn follow(
                             (workset, worksets.get(&workset).map_or(from, |sent| from.max(*sent)))
                         })
                         .collect();
-                    carries.clear();
                 }
                 Some(Follow::Focus(agents)) => {
                     // The pool made them live before this ask was sent, but
@@ -502,7 +499,6 @@ async fn send_chat_from(
 async fn send_rows_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<ServerFrame>,
-    carries: &mut Carries,
     workset: WorksetId,
     next: &mut Wpos,
 ) -> bool {
@@ -514,7 +510,7 @@ async fn send_rows_from(
         *next = last.next();
         let rows = page
             .iter()
-            .filter_map(|(pos, record)| Some((*pos, strip_row(db, carries, *pos, record)?)))
+            .filter_map(|(pos, record)| Some((*pos, crate::transcript::strip(record)?)))
             .collect::<Vec<_>>();
         if !rows.is_empty()
             && outgoing_tx
@@ -525,39 +521,6 @@ async fn send_rows_from(
         }
         tokio::task::yield_now().await;
     }
-}
-
-/// Each agent's newest step as of the rows already read, so a request reads it
-/// back from the log once per agent, not once per request.
-type Carries = HashMap<AgentId, Option<rho_agent::inference::Carry>>;
-
-/// A row as clients read it, or `None` for one they never see. Rows must
-/// come in order per agent; a rewind sends the agent back to the store.
-fn strip_row(
-    db: &RhoDb,
-    carries: &mut Carries,
-    pos: Wpos,
-    record: &Record<'_>,
-) -> Option<LogEvent> {
-    let Some(agent) = record.event.agent() else {
-        return crate::transcript::strip(record, None);
-    };
-    if matches!(record.event, Event::Rewound { .. }) {
-        carries.remove(&agent);
-        return crate::transcript::strip(record, None);
-    }
-    let carry = carries
-        .entry(agent)
-        .or_insert_with(|| crate::transcript::carry_before(&db.read(), agent, pos));
-    let stripped = crate::transcript::strip(record, carry.as_ref());
-    if let Event::Native {
-        entry: rho_agent::entry::Entry::Step { carry: step, .. },
-        ..
-    } = &record.event
-    {
-        *carry = Some(step.clone());
-    }
-    stripped
 }
 
 /// One page of an agent's rows, stripped as the session strips them: read
@@ -578,10 +541,9 @@ fn agent_log_page(db: &RhoDb, AgentLog { agent, from }: AgentLog) -> anyhow::Res
         Some((last, _)) if page.len() == LOG_PAGE => LogNext::Page(last.next()),
         _ => LogNext::Follow(end),
     };
-    let mut carries = Carries::new();
     let rows = page
         .iter()
-        .filter_map(|(pos, record)| Some((*pos, strip_row(db, &mut carries, *pos, record)?)))
+        .filter_map(|(pos, record)| Some((*pos, crate::transcript::strip(record)?)))
         .collect();
     Ok(AgentLogPage { rows, next })
 }
@@ -1084,70 +1046,45 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-/// A request's tool results whole, or a response as the transcript draws
-/// it. Rows a rewind hid still answer; the client asked for one it holds.
+/// What a request answered its call with, what calls came back with, or a
+/// response as the transcript draws it. Rows a rewind hid still answer; the
+/// client asked for one it holds.
 fn detail(
     db: &RhoDb,
     workset: WorksetId,
     pos: Wpos,
 ) -> rho_agents_client::protocol::transcript::DetailBody {
-    use rho_agent::entry::Entry;
-    use rho_agent::log::TranscriptLine;
-    use rho_agent::record::ClaudeRow;
-    use rho_agents_client::protocol::transcript::{
-        ArgumentsFormat, DetailBody, DetailResult, Item, ToolStatus,
-    };
+    use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
     let read = db.read();
     let Some(record) = read.workset_row(workset, pos) else {
         return DetailBody::Nothing;
     };
     match record.event {
         Event::Request {
-            agent,
             output,
             inputs,
             notices,
             ..
-        } => DetailBody::Results(
-            crate::transcript::report_results(
-                crate::transcript::carry_before(&read, agent, pos).as_ref(),
-                &notices,
-                &output,
-                &inputs,
-            )
-            .into_iter()
-            .map(|result| DetailResult {
-                id: result.display_id().to_owned(),
-                status: ToolStatus::Reported,
-                output: result.text,
-                error: None,
-            })
-            .collect(),
+        } => DetailBody::Report(rho_agent::entry::plain_text(
+            &rho_agent::entry::compose(true, &notices, &output, &inputs).result,
+        )),
+        Event::Step { carry, .. } => {
+            DetailBody::Response(crate::transcript::step_items(&carry.display_calls()))
+        }
+        Event::ClaudeReply { calls, .. } => DetailBody::Response(
+            calls
+                .into_iter()
+                .map(|call| Item::ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    format: ArgumentsFormat::Json,
+                })
+                .collect(),
         ),
-        Event::Native {
-            entry: Entry::Step { carry, .. },
-            ..
-        } => DetailBody::Response(crate::transcript::step_items(&carry.display_calls())),
-        Event::Claude {
-            row: ClaudeRow::Transcript { line, .. },
-            ..
-        } => match line {
-            TranscriptLine::Assistant { calls, .. } => DetailBody::Response(
-                calls
-                    .into_iter()
-                    .map(|call| Item::ToolCall {
-                        id: call.id,
-                        name: call.name,
-                        arguments: call.arguments,
-                        format: ArgumentsFormat::Json,
-                    })
-                    .collect(),
-            ),
-            TranscriptLine::ToolResults { results } => {
-                DetailBody::Results(results.iter().map(detail_result).collect())
-            }
-            TranscriptLine::User { .. } | TranscriptLine::Compacted { .. } => DetailBody::Nothing,
-        },
+        Event::ClaudeResults { results, .. } => {
+            DetailBody::Results(results.iter().map(detail_result).collect())
+        }
         Event::Failed { partial, .. } => DetailBody::Response(
             partial
                 .items
@@ -1168,28 +1105,27 @@ fn detail(
 fn detail_result(
     result: &rho_agent_types::transcript::ToolResult,
 ) -> rho_agents_client::protocol::transcript::DetailResult {
-    use rho_agents_client::protocol::transcript::ToolStatus;
     rho_agents_client::protocol::transcript::DetailResult {
         id: result.call_id.as_str().to_owned(),
-        status: ToolStatus::Reported,
         output: result.body.recorded_output().to_owned(),
-        error: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use rho_agent::db::AgentWriteTxnExt as _;
-    use rho_agent::entry::{Entry, Notice, RequestNotice};
-    use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
+    use rho_agent::entry::{Notice, RequestNotice};
+    use rho_agent::record::{AgentSpec, Event, Record, Runtime};
     use rho_agent::store::StoreWrite as _;
     use rho_agent_types::{Role, UnixMs, WorksetId, WorksetKind, Wpos};
     use rho_agents_client::protocol::worksets::{AgentLog, LogEvent, LogNext};
 
     use super::{agent_log_page, detail, detail_result};
 
-    fn step(id: &str) -> Entry {
-        Entry::Step {
+    fn step(id: &str) -> Event<'static> {
+        Event::Step {
+            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
+                .unwrap(),
             exec: None,
             prose: String::new(),
             carry: rho_agent::inference::Carry::new(
@@ -1213,7 +1149,6 @@ mod tests {
         Event::Request {
             agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(1))
                 .unwrap(),
-            why: rho_agent::entry::Wake::Notify,
             output: if output.is_empty() {
                 Vec::new()
             } else {
@@ -1227,8 +1162,8 @@ mod tests {
         }
     }
 
-    fn request() -> Event<'static> {
-        request_of("", Vec::new(), vec![RequestNotice::Restarted])
+    fn notice_agent() -> rho_agent_types::AgentId {
+        rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()
     }
 
     /// A workset with one native agent and its rows, as the loop writes
@@ -1264,10 +1199,21 @@ mod tests {
         let mut positions = Vec::new();
         for event in rows {
             let event = match event {
-                Event::Native { entry, .. } => Event::Native { agent, entry },
+                Event::Step {
+                    exec,
+                    prose,
+                    carry,
+                    usage,
+                    ..
+                } => Event::Step {
+                    agent,
+                    exec,
+                    prose,
+                    carry,
+                    usage,
+                },
                 Event::Rewound { to, .. } => Event::Rewound { agent, to },
                 Event::Request {
-                    why,
                     output,
                     inputs,
                     notices,
@@ -1275,13 +1221,12 @@ mod tests {
                     ..
                 } => Event::Request {
                     agent,
-                    why,
                     output,
                     inputs,
                     notices,
                     compact,
                 },
-                Event::Claude { row, .. } => Event::Claude { agent, row },
+                Event::Notice { notice, .. } => Event::Notice { agent, notice },
                 event => event,
             };
             positions.push(
@@ -1300,145 +1245,37 @@ mod tests {
         (workset, agent, positions)
     }
 
-    fn native(entry: Entry) -> Event<'static> {
-        Event::Native {
-            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0))
-                .unwrap(),
-            entry,
-        }
-    }
-
-    /// The report names the calls of the step it answers: the newest one
-    /// still standing, read from the store when the page starts mid-way,
-    /// and after a rewind that took the newer step back.
+    /// A request's detail is what `compose` answered the open call with:
+    /// output first, then `tool` inputs. A person's words stay out of it.
     #[tokio::test]
-    async fn a_request_after_a_rewind_reports_the_step_still_standing() {
+    async fn a_requests_detail_shows_what_it_answered_with() {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        // Rows 2..=5; the rewind at 6 takes back row 4 (exec-2) and on.
-        let (workset, agent, positions) = workset(
-            &db,
-            vec![
-                native(step("exec-1")),
-                request(),
-                native(step("exec-2")),
-                request(),
-                Event::Rewound {
-                    agent: rho_agent_types::AgentId::from_counter(
-                        1,
-                        &rho_agent_types::AgentIdDomain(0),
-                    )
-                    .unwrap(),
-                    to: Wpos(4),
-                },
-                request(),
-            ],
-        )
-        .await;
-        assert_eq!(positions[2], Wpos(4));
-        let reports = |from| {
-            agent_log_page(&db, AgentLog { agent, from })
-                .unwrap()
-                .rows
-                .into_iter()
-                .filter_map(|(pos, event)| match event {
-                    LogEvent::Request { calls, .. } => Some((pos.0, calls)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let expected = vec![
-            (3, vec!["exec-1".to_owned()]),
-            (5, vec!["exec-2".to_owned()]),
-            (7, vec!["exec-1".to_owned()]),
-        ];
-        assert_eq!(reports(Wpos::ZERO), expected);
-        // A page that starts after the steps reads them back from the store.
-        assert_eq!(reports(Wpos(5)), expected[1..]);
-        assert_eq!(reports(Wpos(7)), expected[2..]);
-        // The detail of the last report is read the same way.
-        let rho_agents_client::protocol::transcript::DetailBody::Results(results) =
-            detail(&db, workset, Wpos(7))
-        else {
-            panic!("a report's detail is its results")
-        };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "exec-1");
-    }
-
-    /// Rows that say nothing a reader uses are left behind; a stop is told
-    /// whichever runtime wrote it; a user's spoken request reads as asked.
-    /// A request's detail is its own output and peers, and nothing an earlier
-    /// request carried. A person's text and the peer's message show as blocks
-    /// of their own in the row a reader keeps.
-    #[tokio::test]
-    async fn a_requests_detail_shows_what_it_carried() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let input = |role, text: &str, message| rho_agent::record::Input {
+        let said = |role, text: &str| rho_agent::record::Input {
             role,
-            message,
+            message: None,
             content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
         };
-        let prose = native(Entry::Step {
-            exec: None,
-            prose: "words".into(),
-            carry: rho_agent::inference::Carry::new(serde_json::json!({}), vec![], false),
-            usage: None,
-        });
-        let message = rho_agent_types::MessageId(rho_agent_types::ChatSeq(1));
         let (workset, _, pos) = workset(
             &db,
             vec![
-                native(step("answered")),
-                request_of("answered-output", Vec::new(), Vec::new()),
-                prose,
-                request_of("", Vec::new(), Vec::new()),
-                native(step("open")),
+                step("call"),
                 request_of(
-                    "printed-output",
-                    vec![
-                        input(Role::User, "from-the-person", None),
-                        input(Role::Tool, "peer-message", Some(message)),
-                    ],
+                    "printed",
+                    vec![said(Role::User, "person"), said(Role::Tool, "peer")],
                     Vec::new(),
                 ),
             ],
         )
         .await;
-        let rho_agents_client::protocol::transcript::DetailBody::Results(results) =
-            detail(&db, workset, pos[5])
+        let rho_agents_client::protocol::transcript::DetailBody::Report(report) =
+            detail(&db, workset, pos[1])
         else {
-            panic!("the request's results");
+            panic!("a request's detail is its report");
         };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "open");
-        assert_eq!(results[0].output, "printed-output\n\npeer-message");
-
-        use rho_agent::store::StoreRead as _;
-        let read = db.read();
-        let row = read.workset_row(workset, pos[5]).unwrap();
-        let carry = crate::transcript::carry_before(&read, row.event.agent().unwrap(), pos[5]);
-        let Some(LogEvent::Request { inputs, calls, .. }) =
-            crate::transcript::strip(&row, carry.as_ref())
-        else {
-            panic!("a request reads as a request");
-        };
-        assert_eq!(calls, ["open"]);
-        assert_eq!(
-            inputs
-                .iter()
-                .map(|input| (input.text.as_str(), input.role, input.message))
-                .collect::<Vec<_>>(),
-            [
-                ("from-the-person", Role::User, None),
-                ("peer-message", Role::Tool, Some(message)),
-            ]
-        );
+        assert_eq!(report, "printed\n\npeer");
     }
 
-    /// A `tool` input that is not a chat message is no longer mistaken for
-    /// output: a reader keeps it, and the call's answer holds it.
     #[tokio::test]
     async fn a_plain_tool_input_is_not_hidden() {
         let dir = tempfile::tempdir().unwrap();
@@ -1446,7 +1283,7 @@ mod tests {
         let (workset, _, pos) = workset(
             &db,
             vec![
-                native(step("call")),
+                step("call"),
                 request_of(
                     "",
                     vec![rho_agent::record::Input {
@@ -1463,7 +1300,7 @@ mod tests {
         .await;
         use rho_agent::store::StoreRead as _;
         let row = db.read().workset_row(workset, pos[1]).unwrap();
-        let Some(LogEvent::Request { inputs, .. }) = crate::transcript::strip(&row, None) else {
+        let Some(LogEvent::Request { inputs, .. }) = crate::transcript::strip(&row) else {
             panic!("a request reads as a request");
         };
         assert_eq!(inputs[0].text, "plain-tool-input");
@@ -1489,19 +1326,17 @@ mod tests {
                     }],
                     Vec::new(),
                 ),
-                native(Entry::Notice {
-                    notice: Notice::Restarted,
-                }),
-                native(Entry::Notice {
+                Event::Notice {
+                    agent: notice_agent(),
+                    notice: Notice::Archived,
+                },
+                Event::Notice {
+                    agent: notice_agent(),
                     notice: Notice::Stopped("quota".into()),
-                }),
-                Event::Claude {
-                    agent: rho_agent_types::AgentId::from_counter(
-                        1,
-                        &rho_agent_types::AgentIdDomain(0),
-                    )
-                    .unwrap(),
-                    row: ClaudeRow::Notice(Notice::Stopped("auth".into())),
+                },
+                Event::Notice {
+                    agent: notice_agent(),
+                    notice: Notice::Error("retry".into()),
                 },
             ],
         )
@@ -1527,7 +1362,7 @@ mod tests {
                             text: "🎤 fix <b>".into(),
                             role: Role::User,
                         }],
-                        calls: Vec::new(),
+                        answers: true,
                         compaction: false,
                         at: UnixMs(1),
                     }
@@ -1542,9 +1377,11 @@ mod tests {
                 ),
                 (
                     Wpos(5),
-                    LogEvent::Stopped {
+                    LogEvent::Failed {
                         agent,
-                        error: "auth".into(),
+                        text: String::new(),
+                        error: "retry".into(),
+                        retrying: true,
                         at: UnixMs(1),
                     }
                 ),
@@ -1609,11 +1446,10 @@ mod tests {
                     .filter(|i| written < i * span + 4 * span)
                     .collect();
                 let agent = ids[active[written % active.len()]];
-                let entry = match (written / active.len()) % 3 {
+                let event = match (written / active.len()) % 3 {
                     0 => {
                         let event = Event::Request {
                             agent,
-                            why: rho_agent::entry::Wake::Notify,
                             output: Vec::new(),
                             inputs: Vec::new(),
                             notices: Vec::new(),
@@ -1631,7 +1467,8 @@ mod tests {
                         written += 1;
                         continue;
                     }
-                    _ => Entry::Step {
+                    _ => Event::Step {
+                        agent,
                         exec: None,
                         prose: String::new(),
                         carry: rho_agent::inference::Carry::new(
@@ -1653,7 +1490,7 @@ mod tests {
                         workset,
                         &Record {
                             at: UnixMs(1),
-                            event: Event::Native { agent, entry },
+                            event,
                         },
                     )
                     .unwrap();
@@ -1748,145 +1585,6 @@ mod tests {
             "one agent's log: {pages} pages, {rows} rows in {:?}",
             started.elapsed()
         );
-    }
-
-    /// What `carry_before` answers, by walking the whole workset forwards: the
-    /// reference.
-    fn carry_by_scan(
-        read: &rho_db::ReadTxn,
-        agent: rho_agent_types::AgentId,
-        pos: Wpos,
-    ) -> Option<rho_agent::inference::Carry> {
-        use rho_agent::store::StoreRead as _;
-        let head = read.agent(agent).unwrap();
-        let mut kept: Vec<(Wpos, Record<'static>)> = Vec::new();
-        for (row, record) in read.workset_rows(head.workset, head.created, usize::MAX) {
-            if row >= pos {
-                break;
-            }
-            if record.event.agent() != Some(agent) {
-                continue;
-            }
-            if let Event::Rewound { to, .. } = &record.event {
-                let keep = kept.partition_point(|(kept, _)| kept < to);
-                kept.truncate(keep);
-            }
-            kept.push((row, record));
-        }
-        kept.into_iter()
-            .rev()
-            .find_map(|(_, record)| match record.event {
-                Event::Native {
-                    entry: Entry::Step { carry, .. },
-                    ..
-                } => Some(carry),
-                _ => None,
-            })
-    }
-
-    /// Three agents' steps, requests and rewinds (rewinds of rewinds among
-    /// them), interleaved: the step before every row, read newest first from
-    /// the agent's own rows, is the forward fold's.
-    #[tokio::test]
-    async fn carry_before_is_the_forward_fold_of_the_agents_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let workset: WorksetId = "0123456789ab".parse().unwrap();
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        write.create_workset(workset, UnixMs(0), WorksetKind::Isolated, String::new());
-        let mut agents = Vec::new();
-        let mut rows: Vec<Vec<Wpos>> = Vec::new();
-        for _ in 0..3 {
-            let agent = write.alloc_agent_id();
-            let pos = write
-                .append(
-                    workset,
-                    &Record {
-                        at: UnixMs(0),
-                        event: Event::AgentCreated {
-                            agent,
-                            spec: AgentSpec {
-                                runtime: Runtime::Native {
-                                    model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
-                                    profile: Default::default(),
-                                    cache_key: rho_agent::inference::PromptCacheKey::generate(),
-                                },
-                                props: Default::default(),
-                            },
-                        },
-                    },
-                )
-                .unwrap();
-            agents.push(agent);
-            rows.push(vec![pos]);
-        }
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |n: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % n as u64) as usize
-        };
-        for n in 0..600 {
-            let which = next(3);
-            let agent = agents[which];
-            let event = match next(9) {
-                0 | 1 => native(step(&format!("exec-{n}"))),
-                2..=6 => Event::Request {
-                    agent,
-                    why: rho_agent::entry::Wake::Notify,
-                    output: Vec::new(),
-                    inputs: Vec::new(),
-                    notices: Vec::new(),
-                    compact: false,
-                },
-                // A step with no call stands as the newest step.
-                7 => native(Entry::Step {
-                    exec: None,
-                    prose: format!("prose-{n}"),
-                    carry: rho_agent::inference::Carry::new(serde_json::json!({}), vec![], false),
-                    usage: None,
-                }),
-                _ if rows[which].len() > 1 => {
-                    let to = rows[which][1 + next(rows[which].len() - 1)];
-                    Event::Rewound { agent, to }
-                }
-                _ => native(Entry::Notice {
-                    notice: Notice::Restarted,
-                }),
-            };
-            let event = match event {
-                Event::Native { entry, .. } => Event::Native { agent, entry },
-                event => event,
-            };
-            let pos = write
-                .append(
-                    workset,
-                    &Record {
-                        at: UnixMs(1),
-                        event,
-                    },
-                )
-                .unwrap();
-            rows[which].push(pos);
-        }
-        write.commit();
-        let read = db.read();
-        let end = rho_agent::store::StoreRead::workset(&read, workset)
-            .unwrap()
-            .next;
-        for agent in &agents {
-            for pos in 0..=end.0 {
-                let pos = Wpos(pos);
-                assert_eq!(
-                    crate::transcript::carry_before(&read, *agent, pos),
-                    carry_by_scan(&read, *agent, pos),
-                    "agent {} before {pos:?}",
-                    agent.encoded()
-                );
-            }
-        }
     }
 
     #[test]

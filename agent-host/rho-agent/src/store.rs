@@ -11,9 +11,9 @@ use rho_agent_types::{Address, AgentId, ChatSeq, Role, UnixMs, WorksetId, Workse
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
-use crate::entry::{CompactionState, Entry, Notice};
+use crate::entry::{CompactionState, Notice};
 use crate::log::ClaudeRewind;
-use crate::record::{AgentSpec, ClaudeRow, Event, Record};
+use crate::record::{AgentSpec, Event, Record};
 
 type WorksetKey = [u8; 6];
 
@@ -69,16 +69,18 @@ pub struct NativeCursor {
 }
 
 impl NativeCursor {
-    fn observe_request(&mut self, pos: Wpos, compact: bool, says: bool) {
-        self.compaction.observe_request(compact, says);
-        self.request = Some(pos);
-        self.woken = true;
-    }
-
-    fn observe(&mut self, entry: &Entry) {
-        self.compaction.observe(entry);
-        match entry {
-            Entry::Step { carry, .. } => {
+    fn observe(&mut self, pos: Wpos, event: &Event<'_>) {
+        match event {
+            Event::Request {
+                notices, compact, ..
+            } => {
+                self.compaction
+                    .observe_request(*compact, !notices.is_empty());
+                self.request = Some(pos);
+                self.woken = true;
+            }
+            Event::Step { carry, usage, .. } => {
+                self.compaction.observe_step(carry, usage.as_ref());
                 // The context starts just after the request.
                 if carry.has_compaction()
                     && let Some(request) = self.request
@@ -87,11 +89,12 @@ impl NativeCursor {
                 }
                 self.request = None;
             }
-            Entry::Notice {
+            Event::CompactionTrigger { manual, .. } => self.compaction.observe_trigger(*manual),
+            Event::Notice {
                 notice: Notice::Archived,
                 ..
             } => self.archived = true,
-            Entry::Notice {
+            Event::Notice {
                 notice: Notice::FreshNotebook,
                 ..
             } => self.archived = false,
@@ -103,33 +106,17 @@ impl NativeCursor {
 impl AgentHead {
     fn fold(&mut self, pos: Wpos, event: &Event<'_>) {
         self.last = pos;
+        self.native.observe(pos, event);
         match event {
             Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
-            Event::Request {
-                inputs,
-                notices,
-                compact,
-                ..
-            } => {
+            Event::Request { inputs, .. } => {
                 let newest = inputs.iter().filter_map(|input| input.message).max();
                 if let Some(newest) = newest {
                     self.delivered = self.delivered.max(newest.0);
                 }
-                self.native
-                    .observe_request(pos, *compact, !notices.is_empty());
             }
-            Event::Native { entry, .. } => self.native.observe(entry),
-            Event::Claude {
-                row: ClaudeRow::RewindPending(rewind),
-                ..
-            } => self.claude_rewind = rewind.clone(),
-            Event::WorksetCreated { .. }
-            | Event::Evaluated { .. }
-            | Event::AgentCreated { .. }
-            | Event::Rewound { .. }
-            | Event::Failed { .. }
-            | Event::ExecObserved { .. }
-            | Event::Claude { .. } => {}
+            Event::RewindPending { rewind, .. } => self.claude_rewind = rewind.clone(),
+            _ => {}
         }
     }
 }
@@ -498,13 +485,7 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         ..NativeCursor::default()
     };
     for (pos, record) in visible(rows) {
-        match &record.event {
-            Event::Native { entry, .. } => cursor.observe(entry),
-            Event::Request {
-                notices, compact, ..
-            } => cursor.observe_request(pos, *compact, !notices.is_empty()),
-            _ => {}
-        }
+        cursor.observe(pos, &record.event);
     }
     head.native = cursor;
     write

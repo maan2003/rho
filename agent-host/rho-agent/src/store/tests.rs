@@ -51,10 +51,10 @@ fn input(agent: AgentId, message: Option<u64>) -> Record<'static> {
     }
 }
 
-fn native(agent: AgentId, entry: Entry) -> Record<'static> {
+fn at_six(event: Event<'static>) -> Record<'static> {
     Record {
         at: UnixMs(6),
-        event: Event::Native { agent, entry },
+        event,
     }
 }
 
@@ -147,7 +147,6 @@ async fn a_row_for_an_agent_of_another_workset_is_refused() {
 
 #[tokio::test]
 async fn compaction_starts_the_context_after_the_request_it_answered() {
-    use crate::entry::Wake;
     let (_dir, db) = db().await;
     let ws = WorksetId([3; 6]);
     let a = agent(1);
@@ -172,7 +171,6 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
                 at: UnixMs(6),
                 event: Event::Request {
                     agent: a,
-                    why: Wake::Compaction,
                     output: Vec::new(),
                     inputs: Vec::new(),
                     notices: Vec::new(),
@@ -186,26 +184,22 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
     let late = write
         .append(
             ws,
-            &native(
-                a,
-                Entry::Notice {
-                    notice: Notice::Restarted,
-                },
-            ),
+            &at_six(Event::Notice {
+                agent: a,
+                notice: Notice::Error("retry".into()),
+            }),
         )
         .unwrap();
     write
         .append(
             ws,
-            &native(
-                a,
-                Entry::Step {
-                    exec: None,
-                    prose: String::new(),
-                    carry: crate::inference::Carry::new(serde_json::json!({}), vec![], true),
-                    usage: None,
-                },
-            ),
+            &at_six(Event::Step {
+                agent: a,
+                exec: None,
+                prose: String::new(),
+                carry: crate::inference::Carry::new(serde_json::json!({}), vec![], true),
+                usage: None,
+            }),
         )
         .unwrap();
     write.commit();

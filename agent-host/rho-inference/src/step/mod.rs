@@ -144,6 +144,8 @@ pub(crate) struct CallResult {
     pub text: String,
     pub images: Vec<Image>,
 }
+
+#[cfg(test)]
 impl CallResult {
     pub fn display_id(&self) -> &str {
         self.id.as_str()
@@ -245,14 +247,6 @@ fn from_openai_values(items: Vec<serde_json::Value>) -> Carry {
         false,
     )
 }
-pub(crate) fn display_results(
-    carry: &rho_agent::inference::Carry,
-    text: &str,
-    images: &[Image],
-) -> Vec<CallResult> {
-    reply(carry, text, images)
-}
-
 /// Observations for the account owner. Acknowledgment preserves policy ordering
 /// before completing a response or using a fallback route.
 pub enum Observation {

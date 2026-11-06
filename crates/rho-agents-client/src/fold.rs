@@ -15,7 +15,7 @@ use rho_agent_types::{
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
-use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
+use crate::protocol::transcript::{RuntimeKind, Speaker};
 use crate::protocol::worksets::{AgentEntry, LogEvent};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
@@ -252,6 +252,8 @@ pub struct TranscriptFold {
     /// The row each block came from, so a rewind drops exactly what was
     /// told after it. `None` for a message, which no rewind takes back.
     told_at: Vec<Option<Wpos>>,
+    /// Blocks before this one came before the last request that answered.
+    unanswered: usize,
     /// Compactions no request has carried yet; drawn after the blocks.
     queue: Vec<(Wpos, UiBlock)>,
     /// Messages the agent received that no input has handed it yet; drawn
@@ -298,6 +300,7 @@ impl TranscriptFold {
             message_newest: None,
             blocks: Vec::new(),
             told_at: Vec::new(),
+            unanswered: 0,
             queue: Vec::new(),
             inbox: Vec::new(),
             handed: BTreeSet::new(),
@@ -371,6 +374,26 @@ impl TranscriptFold {
     }
 
     /// Each reported call is marked reported, its task still running.
+    /// A request answered what was open: every call since the last one that
+    /// did. A call Rho refused ended on its own, and one cut off went with it.
+    fn answer_calls(&mut self) {
+        for index in self.unanswered..self.blocks.len() {
+            if matches!(&*self.blocks[index], UiBlock::Tool(_)) {
+                self.report_block(index);
+            }
+        }
+        self.unanswered = self.blocks.len();
+    }
+
+    fn report_block(&mut self, index: usize) {
+        self.touch(index);
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+            tool.status = UiToolStatus::Reported;
+            tool.started_at = None;
+            tool.finished_at = None;
+        }
+    }
+
     fn report_calls(&mut self, calls: &[String]) {
         for id in calls {
             if let Some(index) = self
@@ -378,39 +401,7 @@ impl TranscriptFold {
                 .iter()
                 .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id))
             {
-                self.touch(index);
-                if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
-                    tool.status = UiToolStatus::Reported;
-                    tool.started_at = None;
-                    tool.finished_at = None;
-                }
-            }
-        }
-    }
-
-    /// Each result lands on the call it answers: its status and its two
-    /// timestamps. The output is not kept, because nothing in the
-    /// transcript draws it.
-    fn finish_calls(&mut self, results: &[ToolOutcome]) {
-        for result in results {
-            let called = self
-                .blocks
-                .iter()
-                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == result.id));
-            if let Some(index) = called {
-                self.touch(index);
-            }
-            if let Some(index) = called
-                && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
-            {
-                tool.status = match result.status {
-                    ToolStatus::Success => UiToolStatus::Success,
-                    ToolStatus::Reported => UiToolStatus::Reported,
-                    ToolStatus::Error => UiToolStatus::Error,
-                    ToolStatus::Cancelled => UiToolStatus::Cancelled,
-                };
-                tool.started_at = Some(result.started_at);
-                tool.finished_at = Some(result.finished_at);
+                self.report_block(index);
             }
         }
     }
@@ -510,7 +501,7 @@ impl TranscriptFold {
             }
             LogEvent::Request {
                 inputs,
-                calls,
+                answers,
                 compaction,
                 ..
             } => {
@@ -553,10 +544,11 @@ impl TranscriptFold {
                         },
                     );
                 }
-                self.report_calls(calls);
+                if *answers {
+                    self.answer_calls();
+                }
             }
-            LogEvent::NotebookReport { calls, .. } => self.report_calls(calls),
-            LogEvent::Results { results, .. } => self.finish_calls(results),
+            LogEvent::CallsEnded { calls, .. } => self.report_calls(calls),
             LogEvent::Replied {
                 items,
                 compacted,
@@ -674,6 +666,7 @@ impl TranscriptFold {
                     }
                 }
                 self.touch(0);
+                self.unanswered = 0;
 
                 let undone = |told: &Option<Wpos>| told.is_some_and(|told| told >= *to);
                 let blocks = std::mem::take(&mut self.blocks);
@@ -776,7 +769,7 @@ mod tests {
                 text: text.to_owned(),
                 role: rho_agent_types::Role::User,
             }],
-            calls: Vec::new(),
+            answers: true,
             compaction: false,
             at: UnixMs(at),
         }
@@ -786,7 +779,7 @@ mod tests {
         LogEvent::Request {
             agent: me(),
             inputs: Vec::new(),
-            calls: Vec::new(),
+            answers: true,
             compaction: false,
             at: UnixMs(at),
         }
@@ -965,14 +958,9 @@ mod tests {
                 Some(10),
                 3,
             ),
-            LogEvent::Results {
+            LogEvent::CallsEnded {
                 agent: me(),
-                results: vec![ToolOutcome {
-                    id: "call-1".to_owned(),
-                    status: ToolStatus::Error,
-                    started_at: UnixMs(3),
-                    finished_at: UnixMs(4),
-                }],
+                calls: vec!["call-1".to_owned()],
                 at: UnixMs(4),
             },
             replied(
@@ -998,13 +986,104 @@ mod tests {
             }
         );
         let tool = only_tool(&state);
-        assert_eq!(tool.status, UiToolStatus::Error);
-        assert_eq!(tool.finished_at, Some(UnixMs(4)));
+        assert_eq!(tool.status, UiToolStatus::Reported);
         assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
         assert_eq!(state.usage.provider, "sol");
         assert_eq!(state.context_used, Some(12));
+    }
+
+    fn tool_statuses(fold: &TranscriptFold) -> Vec<UiToolStatus> {
+        fold.state()
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some(tool.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn call(id: &str) -> Item {
+        Item::ToolCall {
+            id: id.to_owned(),
+            name: "exec".to_owned(),
+            arguments: "pass".to_owned(),
+            format: ArgumentsFormat::Text,
+        }
+    }
+
+    fn request_answering(answers: bool, at: u64) -> LogEvent {
+        LogEvent::Request {
+            agent: me(),
+            inputs: Vec::new(),
+            answers,
+            compaction: false,
+            at: UnixMs(at),
+        }
+    }
+
+    /// A request that answers closes every call since the last one that did,
+    /// past a later call that ended on its own. One that does not, the
+    /// compaction of a quiet agent, leaves the call open.
+    #[test]
+    fn a_request_answers_what_is_open_only_when_it_says_so() {
+        use UiToolStatus::{Reported, Running};
+        let mut pos = 0;
+        let mut fold = TranscriptFold::new(me(), &[]);
+        let mut tell = |fold: &mut TranscriptFold, event: LogEvent| {
+            fold.tell(&TranscriptRow::Log(Wpos(pos), event));
+            pos += 1;
+        };
+        tell(&mut fold, replied(vec![call("admitted")], None, None, 1));
+        tell(&mut fold, replied(vec![call("refused")], None, None, 2));
+        tell(
+            &mut fold,
+            LogEvent::CallsEnded {
+                agent: me(),
+                calls: vec!["refused".to_owned()],
+                at: UnixMs(3),
+            },
+        );
+        assert_eq!(tool_statuses(&fold), [Running, Reported]);
+        tell(&mut fold, request_answering(false, 4));
+        assert_eq!(tool_statuses(&fold), [Running, Reported]);
+        tell(&mut fold, request_answering(true, 5));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported]);
+
+        tell(&mut fold, replied(vec![call("next")], None, None, 6));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported, Running]);
+        tell(&mut fold, request_answering(true, 7));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported, Reported]);
+    }
+
+    /// A rewind drops blocks, so what the fold remembers of the last answer
+    /// must not point past them: the next call is still answered.
+    #[test]
+    fn a_call_after_a_rewind_is_answered() {
+        use UiToolStatus::{Reported, Running};
+        let mut fold = TranscriptFold::new(me(), &[]);
+        let rows = [
+            replied(vec![call("one")], None, None, 1),
+            request_answering(true, 2),
+            replied(vec![call("two")], None, None, 3),
+            request_answering(true, 4),
+            replied(vec![call("three")], None, None, 5),
+            request_answering(true, 6),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(2),
+                at: UnixMs(7),
+            },
+            replied(vec![call("after")], None, None, 8),
+        ];
+        for (pos, event) in rows.into_iter().enumerate() {
+            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+        }
+        assert_eq!(tool_statuses(&fold), [Reported, Running]);
+        fold.tell(&TranscriptRow::Log(Wpos(8), request_answering(true, 9)));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported]);
     }
 
     /// An input may be heard before the message it hands over: the message
@@ -1120,7 +1199,7 @@ mod tests {
         let report = |at| LogEvent::Request {
             agent: me(),
             inputs: Vec::new(),
-            calls: Vec::new(),
+            answers: true,
             compaction: true,
             at: UnixMs(at),
         };

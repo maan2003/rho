@@ -3,8 +3,13 @@
 //! store has moved.
 //!
 //! - A request takes the `Input` rows of its agent since its last request.
-//! - A native request's notebook output becomes its `output`.
-//! - Claude's output rows go: the model read them, and the transcript says so.
+//! - Its notebook output becomes its `output`.
+//! - Claude's output rows go: its transcript said the same.
+//! - Claude's echoes keep only their uuid, which a rewind forks at.
+//! - A Claude result that repeats what its request answered with goes. The rest
+//!   stay as `ClaudeResults`: Claude Code's own tools, and refused calls.
+//! - The runtimes' rows flatten into the log's own, and nothing keeps `why`,
+//!   `wake` or a `Restarted` notice, which no code read.
 //! - An input no request came after goes: the chat hands a message again, since
 //!   the agent's watermark falls back with it.
 //!
@@ -12,28 +17,28 @@
 //! name an input inside a request's group. What it left standing goes to the
 //! agent's next request, which is what the old log read as.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use redb::TableDefinition;
 use rho_agent_types::{AgentId, Role, WorksetId, Wpos};
 use rho_db::{Sen, SenValue, WriteTxn};
 
 use super::*;
-use crate::entry::output_content;
+use crate::entry::{Notice, output_content, plain_text};
 use crate::record::Input;
 
 /// The log as the previous format wrote it.
 mod old {
-    use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse};
+    use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse, ToolResult};
     use rho_agent_types::{
         AgentId, ContentPart, ExecMilestone, MessageId, UnixMs, WorksetKind, Wpos,
     };
     use senax_encoder::{Decode, Encode};
     use uuid::Uuid;
 
-    use crate::entry::{Notice, RequestNotice, ResponseUsage, Wake};
+    use crate::entry::{RequestNotice, ResponseUsage};
     use crate::inference::Carry;
-    use crate::log::{ClaudeRewind, TranscriptLine, WakeFacts};
+    use crate::log::{AgentUsageBucket, ClaudeRewind, TranscriptCall};
     use crate::record::AgentSpec;
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -106,7 +111,6 @@ mod old {
             usage: Option<ResponseUsage>,
         },
         RequestSent {
-            why: Wake,
             report: Report,
             compact: bool,
         },
@@ -118,31 +122,49 @@ mod old {
         },
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub enum Notice {
+        Error(String),
+        Stopped(String),
+        Restarted,
+        Archived,
+        FreshNotebook,
+    }
+
     #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
     pub struct Report {
         pub notices: Vec<RequestNotice>,
         pub notebook: rho_notebook::Report,
     }
 
-    /// `Output` and `OutputHandedOff` held fields this hop drops, which a
-    /// decode skips.
+    /// A decode skips the fields this hop drops: `wake` and `why` here and on
+    /// the native request, all of `Output` and `OutputHandedOff`, and an
+    /// echo's text.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode)]
+    pub enum TranscriptLine {
+        User {},
+        Assistant {
+            text: String,
+            calls: Vec<TranscriptCall>,
+            usage: Option<AgentUsageBucket>,
+            context_used: Option<u64>,
+        },
+        ToolResults {
+            results: Vec<ToolResult>,
+        },
+        Compacted {
+            context_used: Option<u64>,
+        },
+    }
+
     #[derive(Clone, Debug, PartialEq, Encode, Decode)]
     pub enum ClaudeRow {
-        Transcript {
-            uuid: Uuid,
-            line: TranscriptLine,
-            wake: Option<WakeFacts>,
-        },
-        ExecAdmitted {
-            call: ExecCall,
-        },
+        Transcript { uuid: Uuid, line: TranscriptLine },
+        ExecAdmitted { call: ExecCall },
         Output {},
         OutputHandedOff {},
         RewindPending(Option<ClaudeRewind>),
-        RequestSent {
-            why: Wake,
-            report: Report,
-        },
+        RequestSent { report: Report },
         Notice(Notice),
     }
 
@@ -254,6 +276,44 @@ struct Agent {
     requests: Vec<(Wpos, Vec<usize>)>,
     /// Its newest new row.
     last: Option<Wpos>,
+    /// Calls Rho ran for it.
+    admitted: HashSet<String>,
+    /// What its newest request's output said.
+    output: String,
+}
+
+fn new_notice(notice: old::Notice) -> Option<Notice> {
+    match notice {
+        old::Notice::Error(error) => Some(Notice::Error(error)),
+        old::Notice::Stopped(error) => Some(Notice::Stopped(error)),
+        old::Notice::Restarted => None,
+        old::Notice::Archived => Some(Notice::Archived),
+        old::Notice::FreshNotebook => Some(Notice::FreshNotebook),
+    }
+}
+
+/// A request as the new log holds it: it takes what waits for its agent.
+fn request(
+    agents: &mut HashMap<AgentId, Agent>,
+    agent: AgentId,
+    report: old::Report,
+    compact: bool,
+    at: usize,
+    input: &impl Fn(usize) -> Input,
+) -> Event<'static> {
+    let place = agents.entry(agent).or_default();
+    let taken = std::mem::take(&mut place.waiting);
+    let inputs = taken.iter().map(|index| input(*index)).collect();
+    place.requests.push((Wpos(at as u64), taken));
+    let output = output_content(&report.notebook);
+    place.output = plain_text(&output);
+    Event::Request {
+        agent,
+        output,
+        inputs,
+        notices: report.notices,
+        compact,
+    }
 }
 
 /// The new rows of one workset's log, in order.
@@ -320,43 +380,12 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
             }
             old::Event::Native {
                 agent,
-                entry:
-                    old::Entry::RequestSent {
-                        why,
-                        report,
-                        compact,
-                    },
-            } => {
-                let place = agents.entry(agent).or_default();
-                let taken = std::mem::take(&mut place.waiting);
-                let inputs = taken.iter().map(|index| input(*index)).collect();
-                place.requests.push((Wpos(new.len() as u64), taken));
-                Event::Request {
-                    agent,
-                    why,
-                    output: output_content(&report.notebook),
-                    inputs,
-                    notices: report.notices,
-                    compact,
-                }
-            }
+                entry: old::Entry::RequestSent { report, compact },
+            } => request(&mut agents, agent, report, compact, new.len(), &input),
             old::Event::Claude {
                 agent,
-                row: old::ClaudeRow::RequestSent { why, report },
-            } => {
-                let place = agents.entry(agent).or_default();
-                let taken = std::mem::take(&mut place.waiting);
-                let inputs = taken.iter().map(|index| input(*index)).collect();
-                place.requests.push((Wpos(new.len() as u64), taken));
-                Event::Request {
-                    agent,
-                    why,
-                    output: Vec::new(),
-                    inputs,
-                    notices: report.notices,
-                    compact: false,
-                }
-            }
+                row: old::ClaudeRow::RequestSent { report },
+            } => request(&mut agents, agent, report, false, new.len(), &input),
             old::Event::WorksetCreated { kind, code } => Event::WorksetCreated { kind, code },
             old::Event::Evaluated { code } => Event::Evaluated { code },
             old::Event::AgentCreated { agent, spec } => Event::AgentCreated { agent, spec },
@@ -381,38 +410,79 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                 exec,
                 milestone,
             },
-            old::Event::Native { agent, entry } => Event::Native {
-                agent,
-                entry: match entry {
-                    old::Entry::Step {
-                        exec,
-                        prose,
-                        carry,
-                        usage,
-                    } => Entry::Step {
-                        exec,
-                        prose,
-                        carry,
-                        usage,
-                    },
-                    old::Entry::Notice { notice } => Entry::Notice { notice },
-                    old::Entry::CompactionTrigger { manual } => Entry::CompactionTrigger { manual },
-                    old::Entry::RequestSent { .. } => unreachable!("matched above"),
+            old::Event::Native { agent, entry } => match entry {
+                old::Entry::Step {
+                    exec,
+                    prose,
+                    carry,
+                    usage,
+                } => Event::Step {
+                    agent,
+                    exec,
+                    prose,
+                    carry,
+                    usage,
                 },
+                old::Entry::Notice { notice } => {
+                    let Some(notice) = new_notice(notice) else {
+                        continue;
+                    };
+                    Event::Notice { agent, notice }
+                }
+                old::Entry::CompactionTrigger { manual } => {
+                    Event::CompactionTrigger { agent, manual }
+                }
+                old::Entry::RequestSent { .. } => unreachable!("matched above"),
             },
-            old::Event::Claude { agent, row } => Event::Claude {
-                agent,
-                row: match row {
-                    old::ClaudeRow::Transcript { uuid, line, wake } => {
-                        ClaudeRow::Transcript { uuid, line, wake }
+            old::Event::Claude { agent, row } => match row {
+                old::ClaudeRow::Transcript { uuid, line } => match line {
+                    old::TranscriptLine::User {} => Event::ClaudeEcho { agent, uuid },
+                    old::TranscriptLine::Assistant {
+                        text,
+                        calls,
+                        usage,
+                        context_used,
+                    } => Event::ClaudeReply {
+                        agent,
+                        text,
+                        calls,
+                        usage,
+                        context_used,
+                    },
+                    old::TranscriptLine::ToolResults { mut results } => {
+                        let place = agents.entry(agent).or_default();
+                        results.retain(|result| {
+                            !place.admitted.contains(result.call_id.as_str())
+                                || result.body.recorded_output().trim() != place.output.trim()
+                        });
+                        if results.is_empty() {
+                            continue;
+                        }
+                        Event::ClaudeResults { agent, results }
                     }
-                    old::ClaudeRow::ExecAdmitted { call } => ClaudeRow::ExecAdmitted { call },
-                    old::ClaudeRow::RewindPending(rewind) => ClaudeRow::RewindPending(rewind),
-                    old::ClaudeRow::Notice(notice) => ClaudeRow::Notice(notice),
-                    old::ClaudeRow::Output {}
-                    | old::ClaudeRow::OutputHandedOff {}
-                    | old::ClaudeRow::RequestSent { .. } => unreachable!("matched above"),
+                    old::TranscriptLine::Compacted { context_used } => Event::ClaudeCompacted {
+                        agent,
+                        context_used,
+                    },
                 },
+                old::ClaudeRow::ExecAdmitted { call } => {
+                    agents
+                        .entry(agent)
+                        .or_default()
+                        .admitted
+                        .insert(call.id.as_str().to_owned());
+                    Event::ExecAdmitted { agent, call }
+                }
+                old::ClaudeRow::RewindPending(rewind) => Event::RewindPending { agent, rewind },
+                old::ClaudeRow::Notice(notice) => {
+                    let Some(notice) = new_notice(notice) else {
+                        continue;
+                    };
+                    Event::Notice { agent, notice }
+                }
+                old::ClaudeRow::Output {}
+                | old::ClaudeRow::OutputHandedOff {}
+                | old::ClaudeRow::RequestSent { .. } => unreachable!("matched above"),
             },
         };
         if let Some(agent) = agent {
@@ -428,7 +498,7 @@ pub(crate) mod tests {
     use rho_agent_types::{AgentIdDomain, ChatSeq, ContentPart, MessageId, UnixMs, WorksetKind};
 
     use super::*;
-    use crate::entry::{RequestNotice, Wake};
+    use crate::entry::RequestNotice;
 
     fn agent(n: u64) -> AgentId {
         AgentId::from_counter(n, &AgentIdDomain(7)).unwrap()
@@ -454,7 +524,6 @@ pub(crate) mod tests {
         at(old::Event::Native {
             agent,
             entry: old::Entry::RequestSent {
-                why: Wake::Notify,
                 compact: false,
                 report: old::Report {
                     notices: vec![RequestNotice::Restarted],
@@ -463,14 +532,13 @@ pub(crate) mod tests {
             },
         })
     }
-    fn old_claude_request(agent: AgentId) -> old::Record {
+    fn old_claude_request(agent: AgentId, output: &str) -> old::Record {
         at(old::Event::Claude {
             agent,
             row: old::ClaudeRow::RequestSent {
-                why: Wake::Returned,
                 report: old::Report {
                     notices: Vec::new(),
-                    notebook: rho_notebook::Report::from_text("said twice".into(), vec![]),
+                    notebook: rho_notebook::Report::from_text(output.into(), vec![]),
                 },
             },
         })
@@ -479,7 +547,7 @@ pub(crate) mod tests {
         at(old::Event::Native {
             agent,
             entry: old::Entry::Notice {
-                notice: crate::entry::Notice::Restarted,
+                notice: old::Notice::Archived,
             },
         })
     }
@@ -568,10 +636,53 @@ pub(crate) mod tests {
         );
     }
 
-    /// Claude read its output through the transcript: its rows go, and its
-    /// request holds none of it.
+    fn old_line(agent: AgentId, line: old::TranscriptLine) -> old::Record {
+        at(old::Event::Claude {
+            agent,
+            row: old::ClaudeRow::Transcript {
+                uuid: uuid::Uuid::from_u128(11),
+                line,
+            },
+        })
+    }
+    fn old_admitted(agent: AgentId, id: &str) -> old::Record {
+        at(old::Event::Claude {
+            agent,
+            row: old::ClaudeRow::ExecAdmitted {
+                call: rho_agent_types::transcript::ExecCall {
+                    id: id.try_into().unwrap(),
+                    source: "pass".into(),
+                },
+            },
+        })
+    }
+    fn old_result(id: &str, output: &str) -> rho_agent_types::transcript::ToolResult {
+        rho_agent_types::transcript::ToolResult {
+            call_id: id.try_into().unwrap(),
+            tool_type: rho_agent_types::transcript::ToolType::Function,
+            body: rho_agent_types::transcript::ToolOutput {
+                full_output: None,
+                images: Default::default(),
+                output: std::sync::Arc::new(output.to_owned()),
+                status: rho_agent_types::ToolOutputStatus::Success,
+            },
+            started_at: UnixMs(1),
+            finished_at: UnixMs(2),
+        }
+    }
+    fn result_ids(event: &Event<'_>) -> Vec<String> {
+        let Event::ClaudeResults { results, .. } = event else {
+            panic!("{event:?}");
+        };
+        results
+            .iter()
+            .map(|result| result.call_id.as_str().to_owned())
+            .collect()
+    }
+
+    /// Claude's output rows go, and its request holds the output.
     #[test]
-    fn claude_output_rows_go() {
+    fn a_claude_request_holds_its_output() {
         let a = agent(1);
         let new = rewrite(&[
             at(old::Event::Claude {
@@ -582,25 +693,115 @@ pub(crate) mod tests {
                 agent: a,
                 row: old::ClaudeRow::OutputHandedOff {},
             }),
-            old_claude_request(a),
+            old_claude_request(a, "printed"),
         ]);
         assert_eq!(new.len(), 1);
         assert!(
             matches!(&new[0].event, Event::Request { output, compact: false, .. }
-            if output.is_empty())
+            if output == &text("printed"))
         );
     }
 
-    /// The old row carried fields this module does not name: a decode skips
+    /// A result goes only when it says what its request answered with, and
+    /// Rho ran its call. Otherwise it is the only copy, and it stays.
+    #[test]
+    fn a_claude_result_goes_only_when_its_request_holds_it() {
+        let a = agent(1);
+        let other = agent(2);
+        let results = |results| old::TranscriptLine::ToolResults { results };
+        let new = rewrite(&[
+            old_admitted(a, "ran"),
+            old_claude_request(a, "printed"),
+            // Its copy is in the request. Whitespace is Claude Code's.
+            old_line(a, results(vec![old_result("ran", "printed\n")])),
+            // Same text, but Claude Code's own tool: the text is a coincidence.
+            old_line(a, results(vec![old_result("bash", "printed")])),
+            // Rho ran it, and the request said something else.
+            old_admitted(a, "differs"),
+            old_line(a, results(vec![old_result("differs", "other")])),
+            // Another agent's request says nothing of this one's result.
+            old_admitted(other, "theirs"),
+            old_claude_request(other, "not this"),
+            old_line(a, results(vec![old_result("ran", "printed")])),
+            // One line holds both kinds: only the copy goes.
+            old_line(
+                a,
+                results(vec![
+                    old_result("ran", "printed"),
+                    old_result("refused", "only the first exec"),
+                ]),
+            ),
+        ]);
+        let ids: Vec<Vec<String>> = new
+            .iter()
+            .filter(|record| matches!(record.event, Event::ClaudeResults { .. }))
+            .map(|record| result_ids(&record.event))
+            .collect();
+        assert_eq!(ids, [["bash"], ["differs"], ["refused"]]);
+    }
+
+    /// An echo keeps its uuid, which a rewind forks at. A reply keeps its
+    /// words. A `Restarted` notice goes, and a rewind that named it follows.
+    #[test]
+    fn claude_rows_flatten() {
+        let a = agent(1);
+        let new = rewrite(&[
+            old_line(a, old::TranscriptLine::User {}),
+            at(old::Event::Claude {
+                agent: a,
+                row: old::ClaudeRow::Notice(old::Notice::Restarted),
+            }),
+            old_line(
+                a,
+                old::TranscriptLine::Assistant {
+                    text: "said".into(),
+                    calls: Vec::new(),
+                    usage: None,
+                    context_used: Some(4),
+                },
+            ),
+            old_rewind(a, 1),
+        ]);
+        assert_eq!(new.len(), 3, "{new:?}");
+        assert!(
+            matches!(new[0].event, Event::ClaudeEcho { uuid, .. } if uuid == uuid::Uuid::from_u128(11))
+        );
+        assert!(
+            matches!(&new[1].event, Event::ClaudeReply { text, context_used: Some(4), .. } if text == "said")
+        );
+        assert!(matches!(new[2].event, Event::Rewound { to: Wpos(1), .. }));
+    }
+
+    /// The old rows carried fields this module does not name: a decode skips
     /// them, whatever they hold.
     #[test]
     fn output_rows_decode_without_their_fields() {
         use senax_encoder::{Encode, decode, encode};
         #[derive(Encode)]
         enum ClaudeRow {
-            Output { batch: Vec<String> },
-            OutputHandedOff { id: uuid::Uuid },
+            Output {
+                batch: Vec<String>,
+            },
+            OutputHandedOff {
+                id: uuid::Uuid,
+            },
+            RequestSent {
+                why: crate::entry::RequestNotice,
+                report: old::Report,
+            },
         }
+        let bytes = encode(&ClaudeRow::RequestSent {
+            why: RequestNotice::Checkin,
+            report: old::Report::default(),
+        })
+        .unwrap();
+        let row: old::ClaudeRow = decode(&mut bytes.as_ref()).unwrap();
+        assert_eq!(
+            row,
+            old::ClaudeRow::RequestSent {
+                report: old::Report::default()
+            }
+        );
         let bytes = encode(&ClaudeRow::Output {
             batch: vec!["x".into()],
         })

@@ -395,13 +395,7 @@ async fn streaming_crash() {
         !db.read()
             .agent_rows(id, created)
             .iter()
-            .any(|(_, record)| matches!(
-                record.event,
-                rho_agent::record::Event::Native {
-                    entry: rho_agent::entry::Entry::Step { .. },
-                    ..
-                }
-            ))
+            .any(|(_, record)| matches!(record.event, rho_agent::record::Event::Step { .. }))
     );
     // Coming up is not a wake, and the interrupted code never runs again.
     tokio::time::sleep(Duration::from_millis(200)).await;

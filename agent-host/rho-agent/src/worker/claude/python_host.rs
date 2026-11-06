@@ -22,7 +22,6 @@ use tokio::sync::Notify;
 use crate::entry::Wake;
 use crate::worker::shared::Progress;
 use crate::worker::shared::wake::{self, Decision};
-use crate::{WakeFacts, WakeTrigger};
 
 /// One exec call the CLI is waiting on.
 #[derive(Clone, Debug)]
@@ -38,7 +37,7 @@ pub(crate) struct PendingExec {
 #[derive(Debug)]
 pub(crate) enum Boundary {
     No { recheck: Option<UnixMs> },
-    Now { why: Wake, wake: WakeFacts },
+    Now { why: Wake },
 }
 
 /// One notebook, its latest cell, and the exec call (if any) the CLI is
@@ -222,25 +221,9 @@ impl PythonHost {
                 opened + (rho_claude::mcp::EXEC_TIMEOUT - std::time::Duration::from_secs(60));
             facts.checkin = Some(facts.checkin.map_or(limit, |at| at.min(limit)));
         }
-        let checkin_at = facts.checkin;
         match wake::decide(&facts, now) {
-            Decision::Now(why) => Boundary::Now {
-                why,
-                wake: self.wake_facts(trigger(why), checkin_at),
-            },
+            Decision::Now(why) => Boundary::Now { why },
             Decision::Later(recheck) => Boundary::No { recheck },
-        }
-    }
-
-    /// A wake as the log tells it.
-    pub(crate) fn wake_facts(&self, trigger: WakeTrigger, checkin_at: Option<UnixMs>) -> WakeFacts {
-        WakeFacts {
-            trigger,
-            events: Vec::new(),
-            foreground_running: self.running_tasks() as u64,
-            background_running: 0,
-            tools_suppressed: false,
-            checkin_at,
         }
     }
 
@@ -278,22 +261,6 @@ impl PythonHost {
     }
 }
 
-/// How the wake reads in the log's terms.
-fn trigger(why: Wake) -> WakeTrigger {
-    match why {
-        Wake::Message => WakeTrigger::User,
-        Wake::AgentMessage => WakeTrigger::AgentMessage,
-        Wake::Notify => WakeTrigger::Notify,
-        Wake::Returned | Wake::Failure => WakeTrigger::Finished,
-        Wake::Checkin => WakeTrigger::Checkin,
-        Wake::Prose
-        | Wake::Restarted
-        | Wake::Rewound
-        | Wake::Compaction
-        | Wake::CompactionReply => WakeTrigger::Asked,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,12 +281,11 @@ mod tests {
         PythonHost::new(notebook, notify)
     }
 
-    async fn settle(host: &mut PythonHost) -> WakeFacts {
+    async fn settle(host: &mut PythonHost) -> Wake {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Boundary::Now { wake, .. } = host.decide(true, None, None, false, UnixMs::now())
-            {
-                return wake;
+            if let Boundary::Now { why } = host.decide(true, None, None, false, UnixMs::now()) {
+                return why;
             }
             assert!(tokio::time::Instant::now() < deadline, "never woke");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -341,8 +307,7 @@ mod tests {
             .is_none()
         );
         assert!(!host.can_admit(), "one open exec at a time");
-        let wake = settle(&mut host).await;
-        assert_eq!(wake.trigger, WakeTrigger::Finished);
+        assert_eq!(settle(&mut host).await, Wake::Returned);
         let text = host.report().unwrap().render().text;
         assert!(text.contains("ran"), "{text}");
         assert!(!host.latest_failed());
@@ -441,7 +406,9 @@ mod tests {
         assert!(!host.prose_correction());
         assert!(matches!(
             host.decide(true, None, Some(UnixMs(0)), false, UnixMs(100_000)),
-            Boundary::Now { wake, .. } if wake.trigger == WakeTrigger::AgentMessage
+            Boundary::Now {
+                why: Wake::AgentMessage
+            }
         ));
         host.shutdown().await.unwrap();
     }
@@ -476,8 +443,16 @@ mod tests {
         assert!(host.has_pending());
         // News answers it, with what the cell printed.
         assert!(matches!(
-            host.decide(true, None, Some(UnixMs(t0 + 2_000)), false, UnixMs(t0 + 1_000_000)),
-            Boundary::Now { wake, .. } if wake.trigger == WakeTrigger::AgentMessage
+            host.decide(
+                true,
+                None,
+                Some(UnixMs(t0 + 2_000)),
+                false,
+                UnixMs(t0 + 1_000_000)
+            ),
+            Boundary::Now {
+                why: Wake::AgentMessage
+            }
         ));
         let text = host.report().unwrap().render().text;
         assert!(text.contains("done"), "{text}");
@@ -525,7 +500,7 @@ mod tests {
         ));
         assert!(matches!(
             host.decide(true, None, None, false, limit),
-            Boundary::Now { wake, .. } if wake.trigger == WakeTrigger::Checkin
+            Boundary::Now { why: Wake::Checkin }
         ));
         host.shutdown().await.unwrap();
     }
@@ -542,9 +517,10 @@ mod tests {
                 recheck: Some(UnixMs(130_000))
             }
         ));
-        assert!(
-            matches!(host.decide(true, None, None, false, UnixMs(130_000)), Boundary::Now { wake, .. } if wake.trigger == WakeTrigger::Checkin)
-        );
+        assert!(matches!(
+            host.decide(true, None, None, false, UnixMs(130_000)),
+            Boundary::Now { why: Wake::Checkin }
+        ));
         host.shutdown().await.unwrap();
     }
 

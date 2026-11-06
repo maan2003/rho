@@ -1297,7 +1297,7 @@ mod tests {
                 text: "go".into(),
                 role: rho_agent_types::Role::System,
             }],
-            calls: Vec::new(),
+            answers: true,
             compaction: false,
             at: UnixMs(at),
         }

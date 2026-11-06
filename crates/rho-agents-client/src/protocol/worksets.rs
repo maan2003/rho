@@ -12,9 +12,7 @@ use rho_agent_types::{
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use super::transcript::{
-    DetailBody, Item, Live, RuntimeKind, RuntimeState, Speaker, ToolOutcome, Usage,
-};
+use super::transcript::{DetailBody, Item, Live, RuntimeKind, RuntimeState, Speaker, Usage};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
@@ -356,24 +354,19 @@ pub enum LogEvent {
         agent: AgentId,
         at: UnixMs,
     },
-    /// A request went out with these inputs, and it answered these calls.
+    /// A request went out with these inputs. `answers`: it answers the open
+    /// call, if one is. Only a compaction with nothing to say leaves it open.
     Request {
         agent: AgentId,
         inputs: Vec<InputView>,
-        calls: Vec<String>,
+        answers: bool,
         compaction: bool,
         at: UnixMs,
     },
-    /// Claude Code says its calls were answered.
-    NotebookReport {
+    /// Claude Code says these calls came back, with no request to answer them.
+    CallsEnded {
         agent: AgentId,
         calls: Vec<String>,
-        at: UnixMs,
-    },
-    /// A Claude agent's tool results.
-    Results {
-        agent: AgentId,
-        results: Vec<ToolOutcome>,
         at: UnixMs,
     },
     Replied {
@@ -425,8 +418,7 @@ impl LogEvent {
             | Self::AgentChanged { at, .. }
             | Self::Request { at, .. }
             | Self::CompactionRequested { at, .. }
-            | Self::NotebookReport { at, .. }
-            | Self::Results { at, .. }
+            | Self::CallsEnded { at, .. }
             | Self::Replied { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
@@ -444,8 +436,7 @@ impl LogEvent {
             | Self::AgentChanged { agent, .. }
             | Self::Request { agent, .. }
             | Self::CompactionRequested { agent, .. }
-            | Self::NotebookReport { agent, .. }
-            | Self::Results { agent, .. }
+            | Self::CallsEnded { agent, .. }
             | Self::Replied { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
@@ -518,7 +509,7 @@ mod tests {
                         text: "hi".into(),
                         role: Role::User,
                     }],
-                    calls: vec!["call".into()],
+                    answers: true,
                     compaction: false,
                     at: UnixMs(8),
                 },

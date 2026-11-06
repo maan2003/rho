@@ -113,12 +113,14 @@ impl Harness {
     }
 
     /// The loop's own rows.
-    fn entries(&self) -> Vec<Entry> {
+    fn entries(&self) -> Vec<Event<'static>> {
         self.events()
             .into_iter()
-            .filter_map(|event| match event {
-                Event::Native { entry, .. } => Some(entry),
-                _ => None,
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Step { .. } | Event::Notice { .. } | Event::CompactionTrigger { .. }
+                )
             })
             .collect()
     }
@@ -155,7 +157,11 @@ impl Harness {
     }
 
     /// The visible log, once `done` holds of it.
-    async fn until(&self, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
+    async fn until(
+        &self,
+        what: &str,
+        done: impl Fn(&[Event<'static>]) -> bool,
+    ) -> Vec<Event<'static>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let entries = self.entries();
@@ -423,13 +429,12 @@ async fn an_ended_turn_wakes_only_for_news() {
         "{}",
         told(&second[1])
     );
-    assert!(harness.events().iter().any(|event| matches!(
-        event,
-        Event::Request {
-            why: Wake::Notify,
-            ..
-        }
-    )));
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Request { .. }))
+    );
 }
 
 #[tokio::test]
@@ -444,7 +449,7 @@ async fn a_restart_does_not_resume_a_running_cell_by_itself() {
         .until("the step", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { .. }))
+                .any(|entry| matches!(entry, Event::Step { .. }))
         })
         .await;
     drop(handle);
@@ -459,12 +464,9 @@ async fn a_restart_does_not_resume_a_running_cell_by_itself() {
     say(&handle, "second").await;
     let told = told(&requests(&script, 1).await[0]);
     assert!(told.contains("rho restarted"), "{told}");
-    assert!(harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::Notice {
-            notice: Notice::Restarted,
-            ..
-        }
+    assert!(harness.events().iter().any(|event| matches!(
+        event,
+        Event::Request { notices, .. } if notices.contains(&RequestNotice::Restarted)
     )));
 }
 
@@ -488,12 +490,9 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     assert!(script.requests().is_empty(), "a reload is not a wake");
     // What awaited the human went with the old notebook, but the agent
     // still waits on them: nothing moves until they write.
-    assert!(!harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::Notice {
-            notice: Notice::Restarted,
-            ..
-        }
+    assert!(!harness.events().iter().any(|event| matches!(
+        event,
+        Event::Request { notices, .. } if notices.contains(&RequestNotice::Restarted)
     )));
 
     say(&handle, "second").await;
@@ -525,7 +524,7 @@ async fn rewind_branches_before_the_last_human_message() {
         .until("the second step", |entries| {
             entries
                 .iter()
-                .filter(|entry| matches!(entry, Entry::Step { .. }))
+                .filter(|entry| matches!(entry, Event::Step { .. }))
                 .count()
                 == 2
         })
@@ -554,7 +553,7 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
                 .filter(|entry| {
                     matches!(
                         entry,
-                        Entry::Notice {
+                        Event::Notice {
                             notice: Notice::Error(_),
                             ..
                         }
@@ -654,7 +653,7 @@ async fn explicit_retry_after_restart_resumes_with_recovery_notice() {
             entries.iter().any(|entry| {
                 matches!(
                     entry,
-                    Entry::Notice {
+                    Event::Notice {
                         notice: Notice::Error(_),
                         ..
                     }
@@ -890,7 +889,7 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
             } else if response_id.is_some() {
                 assert!(
                     harness.entries().iter().any(|entry| matches!(
-                        entry, Entry::Step { exec, .. } if exec.as_deref() == Some(code.as_str())
+                        entry, Event::Step { exec, .. } if exec.as_deref() == Some(code.as_str())
                     )),
                     "clearing the live response must follow the durable step"
                 );
@@ -1041,7 +1040,8 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     agent.script(script.clone());
     agent.notebook().await.unwrap();
     agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: Some("pass".into()),
             prose: String::new(),
             usage: None,
@@ -1120,20 +1120,17 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
     let harness = Harness::new().await;
     let (_, mut agent) = harness.load().await;
     // These recovery facts precede the retained replay range.
+    agent.notice(Notice::FreshNotebook).await.unwrap();
     agent
-        .append(Entry::Notice {
-            notice: Notice::FreshNotebook,
+        .log(Event::CompactionTrigger {
+            agent: agent.agent_id,
+            manual: false,
         })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::CompactionTrigger { manual: false })
         .await
         .unwrap();
     agent
         .log(Event::Request {
             agent: agent.agent_id,
-            why: Wake::Compaction,
             output: Vec::new(),
             inputs: vec![person("old-discarded")],
             notices: Vec::new(),
@@ -1142,7 +1139,8 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
         .await
         .unwrap();
     agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: None,
             prose: String::new(),
             usage: None,
@@ -1176,7 +1174,6 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
     agent
         .log(Event::Request {
             agent: agent.agent_id,
-            why: Wake::Compaction,
             output: Vec::new(),
             inputs: vec![person("too-late")],
             notices: Vec::new(),
@@ -1185,7 +1182,8 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
         .await
         .unwrap();
     agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: None,
             prose: String::new(),
             usage: None,
@@ -1224,6 +1222,47 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
     handle.retire().await.unwrap();
 }
 
+/// A peer's message the model was told of waits in memory for its next call,
+/// and the agent seems idle meanwhile. It must not unload: the chat has moved
+/// past that message, so nothing would hand it again.
+#[tokio::test]
+async fn an_agent_holding_tool_text_is_not_retired() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("end_turn()").then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    handle
+        .input(words("the-brief"), Role::Tool, None)
+        .await
+        .unwrap();
+    let first = requests(&script, 1).await;
+    assert!(told(&first[0]).contains("are waiting"));
+    harness
+        .until("the wait", |_| {
+            handle.status().runtime.awaiting_human && handle.status().settled()
+        })
+        .await;
+    assert!(handle.retire().await.is_err(), "the-brief would be lost");
+
+    say(&handle, "go on").await;
+    let second = requests(&script, 2).await;
+    assert!(
+        second[1]
+            .items()
+            .iter()
+            .any(|item| matches!(item, Item::Report { text, .. } if text.contains("the-brief"))),
+        "{:?}",
+        second[1].items()
+    );
+    harness
+        .until("the second wait", |_| {
+            handle.status().runtime.awaiting_human && handle.status().settled()
+        })
+        .await;
+    handle.retire().await.unwrap();
+}
+
 /// A loaded skill is shown when loaded, shown again as it reads then after
 /// a compaction, and not repeated on requests in between or after.
 
@@ -1248,7 +1287,7 @@ async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
         .until("the compaction", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+                .any(|entry| matches!(entry, Event::Step { carry, .. } if carry.has_compaction()))
         })
         .await;
     let compaction = &script.requests()[1];
@@ -1293,7 +1332,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
         .until("the compaction", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+                .any(|entry| matches!(entry, Event::Step { carry, .. } if carry.has_compaction()))
         })
         .await;
     assert!(
@@ -1309,9 +1348,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
     let events = harness.events();
     let compacted = events
         .iter()
-        .position(|event| {
-            matches!(event, Event::Native { entry: Entry::Step { carry, .. }, .. } if carry.has_compaction())
-        })
+        .position(|event| matches!(event, Event::Step { carry, .. } if carry.has_compaction()))
         .unwrap();
     let is_restored = |input: &crate::record::Input| {
         input.role == Role::System

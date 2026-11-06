@@ -1,6 +1,5 @@
-//! The native runtime's own rows in its workset's log, and what a request says.
-//! With the agent's `Request` rows, the model's context and the transcript are
-//! both projections of these.
+//! What a request says and what happens to an agent, in the words both
+//! runtimes share.
 
 use rho_agent_types::{ContentPart, Role};
 use senax_encoder::{Decode, Encode};
@@ -17,7 +16,7 @@ pub enum Block {
 }
 
 /// Why the model was woken.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     Message,
     AgentMessage,
@@ -45,7 +44,6 @@ pub enum Notice {
     Error(String),
     /// The agent stopped on an error and will not go on without the user.
     Stopped(String),
-    Restarted,
     Archived,
     FreshNotebook,
 }
@@ -207,24 +205,6 @@ impl RequestNotice {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Entry {
-    Step {
-        exec: Option<String>,
-        prose: String,
-        carry: Carry,
-        /// Complete billable usage, absent for interrupted output.
-        usage: Option<ResponseUsage>,
-    },
-    Notice {
-        notice: Notice,
-    },
-    /// Durable queued intent; a `Request` records when an attempt picks it up.
-    CompactionTrigger {
-        manual: bool,
-    },
-}
-
 /// Derived scheduling facts shared by the live loop and durable recovery.
 /// The log, not this projection, owns compaction intent and completion.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
@@ -247,32 +227,28 @@ impl CompactionState {
         }
     }
 
-    pub fn observe(&mut self, entry: &Entry) {
-        match entry {
-            Entry::CompactionTrigger { manual, .. } => {
-                self.pending = true;
-                self.owes_reply = !manual;
-            }
-            Entry::Step { carry, usage, .. } => {
-                let compacted = carry.has_compaction();
-                if compacted {
-                    self.context_used = None;
-                } else if let Some(usage) = usage {
-                    self.context_used = Some(
-                        usage
-                            .input_tokens
-                            .saturating_add(usage.cache_read_tokens)
-                            .saturating_add(usage.output_tokens),
-                    );
-                }
-                if self.sent {
-                    self.reply = compacted && self.owes_reply;
-                    self.sent = false;
-                    self.pending = false;
-                    self.owes_reply = false;
-                }
-            }
-            _ => {}
+    pub fn observe_trigger(&mut self, manual: bool) {
+        self.pending = true;
+        self.owes_reply = !manual;
+    }
+
+    pub fn observe_step(&mut self, carry: &Carry, usage: Option<&ResponseUsage>) {
+        let compacted = carry.has_compaction();
+        if compacted {
+            self.context_used = None;
+        } else if let Some(usage) = usage {
+            self.context_used = Some(
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_tokens)
+                    .saturating_add(usage.output_tokens),
+            );
+        }
+        if self.sent {
+            self.reply = compacted && self.owes_reply;
+            self.sent = false;
+            self.pending = false;
+            self.owes_reply = false;
         }
     }
 }

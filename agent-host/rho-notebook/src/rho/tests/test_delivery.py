@@ -145,6 +145,39 @@ class Delivery(WorksetCase):
         self.assertEqual(failures, [retry])
         self.assertEqual(self.inputs(self.a)[-1], (retry, "user", id))
 
+    def test_a_retry_does_not_hand_again_what_waits_in_the_agent(self):
+        """`delivered` counts what a request carried. A message the agent holds
+        is not counted, and handing it again would make the model read it twice."""
+        from unittest import mock
+
+        from rho import default
+
+        wait_for(lambda: len(self.inputs(self.a)) == 5, "delivery to a")
+        real = fake_rho.input
+        failures = []
+
+        def flaky(agent, text, **kw):
+            if text.endswith("second of two") and not failures:
+                failures.append(text)
+                raise ConnectionError("host went away")
+            real(agent, text, **kw)
+
+        no_request_since = fake_rho.delivered(self.a)
+        with (
+            mock.patch.object(default, "RETRY_SECONDS", 0.01),
+            mock.patch.object(fake_rho, "input", flaky),
+            mock.patch.object(fake_rho, "delivered", lambda agent: no_request_since),
+            mock.patch("sys.stderr"),
+        ):
+            first = fake_rho.post_user(self.mine, "first of two")
+            wait_for(lambda: len(self.inputs(self.a)) == 6, "the first")
+            second = fake_rho.post_user(self.mine, "second of two")
+            wait_for(lambda: failures, "the failure")
+            wait_for(lambda: len(self.inputs(self.a)) >= 7, "the retry")
+            third = fake_rho.post_user(self.mine, "after")
+            wait_for(lambda: self.inputs(self.a)[-1][2] == third, "a later message")
+        self.assertEqual([m for *_, m in self.inputs(self.a)[5:]], [first, second, third])
+
 
 class OwnDelivery(WorksetCase):
     """init.py replaces the whole delivery: here, one that never joins."""

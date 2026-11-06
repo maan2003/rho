@@ -291,12 +291,8 @@ impl Services {
         let mut last = None;
         for record in records {
             last = Some(write.append(workset, record)?);
-            if let Event::Native {
-                entry:
-                    crate::entry::Entry::Step {
-                        usage: Some(usage), ..
-                    },
-                ..
+            if let Event::Step {
+                usage: Some(usage), ..
             } = &record.event
             {
                 write.add_agent_usage(

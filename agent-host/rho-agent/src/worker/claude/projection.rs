@@ -14,7 +14,26 @@ use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{TranscriptCall, TranscriptLine};
+use crate::TranscriptCall;
+use crate::log::AgentUsageBucket;
+
+/// One line of the conversation, as the stream told it. Bodies are whole.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Line {
+    /// The model spoke or called.
+    Reply {
+        text: String,
+        calls: Vec<TranscriptCall>,
+        usage: Option<AgentUsageBucket>,
+        context_used: Option<u64>,
+    },
+    /// Claude Code echoed text it was handed.
+    Echo,
+    /// What the calls came back with.
+    Results { results: Vec<ToolResult> },
+    /// Claude compacted the context here.
+    Compacted { context_used: Option<u64> },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct ClaudeProviderSpecificData;
@@ -198,7 +217,7 @@ pub(super) fn assistant_row(
     message: &AssistantMessage,
     usage_model: crate::log::AgentUsageModel,
     projection: &mut Projection,
-) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+) -> anyhow::Result<Option<(Uuid, Line, UnixMs)>> {
     let mut text = String::new();
     let mut calls = Vec::new();
     for content in &message.message.content {
@@ -231,7 +250,7 @@ pub(super) fn assistant_row(
     }
     Ok(Some((
         row_uuid(message.uuid.as_deref()),
-        TranscriptLine::Assistant {
+        Line::Reply {
             text,
             calls,
             usage,
@@ -248,21 +267,19 @@ pub(super) fn assistant_row(
 pub(super) fn user_row(
     message: &UserOutputMessage,
     projection: &mut Projection,
-) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+) -> anyhow::Result<Option<(Uuid, Line, UnixMs)>> {
     let Some(body) = &message.message else {
         return Ok(None);
     };
     let at = line_time(message.timestamp.as_deref());
-    let mut text = String::new();
+    let mut said = false;
     let mut results = Vec::new();
     for content in &body.content {
         match content {
-            OutputContent::Text { text: part } => {
-                if !is_auxiliary_user_text(part) {
-                    push_line(&mut text, part);
-                }
+            OutputContent::Text { text } => {
+                said |= !is_auxiliary_user_text(text) && !text.trim().is_empty();
             }
-            OutputContent::Image { source } => push_line(&mut text, image_marker(source)),
+            OutputContent::Image { .. } => said = true,
             OutputContent::ToolResult {
                 tool_use_id,
                 content,
@@ -282,22 +299,19 @@ pub(super) fn user_row(
     }
     let uuid = row_uuid(message.uuid.as_deref());
     if !results.is_empty() {
-        return Ok(Some((uuid, TranscriptLine::ToolResults { results }, at)));
+        return Ok(Some((uuid, Line::Results { results }, at)));
     }
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some((uuid, TranscriptLine::User { text }, at)))
+    Ok(said.then_some((uuid, Line::Echo, at)))
 }
 
 /// The row a `compact_boundary` becomes.
 pub(super) fn compacted_row(
     uuid: Option<&str>,
     metadata: Option<&SystemCompactMetadata>,
-) -> (Uuid, TranscriptLine, UnixMs) {
+) -> (Uuid, Line, UnixMs) {
     (
         row_uuid(uuid),
-        TranscriptLine::Compacted {
+        Line::Compacted {
             context_used: metadata.and_then(|metadata| metadata.post_tokens),
         },
         UnixMs::now(),
@@ -316,23 +330,6 @@ pub(super) fn line_time(timestamp: Option<&str>) -> UnixMs {
         .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|time| UnixMs(time.timestamp_millis().max(0) as u64))
         .unwrap_or_else(UnixMs::now)
-}
-
-fn push_line(output: &mut String, part: &str) {
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(part);
-}
-
-fn image_marker(source: &Value) -> &'static str {
-    match source.get("media_type").and_then(Value::as_str) {
-        Some("image/png") => "[image: PNG]",
-        Some("image/jpeg") => "[image: JPEG]",
-        Some("image/webp") => "[image: WebP]",
-        Some("image/gif") => "[image: GIF]",
-        _ => "[image]",
-    }
 }
 
 fn usage_bucket(
@@ -425,13 +422,13 @@ mod tests {
         .unwrap()
     }
 
-    fn user_line(message: Value) -> Option<TranscriptLine> {
+    fn user_line(message: Value) -> Option<Line> {
         user_row(&user(message), &mut Projection::default())
             .unwrap()
             .map(|(_, line, _)| line)
     }
 
-    fn assistant_line(message: Value) -> Option<TranscriptLine> {
+    fn assistant_line(message: Value) -> Option<Line> {
         assistant_row(
             &assistant(message),
             crate::log::AgentUsageModel::OPUS,
@@ -460,7 +457,7 @@ mod tests {
         ]}));
         answer.timestamp = Some("2026-09-06T10:00:04.500Z".to_owned());
         let (_, line, answered_at) = user_row(&answer, &mut projection).unwrap().unwrap();
-        let TranscriptLine::ToolResults { results } = line else {
+        let Line::Results { results } = line else {
             panic!("expected results");
         };
         assert_eq!(answered_at, UnixMs(called_at.0 + 3_500));
@@ -481,25 +478,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
-        assert_eq!(
-            line,
-            TranscriptLine::User {
-                text: "hello".to_owned()
-            }
-        );
+        assert_eq!(line, Line::Echo);
         assert_eq!(at, UnixMs(1788688800000));
     }
 
     #[test]
-    fn images_become_bounded_markers() {
+    fn an_image_alone_is_an_echo() {
         assert_eq!(
             user_line(json!({"role": "user", "content": [
-                {"type": "text", "text": "look"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
             ]})),
-            Some(TranscriptLine::User {
-                text: "look\n[image: PNG]".to_owned()
-            })
+            Some(Line::Echo)
         );
     }
 
@@ -519,11 +508,9 @@ mod tests {
 
     #[test]
     fn a_failed_result_is_an_error() {
-        let Some(TranscriptLine::ToolResults { results }) = user_line(
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "boom"},
-            ]}),
-        ) else {
+        let Some(Line::Results { results }) = user_line(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "boom"},
+        ]})) else {
             panic!("expected results");
         };
         assert_eq!(results.len(), 1);
@@ -552,7 +539,7 @@ mod tests {
         let (_, second, _) = assistant_row(&call, crate::log::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
-        let TranscriptLine::Assistant {
+        let Line::Reply {
             text,
             calls,
             usage,
@@ -567,7 +554,7 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 100);
         assert_eq!(usage.requests, 1);
         assert_eq!(context_used, Some(110));
-        let TranscriptLine::Assistant { calls, usage, .. } = second else {
+        let Line::Reply { calls, usage, .. } = second else {
             panic!("expected assistant");
         };
         assert_eq!(calls.len(), 1);
@@ -597,7 +584,7 @@ mod tests {
         assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
         assert_eq!(
             line,
-            TranscriptLine::Compacted {
+            Line::Compacted {
                 context_used: Some(2000)
             }
         );

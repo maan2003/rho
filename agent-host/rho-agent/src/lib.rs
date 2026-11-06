@@ -22,10 +22,7 @@ mod testing;
 pub mod worker;
 pub use host::{Process as WorksetProcess, WorksetClient};
 pub use ipc::workset::{Action as WorksetAction, Attach as WorksetAttach, Reply as WorksetReply};
-pub use log::{
-    InputKind, QueuedInput, TranscriptCall, TranscriptLine, WakeEvent, WakeFacts, WakeKind,
-    WakeTrigger,
-};
+pub use log::TranscriptCall;
 pub use rho_agents_client::protocol::transcript::{
     InferenceState, RuntimeState, StreamingResponse,
 };
@@ -49,44 +46,5 @@ impl AgentStatus {
     /// The serialized retirement fence still checks the worker's own state.
     pub fn settled(&self) -> bool {
         !self.runtime.is_working() && self.queued == 0
-    }
-}
-
-/// Pending inputs in arrival order.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct InputQueues {
-    items: Vec<QueuedInput>,
-}
-
-impl InputQueues {
-    pub fn push(&mut self, item: QueuedInput) {
-        self.items.push(item);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.items.clear();
-    }
-
-    /// Pending items in arrival order, for rendering.
-    pub fn iter(&self) -> impl Iterator<Item = &QueuedInput> {
-        self.items.iter()
-    }
-
-    /// Remove the first pending item matching `pred`.
-    pub fn remove_first(&mut self, pred: impl FnMut(&QueuedInput) -> bool) -> Option<QueuedInput> {
-        let pos = self.items.iter().position(pred)?;
-        Some(self.items.remove(pos))
-    }
-
-    pub fn retain(&mut self, pred: impl FnMut(&QueuedInput) -> bool) {
-        self.items.retain(pred);
     }
 }

@@ -237,7 +237,7 @@ mod tests {
                         text: text.to_owned(),
                         role: Role::User,
                     }],
-                    calls: Vec::new(),
+                    answers: true,
                     compaction: false,
                     at: UnixMs(at),
                 },
@@ -299,7 +299,7 @@ mod tests {
             LogEvent::Request {
                 agent: other(),
                 inputs: Vec::new(),
-                calls: Vec::new(),
+                answers: true,
                 compaction: false,
                 at: UnixMs(3),
             },
