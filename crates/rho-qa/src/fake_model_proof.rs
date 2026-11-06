@@ -16,7 +16,7 @@ use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role,
     TopicId, WorksetId, WorksetKind, Wpos,
 };
-use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_agents_client::protocol::worksets::{
     ClientFrame, CreateWorkset, LogEvent, Post, ServerFrame, StartTopic,
 };
@@ -72,12 +72,6 @@ struct FakeMetrics {
 }
 
 struct Children(Vec<Child>);
-
-#[derive(Clone)]
-enum ExpectedDetail {
-    Response(Vec<rho_agents_client::protocol::transcript::Item>),
-    Report,
-}
 
 impl Drop for Children {
     fn drop(&mut self) {
@@ -240,8 +234,6 @@ async fn run_async(args: Args) -> Result<()> {
     let mut reported_calls = 0;
     let mut open_calls = HashSet::new();
     let mut messages_sent = 0usize;
-    let mut reported_output_sizes = Vec::new();
-    let mut pending_details = HashMap::new();
     let mut latencies = Vec::new();
     let mut replies = 0u64;
     let mut failed = 0u64;
@@ -266,7 +258,6 @@ async fn run_async(args: Args) -> Result<()> {
     loop {
         let all_idle = agents.len() == agent_count
             && responding.is_empty()
-            && pending_details.is_empty()
             && (args.scenario == Scenario::Baseline || awaiting.len() == agent_count);
         if (args.scenario != Scenario::Baseline
             && all_idle
@@ -288,11 +279,10 @@ async fn run_async(args: Args) -> Result<()> {
         ensure!(
             Instant::now() < quiesce_deadline,
             "agents did not quiesce after the drive window: {} agents, {} responding, \
-             {} awaiting, {} details pending, {} messages to the user",
+             {} awaiting, {} messages to the user",
             agents.len(),
             responding.len(),
             awaiting.len(),
-            pending_details.len(),
             messages_sent
         );
         let event_timeout = if matches!(
@@ -308,11 +298,10 @@ async fn run_async(args: Args) -> Result<()> {
             .with_context(|| {
                 format!(
                     "agent host session stalled with {} agents created, rows read to {worksets:?}, \
-                     {} responding, {} awaiting, {} details pending, {} messages to the user: {}",
+                     {} responding, {} awaiting, {} messages to the user: {}",
                     agents.len(),
                     responding.len(),
                     awaiting.len(),
-                    pending_details.len(),
                     messages_sent,
                     fs::read_to_string(root.path().join("agent host.stderr.log"))
                         .unwrap_or_default()
@@ -504,14 +493,6 @@ async fn run_async(args: Args) -> Result<()> {
                             }
                             if answers && open_calls.remove(&agent) {
                                 reported_calls += 1;
-                                pending_details.insert((workset, pos), ExpectedDetail::Report);
-                                client
-                                    .send(&ClientFrame::Detail {
-                                        workset,
-                                        pos,
-                                        more: Vec::new(),
-                                    })
-                                    .await?;
                             }
                             report_at.insert(agent, at);
                         }
@@ -550,15 +531,6 @@ async fn run_async(args: Args) -> Result<()> {
                                     )),
                                     "native response contained prose or a non-exec tool"
                                 );
-                                pending_details
-                                    .insert((workset, pos), ExpectedDetail::Response(items));
-                                client
-                                    .send(&ClientFrame::Detail {
-                                        workset,
-                                        pos,
-                                        more: Vec::new(),
-                                    })
-                                    .await?;
                             }
                         }
                         LogEvent::Failed {
@@ -570,34 +542,6 @@ async fn run_async(args: Args) -> Result<()> {
                         }
                         _ => {}
                     }
-                }
-            }
-            Incoming::Session(ServerFrame::Detail { workset, pos, body }) => {
-                let expected = pending_details
-                    .remove(&(workset, pos))
-                    .context("unexpected Detail response")?;
-                match (expected, body) {
-                    (ExpectedDetail::Response(visible), DetailBody::Response(detail)) => {
-                        ensure!(
-                            detail == visible,
-                            "response detail did not match visible code calls"
-                        );
-                    }
-                    (ExpectedDetail::Report, DetailBody::Report(output)) => {
-                        ensure!(
-                            !output.is_empty(),
-                            "empty notebook report for a provider call"
-                        );
-                        if args.scenario == Scenario::RealToolRounds {
-                            let step = reported_output_sizes.len() + 1;
-                            ensure!(
-                                output.contains(&format!("rho-e2e-step-{step}:ok")),
-                                "real shell command did not report its expected step marker"
-                            );
-                        }
-                        reported_output_sizes.push(output.len());
-                    }
-                    _ => bail!("agent host Detail body did not match its row"),
                 }
             }
             Incoming::Refused(reason) => {
@@ -683,7 +627,6 @@ async fn run_async(args: Args) -> Result<()> {
             messages_sent,
             latencies: &latencies,
             model_result_max: metrics.max_input_tool_output_bytes,
-            reported_output_sizes: &reported_output_sizes,
         },
     )
     .err();
@@ -758,7 +701,6 @@ struct ScenarioResults<'a> {
     messages_sent: usize,
     latencies: &'a [u64],
     model_result_max: u64,
-    reported_output_sizes: &'a [usize],
 }
 
 fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<'_>) -> Result<()> {
@@ -807,20 +749,6 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
             ensure!(
                 results.model_result_max >= 7_000 && results.model_result_max <= 40_100,
                 "model-facing output did not exercise or exceeded the 10,000-token budget"
-            );
-            ensure!(
-                results.reported_output_sizes.len() == 100,
-                "missing notebook detail for heavy-tail calls"
-            );
-            let mut sizes = results.reported_output_sizes.to_vec();
-            sizes.sort_unstable();
-            ensure!(
-                sizes[49] >= 227 && sizes[49] < 2_000,
-                "heavy-tail median report drifted"
-            );
-            ensure!(
-                sizes[89] >= 5_000 && sizes[99] >= 7_000,
-                "heavy-tail report tail was not preserved"
             );
         }
         Scenario::FortyToolCalls => {

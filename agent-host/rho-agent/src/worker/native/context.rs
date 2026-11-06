@@ -191,6 +191,8 @@ mod tests {
             inputs,
             notices,
             compact: false,
+            turn: None,
+            timing: None,
         }
     }
     fn sent(notices: Vec<RequestNotice>) -> Event<'static> {

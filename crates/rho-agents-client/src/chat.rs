@@ -635,7 +635,6 @@ pub fn topic_state(
         .iter()
         .map(|text| UiBlock::Unsent { text: text.clone() });
     UiAgentState {
-        exec_timings: std::sync::Arc::default(),
         blocks: said
             .into_iter()
             .chain(waiting)

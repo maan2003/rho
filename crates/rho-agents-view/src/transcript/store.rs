@@ -239,6 +239,7 @@ mod tests {
                     }],
                     answers: true,
                     compaction: false,
+                    timing: None,
                     at: UnixMs(at),
                 },
             ),
@@ -301,6 +302,7 @@ mod tests {
                 inputs: Vec::new(),
                 answers: true,
                 compaction: false,
+                timing: None,
                 at: UnixMs(3),
             },
         );

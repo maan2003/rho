@@ -919,6 +919,8 @@ impl Agent {
             inputs: taken.inputs,
             notices,
             compact: self.compaction.pending,
+            turn: None,
+            timing: None,
         })
         .await?;
         if !quiet {

@@ -5,7 +5,12 @@
 //! - A request takes the `Input` rows of its agent since its last request.
 //! - Its notebook output becomes its `output`.
 //! - Claude's output rows go: its transcript said the same.
-//! - Claude's echoes keep only their uuid, which a rewind forks at.
+//! - Claude's echoes go. The uuid a rewind forks at moves to the newest request
+//!   before the echo, which is the one that sent it.
+//! - Exec observations go. A call's timing moves to the request that handed off
+//!   its answer. A call with no handoff had no answer and has no timing.
+//! - `ExecAdmitted` goes: nothing read it.
+//! - A failure keeps only the text the model had said.
 //! - A Claude result that repeats what its request answered with goes. The rest
 //!   stay as `ClaudeResults`: Claude Code's own tools, and refused calls.
 //! - The runtimes' rows flatten into the log's own, and nothing keeps `why`,
@@ -20,19 +25,20 @@
 use std::collections::{HashMap, HashSet};
 
 use redb::TableDefinition;
-use rho_agent_types::{AgentId, Role, WorksetId, Wpos};
+use rho_agent_types::transcript::{
+    PendingInferenceResponse, StreamingContextItem, StreamingContextItemState,
+};
+use rho_agent_types::{AgentId, CallTiming, ExecTiming, Role, UnixMs, WorksetId, Wpos};
 use rho_db::{Sen, SenValue, WriteTxn};
 
 use super::*;
 use crate::entry::{Notice, output_content, plain_text};
-use crate::record::Input;
+use crate::record::{CallResult, Input};
 
 /// The log as the previous format wrote it.
 mod old {
     use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse, ToolResult};
-    use rho_agent_types::{
-        AgentId, ContentPart, ExecMilestone, MessageId, UnixMs, WorksetKind, Wpos,
-    };
+    use rho_agent_types::{AgentId, ContentPart, MessageId, UnixMs, WorksetKind, Wpos};
     use senax_encoder::{Decode, Encode};
     use uuid::Uuid;
 
@@ -93,6 +99,15 @@ mod old {
             agent: AgentId,
             row: ClaudeRow,
         },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    pub enum ExecMilestone {
+        FirstBlock,
+        ArgumentsFinished,
+        ResponseFinished,
+        Boundary,
+        HandedOff,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -280,6 +295,16 @@ struct Agent {
     admitted: HashSet<String>,
     /// What its newest request's output said.
     output: String,
+    /// How far each call it made has got, until a handoff.
+    timings: HashMap<String, ExecTiming>,
+    /// The turns it named: the request's new position and the echo's old one.
+    turns: Vec<(Wpos, usize)>,
+    /// Where the newest call's boundary fell among the new rows. Only a
+    /// request from there on can be the one that answered it.
+    boundary: usize,
+    /// A call handed off before its request's row went in, as older builds
+    /// wrote them.
+    handed: Option<CallTiming>,
 }
 
 fn new_notice(notice: old::Notice) -> Option<Notice> {
@@ -313,7 +338,43 @@ fn request(
         inputs,
         notices: report.notices,
         compact,
+        turn: None,
+        timing: place.handed.take(),
     }
+}
+
+/// What a failed stream held of what the model said.
+fn model_text(partial: &PendingInferenceResponse) -> String {
+    let mut text = String::new();
+    for slot in &partial.items {
+        let (StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item)) =
+            slot
+        else {
+            continue;
+        };
+        if let StreamingContextItem::AssistantMessage { content, .. } = item {
+            let part = content.iter().map(ToString::to_string).collect::<String>();
+            if !part.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&part);
+            }
+        }
+    }
+    text
+}
+
+/// A call's stage, as its row told it.
+fn observe(timing: &mut ExecTiming, milestone: old::ExecMilestone, at: UnixMs) {
+    let field = match milestone {
+        old::ExecMilestone::FirstBlock => &mut timing.first_block_at,
+        old::ExecMilestone::ArgumentsFinished => &mut timing.arguments_finished_at,
+        old::ExecMilestone::ResponseFinished => &mut timing.response_finished_at,
+        old::ExecMilestone::Boundary => &mut timing.boundary_at,
+        old::ExecMilestone::HandedOff => &mut timing.handed_off_at,
+    };
+    field.get_or_insert(at);
 }
 
 /// The new rows of one workset's log, in order.
@@ -372,6 +433,19 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                 }
                 standing.append(&mut place.waiting);
                 place.waiting = standing;
+                // A rewound echo no longer names the turn of a request that
+                // stands: the next echo does.
+                while place
+                    .turns
+                    .last()
+                    .is_some_and(|(_, echo)| *echo >= to.0 as usize)
+                {
+                    let (at, _) = place.turns.pop().expect("just looked");
+                    let Event::Request { turn, .. } = &mut new[at.0 as usize].event else {
+                        unreachable!("a turn belongs to a request");
+                    };
+                    *turn = None;
+                }
                 // What it took back may all be gone: then it has no work left.
                 if place.last.is_none_or(|last| to_new > last) {
                     continue;
@@ -397,7 +471,7 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                 retrying,
             } => Event::Failed {
                 agent,
-                partial,
+                partial: model_text(&partial),
                 error: error.into(),
                 retrying,
             },
@@ -405,11 +479,29 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                 agent,
                 exec,
                 milestone,
-            } => Event::ExecObserved {
-                agent,
-                exec,
-                milestone,
-            },
+            } => {
+                let place = agents.entry(agent).or_default();
+                let timing = place.timings.entry(exec.as_str().to_owned()).or_default();
+                observe(timing, milestone, at);
+                if milestone == old::ExecMilestone::Boundary {
+                    place.boundary = new.len();
+                }
+                if milestone == old::ExecMilestone::HandedOff {
+                    let timing = place.timings.remove(exec.as_str()).expect("just observed");
+                    let call = CallTiming { call: exec, timing };
+                    match place.requests.last().map(|(at, _)| at.0 as usize) {
+                        Some(request) if request >= place.boundary => {
+                            let Event::Request { timing: slot, .. } = &mut new[request].event
+                            else {
+                                unreachable!("only requests are listed");
+                            };
+                            slot.get_or_insert(call);
+                        }
+                        _ => place.handed = Some(call),
+                    }
+                }
+                continue;
+            }
             old::Event::Native { agent, entry } => match entry {
                 old::Entry::Step {
                     exec,
@@ -436,7 +528,17 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
             },
             old::Event::Claude { agent, row } => match row {
                 old::ClaudeRow::Transcript { uuid, line } => match line {
-                    old::TranscriptLine::User {} => Event::ClaudeEcho { agent, uuid },
+                    old::TranscriptLine::User {} => {
+                        let place = agents.entry(agent).or_default();
+                        if let Some(request) = place.requests.last().map(|(at, _)| *at)
+                            && let Event::Request { turn, .. } = &mut new[request.0 as usize].event
+                            && turn.is_none()
+                        {
+                            *turn = Some(uuid);
+                            place.turns.push((request, index));
+                        }
+                        continue;
+                    }
                     old::TranscriptLine::Assistant {
                         text,
                         calls,
@@ -458,7 +560,16 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                         if results.is_empty() {
                             continue;
                         }
-                        Event::ClaudeResults { agent, results }
+                        Event::ClaudeResults {
+                            agent,
+                            results: results
+                                .iter()
+                                .map(|result| CallResult {
+                                    call: result.call_id.clone(),
+                                    output: result.body.recorded_output().to_owned(),
+                                })
+                                .collect(),
+                        }
                     }
                     old::TranscriptLine::Compacted { context_used } => Event::ClaudeCompacted {
                         agent,
@@ -471,7 +582,7 @@ fn rewrite(rows: &[old::Record]) -> Vec<Record<'static>> {
                         .or_default()
                         .admitted
                         .insert(call.id.as_str().to_owned());
-                    Event::ExecAdmitted { agent, call }
+                    continue;
                 }
                 old::ClaudeRow::RewindPending(rewind) => Event::RewindPending { agent, rewind },
                 old::ClaudeRow::Notice(notice) => {
@@ -676,7 +787,7 @@ pub(crate) mod tests {
         };
         results
             .iter()
-            .map(|result| result.call_id.as_str().to_owned())
+            .map(|result| result.call.as_str().to_owned())
             .collect()
     }
 
@@ -740,13 +851,173 @@ pub(crate) mod tests {
         assert_eq!(ids, [["bash"], ["differs"], ["refused"]]);
     }
 
-    /// An echo keeps its uuid, which a rewind forks at. A reply keeps its
-    /// words. A `Restarted` notice goes, and a rewind that named it follows.
+    fn old_echo(agent: AgentId, id: u128) -> old::Record {
+        at(old::Event::Claude {
+            agent,
+            row: old::ClaudeRow::Transcript {
+                uuid: uuid::Uuid::from_u128(id),
+                line: old::TranscriptLine::User {},
+            },
+        })
+    }
+    fn old_observed(
+        agent: AgentId,
+        exec: &str,
+        milestone: old::ExecMilestone,
+        when: u64,
+    ) -> old::Record {
+        old::Record {
+            at: UnixMs(when),
+            event: old::Event::ExecObserved {
+                agent,
+                exec: exec.try_into().unwrap(),
+                milestone,
+            },
+        }
+    }
+    fn turns(rows: &[Record<'_>]) -> Vec<Option<uuid::Uuid>> {
+        rows.iter()
+            .filter_map(|record| match &record.event {
+                Event::Request { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first echo after a request names its turn, and goes to no other
+    /// agent's request. A later echo says nothing a rewind reads.
+    #[test]
+    fn an_echo_moves_to_the_request_before_it() {
+        let (a, b) = (agent(1), agent(2));
+        let id = uuid::Uuid::from_u128;
+        let new = rewrite(&[
+            old_echo(a, 1),     // no request yet: nothing to name
+            old_request(a, ""), // 1 -> 0
+            old_request(b, ""), // 2 -> 1
+            old_echo(a, 2),     // a's newest request, past b's
+            old_echo(a, 3),     // a's request already has its turn
+            old_request(a, ""), // 5 -> 2
+            old_echo(b, 4),     // b's newest request, past a's
+        ]);
+        assert_eq!(new.len(), 3, "{new:?}");
+        assert_eq!(turns(&new), [Some(id(2)), Some(id(4)), None]);
+    }
+
+    /// A call's stages move to the request whose answer it handed off. A call
+    /// that was never handed off has no timing, and another agent's request
+    /// takes none of this agent's.
+    #[test]
+    fn a_calls_timing_moves_to_the_request_that_answered_it() {
+        use old::ExecMilestone::*;
+        let (a, b) = (agent(1), agent(2));
+        let new = rewrite(&[
+            old_observed(a, "cut", FirstBlock, 1),
+            old_observed(a, "ran", FirstBlock, 10),
+            old_observed(a, "ran", FirstBlock, 99), // the first one counts
+            old_observed(a, "ran", ArgumentsFinished, 11),
+            old_observed(a, "ran", ResponseFinished, 12),
+            old_observed(a, "ran", Boundary, 13),
+            old_claude_request(a, "printed"),
+            old_claude_request(b, "theirs"),
+            old_observed(a, "ran", HandedOff, 14),
+            old_claude_request(a, "later"),
+        ]);
+        let timings: Vec<_> = new
+            .iter()
+            .map(|record| match &record.event {
+                Event::Request { timing, .. } => timing.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            timings,
+            [
+                Some(CallTiming {
+                    call: "ran".try_into().unwrap(),
+                    timing: ExecTiming {
+                        first_block_at: Some(UnixMs(10)),
+                        arguments_finished_at: Some(UnixMs(11)),
+                        response_finished_at: Some(UnixMs(12)),
+                        boundary_at: Some(UnixMs(13)),
+                        handed_off_at: Some(UnixMs(14)),
+                    },
+                }),
+                None,
+                None,
+            ]
+        );
+    }
+
+    fn said_item(said: &str) -> rho_agent_types::transcript::StreamingContextItem {
+        rho_agent_types::transcript::StreamingContextItem::AssistantMessage {
+            provider_specific: Box::new(rho_agent_types::transcript::UnknownProviderSpecificData {
+                body: Default::default(),
+                tag: "test".to_owned(),
+            }),
+            content: vec![said.into()],
+            phase: None,
+        }
+    }
+
+    /// Older builds wrote the handoff before the request's row. The timing
+    /// then goes to the next request, not to the one before the call.
+    #[test]
+    fn a_handoff_before_its_request_waits_for_it() {
+        use old::ExecMilestone::*;
+        let a = agent(1);
+        let new = rewrite(&[
+            old_claude_request(a, "before"),
+            old_observed(a, "ran", FirstBlock, 10),
+            old_observed(a, "ran", Boundary, 13),
+            old_observed(a, "ran", HandedOff, 14),
+            old_claude_request(a, "printed"),
+        ]);
+        let calls: Vec<_> = new
+            .iter()
+            .map(|record| match &record.event {
+                Event::Request { timing, .. } => timing
+                    .as_ref()
+                    .map(|timing| timing.call.as_str().to_owned()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(calls, [None, Some("ran".to_owned())]);
+    }
+
+    /// A failure keeps what the model said, and nothing else of the stream.
+    #[test]
+    fn a_failure_keeps_only_the_models_text() {
+        use rho_agent_types::transcript::{
+            PendingInferenceResponse, StreamingContextItemState as Slot,
+        };
+        let a = agent(1);
+        let new = rewrite(&[at(old::Event::Failed {
+            agent: a,
+            partial: PendingInferenceResponse {
+                items: vec![Slot::Empty, Slot::Pending(said_item("half an answer"))],
+            },
+            error: "overloaded".into(),
+            retrying: true,
+        })]);
+        assert_eq!(
+            new[0].event,
+            Event::Failed {
+                agent: a,
+                partial: "half an answer".into(),
+                error: "overloaded".into(),
+                retrying: true,
+            }
+        );
+    }
+
+    /// A reply keeps its words, an `ExecAdmitted` and a `Restarted` notice go,
+    /// and a rewind that named one follows.
     #[test]
     fn claude_rows_flatten() {
         let a = agent(1);
         let new = rewrite(&[
-            old_line(a, old::TranscriptLine::User {}),
+            old_claude_request(a, ""),
+            old_admitted(a, "ran"),
             at(old::Event::Claude {
                 agent: a,
                 row: old::ClaudeRow::Notice(old::Notice::Restarted),
@@ -760,12 +1031,9 @@ pub(crate) mod tests {
                     context_used: Some(4),
                 },
             ),
-            old_rewind(a, 1),
+            old_rewind(a, 2),
         ]);
         assert_eq!(new.len(), 3, "{new:?}");
-        assert!(
-            matches!(new[0].event, Event::ClaudeEcho { uuid, .. } if uuid == uuid::Uuid::from_u128(11))
-        );
         assert!(
             matches!(&new[1].event, Event::ClaudeReply { text, context_used: Some(4), .. } if text == "said")
         );
@@ -888,10 +1156,11 @@ pub(crate) mod tests {
                 let which = next(2) as usize;
                 let a = agents[which];
                 let pos = rows.len() as u64;
-                let record = match next(7) {
+                let record = match next(8) {
                     0..=2 => old_input(a, &n.to_string(), None),
                     3 | 4 => old_request(a, ""),
                     5 => old_notice(a),
+                    6 => old_echo(a, u128::from(n) + 1),
                     _ if !theirs[which].is_empty() => {
                         let to = theirs[which][next(theirs[which].len() as u64) as usize];
                         old_rewind(a, to)
@@ -906,6 +1175,11 @@ pub(crate) mod tests {
                 assert_eq!(
                     standing(&new, a),
                     old_standing(&rows, a),
+                    "{a:?} in {rows:#?} became {new:#?}"
+                );
+                assert_eq!(
+                    forks(&new, a),
+                    old_forks(&rows, a),
                     "{a:?} in {rows:#?} became {new:#?}"
                 );
             }
@@ -926,8 +1200,63 @@ pub(crate) mod tests {
         }
     }
 
+    /// Where a rewind to each standing request forks in the old log: the
+    /// first echo that stands after it.
+    fn old_forks(rows: &[old::Record], of: AgentId) -> Vec<Option<uuid::Uuid>> {
+        let mut seen: Vec<(u64, &old::Record)> = Vec::new();
+        for (pos, record) in rows.iter().enumerate() {
+            if record.event.agent() != Some(of) {
+                continue;
+            }
+            if let old::Event::Rewound { to, .. } = &record.event {
+                seen.retain(|(at, _)| *at < to.0);
+            } else {
+                seen.push((pos as u64, record));
+            }
+        }
+        let echo = |record: &old::Record| match &record.event {
+            old::Event::Claude {
+                row: old::ClaudeRow::Transcript { uuid, .. },
+                ..
+            } => Some(*uuid),
+            _ => None,
+        };
+        seen.iter()
+            .enumerate()
+            .filter(|(_, (_, record))| {
+                matches!(
+                    record.event,
+                    old::Event::Native {
+                        entry: old::Entry::RequestSent { .. },
+                        ..
+                    }
+                )
+            })
+            .map(|(index, _)| seen[index..].iter().find_map(|(_, record)| echo(record)))
+            .collect()
+    }
+
+    /// The same, from the turns the standing requests hold.
+    fn forks(rows: &[Record<'_>], of: AgentId) -> Vec<Option<uuid::Uuid>> {
+        let mut seen: Vec<(u64, Option<uuid::Uuid>)> = Vec::new();
+        for (pos, record) in rows.iter().enumerate() {
+            match &record.event {
+                Event::Rewound { agent, to } if *agent == of => {
+                    seen.retain(|(at, _)| *at < to.0);
+                }
+                Event::Request { agent, turn, .. } if *agent == of => {
+                    seen.push((pos as u64, *turn));
+                }
+                _ => {}
+            }
+        }
+        (0..seen.len())
+            .map(|from| seen[from..].iter().find_map(|(_, turn)| *turn))
+            .collect()
+    }
+
     /// An agent's standing rows in the old log: requests with what they
-    /// delivered, and notices.
+    /// delivered, and notices. An echo left no row of its own.
     fn old_standing(rows: &[old::Record], of: AgentId) -> Vec<String> {
         let mut seen: Vec<(u64, &old::Record)> = Vec::new();
         for (pos, record) in rows.iter().enumerate() {
@@ -951,6 +1280,10 @@ pub(crate) mod tests {
                     entry: old::Entry::RequestSent { .. },
                     ..
                 } => read.push(format!("request {:?}", std::mem::take(&mut group))),
+                old::Event::Claude {
+                    row: old::ClaudeRow::Transcript { .. },
+                    ..
+                } => {}
                 _ => read.push("notice".to_owned()),
             }
         }

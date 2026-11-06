@@ -1135,6 +1135,8 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
             inputs: vec![person("old-discarded")],
             notices: Vec::new(),
             compact: true,
+            turn: None,
+            timing: None,
         })
         .await
         .unwrap();
@@ -1178,6 +1180,8 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
             inputs: vec![person("too-late")],
             notices: Vec::new(),
             compact: true,
+            turn: None,
+            timing: None,
         })
         .await
         .unwrap();

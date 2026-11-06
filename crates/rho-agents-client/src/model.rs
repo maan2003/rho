@@ -420,7 +420,6 @@ impl Model {
                 }],
                 // Nothing here asks for a detail body: the transcript
                 // draws a call's line and never its output.
-                ServerFrame::Detail { .. } => Vec::new(),
             },
             AgentFrame::Log { agent, read, page } => self.log_page(host, agent, read, page),
             // What was read is on disk; the transcript is that much.
@@ -1299,6 +1298,7 @@ mod tests {
             }],
             answers: true,
             compaction: false,
+            timing: None,
             at: UnixMs(at),
         }
     }

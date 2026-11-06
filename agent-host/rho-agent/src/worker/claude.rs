@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_agent_types::transcript::{ContextItemEvent, PendingInferenceResponse};
-use rho_agent_types::{AgentId, ContentPart, MessageId, Role, UnixMs, Wpos};
+use rho_agent_types::{
+    AgentId, CallTiming, ContentPart, ExecTiming, MessageId, Role, UnixMs, Wpos,
+};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -32,7 +33,7 @@ pub(crate) mod projection;
 pub(crate) mod python_host;
 
 use projection::{
-    ClaudeStreamItem, Line, Projection, assistant_row, compacted_row, live_response, user_row,
+    ClaudeStreamItem, Projection, compacted_row, live_response, reply_row, results_row, said_so_far,
 };
 
 #[derive(Clone)]
@@ -180,16 +181,13 @@ pub(crate) struct ClaudeLoop {
     ended: bool,
     archived: bool,
     waiting: Waiting,
-    /// Why the notebook last spoke, until the transcript row it produced
-    /// arrives to carry it.
-    /// The call a request answered last: its row holds what the echo says.
-    answered: Option<rho_agent_types::transcript::ExecId>,
     /// When the boundary said to ask it again, if it can change by itself.
     python_recheck: Option<UnixMs>,
-    pending_response: PendingInferenceResponse,
     response_id: Option<String>,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
-    response_execs: BTreeMap<usize, rho_agent_types::transcript::ExecId>,
+    /// The exec calls of the response in flight, and how far each has got.
+    /// The request that answers one carries its timing.
+    response_execs: BTreeMap<usize, CallTiming>,
     /// Turns written to Claude Code that it has not echoed yet.
     queued_turns: VecDeque<String>,
     /// Usage of the in-flight message: `message_start` seeds it,
@@ -253,39 +251,6 @@ fn claude_runtime(
         archived,
         stale: false,
     }
-}
-
-/// Materialize unfinished provider context only when a failure needs the
-/// partial response. Finished slots are already authoritative and immutable.
-fn refresh_pending_partial(
-    pending: &mut PendingInferenceResponse,
-    items: &BTreeMap<usize, ClaudeStreamItem>,
-) {
-    for (slot, item) in items.values().enumerate() {
-        if matches!(
-            pending.items.get(slot),
-            Some(rho_agent_types::transcript::StreamingContextItemState::Pending(_))
-        ) && let Ok(item) = item.to_streaming_context_item()
-        {
-            pending.apply(slot, ContextItemEvent::Update(item));
-        }
-    }
-}
-
-/// Finish with the latest bytes rather than the fragment present at start.
-fn finish_stream_block(
-    pending: &mut PendingInferenceResponse,
-    items: &BTreeMap<usize, ClaudeStreamItem>,
-    index: usize,
-) -> anyhow::Result<bool> {
-    let Some(item) = items.get(&index) else {
-        return Ok(false);
-    };
-    let item = item.to_streaming_context_item()?;
-    let slot = items.range(..index).count();
-    pending.apply(slot, ContextItemEvent::Update(item));
-    pending.apply(slot, ContextItemEvent::Finish);
-    Ok(true)
 }
 
 impl ClaudeLoop {
@@ -407,7 +372,7 @@ impl ClaudeLoop {
                 };
             (session_id, start_mode, false)
         };
-        let archived = archived_in(&host.history().await?);
+        let archived = host.head().await?.native.archived;
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let (control, control_rx) = mpsc::unbounded_channel();
         let (outbox, outbound) = Outbox::new();
@@ -433,9 +398,7 @@ impl ClaudeLoop {
             ended: false,
             archived,
             waiting: Waiting::default(),
-            answered: None,
             python_recheck: None,
-            pending_response: PendingInferenceResponse::default(),
             response_id: None,
             stream_items: BTreeMap::new(),
             response_execs: BTreeMap::new(),
@@ -448,7 +411,7 @@ impl ClaudeLoop {
             status: Arc::clone(&status),
             control_rx,
             head,
-            projection: Projection::default(),
+            projection: Projection::new(agent_id),
         };
         runtime.published();
         Ok((ClaudeAgent { status, control }, runtime))
@@ -700,7 +663,6 @@ impl ClaudeLoop {
                     self.close_process().await?;
                 }
                 self.cancelling = false;
-                self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
                 self.response_id = None;
                 self.set_kind(InferenceState::Idle);
@@ -771,10 +733,14 @@ impl ClaudeLoop {
         }
         let composed = compose(open, &notices, &taken.output, &taken.inputs);
         let user = composed.user.concat();
-        let turns: Vec<Vec<ContentPart>> = command
+        // Rho names the line of the text, and a rewind forks there.
+        let turn = (!user.is_empty()).then(Uuid::new_v4);
+        let turns: Vec<(Vec<ContentPart>, Uuid)> = command
+            .map(|command| (command, Uuid::new_v4()))
             .into_iter()
-            .chain((!user.is_empty()).then_some(user))
+            .chain(turn.map(|turn| (user, turn)))
             .collect();
+        let mut timing = None;
         let handed = if open {
             let host = self.python.as_mut().expect("a call is open");
             let failed = host.latest_failed();
@@ -793,11 +759,14 @@ impl ClaudeLoop {
                     "result": result,
                 },
             });
-            self.observe_exec(
-                pending.exec_id.clone(),
-                rho_agent_types::ExecMilestone::Boundary,
-            )
-            .await?;
+            timing = self
+                .response_execs
+                .values()
+                .find(|call| call.call == pending.exec_id)
+                .cloned();
+            if let Some(call) = &mut timing {
+                call.timing.boundary_at = Some(UnixMs::now());
+            }
             if !self.respond_control(&pending.request_id, Ok(reply)).await {
                 // What it took waits for the next request. A future send
                 // carries the output, and never reruns its source.
@@ -813,14 +782,17 @@ impl ClaudeLoop {
         } else {
             None
         };
-        for turn in turns {
-            if !self.hand_off(turn, Uuid::new_v4().to_string()).await? {
+        for (content, uuid) in turns {
+            if !self.hand_off(content, uuid.to_string()).await? {
                 self.waiting.put_back(taken);
                 return Ok(());
             }
         }
         steps.mark("written");
-        self.answered = handed.clone();
+        self.projection.answered = handed;
+        if let Some(call) = &mut timing {
+            call.timing.handed_off_at = Some(UnixMs::now());
+        }
         self.host
             .append(Event::Request {
                 agent: self.agent_id,
@@ -828,6 +800,8 @@ impl ClaudeLoop {
                 inputs: taken.inputs,
                 notices,
                 compact: false,
+                turn,
+                timing,
             })
             .await?;
         steps.mark("logged");
@@ -835,10 +809,6 @@ impl ClaudeLoop {
             "rho-agent: Claude request of {} in {steps}",
             self.agent_id.encoded()
         );
-        if let Some(exec) = handed {
-            self.observe_exec(exec, rho_agent_types::ExecMilestone::HandedOff)
-                .await?;
-        }
         Ok(())
     }
 
@@ -877,7 +847,6 @@ impl ClaudeLoop {
         // CLI's first stream event (seconds on a cold spawn) leaves
         // the agent looking idle while it is working.
         if !busy {
-            self.pending_response = PendingInferenceResponse::default();
             self.stream_items.clear();
             self.set_streaming_kind();
         }
@@ -935,7 +904,6 @@ impl ClaudeLoop {
                 self.queued_turns.clear();
                 self.response_id = None;
                 self.stream_items.clear();
-                self.pending_response = PendingInferenceResponse::default();
                 self.set_kind(InferenceState::Idle);
                 self.turn_ended(TurnEnd::Archived, None);
             }
@@ -1142,8 +1110,7 @@ impl ClaudeLoop {
             ":rewind is not available with queued inputs"
         );
         let rows = self.host.history().await?;
-        let (to, echo) = rewind_point(&rows, turns).context("nothing to rewind")?;
-        let echo = echo.context("the turn to rewind to has not reached Claude Code")?;
+        let (to, sent) = rewind_point(&rows, turns).context("nothing to rewind")?;
         let root = self.root.clone();
         let (source_session_id, messages) = if self.pending_rewind {
             match self.start_mode {
@@ -1176,8 +1143,12 @@ impl ClaudeLoop {
             .await?;
             (self.session_id, messages)
         };
-        let resume_at = resume_before(&messages, echo)
-            .context("the turn to rewind to is not in Claude Code's transcript")?;
+        // A turn cancelled while queued never reached the session: forgetting
+        // starts at the next one that did.
+        let resume_at = sent
+            .iter()
+            .find_map(|turn| resume_before(&messages, *turn))
+            .context("the turn to rewind to has not reached Claude Code's transcript")?;
 
         if let Some(process) = self.process.take() {
             process.close().await?;
@@ -1208,14 +1179,12 @@ impl ClaudeLoop {
         ])
         .await?;
         self.pending_rewind = true;
-        // The rows from `to` are no longer history: what is unread, and
-        // whether the agent is archived, are read again without them.
-        let kept = rows.partition_point(|(pos, _)| *pos < to);
-        self.archived = archived_in(&rows[..kept]);
+        // The rows from `to` are no longer history: the head folded again
+        // without them.
+        self.archived = self.host.head().await?.native.archived;
 
         self.inference_state = InferenceState::Idle;
         self.response_id = None;
-        self.pending_response = PendingInferenceResponse::default();
         self.stream_items.clear();
         self.turn_usage = None;
         self.published();
@@ -1458,12 +1427,14 @@ impl ClaudeLoop {
                 if message.parent_tool_use_id.is_some() {
                     return Ok(());
                 }
-                match assistant_row(
+                match reply_row(
                     &message,
                     usage_model(self.running_model()),
                     &mut self.projection,
                 ) {
-                    Ok(Some((uuid, line, _))) => self.tell_line(uuid, line).await?,
+                    Ok(Some(event)) => {
+                        self.host.append(event).await?;
+                    }
                     Ok(None) => {}
                     Err(error) => eprintln!(
                         "rho-agent: Claude message {} of {} skipped: {error:#}",
@@ -1478,8 +1449,10 @@ impl ClaudeLoop {
             rho_claude::ClaudeEvent::User(message) => {
                 self.activate_turn_from_user_echo(message.uuid.as_deref());
                 if message.parent_tool_use_id.is_none() && !message.is_synthetic.unwrap_or(false) {
-                    match user_row(&message, &mut self.projection) {
-                        Ok(Some((uuid, line, _))) => self.tell_line(uuid, line).await?,
+                    match results_row(&message, &self.projection) {
+                        Ok(Some(event)) => {
+                            self.host.append(event).await?;
+                        }
                         Ok(None) => {}
                         Err(error) => eprintln!(
                             "rho-agent: Claude message {} of {} skipped: {error:#}",
@@ -1514,7 +1487,6 @@ impl ClaudeLoop {
                     }
                 }
                 if self.cancelling {
-                    self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
                     self.response_id = None;
                     self.set_kind(InferenceState::Idle);
@@ -1526,7 +1498,6 @@ impl ClaudeLoop {
                     // human. Queued sends run next inside
                     // the CLI: staying in the
                     // streaming state avoids a false turn end between them.
-                    self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
                     self.response_id = None;
                     if self.queued_turns.is_empty() {
@@ -1562,7 +1533,6 @@ impl ClaudeLoop {
                     // streaming. Finished assistant rows release their own
                     // blocks after they are committed.
                     self.stream_items.clear();
-                    self.pending_response = PendingInferenceResponse::default();
                     self.response_id = None;
                     self.set_streaming_kind();
                 }
@@ -1618,7 +1588,9 @@ impl ClaudeLoop {
                         exec_id,
                         source,
                     } => {
-                        if self.cancelling || self.response_execs.values().next() != Some(&exec_id)
+                        if self.cancelling
+                            || self.response_execs.values().next().map(|call| &call.call)
+                                != Some(&exec_id)
                         {
                             Err("Only the first exec in a provider response may run. This call was not executed; earlier side effects are not undone.".into())
                         } else if self.python.as_ref().is_none_or(|host| !host.can_admit()) {
@@ -1628,15 +1600,6 @@ impl ClaudeLoop {
                             )
                         } else {
                             let now = UnixMs::now();
-                            self.host
-                                .append(Event::ExecAdmitted {
-                                    agent: self.agent_id,
-                                    call: rho_agent_types::transcript::ExecCall {
-                                        id: exec_id.clone(),
-                                        source: source.clone(),
-                                    },
-                                })
-                                .await?;
                             match self.python.as_mut().expect("checked above").exec(
                                 request_id.clone(),
                                 id,
@@ -1800,39 +1763,6 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    /// One row of the conversation, from the stream.
-    async fn tell_line(&mut self, uuid: Uuid, line: Line) -> anyhow::Result<()> {
-        let agent = self.agent_id;
-        let event = match line {
-            Line::Reply {
-                text,
-                calls,
-                usage,
-                context_used,
-            } => Event::ClaudeReply {
-                agent,
-                text,
-                calls,
-                usage,
-                context_used,
-            },
-            Line::Echo => Event::ClaudeEcho { agent, uuid },
-            Line::Results { mut results } => {
-                results.retain(|result| self.answered.as_ref() != Some(&result.call_id));
-                if results.is_empty() {
-                    return Ok(());
-                }
-                Event::ClaudeResults { agent, results }
-            }
-            Line::Compacted { context_used } => Event::ClaudeCompacted {
-                agent,
-                context_used,
-            },
-        };
-        self.host.append(event).await?;
-        Ok(())
-    }
-
     /// The block's row is in: its streamed copy leaves the tail, which
     /// is told again without it (a shorter tail empties the client's and
     /// says the rest).
@@ -1859,20 +1789,7 @@ impl ClaudeLoop {
             return;
         };
         self.stream_items.remove(&index);
-        self.pending_response = PendingInferenceResponse::default();
-        for (slot, item) in self.stream_items.values().enumerate() {
-            if let Ok(item) = item.to_streaming_context_item() {
-                self.pending_response
-                    .apply(slot, ContextItemEvent::Update(item));
-            }
-        }
         self.set_streaming_kind();
-    }
-
-    /// Where the API's block `index` sits in the tail: past the blocks
-    /// let go.
-    fn tail_slot(&self, index: usize) -> usize {
-        self.stream_items.range(..index).count()
     }
 
     async fn complete_rewind(&mut self) -> anyhow::Result<()> {
@@ -1960,15 +1877,14 @@ impl ClaudeLoop {
         message: rho_claude::protocol::SystemMessage,
     ) -> anyhow::Result<()> {
         let rho_claude::protocol::SystemMessage::CompactBoundary {
-            uuid,
-            compact_metadata,
-            ..
+            compact_metadata, ..
         } = message
         else {
             return Ok(());
         };
-        let (uuid, line, _) = compacted_row(uuid.as_deref(), compact_metadata.as_ref());
-        self.tell_line(uuid, line).await?;
+        self.host
+            .append(compacted_row(&self.projection, compact_metadata.as_ref()))
+            .await?;
         let texts = python::on_compaction(self.agent_id)
             .await
             .unwrap_or_else(|error| {
@@ -2040,10 +1956,7 @@ impl ClaudeLoop {
         self.waiting.quiet();
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
-        // Fragments live in stream_items; materialize the latest incomplete
-        // provider items once if the stream fails mid-block.
-        refresh_pending_partial(&mut self.pending_response, &self.stream_items);
-        let partial = std::mem::take(&mut self.pending_response);
+        let partial = said_so_far(&self.stream_items);
         self.host
             .append(Event::Failed {
                 agent: self.agent_id,
@@ -2062,21 +1975,6 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    async fn observe_exec(
-        &self,
-        exec: rho_agent_types::transcript::ExecId,
-        milestone: rho_agent_types::ExecMilestone,
-    ) -> anyhow::Result<()> {
-        self.host
-            .append(Event::ExecObserved {
-                agent: self.agent_id,
-                exec,
-                milestone,
-            })
-            .await?;
-        Ok(())
-    }
-
     async fn handle_stream_event(
         &mut self,
         event: rho_claude::protocol::MessageStreamEvent,
@@ -2090,27 +1988,31 @@ impl ClaudeLoop {
                 content_block: rho_claude::protocol::StreamContentBlock::ToolUse { id, name, .. },
             } if matches!(name.as_str(), "exec" | "mcp__py__exec") => {
                 let id = rho_agent_types::transcript::ExecId::try_from(id.as_str())?;
-                self.response_execs.insert(*index, id.clone());
-                self.observe_exec(id, rho_agent_types::ExecMilestone::FirstBlock)
-                    .await?;
+                self.response_execs.insert(
+                    *index,
+                    CallTiming {
+                        call: id,
+                        timing: ExecTiming {
+                            first_block_at: Some(UnixMs::now()),
+                            ..ExecTiming::default()
+                        },
+                    },
+                );
             }
             rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
-                if let Some(id) = self.response_execs.get(index).cloned() {
-                    self.observe_exec(id, rho_agent_types::ExecMilestone::ArgumentsFinished)
-                        .await?;
+                if let Some(call) = self.response_execs.get_mut(index) {
+                    call.timing.arguments_finished_at = Some(UnixMs::now());
                 }
             }
             rho_claude::protocol::MessageStreamEvent::MessageStop => {
-                for id in self.response_execs.values().cloned().collect::<Vec<_>>() {
-                    self.observe_exec(id, rho_agent_types::ExecMilestone::ResponseFinished)
-                        .await?;
+                for call in self.response_execs.values_mut() {
+                    call.timing.response_finished_at = Some(UnixMs::now());
                 }
             }
             _ => {}
         }
         match event {
             rho_claude::protocol::MessageStreamEvent::MessageStart { message } => {
-                self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
                 self.response_id = Some(Uuid::new_v4().to_string());
                 self.turn_usage = message.usage;
@@ -2123,29 +2025,26 @@ impl ClaudeLoop {
                 let Some(item) = ClaudeStreamItem::from_content_block(content_block)? else {
                     return Ok(());
                 };
-                // A call the model misnamed is not a context item. Claude Code
-                // answers it with an error, so the turn goes on without it.
-                let Ok(streaming) = item.to_streaming_context_item() else {
+                // A call the model misnamed has no place in the tail. Claude
+                // Code answers it with an error, so the turn goes on without
+                // it.
+                if !item.named_well() {
                     return Ok(());
-                };
+                }
                 self.stream_items.insert(index, item);
-                let slot = self.tail_slot(index);
-                self.pending_response
-                    .apply(slot, ContextItemEvent::Update(streaming));
                 self.set_streaming_kind();
             }
             rho_claude::protocol::MessageStreamEvent::ContentBlockDelta { index, delta } => {
                 if let Some(item) = self.stream_items.get_mut(&index) {
                     item.apply_delta(delta)?;
                     // stream_items owns the partial bytes until a block closes
-                    // or a failure needs them. Neither provider context nor the
-                    // GUI needs a second complete copy for every fragment.
+                    // or a failure needs them.
                     self.inference_state = InferenceState::Responding;
                 }
             }
             // The block's own event may have let it go already.
             rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
-                if finish_stream_block(&mut self.pending_response, &self.stream_items, index)? {
+                if self.stream_items.contains_key(&index) {
                     self.set_streaming_kind();
                 }
             }
@@ -2206,30 +2105,11 @@ enum ClaudeLoopEvent {
     Protocol(Box<anyhow::Result<Option<rho_claude::ClaudeEvent>>>),
 }
 
-/// Whether the agent's visible rows leave it archived.
-fn archived_in(rows: &[(Wpos, Record<'_>)]) -> bool {
-    let mut archived = false;
-    for (_, record) in rows {
-        match &record.event {
-            Event::Notice {
-                notice: Notice::Archived,
-                ..
-            } => archived = true,
-            Event::Notice {
-                notice: Notice::FreshNotebook,
-                ..
-            } => archived = false,
-            _ => {}
-        }
-    }
-    archived
-}
-
 /// Where a rewind of `turns` goes: the position of the `turns`-th last
 /// request that carried a person's input (the first one, when there are
-/// fewer), and the uuid of the first user line after it, which is the turn
-/// that took it to Claude Code. `None` with no person's input to go back to.
-fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Option<Uuid>)> {
+/// fewer), and the session lines handed over from there on, oldest first.
+/// `None` with no person's input to go back to.
+fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uuid>)> {
     let people: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -2237,13 +2117,14 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Option
         .map(|(index, _)| index)
         .collect();
     let index = *people.get(people.len().saturating_sub(turns as usize))?;
-    let echo = rows[index..]
+    let sent = rows[index..]
         .iter()
-        .find_map(|(_, record)| match &record.event {
-            Event::ClaudeEcho { uuid, .. } => Some(*uuid),
+        .filter_map(|(_, record)| match &record.event {
+            Event::Request { turn, .. } => *turn,
             _ => None,
-        });
-    Some((rows[index].0, echo))
+        })
+        .collect();
+    Some((rows[index].0, sent))
 }
 
 /// Where a session forked to forget the user message `uuid` and all after
@@ -2392,23 +2273,20 @@ mod tests {
         )
     }
 
-    fn sent(agent: AgentId, role: Role) -> Event<'static> {
-        Event::carrying(
+    fn sent(agent: AgentId, role: Role, turn: Option<Uuid>) -> Event<'static> {
+        Event::Request {
             agent,
-            vec![crate::record::Input {
+            output: Vec::new(),
+            inputs: vec![crate::record::Input {
                 role,
                 message: None,
                 content: vec![ContentPart::Text { text: "x".into() }],
             }],
-        )
-    }
-
-    fn echo(agent: AgentId, uuid: Uuid) -> Event<'static> {
-        Event::ClaudeEcho { agent, uuid }
-    }
-
-    fn notice(agent: AgentId, notice: Notice) -> Event<'static> {
-        Event::Notice { agent, notice }
+            notices: Vec::new(),
+            compact: false,
+            turn,
+            timing: None,
+        }
     }
 
     #[tokio::test]
@@ -2484,39 +2362,33 @@ mod tests {
     }
 
     #[test]
-    fn archive_follows_its_notices() {
+    fn a_rewind_counts_only_peoples_inputs_and_lists_the_turns_from_there() {
         let a = agent(1);
+        let (first, message, second, third) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
         let rows = vec![
-            row(1, notice(a, Notice::Archived)),
-            row(2, notice(a, Notice::FreshNotebook)),
+            row(1, sent(a, Role::User, Some(first))),
+            row(3, sent(a, Role::Tool, Some(message))),
+            row(5, sent(a, Role::System, None)),
+            row(6, sent(a, Role::User, Some(second))),
+            row(8, sent(a, Role::User, Some(third))),
         ];
-        assert!(archived_in(&rows[..1]));
-        assert!(!archived_in(&rows), "a fresh notebook revives the agent");
-    }
-
-    #[test]
-    fn a_rewind_counts_only_peoples_inputs_and_finds_the_turn_that_carried_them() {
-        let a = agent(1);
-        let (first, message, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let rows = vec![
-            row(1, sent(a, Role::User)),
-            row(2, echo(a, first)),
-            row(3, sent(a, Role::Tool)),
-            row(4, echo(a, message)),
-            row(5, sent(a, Role::System)),
-            row(6, sent(a, Role::User)),
-            row(7, echo(a, second)),
-            row(8, sent(a, Role::User)),
-        ];
-        assert_eq!(rewind_point(&rows, 1), Some((Wpos(8), None)));
-        assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), Some(second))));
-        assert_eq!(rewind_point(&rows, 3), Some((Wpos(1), Some(first))));
+        assert_eq!(rewind_point(&rows, 1), Some((Wpos(8), vec![third])));
+        assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), vec![second, third])));
+        assert_eq!(
+            rewind_point(&rows, 3),
+            Some((Wpos(1), vec![first, message, second, third]))
+        );
         assert_eq!(
             rewind_point(&rows, 9),
-            Some((Wpos(1), Some(first))),
+            rewind_point(&rows, 3),
             "more turns than there are go back to the first"
         );
-        assert_eq!(rewind_point(&rows[2..5], 1), None);
+        assert_eq!(rewind_point(&rows[1..3], 1), None);
     }
 
     #[test]
@@ -2541,61 +2413,6 @@ mod tests {
         assert_eq!(resume_before(&messages, ids[3]), Some(Some(ids[2])));
         assert_eq!(resume_before(&messages, ids[0]), Some(None));
         assert_eq!(resume_before(&messages, Uuid::new_v4()), None);
-    }
-
-    #[test]
-    fn pending_context_copies_only_finished_blocks_or_failure_partials() {
-        use rho_agent_types::transcript::{StreamingContextItem, StreamingContextItemState};
-        let mut items = BTreeMap::new();
-        let mut pending = PendingInferenceResponse::default();
-        let call = ClaudeStreamItem::ToolUse {
-            id: "call-1".into(),
-            name: "exec".into(),
-            arguments: "{}".into(),
-        };
-        pending.apply(
-            0,
-            ContextItemEvent::Update(call.to_streaming_context_item().unwrap()),
-        );
-        items.insert(4, call);
-        for partial_json in ["{\"code\":", "\"print(42)\"}"] {
-            items
-                .get_mut(&4)
-                .unwrap()
-                .apply_delta(rho_claude::protocol::ContentBlockDelta::InputJsonDelta {
-                    partial_json: partial_json.into(),
-                })
-                .unwrap();
-        }
-        assert!(
-            matches!(&pending.items[0], StreamingContextItemState::Pending(
-            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{}"))
-        );
-        assert!(finish_stream_block(&mut pending, &items, 4).unwrap());
-        assert!(
-            matches!(&pending.items[0], StreamingContextItemState::Finished(
-            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{\"code\":\"print(42)\"}"))
-        );
-        let mut reasoning = ClaudeStreamItem::Thinking("initial".into());
-        pending.apply(
-            1,
-            ContextItemEvent::Update(reasoning.to_streaming_context_item().unwrap()),
-        );
-        reasoning
-            .apply_delta(rho_claude::protocol::ContentBlockDelta::ThinkingDelta {
-                thinking: " plus final".into(),
-            })
-            .unwrap();
-        items.insert(9, reasoning);
-        refresh_pending_partial(&mut pending, &items);
-        assert!(
-            matches!(&pending.items[1], StreamingContextItemState::Pending(
-            StreamingContextItem::RawReasoning { content, .. }) if content.with_str(|text| text == "initial plus final"))
-        );
-        assert!(
-            matches!(&pending.items[0], StreamingContextItemState::Finished(
-            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{\"code\":\"print(42)\"}"))
-        );
     }
 
     #[tokio::test]

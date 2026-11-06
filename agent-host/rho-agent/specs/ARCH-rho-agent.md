@@ -190,9 +190,9 @@ consumption. An agent that holds anything in memory does not unload, because
 nothing would hand it again.
 
 The `Request` row is the only copy of what Rho answered a call with. Claude Code's
-echo of that answer is not logged. Its echo of handed text logs only the uuid a
-rewind forks at. `ClaudeResults` holds what no request answered: Claude Code's own
-tools, a call Rho refused, or a call cut off.
+echoes are not logged. Rho names the session line of the text it hands over, and
+the `Request` holds that uuid for a rewind to fork at. `ClaudeResults` holds what
+no request answered: Claude Code's own tools, a call Rho refused, or a call cut off.
 
 One initial reply answers an exec; subsequent contributions are reports
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).
@@ -219,8 +219,8 @@ Titles do not write conversation context or classify turn outcomes. Runtime
 status and peer completion delivery remain independent of naming.
 
 Native and Claude observations share the GUI projection, not a conversation
-writer. Timing identifies provider first block, argument completion, response
-completion, boundary, and transport handoff. It does not measure Python execution.
-Native argument completion observes the provider's argument-end event, not
-item completion or Python EOF. Live and committed tool rows use the same observed timing; later output must not
+writer. A Claude call's timing identifies provider first block, argument completion,
+response completion, boundary, and transport handoff. It does not measure Python
+execution. The worker holds it in memory and the `Request` that answers the call
+carries it, so a running call shows only how long it has run. Later output must not
 rewrite the original result's status or duration.

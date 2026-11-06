@@ -285,13 +285,6 @@ where
                     .await;
                 let _ = follow_tx.send(Follow::Focus(agent_ids));
             }
-            ClientFrame::Detail { workset, pos, more } => {
-                // One answer per position, each naming its own `pos`.
-                for pos in std::iter::once(pos).chain(more) {
-                    let body = detail(&services.db, workset, pos);
-                    let _ = outgoing_tx.send(ServerFrame::Detail { workset, pos, body });
-                }
-            }
         }
     };
     follower.abort();
@@ -1046,71 +1039,6 @@ async fn terminal_list(
     Ok(terminals)
 }
 
-/// What a request answered its call with, what calls came back with, or a
-/// response as the transcript draws it. Rows a rewind hid still answer; the
-/// client asked for one it holds.
-fn detail(
-    db: &RhoDb,
-    workset: WorksetId,
-    pos: Wpos,
-) -> rho_agents_client::protocol::transcript::DetailBody {
-    use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
-    let read = db.read();
-    let Some(record) = read.workset_row(workset, pos) else {
-        return DetailBody::Nothing;
-    };
-    match record.event {
-        Event::Request {
-            output,
-            inputs,
-            notices,
-            ..
-        } => DetailBody::Report(rho_agent::entry::plain_text(
-            &rho_agent::entry::compose(true, &notices, &output, &inputs).result,
-        )),
-        Event::Step { carry, .. } => {
-            DetailBody::Response(crate::transcript::step_items(&carry.display_calls()))
-        }
-        Event::ClaudeReply { calls, .. } => DetailBody::Response(
-            calls
-                .into_iter()
-                .map(|call| Item::ToolCall {
-                    id: call.id,
-                    name: call.name,
-                    arguments: call.arguments,
-                    format: ArgumentsFormat::Json,
-                })
-                .collect(),
-        ),
-        Event::ClaudeResults { results, .. } => {
-            DetailBody::Results(results.iter().map(detail_result).collect())
-        }
-        Event::Failed { partial, .. } => DetailBody::Response(
-            partial
-                .items
-                .iter()
-                .filter_map(|slot| match slot {
-                    rho_agent_types::transcript::StreamingContextItemState::Pending(item)
-                    | rho_agent_types::transcript::StreamingContextItemState::Finished(item) => {
-                        crate::transcript::to_item(item)
-                    }
-                    rho_agent_types::transcript::StreamingContextItemState::Empty => None,
-                })
-                .collect(),
-        ),
-        _ => DetailBody::Nothing,
-    }
-}
-
-fn detail_result(
-    result: &rho_agent_types::transcript::ToolResult,
-) -> rho_agents_client::protocol::transcript::DetailResult {
-    rho_agents_client::protocol::transcript::DetailResult {
-        id: result.call_id.as_str().to_owned(),
-        output: result.body.recorded_output().to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rho_agent::db::AgentWriteTxnExt as _;
@@ -1120,7 +1048,7 @@ mod tests {
     use rho_agent_types::{Role, UnixMs, WorksetId, WorksetKind, Wpos};
     use rho_agents_client::protocol::worksets::{AgentLog, LogEvent, LogNext};
 
-    use super::{agent_log_page, detail, detail_result};
+    use super::agent_log_page;
 
     fn step(id: &str) -> Event<'static> {
         Event::Step {
@@ -1159,6 +1087,8 @@ mod tests {
             inputs,
             notices,
             compact: false,
+            turn: None,
+            timing: None,
         }
     }
 
@@ -1225,6 +1155,8 @@ mod tests {
                     inputs,
                     notices,
                     compact,
+                    turn: None,
+                    timing: None,
                 },
                 Event::Notice { notice, .. } => Event::Notice { agent, notice },
                 event => event,
@@ -1243,37 +1175,6 @@ mod tests {
         }
         write.commit();
         (workset, agent, positions)
-    }
-
-    /// A request's detail is what `compose` answered the open call with:
-    /// output first, then `tool` inputs. A person's words stay out of it.
-    #[tokio::test]
-    async fn a_requests_detail_shows_what_it_answered_with() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
-        let said = |role, text: &str| rho_agent::record::Input {
-            role,
-            message: None,
-            content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
-        };
-        let (workset, _, pos) = workset(
-            &db,
-            vec![
-                step("call"),
-                request_of(
-                    "printed",
-                    vec![said(Role::User, "person"), said(Role::Tool, "peer")],
-                    Vec::new(),
-                ),
-            ],
-        )
-        .await;
-        let rho_agents_client::protocol::transcript::DetailBody::Report(report) =
-            detail(&db, workset, pos[1])
-        else {
-            panic!("a request's detail is its report");
-        };
-        assert_eq!(report, "printed\n\npeer");
     }
 
     #[tokio::test]
@@ -1364,6 +1265,7 @@ mod tests {
                         }],
                         answers: true,
                         compaction: false,
+                        timing: None,
                         at: UnixMs(1),
                     }
                 ),
@@ -1454,6 +1356,8 @@ mod tests {
                             inputs: Vec::new(),
                             notices: Vec::new(),
                             compact: false,
+                            turn: None,
+                            timing: None,
                         };
                         write
                             .append(
@@ -1585,23 +1489,5 @@ mod tests {
             "one agent's log: {pages} pages, {rows} rows in {:?}",
             started.elapsed()
         );
-    }
-
-    #[test]
-    fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_agent_types::transcript::ToolResult {
-            call_id: rho_agent_types::transcript::ExecId::try_from("call-1").unwrap(),
-            tool_type: rho_agent_types::transcript::ToolType::Custom,
-            body: rho_agent_types::transcript::ToolOutput {
-                output: std::sync::Arc::new("bounded model view".to_owned()),
-                full_output: Some(std::sync::Arc::new("complete host record".to_owned())),
-                images: std::sync::Arc::new(Vec::new()),
-                status: rho_agent_types::ToolOutputStatus::Success,
-            },
-            started_at: rho_agent_types::UnixMs(1),
-            finished_at: rho_agent_types::UnixMs(2),
-        };
-
-        assert_eq!(detail_result(&result).output, "complete host record");
     }
 }

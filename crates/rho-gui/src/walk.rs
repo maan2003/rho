@@ -1006,7 +1006,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
             }),
         ]);
         return UiAgentState {
-            exec_timings: Default::default(),
             blocks,
             status: UiAgentStatus::Streaming,
             runtime: None,
@@ -1042,7 +1041,6 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         }),
     ]);
     UiAgentState {
-        exec_timings: Default::default(),
         blocks,
         status: UiAgentStatus::Streaming,
         runtime: None,

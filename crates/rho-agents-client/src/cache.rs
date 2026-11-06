@@ -864,6 +864,7 @@ mod tests {
             }],
             answers: true,
             compaction: false,
+            timing: None,
             at: UnixMs(1),
         }
     }

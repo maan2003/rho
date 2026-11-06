@@ -120,6 +120,77 @@ async fn agents_fold_only_their_own_rows_and_rewinds_hide_only_theirs() {
     assert_eq!(read.agent(b).unwrap().delivered, ChatSeq(4));
 }
 
+/// The Claude worker reads `archived` back after a rewind, so the rewind has to
+/// take the notice with it.
+#[tokio::test]
+async fn a_rewind_past_an_archive_takes_it_back() {
+    let (_dir, db) = db().await;
+    let ws = WorksetId([1; 6]);
+    let a = agent(1);
+    let mut write = db.write().await;
+    write.create_workset(ws, UnixMs(1), WorksetKind::Isolated, "setup()".into());
+    write
+        .append(
+            ws,
+            &at_six(Event::AgentCreated {
+                agent: a,
+                spec: spec("a"),
+            }),
+        )
+        .unwrap();
+    let archive = |write: &mut rho_db::WriteTxn| {
+        write
+            .append(
+                ws,
+                &at_six(Event::Notice {
+                    agent: a,
+                    notice: Notice::Archived,
+                }),
+            )
+            .unwrap()
+    };
+    let before = write.append(ws, &input(a, None)).unwrap();
+    let archived = archive(&mut write);
+    let after = write.append(ws, &input(a, None)).unwrap();
+    assert!(write.agent_head(a).unwrap().native.archived);
+
+    // To a row after the notice: it stands.
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: after,
+            }),
+        )
+        .unwrap();
+    assert!(write.agent_head(a).unwrap().native.archived);
+    // To the notice itself: it goes, and a rewind to the row before keeps it
+    // gone.
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: archived,
+            }),
+        )
+        .unwrap();
+    assert!(!write.agent_head(a).unwrap().native.archived);
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: before,
+            }),
+        )
+        .unwrap();
+    assert!(!write.agent_head(a).unwrap().native.archived);
+    write.commit();
+    assert!(!db.read().agent(a).unwrap().native.archived);
+}
+
 #[tokio::test]
 async fn a_row_for_an_agent_of_another_workset_is_refused() {
     let (_dir, db) = db().await;
@@ -175,6 +246,8 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
                     inputs: Vec::new(),
                     notices: Vec::new(),
                     compact: true,
+                    turn: None,
+                    timing: None,
                 },
             },
         )

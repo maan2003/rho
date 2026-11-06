@@ -101,7 +101,7 @@ pub struct StreamingResponse {
     pub items: Vec<Item>,
 }
 
-/// One response item, shared by the live tail, committed mirror, and `Detail`.
+/// One response item, shared by the live tail and committed mirror.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Item {
     Text {
@@ -134,23 +134,4 @@ pub enum ArgumentsFormat {
 pub enum TextPhase {
     Commentary,
     FinalAnswer,
-}
-
-/// The bodies one raw event carries, for a client that asked.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum DetailBody {
-    /// The event is not there, or has no body worth asking for.
-    Nothing,
-    /// A `Request`: what it answers the open call with.
-    Report(String),
-    /// A `CallsEnded`: what the calls came back with.
-    Results(Vec<DetailResult>),
-    /// A `Replied`: the response whole, reasoning and arguments included.
-    Response(Vec<Item>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct DetailResult {
-    pub id: String,
-    pub output: String,
 }

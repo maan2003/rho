@@ -6,7 +6,6 @@
 use rho_agent::entry::{Notice, compose};
 use rho_agent::log::AgentUsageBucket;
 use rho_agent::record::{AgentSpec, Event, Record, Runtime};
-use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
 use rho_agent_types::{ContentPart, Role};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
 use rho_agents_client::protocol::worksets::{InputView, LogEvent, SpecView};
@@ -76,6 +75,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             inputs,
             notices,
             compact,
+            timing,
             ..
         } => LogEvent::Request {
             agent: *agent,
@@ -97,6 +97,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
                 .collect(),
             answers: !compose(true, notices, output, inputs).result.is_empty(),
             compaction: *compact,
+            timing: timing.clone(),
             at,
         },
         Event::Rewound { agent, to } => LogEvent::Rewound {
@@ -111,19 +112,9 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             retrying,
         } => LogEvent::Failed {
             agent: *agent,
-            text: partial_text(partial),
+            text: partial.clone(),
             error: error.to_string(),
             retrying: *retrying,
-            at,
-        },
-        Event::ExecObserved {
-            agent,
-            exec,
-            milestone,
-        } => LogEvent::ExecObserved {
-            agent: *agent,
-            id: exec.as_str().to_owned(),
-            milestone: *milestone,
             at,
         },
         Event::Notice { agent, notice } => match notice {
@@ -206,7 +197,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             agent: *agent,
             calls: results
                 .iter()
-                .map(|result| result.call_id.as_str().to_owned())
+                .map(|result| result.call.as_str().to_owned())
                 .collect(),
             at,
         },
@@ -221,10 +212,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             context_used: *context_used,
             at,
         },
-        // What Claude was handed is in the agent's `Request` rows.
-        Event::ClaudeEcho { .. } | Event::ExecAdmitted { .. } | Event::RewindPending { .. } => {
-            return None;
-        }
+        Event::RewindPending { .. } => return None,
     })
 }
 
@@ -239,87 +227,4 @@ pub(crate) fn step_items(calls: &[rho_agent::inference::Call]) -> Vec<Item> {
             format: ArgumentsFormat::Text,
         })
         .collect()
-}
-
-/// What the model had said when its request failed.
-fn partial_text(partial: &rho_agent_types::transcript::PendingInferenceResponse) -> String {
-    use rho_agent_types::transcript::{StreamingContextItem, StreamingContextItemState};
-    let mut text = String::new();
-    for slot in &partial.items {
-        let (StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item)) =
-            slot
-        else {
-            continue;
-        };
-        if let StreamingContextItem::AssistantMessage { content, .. } = item {
-            let part = content.iter().map(ToString::to_string).collect::<String>();
-            if !part.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&part);
-            }
-        }
-    }
-    text
-}
-
-/// A function tool is given JSON; a custom tool the text the model wrote.
-pub(crate) fn arguments_format(tool_type: ToolType) -> ArgumentsFormat {
-    match tool_type {
-        ToolType::Function => ArgumentsFormat::Json,
-        ToolType::Custom => ArgumentsFormat::Text,
-    }
-}
-
-/// The item as a client draws it. Compaction and unknown items have no
-/// face; their index is never told.
-pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
-    Some(match item {
-        StreamingContextItem::AssistantMessage { .. } => return None,
-        StreamingContextItem::RawReasoning {
-            content, summary, ..
-        } => Item::Reasoning {
-            text: reasoning_text(content, summary),
-        },
-        StreamingContextItem::EncryptedReasoning { summary, .. } => {
-            if summary.is_empty() {
-                return None;
-            }
-            Item::Reasoning {
-                text: join(summary),
-            }
-        }
-        StreamingContextItem::ToolCall {
-            id,
-            name,
-            arguments,
-            tool_type,
-            ..
-        } => Item::ToolCall {
-            id: id.as_str().to_owned(),
-            name: name.as_str().to_owned(),
-            arguments: arguments.to_string(),
-            format: crate::transcript::arguments_format(*tool_type),
-        },
-        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
-            return None;
-        }
-    })
-}
-
-fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
-    if summary.is_empty() {
-        content.to_string()
-    } else {
-        join(summary)
-    }
-}
-
-fn join(parts: &[AStr]) -> String {
-    parts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
 }

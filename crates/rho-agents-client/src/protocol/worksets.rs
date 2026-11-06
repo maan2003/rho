@@ -7,12 +7,12 @@
 //! it looks at. Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, ExecMilestone, MessageId, Props, Role, StreamId,
-    TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
+    AgentId, ChatRecord, ChatSeq, ContentPart, MessageId, Props, Role, StreamId, TopicId, UnixMs,
+    WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use super::transcript::{DetailBody, Item, Live, RuntimeKind, RuntimeState, Speaker, Usage};
+use super::transcript::{Item, Live, RuntimeKind, RuntimeState, Speaker, Usage};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
@@ -222,13 +222,6 @@ pub enum ClientFrame {
     FollowWorksets { from: Vec<(WorksetId, Wpos)> },
     /// The agents whose live frames this client wants. Replaces the set.
     Focus { agent_ids: Vec<AgentId> },
-    /// The bodies of rows: tool output, a response whole. One
-    /// [`ServerFrame::Detail`] answers each position.
-    Detail {
-        workset: WorksetId,
-        pos: Wpos,
-        more: Vec<Wpos>,
-    },
 }
 
 /// What a host says on its session.
@@ -281,11 +274,6 @@ pub enum ServerFrame {
         agent_id: AgentId,
         state: RuntimeState,
     },
-    Detail {
-        workset: WorksetId,
-        pos: Wpos,
-        body: DetailBody,
-    },
     QuotaUsage {
         summaries: Vec<super::QuotaSummary>,
     },
@@ -327,8 +315,7 @@ pub struct InputView {
 }
 
 /// One workset row as it crosses the wire: `strip` of exactly one row.
-/// Bodies a person does not read at a glance are left behind; ask for them
-/// with [`ClientFrame::Detail`].
+/// Bodies a person does not read at a glance are left behind.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum LogEvent {
     WorksetCreated {
@@ -361,6 +348,8 @@ pub enum LogEvent {
         inputs: Vec<InputView>,
         answers: bool,
         compaction: bool,
+        /// How the call it answers went.
+        timing: Option<rho_agent_types::CallTiming>,
         at: UnixMs,
     },
     /// Claude Code says these calls came back, with no request to answer them.
@@ -401,12 +390,6 @@ pub enum LogEvent {
         text: String,
         at: UnixMs,
     },
-    ExecObserved {
-        agent: AgentId,
-        id: String,
-        milestone: ExecMilestone,
-        at: UnixMs,
-    },
 }
 
 impl LogEvent {
@@ -423,8 +406,7 @@ impl LogEvent {
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
-            | Self::ClaudeMessage { at, .. }
-            | Self::ExecObserved { at, .. } => *at,
+            | Self::ClaudeMessage { at, .. } => *at,
         }
     }
 
@@ -441,8 +423,7 @@ impl LogEvent {
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::Stopped { agent, .. }
-            | Self::ClaudeMessage { agent, .. }
-            | Self::ExecObserved { agent, .. } => Some(*agent),
+            | Self::ClaudeMessage { agent, .. } => Some(*agent),
         }
     }
 }
@@ -511,6 +492,7 @@ mod tests {
                     }],
                     answers: true,
                     compaction: false,
+                    timing: None,
                     at: UnixMs(8),
                 },
             )],

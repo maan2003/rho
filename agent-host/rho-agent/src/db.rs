@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "7e41c9b2";
+const CURRENT_AGENT_DB_FORMAT: &str = "c41e6d07";
 /// Temporary (`temp-migration`): the format [`crate::store::pull_inputs`] moves
 /// from.
 const PREVIOUS_AGENT_DB_FORMAT: &str = "0adc0ed8";

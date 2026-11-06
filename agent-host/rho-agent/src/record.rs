@@ -7,9 +7,9 @@
 
 use std::borrow::Cow;
 
-use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse, ToolResult};
+use rho_agent_types::transcript::ExecId;
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
+    AgentId, CallTiming, ContentPart, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -51,6 +51,11 @@ pub enum Event<'a> {
         /// A native request asks the provider to compact. Claude Code
         /// compacts by a command of its own.
         compact: bool,
+        /// The Claude Code session line of the text this request handed over,
+        /// where a rewind forks. Rho names it when it sends.
+        turn: Option<Uuid>,
+        /// How the call this request answers went.
+        timing: Option<CallTiming>,
     },
 
     /// Every row of this agent from `to` up to here is no longer its history.
@@ -58,15 +63,10 @@ pub enum Event<'a> {
     /// A request failed with this much of a response in. Never history.
     Failed {
         agent: AgentId,
-        partial: PendingInferenceResponse,
+        /// What the model had said.
+        partial: String,
         error: Cow<'a, str>,
         retrying: bool,
-    },
-    /// A provider or host lifecycle observation, for presentation only.
-    ExecObserved {
-        agent: AgentId,
-        exec: ExecId,
-        milestone: ExecMilestone,
     },
     /// Something that happened to the agent, as the transcript says it.
     Notice { agent: AgentId, notice: Notice },
@@ -95,21 +95,17 @@ pub enum Event<'a> {
         /// Context-window occupancy after this message.
         context_used: Option<u64>,
     },
-    /// Claude Code echoed text it was handed. A rewind forks at `uuid`.
-    ClaudeEcho { agent: AgentId, uuid: Uuid },
     /// What calls came back with when no `Request` answered them: Claude
     /// Code's own tools, a call Rho refused, or one that was cut off.
     ClaudeResults {
         agent: AgentId,
-        results: Vec<ToolResult>,
+        results: Vec<CallResult>,
     },
     /// Claude compacted the context here.
     ClaudeCompacted {
         agent: AgentId,
         context_used: Option<u64>,
     },
-    /// Rho's permission to execute a cell, committed before it runs.
-    ExecAdmitted { agent: AgentId, call: ExecCall },
     /// A rewind whose destination transcript is not verified yet; `None`
     /// withdraws it. On success the new session is an `AgentChanged`.
     RewindPending {
@@ -134,15 +130,12 @@ impl Event<'_> {
             | Self::Request { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
-            | Self::ExecObserved { agent, .. }
             | Self::Notice { agent, .. }
             | Self::Step { agent, .. }
             | Self::CompactionTrigger { agent, .. }
             | Self::ClaudeReply { agent, .. }
-            | Self::ClaudeEcho { agent, .. }
             | Self::ClaudeResults { agent, .. }
             | Self::ClaudeCompacted { agent, .. }
-            | Self::ExecAdmitted { agent, .. }
             | Self::RewindPending { agent, .. } => Some(*agent),
         }
     }
@@ -156,6 +149,13 @@ pub struct Input {
     /// The message it hands over, if it is one.
     pub message: Option<MessageId>,
     pub content: Vec<ContentPart>,
+}
+
+/// What a call came back with.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CallResult {
+    pub call: ExecId,
+    pub output: String,
 }
 
 /// What an agent is: the loop that runs it, and what Python says about it.
@@ -222,6 +222,8 @@ impl Event<'static> {
             inputs,
             notices: Vec::new(),
             compact: false,
+            turn: None,
+            timing: None,
         }
     }
 }
