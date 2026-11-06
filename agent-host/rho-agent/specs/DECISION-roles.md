@@ -12,9 +12,10 @@ Every input carries one `Role`, in both runtimes:
   message, and notebook output, which is an input like any other. It reaches
   the model only inside an `exec` result. A message wakes the agent after a wait;
   output has its own wake rules.
-- `system`: Rho's own words. It wakes nobody and rides along with the next
-  request. The model reads it as `role: user`, like the fixed lines that say
-  output waits.
+- `system`: what `hooks.on_compaction` gives back, such as a kept skill's text.
+  Only Rust gives this role: `_rho.input` takes `user` or `tool`. It wakes nobody
+  and rides along with the next request. The model reads it as `role: user`, like
+  the fixed lines that say output waits.
 
 One function, `compose`, splits what a request carries by role for both runtimes.
 Inputs and output wait in memory until a request takes them, and its one row
@@ -46,7 +47,10 @@ a restart, a compaction, and an agent's first message.
 `system` reads as `user` because neither provider path gives Rho a better one
 worth its cost. Claude Code's only mid-conversation `role: system` row says "The
 user sent a new message", and its mods can add a text block to a row but cannot
-change a role. Rho's lines are fixed text, so `user` carries no attacker's words.
+change a role. Rho's fixed lines carry no attacker's words. A kept skill's text
+is a file, which an attacker who can edit that file controls. maan2003 accepted
+this for now (2026-11-06), and also that a cell can call `input` with
+`role="user"`: Python that runs an attacker's code has already lost.
 
 Mid-turn delivery through Claude Code does not keep the rule. Depending on the
 model, the CLI folds the message into a system message, which some models can

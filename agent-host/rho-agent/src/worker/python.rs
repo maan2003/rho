@@ -516,11 +516,8 @@ fn input(
     let role = match role {
         "user" => Role::User,
         "tool" => Role::Tool,
-        "system" => Role::System,
         _ => {
-            return Err(PyValueError::new_err(
-                "role is one of \"user\", \"tool\" or \"system\"",
-            ));
+            return Err(PyValueError::new_err("role is one of \"user\" or \"tool\""));
         }
     };
     control(

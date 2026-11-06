@@ -11,7 +11,7 @@ run on the asyncio loop of the caller's thread.
 
 from typing import Literal, TypedDict
 
-Role = Literal["user", "tool", "system"]
+Role = Literal["user", "tool"]
 
 class NativeRuntime(TypedDict):
     kind: Literal["native"]
@@ -89,9 +89,8 @@ def input(agent: str, text: str, *, role: Role, message: int | None = None) -> N
     """Give the agent an input: it waits in memory until a request can carry
     it, and that request's row holds it. This returns once the agent has it. A
     crash loses it unless it is a chat message, which is handed again. `role`
-    says who speaks: "user" for what a person typed, "tool" for anything else
-    nobody at Rho wrote, "system" for Rho's own words. `message` names the chat
-    message it hands over."""
+    says who speaks: "user" for what a person typed, "tool" for anything else.
+    `message` names the chat message it hands over."""
 def delivered(agent: str) -> int:
     """The newest message id a request carried to the agent, or 0. What waits
     in the agent is not counted."""

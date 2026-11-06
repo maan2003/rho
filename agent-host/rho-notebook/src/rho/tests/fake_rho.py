@@ -73,7 +73,7 @@ def set_spec(agent, spec):
 
 
 def input(agent, text, *, role, message=None):
-    assert role in ("user", "tool", "system"), role
+    assert role in ("user", "tool"), role
     with STATE.lock:
         assert agent in STATE.agents, agent
         STATE.inputs.append((agent, text, role, message))
