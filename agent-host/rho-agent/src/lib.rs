@@ -23,8 +23,8 @@ pub mod worker;
 pub use host::{Process as WorksetProcess, WorksetClient};
 pub use ipc::workset::{Action as WorksetAction, Attach as WorksetAttach, Reply as WorksetReply};
 pub use log::{
-    ClaudeOutputBatch, InputKind, QueuedInput, TranscriptCall, TranscriptLine, WakeEvent,
-    WakeFacts, WakeKind, WakeTrigger,
+    InputKind, QueuedInput, TranscriptCall, TranscriptLine, WakeEvent, WakeFacts, WakeKind,
+    WakeTrigger,
 };
 pub use rho_agents_client::protocol::transcript::{
     InferenceState, RuntimeState, StreamingResponse,

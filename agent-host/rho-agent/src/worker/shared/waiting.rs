@@ -1,37 +1,33 @@
 //! What waits to reach the model: inputs and notebook output, in memory. Each
-//! request pulls what it can carry and writes its rows just before it
+//! request pulls what it can carry into its row
 //! ([DECISION-pull-based-sources](../../../specs/DECISION-pull-based-sources.
 //! md)). A crash loses what waits; the chat hands its messages again.
 
-use rho_agent_types::{AgentId, ContentPart, MessageId, Role, UnixMs};
+use rho_agent_types::{ContentPart, MessageId, Role, UnixMs};
 
-use crate::record::Event;
+use crate::entry::add_output;
+use crate::record::Input;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Held {
-    pub role: Role,
-    pub message: Option<MessageId>,
-    pub content: Vec<ContentPart>,
+struct Held {
+    input: Input,
     at: UnixMs,
     /// It can still wake the model. A request with no call open told the
     /// model of `tool` text it left, and a stop quiets what came before it.
     news: bool,
 }
 
-impl Held {
-    /// The row that says a request carried it.
-    pub fn row(self, agent: AgentId) -> Event<'static> {
-        Event::Input {
-            agent,
-            message: self.message,
-            content: self.content,
-            role: self.role,
-        }
-    }
+/// What one request took, and puts back if it cannot be sent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Taken {
+    pub output: Vec<ContentPart>,
+    pub inputs: Vec<Input>,
+    held: Vec<Held>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Waiting {
+    output: Vec<ContentPart>,
     held: Vec<Held>,
 }
 
@@ -44,24 +40,25 @@ impl Waiting {
         at: UnixMs,
     ) {
         self.held.push(Held {
-            role,
-            message,
-            content,
+            input: Input {
+                role,
+                message,
+                content,
+            },
             at,
             news: role != Role::System,
         });
     }
 
     /// The notebook's report, which its own facts wake the model for.
-    pub fn output(&mut self, content: Vec<ContentPart>, at: UnixMs) {
-        self.receive(Role::Tool, None, content, at);
-        self.held.last_mut().expect("just pushed").news = false;
+    pub fn output(&mut self, content: Vec<ContentPart>) {
+        add_output(&mut self.output, content);
     }
 
     pub fn oldest(&self, role: Role) -> Option<UnixMs> {
         self.held
             .iter()
-            .filter(|held| held.news && held.role == role)
+            .filter(|held| held.news && held.input.role == role)
             .map(|held| held.at)
             .min()
     }
@@ -82,36 +79,50 @@ impl Waiting {
 
     /// Whether a request could carry anything now.
     pub fn can_go(&self, call_open: bool) -> bool {
-        self.held
-            .iter()
-            .any(|held| call_open || held.role != Role::Tool)
+        (call_open && !self.output.is_empty())
+            || self
+                .held
+                .iter()
+                .any(|held| call_open || held.input.role != Role::Tool)
     }
 
-    /// Whether `tool` text waits for a call.
+    /// Whether output or `tool` text waits for a call.
     pub fn holds_tool(&self) -> bool {
-        self.held.iter().any(|held| held.role == Role::Tool)
+        !self.output.is_empty() || self.held.iter().any(|held| held.input.role == Role::Tool)
     }
 
-    /// Everything one request carries, oldest first. With no call open `tool`
-    /// text stays: only a tool result reads as a tool's
+    /// Everything one request carries, oldest first. With no call open output
+    /// and `tool` text stay: only a tool result reads as a tool's
     /// ([DECISION-roles](../../../specs/DECISION-roles.md)), and the model has
-    /// been told of it.
-    pub fn take(&mut self, call_open: bool) -> Vec<Held> {
-        let (taken, left): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+    /// been told of them.
+    pub fn take(&mut self, call_open: bool) -> Taken {
+        let (held, left): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|held| call_open || held.role != Role::Tool);
+            .partition(|held| call_open || held.input.role != Role::Tool);
         self.held = left;
         self.quiet();
-        taken
+        Taken {
+            output: if call_open {
+                std::mem::take(&mut self.output)
+            } else {
+                Vec::new()
+            },
+            inputs: held.iter().map(|held| held.input.clone()).collect(),
+            held,
+        }
     }
 
     /// A send failed: what it took goes first next time. It wakes nobody.
-    pub fn put_back(&mut self, mut taken: Vec<Held>) {
-        for held in &mut taken {
+    pub fn put_back(&mut self, taken: Taken) {
+        let mut output = taken.output;
+        add_output(&mut output, std::mem::take(&mut self.output));
+        self.output = output;
+        let mut held = taken.held;
+        for held in &mut held {
             held.news = false;
         }
-        taken.append(&mut self.held);
-        self.held = taken;
+        held.append(&mut self.held);
+        self.held = held;
     }
 }
 
@@ -123,9 +134,11 @@ mod tests {
         vec![ContentPart::Text { text: text.into() }]
     }
 
-    fn texts(held: &[Held]) -> Vec<String> {
-        held.iter()
-            .map(|held| rho_agent_types::transcript::text_content(&held.content))
+    fn texts(taken: &Taken) -> Vec<String> {
+        taken
+            .inputs
+            .iter()
+            .map(|input| rho_agent_types::transcript::text_content(&input.content))
             .collect()
     }
 
@@ -151,16 +164,37 @@ mod tests {
         assert!(!waiting.holds_tool());
     }
 
+    /// Output needs a call, wakes nobody and is not news. It waits across a
+    /// request with no call, and joins what the notebook says next.
     #[test]
-    fn output_wakes_nobody_by_itself_and_a_failed_send_keeps_the_order() {
+    fn output_waits_for_a_call_and_wakes_nobody() {
         let mut waiting = Waiting::default();
-        waiting.output(text("printed"), UnixMs(1));
+        waiting.output(text("first"));
         assert_eq!(waiting.oldest(Role::Tool), None);
+        assert!(!waiting.has_news());
+        assert!(waiting.holds_tool());
+        assert!(!waiting.can_go(false) && waiting.can_go(true));
+
+        assert!(waiting.take(false).output.is_empty());
+        waiting.output(text("second"));
+        assert_eq!(waiting.take(true).output, text("first\n\nsecond"));
+        assert!(!waiting.holds_tool());
+    }
+
+    /// A failed send puts back what it took, before what came since, and none
+    /// of it wakes the model again.
+    #[test]
+    fn a_failed_send_keeps_the_order() {
+        let mut waiting = Waiting::default();
+        waiting.output(text("printed"));
         waiting.receive(Role::User, None, text("person"), UnixMs(2));
         let taken = waiting.take(true);
+        waiting.output(text("printed later"));
         waiting.receive(Role::User, None, text("later"), UnixMs(3));
         waiting.put_back(taken);
         assert_eq!(waiting.oldest(Role::User), Some(UnixMs(3)));
-        assert_eq!(texts(&waiting.take(true)), ["printed", "person", "later"]);
+        let taken = waiting.take(true);
+        assert_eq!(taken.output, text("printed\n\nprinted later"));
+        assert_eq!(texts(&taken), ["person", "later"]);
     }
 }

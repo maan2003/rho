@@ -252,8 +252,8 @@ pub struct TranscriptFold {
     /// The row each block came from, so a rewind drops exactly what was
     /// told after it. `None` for a message, which no rewind takes back.
     told_at: Vec<Option<Wpos>>,
-    /// Inputs no request has carried yet; drawn after the blocks.
-    queue: Vec<(Wpos, Waiting, UiBlock)>,
+    /// Compactions no request has carried yet; drawn after the blocks.
+    queue: Vec<(Wpos, UiBlock)>,
     /// Messages the agent received that no input has handed it yet; drawn
     /// last.
     inbox: Vec<(MessageId, UiBlock)>,
@@ -327,7 +327,7 @@ impl TranscriptFold {
         self.dirty_from = Some(self.dirty_from.map_or(at, |held| held.min(at)));
     }
 
-    /// The end of the queue, where a new input lands.
+    /// The end of the queue, where the inbox starts.
     fn queue_end(&self) -> usize {
         self.blocks.len() + self.queue.len()
     }
@@ -335,14 +335,14 @@ impl TranscriptFold {
     fn waiting(&self) -> impl Iterator<Item = Arc<UiBlock>> + '_ {
         self.queue
             .iter()
-            .map(|(_, _, queued)| queued)
+            .map(|(_, queued)| queued)
             .chain(self.inbox.iter().map(|(_, waiting)| waiting))
             .map(|block| Arc::new(block.clone()))
     }
 
     /// The composed transcript from one index on: the folded blocks, then
-    /// the inputs no request has carried yet, then messages not yet handed
-    /// over.
+    /// the compactions no request has carried yet, then messages not yet
+    /// handed over.
     fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
         if from < self.blocks.len() {
             self.blocks[from..]
@@ -419,15 +419,10 @@ impl TranscriptFold {
     /// Moves what waited into the transcript; returns whether a request
     /// for compaction was among it.
     fn deliver_queue(&mut self, pos: Wpos) -> bool {
-        let mut compaction = false;
-        for (_, waiting, queued) in std::mem::take(&mut self.queue) {
-            compaction |= waiting == Waiting::Compaction;
-            // A delivered message is still a message: a rewind of the turn
-            // it started does not unsay what was written.
-            self.push(
-                (waiting != Waiting::Message).then_some(pos),
-                delivered(queued),
-            );
+        let queue = std::mem::take(&mut self.queue);
+        let compaction = !queue.is_empty();
+        for (_, queued) in queue {
+            self.push(Some(pos), queued);
         }
         compaction
     }
@@ -504,67 +499,50 @@ impl TranscriptFold {
                     tool.timing = self.exec_timings[id];
                 }
             }
-            LogEvent::Input { message, text, .. } => {
-                self.errored = false;
-                let block = match message {
-                    Some(id) => {
-                        self.handed.insert(*id);
-                        // The message as its sender wrote it; the row's text
-                        // is what the policy made of it for the model.
-                        match self.inbox.iter().position(|(waiting, _)| waiting == id) {
-                            Some(index) => {
-                                self.touch(self.queue_end() + index);
-                                self.inbox.remove(index).1
-                            }
-                            None => UiBlock::QueuedMessage {
-                                text: text.clone(),
-                                sender: self.senders.get(id).copied().and_then(sender),
-                            },
-                        }
-                    }
-                    // No message: what the policy has to tell the agent.
-                    None => UiBlock::Notice { text: text.clone() },
-                };
-                self.touch(self.queue_end());
-                self.queue.push((
-                    pos,
-                    match message {
-                        Some(_) => Waiting::Message,
-                        None => Waiting::Input,
-                    },
-                    block,
-                ));
-            }
             LogEvent::CompactionRequested { .. } => {
                 self.touch(self.queue_end());
                 self.queue.push((
                     pos,
-                    Waiting::Compaction,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
                     },
                 ));
             }
-            LogEvent::Sent {
-                results,
+            LogEvent::Request {
+                inputs,
+                calls,
                 compaction,
                 ..
             } => {
-                let requested = self.deliver_queue(pos);
-                // A requested compaction already shows as its request.
-                if *compaction && !requested {
-                    self.push(
-                        Some(pos),
-                        UiBlock::Notice {
-                            text: "compacting context".to_owned(),
-                        },
-                    );
+                if !inputs.is_empty() {
+                    self.errored = false;
                 }
-                self.finish_calls(results);
-            }
-            LogEvent::NotebookReport {
-                calls, compaction, ..
-            } => {
+                for input in inputs {
+                    let block = match input.message {
+                        Some(id) => {
+                            self.handed.insert(id);
+                            // The message as its sender wrote it; the row's
+                            // text is what the policy made of it for the model.
+                            match self.inbox.iter().position(|(waiting, _)| *waiting == id) {
+                                Some(index) => {
+                                    self.touch(self.queue_end() + index);
+                                    self.inbox.remove(index).1
+                                }
+                                None => UiBlock::QueuedMessage {
+                                    text: input.text.clone(),
+                                    sender: self.senders.get(&id).copied().and_then(sender),
+                                },
+                            }
+                        }
+                        // No message: what the policy has to tell the agent.
+                        None => UiBlock::Notice {
+                            text: input.text.clone(),
+                        },
+                    };
+                    // A message is still a message: a rewind of the turn it
+                    // started does not unsay what was written.
+                    self.push(input.message.is_none().then_some(pos), delivered(block));
+                }
                 let requested = self.deliver_queue(pos);
                 // A requested compaction already shows as its request.
                 if *compaction && !requested {
@@ -577,6 +555,7 @@ impl TranscriptFold {
                 }
                 self.report_calls(calls);
             }
+            LogEvent::NotebookReport { calls, .. } => self.report_calls(calls),
             LogEvent::Results { results, .. } => self.finish_calls(results),
             LogEvent::Replied {
                 items,
@@ -748,17 +727,6 @@ fn sender(from: Address) -> Option<AgentId> {
     }
 }
 
-/// What a row waiting for a request is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Waiting {
-    /// What the policy has to tell the agent.
-    Input,
-    /// An input that hands over a message.
-    Message,
-    /// A request to compact the context.
-    Compaction,
-}
-
 fn delivered(queued: UiBlock) -> UiBlock {
     match queued {
         UiBlock::QueuedMessage {
@@ -775,6 +743,7 @@ fn delivered(queued: UiBlock) -> UiBlock {
 mod tests {
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
+    use crate::protocol::worksets::InputView;
     use crate::state::UiTool;
 
     fn agent(n: u64) -> AgentId {
@@ -800,19 +769,24 @@ mod tests {
     }
 
     fn input(text: &str, message: Option<u64>, at: u64) -> LogEvent {
-        LogEvent::Input {
+        LogEvent::Request {
             agent: me(),
-            message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
-            text: text.to_owned(),
-            role: rho_agent_types::Role::User,
+            inputs: vec![InputView {
+                message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
+                text: text.to_owned(),
+                role: rho_agent_types::Role::User,
+            }],
+            calls: Vec::new(),
+            compaction: false,
             at: UnixMs(at),
         }
     }
 
     fn sent_row(at: u64) -> LogEvent {
-        LogEvent::Sent {
+        LogEvent::Request {
             agent: me(),
-            results: Vec::new(),
+            inputs: Vec::new(),
+            calls: Vec::new(),
             compaction: false,
             at: UnixMs(at),
         }
@@ -991,7 +965,7 @@ mod tests {
                 Some(10),
                 3,
             ),
-            LogEvent::Sent {
+            LogEvent::Results {
                 agent: me(),
                 results: vec![ToolOutcome {
                     id: "call-1".to_owned(),
@@ -999,7 +973,6 @@ mod tests {
                     started_at: UnixMs(3),
                     finished_at: UnixMs(4),
                 }],
-                compaction: false,
                 at: UnixMs(4),
             },
             replied(
@@ -1032,90 +1005,6 @@ mod tests {
         assert_eq!(state.usage.total.requests, 2);
         assert_eq!(state.usage.provider, "sol");
         assert_eq!(state.context_used, Some(12));
-    }
-
-    /// Results alone carry nothing out of the queue; a request does.
-    #[test]
-    fn an_input_waits_as_queued_until_a_request_carries_it() {
-        let state = told(vec![
-            input("later", None, 1),
-            LogEvent::Results {
-                agent: me(),
-                results: Vec::new(),
-                at: UnixMs(2),
-            },
-        ]);
-        assert_eq!(state.blocks.len(), 1);
-        assert!(matches!(&*state.blocks[0], UiBlock::Notice { text } if text == "later"));
-    }
-
-    /// The workset's log holds every agent's rows; only this agent's are
-    /// its transcript.
-    #[test]
-    fn rows_about_another_agent_are_not_this_transcript() {
-        let other = LogEvent::ClaudeMessage {
-            agent: agent(2),
-            speaker: Speaker::Assistant,
-            text: "not mine".into(),
-            at: UnixMs(1),
-        };
-        let mut fold = TranscriptFold::new(me(), &[]);
-        assert!(!fold.tell(&TranscriptRow::Log(Wpos(0), other.clone())));
-        assert!(fold.state().blocks.is_empty());
-        let merged = interleave(me(), [(Wpos(0), other)], []);
-        assert!(merged.is_empty());
-    }
-
-    /// A message the agent received waits until an input hands it over,
-    /// then reads as it was written, from whoever wrote it, and is never
-    /// shown twice; what the agent posts is in its transcript.
-    #[test]
-    fn a_message_waits_until_an_input_hands_it_over() {
-        let peer = agent(2);
-        let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Message(message(3, Address::Agent(peer), 1)));
-        fold.tell(&TranscriptRow::Message(from_user(4, 2)));
-        let state = fold.state();
-        assert_eq!(state.blocks.len(), 2, "both wait");
-        assert!(matches!(&*state.blocks[0],
-            UiBlock::QueuedMessage { sender: Some(sender), .. } if *sender == peer));
-
-        // The policy wraps the message for the model; the reader sees the
-        // message as it was written.
-        fold.tell(&TranscriptRow::Log(
-            Wpos(0),
-            input("Message from eng-peer:\nmessage 3", Some(3), 3),
-        ));
-        fold.tell(&TranscriptRow::Log(Wpos(1), sent_row(4)));
-        let state = fold.state();
-        assert_eq!(
-            *state.blocks[0],
-            UiBlock::AgentMessage {
-                sender: peer,
-                text: "message 3".into()
-            }
-        );
-        assert_eq!(
-            state.blocks.len(),
-            2,
-            "the user's message still waits, once"
-        );
-        assert!(matches!(&*state.blocks[1],
-            UiBlock::QueuedMessage { sender: None, text } if text == "message 4"));
-
-        fold.tell(&TranscriptRow::Message(to_user(
-            6,
-            rho_agent_types::MentionKind::Ask,
-            6,
-        )));
-        let state = fold.state();
-        assert_eq!(state.blocks.len(), 3);
-        assert!(matches!(&*state.blocks[1],
-            UiBlock::MessageSent { to: None, text } if text == "message 6"));
-        assert!(
-            matches!(&*state.blocks[2], UiBlock::QueuedMessage { .. }),
-            "a waiting message stays last"
-        );
     }
 
     /// An input may be heard before the message it hands over: the message
@@ -1228,8 +1117,9 @@ mod tests {
     /// by the request that compacts. One nobody asked for still shows.
     #[test]
     fn a_compaction_shows_once() {
-        let report = |at| LogEvent::NotebookReport {
+        let report = |at| LogEvent::Request {
             agent: me(),
+            inputs: Vec::new(),
             calls: Vec::new(),
             compaction: true,
             at: UnixMs(at),

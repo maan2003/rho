@@ -14,9 +14,10 @@ use rho_agent_types::{
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
 
+use crate::entry::{RequestNotice, Wake};
 use crate::inference::PromptCacheKey;
 use crate::inference::config::{InferenceModel, InferenceProfile};
-use crate::log::{ClaudeOutputBatch, ClaudeRewind, TranscriptLine, WakeFacts};
+use crate::log::{ClaudeRewind, TranscriptLine, WakeFacts};
 
 /// One row of a workset log.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -38,15 +39,19 @@ pub enum Event<'a> {
     /// The agent's whole spec, replacing the one before.
     AgentChanged { agent: AgentId, spec: AgentSpec },
 
-    /// What a request carried to the model: the request after it delivers it.
-    /// Written with that request by the agent's own loop.
-    Input {
+    /// A request to the model, and everything it carried. In a Claude agent
+    /// it is handed to Claude Code; a native agent replays its context from
+    /// these rows.
+    Request {
         agent: AgentId,
-        /// The message it hands over, if it is one.
-        message: Option<MessageId>,
-        content: Vec<ContentPart>,
-        #[senax(rename = "wake")]
-        role: Role,
+        why: Wake,
+        /// Notebook output: the first thing the open call's result says.
+        output: Vec<ContentPart>,
+        inputs: Vec<Input>,
+        notices: Vec<RequestNotice>,
+        /// A native request asks the provider to compact. Claude Code
+        /// compacts by a command of its own.
+        compact: bool,
     },
 
     /// Every row of this agent from `to` up to here is no longer its history.
@@ -74,13 +79,19 @@ pub enum Event<'a> {
 }
 
 impl Event<'_> {
+    /// A request that carried something a person typed: where a rewind can go.
+    pub fn carries_a_person(&self) -> bool {
+        matches!(self, Self::Request { inputs, .. }
+            if inputs.iter().any(|input| input.role == Role::User))
+    }
+
     /// The agent the event is about; `None` for a workset event.
     pub fn agent(&self) -> Option<AgentId> {
         match self {
             Self::WorksetCreated { .. } | Self::Evaluated { .. } => None,
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
-            | Self::Input { agent, .. }
+            | Self::Request { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::ExecObserved { agent, .. }
@@ -88,6 +99,16 @@ impl Event<'_> {
             | Self::Claude { agent, .. } => Some(*agent),
         }
     }
+}
+
+/// One thing a request carried, and how the model reads it
+/// ([DECISION-roles](../specs/DECISION-roles.md)).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Input {
+    pub role: Role,
+    /// The message it hands over, if it is one.
+    pub message: Option<MessageId>,
+    pub content: Vec<ContentPart>,
 }
 
 /// What an agent is: the loop that runs it, and what Python says about it.
@@ -157,102 +178,23 @@ pub enum ClaudeRow {
     ExecAdmitted {
         call: ExecCall,
     },
-    /// Only for the temporary migration: notebook output is a `tool` input now.
-    Output {
-        batch: ClaudeOutputBatch,
-    },
-    /// Only for the temporary migration, with `Output`.
-    OutputHandedOff {
-        id: Uuid,
-    },
     /// A rewind whose destination transcript is not verified yet; `None`
     /// withdraws it. On success the new session is an `AgentChanged`.
     RewindPending(Option<ClaudeRewind>),
-    /// A turn or an exec result handed to Claude Code. It delivers every
-    /// input before it, which it wrote with itself.
-    RequestSent {
-        why: crate::entry::Wake,
-        report: crate::entry::Report,
-    },
     Notice(crate::entry::Notice),
 }
 
 #[cfg(test)]
-mod tests {
-    use rho_agent_types::{AgentId, AgentIdDomain, ContentPart, Role};
-    use senax_encoder::{decode, encode};
-
-    use super::*;
-
-    /// Rows as they were written before the roles.
-    mod before_roles {
-        use rho_agent_types::{AgentId, ContentPart, MessageId};
-        use senax_encoder::Encode;
-
-        #[derive(Encode)]
-        pub enum ClaudeRow {
-            RequestSent {
-                why: crate::entry::Wake,
-                report: crate::entry::Report,
-            },
-        }
-
-        #[derive(Encode)]
-        pub enum InputWake {
-            Person,
-            Agent,
-            Quiet,
-        }
-
-        #[derive(Encode)]
-        pub enum Event {
-            Input {
-                agent: AgentId,
-                message: Option<MessageId>,
-                content: Vec<ContentPart>,
-                wake: InputWake,
-            },
-        }
-    }
-
-    #[test]
-    fn a_request_row_from_before_the_roles_delivered_everything() {
-        let bytes = encode(&before_roles::ClaudeRow::RequestSent {
-            why: crate::entry::Wake::Message,
-            report: crate::entry::Report::default(),
-        })
-        .unwrap();
-        let row: ClaudeRow = decode(&mut bytes.as_ref()).unwrap();
-        assert_eq!(
-            row,
-            ClaudeRow::RequestSent {
-                why: crate::entry::Wake::Message,
-                report: crate::entry::Report::default(),
-            }
-        );
-    }
-
-    #[test]
-    fn an_input_row_from_before_the_roles_keeps_who_spoke() {
-        let agent = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
-        let content = vec![ContentPart::Text { text: "hi".into() }];
-        for (wake, role) in [
-            (before_roles::InputWake::Person, Role::User),
-            (before_roles::InputWake::Agent, Role::Tool),
-            (before_roles::InputWake::Quiet, Role::System),
-        ] {
-            let bytes = encode(&before_roles::Event::Input {
-                agent,
-                message: None,
-                content: content.clone(),
-                wake,
-            })
-            .unwrap();
-            let event: Event<'static> = decode(&mut bytes.as_ref()).unwrap();
-            assert!(
-                matches!(event, Event::Input { role: decoded, .. } if decoded == role),
-                "{event:?}"
-            );
+impl Event<'static> {
+    /// A request that carries these inputs and says nothing else.
+    pub(crate) fn carrying(agent: AgentId, inputs: Vec<Input>) -> Self {
+        Self::Request {
+            agent,
+            why: Wake::Message,
+            output: Vec::new(),
+            inputs,
+            notices: Vec::new(),
+            compact: false,
         }
     }
 }

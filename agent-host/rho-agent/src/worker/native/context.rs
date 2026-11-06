@@ -1,27 +1,23 @@
 //! One projection for live input and replay, from the agent's visible rows.
-//! Each RequestSent picks up every input before it and `compose` splits them
-//! by role ([DECISION-roles](../../../specs/DECISION-roles.md)). Consecutive
-//! requests are merged until a response closes the group; provider pairing is
-//! derived from the preceding opaque Carry.
+//! Each `Request` holds what it carried and `compose` splits it by role
+//! ([DECISION-roles](../../../specs/DECISION-roles.md)). Consecutive requests
+//! are merged until a response closes the group; provider pairing is derived
+//! from the preceding opaque Carry.
 
 use std::sync::Arc;
 
-use rho_agent_types::{ContentPart, Role};
+use rho_agent_types::ContentPart;
 
-use crate::entry::{Entry, RequestNotice, compose, plain_text};
+use crate::entry::{Entry, RequestNotice, add_output, compose, plain_text};
 use crate::inference::{CacheKey, Carry, Image, Item, Request};
-use crate::record::Event;
+use crate::record::{Event, Input};
 
 #[derive(Default)]
 pub(crate) struct Context {
-    /// Inputs no request has picked up yet.
-    queued: Vec<(Role, Vec<ContentPart>)>,
     pending: Option<Carry>,
     notices: Vec<RequestNotice>,
-    /// Picked-up `tool` inputs, which answer the open call.
-    tool: Vec<Vec<ContentPart>>,
-    /// Picked-up `user` and `system` inputs.
-    delivered: Vec<Vec<ContentPart>>,
+    output: Vec<ContentPart>,
+    inputs: Vec<Input>,
     compact: bool,
 }
 
@@ -36,45 +32,38 @@ impl Context {
 
     pub fn observe(&mut self, event: &Event<'_>) {
         match event {
-            Event::Input { content, role, .. } => self.queued.push((*role, content.clone())),
-            Event::Native { entry, .. } => self.observe_entry(entry),
-            _ => {}
-        }
-    }
-
-    fn open_call(&self) -> Option<&Carry> {
-        self.pending.as_ref().filter(|carry| carry.has_call())
-    }
-
-    fn observe_entry(&mut self, entry: &Entry) {
-        match entry {
-            Entry::Step { carry, .. } => {
-                self.tool.clear();
-                self.notices.clear();
-                self.pending = Some(carry.clone());
-                self.delivered.clear();
-                self.compact = false;
-            }
-            Entry::RequestSent {
-                report, compact, ..
+            Event::Request {
+                output,
+                inputs,
+                notices,
+                compact,
+                ..
             } => {
-                let call_open = self.open_call().is_some();
-                for (role, content) in self.queued.drain(..) {
-                    match role {
-                        Role::Tool if call_open => self.tool.push(content),
-                        // Old rows only: a loop keeps `tool` text for a call.
-                        _ => self.delivered.push(content),
-                    }
-                }
-                for notice in &report.notices {
+                add_output(&mut self.output, output.clone());
+                self.inputs.extend(inputs.iter().cloned());
+                for notice in notices {
                     if !self.notices.contains(notice) {
                         self.notices.push(notice.clone());
                     }
                 }
                 self.compact |= compact;
             }
-            Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
+            Event::Native {
+                entry: Entry::Step { carry, .. },
+                ..
+            } => {
+                self.notices.clear();
+                self.pending = Some(carry.clone());
+                self.output.clear();
+                self.inputs.clear();
+                self.compact = false;
+            }
+            _ => {}
         }
+    }
+
+    fn open_call(&self) -> Option<&Carry> {
+        self.pending.as_ref().filter(|carry| carry.has_call())
     }
 
     /// The newest step left a call for a request to answer.
@@ -85,7 +74,7 @@ impl Context {
     /// Snapshot the unanswered input group, not the whole conversation.
     pub fn input(&self) -> Vec<Item> {
         let call = self.open_call();
-        let composed = compose(call.is_some(), &self.notices, &self.tool, &self.delivered);
+        let composed = compose(call.is_some(), &self.notices, &self.output, &self.inputs);
         let mut items = Vec::new();
         if let Some(call) = call
             && !composed.result.is_empty()
@@ -157,10 +146,10 @@ fn images_of(content: &[ContentPart]) -> Vec<Image> {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentId, AgentIdDomain};
+    use rho_agent_types::{AgentId, AgentIdDomain, Role};
 
     use super::*;
-    use crate::entry::{Notice, Report, Wake};
+    use crate::entry::{Notice, Wake};
     use crate::inference::Call;
 
     fn agent() -> AgentId {
@@ -180,42 +169,45 @@ mod tests {
             usage: None,
         })
     }
-    fn received(text: &str) -> Event<'static> {
-        Event::Input {
-            agent: agent(),
-            message: None,
-            content: vec![ContentPart::Text { text: text.into() }],
-            role: Role::User,
-        }
-    }
     fn image_part(bytes: Vec<u8>) -> ContentPart {
         ContentPart::Image {
             media_type: "image/png".into(),
             data: bytes,
         }
     }
-    /// Notebook output, as the request's loop writes it before the request.
-    fn output(text: &str, bytes: Vec<u8>) -> Event<'static> {
+    fn output(text: &str, bytes: Vec<u8>) -> Vec<ContentPart> {
         let mut content = vec![ContentPart::Text { text: text.into() }];
         if !bytes.is_empty() {
             content.push(image_part(bytes));
         }
-        Event::Input {
-            agent: agent(),
+        content
+    }
+    fn input_as(role: Role, text: &str) -> Input {
+        Input {
+            role,
             message: None,
-            content,
-            role: Role::Tool,
+            content: vec![ContentPart::Text { text: text.into() }],
+        }
+    }
+    fn person(text: &str) -> Input {
+        input_as(Role::User, text)
+    }
+    fn carrying(
+        output: Vec<ContentPart>,
+        inputs: Vec<Input>,
+        notices: Vec<RequestNotice>,
+    ) -> Event<'static> {
+        Event::Request {
+            agent: agent(),
+            why: Wake::Notify,
+            output,
+            inputs,
+            notices,
+            compact: false,
         }
     }
     fn sent(notices: Vec<RequestNotice>) -> Event<'static> {
-        native(Entry::RequestSent {
-            why: Wake::Notify,
-            compact: false,
-            report: Report {
-                notices,
-                ..Report::default()
-            },
-        })
+        carrying(Vec::new(), Vec::new(), notices)
     }
     fn users(items: &[Item]) -> Vec<String> {
         items
@@ -227,37 +219,27 @@ mod tests {
             .collect()
     }
 
+    /// What a request carried stays until a response closes the group, and
+    /// the request after it carries only its own.
     #[test]
-    fn a_request_delivers_every_input_before_it_and_none_after() {
-        let mut context =
-            Context::restore(&[response("start"), received("first"), received("second")]);
-        assert!(
-            users(&context.input()).is_empty(),
-            "nothing is delivered before a request"
-        );
-        context.observe(&sent(vec![]));
-        assert_eq!(users(&context.input()), ["first", "second"]);
-        // An input after the request waits for the next one, even before a
-        // response closes the group.
-        context.observe(&received("late"));
+    fn a_response_closes_what_a_request_carried() {
+        let mut context = Context::restore(&[response("start")]);
+        assert!(users(&context.input()).is_empty());
+        context.observe(&carrying(
+            Vec::new(),
+            vec![person("first"), person("second")],
+            vec![],
+        ));
         assert_eq!(users(&context.input()), ["first", "second"]);
         context.observe(&response("next"));
         assert!(users(&context.input()).is_empty());
-        context.observe(&sent(vec![]));
+        context.observe(&carrying(Vec::new(), vec![person("late")], vec![]));
         assert_eq!(users(&context.input()), ["late"]);
         context.observe(&response("done"));
         context.observe(&sent(vec![]));
         assert!(users(&context.input()).is_empty());
     }
 
-    fn input_as(role: Role, text: &str) -> Event<'static> {
-        Event::Input {
-            agent: agent(),
-            message: None,
-            content: vec![ContentPart::Text { text: text.into() }],
-            role,
-        }
-    }
     fn prose() -> Event<'static> {
         native(Entry::Step {
             exec: None,
@@ -282,11 +264,15 @@ mod tests {
     fn with_a_call_open_each_role_goes_where_it_reads() {
         let events = [
             response("call"),
-            output("printed", vec![]),
-            input_as(Role::Tool, "[message from peer]\nfrom the peer"),
-            input_as(Role::User, "from the person"),
-            input_as(Role::System, "from rho"),
-            sent(vec![RequestNotice::Restarted]),
+            carrying(
+                output("printed", vec![]),
+                vec![
+                    input_as(Role::Tool, "[message from peer]\nfrom the peer"),
+                    input_as(Role::User, "from the person"),
+                    input_as(Role::System, "from rho"),
+                ],
+                vec![RequestNotice::Restarted],
+            ),
         ];
         let items = Context::restore(&events).input();
         let answer = results(&items);
@@ -311,33 +297,40 @@ mod tests {
         assert_eq!(users(&closed.input()), ["Check-in: nothing new."]);
     }
 
-    /// Only old rows have a `tool` input with no call to answer. The model
-    /// read those as user text, and a replay stays true to that.
+    /// Only old rows have output or a `tool` input with no call to answer. The
+    /// model read those as user text, and a replay stays true to that.
     #[test]
     fn an_old_tool_input_with_no_call_replays_as_it_was_read() {
         let events = [
             prose(),
-            input_as(Role::Tool, "old peer message"),
-            sent(vec![]),
+            carrying(
+                output("old output", vec![]),
+                vec![input_as(Role::Tool, "old peer message")],
+                vec![],
+            ),
         ];
         let items = Context::restore(&events).input();
         assert!(results(&items).is_empty());
-        assert_eq!(users(&items), ["old peer message"]);
+        assert_eq!(users(&items), ["old output", "old peer message"]);
     }
 
     #[test]
     fn failed_attempts_merge_once_and_keep_new_inputs_and_images() {
         let events = vec![
             response("first"),
-            received("steer-left"),
-            output("alpha", vec![1, 7]),
-            sent(vec![RequestNotice::Restarted]),
+            carrying(
+                output("alpha", vec![1, 7]),
+                vec![person("steer-left")],
+                vec![RequestNotice::Restarted],
+            ),
             native(Entry::Notice {
                 notice: Notice::Error("retry".into()),
             }),
-            received("steer-right"),
-            output("beta", vec![9, 2, 8]),
-            sent(vec![RequestNotice::Restarted]),
+            carrying(
+                output("beta", vec![9, 2, 8]),
+                vec![person("steer-right")],
+                vec![RequestNotice::Restarted],
+            ),
         ];
         let request = request("system".into(), &events, CacheKey::from_u128(1));
         assert_eq!(request.items().len(), 5);
@@ -373,11 +366,9 @@ mod tests {
     fn partial_step_closes_the_group_and_compaction_drops_old_pairings() {
         let mut events = vec![
             response("first"),
-            output("before-partial", vec![]),
-            sent(vec![]),
+            carrying(output("before-partial", vec![]), vec![], vec![]),
             response("partial"),
-            output("after-partial", vec![]),
-            sent(vec![]),
+            carrying(output("after-partial", vec![]), vec![], vec![]),
         ];
         let built = request("system".into(), &events, CacheKey::from_u128(2));
         let found = built
@@ -409,8 +400,11 @@ mod tests {
             usage: None,
             carry: Carry::new(serde_json::json!("script-compaction"), vec![], true),
         }));
-        events.push(received("after-compaction"));
-        events.push(sent(vec![RequestNotice::Waiting]));
+        events.push(carrying(
+            Vec::new(),
+            vec![person("after-compaction")],
+            vec![RequestNotice::Waiting],
+        ));
         let built = request("system".into(), &events, CacheKey::from_u128(2));
         // The compaction took the calls with it: what follows opens no result.
         assert_eq!(built.items().len(), 3);

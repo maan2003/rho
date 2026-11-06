@@ -24,7 +24,7 @@ use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::entry::{Entry, Notice, Report, RequestNotice, ResponseUsage, Wake, output_content};
+use crate::entry::{Entry, Notice, RequestNotice, ResponseUsage, Wake, output_content};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey, Request,
@@ -35,7 +35,7 @@ use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
-use crate::worker::shared::waiting::Waiting;
+use crate::worker::shared::waiting::{Taken, Waiting};
 use crate::worker::shared::wake::{Decision, Facts};
 use crate::worker::shared::{Progress, tools, wake};
 use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
@@ -406,14 +406,13 @@ impl Agent {
     fn restore_compaction_owed(&mut self, rows: &[(Wpos, Record<'static>)]) {
         self.compaction_owed = false;
         for (_, record) in rows {
-            if let Event::Native { entry, .. } = &record.event {
-                match entry {
-                    Entry::RequestSent { .. } => self.compaction_owed = false,
-                    Entry::Step { carry, .. } if carry.has_compaction() => {
-                        self.compaction_owed = true;
-                    }
-                    _ => {}
-                }
+            match &record.event {
+                Event::Request { .. } => self.compaction_owed = false,
+                Event::Native {
+                    entry: Entry::Step { carry, .. },
+                    ..
+                } if carry.has_compaction() => self.compaction_owed = true,
+                _ => {}
             }
         }
     }
@@ -608,15 +607,7 @@ impl Agent {
         let rows = self.host.history().await?;
         let people = rows
             .iter()
-            .filter(|(_, record)| {
-                matches!(
-                    record.event,
-                    Event::Input {
-                        role: Role::User,
-                        ..
-                    }
-                )
-            })
+            .filter(|(_, record)| record.event.carries_a_person())
             .map(|(pos, _)| *pos)
             .collect::<Vec<_>>();
         anyhow::ensure!(!people.is_empty(), "nothing to rewind");
@@ -663,38 +654,32 @@ impl Agent {
 
     /// Log one of this agent's rows and fold it into the live context.
     async fn log(&mut self, event: Event<'static>) -> anyhow::Result<()> {
-        self.log_all(vec![event]).await
-    }
-
-    /// Log rows as one write and fold them into the live context.
-    async fn log_all(&mut self, events: Vec<Event<'static>>) -> anyhow::Result<()> {
         let at = UnixMs::now();
         self.writer
-            .append(
-                events
-                    .iter()
-                    .map(|event| Record {
-                        at,
-                        event: event.clone(),
-                    })
-                    .collect(),
-            )
+            .append(vec![Record {
+                at,
+                event: event.clone(),
+            }])
             .await?;
-        for event in &events {
-            self.context.observe(event);
-            if let Event::Native { entry, .. } = event {
-                match entry {
-                    Entry::Step { carry, .. } => {
-                        self.continuation = None;
-                        if carry.has_compaction() {
-                            self.compaction_owed = true;
-                        }
+        self.context.observe(&event);
+        match &event {
+            Event::Request {
+                notices, compact, ..
+            } => {
+                self.compaction_owed = false;
+                self.compaction
+                    .observe_request(*compact, !notices.is_empty());
+            }
+            Event::Native { entry, .. } => {
+                if let Entry::Step { carry, .. } = entry {
+                    self.continuation = None;
+                    if carry.has_compaction() {
+                        self.compaction_owed = true;
                     }
-                    Entry::RequestSent { .. } => self.compaction_owed = false,
-                    _ => {}
                 }
                 self.compaction.observe(entry);
             }
+            _ => {}
         }
         Ok(())
     }
@@ -863,63 +848,64 @@ impl Agent {
             && !self.waiting.has_news()
             && !self.waiting.can_go(self.context.call_open());
         if quiet {
-            return self
-                .wake_with(why, instructions, Report::default(), true)
-                .await;
+            return self.wake_with(why, instructions, Vec::new(), true).await;
         }
-        let mut report = Report::default();
+        let mut notices = Vec::new();
         if self.restarted {
             self.append(Entry::Notice {
                 notice: Notice::Restarted,
             })
             .await?;
-            report.notices.push(RequestNotice::Restarted);
+            notices.push(RequestNotice::Restarted);
         }
         match why {
-            Wake::Rewound => report.notices.push(RequestNotice::Rewound),
-            Wake::Prose if self.progress.prose > 0 => report
-                .notices
-                .push(RequestNotice::PreviousResponseHadNoExec),
+            Wake::Rewound => notices.push(RequestNotice::Rewound),
+            Wake::Prose if self.progress.prose > 0 => {
+                notices.push(RequestNotice::PreviousResponseHadNoExec)
+            }
             _ => {}
         }
         if std::mem::take(&mut self.fresh) {
-            report.notices.push(RequestNotice::FreshNotebook);
+            notices.push(RequestNotice::FreshNotebook);
         }
         if std::mem::take(&mut self.interrupted) {
-            report.notices.push(RequestNotice::InterruptedExecution);
+            notices.push(RequestNotice::InterruptedExecution);
         }
         if let Some(output) = self
             .notebook
             .as_ref()
             .and_then(|notebook| notebook.report())
         {
-            self.waiting.output(output_content(&output), UnixMs::now());
+            self.waiting.output(output_content(&output));
         }
-        self.wake_with(why, instructions, report, false).await
+        self.wake_with(why, instructions, notices, false).await
     }
 
     async fn wake_with(
         &mut self,
         why: Wake,
         instructions: Arc<str>,
-        mut report: Report,
+        mut notices: Vec<RequestNotice>,
         quiet: bool,
     ) -> anyhow::Result<()> {
         if self.cell.is_some() && !quiet {
             self.progress.told_returned = true;
         }
         let call_open = self.context.call_open();
-        let inputs = if quiet {
-            Vec::new()
+        let taken = if quiet {
+            Taken::default()
         } else {
             self.waiting.take(call_open)
         };
         if !quiet && !call_open && self.waiting.holds_tool() {
-            report.notices.push(RequestNotice::Waiting);
+            notices.push(RequestNotice::Waiting);
         }
-        let manual_only = why == Wake::Compaction && report.is_empty() && inputs.is_empty();
-        if report.is_empty() && !manual_only {
-            report.notices.push(if why == Wake::Checkin {
+        let manual_only = why == Wake::Compaction
+            && notices.is_empty()
+            && taken.output.is_empty()
+            && taken.inputs.is_empty();
+        if notices.is_empty() && !manual_only {
+            notices.push(if why == Wake::Checkin {
                 RequestNotice::Checkin
             } else {
                 RequestNotice::NothingNew
@@ -934,19 +920,15 @@ impl Agent {
             self.append(Entry::CompactionTrigger { manual: false })
                 .await?;
         }
-        // One batch, so the log never holds an input no request delivered.
-        let agent = self.agent_id;
-        let mut rows: Vec<Event<'static>> =
-            inputs.into_iter().map(|held| held.row(agent)).collect();
-        rows.push(Event::Native {
-            agent,
-            entry: Entry::RequestSent {
-                why,
-                report,
-                compact: self.compaction.pending,
-            },
-        });
-        self.log_all(rows).await?;
+        self.log(Event::Request {
+            agent: self.agent_id,
+            why,
+            output: taken.output,
+            inputs: taken.inputs,
+            notices,
+            compact: self.compaction.pending,
+        })
+        .await?;
         if !quiet {
             self.restarted = false;
             self.rewound = false;

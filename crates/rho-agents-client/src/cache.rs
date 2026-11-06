@@ -47,7 +47,7 @@ const DELIVERED: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("gui
 const WHERE: TableDefinition<(&str, u64), u64> = TableDefinition::new("gui_chat_where_v1");
 /// The rows of each agent whose transcript was opened, by position.
 const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
-    TableDefinition::new("gui_agent_rows_v1");
+    TableDefinition::new("gui_agent_rows_v2");
 /// What the user wrote that no host has taken yet, by the database of the
 /// host it goes to and the id the client gave it. The user's own words,
 /// with no copy anywhere else: never dropped to be asked for again.
@@ -176,6 +176,10 @@ impl Mirror {
             open_or_rebuild(&mut write, MESSAGES);
             open_or_rebuild(&mut write, DELIVERED);
             open_or_rebuild(&mut write, WHERE);
+            // Temporary (`temp-migration`): the host's move renumbered the
+            // worksets, so rows cached by their old positions are wrong. The
+            // protocol epoch keeps this build off a host that has not moved.
+            write.delete_table("gui_agent_rows_v1");
             open_or_rebuild(&mut write, ROWS);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
@@ -780,7 +784,7 @@ mod tests {
     use super::*;
     use crate::outbox::Destination;
     use crate::protocol::transcript::RuntimeKind;
-    use crate::protocol::worksets::{AgentEntry, SpecView};
+    use crate::protocol::worksets::{AgentEntry, InputView, SpecView};
 
     fn agent_id(counter: u64) -> AgentId {
         AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(7)).expect("agent id")
@@ -851,11 +855,15 @@ mod tests {
     }
 
     fn input(agent: AgentId) -> LogEvent {
-        LogEvent::Input {
+        LogEvent::Request {
             agent,
-            message: None,
-            text: "go".into(),
-            role: Role::System,
+            inputs: vec![InputView {
+                message: None,
+                text: "go".into(),
+                role: Role::System,
+            }],
+            calls: Vec::new(),
+            compaction: false,
             at: UnixMs(1),
         }
     }

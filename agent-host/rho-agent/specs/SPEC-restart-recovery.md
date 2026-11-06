@@ -157,8 +157,8 @@ Claude Code restores its own conversation; Rho does not replay it as native
 provider input. A restart does not restore the Python namespace or its jobs.
 
 Notebook output and inputs wait in memory. A request takes them, hands them to
-Claude Code, and logs them as `Input` rows with its `RequestSent`. A transport
-failure puts them back for the next request. A crash loses what is not logged:
+Claude Code, and logs them in its `Request` row. A transport failure puts them
+back for the next request. A crash loses what is not logged:
 output is gone, and the chat hands its messages again, which can repeat a message
 the model already read. Handoff does not claim the remote model consumed it.
 Slash commands retain their command semantics.

@@ -1,11 +1,12 @@
-//! The native runtime's own rows in its workset's log: what the model was
-//! shown and what it answered. With the agent's `Input` rows, the model's
-//! context and the transcript are both projections of these.
+//! The native runtime's own rows in its workset's log, and what a request says.
+//! With the agent's `Request` rows, the model's context and the transcript are
+//! both projections of these.
 
-use rho_agent_types::ContentPart;
+use rho_agent_types::{ContentPart, Role};
 use senax_encoder::{Decode, Encode};
 
 use crate::inference::{Carry, Image, Usage};
+use crate::record::Input;
 
 /// Part of a message body. Text is kept as written; structure lives around
 /// it, never inside it.
@@ -49,21 +50,6 @@ pub enum Notice {
     FreshNotebook,
 }
 
-/// What one inference attempt adds besides its inputs: Rho's notices. Retries
-/// add more, merged until a Step closes the input group. `notebook` is only for
-/// the temporary migration, which turns it into a `tool` input.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub struct Report {
-    pub notices: Vec<RequestNotice>,
-    pub notebook: rho_notebook::Report,
-}
-
-impl Report {
-    pub fn is_empty(&self) -> bool {
-        self.notices.is_empty()
-    }
-}
-
 /// What one request says, by role.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Composed {
@@ -75,16 +61,27 @@ pub struct Composed {
 }
 
 /// Splits what one request carries by role, for both runtimes
-/// ([DECISION-roles](../specs/DECISION-roles.md)). `tool` holds its `tool`
-/// inputs, which only an open call carries; `others` its `user` and `system`
-/// inputs. An open call always gets an answer, unless the request carries
-/// nothing at all.
+/// ([DECISION-roles](../specs/DECISION-roles.md)). An open call is answered
+/// with `output` and the `tool` inputs, or a line that says why there are none.
+/// With no call, old rows can still hold those, and they read as `user`.
 pub fn compose(
     call_open: bool,
     notices: &[RequestNotice],
-    tool: &[Vec<ContentPart>],
-    others: &[Vec<ContentPart>],
+    output: &[ContentPart],
+    inputs: &[Input],
 ) -> Composed {
+    let mut tool = vec![output.to_vec()];
+    let mut others = Vec::new();
+    if !call_open && !output.is_empty() {
+        others.push(tool.remove(0));
+    }
+    for input in inputs {
+        if call_open && input.role == Role::Tool {
+            tool.push(input.content.clone());
+        } else {
+            others.push(input.content.clone());
+        }
+    }
     let (filler, said): (Vec<_>, Vec<_>) = notices
         .iter()
         .partition(|notice| matches!(notice, RequestNotice::Checkin | RequestNotice::NothingNew));
@@ -95,7 +92,7 @@ pub fn compose(
         .collect();
     let mut result = Vec::new();
     if call_open {
-        result = join(tool);
+        result = join(&tool);
         if result.is_empty() {
             let text = if lines.is_empty() && others.is_empty() {
                 filler
@@ -128,6 +125,11 @@ pub fn plain_text(content: &[ContentPart]) -> String {
         .collect()
 }
 
+/// Output that waited, and output after it, as the one answer they make.
+pub fn add_output(output: &mut Vec<ContentPart>, more: Vec<ContentPart>) {
+    *output = join(&[std::mem::take(output), more]);
+}
+
 /// One answer from many inputs: their text as one block, then their images.
 fn join(contents: &[Vec<ContentPart>]) -> Vec<ContentPart> {
     let text = contents
@@ -148,7 +150,7 @@ fn join(contents: &[Vec<ContentPart>]) -> Vec<ContentPart> {
         .collect()
 }
 
-/// A notebook report as the `tool` input that carries it.
+/// A notebook report as its request's `output`.
 pub fn output_content(report: &rho_notebook::Report) -> Vec<ContentPart> {
     let rendered = report.render();
     (!rendered.text.is_empty())
@@ -214,17 +216,10 @@ pub enum Entry {
         /// Complete billable usage, absent for interrupted output.
         usage: Option<ResponseUsage>,
     },
-    /// Logical send boundary, not provider acknowledgment. It delivers every
-    /// input of the agent logged before it.
-    RequestSent {
-        why: Wake,
-        report: Report,
-        compact: bool,
-    },
     Notice {
         notice: Notice,
     },
-    /// Durable queued intent; RequestSent records when an attempt picks it up.
+    /// Durable queued intent; a `Request` records when an attempt picks it up.
     CompactionTrigger {
         manual: bool,
     },
@@ -242,21 +237,21 @@ pub struct CompactionState {
 }
 
 impl CompactionState {
+    /// A request went out: `says` is whether it had anything to tell the model.
+    pub fn observe_request(&mut self, compact: bool, says: bool) {
+        self.sent = compact;
+        if compact {
+            self.owes_reply |= says;
+        } else {
+            self.reply = false;
+        }
+    }
+
     pub fn observe(&mut self, entry: &Entry) {
         match entry {
             Entry::CompactionTrigger { manual, .. } => {
                 self.pending = true;
                 self.owes_reply = !manual;
-            }
-            Entry::RequestSent {
-                report, compact, ..
-            } => {
-                self.sent = *compact;
-                if *compact {
-                    self.owes_reply |= !report.is_empty();
-                } else {
-                    self.reply = false;
-                }
             }
             Entry::Step { carry, usage, .. } => {
                 let compacted = carry.has_compaction();
@@ -322,15 +317,29 @@ mod tests {
         }]
     }
 
-    /// An answer holds `tool` text, the person's text stays out of it, and a
-    /// notice reads as `user`.
+    fn input(role: Role, content: Vec<ContentPart>) -> Input {
+        Input {
+            role,
+            message: None,
+            content,
+        }
+    }
+    fn person(said: &str) -> Input {
+        input(Role::User, text(said))
+    }
+
+    /// An answer holds output and then `tool` text, whatever order they came
+    /// in. The person's text stays out of it, and a notice reads as `user`.
     #[test]
     fn an_open_call_takes_the_tool_role_and_nothing_else() {
         let composed = compose(
             true,
             &[RequestNotice::Restarted, RequestNotice::NothingNew],
-            &[text("printed"), image(1), text("from a peer"), image(2)],
-            &[text("from the person")],
+            &[text("printed"), image(1)].concat(),
+            &[
+                person("from the person"),
+                input(Role::Tool, [text("from a peer"), image(2)].concat()),
+            ],
         );
         assert_eq!(
             composed.result,
@@ -356,7 +365,7 @@ mod tests {
             true,
             &[RequestNotice::Checkin],
             &[],
-            &[text("from the person")],
+            &[person("from the person")],
         );
         assert_eq!(pointer.result, text("New messages below."));
         assert_eq!(pointer.user, [text("from the person")]);
@@ -381,7 +390,7 @@ mod tests {
                 RequestNotice::NothingNew,
             ],
             &[],
-            &[text("from the person")],
+            &[person("from the person")],
         );
         assert!(composed.result.is_empty());
         assert_eq!(composed.user.len(), 2);
@@ -397,8 +406,31 @@ mod tests {
             [text("Check-in: nothing new.")]
         );
         assert_eq!(
-            compose(false, &[RequestNotice::NothingNew], &[], &[text("hi")]).user,
+            compose(false, &[RequestNotice::NothingNew], &[], &[person("hi")]).user,
             [text("hi")]
         );
+    }
+
+    /// An old row can hold output and a peer's text with no call: they read
+    /// as `user`, in that order, and there is no answer.
+    #[test]
+    fn old_rows_with_no_call_read_as_user() {
+        let composed = compose(
+            false,
+            &[],
+            &text("printed"),
+            &[input(Role::Tool, text("from a peer"))],
+        );
+        assert!(composed.result.is_empty());
+        assert_eq!(composed.user, [text("printed"), text("from a peer")]);
+    }
+
+    /// Output that waits joins what follows with a gap, keeping every image.
+    #[test]
+    fn output_adds_up_to_one_answer() {
+        let mut output = Vec::new();
+        add_output(&mut output, [text("first"), image(1)].concat());
+        add_output(&mut output, text("second"));
+        assert_eq!(output, [text("first\n\nsecond"), image(1)].concat());
     }
 }

@@ -40,12 +40,14 @@ fn agent(n: u64) -> AgentId {
 fn input(agent: AgentId, message: Option<u64>) -> Record<'static> {
     Record {
         at: UnixMs(5),
-        event: Event::Input {
+        event: Event::carrying(
             agent,
-            message: message.map(|seq| MessageId(ChatSeq(seq))),
-            content: vec![ContentPart::Text { text: "hi".into() }],
-            role: Role::User,
-        },
+            vec![crate::record::Input {
+                role: Role::User,
+                message: message.map(|seq| MessageId(ChatSeq(seq))),
+                content: vec![ContentPart::Text { text: "hi".into() }],
+            }],
+        ),
     }
 }
 
@@ -145,7 +147,7 @@ async fn a_row_for_an_agent_of_another_workset_is_refused() {
 
 #[tokio::test]
 async fn compaction_starts_the_context_after_the_request_it_answered() {
-    use crate::entry::{Report, Wake};
+    use crate::entry::Wake;
     let (_dir, db) = db().await;
     let ws = WorksetId([3; 6]);
     let a = agent(1);
@@ -166,19 +168,32 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
     let request = write
         .append(
             ws,
+            &Record {
+                at: UnixMs(6),
+                event: Event::Request {
+                    agent: a,
+                    why: Wake::Compaction,
+                    output: Vec::new(),
+                    inputs: Vec::new(),
+                    notices: Vec::new(),
+                    compact: true,
+                },
+            },
+        )
+        .unwrap();
+    // A row lands while the compacting response streams: it stays in the
+    // context after the compaction.
+    let late = write
+        .append(
+            ws,
             &native(
                 a,
-                Entry::RequestSent {
-                    why: Wake::Compaction,
-                    report: Report::default(),
-                    compact: true,
+                Entry::Notice {
+                    notice: Notice::Restarted,
                 },
             ),
         )
         .unwrap();
-    // An input lands while the compacting response streams: it may not be
-    // in that request, so it must stay in the context after the compaction.
-    let late = write.append(ws, &input(a, None)).unwrap();
     write
         .append(
             ws,

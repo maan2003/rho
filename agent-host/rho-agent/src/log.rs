@@ -98,18 +98,6 @@ pub struct ClaudeRewind {
     pub resume_at: Option<Uuid>,
 }
 
-/// Notebook output on old rows, kept for the temporary migration.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct ClaudeOutputBatch {
-    pub id: uuid::Uuid,
-    pub outputs: Vec<(
-        rho_agent_types::transcript::ExecId,
-        rho_agent_types::transcript::ToolOutput,
-    )>,
-    pub wake: WakeFacts,
-    pub at: UnixMs,
-}
-
 /// Why a request went out when it did: the scheduler's reading of its
 /// sources at the boundary (`agent/boundary.rs`), recorded with the request
 /// so the pace of a session can be judged from its log.

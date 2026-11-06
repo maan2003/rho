@@ -512,21 +512,14 @@ mod tests {
     async fn large_canonical_append_crosses_frames_without_partial_delivery() {
         let (client, mut server) = crate::testing::pair();
         let count = 64 * 1024 * 1024 + 137;
-        let agent =
-            rho_agent_types::AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
         let sending = tokio::spawn(async move {
             client
                 .write(&Message::Request {
                     id: 19,
                     body: Request::Append(Record {
                         at: UnixMs(1),
-                        event: Event::Input {
-                            agent,
-                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
-                            content: vec![rho_agent_types::ContentPart::Text {
-                                text: "a".repeat(count),
-                            }],
-                            role: rho_agent_types::Role::User,
+                        event: Event::Evaluated {
+                            code: "a".repeat(count),
                         },
                     }),
                 })
@@ -538,20 +531,12 @@ mod tests {
             id: 19,
             body:
                 Request::Append(Record {
-                    event:
-                        Event::Input {
-                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
-                            content,
-                            ..
-                        },
+                    event: Event::Evaluated { code: text },
                     ..
                 }),
         } = server.read().await.unwrap()
         else {
             panic!("wrong logical message")
-        };
-        let [rho_agent_types::ContentPart::Text { text }] = &content[..] else {
-            panic!("wrong message body")
         };
         assert_eq!(text.len(), count);
         assert!(text.bytes().all(|byte| byte == b'a'));

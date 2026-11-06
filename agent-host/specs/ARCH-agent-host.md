@@ -45,10 +45,10 @@ it was started from as `chat:<message id>`).
 Instructions are recomputed by Python before each request and are not logged
 ([DECISION-instructions-are-code](../rho-agent/specs/DECISION-instructions-are-code.md)).
 
-An input enters a model's context only as an `Input` row, written by the loop
-of the receiving agent with the request that carries it, so every input before
-an agent's request in the log is delivered by it. Until then inputs and tool
-output wait in the worker's memory, and a crash loses them
+An input enters a model's context only inside a `Request` row, written by the
+loop of the receiving agent. That row holds everything the request carried: tool
+output, inputs and notices. Until then inputs and tool output wait in the
+worker's memory, and a crash loses them
 ([DECISION-roles](../rho-agent/specs/DECISION-roles.md),
 [DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sources.md)).
 
@@ -102,9 +102,9 @@ hands it that message first. An Engineer's child or Advisor is briefed in their
 direct conversation with it, and reports there with `agents.message`.
 
 Agents post with `rho.chat`, always naming the conversation. Policy Python
-reads each agent's inbox and hands each message to the agent as an `Input`
-that names it. The delivery position is derived from those rows, so the chat
-log keeps no cursors. Slack is not chat: agents reach it through the host's
+reads each agent's inbox and hands each message to the agent as an input that
+names it. The delivery position is derived from the `Request` rows that carried
+them, so the chat log keeps no cursors. Slack is not chat: agents reach it through the host's
 Slack server as Python, as before.
 
 ## GUI sync

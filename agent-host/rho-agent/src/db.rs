@@ -51,7 +51,10 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "0adc0ed8";
+const CURRENT_AGENT_DB_FORMAT: &str = "cda3f696";
+/// Temporary (`temp-migration`): the format [`crate::store::pull_inputs`] moves
+/// from.
+const PREVIOUS_AGENT_DB_FORMAT: &str = "0adc0ed8";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -385,6 +388,26 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
+    if stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT) {
+        // Temporary (`temp-migration`): `rho debug rollback` puts the store
+        // back from this savepoint.
+        let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
+        db.persistent_savepoint(|write, id| {
+            write.open_table(RECOVERY).insert(hop, id);
+        })
+        .await;
+        if let Err(error) = db.read_ahead() {
+            eprintln!("rho: read ahead of the migration: {error}");
+        }
+        let mut write = db.write().await;
+        crate::store::pull_inputs::migrate(&mut write);
+        write
+            .open_table(FORMAT)
+            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
+        write.init_agent_tables();
+        write.commit();
+        return;
+    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -505,4 +528,79 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .get(MACHINE_SEED_KEY)
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
+}
+
+/// Temporary (`temp-migration`).
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::{AgentId, AgentIdDomain, UnixMs, WorksetId, WorksetKind, Wpos};
+
+    use super::*;
+    use crate::record::{AgentSpec, Event, Record, Runtime};
+    use crate::store::StoreRead as _;
+    use crate::store::pull_inputs::tests::{old_input, old_request, write_old};
+
+    /// `prepare` moves a store of the previous format once, and the rollback
+    /// puts back its rows and its stamp.
+    #[tokio::test]
+    async fn a_store_moves_once_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let workset = WorksetId([7; 6]);
+        let agent = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        let mut write = db.write().await;
+        write
+            .open_table(FORMAT)
+            .insert((), PREVIOUS_AGENT_DB_FORMAT.to_owned());
+        write.init_store_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent,
+                        spec: AgentSpec {
+                            runtime: Runtime::Claude {
+                                model: rho_claude::Model::Opus,
+                                effort: rho_claude::Effort::Medium,
+                                session_id: uuid::Uuid::from_u128(5),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        write_old(
+            &mut write,
+            workset,
+            &[
+                old_input(agent, "hi", Some(4)),
+                old_request(agent, "printed"),
+            ],
+        );
+        write.commit();
+        let state = || {
+            let read = db.read();
+            let rows = read.workset_rows(workset, Wpos::ZERO, usize::MAX).len();
+            (read.open_table(FORMAT).get(()).unwrap().value(), rows)
+        };
+
+        prepare(&db).await;
+        assert_eq!(state(), (CURRENT_AGENT_DB_FORMAT.to_owned(), 3));
+        prepare(&db).await;
+        assert_eq!(state(), (CURRENT_AGENT_DB_FORMAT.to_owned(), 3));
+
+        let hop = rollback(&db).await.unwrap();
+        assert_eq!(
+            hop,
+            format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}")
+        );
+        assert_eq!(
+            db.read().open_table(FORMAT).get(()).unwrap().value(),
+            PREVIOUS_AGENT_DB_FORMAT
+        );
+    }
 }

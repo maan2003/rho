@@ -35,18 +35,15 @@ impl Wpos {
 
 /// Who speaks in an input: where the model reads it and how soon it wakes for
 /// it ([DECISION-roles](../../../agent-host/rho-agent/specs/DECISION-roles.
-/// md)). Each log row keeps the name a variant had when it was written.
+/// md)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Role {
     /// A person typed it. It wakes the agent soon and revives a stopped one.
-    #[senax(rename = "Person")]
     User,
     /// Anything no person typed and Rho did not write, such as another agent's
     /// message. The model reads it as a tool's output.
-    #[senax(rename = "Agent")]
     Tool,
     /// Rho's own words. It wakes nobody and rides along with the next request.
-    #[senax(rename = "Quiet")]
     System,
 }
 

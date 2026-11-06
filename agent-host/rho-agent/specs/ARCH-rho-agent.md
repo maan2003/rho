@@ -54,12 +54,10 @@ cannot use provider continuation. Interrupted execution synthesizes its call
 from the admitted code instead of pretending a completed item arrived. A streamed
 call supplies a carry before code, so interruption can preserve admitted code without exposing provider IDs. Transcript readers use IDs only
 for display.
-Each `RequestSent` records only the notices collected for that attempt, not
-provider acknowledgment. Notebook sources retain identity, output, images, and
-typed completion facts; at a request their report is rendered into a `tool`
-input logged with it. Human
-messages reference immutable `Received` records. Every `RequestSent` names its
-delivered messages in order and any messages acknowledged without delivery.
+Each `Request` records what that attempt carried, not provider acknowledgment. Notebook sources retain identity, output, images, and
+typed completion facts; at a request their report is rendered into the output
+of its `Request` row. Human
+messages are named by the inputs of the `Request` that carried them.
 New native attempts collect all unread messages. Request construction merges
 consecutive unanswered reports, preserving output and advancing source state,
 until a complete or interrupted `Step` closes the group. Retries collect fresh
@@ -182,8 +180,8 @@ completion, and job completion are distinct live facts
 ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
 At each request, both runtimes take the notebook's report and everything else
-that waits in memory, log it as `Input` rows with the request, and `entry::compose`
-splits it by role ([DECISION-roles](DECISION-roles.md)). Taking it clears the
+that waits in memory into one `Request` row, and `entry::compose` splits it by
+role ([DECISION-roles](DECISION-roles.md)). Taking it clears the
 facts that woke the model, so it never wakes the model twice. Historical
 function-call evidence remains replay data, not an active tool capability. Claude
 logs after transport and puts back what a failed handoff did not carry, for the

@@ -17,8 +17,9 @@ use crate::record::{AgentSpec, ClaudeRow, Event, Record};
 
 type WorksetKey = [u8; 6];
 
+const WORKSET_LOG_NAME: &str = "workset_log";
 const WORKSET_LOG: TableDefinition<(WorksetKey, u64), Sen<Record<'static>>> =
-    TableDefinition::new("workset_log");
+    TableDefinition::new(WORKSET_LOG_NAME);
 const WORKSET_HEADS: TableDefinition<WorksetKey, Sen<WorksetHead>> =
     TableDefinition::new("workset_heads");
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
@@ -45,7 +46,7 @@ pub struct AgentHead {
     pub created: Wpos,
     /// Its newest row.
     pub last: Wpos,
-    /// The newest message handed to it by an `Input`.
+    /// The newest message a `Request` carried to it.
     pub delivered: ChatSeq,
     /// A Claude rewind whose destination is not verified yet.
     pub claude_rewind: Option<ClaudeRewind>,
@@ -68,13 +69,15 @@ pub struct NativeCursor {
 }
 
 impl NativeCursor {
-    fn observe(&mut self, pos: Wpos, entry: &Entry) {
+    fn observe_request(&mut self, pos: Wpos, compact: bool, says: bool) {
+        self.compaction.observe_request(compact, says);
+        self.request = Some(pos);
+        self.woken = true;
+    }
+
+    fn observe(&mut self, entry: &Entry) {
         self.compaction.observe(entry);
         match entry {
-            Entry::RequestSent { .. } => {
-                self.request = Some(pos);
-                self.woken = true;
-            }
             Entry::Step { carry, .. } => {
                 // The context starts just after the request.
                 if carry.has_compaction()
@@ -102,11 +105,20 @@ impl AgentHead {
         self.last = pos;
         match event {
             Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
-            Event::Input {
-                message: Some(message),
+            Event::Request {
+                inputs,
+                notices,
+                compact,
                 ..
-            } => self.delivered = self.delivered.max(message.0),
-            Event::Native { entry, .. } => self.native.observe(pos, entry),
+            } => {
+                let newest = inputs.iter().filter_map(|input| input.message).max();
+                if let Some(newest) = newest {
+                    self.delivered = self.delivered.max(newest.0);
+                }
+                self.native
+                    .observe_request(pos, *compact, !notices.is_empty());
+            }
+            Event::Native { entry, .. } => self.native.observe(entry),
             Event::Claude {
                 row: ClaudeRow::RewindPending(rewind),
                 ..
@@ -114,7 +126,6 @@ impl AgentHead {
             Event::WorksetCreated { .. }
             | Event::Evaluated { .. }
             | Event::AgentCreated { .. }
-            | Event::Input { .. }
             | Event::Rewound { .. }
             | Event::Failed { .. }
             | Event::ExecObserved { .. }
@@ -487,8 +498,12 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         ..NativeCursor::default()
     };
     for (pos, record) in visible(rows) {
-        if let Event::Native { entry, .. } = &record.event {
-            cursor.observe(pos, entry);
+        match &record.event {
+            Event::Native { entry, .. } => cursor.observe(entry),
+            Event::Request {
+                notices, compact, ..
+            } => cursor.observe_request(pos, *compact, !notices.is_empty()),
+            _ => {}
         }
     }
     head.native = cursor;
@@ -507,6 +522,7 @@ pub fn role_of(from: Address) -> Role {
 
 pub(crate) mod agent_rows;
 pub mod chat;
+pub(crate) mod pull_inputs;
 
 pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
 #[cfg(test)]

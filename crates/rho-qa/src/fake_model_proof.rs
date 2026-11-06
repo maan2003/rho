@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatSeq, ContentPart, Role, Mention, MentionKind, MessageId,
+    Address, AgentId, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role,
     TopicId, WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, DetailBody, Item};
@@ -236,8 +236,6 @@ async fn run_async(args: Args) -> Result<()> {
     let mut responding = HashSet::new();
     let mut awaiting = HashSet::new();
     let mut posted = HashSet::new();
-    let mut received = HashSet::new();
-    let mut queued: HashMap<AgentId, Vec<MessageId>> = HashMap::new();
     let mut delivered_ids = HashSet::new();
     let mut reported_calls = HashSet::new();
     let mut messages_sent = 0usize;
@@ -483,33 +481,21 @@ async fn run_async(args: Args) -> Result<()> {
                             );
                             agents.insert(agent);
                         }
-                        LogEvent::Input {
+                        LogEvent::Request {
                             agent,
-                            message,
-                            text,
-                            role,
-                            ..
-                        } => {
-                            let message = message.context("an input that is not a message")?;
-                            ensure!(
-                                role == Role::User,
-                                "unexpected peer input in isolated proof"
-                            );
-                            ensure!(!text.is_empty(), "empty user input");
-                            ensure!(
-                                received.insert((agent, message)),
-                                "message handed to the agent twice"
-                            );
-                            queued.entry(agent).or_default().push(message);
-                        }
-                        LogEvent::NotebookReport {
-                            agent,
+                            inputs,
                             calls: answered,
                             at,
                             ..
                         } => {
-                            // A request delivers every input before it.
-                            for message in queued.remove(&agent).unwrap_or_default() {
+                            for input in inputs {
+                                let message =
+                                    input.message.context("an input that is not a message")?;
+                                ensure!(
+                                    input.role == Role::User,
+                                    "unexpected peer input in isolated proof"
+                                );
+                                ensure!(!input.text.is_empty(), "empty user input");
                                 ensure!(
                                     delivered_ids.insert((agent, message)),
                                     "message delivered twice"
@@ -548,7 +534,7 @@ async fn run_async(args: Args) -> Result<()> {
                             }
                             let started = report_at
                                 .get(&agent)
-                                .context("Replied without preceding NotebookReport")?;
+                                .context("Replied without preceding Request")?;
                             latencies.push(at.saturating_duration_since(*started));
                             replies += 1;
                             calls += items
@@ -642,16 +628,14 @@ async fn run_async(args: Args) -> Result<()> {
         "model prose did not become a message to the user"
     );
     ensure!(
-        received.len() >= agent_count,
+        delivered_ids.len() >= agent_count,
         "not every agent was handed its brief"
     );
     ensure!(
-        received.iter().all(|(_, message)| posted.contains(message)),
+        delivered_ids
+            .iter()
+            .all(|(_, message)| posted.contains(message)),
         "an agent was handed a message the user never sent"
-    );
-    ensure!(
-        delivered_ids.len() >= agent_count,
-        "not every agent delivered its brief to its model"
     );
 
     let final_head = Streams::open(connect(&socket).await?, &socket)

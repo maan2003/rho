@@ -126,8 +126,10 @@ impl Harness {
     /// Whether a person's input with `text` is still history.
     fn received(&self, text: &str) -> bool {
         self.events().iter().any(|event| {
-            matches!(event, Event::Input { role: Role::User, content, .. }
-                if rho_agent_types::transcript::text_content(content) == text)
+            matches!(event, Event::Request { inputs, .. } if inputs.iter().any(|input| {
+                input.role == Role::User
+                    && rho_agent_types::transcript::text_content(&input.content) == text
+            }))
         })
     }
 
@@ -334,21 +336,13 @@ async fn output_is_a_tool_input_before_its_request() {
     say(&handle, "go").await;
     harness.until_sent("done").await;
     let events = harness.events();
-    let output = events
-        .iter()
-        .position(|event| {
-            matches!(event, Event::Input { role: Role::Tool, message: None, content, .. }
-                if rho_agent_types::transcript::text_content(content).contains("output-mark"))
-        })
-        .expect("the output's row");
-    let Event::Native {
-        entry: Entry::RequestSent { report, .. },
-        ..
-    } = &events[output + 1]
-    else {
-        panic!("the request follows its output: {:?}", events[output + 1]);
-    };
-    assert!(report.notebook.is_empty(), "{report:?}");
+    assert!(
+        events.iter().any(|event| {
+            matches!(event, Event::Request { output, .. }
+                if rho_agent_types::transcript::text_content(output).contains("output-mark"))
+        }),
+        "the request holds the output: {events:?}"
+    );
     let all = requests(&script, 2).await;
     let result = all[1]
         .items()
@@ -429,9 +423,9 @@ async fn an_ended_turn_wakes_only_for_news() {
         "{}",
         told(&second[1])
     );
-    assert!(harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::RequestSent {
+    assert!(harness.events().iter().any(|event| matches!(
+        event,
+        Event::Request {
             why: Wake::Notify,
             ..
         }
@@ -995,12 +989,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     for text in ["first-message", "second-message"] {
         agent.receive(words(text), Role::User, None).await.unwrap();
         agent
-            .wake_with(
-                Wake::Message,
-                instructions.clone(),
-                Report::default(),
-                false,
-            )
+            .wake_with(Wake::Message, instructions.clone(), Vec::new(), false)
             .await
             .unwrap();
         assert!(
@@ -1023,12 +1012,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            agent.wake_with(
-                Wake::Message,
-                instructions.clone(),
-                Report::default(),
-                false
-            ),
+            agent.wake_with(Wake::Message, instructions.clone(), Vec::new(), false),
             control
         )
     })
@@ -1040,7 +1024,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         "concurrent compaction must remain pending"
     );
     agent
-        .wake_with(Wake::Message, instructions, Report::default(), false)
+        .wake_with(Wake::Message, instructions, Vec::new(), false)
         .await
         .unwrap();
     assert!(agent.context.input().is_empty());
@@ -1069,9 +1053,9 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .receive(words("initial-message"), Role::User, None)
         .await
         .unwrap();
-    agent.waiting.output(words("alpha-output"), UnixMs::now());
+    agent.waiting.output(words("alpha-output"));
     agent
-        .wake_with(Wake::Notify, "system".into(), Report::default(), false)
+        .wake_with(Wake::Notify, "system".into(), Vec::new(), false)
         .await
         .unwrap();
     assert!(agent.backoff.is_some());
@@ -1080,9 +1064,9 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .receive(words("arrived-after-failure"), Role::User, None)
         .await
         .unwrap();
-    agent.waiting.output(words("beta-output"), UnixMs::now());
+    agent.waiting.output(words("beta-output"));
     agent
-        .wake_with(Wake::Notify, "system".into(), Report::default(), false)
+        .wake_with(Wake::Notify, "system".into(), Vec::new(), false)
         .await
         .unwrap();
     agent.flush().await.unwrap();
@@ -1113,11 +1097,9 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            Event::Input {
-                role: Role::Tool,
-                content,
-                ..
-            } => Some(rho_agent_types::transcript::text_content(&content)),
+            Event::Request { output, .. } => {
+                Some(rho_agent_types::transcript::text_content(&output))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1125,8 +1107,16 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     agent.shutdown().await.unwrap();
 }
 
+fn person(text: &str) -> crate::record::Input {
+    crate::record::Input {
+        role: Role::User,
+        message: None,
+        content: words(text),
+    }
+}
+
 #[tokio::test]
-async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
+async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
     let harness = Harness::new().await;
     let (_, mut agent) = harness.load().await;
     // These recovery facts precede the retained replay range.
@@ -1137,32 +1127,17 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .log(Event::Input {
-            agent: agent.agent_id,
-            message: None,
-            content: words("old-discarded"),
-            role: Role::User,
-        })
-        .await
-        .unwrap();
-    agent
         .append(Entry::CompactionTrigger { manual: false })
         .await
         .unwrap();
     agent
-        .append(Entry::RequestSent {
-            why: Wake::Compaction,
-            compact: true,
-            report: Report::default(),
-        })
-        .await
-        .unwrap();
-    agent
-        .log(Event::Input {
+        .log(Event::Request {
             agent: agent.agent_id,
-            message: None,
-            content: words("during-compaction"),
-            role: Role::User,
+            why: Wake::Compaction,
+            output: Vec::new(),
+            inputs: vec![person("old-discarded")],
+            notices: Vec::new(),
+            compact: true,
         })
         .await
         .unwrap();
@@ -1191,28 +1166,21 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     agent.flush().await.unwrap();
     let write = harness.db.write().await;
     agent
-        .append(Entry::RequestSent {
-            why: Wake::Message,
-            compact: false,
-            report: Report::default(),
-        })
+        .log(Event::carrying(
+            agent.agent_id,
+            vec![person("after-compaction")],
+        ))
         .await
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .log(Event::Input {
+        .log(Event::Request {
             agent: agent.agent_id,
-            message: None,
-            content: words("too-late"),
-            role: Role::User,
-        })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
             why: Wake::Compaction,
+            output: Vec::new(),
+            inputs: vec![person("too-late")],
+            notices: Vec::new(),
             compact: true,
-            report: Report::default(),
         })
         .await
         .unwrap();
@@ -1231,7 +1199,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     let request = turn.request(&harness.host).await.unwrap();
     let text = format!("{:?}", request.items());
     assert!(text.contains("retained-compaction"), "{text}");
-    assert_eq!(text.matches("during-compaction").count(), 1, "{text}");
+    assert_eq!(text.matches("after-compaction").count(), 1, "{text}");
     for excluded in ["old-discarded", "too-late", "later-compaction"] {
         assert!(!text.contains(excluded), "{text}");
     }
@@ -1337,8 +1305,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
     let all = requests(&script, 3).await;
     let after = told_new(&all[2]);
     assert!(after.contains(&restored), "{after}");
-    // In the log: compaction, then the quiet input, then the request that
-    // delivers it.
+    // In the log: compaction, then the request that carries the quiet input.
     let events = harness.events();
     let compacted = events
         .iter()
@@ -1346,38 +1313,28 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
             matches!(event, Event::Native { entry: Entry::Step { carry, .. }, .. } if carry.has_compaction())
         })
         .unwrap();
-    let quiet = events
+    let is_restored = |input: &crate::record::Input| {
+        input.role == Role::System
+            && rho_agent_types::transcript::text_content(&input.content) == restored
+    };
+    let carried = events
         .iter()
         .position(|event| {
-            matches!(event, Event::Input { role: Role::System, content, .. }
-                if rho_agent_types::transcript::text_content(content) == restored)
+            matches!(event, Event::Request { inputs, .. } if inputs.iter().any(is_restored))
         })
-        .expect("the restored text is a quiet input");
-    let delivered = events[compacted..]
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                Event::Native {
-                    entry: Entry::RequestSent { .. },
-                    ..
-                }
-            )
-        })
-        .unwrap()
-        + compacted;
-    assert!(compacted < quiet && quiet < delivered, "{events:#?}");
+        .expect("a request carries the restored text");
+    assert!(compacted < carried, "{events:#?}");
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(
-                event,
-                Event::Input {
-                    role: Role::System,
-                    ..
-                }
-            ))
-            .count(),
+            .map(|event| match event {
+                Event::Request { inputs, .. } => inputs
+                    .iter()
+                    .filter(|input| input.role == Role::System)
+                    .count(),
+                _ => 0,
+            })
+            .sum::<usize>(),
         1,
         "restored once"
     );

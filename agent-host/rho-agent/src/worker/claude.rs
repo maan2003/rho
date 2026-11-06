@@ -17,7 +17,7 @@ use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Ses
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::entry::{Notice, Report, RequestNotice, Wake, compose, output_content};
+use crate::entry::{Notice, RequestNotice, Wake, compose, output_content};
 use crate::inference::Inference;
 use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
@@ -25,7 +25,7 @@ use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
-use crate::worker::shared::waiting::{Held, Waiting};
+use crate::worker::shared::waiting::Waiting;
 use crate::{AgentStatus, InferenceState, RuntimeState, TranscriptLine};
 
 pub(crate) mod projection;
@@ -761,8 +761,8 @@ impl ClaudeLoop {
     /// and `compose` splits that by role. An open call is answered with the
     /// `tool` part. The rest opens a turn of its own, after `command` if there
     /// is one: the answer ends the running turn, and Claude Code sends the text
-    /// behind the result as `role: user`. The rows go in once the transport has
-    /// it, as one write, so the log never holds an input no request delivered.
+    /// behind the result as `role: user`. Its row goes in once the transport
+    /// has it.
     async fn request(
         &mut self,
         why: Wake,
@@ -778,22 +778,14 @@ impl ClaudeLoop {
             steps.mark("process");
         }
         if let Some(report) = self.python.as_mut().and_then(|host| host.report()) {
-            self.waiting.output(output_content(&report), UnixMs::now());
+            self.waiting.output(output_content(&report));
         }
         let open = self.call_open();
-        let inputs = self.waiting.take(open);
+        let taken = self.waiting.take(open);
         if !open && self.waiting.holds_tool() {
             notices.push(RequestNotice::Waiting);
         }
-        let (tool, others): (Vec<_>, Vec<_>) =
-            inputs.iter().partition(|input| input.role == Role::Tool);
-        let contents = |inputs: Vec<&Held>| {
-            inputs
-                .into_iter()
-                .map(|input| input.content.clone())
-                .collect::<Vec<_>>()
-        };
-        let composed = compose(open, &notices, &contents(tool), &contents(others));
+        let composed = compose(open, &notices, &taken.output, &taken.inputs);
         let user = composed.user.concat();
         let turns: Vec<Vec<ContentPart>> = command
             .into_iter()
@@ -825,7 +817,7 @@ impl ClaudeLoop {
             if !self.respond_control(&pending.request_id, Ok(reply)).await {
                 // What it took waits for the next request. A future send
                 // carries the output, and never reruns its source.
-                self.waiting.put_back(inputs);
+                self.waiting.put_back(taken);
                 self.close_process().await?;
                 return self
                     .fail(anyhow::anyhow!(
@@ -839,35 +831,22 @@ impl ClaudeLoop {
         };
         for turn in turns {
             if !self.hand_off(turn, Uuid::new_v4().to_string()).await? {
-                self.waiting.put_back(inputs);
+                self.waiting.put_back(taken);
                 return Ok(());
             }
         }
         steps.mark("written");
         self.python_wake = wake;
-        let at = UnixMs::now();
-        let agent = self.agent_id;
-        let mut rows: Vec<Record<'static>> = inputs
-            .into_iter()
-            .map(|input| Record {
-                at,
-                event: input.row(agent),
+        self.host
+            .append(Event::Request {
+                agent: self.agent_id,
+                why,
+                output: taken.output,
+                inputs: taken.inputs,
+                notices,
+                compact: false,
             })
-            .collect();
-        rows.push(Record {
-            at,
-            event: Event::Claude {
-                agent,
-                row: ClaudeRow::RequestSent {
-                    why,
-                    report: Report {
-                        notices,
-                        ..Report::default()
-                    },
-                },
-            },
-        });
-        self.host.append_batch(rows).await?;
+            .await?;
         steps.mark("logged");
         eprintln!(
             "rho-agent: Claude request of {} in {steps}",
@@ -2242,22 +2221,14 @@ fn archived_in(rows: &[(Wpos, Record<'_>)]) -> bool {
 }
 
 /// Where a rewind of `turns` goes: the position of the `turns`-th last
-/// input from a person (the first one, when there are fewer), and the
-/// uuid of the first user line after it, which is the turn that took it
-/// to Claude Code. `None` with no person's input to go back to.
+/// request that carried a person's input (the first one, when there are
+/// fewer), and the uuid of the first user line after it, which is the turn
+/// that took it to Claude Code. `None` with no person's input to go back to.
 fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Option<Uuid>)> {
     let people: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter(|(_, (_, record))| {
-            matches!(
-                record.event,
-                Event::Input {
-                    role: Role::User,
-                    ..
-                }
-            )
-        })
+        .filter(|(_, (_, record))| record.event.carries_a_person())
         .map(|(index, _)| index)
         .collect();
     let index = *people.get(people.len().saturating_sub(turns as usize))?;
@@ -2424,23 +2395,15 @@ mod tests {
         )
     }
 
-    fn input(agent: AgentId, text: &str, role: Role) -> Event<'static> {
-        Event::Input {
+    fn sent(agent: AgentId, role: Role) -> Event<'static> {
+        Event::carrying(
             agent,
-            message: None,
-            content: vec![ContentPart::Text { text: text.into() }],
-            role,
-        }
-    }
-
-    fn sent(agent: AgentId) -> Event<'static> {
-        Event::Claude {
-            agent,
-            row: ClaudeRow::RequestSent {
-                why: Wake::Message,
-                report: Report::default(),
-            },
-        }
+            vec![crate::record::Input {
+                role,
+                message: None,
+                content: vec![ContentPart::Text { text: "x".into() }],
+            }],
+        )
     }
 
     fn echo(agent: AgentId, uuid: Uuid) -> Event<'static> {
@@ -2549,27 +2512,24 @@ mod tests {
         let a = agent(1);
         let (first, message, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let rows = vec![
-            row(1, input(a, "first", Role::User)),
-            row(2, sent(a)),
-            row(3, echo(a, first)),
-            row(4, input(a, "message", Role::Tool)),
-            row(5, sent(a)),
-            row(6, echo(a, message)),
-            row(7, input(a, "quiet", Role::System)),
-            row(8, input(a, "second", Role::User)),
-            row(9, sent(a)),
-            row(10, echo(a, second)),
-            row(11, input(a, "not yet", Role::User)),
+            row(1, sent(a, Role::User)),
+            row(2, echo(a, first)),
+            row(3, sent(a, Role::Tool)),
+            row(4, echo(a, message)),
+            row(5, sent(a, Role::System)),
+            row(6, sent(a, Role::User)),
+            row(7, echo(a, second)),
+            row(8, sent(a, Role::User)),
         ];
-        assert_eq!(rewind_point(&rows, 1), Some((Wpos(11), None)));
-        assert_eq!(rewind_point(&rows, 2), Some((Wpos(8), Some(second))));
+        assert_eq!(rewind_point(&rows, 1), Some((Wpos(8), None)));
+        assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), Some(second))));
         assert_eq!(rewind_point(&rows, 3), Some((Wpos(1), Some(first))));
         assert_eq!(
             rewind_point(&rows, 9),
             Some((Wpos(1), Some(first))),
             "more turns than there are go back to the first"
         );
-        assert_eq!(rewind_point(&rows[3..7], 1), None);
+        assert_eq!(rewind_point(&rows[2..5], 1), None);
     }
 
     #[test]

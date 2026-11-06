@@ -1290,11 +1290,15 @@ mod tests {
     }
 
     fn input(agent_id: AgentId, at: u64) -> LogEvent {
-        LogEvent::Input {
+        LogEvent::Request {
             agent: agent_id,
-            message: None,
-            text: "go".into(),
-            role: rho_agent_types::Role::System,
+            inputs: vec![crate::protocol::worksets::InputView {
+                message: None,
+                text: "go".into(),
+                role: rho_agent_types::Role::System,
+            }],
+            calls: Vec::new(),
+            compaction: false,
             at: UnixMs(at),
         }
     }

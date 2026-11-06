@@ -320,6 +320,14 @@ pub struct SpecView {
     pub props: Props,
 }
 
+/// One thing a request carried, with its body left as text.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct InputView {
+    pub message: Option<MessageId>,
+    pub text: String,
+    pub role: Role,
+}
+
 /// One workset row as it crosses the wire: `strip` of exactly one row.
 /// Bodies a person does not read at a glance are left behind; ask for them
 /// with [`ClientFrame::Detail`].
@@ -344,31 +352,22 @@ pub enum LogEvent {
         spec: SpecView,
         at: UnixMs,
     },
-    /// Something entered the agent's queue; its next request carries it.
-    Input {
-        agent: AgentId,
-        message: Option<MessageId>,
-        text: String,
-        #[senax(rename = "wake")]
-        role: Role,
-        at: UnixMs,
-    },
     CompactionRequested {
         agent: AgentId,
         at: UnixMs,
     },
-    /// A request went out, carrying every input before it, with these results.
-    Sent {
+    /// A request went out with these inputs, and it answered these calls.
+    Request {
         agent: AgentId,
-        results: Vec<ToolOutcome>,
+        inputs: Vec<InputView>,
+        calls: Vec<String>,
         compaction: bool,
         at: UnixMs,
     },
-    /// A notebook report answered provider calls but completed no task.
+    /// Claude Code says its calls were answered.
     NotebookReport {
         agent: AgentId,
         calls: Vec<String>,
-        compaction: bool,
         at: UnixMs,
     },
     /// A Claude agent's tool results.
@@ -424,9 +423,8 @@ impl LogEvent {
             | Self::Evaluated { at, .. }
             | Self::AgentCreated { at, .. }
             | Self::AgentChanged { at, .. }
-            | Self::Input { at, .. }
+            | Self::Request { at, .. }
             | Self::CompactionRequested { at, .. }
-            | Self::Sent { at, .. }
             | Self::NotebookReport { at, .. }
             | Self::Results { at, .. }
             | Self::Replied { at, .. }
@@ -444,9 +442,8 @@ impl LogEvent {
             Self::WorksetCreated { .. } | Self::Evaluated { .. } => None,
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
-            | Self::Input { agent, .. }
+            | Self::Request { agent, .. }
             | Self::CompactionRequested { agent, .. }
-            | Self::Sent { agent, .. }
             | Self::NotebookReport { agent, .. }
             | Self::Results { agent, .. }
             | Self::Replied { agent, .. }
@@ -514,11 +511,15 @@ mod tests {
             workset,
             rows: vec![(
                 Wpos(7),
-                LogEvent::Input {
+                LogEvent::Request {
                     agent: agent_id,
-                    message: Some(MessageId(ChatSeq(4))),
-                    text: "hi".into(),
-                    role: Role::User,
+                    inputs: vec![InputView {
+                        message: Some(MessageId(ChatSeq(4))),
+                        text: "hi".into(),
+                        role: Role::User,
+                    }],
+                    calls: vec!["call".into()],
+                    compaction: false,
                     at: UnixMs(8),
                 },
             )],
