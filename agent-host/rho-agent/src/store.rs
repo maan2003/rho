@@ -17,9 +17,8 @@ use crate::record::{AgentSpec, Event, Record};
 
 type WorksetKey = [u8; 6];
 
-const WORKSET_LOG_NAME: &str = "workset_log";
 const WORKSET_LOG: TableDefinition<(WorksetKey, u64), Sen<Record<'static>>> =
-    TableDefinition::new(WORKSET_LOG_NAME);
+    TableDefinition::new("workset_log");
 const WORKSET_HEADS: TableDefinition<WorksetKey, Sen<WorksetHead>> =
     TableDefinition::new("workset_heads");
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
@@ -503,7 +502,6 @@ pub fn role_of(from: Address) -> Role {
 
 pub(crate) mod agent_rows;
 pub mod chat;
-pub(crate) mod pull_inputs;
 
 pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
 #[cfg(test)]

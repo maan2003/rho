@@ -352,18 +352,6 @@ impl RhoDb {
         &self.path
     }
 
-    /// Temporary (`temp-migration`). Reads the whole file once, in order, so
-    /// that the OS caches it. A pass over every row, as a migration makes,
-    /// otherwise reads a cold file page by page out of order: 84 s rather than
-    /// 2 s for 9 GB of rows.
-    pub fn read_ahead(&self) -> std::io::Result<()> {
-        use std::io::Read as _;
-        let mut file = std::fs::File::open(&*self.path)?;
-        let mut buffer = vec![0; 16 << 20];
-        while file.read(&mut buffer)? != 0 {}
-        Ok(())
-    }
-
     /// Leaves the file in a state that reopens at once, and commits nothing
     /// more until the guard drops. Opened while this process still has it
     /// open, as a copy or by the program this one execs, the file otherwise

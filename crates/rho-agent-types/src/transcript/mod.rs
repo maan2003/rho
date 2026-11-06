@@ -9,10 +9,8 @@ use serde_json::Value;
 
 use crate::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 
-mod append_string;
 mod util;
 
-pub use self::append_string::{AStr, AppendString, Diff};
 use self::util::validated_string_type;
 
 senax_encoder::declare_senax_tagged_trait!(
@@ -149,14 +147,6 @@ pub struct ToolSpec {
     pub format: Option<ToolFormat>,
 }
 
-/// The only model-issued action in either Rho runtime. Host operations remain
-/// independently callable inside its Python source.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct ExecCall {
-    pub id: ExecId,
-    pub source: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolCall {
     pub id: ExecId,
@@ -261,165 +251,6 @@ pub enum ToolFormat {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum StreamingContextItem {
-    AssistantMessage {
-        provider_specific: Box<dyn ProviderSpecificData>,
-        content: Vec<AStr>,
-        phase: Option<MessagePhase>,
-    },
-    ToolCall {
-        provider_specific: Box<dyn ProviderSpecificData>,
-        id: ExecId,
-        name: ToolName,
-        tool_type: ToolType,
-        arguments: AStr,
-    },
-    RawReasoning {
-        provider_specific: Box<dyn ProviderSpecificData>,
-        content: AStr,
-        summary: Vec<AStr>,
-    },
-    EncryptedReasoning {
-        provider_specific: Box<dyn ProviderSpecificData>,
-        summary: Vec<AStr>,
-    },
-    Compaction {
-        provider_specific: Box<dyn ProviderSpecificData>,
-    },
-    Unknown {
-        provider_specific: Box<dyn ProviderSpecificData>,
-    },
-}
-
-impl StreamingContextItem {
-    pub fn to_context_item(&self) -> anyhow::Result<InferenceResponseItem> {
-        Ok(match self {
-            StreamingContextItem::AssistantMessage {
-                provider_specific,
-                content,
-                phase,
-            } => InferenceResponseItem::AssistantMessage {
-                provider_specific: provider_specific.clone(),
-                content: content
-                    .iter()
-                    .map(|text| ContentPart::Text {
-                        text: text.to_string(),
-                    })
-                    .collect(),
-                phase: *phase,
-            },
-            StreamingContextItem::ToolCall {
-                provider_specific,
-                id,
-                name,
-                tool_type,
-                arguments,
-            } => InferenceResponseItem::ToolCall {
-                provider_specific: provider_specific.clone(),
-                id: id.clone(),
-                name: name.clone(),
-                tool_type: *tool_type,
-                arguments: arguments.to_string(),
-            },
-            StreamingContextItem::RawReasoning {
-                provider_specific,
-                content,
-                summary,
-            } => InferenceResponseItem::RawReasoning {
-                provider_specific: provider_specific.clone(),
-                content: content.to_string(),
-                summary: summary.iter().map(AStr::to_string).collect(),
-            },
-            StreamingContextItem::EncryptedReasoning {
-                provider_specific,
-                summary,
-            } => InferenceResponseItem::EncryptedReasoning {
-                provider_specific: provider_specific.clone(),
-                summary: summary.iter().map(AStr::to_string).collect(),
-            },
-            StreamingContextItem::Compaction { provider_specific } => {
-                InferenceResponseItem::Compaction {
-                    provider_specific: provider_specific.clone(),
-                }
-            }
-            StreamingContextItem::Unknown { provider_specific } => InferenceResponseItem::Unknown {
-                provider_specific: provider_specific.clone(),
-            },
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum StreamingContextItemState {
-    Empty,
-    Pending(StreamingContextItem),
-    Finished(StreamingContextItem),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
-pub struct PendingInferenceResponse {
-    pub items: Vec<StreamingContextItemState>,
-}
-
-impl PendingInferenceResponse {
-    pub fn apply(&mut self, index: usize, event: ContextItemEvent) {
-        match event {
-            ContextItemEvent::Update(item) => {
-                if self.items.len() <= index {
-                    self.items
-                        .resize(index + 1, StreamingContextItemState::Empty);
-                }
-                self.items[index] = StreamingContextItemState::Pending(item);
-            }
-            // The slot already holds the final snapshot from the preceding
-            // `Update`; `Finish` just promotes it to `Finished`.
-            ContextItemEvent::Finish => {
-                if let Some(slot @ StreamingContextItemState::Pending(_)) =
-                    self.items.get_mut(index)
-                {
-                    let StreamingContextItemState::Pending(item) =
-                        std::mem::replace(slot, StreamingContextItemState::Empty)
-                    else {
-                        unreachable!()
-                    };
-                    *slot = StreamingContextItemState::Finished(item);
-                }
-            }
-        }
-    }
-
-    pub fn finish(&self) -> anyhow::Result<Vec<InferenceResponseItem>> {
-        self.items
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| match slot {
-                StreamingContextItemState::Empty => {
-                    anyhow::bail!("response is incomplete: gap at index {index}")
-                }
-                StreamingContextItemState::Pending(_) => {
-                    anyhow::bail!("response is incomplete: item at index {index} never finished")
-                }
-                StreamingContextItemState::Finished(item) => item.to_context_item(),
-            })
-            .collect()
-    }
-}
-
-/// A change to the pending item at some `output_index`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ContextItemEvent {
-    /// The pending item advanced; carries its latest snapshot. The producer
-    /// accumulates into [`AppendString`] buffers and emits the whole refreshed
-    /// snapshot, so a single `Update` covers both first-sight and every
-    /// subsequent delta.
-    Update(StreamingContextItem),
-    /// No more updates will arrive for this index — the value is whatever the
-    /// last `Update` delivered. Lets a consumer act on a finished item (e.g.
-    /// dispatch a tool call) before the whole response completes.
-    Finish,
-}
-
 /// Concatenate the text parts of a message.
 pub fn text_content(parts: &[ContentPart]) -> String {
     let mut output = String::new();
@@ -446,23 +277,6 @@ pub fn text_content(parts: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-    struct TestProviderSpecificData {
-        item_id: String,
-    }
-
-    senax_encoder::register_senax_tagged!(
-        trait = ProviderSpecificData,
-        type = TestProviderSpecificData,
-        tag = "rho-core-test.provider-data",
-    );
-
-    fn test_provider_specific_data() -> Box<dyn ProviderSpecificData> {
-        Box::new(TestProviderSpecificData {
-            item_id: "item_1".to_owned(),
-        })
-    }
 
     #[test]
     fn tool_output_round_trips_its_complete_record() {
@@ -509,139 +323,5 @@ mod tests {
             err.to_string().contains("invalid character"),
             "unexpected error: {err}"
         );
-    }
-
-    fn pending_message(text: &str) -> StreamingContextItem {
-        StreamingContextItem::AssistantMessage {
-            provider_specific: test_provider_specific_data(),
-            content: vec![AStr::from(text)],
-            phase: None,
-        }
-    }
-
-    fn message_item(text: &str) -> InferenceResponseItem {
-        InferenceResponseItem::AssistantMessage {
-            provider_specific: test_provider_specific_data(),
-            content: vec![ContentPart::Text {
-                text: text.to_owned(),
-            }],
-            phase: None,
-        }
-    }
-
-    #[test]
-    fn apply_keeps_latest_snapshot_per_index() {
-        let mut response = PendingInferenceResponse::default();
-
-        // Each streamed snapshot supersedes the previous one for that index;
-        // there is no accumulation here, the producer already did it.
-        response.apply(0, ContextItemEvent::Update(pending_message("hel")));
-        response.apply(0, ContextItemEvent::Update(pending_message("hello")));
-        response.apply(0, ContextItemEvent::Finish);
-
-        assert_eq!(response.finish().unwrap(), vec![message_item("hello")]);
-    }
-
-    #[test]
-    fn finish_event_marks_slot_without_disturbing_snapshot() {
-        let mut response = PendingInferenceResponse::default();
-
-        response.apply(0, ContextItemEvent::Update(pending_message("done")));
-        assert_eq!(
-            response.items[0],
-            StreamingContextItemState::Pending(pending_message("done"))
-        );
-
-        // `Finish` promotes the slot but leaves the snapshot untouched.
-        response.apply(0, ContextItemEvent::Finish);
-        assert_eq!(
-            response.items[0],
-            StreamingContextItemState::Finished(pending_message("done"))
-        );
-
-        assert_eq!(response.finish().unwrap(), vec![message_item("done")]);
-    }
-
-    #[test]
-    fn finalizes_unknown_provider_item() {
-        let mut response = PendingInferenceResponse::default();
-
-        response.apply(
-            0,
-            ContextItemEvent::Update(StreamingContextItem::Unknown {
-                provider_specific: test_provider_specific_data(),
-            }),
-        );
-        response.apply(0, ContextItemEvent::Finish);
-
-        assert_eq!(
-            response.finish().unwrap(),
-            vec![InferenceResponseItem::Unknown {
-                provider_specific: test_provider_specific_data()
-            }]
-        );
-    }
-
-    #[test]
-    fn finish_collects_items_in_index_order() {
-        let mut response = PendingInferenceResponse::default();
-
-        response.apply(0, ContextItemEvent::Update(pending_message("hi")));
-        response.apply(
-            1,
-            ContextItemEvent::Update(StreamingContextItem::ToolCall {
-                provider_specific: test_provider_specific_data(),
-                id: ExecId::try_from("call-1").unwrap(),
-                name: ToolName::try_from("shell").unwrap(),
-                tool_type: ToolType::Function,
-                arguments: AStr::from(r#"{"cmd":"ls"}"#),
-            }),
-        );
-        response.apply(0, ContextItemEvent::Finish);
-        response.apply(1, ContextItemEvent::Finish);
-
-        assert_eq!(
-            response.finish().unwrap(),
-            vec![
-                message_item("hi"),
-                InferenceResponseItem::ToolCall {
-                    provider_specific: test_provider_specific_data(),
-                    id: ExecId::try_from("call-1").unwrap(),
-                    name: ToolName::try_from("shell").unwrap(),
-                    tool_type: ToolType::Function,
-                    arguments: r#"{"cmd":"ls"}"#.to_owned(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn finish_rejects_item_without_finish() {
-        let mut response = PendingInferenceResponse::default();
-
-        // Updated but never signalled finished.
-        response.apply(0, ContextItemEvent::Update(pending_message("partial")));
-
-        let error = response.finish().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "response is incomplete: item at index 0 never finished"
-        );
-    }
-
-    #[test]
-    fn finish_rejects_absent_gap() {
-        let mut response = PendingInferenceResponse::default();
-
-        // Only index 1 is filled; index 0 stays a gap.
-        response.apply(
-            1,
-            ContextItemEvent::Update(StreamingContextItem::Unknown {
-                provider_specific: test_provider_specific_data(),
-            }),
-        );
-
-        let error = response.finish().unwrap_err();
-        assert_eq!(error.to_string(), "response is incomplete: gap at index 0");
     }
 }
