@@ -154,12 +154,11 @@ execution journal.
 ### Claude ownership
 
 Claude Code restores its own conversation; Rho does not replay it as native
-provider input. Notebook admission and output ownership remain Rho's durable
-facts. A restart does not restore the Python namespace or its jobs.
+provider input. A restart does not restore the Python namespace or its jobs.
 
-Before releasing notebook output, Rho logs it as a `tool` input. A transport
-failure leaves that input unread across restart. The next exec result carries
-it, not a request to rerun code. It wakes nobody by itself. The request row that
-follows the handoff retires it; a crash between write and row can repeat the
-output, but cannot authorize repeating its side effects. Handoff does not claim
-the remote model consumed it. Slash commands retain their command semantics.
+Notebook output and inputs wait in memory. A request takes them, hands them to
+Claude Code, and logs them as `Input` rows with its `RequestSent`. A transport
+failure puts them back for the next request. A crash loses what is not logged:
+output is gone, and the chat hands its messages again, which can repeat a message
+the model already read. Handoff does not claim the remote model consumed it.
+Slash commands retain their command semantics.

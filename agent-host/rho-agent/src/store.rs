@@ -61,13 +61,6 @@ pub struct NativeCursor {
     pub from: Wpos,
     /// The agent's newest request, which a compacting step answers.
     request: Option<Wpos>,
-    /// The newest step left a call for a request to answer.
-    #[senax(default)]
-    call_open: bool,
-    /// The oldest `tool` input no call's answer has taken. A compaction leaves
-    /// it in the context: the model has not read it.
-    #[senax(default)]
-    waiting: Option<Wpos>,
     pub archived: bool,
     /// A request was ever made: a restart owes a notice.
     pub woken: bool,
@@ -75,31 +68,20 @@ pub struct NativeCursor {
 }
 
 impl NativeCursor {
-    fn input(&mut self, pos: Wpos, role: Role) {
-        if role == Role::Tool {
-            self.waiting.get_or_insert(pos);
-        }
-    }
-
     fn observe(&mut self, pos: Wpos, entry: &Entry) {
         self.compaction.observe(entry);
         match entry {
             Entry::RequestSent { .. } => {
                 self.request = Some(pos);
                 self.woken = true;
-                if self.call_open {
-                    self.waiting = None;
-                }
             }
             Entry::Step { carry, .. } => {
-                // An input after the request may not have been delivered by
-                // it, so the context starts just after the request.
+                // The context starts just after the request.
                 if carry.has_compaction()
                     && let Some(request) = self.request
                 {
-                    self.from = self.waiting.unwrap_or(request.next()).min(request.next());
+                    self.from = request.next();
                 }
-                self.call_open = carry.has_call();
                 self.request = None;
             }
             Entry::Notice {
@@ -120,12 +102,10 @@ impl AgentHead {
         self.last = pos;
         match event {
             Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
-            Event::Input { message, role, .. } => {
-                if let Some(message) = message {
-                    self.delivered = self.delivered.max(message.0);
-                }
-                self.native.input(pos, *role);
-            }
+            Event::Input {
+                message: Some(message),
+                ..
+            } => self.delivered = self.delivered.max(message.0),
             Event::Native { entry, .. } => self.native.observe(pos, entry),
             Event::Claude {
                 row: ClaudeRow::RewindPending(rewind),
@@ -134,6 +114,7 @@ impl AgentHead {
             Event::WorksetCreated { .. }
             | Event::Evaluated { .. }
             | Event::AgentCreated { .. }
+            | Event::Input { .. }
             | Event::Rewound { .. }
             | Event::Failed { .. }
             | Event::ExecObserved { .. }

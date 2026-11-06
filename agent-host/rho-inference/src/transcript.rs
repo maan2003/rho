@@ -1,5 +1,5 @@
 //! Read-only provider interpretation for transcript and export consumers.
-use rho_agent::entry::{Entry, Report, compose, output_content, plain_text};
+use rho_agent::entry::{Entry, Report, compose, plain_text};
 use rho_agent::inference::{Carry, Image};
 use rho_agent::record::{ClaudeRow, Event};
 use rho_agent::store::StoreRead as _;
@@ -25,13 +25,8 @@ pub fn report_results(report: &Report, before: &Before) -> Vec<ReportOutput> {
     let Some(carry) = &before.carry else {
         return Vec::new();
     };
-    let mut tool = Vec::new();
-    if !report.notebook.is_empty() {
-        tool.push(output_content(&report.notebook));
-    }
-    tool.extend(before.output.iter().cloned());
     let others: &[Vec<ContentPart>] = if before.inputs { &[Vec::new()] } else { &[] };
-    let result = compose(carry.has_call(), &report.notices, &tool, others).result;
+    let result = compose(carry.has_call(), &report.notices, &before.output, others).result;
     let images = result
         .iter()
         .filter_map(|part| match part {
@@ -53,8 +48,8 @@ pub fn report_results(report: &Report, before: &Before) -> Vec<ReportOutput> {
 }
 
 /// What a request is read against: the agent's newest step before it, whose
-/// calls the request answers, the notebook output that waits for an answer,
-/// and whether messages went with it.
+/// calls the request answers, the notebook output that goes with it, and
+/// whether messages do.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Before {
     pub carry: Option<Carry>,
@@ -80,14 +75,8 @@ impl Before {
             Event::Native {
                 entry: Entry::RequestSent { .. },
                 ..
-            } => {
-                self.inputs = false;
-                // With no call to answer, output waits for one.
-                if self.carry.as_ref().is_some_and(Carry::has_call) {
-                    self.output.clear();
-                }
             }
-            Event::Claude {
+            | Event::Claude {
                 row: ClaudeRow::RequestSent { .. },
                 ..
             } => {
@@ -103,8 +92,8 @@ impl Before {
 /// A rewind before `pos` hides what it took back; one after does not.
 ///
 /// Read newest first, from the agent's own rows, and only as far back as
-/// the answer needs: its newest standing step, whether an input came after
-/// its newest request, and the output no answered call took. A rewind takes
+/// the answer needs: its newest standing step, and the inputs and output
+/// after its newest request. A rewind takes
 /// back the agent's rows from its `to` up to itself, whether or not a later
 /// rewind took it back too, so a row is hidden when any rewind after it starts
 /// at or before it.
@@ -112,18 +101,14 @@ pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: W
     const PAGE: usize = 64;
     let mut carry: Option<Option<Carry>> = None;
     let mut inputs: Option<bool> = None;
-    // Newest first. Output that a request picked up still waits if the step
-    // before that request had no call, so it stays aside until that step.
+    // Newest first, up to the newest request.
     let mut output = Vec::new();
-    let mut picked_up = Vec::new();
-    let mut past_a_request = false;
-    let mut output_done = false;
+    let mut past = false;
     let mut hidden_from = pos;
     let mut before = pos;
-    while carry.is_none() || inputs.is_none() || !output_done {
+    while carry.is_none() || inputs.is_none() {
         let page = read.agent_log_before(agent, before, PAGE);
         let Some((oldest, _)) = page.last() else {
-            output.append(&mut picked_up);
             break;
         };
         before = *oldest;
@@ -141,13 +126,8 @@ pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: W
                     content,
                     ..
                 } => {
-                    if !output_done {
-                        let into = if past_a_request {
-                            &mut picked_up
-                        } else {
-                            &mut output
-                        };
-                        into.push(content.clone());
+                    if !past {
+                        output.push(content.clone());
                     }
                 }
                 Event::Input { .. } => {
@@ -158,30 +138,17 @@ pub fn before_at(read: &rho_db::ReadTxn, agent: rho_agent_types::AgentId, pos: W
                     ..
                 } => {
                     carry.get_or_insert_with(|| Some(step.clone()));
-                    if past_a_request {
-                        if step.has_call() {
-                            output_done = true;
-                            picked_up.clear();
-                        } else {
-                            output.append(&mut picked_up);
-                            past_a_request = false;
-                        }
-                    }
                 }
                 Event::Native {
                     entry: Entry::RequestSent { .. },
                     ..
-                } => {
-                    inputs.get_or_insert(false);
-                    past_a_request = true;
                 }
-                Event::Claude {
+                | Event::Claude {
                     row: ClaudeRow::RequestSent { .. },
                     ..
                 } => {
                     inputs.get_or_insert(false);
-                    output_done = true;
-                    picked_up.clear();
+                    past = true;
                 }
                 _ => {}
             }

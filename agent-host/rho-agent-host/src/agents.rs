@@ -1336,11 +1336,11 @@ mod tests {
 
     /// Rows that say nothing a reader uses are left behind; a stop is told
     /// whichever runtime wrote it; a user's spoken request reads as asked.
-    /// Output reads as its call's result: what it printed, and what waited
-    /// for a call. A peer's message is its own block, and an output row is
+    /// Output reads as its call's result. Earlier output went with its own
+    /// request. A peer's message is its own block, and an output row is
     /// nothing of its own to a reader.
     #[tokio::test]
-    async fn a_requests_detail_shows_the_output_before_it_and_what_waited() {
+    async fn a_requests_detail_shows_the_output_before_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
         let tool = |text: &str, message| Event::Input {
@@ -1368,7 +1368,7 @@ mod tests {
                 tool("answered-output", None),
                 native(plain.clone()),
                 prose,
-                tool("waited-output", None),
+                tool("older-output", None),
                 native(plain.clone()),
                 native(step("open")),
                 tool("printed-output", None),
@@ -1387,7 +1387,7 @@ mod tests {
         };
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "open");
-        assert_eq!(results[0].output, "waited-output\n\nprinted-output");
+        assert_eq!(results[0].output, "printed-output");
 
         use rho_agent::store::StoreRead as _;
         let read = db.read();

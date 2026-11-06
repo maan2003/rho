@@ -38,10 +38,8 @@ pub enum Event<'a> {
     /// The agent's whole spec, replacing the one before.
     AgentChanged { agent: AgentId, spec: AgentSpec },
 
-    /// Something entered the agent's queue: delivered by the agent's next
-    /// request that can carry its role, and by every such request after a
-    /// position before it. Written by the agent's own loop, so its order
-    /// against that loop's requests is true.
+    /// What a request carried to the model: the request after it delivers it.
+    /// Written with that request by the agent's own loop.
     Input {
         agent: AgentId,
         /// The message it hands over, if it is one.
@@ -159,11 +157,11 @@ pub enum ClaudeRow {
     ExecAdmitted {
         call: ExecCall,
     },
-    /// On old rows only: notebook output is a `tool` input now.
+    /// Only for the temporary migration: notebook output is a `tool` input now.
     Output {
         batch: ClaudeOutputBatch,
     },
-    /// On old rows only, with `Output`.
+    /// Only for the temporary migration, with `Output`.
     OutputHandedOff {
         id: Uuid,
     },
@@ -171,14 +169,10 @@ pub enum ClaudeRow {
     /// withdraws it. On success the new session is an `AgentChanged`.
     RewindPending(Option<ClaudeRewind>),
     /// A turn or an exec result handed to Claude Code. It delivers every
-    /// input logged before it, except `tool` inputs when `no_call`: only an
-    /// exec result carries them
-    /// ([DECISION-roles](../specs/DECISION-roles.md)).
+    /// input before it, which it wrote with itself.
     RequestSent {
         why: crate::entry::Wake,
         report: crate::entry::Report,
-        #[senax(default)]
-        no_call: bool,
     },
     Notice(crate::entry::Notice),
 }
@@ -234,7 +228,6 @@ mod tests {
             ClaudeRow::RequestSent {
                 why: crate::entry::Wake::Message,
                 report: crate::entry::Report::default(),
-                no_call: false,
             }
         );
     }

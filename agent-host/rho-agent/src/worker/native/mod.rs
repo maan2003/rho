@@ -35,8 +35,9 @@ use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
+use crate::worker::shared::waiting::Waiting;
 use crate::worker::shared::wake::{Decision, Facts};
-use crate::worker::shared::{Progress, input_wakes, tools, wake};
+use crate::worker::shared::{Progress, tools, wake};
 use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
@@ -98,7 +99,8 @@ impl AgentHandle {
         let _ = self.control.send(Control::TellTail);
     }
 
-    /// Queue an input and wait until the loop has durably logged it.
+    /// Queue an input and wait until the loop has it. The request that
+    /// carries it writes its row.
     pub async fn input(
         &self,
         content: Vec<ContentPart>,
@@ -292,8 +294,7 @@ pub(crate) struct Agent {
     cell: Option<Latest>,
     /// The latest step was cut off part-way through its cell.
     interrupted: bool,
-    /// Inputs that wake the model and it has not seen, oldest first.
-    unread: Vec<(Role, UnixMs)>,
+    waiting: Waiting,
     progress: Progress,
     awaiting: bool,
     /// The notebook went with a restart since the model's last wake: tell
@@ -362,7 +363,7 @@ impl Agent {
             response_id: String::new(),
             cell: None,
             interrupted: false,
-            unread: Vec::new(),
+            waiting: Waiting::default(),
             progress: Progress::default(),
             awaiting: false,
             restarted: false,
@@ -392,37 +393,27 @@ impl Agent {
         self.session = Arc::new(script);
     }
 
-    /// Pick up from the log: what the model has not seen, and whether there
-    /// was a notebook that is now gone.
+    /// Pick up from the log: whether a compaction is owed its texts, and
+    /// whether there was a notebook that is now gone.
     fn resume(&mut self, rows: &[(Wpos, Record<'static>)], woken: bool) {
-        self.restore_unread(rows);
+        self.restore_compaction_owed(rows);
         if woken && !self.archived {
             self.restarted = true;
         }
     }
 
-    /// Every input after the newest request is unread: delivery is
-    /// positional. A compaction with no request after it is owed its
-    /// texts.
-    fn restore_unread(&mut self, rows: &[(Wpos, Record<'static>)]) {
-        self.unread.clear();
+    /// A compaction with no request after it is owed its texts.
+    fn restore_compaction_owed(&mut self, rows: &[(Wpos, Record<'static>)]) {
         self.compaction_owed = false;
         for (_, record) in rows {
-            match &record.event {
-                Event::Input { role, message, .. } if input_wakes(*role, *message) => {
-                    self.unread.push((*role, record.at));
-                }
-                Event::Native { entry, .. } => match entry {
-                    Entry::RequestSent { .. } => {
-                        self.unread.clear();
-                        self.compaction_owed = false;
-                    }
+            if let Event::Native { entry, .. } = &record.event {
+                match entry {
+                    Entry::RequestSent { .. } => self.compaction_owed = false,
                     Entry::Step { carry, .. } if carry.has_compaction() => {
                         self.compaction_owed = true;
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
     }
@@ -535,7 +526,6 @@ impl Agent {
             } => {
                 self.receive(content, role, message).await?;
                 if let Some(done) = done {
-                    self.flush().await?;
                     let _ = done.send(());
                 }
             }
@@ -573,7 +563,7 @@ impl Agent {
     fn settled(&self) -> bool {
         !self.responding
             && self.backoff.is_none()
-            && self.unread.is_empty()
+            && !self.waiting.has_news()
             && self.notebook.as_ref().is_none_or(|notebook| {
                 notebook
                     .facts()
@@ -641,7 +631,7 @@ impl Agent {
         self.writer = persistence::Writer::new(self.host.clone(), boundary);
         self.context = context::Context::restore(rows.iter().map(|(_, record)| &record.event));
         self.continuation = None;
-        self.restore_unread(&rows);
+        self.restore_compaction_owed(&rows);
         self.progress.last_response = None;
         self.cell = None;
         self.progress.told_returned = false;
@@ -673,25 +663,38 @@ impl Agent {
 
     /// Log one of this agent's rows and fold it into the live context.
     async fn log(&mut self, event: Event<'static>) -> anyhow::Result<()> {
+        self.log_all(vec![event]).await
+    }
+
+    /// Log rows as one write and fold them into the live context.
+    async fn log_all(&mut self, events: Vec<Event<'static>>) -> anyhow::Result<()> {
+        let at = UnixMs::now();
         self.writer
-            .append(vec![Record {
-                at: UnixMs::now(),
-                event: event.clone(),
-            }])
+            .append(
+                events
+                    .iter()
+                    .map(|event| Record {
+                        at,
+                        event: event.clone(),
+                    })
+                    .collect(),
+            )
             .await?;
-        self.context.observe(&event);
-        if let Event::Native { entry, .. } = &event {
-            match entry {
-                Entry::Step { carry, .. } => {
-                    self.continuation = None;
-                    if carry.has_compaction() {
-                        self.compaction_owed = true;
+        for event in &events {
+            self.context.observe(event);
+            if let Event::Native { entry, .. } = event {
+                match entry {
+                    Entry::Step { carry, .. } => {
+                        self.continuation = None;
+                        if carry.has_compaction() {
+                            self.compaction_owed = true;
+                        }
                     }
+                    Entry::RequestSent { .. } => self.compaction_owed = false,
+                    _ => {}
                 }
-                Entry::RequestSent { .. } => self.compaction_owed = false,
-                _ => {}
+                self.compaction.observe(entry);
             }
-            self.compaction.observe(entry);
         }
         Ok(())
     }
@@ -715,19 +718,13 @@ impl Agent {
             self.awaiting = false;
             self.stopped = None;
         }
-        if role != Role::System {
-            if let Some(backoff) = &mut self.backoff {
-                backoff.at = at;
-            }
-            self.unread.push((role, at));
+        if role != Role::System
+            && let Some(backoff) = &mut self.backoff
+        {
+            backoff.at = at;
         }
-        self.log(Event::Input {
-            agent: self.agent_id,
-            message,
-            content,
-            role,
-        })
-        .await
+        self.waiting.receive(role, message, content, at);
+        Ok(())
     }
 
     async fn fresh_notebook(&mut self) -> anyhow::Result<()> {
@@ -789,15 +786,9 @@ impl Agent {
             self.notebook.as_ref(),
             self.cell.as_ref().map(|latest| &latest.cell),
         );
-        let first = |role| {
-            self.unread
-                .iter()
-                .find(|(from, _)| *from == role)
-                .map(|(_, at)| *at)
-        };
         Facts {
-            human: first(Role::User),
-            agent: first(Role::Tool),
+            human: self.waiting.oldest(Role::User),
+            agent: self.waiting.oldest(Role::Tool),
             prose: self.progress.prose > 0 || self.retry,
             rewound: self.rewound,
             compaction: self.compaction.pending,
@@ -856,13 +847,12 @@ impl Agent {
             Err(error) => return self.fail(format!("{error:#}")).await,
         };
         for text in restored {
-            self.log(Event::Input {
-                agent,
-                message: None,
-                content: vec![ContentPart::Text { text }],
-                role: Role::System,
-            })
-            .await?;
+            self.waiting.receive(
+                Role::System,
+                None,
+                vec![ContentPart::Text { text }],
+                UnixMs::now(),
+            );
         }
         // A compaction asked of an agent with nothing in flight carries
         // nothing it must answer, so it starts no turn: what the next
@@ -870,8 +860,8 @@ impl Agent {
         // waits for that request.
         let quiet = why == Wake::Compaction
             && (self.progress.ended || self.progress.last_response.is_none())
-            && self.unread.is_empty()
-            && !self.context.has_queued();
+            && !self.waiting.has_news()
+            && !self.waiting.can_go(self.context.call_open());
         if quiet {
             return self
                 .wake_with(why, instructions, Report::default(), true)
@@ -903,13 +893,7 @@ impl Agent {
             .as_ref()
             .and_then(|notebook| notebook.report())
         {
-            self.log(Event::Input {
-                agent,
-                message: None,
-                content: output_content(&output),
-                role: Role::Tool,
-            })
-            .await?;
+            self.waiting.output(output_content(&output), UnixMs::now());
         }
         self.wake_with(why, instructions, report, false).await
     }
@@ -924,9 +908,16 @@ impl Agent {
         if self.cell.is_some() && !quiet {
             self.progress.told_returned = true;
         }
-        self.unread.clear();
-        let manual_only =
-            why == Wake::Compaction && report.is_empty() && !self.context.has_queued();
+        let call_open = self.context.call_open();
+        let inputs = if quiet {
+            Vec::new()
+        } else {
+            self.waiting.take(call_open)
+        };
+        if !quiet && !call_open && self.waiting.holds_tool() {
+            report.notices.push(RequestNotice::Waiting);
+        }
+        let manual_only = why == Wake::Compaction && report.is_empty() && inputs.is_empty();
         if report.is_empty() && !manual_only {
             report.notices.push(if why == Wake::Checkin {
                 RequestNotice::Checkin
@@ -943,12 +934,19 @@ impl Agent {
             self.append(Entry::CompactionTrigger { manual: false })
                 .await?;
         }
-        self.append(Entry::RequestSent {
-            why,
-            report,
-            compact: self.compaction.pending,
-        })
-        .await?;
+        // One batch, so the log never holds an input no request delivered.
+        let agent = self.agent_id;
+        let mut rows: Vec<Event<'static>> =
+            inputs.into_iter().map(|held| held.row(agent)).collect();
+        rows.push(Event::Native {
+            agent,
+            entry: Entry::RequestSent {
+                why,
+                report,
+                compact: self.compaction.pending,
+            },
+        });
+        self.log_all(rows).await?;
         if !quiet {
             self.restarted = false;
             self.rewound = false;
@@ -1168,7 +1166,7 @@ impl Agent {
 
     /// The user wrote to an archived agent while it was responding.
     async fn revive_if_written(&mut self) -> anyhow::Result<()> {
-        if self.archived && self.unread.iter().any(|(role, _)| *role == Role::User) {
+        if self.archived && self.waiting.oldest(Role::User).is_some() {
             self.fresh_notebook().await?;
         }
         Ok(())
@@ -1327,7 +1325,7 @@ impl Agent {
             },
             response: self.response(),
             draft: self.draft(),
-            queued: self.unread.len(),
+            queued: self.waiting.news(),
         }
     }
 

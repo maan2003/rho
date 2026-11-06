@@ -46,12 +46,11 @@ Instructions are recomputed by Python before each request and are not logged
 ([DECISION-instructions-are-code](../rho-agent/specs/DECISION-instructions-are-code.md)).
 
 An input enters a model's context only as an `Input` row, written by the loop
-of the receiving agent. Every input before an agent's request in the log is
-delivered by it, so the receiver writes its own inputs to keep that order true.
-The exception is `tool` text with no call open, which waits for an `exec` result
-([DECISION-roles](../rho-agent/specs/DECISION-roles.md)).
-Tool output is drained at the boundary and logged as a `tool` input just before
-the request ([DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sources.md)).
+of the receiving agent with the request that carries it, so every input before
+an agent's request in the log is delivered by it. Until then inputs and tool
+output wait in the worker's memory, and a crash loses them
+([DECISION-roles](../rho-agent/specs/DECISION-roles.md),
+[DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sources.md)).
 
 ## Chat
 

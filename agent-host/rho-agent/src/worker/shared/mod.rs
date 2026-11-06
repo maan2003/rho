@@ -4,22 +4,11 @@
 pub(crate) mod outbox;
 pub(crate) mod python_preview;
 pub(crate) mod tools;
+pub(crate) mod waiting;
 pub(crate) mod wake;
 
-use rho_agent_types::{MessageId, Role, UnixMs};
+use rho_agent_types::UnixMs;
 use rho_notebook::{CellHandle, Notebook};
-
-/// Whether a logged input wakes the model after a restart: a message does, and
-/// a person's text. Notebook output is a `tool` input with no message, and it
-/// waits ([DECISION-a-restart-does-not-resume-by-itself](../../../specs/
-/// DECISION-a-restart-does-not-resume-by-itself.md)).
-pub(crate) fn input_wakes(role: Role, message: Option<MessageId>) -> bool {
-    match role {
-        Role::User => true,
-        Role::Tool => message.is_some(),
-        Role::System => false,
-    }
-}
 
 /// The model's attention, independent of how a provider delivers its replies.
 /// A response is not a task ending, and a report is not a task finishing.

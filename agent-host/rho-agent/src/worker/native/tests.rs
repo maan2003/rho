@@ -287,7 +287,7 @@ async fn a_peers_message_reaches_the_model_in_the_calls_result() {
         "{:?}",
         first[0].items()
     );
-    assert!(told(&first[0]).contains(crate::entry::WAITING));
+    assert!(told(&first[0]).contains("are waiting"));
 
     let second = requests(&script, 2).await;
     let result = second[1]
@@ -1069,12 +1069,9 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .receive(words("initial-message"), Role::User, None)
         .await
         .unwrap();
-    let first = Report {
-        notebook: rho_notebook::Report::from_text("alpha-output".into(), vec![]),
-        ..Report::default()
-    };
+    agent.waiting.output(words("alpha-output"), UnixMs::now());
     agent
-        .wake_with(Wake::Notify, "system".into(), first, false)
+        .wake_with(Wake::Notify, "system".into(), Report::default(), false)
         .await
         .unwrap();
     assert!(agent.backoff.is_some());
@@ -1083,12 +1080,9 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .receive(words("arrived-after-failure"), Role::User, None)
         .await
         .unwrap();
-    let second = Report {
-        notebook: rho_notebook::Report::from_text("beta-output".into(), vec![]),
-        ..Report::default()
-    };
+    agent.waiting.output(words("beta-output"), UnixMs::now());
     agent
-        .wake_with(Wake::Notify, "system".into(), second, false)
+        .wake_with(Wake::Notify, "system".into(), Report::default(), false)
         .await
         .unwrap();
     agent.flush().await.unwrap();
@@ -1116,114 +1110,19 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     assert_eq!(text.matches("initial-message").count(), 1);
     assert_eq!(text.matches("arrived-after-failure").count(), 1);
     let logged = harness
-        .entries()
+        .events()
         .into_iter()
-        .filter_map(|entry| match entry {
-            Entry::RequestSent { report, .. } => Some(report.notebook.render().text),
+        .filter_map(|event| match event {
+            Event::Input {
+                role: Role::Tool,
+                content,
+                ..
+            } => Some(rho_agent_types::transcript::text_content(&content)),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(logged, ["alpha-output", "beta-output"]);
     agent.shutdown().await.unwrap();
-}
-
-/// A compaction with no call open cuts off what came before it, except `tool`
-/// inputs that wait for a call: the model has not read them.
-#[tokio::test]
-async fn a_compaction_with_no_call_open_keeps_what_waits_for_a_call() {
-    let harness = Harness::new().await;
-    let (_, mut agent) = harness.load().await;
-    agent
-        .receive(words("before-the-brief"), Role::User, None)
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
-            why: Wake::Message,
-            compact: false,
-            report: Report::default(),
-        })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::Step {
-            exec: None,
-            prose: "words".into(),
-            usage: None,
-            carry: Carry::new(serde_json::json!({}), vec![], false),
-        })
-        .await
-        .unwrap();
-    agent
-        .receive(words("the-brief"), Role::Tool, None)
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
-            why: Wake::Compaction,
-            compact: true,
-            report: Report::default(),
-        })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::Step {
-            exec: None,
-            prose: String::new(),
-            usage: None,
-            carry: Carry::new(serde_json::json!("compacted"), vec![], true),
-        })
-        .await
-        .unwrap();
-    agent.shutdown().await.unwrap();
-    drop(agent);
-
-    let (_, mut agent) = harness.load().await;
-    agent
-        .append(Entry::Step {
-            exec: Some("pass".into()),
-            prose: String::new(),
-            usage: None,
-            carry: scripted::carry(Call::new("after", "pass".into())),
-        })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
-            why: Wake::Returned,
-            compact: false,
-            report: Report::default(),
-        })
-        .await
-        .unwrap();
-    let input = agent.context.input();
-    assert!(
-        matches!(&input[..], [Item::Report { text, .. }] if text == "the-brief"),
-        "{input:?}"
-    );
-
-    // Its answer is the end of it: a later compaction cuts it off.
-    agent
-        .append(Entry::Step {
-            exec: None,
-            prose: String::new(),
-            usage: None,
-            carry: Carry::new(serde_json::json!("compacted-again"), vec![], true),
-        })
-        .await
-        .unwrap();
-    agent.shutdown().await.unwrap();
-    drop(agent);
-    let (_, agent) = harness.load().await;
-    let (_, _, rows) = agent.host.native_history(None).await.unwrap();
-    assert!(
-        rows.iter().all(|(_, record)| !matches!(
-            &record.event,
-            Event::Input { content, .. }
-                if rho_agent_types::transcript::text_content(content) == "the-brief"
-        )),
-        "{rows:?}"
-    );
 }
 
 #[tokio::test]
@@ -1238,7 +1137,12 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("old-discarded"), Role::User, None)
+        .log(Event::Input {
+            agent: agent.agent_id,
+            message: None,
+            content: words("old-discarded"),
+            role: Role::User,
+        })
         .await
         .unwrap();
     agent
@@ -1254,7 +1158,12 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("during-compaction"), Role::User, None)
+        .log(Event::Input {
+            agent: agent.agent_id,
+            message: None,
+            content: words("during-compaction"),
+            role: Role::User,
+        })
         .await
         .unwrap();
     agent
@@ -1264,14 +1173,6 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
             usage: None,
             carry: Carry::new(serde_json::json!("retained-compaction"), vec![], true),
         })
-        .await
-        .unwrap();
-    agent
-        .receive(
-            words("after-compaction"),
-            Role::Tool,
-            Some(MessageId(ChatSeq(1))),
-        )
         .await
         .unwrap();
     agent.shutdown().await.unwrap();
@@ -1284,15 +1185,6 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         "automatic compaction still owes a reply"
     );
     assert!(agent.compaction_owed, "the compaction's texts are owed");
-    assert_eq!(
-        agent
-            .unread
-            .iter()
-            .map(|(role, _)| *role)
-            .collect::<Vec<_>>(),
-        [Role::User, Role::Tool],
-        "the inputs after the compacting request are unread"
-    );
 
     // Freeze while persistence is blocked. A later request and compaction must
     // not move this prepared turn's cutoff or its replay start.
@@ -1308,7 +1200,12 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .receive(words("too-late"), Role::User, None)
+        .log(Event::Input {
+            agent: agent.agent_id,
+            message: None,
+            content: words("too-late"),
+            role: Role::User,
+        })
         .await
         .unwrap();
     agent
@@ -1335,14 +1232,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     let text = format!("{:?}", request.items());
     assert!(text.contains("retained-compaction"), "{text}");
     assert_eq!(text.matches("during-compaction").count(), 1, "{text}");
-    // The compaction took the call; the peer's message waits for the next one.
-    assert!(text.contains(crate::entry::WAITING), "{text}");
-    for excluded in [
-        "old-discarded",
-        "too-late",
-        "later-compaction",
-        "after-compaction",
-    ] {
+    for excluded in ["old-discarded", "too-late", "later-compaction"] {
         assert!(!text.contains(excluded), "{text}");
     }
     agent.shutdown().await.unwrap();
@@ -1410,7 +1300,7 @@ async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
     let next = told_new(&all[2]);
     assert!(next.contains("next"), "{next}");
     // The compaction took the call, so the output waits for the next one.
-    assert!(next.contains(crate::entry::WAITING), "{next}");
+    assert!(next.contains("are waiting"), "{next}");
     assert!(!next.contains("cell-output-77"), "{next}");
 }
 

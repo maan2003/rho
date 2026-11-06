@@ -50,8 +50,8 @@ pub enum Notice {
 }
 
 /// What one inference attempt adds besides its inputs: Rho's notices. Retries
-/// add more, merged until a Step closes the input group. `notebook` is on old
-/// rows only: new output is a `tool` input.
+/// add more, merged until a Step closes the input group. `notebook` is only for
+/// the temporary migration, which turns it into a `tool` input.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Report {
     pub notices: Vec<RequestNotice>,
@@ -60,14 +60,9 @@ pub struct Report {
 
 impl Report {
     pub fn is_empty(&self) -> bool {
-        self.notices.is_empty() && self.notebook.is_empty()
+        self.notices.is_empty()
     }
 }
-
-/// What a model with no call open is told when `tool` text waits for one
-/// ([DECISION-roles](../specs/DECISION-roles.md)).
-pub const WAITING: &str =
-    "Notebook output or agent messages are waiting. Your next exec result carries them.";
 
 /// What one request says, by role.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -80,11 +75,10 @@ pub struct Composed {
 }
 
 /// Splits what one request carries by role, for both runtimes
-/// ([DECISION-roles](../specs/DECISION-roles.md)). `tool` holds every `tool`
-/// input that still waits, `others` the `user` and `system` inputs of this
-/// request. An open call always gets an answer, unless the request carries
-/// nothing at all. With no call open, `tool` stays out and a fixed line says
-/// so.
+/// ([DECISION-roles](../specs/DECISION-roles.md)). `tool` holds its `tool`
+/// inputs, which only an open call carries; `others` its `user` and `system`
+/// inputs. An open call always gets an answer, unless the request carries
+/// nothing at all.
 pub fn compose(
     call_open: bool,
     notices: &[RequestNotice],
@@ -110,13 +104,8 @@ pub fn compose(
             };
             result.extend(text.map(|text| ContentPart::Text { text }));
         }
-    } else {
-        if tool.iter().any(|content| !content.is_empty()) {
-            lines.push(WAITING.to_owned());
-        }
-        if lines.is_empty() && others.is_empty() {
-            lines.extend(filler);
-        }
+    } else if lines.is_empty() && others.is_empty() {
+        lines.extend(filler);
     }
     let mut user = Vec::new();
     if !lines.is_empty() {
@@ -181,6 +170,9 @@ pub enum RequestNotice {
     FreshNotebook,
     InterruptedExecution,
     PreviousResponseHadNoExec,
+    /// `tool` text waits for a call: the model reads it in its next exec's
+    /// result ([DECISION-roles](../specs/DECISION-roles.md)).
+    Waiting,
     Checkin,
     NothingNew,
 }
@@ -203,6 +195,9 @@ impl RequestNotice {
             Self::PreviousResponseHadNoExec => {
                 "Your last response had no exec call. Text outside a call reaches nobody."
             }
+            Self::Waiting => {
+                "Notebook output or agent messages are waiting. Your next exec result carries them."
+            }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
         };
@@ -220,8 +215,7 @@ pub enum Entry {
         usage: Option<ResponseUsage>,
     },
     /// Logical send boundary, not provider acknowledgment. It delivers every
-    /// input of the agent logged before it, except `tool` inputs when no call
-    /// is open: those wait for the next call's answer.
+    /// input of the agent logged before it.
     RequestSent {
         why: Wake,
         report: Report,
@@ -375,37 +369,28 @@ mod tests {
         assert_eq!(compose(true, &[], &[], &[]), Composed::default());
     }
 
-    /// With no call open, no `tool` text reaches the model. It hears only
-    /// that some waits, and the filler is for when nothing else is said.
+    /// With no call open a request says what it has, and the filler is for
+    /// when it has nothing else.
     #[test]
-    fn with_no_call_open_tool_text_stays_out() {
+    fn with_no_call_open_everything_reads_as_user() {
         let composed = compose(
             false,
-            &[RequestNotice::NothingNew],
-            &[text("HOSTILE")],
+            &[
+                RequestNotice::PreviousResponseHadNoExec,
+                RequestNotice::Waiting,
+                RequestNotice::NothingNew,
+            ],
+            &[],
             &[text("from the person")],
         );
         assert!(composed.result.is_empty());
-        assert_eq!(composed.user, [text(WAITING), text("from the person")]);
-
-        let composed = compose(
-            false,
-            &[RequestNotice::PreviousResponseHadNoExec],
-            &[image(1)],
-            &[],
-        );
-        let line = rho_agent_types::transcript::text_content(&composed.user.concat());
+        assert_eq!(composed.user.len(), 2);
+        let line = plain_text(&composed.user[0]);
         assert!(
-            line.contains("no exec call") && line.ends_with(WAITING),
+            line.contains("no exec call") && line.contains("are waiting"),
             "{line}"
         );
-        assert!(
-            !composed
-                .user
-                .concat()
-                .iter()
-                .any(|part| matches!(part, ContentPart::Image { .. }))
-        );
+        assert_eq!(composed.user[1], text("from the person"));
 
         assert_eq!(
             compose(false, &[RequestNotice::Checkin], &[], &[]).user,

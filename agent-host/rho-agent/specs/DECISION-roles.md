@@ -17,8 +17,9 @@ Every input carries one `Role`, in both runtimes:
   output waits.
 
 One function, `compose`, splits what a request carries by role for both runtimes.
-Inputs are logged when they arrive, and output when a request takes it; a request
-delivers every input before it, except `tool` inputs when no call is open.
+Inputs and output wait in memory until a request takes them, and that request
+writes their rows with its own. So a request delivers every input before it. A
+crash loses what waits: the chat hands its messages again, and output is gone.
 
 When `end_turn()` runs, the model waits inside its open call, and news answers
 that call. With no call open, `tool` text stays where it is and the model gets

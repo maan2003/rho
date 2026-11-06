@@ -54,8 +54,9 @@ class Agent:
         self.set_spec(self.runtime, props)
 
     def input(self, text: str, *, role: str, message: int | None = None) -> None:
-        """Queue `text` for the model; returns once its `Input` row is
-        durable. `role` says who speaks: `user` for what a person typed,
+        """Queue `text` for the model; returns once the agent has it, and the
+        request that carries it writes its `Input` row. A crash loses it unless
+        it is a chat message, which is handed again. `role` says who speaks: `user` for what a person typed,
         `tool` for anything else nobody at Rho wrote, `system` for Rho's own
         words. `message` names the chat message it hands over."""
         _rho.input(self.id, text, role=role, message=message)

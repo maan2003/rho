@@ -98,8 +98,7 @@ pub struct ClaudeRewind {
     pub resume_at: Option<Uuid>,
 }
 
-/// Notebook output on old rows, kept so they decode. New output is a `tool`
-/// input.
+/// Notebook output on old rows, kept for the temporary migration.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ClaudeOutputBatch {
     pub id: uuid::Uuid,
@@ -109,31 +108,6 @@ pub struct ClaudeOutputBatch {
     )>,
     pub wake: WakeFacts,
     pub at: UnixMs,
-}
-
-impl ClaudeOutputBatch {
-    /// The output as the `tool` input that carries it now.
-    pub(crate) fn content(&self) -> Vec<rho_agent_types::ContentPart> {
-        let text = self
-            .outputs
-            .iter()
-            .map(|(_, output)| output.output.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let images = self
-            .outputs
-            .iter()
-            .flat_map(|(_, output)| output.images.iter())
-            .map(|image| rho_agent_types::ContentPart::Image {
-                media_type: image.media_type.clone(),
-                data: image.data.clone(),
-            });
-        (!text.is_empty())
-            .then_some(rho_agent_types::ContentPart::Text { text })
-            .into_iter()
-            .chain(images)
-            .collect()
-    }
 }
 
 /// Why a request went out when it did: the scheduler's reading of its
