@@ -15,7 +15,7 @@ use rho_agent_types::{
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
-use crate::protocol::transcript::{RuntimeKind, Speaker, ToolOutcome, ToolStatus};
+use crate::protocol::transcript::{RuntimeKind, Speaker};
 use crate::protocol::worksets::{AgentEntry, LogEvent};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
@@ -240,8 +240,6 @@ pub fn transcript(agent: AgentId, rows: &[TranscriptRow]) -> UiAgentState {
 #[derive(Clone, Debug)]
 pub struct TranscriptFold {
     agent: AgentId,
-    exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
-    timing_events: Vec<(Wpos, String, rho_agent_types::ExecMilestone, UnixMs)>,
     /// One past the newest row folded.
     next: Wpos,
     /// The newest message folded.
@@ -252,8 +250,10 @@ pub struct TranscriptFold {
     /// The row each block came from, so a rewind drops exactly what was
     /// told after it. `None` for a message, which no rewind takes back.
     told_at: Vec<Option<Wpos>>,
-    /// Inputs no request has carried yet; drawn after the blocks.
-    queue: Vec<(Wpos, Waiting, UiBlock)>,
+    /// Blocks before this one came before the last request that answered.
+    unanswered: usize,
+    /// Compactions no request has carried yet; drawn after the blocks.
+    queue: Vec<(Wpos, UiBlock)>,
     /// Messages the agent received that no input has handed it yet; drawn
     /// last.
     inbox: Vec<(MessageId, UiBlock)>,
@@ -280,7 +280,6 @@ pub struct TranscriptFold {
 /// already was, so a reader replaces a suffix rather than a state.
 #[derive(Clone, Debug)]
 pub struct FoldDelta {
-    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
@@ -292,12 +291,11 @@ impl TranscriptFold {
     pub fn new(agent: AgentId, rows: &[TranscriptRow]) -> Self {
         let mut fold = Self {
             agent,
-            exec_timings: Arc::default(),
-            timing_events: Vec::new(),
             next: Wpos::ZERO,
             message_newest: None,
             blocks: Vec::new(),
             told_at: Vec::new(),
+            unanswered: 0,
             queue: Vec::new(),
             inbox: Vec::new(),
             handed: BTreeSet::new(),
@@ -327,7 +325,7 @@ impl TranscriptFold {
         self.dirty_from = Some(self.dirty_from.map_or(at, |held| held.min(at)));
     }
 
-    /// The end of the queue, where a new input lands.
+    /// The end of the queue, where the inbox starts.
     fn queue_end(&self) -> usize {
         self.blocks.len() + self.queue.len()
     }
@@ -335,14 +333,14 @@ impl TranscriptFold {
     fn waiting(&self) -> impl Iterator<Item = Arc<UiBlock>> + '_ {
         self.queue
             .iter()
-            .map(|(_, _, queued)| queued)
+            .map(|(_, queued)| queued)
             .chain(self.inbox.iter().map(|(_, waiting)| waiting))
             .map(|block| Arc::new(block.clone()))
     }
 
     /// The composed transcript from one index on: the folded blocks, then
-    /// the inputs no request has carried yet, then messages not yet handed
-    /// over.
+    /// the compactions no request has carried yet, then messages not yet
+    /// handed over.
     fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
         if from < self.blocks.len() {
             self.blocks[from..]
@@ -361,7 +359,6 @@ impl TranscriptFold {
         let from = self.dirty_from.take()?;
         let state = self.state();
         Some(FoldDelta {
-            exec_timings: state.exec_timings,
             from,
             blocks: self.composed_from(from),
             status: state.status,
@@ -371,6 +368,32 @@ impl TranscriptFold {
     }
 
     /// Each reported call is marked reported, its task still running.
+    /// A request answered what was open: every call since the last one that
+    /// did. A call Rho refused ended on its own, and one cut off went with it.
+    fn answer_calls(&mut self, timing: Option<&rho_agent_types::CallTiming>) {
+        for index in self.unanswered..self.blocks.len() {
+            if matches!(&*self.blocks[index], UiBlock::Tool(_)) {
+                self.report_block(index);
+                if let (Some(timing), UiBlock::Tool(tool)) =
+                    (timing, Arc::make_mut(&mut self.blocks[index]))
+                    && tool.id == timing.call.as_str()
+                {
+                    tool.timing = timing.timing;
+                }
+            }
+        }
+        self.unanswered = self.blocks.len();
+    }
+
+    fn report_block(&mut self, index: usize) {
+        self.touch(index);
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+            tool.status = UiToolStatus::Reported;
+            tool.started_at = None;
+            tool.finished_at = None;
+        }
+    }
+
     fn report_calls(&mut self, calls: &[String]) {
         for id in calls {
             if let Some(index) = self
@@ -378,39 +401,7 @@ impl TranscriptFold {
                 .iter()
                 .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id))
             {
-                self.touch(index);
-                if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
-                    tool.status = UiToolStatus::Reported;
-                    tool.started_at = None;
-                    tool.finished_at = None;
-                }
-            }
-        }
-    }
-
-    /// Each result lands on the call it answers: its status and its two
-    /// timestamps. The output is not kept, because nothing in the
-    /// transcript draws it.
-    fn finish_calls(&mut self, results: &[ToolOutcome]) {
-        for result in results {
-            let called = self
-                .blocks
-                .iter()
-                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == result.id));
-            if let Some(index) = called {
-                self.touch(index);
-            }
-            if let Some(index) = called
-                && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
-            {
-                tool.status = match result.status {
-                    ToolStatus::Success => UiToolStatus::Success,
-                    ToolStatus::Reported => UiToolStatus::Reported,
-                    ToolStatus::Error => UiToolStatus::Error,
-                    ToolStatus::Cancelled => UiToolStatus::Cancelled,
-                };
-                tool.started_at = Some(result.started_at);
-                tool.finished_at = Some(result.finished_at);
+                self.report_block(index);
             }
         }
     }
@@ -419,15 +410,10 @@ impl TranscriptFold {
     /// Moves what waited into the transcript; returns whether a request
     /// for compaction was among it.
     fn deliver_queue(&mut self, pos: Wpos) -> bool {
-        let mut compaction = false;
-        for (_, waiting, queued) in std::mem::take(&mut self.queue) {
-            compaction |= waiting == Waiting::Compaction;
-            // A delivered message is still a message: a rewind of the turn
-            // it started does not unsay what was written.
-            self.push(
-                (waiting != Waiting::Message).then_some(pos),
-                delivered(queued),
-            );
+        let queue = std::mem::take(&mut self.queue);
+        let compaction = !queue.is_empty();
+        for (_, queued) in queue {
+            self.push(Some(pos), queued);
         }
         compaction
     }
@@ -485,71 +471,51 @@ impl TranscriptFold {
 
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
         match event {
-            LogEvent::ExecObserved {
-                id, milestone, at, ..
-            } => {
-                self.timing_events.push((pos, id.clone(), *milestone, *at));
-                Arc::make_mut(&mut self.exec_timings)
-                    .entry(id.clone())
-                    .or_default()
-                    .observe(*milestone, *at);
-                let changed = self
-                    .blocks
-                    .iter()
-                    .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id));
-                self.touch(changed.unwrap_or(self.blocks.len()));
-                if let Some(index) = changed
-                    && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
-                {
-                    tool.timing = self.exec_timings[id];
-                }
-            }
-            LogEvent::Input { message, text, .. } => {
-                self.errored = false;
-                let block = match message {
-                    Some(id) => {
-                        self.handed.insert(*id);
-                        // The message as its sender wrote it; the row's text
-                        // is what the policy made of it for the model.
-                        match self.inbox.iter().position(|(waiting, _)| waiting == id) {
-                            Some(index) => {
-                                self.touch(self.queue_end() + index);
-                                self.inbox.remove(index).1
-                            }
-                            None => UiBlock::QueuedMessage {
-                                text: text.clone(),
-                                sender: self.senders.get(id).copied().and_then(sender),
-                            },
-                        }
-                    }
-                    // No message: what the policy has to tell the agent.
-                    None => UiBlock::Notice { text: text.clone() },
-                };
-                self.touch(self.queue_end());
-                self.queue.push((
-                    pos,
-                    match message {
-                        Some(_) => Waiting::Message,
-                        None => Waiting::Input,
-                    },
-                    block,
-                ));
-            }
             LogEvent::CompactionRequested { .. } => {
                 self.touch(self.queue_end());
                 self.queue.push((
                     pos,
-                    Waiting::Compaction,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
                     },
                 ));
             }
-            LogEvent::Sent {
-                results,
+            LogEvent::Request {
+                inputs,
+                answers,
                 compaction,
+                timing,
                 ..
             } => {
+                if !inputs.is_empty() {
+                    self.errored = false;
+                }
+                for input in inputs {
+                    let block = match input.message {
+                        Some(id) => {
+                            self.handed.insert(id);
+                            // The message as its sender wrote it; the row's
+                            // text is what the policy made of it for the model.
+                            match self.inbox.iter().position(|(waiting, _)| *waiting == id) {
+                                Some(index) => {
+                                    self.touch(self.queue_end() + index);
+                                    self.inbox.remove(index).1
+                                }
+                                None => UiBlock::QueuedMessage {
+                                    text: input.text.clone(),
+                                    sender: self.senders.get(&id).copied().and_then(sender),
+                                },
+                            }
+                        }
+                        // No message: what the policy has to tell the agent.
+                        None => UiBlock::Notice {
+                            text: input.text.clone(),
+                        },
+                    };
+                    // A message is still a message: a rewind of the turn it
+                    // started does not unsay what was written.
+                    self.push(input.message.is_none().then_some(pos), delivered(block));
+                }
                 let requested = self.deliver_queue(pos);
                 // A requested compaction already shows as its request.
                 if *compaction && !requested {
@@ -560,24 +526,11 @@ impl TranscriptFold {
                         },
                     );
                 }
-                self.finish_calls(results);
-            }
-            LogEvent::NotebookReport {
-                calls, compaction, ..
-            } => {
-                let requested = self.deliver_queue(pos);
-                // A requested compaction already shows as its request.
-                if *compaction && !requested {
-                    self.push(
-                        Some(pos),
-                        UiBlock::Notice {
-                            text: "compacting context".to_owned(),
-                        },
-                    );
+                if *answers {
+                    self.answer_calls(timing.as_ref());
                 }
-                self.report_calls(calls);
             }
-            LogEvent::Results { results, .. } => self.finish_calls(results),
+            LogEvent::CallsEnded { calls, .. } => self.report_calls(calls),
             LogEvent::Replied {
                 items,
                 compacted,
@@ -601,7 +554,6 @@ impl TranscriptFold {
                 for item in items {
                     let mut block = crate::store::block(item);
                     if let UiBlock::Tool(tool) = &mut block {
-                        tool.timing = self.exec_timings.get(&tool.id).copied().unwrap_or_default();
                         tool.started_at = Some(*at);
                     }
                     self.push(Some(pos), block);
@@ -678,23 +630,8 @@ impl TranscriptFold {
             // A rewind is told rather than unwritten, so the reader is the
             // one that hides what it undid. Messages stay: they were sent.
             LogEvent::Rewound { to, .. } => {
-                self.timing_events.retain(|(pos, ..)| pos < to);
-                let timings = Arc::make_mut(&mut self.exec_timings);
-                timings.clear();
-                for (_, id, milestone, at) in &self.timing_events {
-                    timings
-                        .entry(id.clone())
-                        .or_default()
-                        .observe(*milestone, *at);
-                }
-                // Earlier tool rows may have been updated by a now-rewound
-                // handoff.
-                for block in &mut self.blocks {
-                    if let UiBlock::Tool(tool) = Arc::make_mut(block) {
-                        tool.timing = timings.get(&tool.id).copied().unwrap_or_default();
-                    }
-                }
                 self.touch(0);
+                self.unanswered = 0;
 
                 let undone = |told: &Option<Wpos>| told.is_some_and(|told| told >= *to);
                 let blocks = std::mem::take(&mut self.blocks);
@@ -722,7 +659,6 @@ impl TranscriptFold {
         let mut blocks = self.blocks.clone();
         blocks.extend(self.waiting());
         UiAgentState {
-            exec_timings: self.exec_timings.clone(),
             blocks,
             runtime: None,
             // Never `Streaming`: this is the log, not the live tail.
@@ -748,17 +684,6 @@ fn sender(from: Address) -> Option<AgentId> {
     }
 }
 
-/// What a row waiting for a request is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Waiting {
-    /// What the policy has to tell the agent.
-    Input,
-    /// An input that hands over a message.
-    Message,
-    /// A request to compact the context.
-    Compaction,
-}
-
 fn delivered(queued: UiBlock) -> UiBlock {
     match queued {
         UiBlock::QueuedMessage {
@@ -775,6 +700,7 @@ fn delivered(queued: UiBlock) -> UiBlock {
 mod tests {
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
+    use crate::protocol::worksets::InputView;
     use crate::state::UiTool;
 
     fn agent(n: u64) -> AgentId {
@@ -800,20 +726,27 @@ mod tests {
     }
 
     fn input(text: &str, message: Option<u64>, at: u64) -> LogEvent {
-        LogEvent::Input {
+        LogEvent::Request {
             agent: me(),
-            message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
-            text: text.to_owned(),
-            wake: rho_agent_types::InputWake::Person,
+            inputs: vec![InputView {
+                message: message.map(|id| MessageId(rho_agent_types::ChatSeq(id))),
+                text: text.to_owned(),
+                role: rho_agent_types::Role::User,
+            }],
+            answers: true,
+            compaction: false,
+            timing: None,
             at: UnixMs(at),
         }
     }
 
     fn sent_row(at: u64) -> LogEvent {
-        LogEvent::Sent {
+        LogEvent::Request {
             agent: me(),
-            results: Vec::new(),
+            inputs: Vec::new(),
+            answers: true,
             compaction: false,
+            timing: None,
             at: UnixMs(at),
         }
     }
@@ -991,15 +924,9 @@ mod tests {
                 Some(10),
                 3,
             ),
-            LogEvent::Sent {
+            LogEvent::CallsEnded {
                 agent: me(),
-                results: vec![ToolOutcome {
-                    id: "call-1".to_owned(),
-                    status: ToolStatus::Error,
-                    started_at: UnixMs(3),
-                    finished_at: UnixMs(4),
-                }],
-                compaction: false,
+                calls: vec!["call-1".to_owned()],
                 at: UnixMs(4),
             },
             replied(
@@ -1025,8 +952,7 @@ mod tests {
             }
         );
         let tool = only_tool(&state);
-        assert_eq!(tool.status, UiToolStatus::Error);
-        assert_eq!(tool.finished_at, Some(UnixMs(4)));
+        assert_eq!(tool.status, UiToolStatus::Reported);
         assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
@@ -1034,88 +960,151 @@ mod tests {
         assert_eq!(state.context_used, Some(12));
     }
 
-    /// Results alone carry nothing out of the queue; a request does.
-    #[test]
-    fn an_input_waits_as_queued_until_a_request_carries_it() {
-        let state = told(vec![
-            input("later", None, 1),
-            LogEvent::Results {
-                agent: me(),
-                results: Vec::new(),
-                at: UnixMs(2),
-            },
-        ]);
-        assert_eq!(state.blocks.len(), 1);
-        assert!(matches!(&*state.blocks[0], UiBlock::Notice { text } if text == "later"));
+    fn tool_statuses(fold: &TranscriptFold) -> Vec<UiToolStatus> {
+        fold.state()
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some(tool.status),
+                _ => None,
+            })
+            .collect()
     }
 
-    /// The workset's log holds every agent's rows; only this agent's are
-    /// its transcript.
+    fn call(id: &str) -> Item {
+        Item::ToolCall {
+            id: id.to_owned(),
+            name: "exec".to_owned(),
+            arguments: "pass".to_owned(),
+            format: ArgumentsFormat::Text,
+        }
+    }
+
+    fn request_answering(answers: bool, at: u64) -> LogEvent {
+        LogEvent::Request {
+            agent: me(),
+            inputs: Vec::new(),
+            answers,
+            compaction: false,
+            timing: None,
+            at: UnixMs(at),
+        }
+    }
+
+    /// A request that answers closes every call since the last one that did,
+    /// past a later call that ended on its own. One that does not, the
+    /// compaction of a quiet agent, leaves the call open.
     #[test]
-    fn rows_about_another_agent_are_not_this_transcript() {
-        let other = LogEvent::ClaudeMessage {
-            agent: agent(2),
-            speaker: Speaker::Assistant,
-            text: "not mine".into(),
-            at: UnixMs(1),
+    fn a_request_answers_what_is_open_only_when_it_says_so() {
+        use UiToolStatus::{Reported, Running};
+        let mut pos = 0;
+        let mut fold = TranscriptFold::new(me(), &[]);
+        let mut tell = |fold: &mut TranscriptFold, event: LogEvent| {
+            fold.tell(&TranscriptRow::Log(Wpos(pos), event));
+            pos += 1;
+        };
+        tell(&mut fold, replied(vec![call("admitted")], None, None, 1));
+        tell(&mut fold, replied(vec![call("refused")], None, None, 2));
+        tell(
+            &mut fold,
+            LogEvent::CallsEnded {
+                agent: me(),
+                calls: vec!["refused".to_owned()],
+                at: UnixMs(3),
+            },
+        );
+        assert_eq!(tool_statuses(&fold), [Running, Reported]);
+        tell(&mut fold, request_answering(false, 4));
+        assert_eq!(tool_statuses(&fold), [Running, Reported]);
+        tell(&mut fold, request_answering(true, 5));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported]);
+
+        tell(&mut fold, replied(vec![call("next")], None, None, 6));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported, Running]);
+        tell(&mut fold, request_answering(true, 7));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported, Reported]);
+    }
+
+    /// A request's timing lands on the call it names, among the calls it
+    /// answers, and goes with that call when a rewind drops it.
+    #[test]
+    fn a_request_times_the_call_it_answers() {
+        let timing = rho_agent_types::ExecTiming {
+            first_block_at: Some(UnixMs(10)),
+            handed_off_at: Some(UnixMs(40)),
+            ..Default::default()
         };
         let mut fold = TranscriptFold::new(me(), &[]);
-        assert!(!fold.tell(&TranscriptRow::Log(Wpos(0), other.clone())));
-        assert!(fold.state().blocks.is_empty());
-        let merged = interleave(me(), [(Wpos(0), other)], []);
-        assert!(merged.is_empty());
+        let mut answering = request_answering(true, 4);
+        let LogEvent::Request { timing: slot, .. } = &mut answering else {
+            unreachable!()
+        };
+        *slot = Some(rho_agent_types::CallTiming {
+            call: rho_agent_types::transcript::ExecId::try_from("two").unwrap(),
+            timing,
+        });
+        let rows = [
+            replied(vec![call("one")], None, None, 1),
+            replied(vec![call("two")], None, None, 2),
+            answering,
+        ];
+        for (pos, event) in rows.into_iter().enumerate() {
+            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+        }
+        let timings = |fold: &TranscriptFold| -> Vec<(String, rho_agent_types::ExecTiming)> {
+            fold.state()
+                .blocks
+                .iter()
+                .filter_map(|block| match &**block {
+                    UiBlock::Tool(tool) => Some((tool.id.clone(), tool.timing)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            timings(&fold),
+            [
+                ("one".to_owned(), Default::default()),
+                ("two".to_owned(), timing),
+            ]
+        );
+        fold.tell(&TranscriptRow::Log(
+            Wpos(3),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(1),
+                at: UnixMs(5),
+            },
+        ));
+        assert_eq!(timings(&fold), [("one".to_owned(), Default::default())]);
     }
 
-    /// A message the agent received waits until an input hands it over,
-    /// then reads as it was written, from whoever wrote it, and is never
-    /// shown twice; what the agent posts is in its transcript.
+    /// A rewind drops blocks, so what the fold remembers of the last answer
+    /// must not point past them: the next call is still answered.
     #[test]
-    fn a_message_waits_until_an_input_hands_it_over() {
-        let peer = agent(2);
+    fn a_call_after_a_rewind_is_answered() {
+        use UiToolStatus::{Reported, Running};
         let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Message(message(3, Address::Agent(peer), 1)));
-        fold.tell(&TranscriptRow::Message(from_user(4, 2)));
-        let state = fold.state();
-        assert_eq!(state.blocks.len(), 2, "both wait");
-        assert!(matches!(&*state.blocks[0],
-            UiBlock::QueuedMessage { sender: Some(sender), .. } if *sender == peer));
-
-        // The policy wraps the message for the model; the reader sees the
-        // message as it was written.
-        fold.tell(&TranscriptRow::Log(
-            Wpos(0),
-            input("Message from eng-peer:\nmessage 3", Some(3), 3),
-        ));
-        fold.tell(&TranscriptRow::Log(Wpos(1), sent_row(4)));
-        let state = fold.state();
-        assert_eq!(
-            *state.blocks[0],
-            UiBlock::AgentMessage {
-                sender: peer,
-                text: "message 3".into()
-            }
-        );
-        assert_eq!(
-            state.blocks.len(),
-            2,
-            "the user's message still waits, once"
-        );
-        assert!(matches!(&*state.blocks[1],
-            UiBlock::QueuedMessage { sender: None, text } if text == "message 4"));
-
-        fold.tell(&TranscriptRow::Message(to_user(
-            6,
-            rho_agent_types::MentionKind::Ask,
-            6,
-        )));
-        let state = fold.state();
-        assert_eq!(state.blocks.len(), 3);
-        assert!(matches!(&*state.blocks[1],
-            UiBlock::MessageSent { to: None, text } if text == "message 6"));
-        assert!(
-            matches!(&*state.blocks[2], UiBlock::QueuedMessage { .. }),
-            "a waiting message stays last"
-        );
+        let rows = [
+            replied(vec![call("one")], None, None, 1),
+            request_answering(true, 2),
+            replied(vec![call("two")], None, None, 3),
+            request_answering(true, 4),
+            replied(vec![call("three")], None, None, 5),
+            request_answering(true, 6),
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(2),
+                at: UnixMs(7),
+            },
+            replied(vec![call("after")], None, None, 8),
+        ];
+        for (pos, event) in rows.into_iter().enumerate() {
+            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+        }
+        assert_eq!(tool_statuses(&fold), [Reported, Running]);
+        fold.tell(&TranscriptRow::Log(Wpos(8), request_answering(true, 9)));
+        assert_eq!(tool_statuses(&fold), [Reported, Reported]);
     }
 
     /// An input may be heard before the message it hands over: the message
@@ -1228,10 +1217,12 @@ mod tests {
     /// by the request that compacts. One nobody asked for still shows.
     #[test]
     fn a_compaction_shows_once() {
-        let report = |at| LogEvent::NotebookReport {
+        let report = |at| LogEvent::Request {
             agent: me(),
-            calls: Vec::new(),
+            inputs: Vec::new(),
+            answers: true,
             compaction: true,
+            timing: None,
             at: UnixMs(at),
         };
         let notices = |state: UiAgentState| {
@@ -1303,42 +1294,6 @@ mod tests {
                 }),
             ]
         );
-    }
-
-    #[test]
-    fn exec_observations_survive_commit_and_rewind_without_retiming() {
-        use rho_agent_types::ExecMilestone::*;
-        let mut fold = TranscriptFold::new(me(), &[]);
-        let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
-            fold.tell(&TranscriptRow::Log(
-                Wpos(pos),
-                LogEvent::ExecObserved {
-                    agent: me(),
-                    id: "exec-1".into(),
-                    milestone,
-                    at: UnixMs(at),
-                },
-            ));
-        };
-        tell(&mut fold, 0, FirstBlock, 10);
-        tell(&mut fold, 1, ResponseFinished, 30);
-        tell(&mut fold, 2, Boundary, 40);
-        tell(&mut fold, 3, FirstBlock, 99);
-        assert_eq!(
-            fold.state().exec_timings["exec-1"].first_block_at,
-            Some(UnixMs(10))
-        );
-        fold.tell(&TranscriptRow::Log(
-            Wpos(4),
-            LogEvent::Rewound {
-                agent: me(),
-                to: Wpos(2),
-                at: UnixMs(60),
-            },
-        ));
-        let timing = fold.state().exec_timings["exec-1"];
-        assert_eq!(timing.response_finished_at, Some(UnixMs(30)));
-        assert_eq!(timing.boundary_at, None);
     }
 
     /// What the user last wrote to the agent is what the rails find it

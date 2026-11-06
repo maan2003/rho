@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent::entry::Entry;
-use rho_agent::log::TranscriptLine;
-use rho_agent::record::{ClaudeRow, Event};
+use rho_agent::entry::{compose, plain_text};
+use rho_agent::record::Event;
 use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
 use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::snippets;
@@ -412,8 +411,70 @@ impl Watch<'_> {
                     return Ok(None);
                 };
                 match record.event {
-                    Event::Native { agent, entry } => self.entry(agent, pos, entry),
-                    Event::Claude { agent, row } => self.claude(agent, pos, row),
+                    Event::Request {
+                        agent,
+                        output,
+                        inputs,
+                        notices,
+                        ..
+                    } => {
+                        if let Some(stop) = self.request(agent, pos)? {
+                            return Ok(Some(stop));
+                        }
+                        let result = compose(true, &notices, &output, &inputs).result;
+                        if !result.is_empty() {
+                            emit(
+                                json!({"type":"notebook_report", "agent":format!("{agent:?}"), "output":plain_text(&result)}),
+                            )?;
+                        }
+                        Ok(None)
+                    }
+                    Event::Step {
+                        agent,
+                        carry,
+                        usage,
+                        ..
+                    } => {
+                        let name = format!("{agent:?}");
+                        for call in carry.display_calls() {
+                            self.calls.insert("exec".to_owned());
+                            emit(
+                                json!({"type":"tool_call", "agent":name, "id":call.display_id(), "name":"exec", "arguments":call.code}),
+                            )?;
+                        }
+                        if let Some(usage) = usage {
+                            self.usage(
+                                &name,
+                                usage.input_tokens,
+                                usage.cache_read_tokens,
+                                usage.output_tokens,
+                            )?;
+                        }
+                        Ok(None)
+                    }
+                    Event::ClaudeReply {
+                        agent,
+                        calls,
+                        usage,
+                        ..
+                    } => {
+                        let name = format!("{agent:?}");
+                        for call in calls {
+                            self.calls.insert(call.name.clone());
+                            emit(
+                                json!({"type":"tool_call", "agent":name, "id":call.id, "name":call.name, "arguments":call.arguments}),
+                            )?;
+                        }
+                        if let Some(usage) = usage {
+                            self.usage(
+                                &name,
+                                usage.input_tokens,
+                                usage.cache_read_tokens,
+                                usage.output_tokens,
+                            )?;
+                        }
+                        Ok(None)
+                    }
                     _ => Ok(None),
                 }
             }
@@ -447,75 +508,6 @@ impl Watch<'_> {
         }
     }
 
-    fn entry(&mut self, agent_id: AgentId, pos: Wpos, entry: Entry) -> Result<Option<String>> {
-        // Agents it spawns are part of the run: their work and tokens count.
-        let agent = format!("{agent_id:?}");
-        match entry {
-            Entry::RequestSent { report, .. } => {
-                if let Some(stop) = self.request(agent_id, pos)? {
-                    return Ok(Some(stop));
-                }
-                let rho_inference::transcript::Before {
-                    carry: prior,
-                    inputs,
-                } = rho_inference::transcript::before_at(&self.db.read(), agent_id, pos);
-                let results =
-                    rho_inference::transcript::report_results(&report, inputs, prior.as_ref());
-                for result in results {
-                    emit(
-                        json!({"type":"notebook_report", "agent":agent, "id":result.display_id(), "output":result.text}),
-                    )?;
-                }
-            }
-            Entry::Step { carry, usage, .. } => {
-                for call in carry.display_calls() {
-                    self.calls.insert("exec".to_owned());
-                    emit(
-                        json!({"type":"tool_call", "agent":agent, "id":call.display_id(), "name":"exec", "arguments":call.code}),
-                    )?;
-                }
-                if let Some(usage) = usage {
-                    self.usage(
-                        &agent,
-                        usage.input_tokens,
-                        usage.cache_read_tokens,
-                        usage.output_tokens,
-                    )?;
-                }
-            }
-            Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
-        }
-        Ok(None)
-    }
-
-    fn claude(&mut self, agent_id: AgentId, pos: Wpos, row: ClaudeRow) -> Result<Option<String>> {
-        let agent = format!("{agent_id:?}");
-        match row {
-            ClaudeRow::RequestSent { .. } => return self.request(agent_id, pos),
-            ClaudeRow::Transcript {
-                line: TranscriptLine::Assistant { calls, usage, .. },
-                ..
-            } => {
-                for call in calls {
-                    self.calls.insert(call.name.clone());
-                    emit(
-                        json!({"type":"tool_call", "agent":agent, "id":call.id, "name":call.name, "arguments":call.arguments}),
-                    )?;
-                }
-                if let Some(usage) = usage {
-                    self.usage(
-                        &agent,
-                        usage.input_tokens,
-                        usage.cache_read_tokens,
-                        usage.output_tokens,
-                    )?;
-                }
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
     /// A request went: counted, and for the task's agent checkpointed and
     /// held to --max-requests.
     fn request(&mut self, agent_id: AgentId, pos: Wpos) -> Result<Option<String>> {
@@ -531,19 +523,7 @@ impl Watch<'_> {
             .read()
             .agent_rows(agent_id, Wpos(0))
             .into_iter()
-            .filter(|(row, record)| {
-                *row <= pos
-                    && matches!(
-                        record.event,
-                        Event::Native {
-                            entry: Entry::RequestSent { .. },
-                            ..
-                        } | Event::Claude {
-                            row: ClaudeRow::RequestSent { .. },
-                            ..
-                        }
-                    )
-            })
+            .filter(|(row, record)| *row <= pos && matches!(record.event, Event::Request { .. }))
             .count();
         if let Some(dir) = &self.args.checkpoints {
             let status = std::process::Command::new("bcachefs")

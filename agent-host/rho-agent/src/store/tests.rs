@@ -1,7 +1,7 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId, StreamId,
+    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, StreamId,
     TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
@@ -40,19 +40,21 @@ fn agent(n: u64) -> AgentId {
 fn input(agent: AgentId, message: Option<u64>) -> Record<'static> {
     Record {
         at: UnixMs(5),
-        event: Event::Input {
+        event: Event::carrying(
             agent,
-            message: message.map(|seq| MessageId(ChatSeq(seq))),
-            content: vec![ContentPart::Text { text: "hi".into() }],
-            wake: InputWake::Person,
-        },
+            vec![crate::record::Input {
+                role: Role::User,
+                message: message.map(|seq| MessageId(ChatSeq(seq))),
+                content: vec![ContentPart::Text { text: "hi".into() }],
+            }],
+        ),
     }
 }
 
-fn native(agent: AgentId, entry: Entry) -> Record<'static> {
+fn at_six(event: Event<'static>) -> Record<'static> {
     Record {
         at: UnixMs(6),
-        event: Event::Native { agent, entry },
+        event,
     }
 }
 
@@ -118,6 +120,77 @@ async fn agents_fold_only_their_own_rows_and_rewinds_hide_only_theirs() {
     assert_eq!(read.agent(b).unwrap().delivered, ChatSeq(4));
 }
 
+/// The Claude worker reads `archived` back after a rewind, so the rewind has to
+/// take the notice with it.
+#[tokio::test]
+async fn a_rewind_past_an_archive_takes_it_back() {
+    let (_dir, db) = db().await;
+    let ws = WorksetId([1; 6]);
+    let a = agent(1);
+    let mut write = db.write().await;
+    write.create_workset(ws, UnixMs(1), WorksetKind::Isolated, "setup()".into());
+    write
+        .append(
+            ws,
+            &at_six(Event::AgentCreated {
+                agent: a,
+                spec: spec("a"),
+            }),
+        )
+        .unwrap();
+    let archive = |write: &mut rho_db::WriteTxn| {
+        write
+            .append(
+                ws,
+                &at_six(Event::Notice {
+                    agent: a,
+                    notice: Notice::Archived,
+                }),
+            )
+            .unwrap()
+    };
+    let before = write.append(ws, &input(a, None)).unwrap();
+    let archived = archive(&mut write);
+    let after = write.append(ws, &input(a, None)).unwrap();
+    assert!(write.agent_head(a).unwrap().native.archived);
+
+    // To a row after the notice: it stands.
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: after,
+            }),
+        )
+        .unwrap();
+    assert!(write.agent_head(a).unwrap().native.archived);
+    // To the notice itself: it goes, and a rewind to the row before keeps it
+    // gone.
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: archived,
+            }),
+        )
+        .unwrap();
+    assert!(!write.agent_head(a).unwrap().native.archived);
+    write
+        .append(
+            ws,
+            &at_six(Event::Rewound {
+                agent: a,
+                to: before,
+            }),
+        )
+        .unwrap();
+    assert!(!write.agent_head(a).unwrap().native.archived);
+    write.commit();
+    assert!(!db.read().agent(a).unwrap().native.archived);
+}
+
 #[tokio::test]
 async fn a_row_for_an_agent_of_another_workset_is_refused() {
     let (_dir, db) = db().await;
@@ -145,7 +218,6 @@ async fn a_row_for_an_agent_of_another_workset_is_refused() {
 
 #[tokio::test]
 async fn compaction_starts_the_context_after_the_request_it_answered() {
-    use crate::entry::{Report, Wake};
     let (_dir, db) = db().await;
     let ws = WorksetId([3; 6]);
     let a = agent(1);
@@ -166,31 +238,41 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
     let request = write
         .append(
             ws,
-            &native(
-                a,
-                Entry::RequestSent {
-                    why: Wake::Compaction,
-                    report: Report::default(),
+            &Record {
+                at: UnixMs(6),
+                event: Event::Request {
+                    agent: a,
+                    output: Vec::new(),
+                    inputs: Vec::new(),
+                    notices: Vec::new(),
                     compact: true,
+                    turn: None,
+                    timing: None,
                 },
-            ),
+            },
         )
         .unwrap();
-    // An input lands while the compacting response streams: it may not be
-    // in that request, so it must stay in the context after the compaction.
-    let late = write.append(ws, &input(a, None)).unwrap();
+    // A row lands while the compacting response streams: it stays in the
+    // context after the compaction.
+    let late = write
+        .append(
+            ws,
+            &at_six(Event::Notice {
+                agent: a,
+                notice: Notice::Error("retry".into()),
+            }),
+        )
+        .unwrap();
     write
         .append(
             ws,
-            &native(
-                a,
-                Entry::Step {
-                    exec: None,
-                    prose: String::new(),
-                    carry: crate::inference::Carry::new(serde_json::json!({}), vec![], true),
-                    usage: None,
-                },
-            ),
+            &at_six(Event::Step {
+                agent: a,
+                exec: None,
+                prose: String::new(),
+                carry: crate::inference::Carry::new(serde_json::json!({}), vec![], true),
+                usage: None,
+            }),
         )
         .unwrap();
     write.commit();

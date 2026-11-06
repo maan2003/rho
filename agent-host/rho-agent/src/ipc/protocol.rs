@@ -1,14 +1,14 @@
 //! Private agent messages shared by the host and worker.
 use std::io;
 
-use rho_agent_types::{ContentPart, InputWake, MessageId, Wpos};
+use rho_agent_types::{ContentPart, MessageId, Role, Wpos};
 use senax_encoder::{Decode, Encode};
 
 use crate::log::AgentUsageBucket;
 use crate::record::Record;
 use crate::store::{AgentHead, NativeCursor};
 
-pub(crate) const VERSION: u32 = 28;
+pub(crate) const VERSION: u32 = 29;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host
@@ -18,10 +18,10 @@ pub(crate) const REQUESTS_FD: i32 = 3;
 #[derive(Encode, Decode)]
 pub(crate) enum Control {
     Retire,
-    /// Log this input as the agent's own row; the ack follows the commit.
+    /// Hold this input for the agent's next request; the ack says it holds it.
     Input {
         content: Vec<ContentPart>,
-        wake: InputWake,
+        role: Role,
         message: Option<MessageId>,
     },
     TellTail,
@@ -65,7 +65,6 @@ pub(crate) enum Request<'a> {
     Append(Record<'a>),
     AppendBatch(Vec<Record<'static>>),
     ClaudeAccount,
-    ClaudePendingOutput,
 }
 
 #[derive(Encode, Decode)]
@@ -83,7 +82,6 @@ pub(crate) enum Reply {
     Boundary(ContextBoundary),
     Position(Wpos),
     ClaudeAccount(String),
-    ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
     Usage(AgentUsageBucket),
     Error(String),
     Done,

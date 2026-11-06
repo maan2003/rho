@@ -231,7 +231,15 @@ def where(topic, head, reader):
         other = next(member for member in head["agents"] if member != reader)
         return f"[#{topic} direct with {label(other)}]"
     done = "✔ " if head["resolved"] else ""
-    return f"[#{topic} {head['stream']} › {done}{head['name']}]"
+    return f"[#{topic} {_label_text(head['stream'])} › {done}{_label_text(head['name'])}]"
+
+
+def _label_text(name):
+    """A stream or topic name as a header shows it. Agents can set names, and a
+    header reaches the model in the user's own message, so a name stays one
+    short line that cannot close the header."""
+    text = " ".join(name.split()).replace("[", "(").replace("]", ")")
+    return text if len(text) <= 80 else text[:79] + "…"
 
 
 

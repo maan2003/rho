@@ -1,15 +1,14 @@
 //! Transcripts: what a client is told of a workset's log. `strip` takes
 //! one row to what a client keeps of it, in that row's position: the
-//! transcript is a pure function of the log. The runtimes write their own
-//! rows; this is the one place they become the client's words.
+//! transcript is a pure function of the log, one row at a time. The runtimes
+//! write their own rows; this is the one place they become the client's words.
 
-use rho_agent::entry::{Entry, Notice, Report};
-use rho_agent::log::{AgentUsageBucket, TranscriptLine};
-use rho_agent::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
-use rho_agent_types::transcript::{AStr, StreamingContextItem, ToolType};
-use rho_agent_types::{ContentPart, InputWake, UnixMs};
+use rho_agent::entry::{Notice, compose};
+use rho_agent::log::AgentUsageBucket;
+use rho_agent::record::{AgentSpec, Event, Record, Runtime};
+use rho_agent_types::{ContentPart, Role};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
-use rho_agents_client::protocol::worksets::{LogEvent, SpecView};
+use rho_agents_client::protocol::worksets::{InputView, LogEvent, SpecView};
 
 /// An agent's spec as a reader needs it.
 pub fn spec_view(spec: &AgentSpec) -> SpecView {
@@ -47,9 +46,8 @@ pub fn content_text(content: &[ContentPart]) -> String {
 }
 
 /// What a client keeps of one row: the same fact with the bodies left
-/// behind. `before` is the agent's state as of the row, for a request.
-/// `None` for rows that say nothing a client uses.
-pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
+/// behind. `None` for rows that say nothing a client uses.
+pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
     let at = record.at;
     Some(match &record.event {
         Event::WorksetCreated { kind, code } => LogEvent::WorksetCreated {
@@ -71,26 +69,37 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
             spec: spec_view(spec),
             at,
         },
-        Event::Input {
+        Event::Request {
             agent,
-            message,
-            content,
-            wake,
-        } => {
-            let text = content_text(content);
-            LogEvent::Input {
-                agent: *agent,
-                message: *message,
-                // A spoken request reads as what was asked, not as the
-                // markup the agent is handed.
-                text: match wake {
-                    InputWake::Person => crate::realtime::shown_to_reader(&text).unwrap_or(text),
-                    _ => text,
-                },
-                wake: *wake,
-                at,
-            }
-        }
+            output,
+            inputs,
+            notices,
+            compact,
+            timing,
+            ..
+        } => LogEvent::Request {
+            agent: *agent,
+            inputs: inputs
+                .iter()
+                .map(|input| {
+                    let text = content_text(&input.content);
+                    InputView {
+                        message: input.message,
+                        // A spoken request reads as what was asked, not as the
+                        // markup the agent is handed.
+                        text: match input.role {
+                            Role::User => crate::realtime::shown_to_reader(&text).unwrap_or(text),
+                            _ => text,
+                        },
+                        role: input.role,
+                    }
+                })
+                .collect(),
+            answers: !compose(true, notices, output, inputs).result.is_empty(),
+            compaction: *compact,
+            timing: timing.clone(),
+            at,
+        },
         Event::Rewound { agent, to } => LogEvent::Rewound {
             agent: *agent,
             to: *to,
@@ -103,68 +112,34 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
             retrying,
         } => LogEvent::Failed {
             agent: *agent,
-            text: partial_text(partial),
+            text: partial.clone(),
             error: error.to_string(),
             retrying: *retrying,
             at,
         },
-        Event::ExecObserved {
+        Event::Notice { agent, notice } => match notice {
+            Notice::Error(error) => LogEvent::Failed {
+                agent: *agent,
+                text: String::new(),
+                error: error.clone(),
+                retrying: true,
+                at,
+            },
+            Notice::Stopped(error) => LogEvent::Stopped {
+                agent: *agent,
+                error: error.clone(),
+                at,
+            },
+            // The runtime state says these.
+            Notice::Archived | Notice::FreshNotebook => return None,
+        },
+        Event::Step {
             agent,
-            exec,
-            milestone,
-        } => LogEvent::ExecObserved {
+            carry,
+            usage,
+            ..
+        } => LogEvent::Replied {
             agent: *agent,
-            id: exec.as_str().to_owned(),
-            milestone: *milestone,
-            at,
-        },
-        Event::Native { agent, entry } => return strip_entry(*agent, entry, before, at),
-        Event::Claude { agent, row } => return strip_claude(*agent, row, at),
-    })
-}
-
-/// A notice, in the words a reader knows; `None` for one that says nothing
-/// the runtime state does not.
-fn strip_notice(agent: rho_agent_types::AgentId, notice: &Notice, at: UnixMs) -> Option<LogEvent> {
-    match notice {
-        Notice::Error(error) => Some(LogEvent::Failed {
-            agent,
-            text: String::new(),
-            error: error.clone(),
-            retrying: true,
-            at,
-        }),
-        Notice::Stopped(error) => Some(LogEvent::Stopped {
-            agent,
-            error: error.clone(),
-            at,
-        }),
-        Notice::Restarted | Notice::Archived | Notice::FreshNotebook => None,
-    }
-}
-
-/// The native runtime's rows: a request the report that carried the
-/// queue, a step the model's reply.
-fn strip_entry(
-    agent: rho_agent_types::AgentId,
-    entry: &Entry,
-    before: &Before,
-    at: UnixMs,
-) -> Option<LogEvent> {
-    Some(match entry {
-        Entry::RequestSent {
-            report, compact, ..
-        } => LogEvent::NotebookReport {
-            agent,
-            calls: report_results(report, before)
-                .iter()
-                .map(|result| result.display_id().to_owned())
-                .collect(),
-            compaction: *compact,
-            at,
-        },
-        Entry::Step { carry, usage, .. } => LogEvent::Replied {
-            agent,
             items: step_items(&carry.display_calls()),
             compacted: carry.has_compaction(),
             usage: usage.as_ref().map(|usage| Usage {
@@ -191,83 +166,54 @@ fn strip_entry(
             }),
             at,
         },
-        Entry::Notice { notice } => return strip_notice(agent, notice, at),
-        Entry::CompactionTrigger { .. } => LogEvent::CompactionRequested { agent, at },
-    })
-}
-
-/// Claude's rows, in the runtime-neutral words a reader already knows: the
-/// model's line a reply, the results a report, a turn the request that
-/// carried the queue.
-fn strip_claude(agent: rho_agent_types::AgentId, row: &ClaudeRow, at: UnixMs) -> Option<LogEvent> {
-    Some(match row {
-        ClaudeRow::Transcript { line, .. } => match line {
-            // What Claude was handed is the agent's `Input` rows.
-            TranscriptLine::User { .. } => return None,
-            TranscriptLine::Assistant {
-                text: _,
-                calls,
-                usage: cost,
-                context_used,
-            } => LogEvent::Replied {
-                agent,
-                items: calls
-                    .iter()
-                    .map(|call| Item::ToolCall {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        // Claude's tools are all schema'd: their arguments
-                        // are always JSON.
-                        format: ArgumentsFormat::Json,
-                    })
-                    .collect(),
-                compacted: false,
-                usage: cost.as_ref().map(usage),
-                context_used: *context_used,
-                at,
-            },
-            TranscriptLine::ToolResults { results } => LogEvent::NotebookReport {
-                agent,
-                calls: results
-                    .iter()
-                    .map(|result| result.call_id.as_str().to_owned())
-                    .collect(),
-                compaction: false,
-                at,
-            },
-            TranscriptLine::Compacted { context_used } => LogEvent::Replied {
-                agent,
-                items: Vec::new(),
-                compacted: true,
-                usage: None,
-                context_used: *context_used,
-                at,
-            },
-        },
-        ClaudeRow::RequestSent { .. } => LogEvent::NotebookReport {
+        Event::CompactionTrigger { agent, .. } => {
+            LogEvent::CompactionRequested { agent: *agent, at }
+        }
+        Event::ClaudeReply {
             agent,
-            calls: Vec::new(),
-            compaction: false,
+            calls,
+            usage: cost,
+            context_used,
+            ..
+        } => LogEvent::Replied {
+            agent: *agent,
+            items: calls
+                .iter()
+                .map(|call| Item::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    // Claude's tools are all schema'd: their arguments
+                    // are always JSON.
+                    format: ArgumentsFormat::Json,
+                })
+                .collect(),
+            compacted: false,
+            usage: cost.as_ref().map(usage),
+            context_used: *context_used,
             at,
         },
-        ClaudeRow::Notice(notice) => return strip_notice(agent, notice, at),
-        ClaudeRow::ExecAdmitted { .. }
-        | ClaudeRow::Output { .. }
-        | ClaudeRow::OutputHandedOff { .. }
-        | ClaudeRow::RewindPending(_) => return None,
+        Event::ClaudeResults { agent, results } => LogEvent::CallsEnded {
+            agent: *agent,
+            calls: results
+                .iter()
+                .map(|result| result.call.as_str().to_owned())
+                .collect(),
+            at,
+        },
+        Event::ClaudeCompacted {
+            agent,
+            context_used,
+        } => LogEvent::Replied {
+            agent: *agent,
+            items: Vec::new(),
+            compacted: true,
+            usage: None,
+            context_used: *context_used,
+            at,
+        },
+        Event::RewindPending { .. } => return None,
     })
-}
-
-pub(crate) use rho_inference::transcript::{Before, before_at};
-
-/// A request's rendered notebook output belongs to the prior provider call.
-/// Without one, it is ordinary user context, not a tool result.
-pub(crate) fn report_results(
-    report: &Report,
-    before: &Before,
-) -> Vec<rho_inference::transcript::ReportOutput> {
-    rho_inference::transcript::report_results(report, before.inputs, before.carry.as_ref())
 }
 
 /// A step's visible items: the prose it wrote, then its calls.
@@ -281,87 +227,4 @@ pub(crate) fn step_items(calls: &[rho_agent::inference::Call]) -> Vec<Item> {
             format: ArgumentsFormat::Text,
         })
         .collect()
-}
-
-/// What the model had said when its request failed.
-fn partial_text(partial: &rho_agent_types::transcript::PendingInferenceResponse) -> String {
-    use rho_agent_types::transcript::{StreamingContextItem, StreamingContextItemState};
-    let mut text = String::new();
-    for slot in &partial.items {
-        let (StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item)) =
-            slot
-        else {
-            continue;
-        };
-        if let StreamingContextItem::AssistantMessage { content, .. } = item {
-            let part = content.iter().map(ToString::to_string).collect::<String>();
-            if !part.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&part);
-            }
-        }
-    }
-    text
-}
-
-/// A function tool is given JSON; a custom tool the text the model wrote.
-pub(crate) fn arguments_format(tool_type: ToolType) -> ArgumentsFormat {
-    match tool_type {
-        ToolType::Function => ArgumentsFormat::Json,
-        ToolType::Custom => ArgumentsFormat::Text,
-    }
-}
-
-/// The item as a client draws it. Compaction and unknown items have no
-/// face; their index is never told.
-pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
-    Some(match item {
-        StreamingContextItem::AssistantMessage { .. } => return None,
-        StreamingContextItem::RawReasoning {
-            content, summary, ..
-        } => Item::Reasoning {
-            text: reasoning_text(content, summary),
-        },
-        StreamingContextItem::EncryptedReasoning { summary, .. } => {
-            if summary.is_empty() {
-                return None;
-            }
-            Item::Reasoning {
-                text: join(summary),
-            }
-        }
-        StreamingContextItem::ToolCall {
-            id,
-            name,
-            arguments,
-            tool_type,
-            ..
-        } => Item::ToolCall {
-            id: id.as_str().to_owned(),
-            name: name.as_str().to_owned(),
-            arguments: arguments.to_string(),
-            format: crate::transcript::arguments_format(*tool_type),
-        },
-        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
-            return None;
-        }
-    })
-}
-
-fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
-    if summary.is_empty() {
-        content.to_string()
-    } else {
-        join(summary)
-    }
-}
-
-fn join(parts: &[AStr]) -> String {
-    parts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
 }

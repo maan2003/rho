@@ -901,17 +901,9 @@ mod tests {
             answer.continuation.is_none(),
             "filtered response cannot use server continuation"
         );
-        let entry = rho_agent::entry::Entry::Step {
-            exec: Some("print(7)".into()),
-            prose: answer.prose,
-            carry: answer.carry,
-            usage: None,
-        };
-        let bytes = senax_encoder::encode(&entry).unwrap();
-        let decoded: rho_agent::entry::Entry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
-        let rho_agent::entry::Entry::Step { carry, .. } = decoded else {
-            panic!()
-        };
+        let bytes = senax_encoder::encode(&answer.carry).unwrap();
+        let carry: rho_agent::inference::Carry =
+            senax_encoder::decode(&mut bytes.as_ref()).unwrap();
         let stored = super::super::replay(&carry);
         assert_eq!(
             stored.items.len(),

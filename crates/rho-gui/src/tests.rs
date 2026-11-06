@@ -6456,7 +6456,6 @@ fn tool(
 fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
     let blocks = history.into_iter().chain(live).map(Arc::new).collect();
     UiAgentState {
-        exec_timings: Default::default(),
         blocks,
         status: UiAgentStatus::Streaming,
         runtime: None,

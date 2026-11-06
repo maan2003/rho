@@ -7,16 +7,17 @@
 
 use std::borrow::Cow;
 
-use rho_agent_types::transcript::{ExecCall, ExecId, PendingInferenceResponse};
+use rho_agent_types::transcript::ExecId;
 use rho_agent_types::{
-    AgentId, ContentPart, ExecMilestone, InputWake, MessageId, Props, UnixMs, WorksetKind, Wpos,
+    AgentId, CallTiming, ContentPart, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
 
-use crate::inference::PromptCacheKey;
+use crate::entry::{Notice, RequestNotice, ResponseUsage};
 use crate::inference::config::{InferenceModel, InferenceProfile};
-use crate::log::{ClaudeOutputBatch, ClaudeRewind, TranscriptLine, WakeFacts};
+use crate::inference::{Carry, PromptCacheKey};
+use crate::log::{AgentUsageBucket, ClaudeRewind, TranscriptCall};
 
 /// One row of a workset log.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -38,16 +39,23 @@ pub enum Event<'a> {
     /// The agent's whole spec, replacing the one before.
     AgentChanged { agent: AgentId, spec: AgentSpec },
 
-    /// Something entered the agent's queue: delivered by the agent's next
-    /// request, and by every request after a position before it. Written
-    /// by the agent's own loop, so its order against that loop's requests
-    /// is true.
-    Input {
+    /// A request to the model, and everything it carried. In a Claude agent
+    /// it is handed to Claude Code; a native agent replays its context from
+    /// these rows.
+    Request {
         agent: AgentId,
-        /// The message it hands over, if it is one.
-        message: Option<MessageId>,
-        content: Vec<ContentPart>,
-        wake: InputWake,
+        /// Notebook output: the first thing the open call's result says.
+        output: Vec<ContentPart>,
+        inputs: Vec<Input>,
+        notices: Vec<RequestNotice>,
+        /// A native request asks the provider to compact. Claude Code
+        /// compacts by a command of its own.
+        compact: bool,
+        /// The Claude Code session line of the text this request handed over,
+        /// where a rewind forks. Rho names it when it sends.
+        turn: Option<Uuid>,
+        /// How the call this request answers went.
+        timing: Option<CallTiming>,
     },
 
     /// Every row of this agent from `to` up to here is no longer its history.
@@ -55,40 +63,99 @@ pub enum Event<'a> {
     /// A request failed with this much of a response in. Never history.
     Failed {
         agent: AgentId,
-        partial: PendingInferenceResponse,
+        /// What the model had said.
+        partial: String,
         error: Cow<'a, str>,
         retrying: bool,
     },
-    /// A provider or host lifecycle observation, for presentation only.
-    ExecObserved {
+    /// Something that happened to the agent, as the transcript says it.
+    Notice { agent: AgentId, notice: Notice },
+
+    /// A native agent's model replied.
+    Step {
         agent: AgentId,
-        exec: ExecId,
-        milestone: ExecMilestone,
+        exec: Option<String>,
+        prose: String,
+        carry: Carry,
+        /// Complete billable usage, absent for interrupted output.
+        usage: Option<ResponseUsage>,
     },
-    /// One of the native runtime's own rows.
-    Native {
+    /// A native agent must compact; a `Request` records when an attempt picks
+    /// it up.
+    CompactionTrigger { agent: AgentId, manual: bool },
+
+    /// A Claude agent's model spoke or called. One row per content block, so a
+    /// text and the call after it are two rows. Usage rides on the first row
+    /// of a message only, so a reader counts each request once.
+    ClaudeReply {
         agent: AgentId,
-        entry: crate::entry::Entry,
+        text: String,
+        calls: Vec<TranscriptCall>,
+        usage: Option<AgentUsageBucket>,
+        /// Context-window occupancy after this message.
+        context_used: Option<u64>,
     },
-    /// One of the Claude runtime's own rows.
-    Claude { agent: AgentId, row: ClaudeRow },
+    /// What calls came back with when no `Request` answered them: Claude
+    /// Code's own tools, a call Rho refused, or one that was cut off.
+    ClaudeResults {
+        agent: AgentId,
+        results: Vec<CallResult>,
+    },
+    /// Claude compacted the context here.
+    ClaudeCompacted {
+        agent: AgentId,
+        context_used: Option<u64>,
+    },
+    /// A rewind whose destination transcript is not verified yet; `None`
+    /// withdraws it. On success the new session is an `AgentChanged`.
+    RewindPending {
+        agent: AgentId,
+        rewind: Option<ClaudeRewind>,
+    },
 }
 
 impl Event<'_> {
+    /// A request that carried something a person typed: where a rewind can go.
+    pub fn carries_a_person(&self) -> bool {
+        matches!(self, Self::Request { inputs, .. }
+            if inputs.iter().any(|input| input.role == Role::User))
+    }
+
     /// The agent the event is about; `None` for a workset event.
     pub fn agent(&self) -> Option<AgentId> {
         match self {
             Self::WorksetCreated { .. } | Self::Evaluated { .. } => None,
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
-            | Self::Input { agent, .. }
+            | Self::Request { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
-            | Self::ExecObserved { agent, .. }
-            | Self::Native { agent, .. }
-            | Self::Claude { agent, .. } => Some(*agent),
+            | Self::Notice { agent, .. }
+            | Self::Step { agent, .. }
+            | Self::CompactionTrigger { agent, .. }
+            | Self::ClaudeReply { agent, .. }
+            | Self::ClaudeResults { agent, .. }
+            | Self::ClaudeCompacted { agent, .. }
+            | Self::RewindPending { agent, .. } => Some(*agent),
         }
     }
+}
+
+/// One thing a request carried, and how the model reads it
+/// ([DECISION-roles](../specs/DECISION-roles.md)).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Input {
+    pub role: Role,
+    /// The message it hands over, if it is one.
+    pub message: Option<MessageId>,
+    pub content: Vec<ContentPart>,
+}
+
+/// What a call came back with.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CallResult {
+    pub call: ExecId,
+    pub output: String,
 }
 
 /// What an agent is: the loop that runs it, and what Python says about it.
@@ -145,34 +212,18 @@ impl Runtime {
     }
 }
 
-/// The Claude runtime's rows.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum ClaudeRow {
-    /// One line of the conversation, as the stream told it.
-    Transcript {
-        uuid: Uuid,
-        line: TranscriptLine,
-        wake: Option<WakeFacts>,
-    },
-    /// Rho's permission to execute a cell, committed before it runs.
-    ExecAdmitted {
-        call: ExecCall,
-    },
-    /// Notebook output owned by the host before Claude Code is contacted.
-    Output {
-        batch: ClaudeOutputBatch,
-    },
-    OutputHandedOff {
-        id: Uuid,
-    },
-    /// A rewind whose destination transcript is not verified yet; `None`
-    /// withdraws it. On success the new session is an `AgentChanged`.
-    RewindPending(Option<ClaudeRewind>),
-    /// A turn handed to Claude Code. Like the native one, it delivers every
-    /// input of the agent logged before it.
-    RequestSent {
-        why: crate::entry::Wake,
-        report: crate::entry::Report,
-    },
-    Notice(crate::entry::Notice),
+#[cfg(test)]
+impl Event<'static> {
+    /// A request that carries these inputs and says nothing else.
+    pub(crate) fn carrying(agent: AgentId, inputs: Vec<Input>) -> Self {
+        Self::Request {
+            agent,
+            output: Vec::new(),
+            inputs,
+            notices: Vec::new(),
+            compact: false,
+            turn: None,
+            timing: None,
+        }
+    }
 }

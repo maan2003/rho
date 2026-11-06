@@ -368,20 +368,6 @@ impl HostClient {
         self.change(Request::Usage(usage)).await
     }
 
-    pub(crate) async fn claude_pending_output(
-        &self,
-    ) -> Result<Option<crate::ClaudeOutputBatch>, StoreError> {
-        match self
-            .request(Request::ClaudePendingOutput)
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::ClaudePendingOutput(batch) => Ok(batch),
-            _ => Err(StoreError(anyhow::anyhow!(
-                "unexpected Claude output reply"
-            ))),
-        }
-    }
     pub(crate) async fn claude_account(&self) -> Result<String, StoreError> {
         match self
             .request(Request::ClaudeAccount)
@@ -414,14 +400,14 @@ mod tests {
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: "queue this".into(),
                 }],
-                wake: rho_agent_types::InputWake::Agent,
+                role: rho_agent_types::Role::Tool,
                 message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))),
             },
         };
         let decoded = decode(&encode(&input).unwrap()).unwrap();
         assert!(matches!(
             decoded,
-            Message::Control { id: 1, body: Control::Input { content, wake: rho_agent_types::InputWake::Agent, message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))) } }
+            Message::Control { id: 1, body: Control::Input { content, role: rho_agent_types::Role::Tool, message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(7))) } }
             if matches!(&content[..], [rho_agent_types::ContentPart::Text { text }] if text == "queue this")
         ));
         let cancel = Message::Control {
@@ -526,21 +512,14 @@ mod tests {
     async fn large_canonical_append_crosses_frames_without_partial_delivery() {
         let (client, mut server) = crate::testing::pair();
         let count = 64 * 1024 * 1024 + 137;
-        let agent =
-            rho_agent_types::AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
         let sending = tokio::spawn(async move {
             client
                 .write(&Message::Request {
                     id: 19,
                     body: Request::Append(Record {
                         at: UnixMs(1),
-                        event: Event::Input {
-                            agent,
-                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
-                            content: vec![rho_agent_types::ContentPart::Text {
-                                text: "a".repeat(count),
-                            }],
-                            wake: rho_agent_types::InputWake::Person,
+                        event: Event::Evaluated {
+                            code: "a".repeat(count),
                         },
                     }),
                 })
@@ -552,20 +531,12 @@ mod tests {
             id: 19,
             body:
                 Request::Append(Record {
-                    event:
-                        Event::Input {
-                            message: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(37))),
-                            content,
-                            ..
-                        },
+                    event: Event::Evaluated { code: text },
                     ..
                 }),
         } = server.read().await.unwrap()
         else {
             panic!("wrong logical message")
-        };
-        let [rho_agent_types::ContentPart::Text { text }] = &content[..] else {
-            panic!("wrong message body")
         };
         assert_eq!(text.len(), count);
         assert!(text.bytes().all(|byte| byte == b'a'));

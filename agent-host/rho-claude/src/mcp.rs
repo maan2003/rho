@@ -2,9 +2,7 @@
 //! caller-owned.
 use std::time::Duration;
 
-use base64::Engine as _;
-use rho_agent_types::ToolOutputStatus;
-use rho_agent_types::transcript::{ExecId, ToolName, ToolOutput, ToolSpec, ToolType};
+use rho_agent_types::transcript::{ExecId, ToolName, ToolSpec, ToolType};
 use serde_json::{Value, json};
 
 /// The SDK server's routing name. Rho sets `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`
@@ -149,44 +147,6 @@ pub fn tool_result(content: Vec<Value>, is_error: bool) -> Value {
 
 pub fn text_item(text: &str) -> Value {
     json!({ "type": "text", "text": text })
-}
-
-/// Encode one boundary contribution in the SDK's MCP content vocabulary.
-pub fn exec_result(own: Option<ToolOutput>, updates: Vec<(ExecId, ToolOutput)>) -> Value {
-    let mut content = Vec::new();
-    let mut is_error = false;
-    if let Some(own) = &own {
-        is_error = own.status == ToolOutputStatus::Error;
-        content.extend(output_items(own, None));
-    }
-    for (id, update) in &updates {
-        content.extend(output_items(
-            update,
-            Some(&format!("Later output from exec {}:\n", id.as_str())),
-        ));
-    }
-    tool_result(content, is_error)
-}
-
-fn output_items(output: &ToolOutput, prefix: Option<&str>) -> Vec<Value> {
-    // A cell that answered with nothing because older cells speak in the
-    // same reply gets no item of its own; the older cells' items follow.
-    let mut items = Vec::new();
-    if prefix.is_some() || !output.output.is_empty() {
-        items.push(text_item(&format!(
-            "{}{}",
-            prefix.unwrap_or_default(),
-            output.output
-        )));
-    }
-    items.extend(output.images.iter().map(|image| {
-        json!({
-            "type": "image",
-            "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
-            "mimeType": image.media_type,
-        })
-    }));
-    items
 }
 
 #[cfg(test)]

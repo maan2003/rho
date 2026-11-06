@@ -7,14 +7,12 @@
 //! it looks at. Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, ExecMilestone, InputWake, MessageId, Props,
-    StreamId, TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
+    AgentId, ChatRecord, ChatSeq, ContentPart, MessageId, Props, Role, StreamId, TopicId, UnixMs,
+    WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use super::transcript::{
-    DetailBody, Item, Live, RuntimeKind, RuntimeState, Speaker, ToolOutcome, Usage,
-};
+use super::transcript::{Item, Live, RuntimeKind, RuntimeState, Speaker, Usage};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
@@ -224,13 +222,6 @@ pub enum ClientFrame {
     FollowWorksets { from: Vec<(WorksetId, Wpos)> },
     /// The agents whose live frames this client wants. Replaces the set.
     Focus { agent_ids: Vec<AgentId> },
-    /// The bodies of rows: tool output, a response whole. One
-    /// [`ServerFrame::Detail`] answers each position.
-    Detail {
-        workset: WorksetId,
-        pos: Wpos,
-        more: Vec<Wpos>,
-    },
 }
 
 /// What a host says on its session.
@@ -283,11 +274,6 @@ pub enum ServerFrame {
         agent_id: AgentId,
         state: RuntimeState,
     },
-    Detail {
-        workset: WorksetId,
-        pos: Wpos,
-        body: DetailBody,
-    },
     QuotaUsage {
         summaries: Vec<super::QuotaSummary>,
     },
@@ -320,9 +306,16 @@ pub struct SpecView {
     pub props: Props,
 }
 
+/// One thing a request carried, with its body left as text.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct InputView {
+    pub message: Option<MessageId>,
+    pub text: String,
+    pub role: Role,
+}
+
 /// One workset row as it crosses the wire: `strip` of exactly one row.
-/// Bodies a person does not read at a glance are left behind; ask for them
-/// with [`ClientFrame::Detail`].
+/// Bodies a person does not read at a glance are left behind.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum LogEvent {
     WorksetCreated {
@@ -344,36 +337,25 @@ pub enum LogEvent {
         spec: SpecView,
         at: UnixMs,
     },
-    /// Something entered the agent's queue; its next request carries it.
-    Input {
-        agent: AgentId,
-        message: Option<MessageId>,
-        text: String,
-        wake: InputWake,
-        at: UnixMs,
-    },
     CompactionRequested {
         agent: AgentId,
         at: UnixMs,
     },
-    /// A request went out, carrying every input before it, with these results.
-    Sent {
+    /// A request went out with these inputs. `answers`: it answers the open
+    /// call, if one is. Only a compaction with nothing to say leaves it open.
+    Request {
         agent: AgentId,
-        results: Vec<ToolOutcome>,
+        inputs: Vec<InputView>,
+        answers: bool,
         compaction: bool,
+        /// How the call it answers went.
+        timing: Option<rho_agent_types::CallTiming>,
         at: UnixMs,
     },
-    /// A notebook report answered provider calls but completed no task.
-    NotebookReport {
+    /// Claude Code says these calls came back, with no request to answer them.
+    CallsEnded {
         agent: AgentId,
         calls: Vec<String>,
-        compaction: bool,
-        at: UnixMs,
-    },
-    /// A Claude agent's tool results.
-    Results {
-        agent: AgentId,
-        results: Vec<ToolOutcome>,
         at: UnixMs,
     },
     Replied {
@@ -408,12 +390,6 @@ pub enum LogEvent {
         text: String,
         at: UnixMs,
     },
-    ExecObserved {
-        agent: AgentId,
-        id: String,
-        milestone: ExecMilestone,
-        at: UnixMs,
-    },
 }
 
 impl LogEvent {
@@ -423,17 +399,14 @@ impl LogEvent {
             | Self::Evaluated { at, .. }
             | Self::AgentCreated { at, .. }
             | Self::AgentChanged { at, .. }
-            | Self::Input { at, .. }
+            | Self::Request { at, .. }
             | Self::CompactionRequested { at, .. }
-            | Self::Sent { at, .. }
-            | Self::NotebookReport { at, .. }
-            | Self::Results { at, .. }
+            | Self::CallsEnded { at, .. }
             | Self::Replied { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
-            | Self::ClaudeMessage { at, .. }
-            | Self::ExecObserved { at, .. } => *at,
+            | Self::ClaudeMessage { at, .. } => *at,
         }
     }
 
@@ -443,17 +416,14 @@ impl LogEvent {
             Self::WorksetCreated { .. } | Self::Evaluated { .. } => None,
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
-            | Self::Input { agent, .. }
+            | Self::Request { agent, .. }
             | Self::CompactionRequested { agent, .. }
-            | Self::Sent { agent, .. }
-            | Self::NotebookReport { agent, .. }
-            | Self::Results { agent, .. }
+            | Self::CallsEnded { agent, .. }
             | Self::Replied { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::Stopped { agent, .. }
-            | Self::ClaudeMessage { agent, .. }
-            | Self::ExecObserved { agent, .. } => Some(*agent),
+            | Self::ClaudeMessage { agent, .. } => Some(*agent),
         }
     }
 }
@@ -513,11 +483,16 @@ mod tests {
             workset,
             rows: vec![(
                 Wpos(7),
-                LogEvent::Input {
+                LogEvent::Request {
                     agent: agent_id,
-                    message: Some(MessageId(ChatSeq(4))),
-                    text: "hi".into(),
-                    wake: InputWake::Person,
+                    inputs: vec![InputView {
+                        message: Some(MessageId(ChatSeq(4))),
+                        text: "hi".into(),
+                        role: Role::User,
+                    }],
+                    answers: true,
+                    compaction: false,
+                    timing: None,
                     at: UnixMs(8),
                 },
             )],

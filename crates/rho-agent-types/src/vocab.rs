@@ -5,19 +5,6 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 /// Provider/host observations, never Python execution timestamps.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
-)]
-pub enum ExecMilestone {
-    FirstBlock,
-    ArgumentsFinished,
-    ResponseFinished,
-    Boundary,
-    /// The host successfully handed the reply to its transport, not evidence
-    /// that the remote model consumed it.
-    HandedOff,
-}
-
-#[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
 )]
 pub struct ExecTiming {
@@ -25,20 +12,17 @@ pub struct ExecTiming {
     pub arguments_finished_at: Option<UnixMs>,
     pub response_finished_at: Option<UnixMs>,
     pub boundary_at: Option<UnixMs>,
+    /// The host successfully handed the reply to its transport, not evidence
+    /// that the remote model consumed it.
     pub handed_off_at: Option<UnixMs>,
 }
 
-impl ExecTiming {
-    pub fn observe(&mut self, milestone: ExecMilestone, at: UnixMs) {
-        let field = match milestone {
-            ExecMilestone::FirstBlock => &mut self.first_block_at,
-            ExecMilestone::ArgumentsFinished => &mut self.arguments_finished_at,
-            ExecMilestone::ResponseFinished => &mut self.response_finished_at,
-            ExecMilestone::Boundary => &mut self.boundary_at,
-            ExecMilestone::HandedOff => &mut self.handed_off_at,
-        };
-        field.get_or_insert(at);
-    }
+/// A call's timing, which the worker holds in memory until the request that
+/// answers the call. A crash loses only what no request has carried yet.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CallTiming {
+    pub call: crate::transcript::ExecId,
+    pub timing: ExecTiming,
 }
 
 pub type AgentId = PrefixId<AgentIdDomain>;

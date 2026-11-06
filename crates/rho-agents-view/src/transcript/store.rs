@@ -200,9 +200,9 @@ impl Transcripts {
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{
-        Address, ChatSeq, ContentPart, InputWake, Message, MessageId, TopicId, UnixMs, Wpos,
+        Address, ChatSeq, ContentPart, Message, MessageId, Role, TopicId, UnixMs, Wpos,
     };
-    use rho_agents_client::protocol::worksets::LogEvent;
+    use rho_agents_client::protocol::worksets::{InputView, LogEvent};
 
     use super::*;
 
@@ -230,20 +230,16 @@ mod tests {
             }),
             TranscriptRow::Log(
                 Wpos(pos),
-                LogEvent::Input {
+                LogEvent::Request {
                     agent: agent(),
-                    message: Some(MessageId(ChatSeq(message))),
-                    text: text.to_owned(),
-                    wake: InputWake::Person,
-                    at: UnixMs(at),
-                },
-            ),
-            TranscriptRow::Log(
-                Wpos(pos + 1),
-                LogEvent::Sent {
-                    agent: agent(),
-                    results: Vec::new(),
+                    inputs: vec![InputView {
+                        message: Some(MessageId(ChatSeq(message))),
+                        text: text.to_owned(),
+                        role: Role::User,
+                    }],
+                    answers: true,
                     compaction: false,
+                    timing: None,
                     at: UnixMs(at),
                 },
             ),
@@ -301,10 +297,12 @@ mod tests {
         );
         let elsewhere = TranscriptRow::Log(
             Wpos(9),
-            LogEvent::Sent {
+            LogEvent::Request {
                 agent: other(),
-                results: Vec::new(),
+                inputs: Vec::new(),
+                answers: true,
                 compaction: false,
+                timing: None,
                 at: UnixMs(3),
             },
         );

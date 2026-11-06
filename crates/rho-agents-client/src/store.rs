@@ -134,11 +134,7 @@ impl Layered {
         self.state.blocks.extend(self.tail.response.iter().flat_map(|response| &response.items)
             .filter(|item| !matches!(item, Item::ToolCall { id, .. } if self.committed_tools.contains(id)))
             .map(|item| {
-                let mut block = block(item);
-                if let UiBlock::Tool(tool) = &mut block {
-                    tool.timing = self.fold.exec_timings.get(&tool.id).copied().unwrap_or_default();
-                }
-                Arc::new(block)
+                Arc::new(block(item))
             }));
         if let Some(draft) = &self.tail.draft {
             self.state.blocks.push(Arc::new(UiBlock::MessageDraft {
@@ -170,7 +166,6 @@ impl Layered {
         self.state.runtime = self.tail.runtime.clone();
         self.state.context_used = self.fold.context_used;
         self.state.usage = self.fold.usage.clone();
-        self.state.exec_timings = self.fold.exec_timings.clone();
     }
 }
 
@@ -270,7 +265,6 @@ impl AgentStore {
         layered.fold.status = delta.status;
         layered.fold.context_used = delta.context_used;
         layered.fold.usage = delta.usage;
-        layered.fold.exec_timings = delta.exec_timings;
         layered.compose_from(from);
         let mut summary = FrameSummary {
             first_changed_block: Some(from),
@@ -412,7 +406,6 @@ pub fn turn_open(status: UiAgentStatus) -> bool {
 
 fn empty_state() -> UiAgentState {
     UiAgentState {
-        exec_timings: Default::default(),
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
         runtime: None,
@@ -475,7 +468,7 @@ pub fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ExecMilestone, UnixMs, Wpos};
+    use rho_agent_types::{AgentIdDomain, UnixMs, Wpos};
 
     use super::*;
     use crate::fold::{TranscriptFold, TranscriptRow};
@@ -879,26 +872,5 @@ mod tests {
         assert!(state.runtime.is_none());
         assert!(state.blocks.is_empty());
         assert_eq!(state.status, UiAgentStatus::Idle);
-    }
-
-    #[test]
-    fn durable_provider_timing_reaches_the_live_tail() {
-        let mut store = AgentStore::default();
-        store.apply_live(agent(), snapshot("first", vec![call("one")]));
-        let mut fold = TranscriptFold::new(agent(), &[]);
-        fold.tell(&TranscriptRow::Log(
-            Wpos(0),
-            LogEvent::ExecObserved {
-                agent: agent(),
-                id: "one".into(),
-                milestone: ExecMilestone::FirstBlock,
-                at: UnixMs(10),
-            },
-        ));
-        store.apply_fold_delta(agent(), fold.delta().unwrap());
-        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
-            panic!("missing tool")
-        };
-        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
     }
 }

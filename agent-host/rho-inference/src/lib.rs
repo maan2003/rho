@@ -11,7 +11,6 @@ pub use credentials::{CredentialSnapshot, CredentialState};
 pub use wiring::worker_main;
 mod responses;
 mod step;
-pub mod transcript;
 
 pub use accounts::{
     InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState, SelectedAuth,

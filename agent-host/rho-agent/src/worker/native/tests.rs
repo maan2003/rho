@@ -113,12 +113,14 @@ impl Harness {
     }
 
     /// The loop's own rows.
-    fn entries(&self) -> Vec<Entry> {
+    fn entries(&self) -> Vec<Event<'static>> {
         self.events()
             .into_iter()
-            .filter_map(|event| match event {
-                Event::Native { entry, .. } => Some(entry),
-                _ => None,
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Step { .. } | Event::Notice { .. } | Event::CompactionTrigger { .. }
+                )
             })
             .collect()
     }
@@ -126,8 +128,10 @@ impl Harness {
     /// Whether a person's input with `text` is still history.
     fn received(&self, text: &str) -> bool {
         self.events().iter().any(|event| {
-            matches!(event, Event::Input { wake: InputWake::Person, content, .. }
-                if rho_agent_types::transcript::text_content(content) == text)
+            matches!(event, Event::Request { inputs, .. } if inputs.iter().any(|input| {
+                input.role == Role::User
+                    && rho_agent_types::transcript::text_content(&input.content) == text
+            }))
         })
     }
 
@@ -153,7 +157,11 @@ impl Harness {
     }
 
     /// The visible log, once `done` holds of it.
-    async fn until(&self, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
+    async fn until(
+        &self,
+        what: &str,
+        done: impl Fn(&[Event<'static>]) -> bool,
+    ) -> Vec<Event<'static>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let entries = self.entries();
@@ -190,7 +198,7 @@ async fn say(handle: &AgentHandle, text: &str) {
     handle
         .input(
             vec![ContentPart::Text { text: text.into() }],
-            InputWake::Person,
+            Role::User,
             None,
         )
         .await
@@ -261,6 +269,98 @@ async fn wait_for(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// A peer's message reads as the output of the call the model waits in, never
+/// as a person's words, and an agent's first message tells it only to call
+/// exec.
+#[tokio::test]
+async fn a_peers_message_reaches_the_model_in_the_calls_result() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('reading')")
+        .then("print('more')\nend_turn()")
+        .then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    handle
+        .input(words("the-brief"), Role::Tool, None)
+        .await
+        .unwrap();
+    let first = requests(&script, 1).await;
+    assert!(
+        first[0]
+            .items()
+            .iter()
+            .all(|item| !matches!(item, Item::User { text, .. } if text.contains("the-brief"))),
+        "{:?}",
+        first[0].items()
+    );
+    assert!(told(&first[0]).contains("are waiting"));
+
+    let second = requests(&script, 2).await;
+    let result = second[1]
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            Item::Report { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the call's result");
+    assert!(
+        result.contains("the-brief") && result.contains("reading"),
+        "{result}"
+    );
+
+    wait_for("the wait", || handle.status().runtime.awaiting_human).await;
+    handle
+        .input(words("from-the-peer"), Role::Tool, None)
+        .await
+        .unwrap();
+    let all = requests(&script, 3).await;
+    let new = all[2]
+        .items()
+        .iter()
+        .rposition(|item| matches!(item, Item::Step { .. }))
+        .unwrap();
+    assert!(
+        matches!(&all[2].items()[new + 1..], [Item::Report { text, .. }] if text.contains("from-the-peer") && text.contains("more")),
+        "{:?}",
+        &all[2].items()[new + 1..]
+    );
+}
+
+/// Notebook output is an input like any other: a `tool` row before the
+/// request that carries it, and the request's report holds none of it.
+#[tokio::test]
+async fn output_is_a_tool_input_before_its_request() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('output-mark')")
+        .then("human.send('done', kind='result')\nend_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "go").await;
+    harness.until_sent("done").await;
+    let events = harness.events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(event, Event::Request { output, .. }
+                if rho_agent_types::transcript::text_content(output).contains("output-mark"))
+        }),
+        "the request holds the output: {events:?}"
+    );
+    let all = requests(&script, 2).await;
+    let result = all[1]
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            Item::Report { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the call's result");
+    assert!(result.contains("output-mark"), "{result}");
+}
+
 #[tokio::test]
 async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let harness = Harness::new().await;
@@ -290,7 +390,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
         second[1]
             .items()
             .iter()
-            .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
+            .any(|item| matches!(item, Item::Report {reply_to: carry,..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
     harness.until_sent("reading").await;
@@ -329,13 +429,12 @@ async fn an_ended_turn_wakes_only_for_news() {
         "{}",
         told(&second[1])
     );
-    assert!(harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::RequestSent {
-            why: Wake::Notify,
-            ..
-        }
-    )));
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Request { .. }))
+    );
 }
 
 #[tokio::test]
@@ -350,7 +449,7 @@ async fn a_restart_does_not_resume_a_running_cell_by_itself() {
         .until("the step", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { .. }))
+                .any(|entry| matches!(entry, Event::Step { .. }))
         })
         .await;
     drop(handle);
@@ -365,12 +464,9 @@ async fn a_restart_does_not_resume_a_running_cell_by_itself() {
     say(&handle, "second").await;
     let told = told(&requests(&script, 1).await[0]);
     assert!(told.contains("rho restarted"), "{told}");
-    assert!(harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::Notice {
-            notice: Notice::Restarted,
-            ..
-        }
+    assert!(harness.events().iter().any(|event| matches!(
+        event,
+        Event::Request { notices, .. } if notices.contains(&RequestNotice::Restarted)
     )));
 }
 
@@ -394,12 +490,9 @@ async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     assert!(script.requests().is_empty(), "a reload is not a wake");
     // What awaited the human went with the old notebook, but the agent
     // still waits on them: nothing moves until they write.
-    assert!(!harness.entries().iter().any(|entry| matches!(
-        entry,
-        Entry::Notice {
-            notice: Notice::Restarted,
-            ..
-        }
+    assert!(!harness.events().iter().any(|event| matches!(
+        event,
+        Event::Request { notices, .. } if notices.contains(&RequestNotice::Restarted)
     )));
 
     say(&handle, "second").await;
@@ -431,7 +524,7 @@ async fn rewind_branches_before_the_last_human_message() {
         .until("the second step", |entries| {
             entries
                 .iter()
-                .filter(|entry| matches!(entry, Entry::Step { .. }))
+                .filter(|entry| matches!(entry, Event::Step { .. }))
                 .count()
                 == 2
         })
@@ -460,7 +553,7 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
                 .filter(|entry| {
                     matches!(
                         entry,
-                        Entry::Notice {
+                        Event::Notice {
                             notice: Notice::Error(_),
                             ..
                         }
@@ -560,7 +653,7 @@ async fn explicit_retry_after_restart_resumes_with_recovery_notice() {
             entries.iter().any(|entry| {
                 matches!(
                     entry,
-                    Entry::Notice {
+                    Event::Notice {
                         notice: Notice::Error(_),
                         ..
                     }
@@ -796,7 +889,7 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
             } else if response_id.is_some() {
                 assert!(
                     harness.entries().iter().any(|entry| matches!(
-                        entry, Entry::Step { exec, .. } if exec.as_deref() == Some(code.as_str())
+                        entry, Event::Step { exec, .. } if exec.as_deref() == Some(code.as_str())
                     )),
                     "clearing the live response must follow the durable step"
                 );
@@ -893,17 +986,9 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
     agent.session = Arc::new(Controlled(submitted));
     let instructions: Arc<str> = "test instructions".into();
     for text in ["first-message", "second-message"] {
+        agent.receive(words(text), Role::User, None).await.unwrap();
         agent
-            .receive(words(text), InputWake::Person, None)
-            .await
-            .unwrap();
-        agent
-            .wake_with(
-                Wake::Message,
-                instructions.clone(),
-                Report::default(),
-                false,
-            )
+            .wake_with(Wake::Message, instructions.clone(), Vec::new(), false)
             .await
             .unwrap();
         assert!(
@@ -912,26 +997,21 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         );
     }
     agent
-        .receive(words("third-message"), InputWake::Person, None)
+        .receive(words("third-message"), Role::User, None)
         .await
         .unwrap();
     let control = async {
         reconnect.await.unwrap();
         handle.compact();
         handle
-            .input(words("late-message"), InputWake::Agent, None)
+            .input(words("late-message"), Role::User, None)
             .await
             .unwrap();
         resume.send(()).unwrap();
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            agent.wake_with(
-                Wake::Message,
-                instructions.clone(),
-                Report::default(),
-                false
-            ),
+            agent.wake_with(Wake::Message, instructions.clone(), Vec::new(), false),
             control
         )
     })
@@ -943,7 +1023,7 @@ async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() 
         "concurrent compaction must remain pending"
     );
     agent
-        .wake_with(Wake::Message, instructions, Report::default(), false)
+        .wake_with(Wake::Message, instructions, Vec::new(), false)
         .await
         .unwrap();
     assert!(agent.context.input().is_empty());
@@ -960,7 +1040,8 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     agent.script(script.clone());
     agent.notebook().await.unwrap();
     agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: Some("pass".into()),
             prose: String::new(),
             usage: None,
@@ -969,29 +1050,23 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .await
         .unwrap();
     agent
-        .receive(words("initial-message"), InputWake::Person, None)
+        .receive(words("initial-message"), Role::User, None)
         .await
         .unwrap();
-    let first = Report {
-        notebook: rho_notebook::Report::from_text("alpha-output".into(), vec![]),
-        ..Report::default()
-    };
+    agent.waiting.output(words("alpha-output"));
     agent
-        .wake_with(Wake::Notify, "system".into(), first, false)
+        .wake_with(Wake::Notify, "system".into(), Vec::new(), false)
         .await
         .unwrap();
     assert!(agent.backoff.is_some());
 
     agent
-        .receive(words("arrived-after-failure"), InputWake::Person, None)
+        .receive(words("arrived-after-failure"), Role::User, None)
         .await
         .unwrap();
-    let second = Report {
-        notebook: rho_notebook::Report::from_text("beta-output".into(), vec![]),
-        ..Report::default()
-    };
+    agent.waiting.output(words("beta-output"));
     agent
-        .wake_with(Wake::Notify, "system".into(), second, false)
+        .wake_with(Wake::Notify, "system".into(), Vec::new(), false)
         .await
         .unwrap();
     agent.flush().await.unwrap();
@@ -1004,7 +1079,7 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
             Item::Report {
                 text,
                 images,
-                reply_to: Some(carry),
+                reply_to: carry,
             } => Some((text, images, carry)),
             _ => None,
         })
@@ -1019,10 +1094,12 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     assert_eq!(text.matches("initial-message").count(), 1);
     assert_eq!(text.matches("arrived-after-failure").count(), 1);
     let logged = harness
-        .entries()
+        .events()
         .into_iter()
-        .filter_map(|entry| match entry {
-            Entry::RequestSent { report, .. } => Some(report.render(false).text),
+        .filter_map(|event| match event {
+            Event::Request { output, .. } => {
+                Some(rho_agent_types::transcript::text_content(&output))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1030,48 +1107,47 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
     agent.shutdown().await.unwrap();
 }
 
+fn person(text: &str) -> crate::record::Input {
+    crate::record::Input {
+        role: Role::User,
+        message: None,
+        content: words(text),
+    }
+}
+
 #[tokio::test]
-async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
+async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
     let harness = Harness::new().await;
     let (_, mut agent) = harness.load().await;
     // These recovery facts precede the retained replay range.
+    agent.notice(Notice::FreshNotebook).await.unwrap();
     agent
-        .append(Entry::Notice {
-            notice: Notice::FreshNotebook,
+        .log(Event::CompactionTrigger {
+            agent: agent.agent_id,
+            manual: false,
         })
         .await
         .unwrap();
     agent
-        .receive(words("old-discarded"), InputWake::Person, None)
-        .await
-        .unwrap();
-    agent
-        .append(Entry::CompactionTrigger { manual: false })
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
-            why: Wake::Compaction,
+        .log(Event::Request {
+            agent: agent.agent_id,
+            output: Vec::new(),
+            inputs: vec![person("old-discarded")],
+            notices: Vec::new(),
             compact: true,
-            report: Report::default(),
+            turn: None,
+            timing: None,
         })
         .await
         .unwrap();
     agent
-        .receive(words("during-compaction"), InputWake::Person, None)
-        .await
-        .unwrap();
-    agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: None,
             prose: String::new(),
             usage: None,
             carry: Carry::new(serde_json::json!("retained-compaction"), vec![], true),
         })
-        .await
-        .unwrap();
-    agent
-        .receive(words("after-compaction"), InputWake::Agent, None)
         .await
         .unwrap();
     agent.shutdown().await.unwrap();
@@ -1084,43 +1160,34 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         "automatic compaction still owes a reply"
     );
     assert!(agent.compaction_owed, "the compaction's texts are owed");
-    assert_eq!(
-        agent
-            .unread
-            .iter()
-            .map(|(wake, _)| *wake)
-            .collect::<Vec<_>>(),
-        [InputWake::Person, InputWake::Agent],
-        "the inputs after the compacting request are unread"
-    );
 
     // Freeze while persistence is blocked. A later request and compaction must
     // not move this prepared turn's cutoff or its replay start.
     agent.flush().await.unwrap();
     let write = harness.db.write().await;
     agent
-        .append(Entry::RequestSent {
-            why: Wake::Message,
-            compact: false,
-            report: Report::default(),
-        })
+        .log(Event::carrying(
+            agent.agent_id,
+            vec![person("after-compaction")],
+        ))
         .await
         .unwrap();
     let mut turn = agent.prepare_turn("system".into()).await.unwrap();
     agent
-        .receive(words("too-late"), InputWake::Person, None)
-        .await
-        .unwrap();
-    agent
-        .append(Entry::RequestSent {
-            why: Wake::Compaction,
+        .log(Event::Request {
+            agent: agent.agent_id,
+            output: Vec::new(),
+            inputs: vec![person("too-late")],
+            notices: Vec::new(),
             compact: true,
-            report: Report::default(),
+            turn: None,
+            timing: None,
         })
         .await
         .unwrap();
     agent
-        .append(Entry::Step {
+        .log(Event::Step {
+            agent: agent.agent_id,
             exec: None,
             prose: String::new(),
             usage: None,
@@ -1134,9 +1201,7 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
     let request = turn.request(&harness.host).await.unwrap();
     let text = format!("{:?}", request.items());
     assert!(text.contains("retained-compaction"), "{text}");
-    for message in ["during-compaction", "after-compaction"] {
-        assert_eq!(text.matches(message).count(), 1, "{text}");
-    }
+    assert_eq!(text.matches("after-compaction").count(), 1, "{text}");
     for excluded in ["old-discarded", "too-late", "later-compaction"] {
         assert!(!text.contains(excluded), "{text}");
     }
@@ -1157,6 +1222,47 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
     assert!(handle.retire().await.is_err(), "its task is still running");
     harness
         .until("the task to finish", |_| handle.status().settled())
+        .await;
+    handle.retire().await.unwrap();
+}
+
+/// A peer's message the model was told of waits in memory for its next call,
+/// and the agent seems idle meanwhile. It must not unload: the chat has moved
+/// past that message, so nothing would hand it again.
+#[tokio::test]
+async fn an_agent_holding_tool_text_is_not_retired() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("end_turn()").then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+
+    handle
+        .input(words("the-brief"), Role::Tool, None)
+        .await
+        .unwrap();
+    let first = requests(&script, 1).await;
+    assert!(told(&first[0]).contains("are waiting"));
+    harness
+        .until("the wait", |_| {
+            handle.status().runtime.awaiting_human && handle.status().settled()
+        })
+        .await;
+    assert!(handle.retire().await.is_err(), "the-brief would be lost");
+
+    say(&handle, "go on").await;
+    let second = requests(&script, 2).await;
+    assert!(
+        second[1]
+            .items()
+            .iter()
+            .any(|item| matches!(item, Item::Report { text, .. } if text.contains("the-brief"))),
+        "{:?}",
+        second[1].items()
+    );
+    harness
+        .until("the second wait", |_| {
+            handle.status().runtime.awaiting_human && handle.status().settled()
+        })
         .await;
     handle.retire().await.unwrap();
 }
@@ -1185,7 +1291,7 @@ async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
         .until("the compaction", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+                .any(|entry| matches!(entry, Event::Step { carry, .. } if carry.has_compaction()))
         })
         .await;
     let compaction = &script.requests()[1];
@@ -1204,10 +1310,12 @@ async fn compacting_an_agent_that_ended_its_turn_starts_no_turn() {
     let all = requests(&script, 3).await;
     let next = told_new(&all[2]);
     assert!(next.contains("next"), "{next}");
-    assert!(next.contains("cell-output-77"), "{next}");
+    // The compaction took the call, so the output waits for the next one.
+    assert!(next.contains("are waiting"), "{next}");
+    assert!(!next.contains("cell-output-77"), "{next}");
 }
 
-/// A compaction owes the model what policy gives back: the texts are quiet
+/// A compaction owes the model what policy gives back: the texts are `system`
 /// inputs logged after the compaction and before the next request, which
 /// tells them to the model once.
 #[tokio::test]
@@ -1228,7 +1336,7 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
         .until("the compaction", |entries| {
             entries
                 .iter()
-                .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+                .any(|entry| matches!(entry, Event::Step { carry, .. } if carry.has_compaction()))
         })
         .await;
     assert!(
@@ -1240,47 +1348,34 @@ async fn a_compaction_is_followed_by_the_policys_texts_once() {
     let all = requests(&script, 3).await;
     let after = told_new(&all[2]);
     assert!(after.contains(&restored), "{after}");
-    // In the log: compaction, then the quiet input, then the request that
-    // delivers it.
+    // In the log: compaction, then the request that carries the quiet input.
     let events = harness.events();
     let compacted = events
         .iter()
-        .position(|event| {
-            matches!(event, Event::Native { entry: Entry::Step { carry, .. }, .. } if carry.has_compaction())
-        })
+        .position(|event| matches!(event, Event::Step { carry, .. } if carry.has_compaction()))
         .unwrap();
-    let quiet = events
+    let is_restored = |input: &crate::record::Input| {
+        input.role == Role::System
+            && rho_agent_types::transcript::text_content(&input.content) == restored
+    };
+    let carried = events
         .iter()
         .position(|event| {
-            matches!(event, Event::Input { wake: InputWake::Quiet, content, .. }
-                if rho_agent_types::transcript::text_content(content) == restored)
+            matches!(event, Event::Request { inputs, .. } if inputs.iter().any(is_restored))
         })
-        .expect("the restored text is a quiet input");
-    let delivered = events[compacted..]
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                Event::Native {
-                    entry: Entry::RequestSent { .. },
-                    ..
-                }
-            )
-        })
-        .unwrap()
-        + compacted;
-    assert!(compacted < quiet && quiet < delivered, "{events:#?}");
+        .expect("a request carries the restored text");
+    assert!(compacted < carried, "{events:#?}");
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(
-                event,
-                Event::Input {
-                    wake: InputWake::Quiet,
-                    ..
-                }
-            ))
-            .count(),
+            .map(|event| match event {
+                Event::Request { inputs, .. } => inputs
+                    .iter()
+                    .filter(|input| input.role == Role::System)
+                    .count(),
+                _ => 0,
+            })
+            .sum::<usize>(),
         1,
         "restored once"
     );

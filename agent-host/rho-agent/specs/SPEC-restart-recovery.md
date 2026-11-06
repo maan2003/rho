@@ -52,9 +52,8 @@ It emits, ahead of everything the sources drain:
 
 Settling at the first request rather than at load means reading history never
 writes placeholder tool answers, and it puts the note beside the request it
-explains. It also makes recovery idempotent: those call ids appear in a
-`ToolResults` block of the resulting `NativeEvent::RequestStarted`, so a second restart
-derives an `owed` without them.
+explains. It also makes recovery idempotent: the resulting `Request` answers
+those calls, so a second restart derives an `owed` without them.
 
 Nothing else may consume `owed`. In particular `boundary` never reads it: what a
 request must carry is not a reason to make one.
@@ -154,13 +153,11 @@ execution journal.
 ### Claude ownership
 
 Claude Code restores its own conversation; Rho does not replay it as native
-provider input. Notebook admission and output ownership remain Rho's durable
-facts. A restart does not restore the Python namespace or its jobs.
+provider input. A restart does not restore the Python namespace or its jobs.
 
-Before releasing notebook output, Rho commits its attributed contributions.
-A transport failure leaves that batch pending across restart. The next eligible
-send carries it as a report, not a second initial result or a request to rerun
-code. A completed handoff retires the batch; a crash between write and recorded
-handoff can repeat the report, but cannot authorize repeating its side effects.
-Handoff does not claim the remote model consumed the report. Slash commands retain
-their command semantics; pending reports can wait for the CLI to become idle.
+Notebook output and inputs wait in memory. A request takes them, hands them to
+Claude Code, and logs them in its `Request` row. A transport failure puts them
+back for the next request. A crash loses what is not logged:
+output is gone, and the chat hands its messages again, which can repeat a message
+the model already read. Handoff does not claim the remote model consumed it.
+Slash commands retain their command semantics.

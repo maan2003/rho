@@ -420,7 +420,6 @@ impl Model {
                 }],
                 // Nothing here asks for a detail body: the transcript
                 // draws a call's line and never its output.
-                ServerFrame::Detail { .. } => Vec::new(),
             },
             AgentFrame::Log { agent, read, page } => self.log_page(host, agent, read, page),
             // What was read is on disk; the transcript is that much.
@@ -1290,11 +1289,16 @@ mod tests {
     }
 
     fn input(agent_id: AgentId, at: u64) -> LogEvent {
-        LogEvent::Input {
+        LogEvent::Request {
             agent: agent_id,
-            message: None,
-            text: "go".into(),
-            wake: rho_agent_types::InputWake::Quiet,
+            inputs: vec![crate::protocol::worksets::InputView {
+                message: None,
+                text: "go".into(),
+                role: rho_agent_types::Role::System,
+            }],
+            answers: true,
+            compaction: false,
+            timing: None,
             at: UnixMs(at),
         }
     }

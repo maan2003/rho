@@ -57,6 +57,19 @@ macro_rules! validated_string_type {
             }
         }
 
+        impl senax_encoder::Packer for $name {
+            fn pack(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+                self.as_str().to_owned().pack(writer)
+            }
+        }
+
+        impl senax_encoder::Unpacker for $name {
+            fn unpack(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+                let raw = String::unpack(reader)?;
+                <$name>::try_from(raw).map_err(|error| senax_encoder::EncoderError::Decode(error.to_string()))
+            }
+        }
+
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0

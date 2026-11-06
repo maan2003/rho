@@ -6161,7 +6161,6 @@ impl Workspace {
             .state(&agent_id)
             .cloned()
             .unwrap_or_else(|| rho_agents_client::state::UiAgentState {
-                exec_timings: Default::default(),
                 blocks: Vec::new(),
                 status: rho_agents_client::state::UiAgentStatus::Idle,
                 runtime: None,

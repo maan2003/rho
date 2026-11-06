@@ -16,7 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, InputWake, Mention, MentionKind, MessageId, TopicId,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, TopicId,
     WorksetId,
 };
 use tokio::sync::oneshot;
@@ -240,7 +240,7 @@ pub(crate) async fn instructions(agent: AgentId) -> anyhow::Result<String> {
 }
 
 /// `hooks.on_compaction`: what the model is given back after its context
-/// was compacted, as quiet inputs.
+/// was compacted, as `system` inputs.
 pub(crate) async fn on_compaction(agent: AgentId) -> anyhow::Result<Vec<String>> {
     hook(
         "on_compaction",
@@ -505,22 +505,19 @@ fn control(py: Python<'_>, agent: &str, control: Control) -> PyResult<()> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (agent, text, *, wake, message = None))]
+#[pyo3(signature = (agent, text, *, role, message = None))]
 fn input(
     py: Python<'_>,
     agent: &str,
     text: String,
-    wake: &str,
+    role: &str,
     message: Option<u64>,
 ) -> PyResult<()> {
-    let wake = match wake {
-        "person" => InputWake::Person,
-        "agent" => InputWake::Agent,
-        "quiet" => InputWake::Quiet,
+    let role = match role {
+        "user" => Role::User,
+        "tool" => Role::Tool,
         _ => {
-            return Err(PyValueError::new_err(
-                "wake is one of \"person\", \"agent\" or \"quiet\"",
-            ));
+            return Err(PyValueError::new_err("role is one of \"user\" or \"tool\""));
         }
     };
     control(
@@ -528,7 +525,7 @@ fn input(
         agent,
         Control::Input {
             content: vec![ContentPart::Text { text }],
-            wake,
+            role,
             message: message.map(|seq| MessageId(ChatSeq(seq))),
         },
     )

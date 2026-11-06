@@ -33,15 +33,18 @@ impl Wpos {
     }
 }
 
-/// How an input wakes the agent it reaches (`wake.rs` decides when).
+/// Who speaks in an input: where the model reads it and how soon it wakes for
+/// it ([DECISION-roles](../../../agent-host/rho-agent/specs/DECISION-roles.
+/// md)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum InputWake {
-    /// A person is waiting: soon, and it revives a stopped agent.
-    Person,
-    /// Another agent wrote.
-    Agent,
-    /// Rides along with the next request.
-    Quiet,
+pub enum Role {
+    /// A person typed it. It wakes the agent soon and revives a stopped one.
+    User,
+    /// Anything no person typed and Rho did not write, such as another agent's
+    /// message. The model reads it as a tool's output.
+    Tool,
+    /// Rho's own words. It wakes nobody and rides along with the next request.
+    System,
 }
 
 /// String properties Python sets on an agent. Rust reads none of them; the

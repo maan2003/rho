@@ -1,45 +1,16 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
-use rho_agent_types::transcript::{
-    ExecId, ProviderSpecificData, StreamingContextItem, ToolName, ToolOutput, ToolResult, ToolType,
-};
-use rho_agent_types::{ToolOutputStatus, UnixMs};
+use rho_agent_types::AgentId;
+use rho_agent_types::transcript::{ExecId, ToolName};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, StreamingResponse};
 use rho_claude::protocol::{
     AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
     UserOutputMessage,
 };
-use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::Value;
-use uuid::Uuid;
 
-use crate::{TranscriptCall, TranscriptLine};
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct ClaudeProviderSpecificData;
-
-impl TaggedSenax for ClaudeProviderSpecificData {
-    const TAG: &'static str = "claude.projected";
-}
-
-senax_encoder::__private::inventory::submit! {
-    rho_agent_types::transcript::__SenaxProviderSpecificDataEntry::new(
-        ClaudeProviderSpecificData::TAG,
-        |mut body: bytes::Bytes| -> senax_encoder::Result<Box<dyn ProviderSpecificData>> {
-            use bytes::Buf as _;
-            let value = ClaudeProviderSpecificData::decode(&mut body)?;
-            if body.remaining() != 0 {
-                return Err(senax_encoder::EncoderError::Decode(format!(
-                    "Trailing bytes while decoding registered tagged senax value '{}': {}",
-                    ClaudeProviderSpecificData::TAG,
-                    body.remaining()
-                )));
-            }
-            Ok(Box::new(value) as Box<dyn ProviderSpecificData>)
-        },
-    )
-}
+use crate::TranscriptCall;
+use crate::record::{CallResult, Event};
 
 pub(super) enum ClaudeStreamItem {
     Text(String),
@@ -131,31 +102,28 @@ impl ClaudeStreamItem {
         }
     }
 
-    pub(super) fn to_streaming_context_item(&self) -> anyhow::Result<StreamingContextItem> {
-        Ok(match self {
-            Self::Text(text) => StreamingContextItem::AssistantMessage {
-                provider_specific: Box::new(ClaudeProviderSpecificData),
-                content: vec![text.as_str().into()],
-                phase: None,
-            },
-            Self::Thinking(thinking) => StreamingContextItem::RawReasoning {
-                provider_specific: Box::new(ClaudeProviderSpecificData),
-                content: thinking.as_str().into(),
-                summary: Vec::new(),
-            },
-            Self::ToolUse {
-                id,
-                name,
-                arguments,
-            } => StreamingContextItem::ToolCall {
-                provider_specific: Box::new(ClaudeProviderSpecificData),
-                id: ExecId::try_from(id.as_str())?,
-                name: ToolName::try_from(name.as_str())?,
-                tool_type: ToolType::Function,
-                arguments: arguments.as_str().into(),
-            },
-        })
+    /// A call's id and name are ones Rho can hold.
+    pub(super) fn named_well(&self) -> bool {
+        match self {
+            Self::Text(_) | Self::Thinking(_) => true,
+            Self::ToolUse { id, name, .. } => {
+                ExecId::try_from(id.as_str()).is_ok() && ToolName::try_from(name.as_str()).is_ok()
+            }
+        }
     }
+}
+
+/// What the model has said that has no row yet. A finished block's row takes
+/// it out of `items`, so this never repeats a row.
+pub(super) fn said_so_far(items: &BTreeMap<usize, ClaudeStreamItem>) -> String {
+    let said: Vec<&str> = items
+        .values()
+        .filter_map(|item| match item {
+            ClaudeStreamItem::Text(text) if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    said.join("\n")
 }
 
 /// A complete replaceable snapshot of the visible blocks of one provider
@@ -181,24 +149,33 @@ pub(super) fn live_response(
 /// carries: every block's event repeats the message's usage, and a
 /// reader counts a request once.
 ///
-/// `calls_made` is when each open call was made, by id. Claude's log
-/// stamps lines, not tool runs, so a result's span is from the assistant
-/// line that made the call to the user line that answered it; without
-/// this a result carried no times and the transcript drew no duration.
-#[derive(Debug, Default)]
+/// `answered` is the call the newest request answered: that request's row
+/// holds what the stream's result says.
+#[derive(Debug)]
 pub(super) struct Projection {
+    agent: AgentId,
     usage_told: Option<String>,
-    calls_made: HashMap<String, UnixMs>,
+    pub(super) answered: Option<ExecId>,
+}
+
+impl Projection {
+    pub(super) fn new(agent: AgentId) -> Self {
+        Self {
+            agent,
+            usage_told: None,
+            answered: None,
+        }
+    }
 }
 
 /// The row an `assistant` event of the stream becomes: one finished
-/// content block, with the message's id, usage, uuid and time. `None`
-/// for a block a reader never sees (thinking only, empty).
-pub(super) fn assistant_row(
+/// content block, with the message's usage. `None` for a block a reader
+/// never sees (thinking only, empty).
+pub(super) fn reply_row(
     message: &AssistantMessage,
     usage_model: crate::log::AgentUsageModel,
     projection: &mut Projection,
-) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+) -> anyhow::Result<Option<Event<'static>>> {
     let mut text = String::new();
     let mut calls = Vec::new();
     for content in &message.message.content {
@@ -225,113 +202,56 @@ pub(super) fn assistant_row(
         (Some(usage), None) => Some(usage_bucket(usage, usage_model)),
         _ => None,
     };
-    let at = line_time(message.timestamp.as_deref());
-    for call in &calls {
-        projection.calls_made.insert(call.id.clone(), at);
-    }
-    Ok(Some((
-        row_uuid(message.uuid.as_deref()),
-        TranscriptLine::Assistant {
-            text,
-            calls,
-            usage,
-            context_used,
-        },
-        at,
-    )))
+    Ok(Some(Event::ClaudeReply {
+        agent: projection.agent,
+        text,
+        calls,
+        usage,
+        context_used,
+    }))
 }
 
-/// The row a `user` event of the stream becomes: the results it
-/// carries, else what the person said. Claude's own command echoes
-/// (`<command-name>`, `<local-command-stdout>`) are not something the
-/// person said.
-pub(super) fn user_row(
+/// The row a `user` event of the stream becomes: the results no request
+/// answered. An echo of text makes no row, since the request holds that text.
+pub(super) fn results_row(
     message: &UserOutputMessage,
-    projection: &mut Projection,
-) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+    projection: &Projection,
+) -> anyhow::Result<Option<Event<'static>>> {
     let Some(body) = &message.message else {
         return Ok(None);
     };
-    let at = line_time(message.timestamp.as_deref());
-    let mut text = String::new();
     let mut results = Vec::new();
     for content in &body.content {
-        match content {
-            OutputContent::Text { text: part } => {
-                if !is_auxiliary_user_text(part) {
-                    push_line(&mut text, part);
-                }
-            }
-            OutputContent::Image { source } => push_line(&mut text, image_marker(source)),
-            OutputContent::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => results.push(tool_result(
-                tool_use_id,
-                content,
-                is_error.unwrap_or(false),
-                // A result whose call this projection never saw (a log
-                // read from its middle) spans nothing rather than
-                // everything since the epoch.
-                projection.calls_made.remove(tool_use_id).unwrap_or(at),
-                at,
-            )?),
-            OutputContent::Other => {}
+        let OutputContent::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = content
+        else {
+            continue;
+        };
+        let call = ExecId::try_from(tool_use_id.as_str())?;
+        if projection.answered.as_ref() != Some(&call) {
+            results.push(CallResult {
+                call,
+                output: result_text(content)?,
+            });
         }
     }
-    let uuid = row_uuid(message.uuid.as_deref());
-    if !results.is_empty() {
-        return Ok(Some((uuid, TranscriptLine::ToolResults { results }, at)));
-    }
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some((uuid, TranscriptLine::User { text }, at)))
+    Ok((!results.is_empty()).then_some(Event::ClaudeResults {
+        agent: projection.agent,
+        results,
+    }))
 }
 
 /// The row a `compact_boundary` becomes.
 pub(super) fn compacted_row(
-    uuid: Option<&str>,
+    projection: &Projection,
     metadata: Option<&SystemCompactMetadata>,
-) -> (Uuid, TranscriptLine, UnixMs) {
-    (
-        row_uuid(uuid),
-        TranscriptLine::Compacted {
-            context_used: metadata.and_then(|metadata| metadata.post_tokens),
-        },
-        UnixMs::now(),
-    )
-}
-
-/// The line's uuid as Claude names it (the same in its file); one of
-/// Rho's own for a message that came without one.
-fn row_uuid(uuid: Option<&str>) -> Uuid {
-    uuid.and_then(|uuid| Uuid::parse_str(uuid).ok())
-        .unwrap_or_else(Uuid::new_v4)
-}
-
-pub(super) fn line_time(timestamp: Option<&str>) -> UnixMs {
-    timestamp
-        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|time| UnixMs(time.timestamp_millis().max(0) as u64))
-        .unwrap_or_else(UnixMs::now)
-}
-
-fn push_line(output: &mut String, part: &str) {
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(part);
-}
-
-fn image_marker(source: &Value) -> &'static str {
-    match source.get("media_type").and_then(Value::as_str) {
-        Some("image/png") => "[image: PNG]",
-        Some("image/jpeg") => "[image: JPEG]",
-        Some("image/webp") => "[image: WebP]",
-        Some("image/gif") => "[image: GIF]",
-        _ => "[image]",
+) -> Event<'static> {
+    Event::ClaudeCompacted {
+        agent: projection.agent,
+        context_used: metadata.and_then(|metadata| metadata.post_tokens),
     }
 }
 
@@ -355,14 +275,8 @@ fn usage_bucket(
     }
 }
 
-fn tool_result(
-    tool_use_id: &str,
-    content: &Value,
-    is_error: bool,
-    started_at: UnixMs,
-    finished_at: UnixMs,
-) -> anyhow::Result<ToolResult> {
-    let output = match content {
+fn result_text(content: &Value) -> anyhow::Result<String> {
+    Ok(match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
@@ -371,30 +285,7 @@ fn tool_result(
             .join(""),
         Value::Null => String::new(),
         other => serde_json::to_string(other)?,
-    };
-    Ok(ToolResult {
-        call_id: ExecId::try_from(tool_use_id)?,
-        tool_type: ToolType::Function,
-        body: ToolOutput {
-            full_output: None,
-            images: Arc::new(Vec::new()),
-            output: Arc::new(output),
-            status: if is_error {
-                ToolOutputStatus::Error
-            } else {
-                ToolOutputStatus::Success
-            },
-        },
-        started_at,
-        finished_at,
     })
-}
-
-fn is_auxiliary_user_text(text: &str) -> bool {
-    let text = text.trim_start();
-    text.starts_with("<command-name>")
-        || text.starts_with("<local-command-stdout>")
-        || text.starts_with("<task-notification>")
 }
 
 #[cfg(test)]
@@ -404,6 +295,10 @@ mod tests {
     use super::*;
 
     const UUID: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn agent() -> AgentId {
+        AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()
+    }
 
     fn user(message: Value) -> UserOutputMessage {
         serde_json::from_value(json!({
@@ -425,111 +320,60 @@ mod tests {
         .unwrap()
     }
 
-    fn user_line(message: Value) -> Option<TranscriptLine> {
-        user_row(&user(message), &mut Projection::default())
-            .unwrap()
-            .map(|(_, line, _)| line)
+    fn results_of(event: Option<Event<'static>>) -> Vec<CallResult> {
+        match event {
+            Some(Event::ClaudeResults { results, .. }) => results,
+            None => Vec::new(),
+            other => panic!("expected results, got {other:?}"),
+        }
     }
 
-    fn assistant_line(message: Value) -> Option<TranscriptLine> {
-        assistant_row(
-            &assistant(message),
-            crate::log::AgentUsageModel::OPUS,
-            &mut Projection::default(),
-        )
-        .unwrap()
-        .map(|(_, line, _)| line)
-    }
-
-    /// The log stamps lines, so a result's span is from the line that made
-    /// the call to the line that answered it. A result whose call was not
-    /// seen spans nothing.
+    /// The request's row holds what it answered with. What no request
+    /// answered, such as a call Claude Code refused, has only this row.
     #[test]
-    fn a_result_spans_its_call_line_to_its_own() {
-        let mut projection = Projection::default();
-        let call = assistant(json!({"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+    fn only_a_result_no_request_answered_is_a_row() {
+        let mut projection = Projection::new(agent());
+        projection.answered = Some(ExecId::try_from("toolu_exec").unwrap());
+        let message = user(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_exec", "content": "from the notebook"},
+            {"type": "tool_result", "tool_use_id": "toolu_refused", "is_error": true, "content": "boom"},
         ]}));
-        let (_, _, called_at) =
-            assistant_row(&call, crate::log::AgentUsageModel::OPUS, &mut projection)
-                .unwrap()
-                .unwrap();
-        let mut answer: UserOutputMessage = user(json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a\n"},
-            {"type": "tool_result", "tool_use_id": "toolu_unseen", "content": "b\n"},
+        let results = results_of(results_row(&message, &projection).unwrap());
+        assert_eq!(
+            results,
+            vec![CallResult {
+                call: ExecId::try_from("toolu_refused").unwrap(),
+                output: "boom".into(),
+            }]
+        );
+        let answered = user(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_exec", "content": "from the notebook"},
         ]}));
-        answer.timestamp = Some("2026-09-06T10:00:04.500Z".to_owned());
-        let (_, line, answered_at) = user_row(&answer, &mut projection).unwrap().unwrap();
-        let TranscriptLine::ToolResults { results } = line else {
-            panic!("expected results");
-        };
-        assert_eq!(answered_at, UnixMs(called_at.0 + 3_500));
-        assert_eq!(results[0].started_at, called_at);
-        assert_eq!(results[0].finished_at, answered_at);
-        assert_eq!(results[1].started_at, answered_at);
-        assert_eq!(results[1].finished_at, answered_at);
-        assert!(
-            projection.calls_made.is_empty(),
-            "an answered call is forgotten"
-        );
+        assert_eq!(results_row(&answered, &projection).unwrap(), None);
     }
 
     #[test]
-    fn a_persons_text_is_a_user_line_with_the_streams_time() {
-        let message = user(json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}));
-        let (uuid, line, at) = user_row(&message, &mut Projection::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
-        assert_eq!(
-            line,
-            TranscriptLine::User {
-                text: "hello".to_owned()
-            }
-        );
-        assert_eq!(at, UnixMs(1788688800000));
+    fn an_echo_is_no_row() {
+        let projection = Projection::new(agent());
+        for content in [
+            json!([{"type": "text", "text": "hello"}]),
+            json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]),
+            json!("<command-name>/compact</command-name>"),
+        ] {
+            let message = user(json!({"role": "user", "content": content}));
+            assert_eq!(results_row(&message, &projection).unwrap(), None);
+        }
     }
 
     #[test]
-    fn images_become_bounded_markers() {
-        assert_eq!(
-            user_line(json!({"role": "user", "content": [
-                {"type": "text", "text": "look"},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
-            ]})),
-            Some(TranscriptLine::User {
-                text: "look\n[image: PNG]".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn a_commands_own_output_is_not_a_line() {
-        assert_eq!(
-            user_line(json!({"role": "user", "content": "<command-name>/compact</command-name>"})),
-            None
-        );
-        assert_eq!(
-            user_line(
-                json!({"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]})
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn a_failed_result_is_an_error() {
-        let Some(TranscriptLine::ToolResults { results }) = user_line(
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "boom"},
-            ]}),
-        ) else {
-            panic!("expected results");
-        };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].call_id.as_str(), "toolu_1");
-        assert_eq!(results[0].body.status, ToolOutputStatus::Error);
-        assert_eq!(results[0].body.output.as_str(), "boom");
+    fn a_results_parts_join() {
+        let message = user(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "text", "text": "a"}, {"type": "text", "text": "b"},
+            ]},
+        ]}));
+        let results = results_of(results_row(&message, &Projection::new(agent())).unwrap());
+        assert_eq!(results[0].output, "ab");
     }
 
     #[test]
@@ -545,21 +389,22 @@ mod tests {
                 {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "a.rs"}},
             ]}),
         );
-        let mut told = Projection::default();
-        let (_, first, _) = assistant_row(&text, crate::log::AgentUsageModel::OPUS, &mut told)
+        let mut told = Projection::new(agent());
+        let first = reply_row(&text, crate::log::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
-        let (_, second, _) = assistant_row(&call, crate::log::AgentUsageModel::OPUS, &mut told)
+        let second = reply_row(&call, crate::log::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
-        let TranscriptLine::Assistant {
+        let Event::ClaudeReply {
             text,
             calls,
             usage,
             context_used,
+            ..
         } = first
         else {
-            panic!("expected assistant");
+            panic!("expected a reply");
         };
         assert_eq!(text, "reading");
         assert!(calls.is_empty());
@@ -567,8 +412,8 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 100);
         assert_eq!(usage.requests, 1);
         assert_eq!(context_used, Some(110));
-        let TranscriptLine::Assistant { calls, usage, .. } = second else {
-            panic!("expected assistant");
+        let Event::ClaudeReply { calls, usage, .. } = second else {
+            panic!("expected a reply");
         };
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
@@ -577,11 +422,17 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_only_block_is_no_line() {
+    fn a_thinking_only_block_is_no_row() {
+        let message = assistant(
+            json!({"role": "assistant", "id": "msg_2", "content": [{"type": "thinking", "thinking": "hmm"}]}),
+        );
         assert_eq!(
-            assistant_line(
-                json!({"role": "assistant", "id": "msg_2", "content": [{"type": "thinking", "thinking": "hmm"}]})
-            ),
+            reply_row(
+                &message,
+                crate::log::AgentUsageModel::OPUS,
+                &mut Projection::new(agent()),
+            )
+            .unwrap(),
             None
         );
     }
@@ -593,14 +444,45 @@ mod tests {
             pre_tokens: Some(9000),
             post_tokens: Some(2000),
         };
-        let (uuid, line, _) = compacted_row(Some(UUID), Some(&metadata));
-        assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
         assert_eq!(
-            line,
-            TranscriptLine::Compacted {
-                context_used: Some(2000)
+            compacted_row(&Projection::new(agent()), Some(&metadata)),
+            Event::ClaudeCompacted {
+                agent: agent(),
+                context_used: Some(2000),
             }
         );
+    }
+
+    /// Only what the model said counts, not what it thought or called.
+    #[test]
+    fn said_so_far_is_only_the_text() {
+        let mut items = BTreeMap::new();
+        assert_eq!(said_so_far(&items), "");
+        items.insert(2, ClaudeStreamItem::Thinking("hmm".into()));
+        items.insert(5, ClaudeStreamItem::Text("first".into()));
+        items.insert(6, ClaudeStreamItem::Text("  ".into()));
+        items.insert(
+            7,
+            ClaudeStreamItem::ToolUse {
+                id: "call-1".into(),
+                name: "exec".into(),
+                arguments: "{}".into(),
+            },
+        );
+        items.insert(9, ClaudeStreamItem::Text("second".into()));
+        assert_eq!(said_so_far(&items), "first\nsecond");
+    }
+
+    #[test]
+    fn a_misnamed_call_is_not_named_well() {
+        let call = |id: &str, name: &str| ClaudeStreamItem::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        };
+        assert!(call("toolu_1", "exec").named_well());
+        assert!(!call("toolu_1", "no such name!").named_well());
+        assert!(!call("", "exec").named_well());
     }
 
     #[test]

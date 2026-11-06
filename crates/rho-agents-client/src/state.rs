@@ -24,9 +24,6 @@ pub struct UiAgentState {
     /// Cumulative billable usage for this agent across all of its turns.
     #[senax(default)]
     pub usage: UiAgentUsage,
-    #[senax(default)]
-    pub exec_timings:
-        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

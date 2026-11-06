@@ -54,11 +54,10 @@ cannot use provider continuation. Interrupted execution synthesizes its call
 from the admitted code instead of pretending a completed item arrived. A streamed
 call supplies a carry before code, so interruption can preserve admitted code without exposing provider IDs. Transcript readers use IDs only
 for display.
-Each `RequestSent` records only the typed contributions collected for that
-attempt, not provider acknowledgment. Notebook sources retain identity, output,
-images, and typed completion facts; their renderer is deterministic. Human
-messages reference immutable `Received` records. Every `RequestSent` names its
-delivered messages in order and any messages acknowledged without delivery.
+Each `Request` records what that attempt carried, not provider acknowledgment. Notebook sources retain identity, output, images, and
+typed completion facts; at a request their report is rendered into the output
+of its `Request` row. Human
+messages are named by the inputs of the `Request` that carried them.
 New native attempts collect all unread messages. Request construction merges
 consecutive unanswered reports, preserving output and advancing source state,
 until a complete or interrupted `Step` closes the group. Retries collect fresh
@@ -180,17 +179,20 @@ execution and output without rolling back external effects. Settlement, model
 completion, and job completion are distinct live facts
 ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
-Output reads lease a stable contribution until acknowledgment. Notebook replies and reports project once into canonical native inputs carrying
-complete text, images, and status. Historical function-call evidence remains
-replay data, not an active tool capability. Native requests enqueue owned
-contributions before acknowledging notebook buffers, without waiting for disk.
-Claude transfers them to a durable outbox before transport; a failed handoff
-leaves them recoverable.
-Retained batches participate in boundary scheduling and stop rules; when a later
-exec is open, its reply carries retained output as reports. The replacement batch
-owns both old and new contributions before fresh leases are acknowledged.
-A recovered Claude batch becomes an attributed report, not another initial tool
-result and never replayed source. Transport handoff is not proof of consumption.
+At each request, both runtimes take the notebook's report and everything else
+that waits in memory into one `Request` row, and `entry::compose` splits it by
+role ([DECISION-roles](DECISION-roles.md)). Taking it clears the
+facts that woke the model, so it never wakes the model twice. Historical
+function-call evidence remains replay data, not an active tool capability. Claude
+logs after transport and puts back what a failed handoff did not carry, for the
+next exec result; it never replays its source. Transport handoff is not proof of
+consumption. An agent that holds anything in memory does not unload, because
+nothing would hand it again.
+
+The `Request` row is the only copy of what Rho answered a call with. Claude Code's
+echoes are not logged. Rho names the session line of the text it hands over, and
+the `Request` holds that uuid for a rewind to fork at. `ClaudeResults` holds what
+no request answered: Claude Code's own tools, a call Rho refused, or a call cut off.
 
 One initial reply answers an exec; subsequent contributions are reports
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).
@@ -217,9 +219,8 @@ Titles do not write conversation context or classify turn outcomes. Runtime
 status and peer completion delivery remain independent of naming.
 
 Native and Claude observations share the GUI projection, not a conversation
-writer. Timing identifies provider first block, argument completion, response
-completion, boundary, and transport handoff. It does not measure Python execution.
-`WakeFacts` separately records source occurrence, observation, deadline, and trigger.
-Native argument completion observes the provider's argument-end event, not
-item completion or Python EOF. Live and committed tool rows use the same observed timing; later output must not
+writer. A Claude call's timing identifies provider first block, argument completion,
+response completion, boundary, and transport handoff. It does not measure Python
+execution. The worker holds it in memory and the `Request` that answers the call
+carries it, so a running call shows only how long it has run. Later output must not
 rewrite the original result's status or duration.
