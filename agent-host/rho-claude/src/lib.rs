@@ -78,7 +78,6 @@ impl ClaudeCodeOptions {
             "--input-format".to_owned(),
             "stream-json".to_owned(),
             "--include-partial-messages".to_owned(),
-            "--replay-user-messages".to_owned(),
             "--permission-mode".to_owned(),
             "bypassPermissions".to_owned(),
             "--allow-dangerously-skip-permissions".to_owned(),
@@ -234,14 +233,6 @@ impl ClaudeCode {
     pub async fn interrupt(&mut self) -> Result<String> {
         self.write_control_request(serde_json::json!({"subtype": "interrupt"}))
             .await
-    }
-
-    pub async fn cancel_async_message(&mut self, message_uuid: &str) -> Result<String> {
-        self.write_control_request(serde_json::json!({
-            "subtype": "cancel_async_message",
-            "message_uuid": message_uuid,
-        }))
-        .await
     }
 
     /// Registers in-process MCP servers: from here on the CLI routes their
@@ -455,7 +446,6 @@ mod tests {
                 "--input-format",
                 "stream-json",
                 "--include-partial-messages",
-                "--replay-user-messages",
                 "--permission-mode",
                 "bypassPermissions",
                 "--allow-dangerously-skip-permissions",
@@ -760,24 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_command_lifecycle_event() {
-        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
-            "type": "command_lifecycle",
-            "command_uuid": "64c38380-e21a-4bff-b116-238ef5b585a6",
-            "state": "queued",
-            "uuid": "002995d7-9296-4ac7-aea8-29671133fe06",
-            "session_id": "98badc56-ce7b-4f69-9e4d-47696fd08dce"
-        }))
-        .unwrap();
-
-        let protocol::ClaudeEvent::CommandLifecycle(message) = event else {
-            panic!("expected command lifecycle event");
-        };
-        assert_eq!(message.command_uuid, "64c38380-e21a-4bff-b116-238ef5b585a6");
-        assert_eq!(message.state, "queued");
-    }
-
-    #[test]
     fn ignores_unknown_top_level_event() {
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "future_sdk_event",
@@ -868,21 +840,6 @@ mod tests {
                 session_id: Some(_),
                 ..
             })
-        ));
-
-        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
-            "type": "system",
-            "subtype": "session_state_changed",
-            "state": "idle",
-            "session_id": "00000000-0000-4000-8000-000000000001"
-        }))
-        .unwrap();
-        assert!(matches!(
-            event,
-            protocol::ClaudeEvent::System(protocol::SystemMessage::SessionStateChanged {
-                state: Some(state),
-                ..
-            }) if state == "idle"
         ));
 
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({

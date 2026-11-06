@@ -4,7 +4,7 @@
 //! from Claude protocol/transcript messages into Rho agent vocabulary.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,7 +26,7 @@ use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
-use crate::worker::shared::waiting::Waiting;
+use crate::worker::shared::waiting::{Taken, Waiting};
 use crate::{AgentStatus, InferenceState, RuntimeState};
 
 pub(crate) mod projection;
@@ -141,6 +141,17 @@ async fn end_process(process: ClaudeCode, call_open: bool) -> anyhow::Result<()>
     }
 }
 
+/// A request whose call is answered, and whose text waits for that turn's
+/// result.
+struct Following {
+    text: Vec<ContentPart>,
+    turn: Uuid,
+    /// All the request carried: its row goes in when the text goes.
+    taken: Taken,
+    notices: Vec<RequestNotice>,
+    timing: Option<CallTiming>,
+}
+
 /// What the running Claude Code process was started with: a change to any
 /// of it restarts the process at the next send.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +200,10 @@ pub(crate) struct ClaudeLoop {
     /// The request that answers one carries its timing.
     response_execs: BTreeMap<usize, CallTiming>,
     /// Turns written to Claude Code that it has not echoed yet.
-    queued_turns: VecDeque<String>,
+    /// A request whose text waits for the turn its answer ended.
+    following: Option<Following>,
+    /// `/compact` waits for the turn that is running.
+    compact_wanted: bool,
     /// Usage of the in-flight message: `message_start` seeds it,
     /// `message_delta` overlays the final counts (`message_start`'s
     /// `input_tokens` is a streaming placeholder). Snapshots are taken as-is,
@@ -402,7 +416,8 @@ impl ClaudeLoop {
             response_id: None,
             stream_items: BTreeMap::new(),
             response_execs: BTreeMap::new(),
-            queued_turns: VecDeque::new(),
+            following: None,
+            compact_wanted: false,
             turn_usage: None,
             cancelling: false,
             pending_rewind,
@@ -481,8 +496,12 @@ impl ClaudeLoop {
                             // What the turn held back goes now. A stop is
                             // handled inside its control, so it never gets
                             // here.
-                            if turn_ended && matches!(self.inference_state, InferenceState::Idle) {
-                                self.deliver_unread().await?;
+                            if turn_ended {
+                                if self.turn_follows() {
+                                    self.next_turn().await?;
+                                } else if matches!(self.inference_state, InferenceState::Idle) {
+                                    self.deliver_unread().await?;
+                                }
                             }
                         }
                         Ok(None) => {
@@ -490,11 +509,6 @@ impl ClaudeLoop {
                             self.process = None;
                             self.forget_pending_exec();
                             self.recover_pending_rewind().await?;
-                            // Unechoed sends died with the process; a stale
-                            // entry here would pin every later turn end in
-                            // the streaming state (the rail's lamp never
-                            // settles).
-                            self.queued_turns.clear();
                             // An exit without a result leaves the turn open;
                             // settle it as an error so the turn end is
                             // observable (attention, the parent's message).
@@ -513,7 +527,6 @@ impl ClaudeLoop {
                             self.process = None;
                             self.forget_pending_exec();
                             self.recover_pending_rewind().await?;
-                            self.queued_turns.clear();
                             self.fail(error).await?;
                         }
                     },
@@ -617,37 +630,27 @@ impl ClaudeLoop {
                 self.deliver_unread().await?;
             }
             ClaudeControl::Compact => {
-                // A slash command goes alone: inputs and notebook output
-                // wait for the next turn.
+                // A slash command goes alone, when no turn is running: inputs
+                // and notebook output wait for the next turn.
                 if self.archived {
                     return Ok(());
                 }
-                let compact = vec![ContentPart::Text {
-                    text: "/compact".into(),
-                }];
-                // A model waiting in its call would never get to the command.
-                if self.waiting_in_call() {
-                    return self
-                        .request(vec![RequestNotice::NothingNew], Some(compact))
-                        .await;
+                self.compact_wanted = true;
+                if !matches!(self.inference_state, InferenceState::Responding) {
+                    self.next_turn().await?;
                 }
-                if let Err(error) = self.ensure_process().await {
-                    return self.fail(error).await;
-                }
-                self.hand_off(compact, Uuid::new_v4().to_string()).await?;
             }
             ClaudeControl::Cancel => {
                 let kind = self.inference_state.clone();
                 let busy = matches!(kind, InferenceState::Responding);
-                let queued = self.queued_turns.iter().cloned().collect::<Vec<_>>();
-                self.queued_turns.clear();
+                self.compact_wanted = false;
+                self.give_back_following().await?;
                 self.cancelling = busy;
                 self.cancel_python().await?;
                 self.waiting.quiet();
                 if busy && self.process.is_some() {
                     let result =
-                        tokio::time::timeout(Duration::from_secs(30), self.soft_cancel(&queued))
-                            .await;
+                        tokio::time::timeout(Duration::from_secs(30), self.soft_cancel()).await;
                     if !matches!(result, Ok(Ok(()))) {
                         if let Ok(Err(error)) = result {
                             if error.is::<StoreError>() {
@@ -696,26 +699,21 @@ impl ClaudeLoop {
         if self.archived || !(person || tool) {
             return Ok(());
         }
-        if matches!(self.inference_state, InferenceState::Responding)
-            || !self.queued_turns.is_empty()
-            || self.call_open()
-        {
+        if matches!(self.inference_state, InferenceState::Responding) || self.call_open() {
             return Ok(());
         }
-        self.request(Vec::new(), None).await
+        self.request(Vec::new()).await
     }
 
     /// Sends one request: it pulls what the notebook has said and what waits,
     /// and `compose` splits that by role. An open call is answered with the
-    /// `tool` part. The rest opens a turn of its own, after `command` if there
-    /// is one: the answer ends the running turn, and Claude Code sends the text
-    /// behind the result as `role: user`. Its row goes in once the transport
-    /// has it.
-    async fn request(
-        &mut self,
-        mut notices: Vec<RequestNotice>,
-        command: Option<Vec<ContentPart>>,
-    ) -> anyhow::Result<()> {
+    /// `tool` part. The rest opens a turn of its own. With a call open that
+    /// answer ends the running turn, and the text waits for the turn's result,
+    /// so Claude Code never holds text it could fold into a turn. The row goes
+    /// in once the transport has all of it.
+    async fn request(&mut self, mut notices: Vec<RequestNotice>) -> anyhow::Result<()> {
+        // Claude Code went on past the answer, so the text goes with this one.
+        self.give_back_following().await?;
         let mut steps = Steps::new();
         if !self.call_open() {
             if let Err(error) = self.ensure_process().await {
@@ -727,6 +725,7 @@ impl ClaudeLoop {
             self.waiting.output(output_content(&report));
         }
         let open = self.call_open();
+        let ends_turn_for_compact = self.compact_wanted && self.waiting_in_call();
         let taken = self.waiting.take(open);
         if !open && self.waiting.holds_tool() {
             notices.push(RequestNotice::Waiting);
@@ -735,64 +734,92 @@ impl ClaudeLoop {
         let user = composed.user.concat();
         // Rho names the line of the text, and a rewind forks there.
         let turn = (!user.is_empty()).then(Uuid::new_v4);
-        let turns: Vec<(Vec<ContentPart>, Uuid)> = command
-            .map(|command| (command, Uuid::new_v4()))
-            .into_iter()
-            .chain(turn.map(|turn| (user, turn)))
-            .collect();
-        let mut timing = None;
-        let handed = if open {
-            let host = self.python.as_mut().expect("a call is open");
-            let failed = host.latest_failed();
-            let pending = host.take_pending().expect("a call is open");
-            let items = composed.result.iter().map(mcp_item).collect();
-            // Claude Code samples the model after an error, whatever the
-            // end-turn flag says, and a turn must follow this result.
-            let mut result = rho_claude::mcp::tool_result(items, failed && turns.is_empty());
-            if !turns.is_empty() {
-                // It ends the turn on this result without sampling the model.
-                result["_meta"] = serde_json::json!({ "claude/endTurn": true });
-            }
-            let reply = serde_json::json!({
-                "mcp_response": {
-                    "jsonrpc": "2.0", "id": pending.rpc_id,
-                    "result": result,
-                },
-            });
-            timing = self
-                .response_execs
-                .values()
-                .find(|call| call.call == pending.exec_id)
-                .cloned();
-            if let Some(call) = &mut timing {
-                call.timing.boundary_at = Some(UnixMs::now());
-            }
-            if !self.respond_control(&pending.request_id, Ok(reply)).await {
-                // What it took waits for the next request. A future send
-                // carries the output, and never reruns its source.
-                self.waiting.put_back(taken);
-                self.close_process().await?;
-                return self
-                    .fail(anyhow::anyhow!(
-                        "Claude Code output transport failed; notebook output is retained"
-                    ))
-                    .await;
-            }
-            Some(pending.exec_id)
-        } else {
-            None
-        };
-        for (content, uuid) in turns {
-            if !self.hand_off(content, uuid.to_string()).await? {
+        if !open {
+            if let Some(turn) = turn
+                && !self.hand_off(user, turn).await?
+            {
                 self.waiting.put_back(taken);
                 return Ok(());
             }
+            steps.mark("written");
+            self.projection.answered = None;
+            self.append_request(taken, notices, turn, None).await?;
+            steps.mark("logged");
+            eprintln!(
+                "rho-agent: Claude request of {} in {steps}",
+                self.agent_id.encoded()
+            );
+            return Ok(());
+        }
+        let host = self.python.as_mut().expect("a call is open");
+        let failed = host.latest_failed();
+        let pending = host.take_pending().expect("a call is open");
+        let items = composed.result.iter().map(mcp_item).collect();
+        let ends_turn = turn.is_some() || ends_turn_for_compact;
+        // Claude Code samples the model after an error, whatever the
+        // end-turn flag says, and a turn must follow this result.
+        let mut result = rho_claude::mcp::tool_result(items, failed && !ends_turn);
+        if ends_turn {
+            // It ends the turn on this result without sampling the model.
+            result["_meta"] = serde_json::json!({ "claude/endTurn": true });
+        }
+        let reply = serde_json::json!({
+            "mcp_response": {
+                "jsonrpc": "2.0", "id": pending.rpc_id,
+                "result": result,
+            },
+        });
+        let mut timing = self
+            .response_execs
+            .values()
+            .find(|call| call.call == pending.exec_id)
+            .cloned();
+        if let Some(call) = &mut timing {
+            call.timing.boundary_at = Some(UnixMs::now());
+        }
+        if !self.respond_control(&pending.request_id, Ok(reply)).await {
+            // What it took waits for the next request. A future send
+            // carries the output, and never reruns its source.
+            self.waiting.put_back(taken);
+            self.close_process().await?;
+            return self
+                .fail(anyhow::anyhow!(
+                    "Claude Code output transport failed; notebook output is retained"
+                ))
+                .await;
         }
         steps.mark("written");
-        self.projection.answered = handed;
+        self.projection.answered = Some(pending.exec_id);
         if let Some(call) = &mut timing {
             call.timing.handed_off_at = Some(UnixMs::now());
         }
+        if let Some(turn) = turn {
+            self.following = Some(Following {
+                text: user,
+                turn,
+                taken,
+                notices,
+                timing,
+            });
+            self.published();
+            return Ok(());
+        }
+        self.append_request(taken, notices, None, timing).await?;
+        steps.mark("logged");
+        eprintln!(
+            "rho-agent: Claude request of {} in {steps}",
+            self.agent_id.encoded()
+        );
+        Ok(())
+    }
+
+    async fn append_request(
+        &self,
+        taken: Taken,
+        notices: Vec<RequestNotice>,
+        turn: Option<Uuid>,
+        timing: Option<CallTiming>,
+    ) -> anyhow::Result<()> {
         self.host
             .append(Event::Request {
                 agent: self.agent_id,
@@ -804,12 +831,72 @@ impl ClaudeLoop {
                 timing,
             })
             .await?;
-        steps.mark("logged");
-        eprintln!(
-            "rho-agent: Claude request of {} in {steps}",
-            self.agent_id.encoded()
-        );
         Ok(())
+    }
+
+    /// The ended turn left something to send.
+    fn turn_follows(&self) -> bool {
+        self.compact_wanted || self.following.is_some()
+    }
+
+    /// Sends what waits for a turn to end, one turn at a time.
+    async fn next_turn(&mut self) -> anyhow::Result<()> {
+        if std::mem::take(&mut self.compact_wanted) {
+            if let Err(error) = self.ensure_process().await {
+                return self.fail(error).await;
+            }
+            let compact = vec![ContentPart::Text {
+                text: "/compact".into(),
+            }];
+            self.hand_off(compact, Uuid::new_v4()).await?;
+            return Ok(());
+        }
+        let Some(following) = self.following.take() else {
+            return Ok(());
+        };
+        let Following {
+            text,
+            turn,
+            taken,
+            notices,
+            timing,
+        } = following;
+        if self.hand_off(text, turn).await? {
+            return self
+                .append_request(taken, notices, Some(turn), timing)
+                .await;
+        }
+        self.give_back(taken, notices, timing).await
+    }
+
+    /// The answer went but its text cannot follow it.
+    async fn give_back_following(&mut self) -> anyhow::Result<()> {
+        match self.following.take() {
+            Some(following) => {
+                self.give_back(following.taken, following.notices, following.timing)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The row says what the answer carried, and the text waits for the next
+    /// request.
+    async fn give_back(
+        &mut self,
+        mut taken: Taken,
+        mut notices: Vec<RequestNotice>,
+        timing: Option<CallTiming>,
+    ) -> anyhow::Result<()> {
+        self.waiting.keep_text(&mut taken);
+        // The model read a line here, so the row still answers the call.
+        if compose(true, &notices, &taken.output, &taken.inputs)
+            .result
+            .is_empty()
+        {
+            notices.push(RequestNotice::NothingNew);
+        }
+        self.append_request(taken, notices, None, timing).await
     }
 
     /// The boundary says to look, with no call open.
@@ -828,33 +915,24 @@ impl ClaudeLoop {
         } else {
             Some(RequestNotice::NothingNew)
         };
-        self.request(notice.into_iter().collect(), None).await
+        self.request(notice.into_iter().collect()).await
     }
 
-    /// Writes one turn to the running process. A failed write fails the
-    /// agent and returns `false`.
-    async fn hand_off(&mut self, content: Vec<ContentPart>, uuid: String) -> anyhow::Result<bool> {
+    /// Writes one turn to the running process, which is between turns. A
+    /// failed write fails the agent and returns `false`.
+    async fn hand_off(&mut self, content: Vec<ContentPart>, uuid: Uuid) -> anyhow::Result<bool> {
         self.cancelling = false;
-        let busy = matches!(self.inference_state, InferenceState::Responding);
-        if !busy {
-            self.execution_generation = self.execution_generation.wrapping_add(1);
-        }
-        // The queue is Claude Code's, in its process; the echo of the turn
-        // takes it off this mirror.
-        self.queued_turns.push_back(uuid.clone());
-        self.published();
-        // A turn-opening send starts the turn now: waiting for the
-        // CLI's first stream event (seconds on a cold spawn) leaves
-        // the agent looking idle while it is working.
-        if !busy {
-            self.stream_items.clear();
-            self.set_streaming_kind();
-        }
+        self.execution_generation = self.execution_generation.wrapping_add(1);
+        // A send starts the turn now: waiting for the CLI's first stream event
+        // (seconds on a cold spawn) leaves the agent looking idle while it is
+        // working.
+        self.stream_items.clear();
+        self.set_streaming_kind();
         let written = self
             .process
             .as_mut()
             .context("Claude Code process is not running")?
-            .send_user_content_with_uuid(content, uuid)
+            .send_user_content_with_uuid(content, uuid.to_string())
             .await;
         match written {
             Ok(()) => Ok(true),
@@ -901,7 +979,7 @@ impl ClaudeLoop {
                 self.awaiting = false;
                 self.ended = false;
                 self.python_recheck = None;
-                self.queued_turns.clear();
+                self.compact_wanted = false;
                 self.response_id = None;
                 self.stream_items.clear();
                 self.set_kind(InferenceState::Idle);
@@ -928,6 +1006,7 @@ impl ClaudeLoop {
     }
 
     async fn close_process(&mut self) -> anyhow::Result<()> {
+        self.give_back_following().await?;
         let open = self.call_open();
         self.forget_pending_exec();
         if let Some(process) = self.process.take() {
@@ -960,19 +1039,7 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    async fn soft_cancel(&mut self, queued: &[String]) -> anyhow::Result<()> {
-        let mut cancel_ids = std::collections::HashSet::new();
-        for uuid in queued {
-            let request_id = self
-                .process
-                .as_mut()
-                .context("Claude Code exited while cancelling queued input")?
-                .cancel_async_message(uuid)
-                .await?;
-            cancel_ids.insert(request_id);
-        }
-        // Queue cancellations are written first so the CLI cannot begin a
-        // surviving queued command in the gap after interrupt processing.
+    async fn soft_cancel(&mut self) -> anyhow::Result<()> {
         let interrupt_id = self
             .process
             .as_mut()
@@ -980,7 +1047,7 @@ impl ClaudeLoop {
             .interrupt()
             .await?;
         let mut interrupt_done = false;
-        let mut idle = false;
+        let mut turn_over = false;
 
         loop {
             let event = self
@@ -1003,54 +1070,27 @@ impl ClaudeLoop {
                                 .unwrap_or_else(|| "Claude Code rejected interrupt".to_owned())
                         );
                     }
+                    // A turn it had not started yet, on a cold spawn, would run
+                    // after the interrupt. Only a new process drops it.
+                    anyhow::ensure!(
+                        message
+                            .response
+                            .response
+                            .as_ref()
+                            .and_then(|response| response.get("still_queued"))
+                            .and_then(serde_json::Value::as_array)
+                            .is_none_or(Vec::is_empty),
+                        "Claude Code still holds a turn"
+                    );
                     interrupt_done = true;
-                    // The interrupt receipt precedes the interrupted turn's
-                    // result/idle. Any idle drained before this barrier can be
-                    // a lagging trailer from the preceding turn.
-                    idle = false;
-                    let still_queued = message
-                        .response
-                        .response
-                        .as_ref()
-                        .and_then(|response| response.get("still_queued"))
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(serde_json::Value::as_str)
-                        .filter(|uuid| queued.iter().any(|queued| queued == uuid))
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    for uuid in still_queued {
-                        let request_id = self
-                            .process
-                            .as_mut()
-                            .context("Claude Code exited while reconciling interrupt receipt")?
-                            .cancel_async_message(&uuid)
-                            .await?;
-                        cancel_ids.insert(request_id);
-                    }
-                }
-                rho_claude::ClaudeEvent::ControlResponse(message)
-                    if cancel_ids.remove(&message.response.request_id) =>
-                {
-                    if message.response.subtype != "success" {
-                        anyhow::bail!(
-                            "{}",
-                            message.response.error.unwrap_or_else(|| {
-                                "Claude Code rejected queued-message cancellation".to_owned()
-                            })
-                        );
-                    }
-                }
-                rho_claude::ClaudeEvent::System(
-                    rho_claude::protocol::SystemMessage::SessionStateChanged { state, .. },
-                ) => {
-                    idle |= interrupt_done && state.as_deref() == Some("idle");
                 }
                 rho_claude::ClaudeEvent::ControlResponse(_) => {}
-                event => self.handle_event(event).await?,
+                event => {
+                    turn_over |= matches!(event, rho_claude::ClaudeEvent::Result(_));
+                    self.handle_event(event).await?;
+                }
             }
-            if interrupt_done && cancel_ids.is_empty() && idle {
+            if interrupt_done && turn_over {
                 return Ok(());
             }
         }
@@ -1105,10 +1145,6 @@ impl ClaudeLoop {
             ),
             ":rewind is only available while idle or errored; use :cancel first"
         );
-        anyhow::ensure!(
-            self.queued_turns.is_empty(),
-            ":rewind is not available with queued inputs"
-        );
         let rows = self.host.history().await?;
         let (to, sent) = rewind_point(&rows, turns).context("nothing to rewind")?;
         let root = self.root.clone();
@@ -1143,8 +1179,8 @@ impl ClaudeLoop {
             .await?;
             (self.session_id, messages)
         };
-        // A turn cancelled while queued never reached the session: forgetting
-        // starts at the next one that did.
+        // A turn cancelled before Claude Code took it never reached the
+        // session: forgetting starts at the next one that did.
         let resume_at = sent
             .iter()
             .find_map(|turn| resume_before(&messages, *turn))
@@ -1444,10 +1480,8 @@ impl ClaudeLoop {
                 }
                 self.release_block(&message.message.content);
             }
-            // The echo of a send (its turn leaves the queue first), or a
-            // call's results.
+            // A call's results.
             rho_claude::ClaudeEvent::User(message) => {
-                self.activate_turn_from_user_echo(message.uuid.as_deref());
                 if message.parent_tool_use_id.is_none() && !message.is_synthetic.unwrap_or(false) {
                     match results_row(&message, &self.projection) {
                         Ok(Some(event)) => {
@@ -1495,20 +1529,19 @@ impl ClaudeLoop {
                         .await?;
                 } else {
                     // CLI result prose is provider output, not a message to the
-                    // human. Queued sends run next inside
-                    // the CLI: staying in the
-                    // streaming state avoids a false turn end between them.
+                    // human. What follows goes next: staying in the streaming
+                    // state avoids a false turn end between them.
                     self.stream_items.clear();
                     self.response_id = None;
-                    if self.queued_turns.is_empty() {
-                        self.set_kind(InferenceState::Idle);
-                    } else {
+                    if self.turn_follows() {
                         self.set_streaming_kind();
+                    } else {
+                        self.set_kind(InferenceState::Idle);
                     }
                 }
                 if self.pending_rewind
                     && successful
-                    && self.queued_turns.is_empty()
+                    && !self.turn_follows()
                     && let Err(error) = self.complete_rewind().await
                 {
                     if error.is::<StoreError>() {
@@ -1556,9 +1589,6 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
-            rho_claude::ClaudeEvent::CommandLifecycle(message) => {
-                self.handle_command_lifecycle(message).await?;
-            }
             rho_claude::ClaudeEvent::Other => {}
         }
         Ok(())
@@ -1650,10 +1680,13 @@ impl ClaudeLoop {
     /// and acts on the answer. A working model with no call open hears it at
     /// its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
+        // A model waiting in its call would never get to the command.
+        if self.compact_wanted && self.waiting_in_call() {
+            return self.request(vec![RequestNotice::NothingNew]).await;
+        }
         let now = UnixMs::now();
         let idle = matches!(self.inference_state, InferenceState::Idle)
             && self.process.is_some()
-            && self.queued_turns.is_empty()
             && !self.pending_rewind;
         let Some(host) = self.python.as_mut() else {
             return Ok(());
@@ -1692,7 +1725,7 @@ impl ClaudeLoop {
         } else {
             RequestNotice::NothingNew
         };
-        self.request(vec![notice], None).await
+        self.request(vec![notice]).await
     }
 
     /// Stops the notebook's cells and answers an open exec call as
@@ -1726,41 +1759,6 @@ impl ClaudeLoop {
             host.take_pending();
         }
         self.python_recheck = None;
-    }
-
-    async fn handle_command_lifecycle(
-        &mut self,
-        message: rho_claude::protocol::CommandLifecycleMessage,
-    ) -> anyhow::Result<()> {
-        match message.state.as_str() {
-            "queued" | "started" => {}
-            "completed" | "cancelled" | "discarded" => {
-                let Some(index) = self
-                    .queued_turns
-                    .iter()
-                    .position(|turn| *turn == message.command_uuid)
-                else {
-                    return Ok(());
-                };
-                self.queued_turns.remove(index);
-                self.published();
-
-                // Claude emits `completed` after the command's result. If a
-                // missing replay echo left this command in our mirror, the
-                // result kept the agent streaming; the lifecycle terminal is
-                // the final authoritative opportunity to settle it.
-                if message.state == "completed" && self.queued_turns.is_empty() {
-                    self.set_kind(InferenceState::Idle);
-                }
-            }
-            state => {
-                eprintln!(
-                    "rho-agent: unknown Claude command_lifecycle state {state:?} for {}",
-                    message.command_uuid
-                );
-            }
-        }
-        Ok(())
     }
 
     /// The block's row is in: its streamed copy leaves the tail, which
@@ -1857,19 +1855,6 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    /// With --replay-user-messages the CLI echoes every user message when
-    /// it enters context: the echo of a turn this loop sent takes it off
-    /// the queue; the echo's row (next) is the message in the conversation.
-    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) -> bool {
-        let Some(uuid) = uuid else { return false };
-        let Some(index) = self.queued_turns.iter().position(|turn| turn == uuid) else {
-            return false;
-        };
-        self.queued_turns.remove(index);
-        self.published();
-        true
-    }
-
     /// A compaction: its row, then what the policy gives the model back, as
     /// `system` inputs the next request delivers.
     async fn handle_system_message(
@@ -1912,7 +1897,7 @@ impl ClaudeLoop {
             self.archived,
             self.response_id.as_deref(),
             &self.stream_items,
-            self.queued_turns.len(),
+            self.waiting.news() + usize::from(self.following.is_some()),
         )
     }
 
@@ -1954,6 +1939,8 @@ impl ClaudeLoop {
             host.failed(UnixMs::now(), Arc::from(error.to_string()));
         }
         self.waiting.quiet();
+        self.compact_wanted = false;
+        self.give_back_following().await?;
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
         let partial = said_so_far(&self.stream_items);

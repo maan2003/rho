@@ -117,6 +117,20 @@ impl Waiting {
         }
     }
 
+    /// A call's answer went, but the text it took did not: that text goes first
+    /// next time, and `taken` keeps what the answer carried. It wakes nobody.
+    pub fn keep_text(&mut self, taken: &mut Taken) {
+        let (tool, text): (Vec<_>, Vec<_>) = std::mem::take(&mut taken.held)
+            .into_iter()
+            .partition(|held| held.input.role == Role::Tool);
+        taken.inputs = tool.iter().map(|held| held.input.clone()).collect();
+        taken.held = tool;
+        self.put_back(Taken {
+            held: text,
+            ..Taken::default()
+        });
+    }
+
     /// A send failed: what it took goes first next time. It wakes nobody.
     pub fn put_back(&mut self, taken: Taken) {
         let mut output = taken.output;
@@ -184,6 +198,26 @@ mod tests {
         waiting.output(text("second"));
         assert_eq!(waiting.take(true).output, text("first\n\nsecond"));
         assert!(!waiting.holds_tool());
+    }
+
+    /// The answer keeps its output and `tool` text. The person's text goes back
+    /// ahead of what came since, and only a new input wakes the model.
+    #[test]
+    fn an_answer_gives_back_only_the_text_it_could_not_send() {
+        let mut waiting = Waiting::default();
+        waiting.output(text("out"));
+        waiting.receive(Role::Tool, None, text("peer"), UnixMs(1));
+        waiting.receive(Role::User, None, text("person"), UnixMs(2));
+        waiting.receive(Role::System, None, text("rho"), UnixMs(3));
+        let mut taken = waiting.take(true);
+        waiting.receive(Role::User, None, text("later"), UnixMs(4));
+
+        waiting.keep_text(&mut taken);
+        assert_eq!(taken.output, text("out"));
+        assert_eq!(texts(&taken), ["peer"]);
+        assert_eq!(waiting.oldest(Role::User), Some(UnixMs(4)));
+        assert!(!waiting.holds_tool());
+        assert_eq!(texts(&waiting.take(false)), ["person", "rho", "later"]);
     }
 
     /// A failed send puts back what it took, before what came since, and none

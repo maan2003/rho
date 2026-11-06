@@ -26,9 +26,11 @@ that call. With no call open, `tool` text stays where it is and the model gets
 one fixed line telling it so; its next `exec` result carries the text.
 
 In a Claude agent, a person's message is never written while a turn is going:
-the open call is answered with the end-turn flag and the message follows it, so
-the provider sees the tool result and the text in one user message. A native
-request places all of it itself.
+the open call is answered with the end-turn flag, and the message waits in Rho for
+that turn's result. The provider sees the tool result and the text in one user
+message, and one `Request` row holds both. If the text cannot follow its answer,
+the row holds the answer and the text waits for the next request. A native request
+places all of it itself.
 
 ## Rationale
 

@@ -142,7 +142,6 @@ impl InputContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
-    CommandLifecycle(CommandLifecycleMessage),
     ControlRequest(ControlRequestMessage),
     ControlResponse(ControlResponseMessage),
     RateLimitEvent(RateLimitEvent),
@@ -165,12 +164,6 @@ pub struct RateLimitInfo {
     pub rate_limit_type: Option<String>,
     pub resets_at: Option<i64>,
     pub utilization: Option<f64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct CommandLifecycleMessage {
-    pub command_uuid: String,
-    pub state: String,
 }
 
 /// A request the CLI makes of the process driving it. With an SDK-hosted
@@ -362,12 +355,6 @@ pub enum SystemMessage {
         uuid: Option<String>,
         content: Option<String>,
         level: Option<String>,
-    },
-    SessionStateChanged {
-        #[serde(alias = "session_id")]
-        session_id: Option<Uuid>,
-        uuid: Option<String>,
-        state: Option<String>,
     },
     TurnDuration {
         #[serde(alias = "session_id")]
