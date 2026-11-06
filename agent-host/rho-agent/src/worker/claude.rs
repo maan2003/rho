@@ -17,13 +17,14 @@ use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Ses
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::entry::{Notice, Report, WAITING, Wake};
+use crate::entry::{Notice, Report, RequestNotice, Wake, compose, output_content};
 use crate::inference::Inference;
 use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, ClaudeRow, Event, Record, Runtime};
 use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
+use crate::worker::shared::input_wakes;
 use crate::worker::shared::outbox::{Outbound, Outbox};
 use crate::{AgentStatus, InferenceState, RuntimeState, TranscriptLine};
 
@@ -130,19 +131,6 @@ enum ClaudeControl {
     TellTail,
 }
 
-/// What a model with no call open is told when nothing a person wrote wakes
-/// it ([DECISION-roles](../../specs/DECISION-roles.md)).
-fn idle_lead(correction: bool, waiting: bool) -> String {
-    const CORRECTION: &str =
-        "Your last response had no exec call. Text outside a call reaches nobody.";
-    match (correction, waiting) {
-        (true, true) => format!("{CORRECTION} {WAITING}"),
-        (true, false) => CORRECTION.to_owned(),
-        (false, true) => WAITING.to_owned(),
-        (false, false) => "Check-in: nothing new.".to_owned(),
-    }
-}
-
 async fn end_process(process: ClaudeCode, call_open: bool) -> anyhow::Result<()> {
     if call_open {
         process.kill().await
@@ -157,6 +145,9 @@ struct Unread {
     at: UnixMs,
     content: Vec<ContentPart>,
     role: Role,
+    /// It can still wake the model. A request with no call answers leaves
+    /// `tool` text unread but told, and a stop quiets what came before it.
+    news: bool,
 }
 
 /// What the running Claude Code process was started with: a change to any
@@ -200,10 +191,6 @@ pub(crate) struct ClaudeLoop {
     archived: bool,
     /// The agent's `Input` rows after its last request, oldest first.
     unread: Vec<Unread>,
-    pending_output: Option<crate::ClaudeOutputBatch>,
-    /// With no call open, when the model was told `tool` text waits for its
-    /// next exec. What came before wakes it no more.
-    told: Option<UnixMs>,
     /// Why the notebook last spoke, until the transcript row it produced
     /// arrives to carry it.
     python_wake: Option<crate::WakeFacts>,
@@ -430,7 +417,6 @@ impl ClaudeLoop {
                 };
             (session_id, start_mode, false)
         };
-        let pending_output = host.claude_pending_output().await?;
         let (archived, unread) = recover(&host.history().await?);
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -457,8 +443,6 @@ impl ClaudeLoop {
             ended: false,
             archived,
             unread,
-            pending_output,
-            told: None,
             python_wake: None,
             python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
@@ -681,6 +665,7 @@ impl ClaudeLoop {
                     at: UnixMs::now(),
                     content,
                     role,
+                    news: role != Role::System,
                 });
                 if role == Role::User {
                     // The person's input ends a wait it answers.
@@ -694,7 +679,7 @@ impl ClaudeLoop {
                 self.deliver_unread().await?;
             }
             ClaudeControl::Compact => {
-                // A slash command goes alone: inputs and retained output
+                // A slash command goes alone: inputs and notebook output
                 // wait for the next turn.
                 if self.archived {
                     return Ok(());
@@ -709,7 +694,14 @@ impl ClaudeLoop {
                         .as_ref()
                         .expect("a call is open")
                         .wake_facts(crate::WakeTrigger::Asked, None);
-                    return self.answer_call(wake, Some(compact)).await;
+                    return self
+                        .request(
+                            Wake::Compaction,
+                            vec![RequestNotice::NothingNew],
+                            Some(wake),
+                            Some(compact),
+                        )
+                        .await;
                 }
                 if let Err(error) = self.ensure_process().await {
                     return self.fail(error).await;
@@ -723,6 +715,7 @@ impl ClaudeLoop {
                 self.queued_turns.clear();
                 self.cancelling = busy;
                 self.cancel_python().await?;
+                self.quiet_unread();
                 if busy && self.process.is_some() {
                     let result =
                         tokio::time::timeout(Duration::from_secs(30), self.soft_cancel(&queued))
@@ -764,16 +757,16 @@ impl ClaudeLoop {
     }
 
     /// With no call open and no response going, the model hears of unread
-    /// inputs at once: a person's always, reviving an archived agent; a
-    /// `tool` one unless the agent is archived; `system` ones wait for a
-    /// request to carry them. Otherwise the boundary tells it (`python_tick`).
+    /// news at once: a person's always, reviving an archived agent; a `tool`
+    /// input unless the agent is archived. Otherwise the boundary tells it
+    /// (`python_tick`).
     async fn deliver_unread(&mut self) -> anyhow::Result<()> {
-        let person = self.unread.iter().any(|input| input.role == Role::User);
-        let told = self.told;
-        let tool = self
-            .unread
-            .iter()
-            .any(|input| input.role == Role::Tool && told.is_none_or(|told| input.at >= told));
+        let news = |role| {
+            self.unread
+                .iter()
+                .any(|input| input.news && input.role == role)
+        };
+        let (person, tool) = (news(Role::User), news(Role::Tool));
         if person && self.archived {
             self.fresh_notebook().await?;
         }
@@ -786,172 +779,165 @@ impl ClaudeLoop {
         {
             return Ok(());
         }
-        if person {
-            self.send_turn(Wake::Message, None).await
+        let why = if person {
+            Wake::Message
         } else {
-            self.told = Some(UnixMs::now());
-            self.send_turn(Wake::AgentMessage, Some(WAITING.to_owned()))
-                .await
+            Wake::AgentMessage
+        };
+        self.request(why, Vec::new(), None, None).await
+    }
+
+    /// News from before a stop wakes nothing. It goes with the next request.
+    fn quiet_unread(&mut self) {
+        for input in &mut self.unread {
+            input.news = false;
         }
     }
 
-    /// With no call open, hands Claude Code one turn: `lead`, a fixed line of
-    /// Rho's, and every unread input but the `tool` ones, which wait for the
-    /// exec result that carries them.
-    async fn send_turn(&mut self, why: Wake, lead: Option<String>) -> anyhow::Result<()> {
-        let mut steps = Steps::new();
-        if let Err(error) = self.ensure_process().await {
-            return self.fail(error).await;
-        }
-        steps.mark("process");
-        let mut content: Vec<ContentPart> = lead
-            .map(|text| ContentPart::Text { text })
-            .into_iter()
-            .collect();
-        content.extend(
-            self.unread
-                .iter()
-                .filter(|input| input.role != Role::Tool)
-                .flat_map(|input| input.content.iter().cloned()),
-        );
-        if !self.hand_off(content, Uuid::new_v4().to_string()).await? {
-            return Ok(());
-        }
-        steps.mark("written");
-        self.unread.retain(|input| input.role == Role::Tool);
-        self.claude_row(ClaudeRow::RequestSent {
-            why,
-            report: Report::default(),
-            no_call: true,
-        })
-        .await?;
-        steps.mark("logged");
-        eprintln!(
-            "rho-agent: Claude input of {} in {steps}",
-            self.agent_id.encoded()
-        );
-        Ok(())
-    }
-
-    /// Answers the open call with everything in the `tool` role. Anything
-    /// else unread opens a turn of its own, after `command` if there is one:
-    /// the answer ends the running turn, and Claude Code sends the text behind
-    /// the result as `role: user`.
-    async fn answer_call(
+    /// Sends one request: everything the notebook has said goes to the log,
+    /// and `compose` splits what waits by role. An open call is answered with
+    /// the `tool` part. The rest opens a turn of its own, after `command` if
+    /// there is one: the answer ends the running turn, and Claude Code sends
+    /// the text behind the result as `role: user`.
+    async fn request(
         &mut self,
-        wake: crate::WakeFacts,
+        why: Wake,
+        notices: Vec<RequestNotice>,
+        wake: Option<crate::WakeFacts>,
         command: Option<Vec<ContentPart>>,
     ) -> anyhow::Result<()> {
-        let now = UnixMs::now();
-        let host = self.python.as_mut().expect("a call is open");
-        let Some((pending, mut drained)) = host.answer_pending() else {
-            return Ok(());
-        };
-        let turn: Vec<ContentPart> = self
+        let mut steps = Steps::new();
+        if !self.call_open() {
+            if let Err(error) = self.ensure_process().await {
+                return self.fail(error).await;
+            }
+            steps.mark("process");
+        }
+        if let Some(report) = self.python.as_mut().and_then(|host| host.report()) {
+            let content = output_content(&report);
+            self.host
+                .append(Event::Input {
+                    agent: self.agent_id,
+                    message: None,
+                    content: content.clone(),
+                    role: Role::Tool,
+                })
+                .await?;
+            self.unread.push(Unread {
+                at: UnixMs::now(),
+                content,
+                role: Role::Tool,
+                news: false,
+            });
+        }
+        let open = self.call_open();
+        let (tool, others): (Vec<_>, Vec<_>) = self
             .unread
             .iter()
-            .filter(|input| input.role != Role::Tool)
-            .flat_map(|input| input.content.iter().cloned())
-            .collect();
+            .partition(|input| input.role == Role::Tool);
+        let contents = |inputs: Vec<&Unread>| {
+            inputs
+                .into_iter()
+                .map(|input| input.content.clone())
+                .collect::<Vec<_>>()
+        };
+        let composed = compose(open, &notices, &contents(tool), &contents(others));
+        let user = composed.user.concat();
         let turns: Vec<Vec<ContentPart>> = command
             .into_iter()
-            .chain((!turn.is_empty()).then_some(turn))
+            .chain((!user.is_empty()).then_some(user))
             .collect();
-        let batch = self.record_output(&mut drained, wake, now).await?;
-        let delivered = self.pending_output.clone().expect("recorded output");
-        let mut result = drained.into_mcp_result();
-        if let Some(content) = result["content"].as_array_mut() {
-            content.extend(
-                self.unread
-                    .iter()
-                    .filter(|input| input.role == Role::Tool)
-                    .flat_map(|input| input.content.iter().map(mcp_item)),
-            );
-        }
-        if !turns.is_empty() {
-            // Claude Code ends the turn on this result without sampling the
-            // model again (unless it is an error).
-            result["_meta"] = serde_json::json!({ "claude/endTurn": true });
-        }
-        let reply = serde_json::json!({
-            "mcp_response": {
-                "jsonrpc": "2.0", "id": pending.rpc_id,
-                "result": result,
-            },
-        });
-        self.observe_exec(
-            pending.exec_id.clone(),
-            rho_agent_types::ExecMilestone::Boundary,
-        )
-        .await?;
-        if !self.respond_control(&pending.request_id, Ok(reply)).await {
-            // The outbox survives both this process and the notebook. A
-            // future send carries its output, never reruns its source.
-            self.close_process().await?;
-            return self
-                .fail(anyhow::anyhow!(
-                    "Claude Code output transport failed; notebook output is retained"
-                ))
-                .await;
-        }
+        let handed = if open {
+            let host = self.python.as_mut().expect("a call is open");
+            let failed = host.latest_failed();
+            let pending = host.take_pending().expect("a call is open");
+            let items = composed.result.iter().map(mcp_item).collect();
+            // Claude Code samples the model after an error, whatever the
+            // end-turn flag says, and a turn must follow this result.
+            let mut result = rho_claude::mcp::tool_result(items, failed && turns.is_empty());
+            if !turns.is_empty() {
+                // It ends the turn on this result without sampling the model.
+                result["_meta"] = serde_json::json!({ "claude/endTurn": true });
+            }
+            let reply = serde_json::json!({
+                "mcp_response": {
+                    "jsonrpc": "2.0", "id": pending.rpc_id,
+                    "result": result,
+                },
+            });
+            self.observe_exec(
+                pending.exec_id.clone(),
+                rho_agent_types::ExecMilestone::Boundary,
+            )
+            .await?;
+            if !self.respond_control(&pending.request_id, Ok(reply)).await {
+                // The log keeps the output as an input. A future send carries
+                // it, and never reruns its source.
+                self.close_process().await?;
+                return self
+                    .fail(anyhow::anyhow!(
+                        "Claude Code output transport failed; notebook output is retained"
+                    ))
+                    .await;
+            }
+            Some(pending.exec_id)
+        } else {
+            None
+        };
         for turn in turns {
             if !self.hand_off(turn, Uuid::new_v4().to_string()).await? {
                 return Ok(());
             }
         }
-        self.unread.clear();
-        self.output_handed_off(batch).await?;
+        steps.mark("written");
+        self.python_wake = wake;
+        if open {
+            self.unread.clear();
+        } else {
+            self.unread.retain(|input| input.role == Role::Tool);
+            self.quiet_unread();
+        }
         self.claude_row(ClaudeRow::RequestSent {
-            why: Wake::Returned,
+            why,
             report: Report {
-                notebook: delivered.report(),
-                ..Default::default()
+                notices,
+                ..Report::default()
             },
-            no_call: false,
+            no_call: !open,
         })
         .await?;
-        self.observe_exec(pending.exec_id, rho_agent_types::ExecMilestone::HandedOff)
-            .await
+        steps.mark("logged");
+        eprintln!(
+            "rho-agent: Claude request of {} in {steps}",
+            self.agent_id.encoded()
+        );
+        if let Some(exec) = handed {
+            self.observe_exec(exec, rho_agent_types::ExecMilestone::HandedOff)
+                .await?;
+        }
+        Ok(())
     }
 
-    /// The boundary says to look, with no call open. Text in the `tool` role
-    /// stays where it is until the model's next exec.
-    async fn wake_idle_model(
-        &mut self,
-        wake: crate::WakeFacts,
-        person: bool,
-        now: UnixMs,
-    ) -> anyhow::Result<()> {
-        if person {
-            return self.send_turn(Wake::Message, None).await;
-        }
+    /// The boundary says to look, with no call open.
+    async fn wake_idle_model(&mut self, why: Wake, wake: crate::WakeFacts) -> anyhow::Result<()> {
+        let person = self
+            .unread
+            .iter()
+            .any(|input| input.news && input.role == Role::User);
         let correction = self
             .python
             .as_ref()
             .is_some_and(python_host::PythonHost::prose_correction);
-        let agent = self.unread.iter().any(|input| input.role == Role::Tool);
-        let output = self.pending_output.is_some()
-            || !matches!(
-                wake.trigger,
-                crate::WakeTrigger::Checkin | crate::WakeTrigger::Asked
-            );
-        let waiting = agent || output;
-        if !waiting && !correction && wake.trigger != crate::WakeTrigger::Checkin {
-            return Ok(());
-        }
-        let why = if output {
-            Wake::Returned
-        } else if agent {
-            Wake::AgentMessage
+        let notice = if person {
+            None
         } else if correction {
-            Wake::Prose
+            Some(RequestNotice::PreviousResponseHadNoExec)
+        } else if why == Wake::Checkin {
+            Some(RequestNotice::Checkin)
         } else {
-            Wake::Checkin
+            Some(RequestNotice::NothingNew)
         };
-        if waiting {
-            self.told = Some(now);
-        }
-        self.send_turn(why, Some(idle_lead(correction, waiting)))
+        self.request(why, notice.into_iter().collect(), Some(wake), None)
             .await
     }
 
@@ -1723,7 +1709,6 @@ impl ClaudeLoop {
                             )
                         } else {
                             let now = UnixMs::now();
-                            self.told = None;
                             self.claude_row(ClaudeRow::ExecAdmitted {
                                 call: rho_agent_types::transcript::ExecCall {
                                     id: exec_id.clone(),
@@ -1778,51 +1763,42 @@ impl ClaudeLoop {
     }
 
     /// Asks the boundary whether the model should hear from the notebook,
-    /// and acts on the answer: an open exec call returns with everything
-    /// waiting, or an idle model is woken with it as a message. A working
-    /// model with no call open hears it at its next call or turn end.
+    /// and acts on the answer. A working model with no call open hears it at
+    /// its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
         let now = UnixMs::now();
         let idle = matches!(self.inference_state, InferenceState::Idle)
             && self.process.is_some()
             && self.queued_turns.is_empty()
             && !self.pending_rewind;
-        let told = self.told;
         let Some(host) = self.python.as_mut() else {
             return Ok(());
         };
-        let since = host.stopped_at().max(told);
         let oldest = |role| {
             self.unread
                 .iter()
-                .filter(|input| input.role == role && since.is_none_or(|since| input.at >= since))
+                .filter(|input| input.news && input.role == role)
                 .map(|input| input.at)
                 .min()
         };
-        let oldest_human = oldest(Role::User);
-        let oldest_agent = oldest(Role::Tool);
         let open = host.has_pending();
-        let retained_output = self.pending_output.is_some() && (open || told.is_none());
-        let wake = match host.decide(
+        let (why, wake) = match host.decide(
             open || idle,
-            oldest_human,
-            oldest_agent,
-            since,
+            oldest(Role::User),
+            oldest(Role::Tool),
             self.archived,
-            retained_output,
             now,
         ) {
             python_host::Boundary::No { recheck } => {
                 self.python_recheck = recheck;
                 return Ok(());
             }
-            python_host::Boundary::Now { wake } => wake,
+            python_host::Boundary::Now { why, wake } => (why, wake),
         };
         self.python_recheck = None;
         if !open {
             return if idle {
-                self.wake_idle_model(wake, oldest_human.is_some(), now)
-                    .await
+                self.wake_idle_model(why, wake).await
             } else {
                 Ok(())
             };
@@ -1832,53 +1808,14 @@ impl ClaudeLoop {
         // model with no call open.
         if self.waiting_in_call() && self.launched.as_ref() != Some(&self.launch().await?) {
             self.release_waiting_call().await?;
-            return self
-                .wake_idle_model(wake, oldest_human.is_some(), now)
-                .await;
+            return self.wake_idle_model(why, wake).await;
         }
-        self.answer_call(wake, None).await
-    }
-
-    async fn record_output(
-        &mut self,
-        drained: &mut python_host::Drained,
-        wake: crate::WakeFacts,
-        at: UnixMs,
-    ) -> anyhow::Result<Uuid> {
-        if let Some(retained) = &self.pending_output {
-            drained
-                .updates
-                .splice(0..0, retained.outputs.iter().cloned());
-        }
-        let batch = crate::ClaudeOutputBatch {
-            id: Uuid::new_v4(),
-            outputs: drained
-                .own
-                .iter()
-                .chain(drained.updates.iter())
-                .cloned()
-                .collect(),
-            wake: wake.clone(),
-            at,
+        let notice = if why == Wake::Checkin {
+            RequestNotice::Checkin
+        } else {
+            RequestNotice::NothingNew
         };
-        let id = batch.id;
-        self.claude_row(ClaudeRow::Output {
-            batch: batch.clone(),
-        })
-        .await?;
-        self.pending_output = Some(batch);
-        self.python_wake = Some(wake);
-        self.python
-            .as_mut()
-            .expect("drained a notebook")
-            .acknowledge();
-        Ok(id)
-    }
-
-    async fn output_handed_off(&mut self, id: Uuid) -> anyhow::Result<()> {
-        self.claude_row(ClaudeRow::OutputHandedOff { id }).await?;
-        self.pending_output = None;
-        Ok(())
+        self.request(why, vec![notice], Some(wake), None).await
     }
 
     /// Stops the notebook's cells and answers an open exec call as
@@ -2116,6 +2053,7 @@ impl ClaudeLoop {
                 at: UnixMs::now(),
                 content,
                 role: Role::System,
+                news: false,
             });
         }
         self.published();
@@ -2172,6 +2110,7 @@ impl ClaudeLoop {
         if let Some(host) = &mut self.python {
             host.failed(UnixMs::now(), Arc::from(error.to_string()));
         }
+        self.quiet_unread();
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
         // Fragments live in stream_items; materialize the latest incomplete
@@ -2308,36 +2247,6 @@ impl ClaudeLoop {
     }
 }
 
-impl crate::ClaudeOutputBatch {
-    fn report(&self) -> rho_notebook::Report {
-        let text = self
-            .outputs
-            .iter()
-            .map(|(_, output)| output.output.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let images: Vec<crate::inference::Image> = self
-            .outputs
-            .iter()
-            .flat_map(|(_, output)| output.images.iter())
-            .map(|image| crate::inference::Image {
-                media_type: image.media_type.clone(),
-                data: image.data.clone(),
-            })
-            .collect();
-        rho_notebook::Report::from_text(
-            text,
-            images
-                .into_iter()
-                .map(|image: crate::inference::Image| rho_notebook::Image {
-                    media_type: image.media_type,
-                    data: image.data,
-                })
-                .collect(),
-        )
-    }
-}
-
 /// Wakes when a notebook cell has something new, or when the boundary said
 /// to ask it again. Never, for an agent without a notebook.
 async fn python_wake(
@@ -2371,22 +2280,49 @@ enum ClaudeLoopEvent {
 }
 
 /// What the agent's visible rows say the loop resumes with: whether it is
-/// archived, and the inputs no request has delivered (those after its
-/// last request).
+/// archived, and the inputs no request has delivered: those after its last
+/// request, and the `tool` ones a request with no call left.
 fn recover(rows: &[(Wpos, Record<'_>)]) -> (bool, Vec<Unread>) {
     let mut archived = false;
     let mut unread = Vec::new();
+    // On old rows only: output with no handoff after it.
+    let mut old_output: Option<(Uuid, Unread)> = None;
     for (_, record) in rows {
         match &record.event {
-            Event::Input { content, role, .. } => unread.push(Unread {
+            Event::Input {
+                content,
+                role,
+                message,
+                ..
+            } => unread.push(Unread {
                 at: record.at,
                 content: content.clone(),
                 role: *role,
+                news: input_wakes(*role, *message),
             }),
             Event::Claude { row, .. } => match row {
                 ClaudeRow::RequestSent { no_call: false, .. } => unread.clear(),
                 ClaudeRow::RequestSent { no_call: true, .. } => {
-                    unread.retain(|input| input.role == Role::Tool)
+                    unread.retain(|input| input.role == Role::Tool);
+                    for input in &mut unread {
+                        input.news = false;
+                    }
+                }
+                ClaudeRow::Output { batch } => {
+                    old_output = Some((
+                        batch.id,
+                        Unread {
+                            at: batch.at,
+                            content: batch.content(),
+                            role: Role::Tool,
+                            news: false,
+                        },
+                    ));
+                }
+                ClaudeRow::OutputHandedOff { id } => {
+                    if old_output.as_ref().is_some_and(|(batch, _)| batch == id) {
+                        old_output = None;
+                    }
                 }
                 ClaudeRow::Notice(Notice::Archived) => archived = true,
                 ClaudeRow::Notice(Notice::FreshNotebook) => archived = false,
@@ -2395,6 +2331,7 @@ fn recover(rows: &[(Wpos, Record<'_>)]) -> (bool, Vec<Unread>) {
             _ => {}
         }
     }
+    unread.splice(0..0, old_output.map(|(_, output)| output));
     (archived, unread)
 }
 
@@ -2713,6 +2650,7 @@ mod tests {
                         text: "quiet".into()
                     }],
                     role: Role::System,
+                    news: false,
                 },
                 Unread {
                     at: UnixMs(6),
@@ -2720,6 +2658,7 @@ mod tests {
                         text: "message".into()
                     }],
                     role: Role::Tool,
+                    news: false,
                 },
             ]
         );
@@ -2782,6 +2721,81 @@ mod tests {
         let mut rows = held;
         rows.push(row(4, sent(a)));
         assert!(unread_texts(&rows).is_empty());
+    }
+
+    /// Only a person's text and a message wake after a restart. Notebook
+    /// output waits, and so does anything a request told the model of.
+    #[test]
+    fn output_and_told_inputs_are_not_news() {
+        let a = agent(1);
+        let news = |rows: &[(Wpos, Record<'_>)]| {
+            recover(rows)
+                .1
+                .into_iter()
+                .map(|input| input.news)
+                .collect::<Vec<_>>()
+        };
+        let message = Event::Input {
+            agent: a,
+            message: Some(MessageId(rho_agent_types::ChatSeq(5))),
+            content: vec![ContentPart::Text { text: "m".into() }],
+            role: Role::Tool,
+        };
+        let mut rows = vec![
+            row(1, input(a, "output", Role::Tool)),
+            row(2, message),
+            row(3, input(a, "person", Role::User)),
+        ];
+        assert_eq!(news(&rows), [false, true, true]);
+        rows.push(row(4, sent_with_no_call(a)));
+        assert_eq!(news(&rows), [false, false]);
+        rows.push(row(5, sent(a)));
+        assert!(news(&rows).is_empty());
+    }
+
+    /// An old log's output that never reached Claude Code goes out with the
+    /// next call. One whose handoff was logged does not.
+    #[test]
+    fn old_output_with_no_handoff_is_a_tool_input_that_waits() {
+        let a = agent(1);
+        let id = Uuid::from_u128(1);
+        let output = Event::Claude {
+            agent: a,
+            row: ClaudeRow::Output {
+                batch: crate::ClaudeOutputBatch {
+                    id,
+                    outputs: vec![(
+                        "call".try_into().unwrap(),
+                        rho_agent_types::transcript::ToolOutput {
+                            output: Arc::new("old output".to_owned()),
+                            full_output: None,
+                            images: Arc::new(Vec::new()),
+                            status: rho_agent_types::ToolOutputStatus::Success,
+                        },
+                    )],
+                    wake: crate::WakeFacts {
+                        trigger: crate::WakeTrigger::Finished,
+                        events: Vec::new(),
+                        foreground_running: 0,
+                        background_running: 0,
+                        tools_suppressed: false,
+                        checkin_at: None,
+                    },
+                    at: UnixMs(1),
+                },
+            },
+        };
+        let mut rows = vec![row(1, output), row(2, input(a, "peer", Role::Tool))];
+        assert_eq!(unread_texts(&rows), ["old output", "peer"]);
+        assert!(!recover(&rows).1[0].news);
+        rows.push(row(
+            3,
+            Event::Claude {
+                agent: a,
+                row: ClaudeRow::OutputHandedOff { id },
+            },
+        ));
+        assert_eq!(unread_texts(&rows), ["peer"]);
     }
 
     #[test]

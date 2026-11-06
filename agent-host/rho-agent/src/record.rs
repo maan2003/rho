@@ -159,10 +159,11 @@ pub enum ClaudeRow {
     ExecAdmitted {
         call: ExecCall,
     },
-    /// Notebook output owned by the host before Claude Code is contacted.
+    /// On old rows only: notebook output is a `tool` input now.
     Output {
         batch: ClaudeOutputBatch,
     },
+    /// On old rows only, with `Output`.
     OutputHandedOff {
         id: Uuid,
     },

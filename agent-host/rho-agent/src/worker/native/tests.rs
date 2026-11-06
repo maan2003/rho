@@ -321,6 +321,46 @@ async fn a_peers_message_reaches_the_model_in_the_calls_result() {
     );
 }
 
+/// Notebook output is an input like any other: a `tool` row before the
+/// request that carries it, and the request's report holds none of it.
+#[tokio::test]
+async fn output_is_a_tool_input_before_its_request() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('output-mark')")
+        .then("human.send('done', kind='result')\nend_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "go").await;
+    harness.until_sent("done").await;
+    let events = harness.events();
+    let output = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::Input { role: Role::Tool, message: None, content, .. }
+                if rho_agent_types::transcript::text_content(content).contains("output-mark"))
+        })
+        .expect("the output's row");
+    let Event::Native {
+        entry: Entry::RequestSent { report, .. },
+        ..
+    } = &events[output + 1]
+    else {
+        panic!("the request follows its output: {:?}", events[output + 1]);
+    };
+    assert!(report.notebook.is_empty(), "{report:?}");
+    let all = requests(&script, 2).await;
+    let result = all[1]
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            Item::Report { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the call's result");
+    assert!(result.contains("output-mark"), "{result}");
+}
+
 #[tokio::test]
 async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let harness = Harness::new().await;
@@ -1079,12 +1119,111 @@ async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
         .entries()
         .into_iter()
         .filter_map(|entry| match entry {
-            Entry::RequestSent { report, .. } => Some(report.render(false).text),
+            Entry::RequestSent { report, .. } => Some(report.notebook.render().text),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(logged, ["alpha-output", "beta-output"]);
     agent.shutdown().await.unwrap();
+}
+
+/// A compaction with no call open cuts off what came before it, except `tool`
+/// inputs that wait for a call: the model has not read them.
+#[tokio::test]
+async fn a_compaction_with_no_call_open_keeps_what_waits_for_a_call() {
+    let harness = Harness::new().await;
+    let (_, mut agent) = harness.load().await;
+    agent
+        .receive(words("before-the-brief"), Role::User, None)
+        .await
+        .unwrap();
+    agent
+        .append(Entry::RequestSent {
+            why: Wake::Message,
+            compact: false,
+            report: Report::default(),
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::Step {
+            exec: None,
+            prose: "words".into(),
+            usage: None,
+            carry: Carry::new(serde_json::json!({}), vec![], false),
+        })
+        .await
+        .unwrap();
+    agent
+        .receive(words("the-brief"), Role::Tool, None)
+        .await
+        .unwrap();
+    agent
+        .append(Entry::RequestSent {
+            why: Wake::Compaction,
+            compact: true,
+            report: Report::default(),
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::Step {
+            exec: None,
+            prose: String::new(),
+            usage: None,
+            carry: Carry::new(serde_json::json!("compacted"), vec![], true),
+        })
+        .await
+        .unwrap();
+    agent.shutdown().await.unwrap();
+    drop(agent);
+
+    let (_, mut agent) = harness.load().await;
+    agent
+        .append(Entry::Step {
+            exec: Some("pass".into()),
+            prose: String::new(),
+            usage: None,
+            carry: scripted::carry(Call::new("after", "pass".into())),
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::RequestSent {
+            why: Wake::Returned,
+            compact: false,
+            report: Report::default(),
+        })
+        .await
+        .unwrap();
+    let input = agent.context.input();
+    assert!(
+        matches!(&input[..], [Item::Report { text, .. }] if text == "the-brief"),
+        "{input:?}"
+    );
+
+    // Its answer is the end of it: a later compaction cuts it off.
+    agent
+        .append(Entry::Step {
+            exec: None,
+            prose: String::new(),
+            usage: None,
+            carry: Carry::new(serde_json::json!("compacted-again"), vec![], true),
+        })
+        .await
+        .unwrap();
+    agent.shutdown().await.unwrap();
+    drop(agent);
+    let (_, agent) = harness.load().await;
+    let (_, _, rows) = agent.host.native_history(None).await.unwrap();
+    assert!(
+        rows.iter().all(|(_, record)| !matches!(
+            &record.event,
+            Event::Input { content, .. }
+                if rho_agent_types::transcript::text_content(content) == "the-brief"
+        )),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -1128,7 +1267,11 @@ async fn cold_load_and_queued_boundary_preserve_inputs_across_compaction() {
         .await
         .unwrap();
     agent
-        .receive(words("after-compaction"), Role::Tool, None)
+        .receive(
+            words("after-compaction"),
+            Role::Tool,
+            Some(MessageId(ChatSeq(1))),
+        )
         .await
         .unwrap();
     agent.shutdown().await.unwrap();

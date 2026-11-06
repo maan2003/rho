@@ -65,7 +65,6 @@ pub(crate) enum Request<'a> {
     Append(Record<'a>),
     AppendBatch(Vec<Record<'static>>),
     ClaudeAccount,
-    ClaudePendingOutput,
 }
 
 #[derive(Encode, Decode)]
@@ -83,7 +82,6 @@ pub(crate) enum Reply {
     Boundary(ContextBoundary),
     Position(Wpos),
     ClaudeAccount(String),
-    ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
     Usage(AgentUsageBucket),
     Error(String),
     Done,

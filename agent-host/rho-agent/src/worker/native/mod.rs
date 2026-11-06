@@ -24,7 +24,7 @@ use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::entry::{Entry, Notice, Report, RequestNotice, ResponseUsage, Wake};
+use crate::entry::{Entry, Notice, Report, RequestNotice, ResponseUsage, Wake, output_content};
 use crate::inference::config::{InferenceModel, InferenceProfile};
 use crate::inference::{
     CacheKey, Call, Carry, Event as Streamed, Inference, InferenceSession, PromptCacheKey, Request,
@@ -36,7 +36,7 @@ use crate::worker::host_client::{HostClient, StoreError};
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
 use crate::worker::shared::wake::{Decision, Facts};
-use crate::worker::shared::{Progress, tools, wake};
+use crate::worker::shared::{Progress, input_wakes, tools, wake};
 use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
@@ -409,7 +409,7 @@ impl Agent {
         self.compaction_owed = false;
         for (_, record) in rows {
             match &record.event {
-                Event::Input { role, .. } if *role != Role::System => {
+                Event::Input { role, message, .. } if input_wakes(*role, *message) => {
                     self.unread.push((*role, record.at));
                 }
                 Event::Native { entry, .. } => match entry {
@@ -903,7 +903,13 @@ impl Agent {
             .as_ref()
             .and_then(|notebook| notebook.report())
         {
-            report.notebook = output;
+            self.log(Event::Input {
+                agent,
+                message: None,
+                content: output_content(&output),
+                role: Role::Tool,
+            })
+            .await?;
         }
         self.wake_with(why, instructions, report, false).await
     }

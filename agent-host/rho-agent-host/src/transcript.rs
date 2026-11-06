@@ -71,6 +71,12 @@ pub fn strip(record: &Record<'_>, before: &Before) -> Option<LogEvent> {
             spec: spec_view(spec),
             at,
         },
+        // Notebook output: the request after it shows as its call's result.
+        Event::Input {
+            role: Role::Tool,
+            message: None,
+            ..
+        } => return None,
         Event::Input {
             agent,
             message,
@@ -267,7 +273,7 @@ pub(crate) fn report_results(
     report: &Report,
     before: &Before,
 ) -> Vec<rho_inference::transcript::ReportOutput> {
-    rho_inference::transcript::report_results(report, before.inputs, before.carry.as_ref())
+    rho_inference::transcript::report_results(report, before)
 }
 
 /// A step's visible items: the prose it wrote, then its calls.

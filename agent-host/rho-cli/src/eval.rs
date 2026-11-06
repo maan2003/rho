@@ -455,12 +455,8 @@ impl Watch<'_> {
                 if let Some(stop) = self.request(agent_id, pos)? {
                     return Ok(Some(stop));
                 }
-                let rho_inference::transcript::Before {
-                    carry: prior,
-                    inputs,
-                } = rho_inference::transcript::before_at(&self.db.read(), agent_id, pos);
-                let results =
-                    rho_inference::transcript::report_results(&report, inputs, prior.as_ref());
+                let before = rho_inference::transcript::before_at(&self.db.read(), agent_id, pos);
+                let results = rho_inference::transcript::report_results(&report, &before);
                 for result in results {
                     emit(
                         json!({"type":"notebook_report", "agent":agent, "id":result.display_id(), "output":result.text}),

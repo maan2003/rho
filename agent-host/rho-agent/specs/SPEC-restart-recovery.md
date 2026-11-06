@@ -157,10 +157,9 @@ Claude Code restores its own conversation; Rho does not replay it as native
 provider input. Notebook admission and output ownership remain Rho's durable
 facts. A restart does not restore the Python namespace or its jobs.
 
-Before releasing notebook output, Rho commits its attributed contributions.
-A transport failure leaves that batch pending across restart. The next eligible
-send carries it as a report, not a second initial result or a request to rerun
-code. A completed handoff retires the batch; a crash between write and recorded
-handoff can repeat the report, but cannot authorize repeating its side effects.
-Handoff does not claim the remote model consumed the report. Slash commands retain
-their command semantics; pending reports can wait for the CLI to become idle.
+Before releasing notebook output, Rho logs it as a `tool` input. A transport
+failure leaves that input unread across restart. The next exec result carries
+it, not a request to rerun code. It wakes nobody by itself. The request row that
+follows the handoff retires it; a crash between write and row can repeat the
+output, but cannot authorize repeating its side effects. Handoff does not claim
+the remote model consumed it. Slash commands retain their command semantics.

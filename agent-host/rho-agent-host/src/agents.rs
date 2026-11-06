@@ -1336,6 +1336,68 @@ mod tests {
 
     /// Rows that say nothing a reader uses are left behind; a stop is told
     /// whichever runtime wrote it; a user's spoken request reads as asked.
+    /// Output reads as its call's result: what it printed, and what waited
+    /// for a call. A peer's message is its own block, and an output row is
+    /// nothing of its own to a reader.
+    #[tokio::test]
+    async fn a_requests_detail_shows_the_output_before_it_and_what_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("rho.redb"));
+        let tool = |text: &str, message| Event::Input {
+            agent: rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(1))
+                .unwrap(),
+            message,
+            content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
+            role: Role::Tool,
+        };
+        let prose = native(Entry::Step {
+            exec: None,
+            prose: "words".into(),
+            carry: rho_agent::inference::Carry::new(serde_json::json!({}), vec![], false),
+            usage: None,
+        });
+        let plain = Entry::RequestSent {
+            why: rho_agent::entry::Wake::Notify,
+            report: Report::default(),
+            compact: false,
+        };
+        let (workset, _, pos) = workset(
+            &db,
+            vec![
+                native(step("answered")),
+                tool("answered-output", None),
+                native(plain.clone()),
+                prose,
+                tool("waited-output", None),
+                native(plain.clone()),
+                native(step("open")),
+                tool("printed-output", None),
+                tool(
+                    "peer-message",
+                    Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(1))),
+                ),
+                native(plain),
+            ],
+        )
+        .await;
+        let rho_agents_client::protocol::transcript::DetailBody::Results(results) =
+            detail(&db, workset, pos[9])
+        else {
+            panic!("the request's results");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "open");
+        assert_eq!(results[0].output, "waited-output\n\nprinted-output");
+
+        use rho_agent::store::StoreRead as _;
+        let read = db.read();
+        let row = read.workset_row(workset, pos[7]).unwrap();
+        let before = crate::transcript::before_at(&read, row.event.agent().unwrap(), pos[7]);
+        assert!(crate::transcript::strip(&row, &before).is_none());
+        let row = read.workset_row(workset, pos[8]).unwrap();
+        assert!(crate::transcript::strip(&row, &before).is_some());
+    }
+
     #[tokio::test]
     async fn rows_are_told_in_the_readers_words() {
         let dir = tempfile::tempdir().unwrap();
@@ -1675,7 +1737,7 @@ mod tests {
         for n in 0..600 {
             let which = next(3);
             let agent = agents[which];
-            let event = match next(7) {
+            let event = match next(9) {
                 0 | 1 => native(step(&format!("exec-{n}"))),
                 2 | 3 => native(request()),
                 4 | 5 => Event::Input {
@@ -1684,6 +1746,21 @@ mod tests {
                     content: Vec::new(),
                     role: Role::User,
                 },
+                6 => Event::Input {
+                    agent,
+                    message: None,
+                    content: vec![rho_agent_types::ContentPart::Text {
+                        text: format!("output-{n}"),
+                    }],
+                    role: Role::Tool,
+                },
+                // A step with no call: the output before it still waits.
+                7 => native(Entry::Step {
+                    exec: None,
+                    prose: format!("prose-{n}"),
+                    carry: rho_agent::inference::Carry::new(serde_json::json!({}), vec![], false),
+                    usage: None,
+                }),
                 _ if rows[which].len() > 1 => {
                     let to = rows[which][1 + next(rows[which].len() - 1)];
                     Event::Rewound { agent, to }
@@ -1716,8 +1793,8 @@ mod tests {
                 let fast = crate::transcript::before_at(&read, *agent, pos);
                 let scan = before_by_scan(&read, *agent, pos);
                 assert_eq!(
-                    (fast.carry, fast.inputs),
-                    (scan.carry, scan.inputs),
+                    (fast.carry, fast.output, fast.inputs),
+                    (scan.carry, scan.output, scan.inputs),
                     "agent {} before {pos:?}",
                     agent.encoded()
                 );

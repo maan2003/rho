@@ -368,20 +368,6 @@ impl HostClient {
         self.change(Request::Usage(usage)).await
     }
 
-    pub(crate) async fn claude_pending_output(
-        &self,
-    ) -> Result<Option<crate::ClaudeOutputBatch>, StoreError> {
-        match self
-            .request(Request::ClaudePendingOutput)
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::ClaudePendingOutput(batch) => Ok(batch),
-            _ => Err(StoreError(anyhow::anyhow!(
-                "unexpected Claude output reply"
-            ))),
-        }
-    }
     pub(crate) async fn claude_account(&self) -> Result<String, StoreError> {
         match self
             .request(Request::ClaudeAccount)

@@ -54,9 +54,10 @@ cannot use provider continuation. Interrupted execution synthesizes its call
 from the admitted code instead of pretending a completed item arrived. A streamed
 call supplies a carry before code, so interruption can preserve admitted code without exposing provider IDs. Transcript readers use IDs only
 for display.
-Each `RequestSent` records only the typed contributions collected for that
-attempt, not provider acknowledgment. Notebook sources retain identity, output,
-images, and typed completion facts; their renderer is deterministic. Human
+Each `RequestSent` records only the notices collected for that attempt, not
+provider acknowledgment. Notebook sources retain identity, output, images, and
+typed completion facts; at a request their report is rendered into a `tool`
+input logged just before it. Human
 messages reference immutable `Received` records. Every `RequestSent` names its
 delivered messages in order and any messages acknowledged without delivery.
 New native attempts collect all unread messages. Request construction merges
@@ -180,17 +181,13 @@ execution and output without rolling back external effects. Settlement, model
 completion, and job completion are distinct live facts
 ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
-Output reads lease a stable contribution until acknowledgment. Notebook replies and reports project once into canonical native inputs carrying
-complete text, images, and status. Historical function-call evidence remains
-replay data, not an active tool capability. Native requests enqueue owned
-contributions before acknowledging notebook buffers, without waiting for disk.
-Claude transfers them to a durable outbox before transport; a failed handoff
-leaves them recoverable.
-Retained batches participate in boundary scheduling and stop rules; when a later
-exec is open, its reply carries retained output as reports. The replacement batch
-owns both old and new contributions before fresh leases are acknowledged.
-A recovered Claude batch becomes an attributed report, not another initial tool
-result and never replayed source. Transport handoff is not proof of consumption.
+At each request, both runtimes take the notebook's report into a `tool` input
+in the log, and `entry::compose` splits everything that waits by role
+([DECISION-roles](DECISION-roles.md)). Taking it clears the facts that woke the
+model, so it never wakes the model twice. Historical function-call evidence
+remains replay data, not an active tool capability. Claude logs the input before
+transport, so a failed handoff leaves it unread for the next exec result, and
+never replays its source. Transport handoff is not proof of consumption.
 
 One initial reply answers an exec; subsequent contributions are reports
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).

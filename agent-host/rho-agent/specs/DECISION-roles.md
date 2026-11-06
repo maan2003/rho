@@ -8,12 +8,17 @@ Every input carries one `Role`, in both runtimes:
 
 - `user`: what a person typed, with a chat header around it. It wakes the agent
   soon.
-- `tool`: anything no person typed and Rho did not write, such as another
-  agent's message. With notebook output, it reaches the model only inside an
-  `exec` result. It wakes the agent after a wait.
+- `tool`: anything no person typed and Rho did not write: another agent's
+  message, and notebook output, which is an input like any other. It reaches
+  the model only inside an `exec` result. A message wakes the agent after a wait;
+  output has its own wake rules.
 - `system`: Rho's own words. It wakes nobody and rides along with the next
   request. The model reads it as `role: user`, like the fixed lines that say
   output waits.
+
+One function, `compose`, splits what a request carries by role for both runtimes.
+Inputs are logged when they arrive, and output when a request takes it; a request
+delivers every input before it, except `tool` inputs when no call is open.
 
 When `end_turn()` runs, the model waits inside its open call, and news answers
 that call. With no call open, `tool` text stays where it is and the model gets

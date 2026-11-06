@@ -1,15 +1,14 @@
 //! One projection for live input and replay, from the agent's visible rows.
-//! Each RequestSent records only new contributions and picks up every input
-//! before it; each input goes in its role
-//! ([DECISION-roles](../../../specs/DECISION-roles.md)). Consecutive requests
-//! are merged until a response closes the group; provider pairing is derived
-//! from the preceding opaque Carry.
+//! Each RequestSent picks up every input before it and `compose` splits them
+//! by role ([DECISION-roles](../../../specs/DECISION-roles.md)). Consecutive
+//! requests are merged until a response closes the group; provider pairing is
+//! derived from the preceding opaque Carry.
 
 use std::sync::Arc;
 
 use rho_agent_types::{ContentPart, Role};
 
-use crate::entry::{Entry, Report, WAITING};
+use crate::entry::{Entry, RequestNotice, compose, output_content, plain_text};
 use crate::inference::{CacheKey, Carry, Image, Item, Request};
 use crate::record::Event;
 
@@ -18,9 +17,9 @@ pub(crate) struct Context {
     /// Inputs no request has picked up yet.
     queued: Vec<(Role, Vec<ContentPart>)>,
     pending: Option<Carry>,
-    report: Report,
-    /// Picked-up `tool` inputs. With `report`'s notebook output, they wait
-    /// for a call to answer: only a tool result reads as a tool's.
+    notices: Vec<RequestNotice>,
+    /// Picked-up `tool` inputs. They wait for a call to answer: only a tool
+    /// result reads as a tool's.
     tool: Vec<Vec<ContentPart>>,
     /// Picked-up `user` and `system` inputs.
     delivered: Vec<Vec<ContentPart>>,
@@ -52,12 +51,9 @@ impl Context {
         match entry {
             Entry::Step { carry, .. } => {
                 if self.open_call().is_some() {
-                    self.report = Report::default();
                     self.tool.clear();
-                } else {
-                    // The notices went out; the rest had no call to answer.
-                    self.report.notices.clear();
                 }
+                self.notices.clear();
                 self.pending = Some(carry.clone());
                 self.delivered.clear();
                 self.compact = false;
@@ -65,13 +61,20 @@ impl Context {
             Entry::RequestSent {
                 report, compact, ..
             } => {
+                if !report.notebook.is_empty() {
+                    self.tool.push(output_content(&report.notebook));
+                }
                 for (role, content) in self.queued.drain(..) {
                     match role {
                         Role::Tool => self.tool.push(content),
                         Role::User | Role::System => self.delivered.push(content),
                     }
                 }
-                self.report.merge(report.clone());
+                for notice in &report.notices {
+                    if !self.notices.contains(notice) {
+                        self.notices.push(notice.clone());
+                    }
+                }
                 self.compact |= compact;
             }
             Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {}
@@ -85,47 +88,19 @@ impl Context {
 
     /// Snapshot the unanswered input group, not the whole conversation.
     pub fn input(&self) -> Vec<Item> {
-        let others = !self.delivered.is_empty();
+        let call = self.open_call();
+        let composed = compose(call.is_some(), &self.notices, &self.tool, &self.delivered);
         let mut items = Vec::new();
-        if let Some(call) = self.open_call() {
-            let rendered = self.report.render(others || !self.tool.is_empty());
-            let mut parts = vec![rendered.text];
-            parts.extend(
-                self.tool
-                    .iter()
-                    .map(|content| rho_agent_types::transcript::text_content(content)),
-            );
-            parts.retain(|part| !part.is_empty());
-            let mut images: Vec<Image> = rendered
-                .images
-                .into_iter()
-                .map(|image| Image {
-                    media_type: image.media_type,
-                    data: image.data,
-                })
-                .collect();
-            images.extend(self.tool.iter().flat_map(|content| images_of(content)));
-            if !parts.is_empty() || !images.is_empty() {
-                items.push(Item::Report {
-                    text: parts.join("\n\n"),
-                    images,
-                    reply_to: call.clone(),
-                });
-            }
-        } else {
-            let waiting = !self.report.notebook.is_empty() || !self.tool.is_empty();
-            let mut parts = self.report.notices(others || waiting);
-            if waiting {
-                parts.push(WAITING.to_owned());
-            }
-            if !parts.is_empty() {
-                items.push(Item::User {
-                    text: parts.join("\n\n"),
-                    images: Vec::new(),
-                });
-            }
+        if let Some(call) = call
+            && !composed.result.is_empty()
+        {
+            items.push(Item::Report {
+                text: plain_text(&composed.result),
+                images: images_of(&composed.result),
+                reply_to: call.clone(),
+            });
         }
-        items.extend(self.delivered.iter().map(|content| Item::User {
+        items.extend(composed.user.iter().map(|content| Item::User {
             text: rho_agent_types::transcript::text_content(content),
             images: images_of(content),
         }));
@@ -189,7 +164,7 @@ mod tests {
     use rho_agent_types::{AgentId, AgentIdDomain};
 
     use super::*;
-    use crate::entry::{Notice, RequestNotice, Wake};
+    use crate::entry::{Notice, Report, WAITING, Wake};
     use crate::inference::Call;
 
     fn agent() -> AgentId {
@@ -217,12 +192,13 @@ mod tests {
             role: Role::User,
         }
     }
+    /// A request as old rows have it, with the output in its report.
     fn attempt(text: &str, bytes: Vec<u8>) -> Event<'static> {
         native(Entry::RequestSent {
             why: Wake::Notify,
             compact: false,
             report: Report {
-                notices: vec![RequestNotice::Restarted],
+                notices: Vec::new(),
                 notebook: rho_notebook::Report::from_text(
                     text.into(),
                     if bytes.is_empty() {
@@ -400,8 +376,7 @@ mod tests {
             panic!("one combined report");
         };
         assert_eq!(carry.display_calls()[0].display_id(), "first");
-        assert!(text.ends_with("alpha\n\nbeta"));
-        assert_eq!(text.matches("rho restarted.").count(), 1);
+        assert_eq!(text, "alpha\n\nbeta");
         assert_eq!(
             images.iter().map(|i| i.data.clone()).collect::<Vec<_>>(),
             vec![vec![1, 7], vec![9, 2, 8]]
@@ -462,7 +437,7 @@ mod tests {
         // next one.
         assert_eq!(built.items().len(), 3);
         let told = users(&built.items()[1..]);
-        assert!(told[0].ends_with(WAITING), "{told:?}");
+        assert!(told[0].contains(WAITING), "{told:?}");
         assert_eq!(told[1], "queued-during-compaction");
     }
 }
