@@ -176,10 +176,6 @@ impl Mirror {
             open_or_rebuild(&mut write, MESSAGES);
             open_or_rebuild(&mut write, DELIVERED);
             open_or_rebuild(&mut write, WHERE);
-            // Temporary (`temp-migration`): the host's move renumbered the
-            // worksets, so rows cached by their old positions are wrong. The
-            // protocol epoch keeps this build off a host that has not moved.
-            write.delete_table("gui_agent_rows_v1");
             open_or_rebuild(&mut write, ROWS);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
