@@ -462,6 +462,29 @@ mod tests {
     }
 
     #[test]
+    fn passes_each_model_by_its_cli_alias() {
+        for (model, alias) in [
+            (Model::Opus, "opus"),
+            (Model::Sonnet, "sonnet"),
+            (Model::Fable, "fable"),
+            (Model::Haiku, "haiku"),
+        ] {
+            let options = ClaudeCodeOptions::new(
+                "/tmp/project",
+                model,
+                Effort::Max,
+                uuid::uuid!("00000000-0000-4000-8000-000000000000"),
+            );
+            let args = options.args();
+            assert!(
+                args.windows(2).any(|args| args == ["--model", alias]),
+                "{model:?}: {args:?}"
+            );
+            assert!(args.windows(2).any(|args| args == ["--effort", "max"]));
+        }
+    }
+
+    #[test]
     fn builds_fork_at_message_args() {
         let mut options = ClaudeCodeOptions::new(
             "/tmp/project",

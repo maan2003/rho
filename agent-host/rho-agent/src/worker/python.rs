@@ -1008,6 +1008,7 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
                 "fable" => rho_claude::Model::Fable,
                 "opus" => rho_claude::Model::Opus,
                 "sonnet" => rho_claude::Model::Sonnet,
+                "haiku" => rho_claude::Model::Haiku,
                 _ => return Err(PyValueError::new_err(format!("no Claude model {model:?}"))),
             };
             let effort = match effort.as_str() {
@@ -1039,4 +1040,36 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
         }
     };
     Ok(AgentSpec { runtime, props })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each Claude model goes out to Python by the name Python gives it back.
+    #[test]
+    fn claude_models_round_trip_through_python() {
+        rho_notebook::start_python().unwrap();
+        Python::attach(|py| {
+            for (model, name) in [
+                (rho_claude::Model::Fable, "fable"),
+                (rho_claude::Model::Opus, "opus"),
+                (rho_claude::Model::Sonnet, "sonnet"),
+                (rho_claude::Model::Haiku, "haiku"),
+            ] {
+                let spec = AgentSpec {
+                    runtime: Runtime::Claude {
+                        model,
+                        effort: rho_claude::Effort::Max,
+                        session_id: uuid::Uuid::nil(),
+                    },
+                    props: Default::default(),
+                };
+                let dict = spec_to_py(py, &spec).unwrap();
+                let runtime: Bound<'_, PyDict> = item(&dict, "runtime").unwrap();
+                assert_eq!(item::<String>(&runtime, "model").unwrap(), name);
+                assert_eq!(spec_from_py(&dict, Some(&spec)).unwrap(), spec);
+            }
+        });
+    }
 }

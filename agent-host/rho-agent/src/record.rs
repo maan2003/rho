@@ -193,6 +193,7 @@ impl Runtime {
                 rho_claude::Model::Fable => "fable",
                 rho_claude::Model::Opus => "opus",
                 rho_claude::Model::Sonnet => "sonnet",
+                rho_claude::Model::Haiku => "haiku",
             },
         }
     }
