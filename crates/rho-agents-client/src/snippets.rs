@@ -24,7 +24,7 @@ pub struct Runtime {
 /// `_rho.pyi` lists them.
 const NATIVE_MODELS: [&str; 3] = ["sol", "terra", "astra"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-const CLAUDE_MODELS: [&str; 3] = ["fable", "opus", "sonnet"];
+const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
 
 /// What the model picker cycles through, first the default. Any other
@@ -226,6 +226,14 @@ mod tests {
             RuntimeKind::Claude
         );
         assert!(Runtime::parse("opus-low").is_err(), "claude takes no low");
+        assert_eq!(
+            Runtime::parse("haiku-medium").unwrap(),
+            Runtime {
+                kind: RuntimeKind::Claude,
+                model: "haiku".into(),
+                effort: "medium".into()
+            }
+        );
         assert!(Runtime::parse("med-eng").is_err());
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");

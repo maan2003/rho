@@ -21,7 +21,7 @@ class NativeRuntime(TypedDict):
 
 class ClaudeRuntime(TypedDict):
     kind: Literal["claude"]
-    model: Literal["fable", "opus", "sonnet"]
+    model: Literal["fable", "opus", "sonnet", "haiku"]
     effort: Literal["medium", "high", "xhigh"]
 
 Runtime = NativeRuntime | ClaudeRuntime

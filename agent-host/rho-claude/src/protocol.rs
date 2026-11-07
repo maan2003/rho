@@ -8,6 +8,7 @@ pub enum Model {
     Opus,
     Sonnet,
     Fable,
+    Haiku,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -37,6 +38,7 @@ impl Model {
             Self::Opus => "opus",
             Self::Sonnet => "sonnet",
             Self::Fable => "fable",
+            Self::Haiku => "haiku",
         }
     }
 }

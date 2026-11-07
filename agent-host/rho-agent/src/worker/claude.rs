@@ -2170,7 +2170,7 @@ async fn finish_rewind(
 fn usage_model(model: Model) -> crate::log::AgentUsageModel {
     match model {
         Model::Opus => crate::log::AgentUsageModel::OPUS,
-        Model::Fable | Model::Sonnet => crate::log::AgentUsageModel::FABLE,
+        Model::Fable | Model::Sonnet | Model::Haiku => crate::log::AgentUsageModel::FABLE,
     }
 }
 

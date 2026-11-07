@@ -135,7 +135,9 @@ pub fn usage_model_of(runtime: &Runtime) -> AgentUsageModel {
         },
         Runtime::Claude { model, .. } => match model {
             rho_claude::Model::Opus => AgentUsageModel::OPUS,
-            rho_claude::Model::Fable | rho_claude::Model::Sonnet => AgentUsageModel::FABLE,
+            rho_claude::Model::Fable | rho_claude::Model::Sonnet | rho_claude::Model::Haiku => {
+                AgentUsageModel::FABLE
+            }
         },
     }
 }

@@ -1498,6 +1498,7 @@ fn models() -> Vec<Runtime> {
         rho_claude::Model::Fable,
         rho_claude::Model::Opus,
         rho_claude::Model::Sonnet,
+        rho_claude::Model::Haiku,
     ]
     .map(|model| Runtime::Claude {
         model,
