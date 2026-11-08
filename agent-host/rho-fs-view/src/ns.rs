@@ -120,6 +120,15 @@ impl Layout {
         if let Some(cargo) = crate::shared_cargo_bin() {
             command.env("RHO_DEVSHELL_CARGO", cargo);
         }
+        // Yarn hard-links node_modules from its global folder, and a hard
+        // link cannot cross a mount, so the folder lives in the workset mount
+        // that holds the checkouts. The user's own setting wins.
+        if environment.get("YARN_GLOBAL_FOLDER").is_none() {
+            command.env(
+                "YARN_GLOBAL_FOLDER",
+                Path::new(MOUNT_ROOT).join(".yarn-berry"),
+            );
+        }
         if let Some(socket) = &self.store_socket {
             command.env(crate::SOCKET_ENV, socket);
         }
