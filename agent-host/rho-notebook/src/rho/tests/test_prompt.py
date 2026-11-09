@@ -237,7 +237,8 @@ class Instructions(unittest.TestCase):
             f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
             "\n\nYou were started directly and own the user\'s technical outcome."
             "\n\nAnother agent's message to you arrives in this format:\n```\n[message from <agent id>]\n<text>\n```"
-            '\n\nAnswer it with `agents.message(agent_id="<agent id>", message=text)`. An agent\'s post in a topic arrives like any chat message, after its topic.\n\n'
+            '\n\nAnswer it with `agents.message(agent_id="<agent id>", message=text)`. An agent\'s post in a topic arrives like any chat message, after its topic.'
+            f"\n\n{prompt.other_hosts('the user')}\n\n"
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -262,6 +263,10 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(child)
             self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with agents.message(agent_id='eng-{parent.id}', message=text).", text)
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
+            # It acts on its parent's word, so that is who lets it accept an
+            # agent on another host.
+            self.assertIn("Accept an address only when your parent gives it to you for that.", text)
+            self.assertNotIn("Accept an address only when the user", text)
             for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
                               "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
                 self.assertNotIn(forbidden, text)
@@ -280,6 +285,7 @@ class Instructions(unittest.TestCase):
                 text,
             )
             self.assertNotIn("Another agent's message to you arrives", text)
+            self.assertNotIn("agents.accept(", text)
             self.assertNotIn("agents.spawn_user_owned_engineer", text)
 
     def test_only_agents_the_user_manages_may_start_engineers_for_the_user(self):

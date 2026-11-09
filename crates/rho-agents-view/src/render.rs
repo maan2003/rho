@@ -142,7 +142,8 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::AgentMessage { .. } => BlockKind::User,
         UiBlock::ChatMessage { from, .. } => match from {
             Address::User => BlockKind::User,
-            Address::Agent(_) => BlockKind::Response { working: false },
+            // A peer's words are never the user's.
+            Address::Agent(_) | Address::Peer => BlockKind::Response { working: false },
         },
     }
 }
@@ -487,7 +488,7 @@ pub fn render_block_with_agent_labels(
                     gutter_span = Some(spans.len());
                     spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
                 }
-                Address::Agent(_) => {
+                Address::Agent(_) | Address::Peer => {
                     markdown = true;
                     let mut text = text.clone();
                     if !text.ends_with('\n') {

@@ -460,13 +460,8 @@ impl TranscriptFold {
         }
         self.errored = false;
         self.touch(self.queue_end() + self.inbox.len());
-        self.inbox.push((
-            message.id,
-            UiBlock::QueuedMessage {
-                text: text(message),
-                sender: sender(message.from),
-            },
-        ));
+        self.inbox
+            .push((message.id, received(message.from, text(message))));
     }
 
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
@@ -501,9 +496,17 @@ impl TranscriptFold {
                                     self.touch(self.queue_end() + index);
                                     self.inbox.remove(index).1
                                 }
-                                None => UiBlock::QueuedMessage {
-                                    text: input.text.clone(),
-                                    sender: self.senders.get(&id).copied().and_then(sender),
+                                None => match self.senders.get(&id) {
+                                    Some(from) => received(*from, input.text.clone()),
+                                    None if input.role == rho_agent_types::Role::User => {
+                                        received(Address::User, input.text.clone())
+                                    }
+                                    // Its message is not heard yet, and it is
+                                    // not the user's: the policy's text says
+                                    // whose it is.
+                                    None => UiBlock::Notice {
+                                        text: input.text.clone(),
+                                    },
                                 },
                             }
                         }
@@ -677,10 +680,19 @@ impl TranscriptFold {
     }
 }
 
-fn sender(from: Address) -> Option<AgentId> {
+/// A message the agent received, as it waits. One from a peer on another
+/// host is neither the user's nor an agent's of this host, so it is a
+/// notice that says so and never reads as either.
+fn received(from: Address, text: String) -> UiBlock {
     match from {
-        Address::User => None,
-        Address::Agent(agent) => Some(agent),
+        Address::User => UiBlock::QueuedMessage { text, sender: None },
+        Address::Agent(agent) => UiBlock::QueuedMessage {
+            text,
+            sender: Some(agent),
+        },
+        Address::Peer => UiBlock::Notice {
+            text: format!("from a peer on another host:\n{text}"),
+        },
     }
 }
 
@@ -1119,6 +1131,45 @@ mod tests {
         assert!(
             !fold.tell(&TranscriptRow::Message(from_user(9, 1))),
             "a replay"
+        );
+    }
+
+    /// What a peer on another host wrote is never shown as the user's
+    /// words or as an agent's of this host, waiting or delivered, whichever
+    /// of its message and its input is heard first.
+    #[test]
+    fn a_message_from_a_peer_is_a_notice() {
+        let from_peer = Arc::new(UiBlock::Notice {
+            text: "from a peer on another host:\nmessage 9".to_owned(),
+        });
+        let handed = LogEvent::Request {
+            agent: me(),
+            inputs: vec![InputView {
+                message: Some(MessageId(rho_agent_types::ChatSeq(9))),
+                text: "[message from bob at b2/x, an agent on another host]\nmessage 9".to_owned(),
+                role: rho_agent_types::Role::Tool,
+            }],
+            answers: true,
+            compaction: false,
+            timing: None,
+            at: UnixMs(2),
+        };
+
+        let mut fold = TranscriptFold::new(me(), &[]);
+        fold.tell(&TranscriptRow::Message(message(9, Address::Peer, 1)));
+        assert_eq!(fold.state().blocks, vec![from_peer.clone()], "waiting");
+        fold.tell(&TranscriptRow::Log(Wpos(0), handed.clone()));
+        assert_eq!(fold.state().blocks, vec![from_peer], "delivered");
+
+        let mut fold = TranscriptFold::new(me(), &[]);
+        fold.tell(&TranscriptRow::Log(Wpos(0), handed));
+        fold.tell(&TranscriptRow::Message(message(9, Address::Peer, 1)));
+        assert_eq!(
+            fold.state().blocks,
+            vec![Arc::new(UiBlock::Notice {
+                text: "[message from bob at b2/x, an agent on another host]\nmessage 9".to_owned(),
+            })],
+            "input first"
         );
     }
 

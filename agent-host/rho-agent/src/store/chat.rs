@@ -8,7 +8,7 @@
 use redb::TableDefinition;
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, Message, MessageId,
-    StreamId, TopicId, UnixMs,
+    PeerAddress, StreamId, TopicId, UnixMs,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
@@ -31,6 +31,16 @@ const DIRECTS: TableDefinition<(AgentId, AgentId), u64> = TableDefinition::new("
 /// A moved message's topic now. A message never moved is in the topic its
 /// `Posted` names.
 const MOVED: TableDefinition<u64, u64> = TableDefinition::new("chat_moved");
+/// `(agent, address)`: the open peer conversation of an agent and an
+/// address it accepted.
+const PEERS: TableDefinition<(AgentId, String), u64> = TableDefinition::new("chat_peers");
+/// By peer conversation: the newest of the agent's messages in it that is
+/// done with, delivered to the peer or given up on. The ones after it are
+/// still to send, so the log is the outbox.
+const PEER_SENT: TableDefinition<u64, u64> = TableDefinition::new("chat_peer_sent");
+/// By peer conversation: the id the peer gave the newest message stored
+/// from it. A peer sends in order, so only its newest can come twice.
+const PEER_RECEIVED: TableDefinition<u64, u64> = TableDefinition::new("chat_peer_received");
 
 /// Where a conversation is.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -43,6 +53,50 @@ pub enum Place {
     },
     /// Two agents' own conversation: only they post in it.
     Direct,
+    /// An agent's conversation with an address it accepted, under the name
+    /// it gave it: only the two post in it. Once it is not `open`, the
+    /// acceptance was taken back and no one does.
+    Peer {
+        peer: PeerAddress,
+        name: String,
+        open: bool,
+    },
+}
+
+impl Place {
+    /// What only a topic in a stream allows, refused with `what` for any
+    /// other conversation.
+    fn stream_only(&self, direct: &str, peer: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Stream { .. } => Ok(()),
+            Self::Direct => anyhow::bail!("{direct}"),
+            Self::Peer { .. } => anyhow::bail!("{peer}"),
+        }
+    }
+}
+
+/// An agent's message a peer has not taken yet: the oldest of its
+/// conversation, since a peer is sent them in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerOutgoing {
+    pub topic: TopicId,
+    pub message: MessageId,
+    pub at: UnixMs,
+    pub agent: AgentId,
+    pub peer: PeerAddress,
+    pub name: String,
+    pub content: Vec<ContentPart>,
+}
+
+/// An open peer conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct PeerContact {
+    pub topic: TopicId,
+    pub agent: AgentId,
+    pub peer: PeerAddress,
+    pub name: String,
+    /// How many of the agent's messages the peer has not taken.
+    pub unsent: u64,
 }
 
 /// A conversation as the log has made it.
@@ -75,6 +129,12 @@ pub trait ChatRead {
     fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message>;
     /// A topic's `newest` latest messages, oldest first.
     fn topic_messages(&self, topic: TopicId, newest: usize) -> Vec<Message>;
+    /// The open peer conversation of `agent` and `peer`.
+    fn peer_topic(&self, agent: AgentId, peer: &PeerAddress) -> Option<TopicId>;
+    /// Every open peer conversation, an agent's together.
+    fn peers(&self) -> Vec<PeerContact>;
+    /// The next message to send in each open peer conversation that has one.
+    fn peer_outgoing(&self) -> Vec<PeerOutgoing>;
 }
 
 impl ChatRead for ReadTxn {
@@ -150,6 +210,81 @@ impl ChatRead for ReadTxn {
             })
             .collect()
     }
+
+    fn peer_topic(&self, agent: AgentId, peer: &PeerAddress) -> Option<TopicId> {
+        self.open_table(PEERS)
+            .get((agent, peer.to_string()))
+            .map(|seq| TopicId(ChatSeq(seq.value())))
+    }
+
+    fn peers(&self) -> Vec<PeerContact> {
+        let topics: Vec<(AgentId, u64)> = self
+            .open_table(PEERS)
+            .iter()
+            .map(|(key, seq)| (key.value().0, seq.value()))
+            .collect();
+        topics
+            .into_iter()
+            .map(|(agent, seq)| {
+                let topic = TopicId(ChatSeq(seq));
+                let Some(Place::Peer { peer, name, .. }) = self.topic(topic).map(|head| head.place)
+                else {
+                    panic!("a peer index names a peer conversation");
+                };
+                PeerContact {
+                    topic,
+                    agent,
+                    peer,
+                    name,
+                    unsent: self.peer_unsent(topic, agent).count() as u64,
+                }
+            })
+            .collect()
+    }
+
+    fn peer_outgoing(&self) -> Vec<PeerOutgoing> {
+        self.peers()
+            .into_iter()
+            .filter_map(|contact| {
+                let message = self.peer_unsent(contact.topic, contact.agent).next()?;
+                Some(PeerOutgoing {
+                    topic: contact.topic,
+                    message: message.id,
+                    at: message.at,
+                    agent: contact.agent,
+                    peer: contact.peer,
+                    name: contact.name,
+                    content: message.content,
+                })
+            })
+            .collect()
+    }
+}
+
+trait PeerRead {
+    /// The agent's messages in its peer conversation after the last one
+    /// done with, oldest first.
+    fn peer_unsent(&self, topic: TopicId, agent: AgentId) -> impl Iterator<Item = Message>;
+}
+
+impl PeerRead for ReadTxn {
+    fn peer_unsent(&self, topic: TopicId, agent: AgentId) -> impl Iterator<Item = Message> {
+        let sent = self
+            .open_table(PEER_SENT)
+            .get(topic.0.0)
+            .map_or(0, |seq| seq.value());
+        let seqs: Vec<u64> = self
+            .open_table(TOPIC_MESSAGES)
+            .range((topic.0.0, sent + 1)..=(topic.0.0, u64::MAX))
+            .map(|(key, _)| key.value().1)
+            .collect();
+        seqs.into_iter()
+            .map(|seq| {
+                self.message(MessageId(ChatSeq(seq)))
+                    .expect("a topic names its messages")
+            })
+            .filter(move |message| message.from == Address::Agent(agent))
+    }
 }
 
 fn where_now(mut message: Message, moved: Option<TopicId>) -> Option<Message> {
@@ -222,6 +357,30 @@ pub trait ChatWrite {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId>;
+    /// `agent` accepts `peer` under `name`: their conversation, started if
+    /// they have none open. One already open keeps its name, so a second
+    /// name for it is refused.
+    fn accept_peer(
+        &mut self,
+        at: UnixMs,
+        agent: AgentId,
+        peer: PeerAddress,
+        name: String,
+    ) -> anyhow::Result<TopicId>;
+    /// Takes back the acceptance behind an open peer conversation.
+    fn remove_peer(&mut self, at: UnixMs, topic: TopicId) -> anyhow::Result<()>;
+    /// The agent's messages in `topic` up to `message` are done with:
+    /// delivered, or given up on.
+    fn peer_sent(&mut self, topic: TopicId, message: MessageId);
+    /// Stores what the peer of `topic` sent under its own `id`; `None` for
+    /// its newest come again.
+    fn receive_peer(
+        &mut self,
+        at: UnixMs,
+        topic: TopicId,
+        id: u64,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<Option<MessageId>>;
     fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead>;
     fn chat_stream_named(&mut self, name: &str) -> Option<StreamId>;
 }
@@ -275,6 +434,9 @@ impl ChatWrite for WriteTxn {
         self.open_table(CLIENT_IDS);
         self.open_table(DIRECTS);
         self.open_table(MOVED);
+        self.open_table(PEERS);
+        self.open_table(PEER_SENT);
+        self.open_table(PEER_RECEIVED);
     }
 
     fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId> {
@@ -377,10 +539,10 @@ impl ChatWrite for WriteTxn {
         let mut head = self
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "no one joins a direct conversation"
-        );
+        head.place.stream_only(
+            "no one joins a direct conversation",
+            "no one joins a peer conversation",
+        )?;
         if head.agents.contains(&agent) {
             return Ok(());
         }
@@ -395,10 +557,10 @@ impl ChatWrite for WriteTxn {
         let mut head = self
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "no one leaves a direct conversation"
-        );
+        head.place.stream_only(
+            "no one leaves a direct conversation",
+            "no one leaves a peer conversation",
+        )?;
         if !head.agents.contains(&agent) {
             return Ok(());
         }
@@ -420,10 +582,10 @@ impl ChatWrite for WriteTxn {
         let mut head = self
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "a direct conversation has no name or stream"
-        );
+        head.place.stream_only(
+            "a direct conversation has no name or stream",
+            "a peer conversation has no stream, and its name is the peer's",
+        )?;
         anyhow::ensure!(
             self.open_table(STREAMS).get(stream.0.0).is_some(),
             "no stream {}",
@@ -494,10 +656,10 @@ impl ChatWrite for WriteTxn {
                 .get(id.0.0)
                 .map_or(message.topic, |topic| TopicId(ChatSeq(topic.value())));
             let head = self.chat_topic(now).expect("a message's topic exists");
-            anyhow::ensure!(
-                head.place != Place::Direct,
-                "a direct conversation's messages stay in it"
-            );
+            head.place.stream_only(
+                "a direct conversation's messages stay in it",
+                "a peer conversation's messages stay in it",
+            )?;
             from.push((*id, message.topic, now));
         }
         let to = match to {
@@ -505,10 +667,10 @@ impl ChatWrite for WriteTxn {
                 let head = self
                     .chat_topic(topic)
                     .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-                anyhow::ensure!(
-                    head.place != Place::Direct,
-                    "messages move only to a topic in a stream"
-                );
+                head.place.stream_only(
+                    "messages move only to a topic in a stream",
+                    "messages move only to a topic in a stream",
+                )?;
                 topic
             }
             MoveTo::NewTopic { stream, name } => self.open_topic(at, stream, name, by)?,
@@ -554,11 +716,33 @@ impl ChatWrite for WriteTxn {
             .chat_topic(topic)
             .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
         anyhow::ensure!(has_content(&message.content), "a message needs content");
-        if head.place == Place::Direct {
-            anyhow::ensure!(
+        anyhow::ensure!(
+            message
+                .mentions
+                .iter()
+                .all(|mention| mention.to != Address::Peer),
+            "a peer is not mentioned"
+        );
+        match &head.place {
+            Place::Stream { .. } => anyhow::ensure!(
+                message.from != Address::Peer,
+                "a peer posts only in its peer conversation"
+            ),
+            Place::Direct => anyhow::ensure!(
                 matches!(message.from, Address::Agent(agent) if head.agents.contains(&agent)),
                 "only its two agents post in a direct conversation"
-            );
+            ),
+            Place::Peer { open, name, .. } => {
+                anyhow::ensure!(*open, "{name} is no longer accepted");
+                anyhow::ensure!(
+                    match message.from {
+                        Address::Agent(agent) => head.agents.contains(&agent),
+                        Address::Peer => true,
+                        Address::User => false,
+                    },
+                    "only its agent and its peer post in a peer conversation"
+                );
+            }
         }
         let NewMessage {
             from,
@@ -595,6 +779,118 @@ impl ChatWrite for WriteTxn {
         drop(inbox);
         remember(self, client_id, seq);
         Ok(MessageId(seq))
+    }
+
+    fn accept_peer(
+        &mut self,
+        at: UnixMs,
+        agent: AgentId,
+        peer: PeerAddress,
+        name: String,
+    ) -> anyhow::Result<TopicId> {
+        let name = name.trim().to_owned();
+        anyhow::ensure!(!name.is_empty(), "an accepted address needs a name");
+        let key = (agent, peer.to_string());
+        let open = self
+            .open_table(PEERS)
+            .get(key.clone())
+            .map(|seq| seq.value());
+        if let Some(seq) = open {
+            let topic = TopicId(ChatSeq(seq));
+            let head = self.chat_topic(topic).expect("a peer index names a topic");
+            let Place::Peer { name: held, .. } = head.place else {
+                panic!("a peer index names a peer conversation");
+            };
+            anyhow::ensure!(
+                held == name,
+                "{peer} is already accepted as {held:?}; remove it to name it again"
+            );
+            return Ok(topic);
+        }
+        let seq = append(
+            self,
+            at,
+            ChatEvent::PeerAccepted {
+                agent,
+                peer: peer.clone(),
+                name: name.clone(),
+            },
+        );
+        self.open_table(TOPICS).insert(
+            seq.0,
+            SenValue::borrowed(&TopicHead {
+                place: Place::Peer {
+                    peer,
+                    name,
+                    open: true,
+                },
+                agents: vec![agent],
+            }),
+        );
+        self.open_table(PEERS).insert(key, seq.0);
+        Ok(TopicId(seq))
+    }
+
+    fn remove_peer(&mut self, at: UnixMs, topic: TopicId) -> anyhow::Result<()> {
+        let mut head = self
+            .chat_topic(topic)
+            .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
+        let Place::Peer { peer, open, .. } = &mut head.place else {
+            anyhow::bail!("topic {} is not a peer conversation", topic.0.0);
+        };
+        if !*open {
+            return Ok(());
+        }
+        *open = false;
+        let key = (head.agents[0], peer.to_string());
+        append(self, at, ChatEvent::PeerRemoved { topic });
+        self.open_table(TOPICS)
+            .insert(topic.0.0, SenValue::borrowed(&head));
+        self.open_table(PEERS).remove(key);
+        self.open_table(PEER_SENT).remove(topic.0.0);
+        self.open_table(PEER_RECEIVED).remove(topic.0.0);
+        Ok(())
+    }
+
+    fn peer_sent(&mut self, topic: TopicId, message: MessageId) {
+        // A conversation closed meanwhile has nothing left to send.
+        if !matches!(
+            self.chat_topic(topic).map(|head| head.place),
+            Some(Place::Peer { open: true, .. })
+        ) {
+            return;
+        }
+        let mut sent = self.open_table(PEER_SENT);
+        if sent
+            .get(topic.0.0)
+            .is_none_or(|seq| seq.value() < message.0.0)
+        {
+            sent.insert(topic.0.0, message.0.0);
+        }
+    }
+
+    fn receive_peer(
+        &mut self,
+        at: UnixMs,
+        topic: TopicId,
+        id: u64,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<Option<MessageId>> {
+        if self
+            .open_table(PEER_RECEIVED)
+            .get(topic.0.0)
+            .is_some_and(|newest| newest.value() == id)
+        {
+            return Ok(None);
+        }
+        let message = NewMessage {
+            from: Address::Peer,
+            mentions: Vec::new(),
+            content,
+        };
+        let message = self.post(at, topic, message, None)?;
+        self.open_table(PEER_RECEIVED).insert(topic.0.0, id);
+        Ok(Some(message))
     }
 
     fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead> {

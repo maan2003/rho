@@ -58,10 +58,11 @@ Chat is how people and agents talk, shaped like Zulip: streams hold topics,
 and topics hold messages. Each host owns one append-only chat log, dense from
 1; a stream, topic or message is named by the sequence number of the event
 that made it. A fresh log is empty: there is no default stream, and whoever
-starts a topic names its stream, which is made on first use. Hosts never talk
-to each other: a GUI attached to several hosts shows each host's streams. The
-log lives on the host because the GUI is often offline and chat crosses
-worksets, and it survives workset deletion.
+starts a topic names its stream, which is made on first use. A host's chat is
+its own: a GUI attached to several hosts shows each host's streams, and hosts
+carry nothing between them but peer conversations (below). The log lives on
+the host because the GUI is often offline and chat crosses worksets, and it
+survives workset deletion.
 
 Chat and agents are separate hierarchies. They meet only through a topic's
 members and through mentions. A message reaches its conversation's members and
@@ -79,6 +80,20 @@ default tools name it `agents.message`, not chat: an agent reads a message in
 it as a message from the other agent, with no conversation id. Chat is the
 user's. The GUI neither lists direct conversations nor makes cards for them:
 each agent's own transcript shows what it sent and received.
+
+An agent talks to an agent on another harness in a peer conversation, over
+C2C ([docs/c2c.md](../../docs/c2c.md)). An agent's address is the host's iroh
+endpoint id and the agent's id, so only a host that listens over iroh speaks
+C2C. Accepting an address under a name (`agents.accept`) makes the
+conversation, which is like a direct one with a single member: the agent. The
+other side is the address. What the agent posts there is what the host sends,
+in order, and a cursor beside the log says how far the peer's harness has
+taken it. What that harness sends is posted there as from the peer and
+delivered like any message, as input with no authority. The host takes a
+message only for an agent that accepted the sender's address; it refuses
+everything else and logs nothing. Nothing asks the user: they see what agents
+accepted, and take an acceptance back, with `rho c2c`. A conversation taken
+back keeps its messages and carries no more.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move

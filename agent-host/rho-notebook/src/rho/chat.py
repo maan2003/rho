@@ -1,14 +1,19 @@
-"""The host's chat: streams of topics of messages, and direct
-conversations of two agents ([ARCH-agent-host]). Chat and agents meet only
-here: a message reaches the members of its conversation and the agents it
-mentions, never its sender. A topic's members are the agents that joined it.
-A direct conversation's members are its two agents, and only they post in
-it. The user is reached by a mention."""
+"""The host's chat: streams of topics of messages, direct conversations of
+two agents, and peer conversations of an agent and an address on another
+host ([ARCH-agent-host]). Chat and agents meet only here: a message reaches
+the members of its conversation and the agents it mentions, never its
+sender. A topic's members are the agents that joined it. A direct
+conversation's members are its two agents, and only they post in it. A peer
+conversation is the same with one agent: the host sends what it posts to
+the address it accepted, and what that address sends arrives in it. The
+user is reached by a mention."""
 
 import _rho
 
 #: The address of the user.
 USER = "user"
+#: The sender of what the other end of a peer conversation sent.
+PEER = "peer"
 #: What a mention asks of the one it names.
 KINDS = ("ask", "result", "fyi")
 #: The prop that links an agent to the message it was started from, as
@@ -32,6 +37,27 @@ def start(sender: str, stream: str, name: str, text: str, mentions: list[tuple[s
 def direct(a: str, b: str) -> int:
     """The direct conversation of agents `a` and `b`, started if new."""
     return _rho.direct(a, b)
+
+
+def address(agent: str) -> str:
+    """The C2C address other hosts reach `agent` at."""
+    return _rho.peer_address(agent)
+
+
+def accept(agent: str, address: str, name: str) -> int:
+    """`agent` accepts the C2C `address` under `name`; returns their peer
+    conversation. The host then carries messages between the two."""
+    return _rho.peer_accept(agent, address, name)
+
+
+def peer(agent: str, address: str) -> int:
+    """The peer conversation of `agent` and an address it accepted."""
+    return _rho.peer_topic(agent, address)
+
+
+def contacts(agent: str) -> list[dict]:
+    """The addresses `agent` has accepted."""
+    return _rho.peers(agent)
 
 
 def join(topic: int, agent: str) -> None:
@@ -68,7 +94,8 @@ def move(agent: str, messages: list[int], to: int | None = None, *, stream: str 
 
 def topic(id: int) -> dict | None:
     """The conversation's name, its stream's name, whether it is resolved,
-    and its members. Name and stream are None for a direct conversation."""
+    its members, and its peer. Name and stream are None outside a stream;
+    the peer is None but for a peer conversation."""
     return _rho.topic(id)
 
 

@@ -64,7 +64,7 @@ class Tools(WorksetCase):
             "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
         })
         # The brief goes in their direct conversation.
-        self.assertEqual(self.state.topics[topic], {"id": topic, "name": None, "stream": None, "resolved": False, "agents": sorted([self.root, child])})
+        self.assertEqual(self.state.topics[topic], {"id": topic, "name": None, "stream": None, "resolved": False, "agents": sorted([self.root, child]), "peer": None})
         [brief] = self.state.messages
         self.assertEqual((brief["topic"], brief["sender"], brief["text"], brief["mentions"]), (topic, self.root, "Fix it.", []))
         self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as messages from it. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
@@ -209,7 +209,7 @@ class Tools(WorksetCase):
         printed, started = run(lambda: chat.start("ops", "side", "Look.", mention=f"eng-{child}", kind="ask"))
         self.assertEqual(printed, f"Started topic #{started}.\n")
         # Its starter joins it; the mentioned child does not.
-        self.assertEqual(self.state.topics[started], {"id": started, "name": "side", "stream": "ops", "resolved": False, "agents": [self.root]})
+        self.assertEqual(self.state.topics[started], {"id": started, "name": "side", "stream": "ops", "resolved": False, "agents": [self.root], "peer": None})
         self.assertEqual(self.state.messages[-1]["_to"], {child})
         # Agents message each other outside the user's chat, in a direct
         # conversation of their own, any agent on the host.
@@ -243,6 +243,60 @@ class Tools(WorksetCase):
         self.assertEqual(printed, f"[#{conversation} direct with eng-{self.root}]\n#{yes} eng-{child}: Yes?\n")
         printed, _ = run(lambda: chat.read(topic))
         self.assertEqual(printed, f"[#{topic} rho › Do it]\n#{topic + 1} user: Do it.\n")
+
+    def test_an_agent_on_another_host_is_reached_only_once_accepted(self):
+        ns, _ = self.notebook(self.root)
+        agents = ns["agents"]
+        theirs = "cd" * 32 + "/their-agent"
+        mine = "ab" * 32 + f"/{self.root}"
+        printed, _ = run(agents.address)
+        self.assertEqual(printed, mine + "\n")
+        with self.assertRaisesRegex(ValueError, "is not accepted"):
+            agents.message(agent_id=theirs, message="Hi.")
+        self.assertEqual(self.state.messages, [], "nothing goes to an address not accepted")
+        printed, _ = run(agents.contacts)
+        self.assertEqual(printed, "You have accepted no address.\n")
+
+        printed, _ = run(lambda: agents.accept(address=f" {theirs} ", name="dpc's agent"))
+        self.assertEqual(
+            printed,
+            f"Accepted {theirs} as dpc's agent. It reaches you once it has your address, {mine}, "
+            "and you reach it once it has accepted that address.\n",
+        )
+        topic = self.state.peers[self.root, theirs]
+        self.assertEqual(self.state.topics[topic]["agents"], [self.root])
+        with self.assertRaisesRegex(ValueError, "already accepted as \"dpc's agent\""):
+            agents.accept(address=theirs, name="someone else")
+        with self.assertRaisesRegex(ValueError, "<endpoint id>/<local id>"):
+            agents.accept(address="their-agent", name="x")
+
+        printed, _ = run(lambda: agents.message(agent_id=theirs, message="Hi."))
+        self.assertEqual(printed, "Sent to dpc's agent. A notice follows if its host does not take it.\n")
+        sent = self.state.messages[-1]
+        self.assertEqual((sent["topic"], sent["sender"], sent["text"]), (topic, self.root, "Hi."))
+        self.assertEqual(sent["_to"], set(), "the host sends it; no agent here receives it")
+        heard = fake_rho.receive_peer(topic, "Hello.")
+        printed, _ = run(agents.contacts)
+        self.assertEqual(printed, f"dpc's agent: {theirs}\n")
+        printed, _ = run(lambda: ns["chat"].read(topic))
+        self.assertEqual(
+            printed,
+            f"[#{topic} with dpc's agent at {theirs}, an agent on another host]\n"
+            f"#{sent['id']} eng-{self.root}: Hi.\n#{heard} dpc's agent: Hello.\n",
+        )
+
+        # Another agent of the host has accepted nothing.
+        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        cns, _ = self.notebook(child)
+        with self.assertRaisesRegex(ValueError, "is not accepted"):
+            cns["agents"].message(agent_id=theirs, message="Hi.")
+        advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
+        ans, _ = self.notebook(advisor)
+        self.assertFalse(hasattr(ans["agents"], "accept"), "an Advisor accepts no one")
+
+        self.state.endpoint = None
+        with self.assertRaisesRegex(ValueError, "no iroh endpoint"):
+            agents.address()
 
     def test_leave_and_read_by_any_id(self):
         ns, _ = self.notebook(self.root)

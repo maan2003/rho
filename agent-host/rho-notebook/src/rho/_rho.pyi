@@ -36,16 +36,28 @@ class MessageRecord(TypedDict):
     id: int
     at: int  # unix ms
     topic: int
-    sender: str  # "user" or an agent id
+    sender: str  # "user", an agent id, or "peer" in a peer conversation
     mentions: list[tuple[str, MentionKind]]  # (address, kind)
     text: str
 
+class Peer(TypedDict):
+    address: str  # the C2C address the agent accepted
+    name: str  # what the agent named it
+    open: bool  # False once the acceptance was taken back
+
 class TopicRecord(TypedDict):
     id: int
-    name: str | None  # None for a direct conversation
-    stream: str | None  # its stream's name; None for a direct conversation
-    resolved: bool  # its work is done; False for a direct conversation
-    agents: list[str]  # its members: who joined a topic, or a direct's two
+    name: str | None  # None outside a stream
+    stream: str | None  # its stream's name; None for a direct or peer conversation
+    resolved: bool  # its work is done; False outside a stream
+    agents: list[str]  # its members: who joined a topic, a direct's two, or a peer conversation's one
+    peer: Peer | None  # the other end of a peer conversation
+
+class Contact(TypedDict):
+    topic: int  # the peer conversation
+    address: str
+    name: str
+    unsent: int  # the agent's messages the peer has not taken yet
 
 class AgentsFile(TypedDict):
     path: str
@@ -109,7 +121,9 @@ def new_cache_key(agent: str) -> None:
 # host's chat log. A message reaches its conversation's members and every
 # agent it mentions, never its sender. A topic's members are the agents that
 # joined it; neither posting nor a mention joins. A direct conversation's
-# members are its two agents, and only they post in it. Messages from the
+# members are its two agents, and only they post in it. A peer conversation
+# is an agent's with an address on another host that it accepted: only the
+# two post in it, and the host carries their messages over C2C. Messages from the
 # user come only from the GUI, so Python cannot forge them. The user and
 # agents may rename, move and resolve a topic, and move messages between
 # topics.
@@ -140,6 +154,21 @@ def direct(sender: str, other: str) -> int:
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
+def peer_address(agent: str) -> str:
+    """The C2C address of `agent`, an agent of this workset:
+    `<endpoint id>/<local id>` (docs/c2c.md). Raises when the host has no
+    iroh endpoint."""
+def peer_accept(agent: str, address: str, name: str) -> int:
+    """`agent` accepts `address` under `name`: returns their peer
+    conversation, started if they have none open. From then on the host
+    delivers what that address sends the agent, as messages from "peer", and
+    sends it what the agent posts in the conversation, in order. Raises for an
+    address already accepted under another name."""
+def peer_topic(agent: str, address: str) -> int:
+    """The peer conversation of `agent` and an address it accepted. Raises
+    when it has not."""
+def peers(agent: str) -> list[Contact]:
+    """The addresses `agent` has accepted."""
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""

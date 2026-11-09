@@ -134,11 +134,14 @@ impl Topic {
     }
 }
 
-/// A direct conversation between two agents, folded: outside every stream,
-/// and never a card.
+/// A conversation outside every stream, folded, and never a card: a direct
+/// conversation between two agents, or an agent's conversation with a peer
+/// on another host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Direct {
-    pub members: [AgentId; 2],
+    /// Its agents on this host: a direct conversation's two, or the one
+    /// that accepted the peer.
+    pub members: Vec<AgentId>,
     pub started_at: UnixMs,
     /// The newest message in it.
     pub newest: Option<(MessageId, UnixMs)>,
@@ -228,7 +231,7 @@ impl HostChat {
                 self.directs.insert(
                     direct,
                     Direct {
-                        members: *members,
+                        members: members.to_vec(),
                         started_at: record.at,
                         newest: None,
                         others: Vec::new(),
@@ -239,6 +242,28 @@ impl HostChat {
                     message: None,
                 }
             }
+            ChatEvent::PeerAccepted { agent, .. } => {
+                let direct = TopicId(record.seq);
+                if self.directs.contains_key(&direct) {
+                    return Told::Nothing;
+                }
+                self.directs.insert(
+                    direct,
+                    Direct {
+                        members: vec![*agent],
+                        started_at: record.at,
+                        newest: None,
+                        others: Vec::new(),
+                    },
+                );
+                Told::Direct {
+                    direct,
+                    message: None,
+                }
+            }
+            // The host stops carrying the conversation; what was said in it
+            // stays said.
+            ChatEvent::PeerRemoved { .. } => Told::Nothing,
             ChatEvent::Joined { topic, agent } => {
                 let Some(held) = self.topics.get_mut(topic) else {
                     tracing::warn!(topic = topic.0.0, "a join to a topic not heard of");
@@ -346,7 +371,7 @@ impl HostChat {
                     .iter()
                     .filter_map(|mention| match mention.to {
                         Address::Agent(agent) => Some(agent),
-                        Address::User => None,
+                        Address::User | Address::Peer => None,
                     });
                 let reach = |members: &mut dyn Iterator<Item = AgentId>| {
                     let mut parties = Vec::new();
@@ -368,7 +393,7 @@ impl HostChat {
                     }
                     held.newest = Some((message.id, message.at));
                     held.others.push(message.id);
-                    let parties = reach(&mut held.members.into_iter());
+                    let parties = reach(&mut held.members.clone().into_iter());
                     return Told::Direct {
                         direct: *topic,
                         message: Some((message, parties)),
@@ -398,6 +423,8 @@ impl HostChat {
                         held.agent_wrote = Some((message.id, message.at));
                         held.others.push(message.id);
                     }
+                    // A peer posts only in its peer conversation.
+                    Address::Peer => {}
                 }
                 if let (Some(kind), Address::Agent(by)) =
                     (message.mentions(Address::User), message.from)
@@ -444,6 +471,7 @@ impl HostChat {
                         });
                     }
                 }
+                Address::Peer => {}
             }
         }
     }
@@ -606,7 +634,7 @@ pub fn topic_state(
 ) -> UiAgentState {
     let mut writers = messages.iter().filter_map(|message| match message.from {
         Address::Agent(agent) => Some(agent),
-        Address::User => None,
+        Address::User | Address::Peer => None,
     });
     let first = writers.next();
     let several = writers.any(|agent| Some(agent) != first);
@@ -620,7 +648,7 @@ pub fn topic_state(
         }
         let named = match message.from {
             Address::Agent(agent) => several && last.replace(agent) != Some(agent),
-            Address::User => false,
+            Address::User | Address::Peer => false,
         };
         said.push(UiBlock::ChatMessage {
             id: message.id,
@@ -1002,6 +1030,59 @@ mod tests {
     /// The user's mentions are kept in order with their kind; what the
     /// user has seen is what they said they had, or their own newest
     /// message if later.
+    /// A peer conversation has one agent of this host in it: what either
+    /// side writes there is that agent's to read, and nobody else's.
+    #[test]
+    fn a_peer_message_reaches_the_agent_that_accepted_the_peer() {
+        let a = agent(1);
+        let conversation = TopicId(ChatSeq(1));
+        let mut chat = HostChat::default();
+        assert_eq!(
+            chat.tell(&record(
+                1,
+                ChatEvent::PeerAccepted {
+                    agent: a,
+                    peer: format!("{}/bob.1", "b2".repeat(32)).parse().unwrap(),
+                    name: "bob".into(),
+                },
+            )),
+            Told::Direct {
+                direct: conversation,
+                message: None
+            }
+        );
+        for (seq, from) in [(2, Address::Peer), (3, Address::Agent(a))] {
+            let told = chat.tell(&record(
+                seq,
+                ChatEvent::Posted {
+                    topic: conversation,
+                    from,
+                    mentions: Vec::new(),
+                    content: Vec::new(),
+                },
+            ));
+            let Told::Direct {
+                message: Some((message, parties)),
+                ..
+            } = told
+            else {
+                panic!("not a message of the conversation: {told:?}");
+            };
+            assert_eq!(parties, vec![a]);
+            assert_eq!(message.from, from);
+        }
+        assert_eq!(
+            chat.tell(&record(
+                4,
+                ChatEvent::PeerRemoved {
+                    topic: conversation
+                }
+            )),
+            Told::Nothing
+        );
+        assert!(chat.topics.is_empty(), "a peer conversation is no topic");
+    }
+
     #[test]
     fn the_users_mentions_are_unseen_until_seen_or_answered() {
         let a = agent(1);

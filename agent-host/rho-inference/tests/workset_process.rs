@@ -271,11 +271,20 @@ async fn fixture(endpoint: &str) -> (tempfile::TempDir, Arc<AgentPool>) {
 
 #[test]
 fn streamed_side_effect_survives_workset_death_without_execution_replay() {
+    with_synthetic_login(
+        "streamed_side_effect_survives_workset_death_without_execution_replay",
+        Duration::from_secs(45),
+        streaming_crash(),
+    );
+}
+
+/// Runs `test`, the body of the test named `name`, in a copy of this process
+/// whose home holds one synthetic login: agents there reach a model, and
+/// never the machine's own accounts.
+fn with_synthetic_login(name: &str, within: Duration, test: impl Future<Output = ()>) {
     if std::env::var_os("RHO_TEST_ISOLATED_AUTH").is_some() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            tokio::time::timeout(Duration::from_secs(45), streaming_crash())
-                .await
-                .unwrap();
+            tokio::time::timeout(within, test).await.unwrap();
         });
         return;
     }
@@ -295,11 +304,7 @@ fn streamed_side_effect_survives_workset_death_without_execution_replay() {
     .unwrap();
     std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "streamed_side_effect_survives_workset_death_without_execution_replay",
-            "--nocapture",
-        ])
+        .args(["--exact", name, "--nocapture"])
         .env("RHO_TEST_ISOLATED_AUTH", "1")
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", home.path().join("state"))
@@ -435,4 +440,390 @@ async fn streaming_crash() {
     );
     pool.execution(id).await.unwrap().shutdown().await;
     server.abort();
+}
+
+#[test]
+fn c2c_carries_messages_between_two_hosts_only_once_both_accepted() {
+    with_synthetic_login(
+        "c2c_carries_messages_between_two_hosts_only_once_both_accepted",
+        // An agent that has just answered is told of other agents' messages
+        // 15 seconds later.
+        Duration::from_secs(90),
+        c2c_two_hosts(),
+    );
+}
+
+type Bodies = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A model that ends every turn at once: where it listens, and every request
+/// it was sent.
+async fn idle_model() -> (String, Bodies, tokio::task::JoinHandle<()>) {
+    use futures::{SinkExt as _, StreamExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let bodies = Bodies::default();
+    let server = tokio::spawn({
+        let bodies = bodies.clone();
+        async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let bodies = bodies.clone();
+                connections.spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    while let Some(Ok(message)) = socket.next().await {
+                        if !message.is_text() {
+                            continue;
+                        }
+                        let turn = {
+                            let mut bodies = bodies.lock().unwrap();
+                            bodies.push(message.to_text().unwrap().to_owned());
+                            bodies.len()
+                        };
+                        for event in [
+                            serde_json::json!({"type":"response.created","response":{"id":format!("resp_{turn}")}}),
+                            serde_json::json!({"type":"response.output_item.done","item":{
+                                "type":"custom_tool_call","id":format!("ctc_{turn}"),
+                                "call_id":format!("call_{turn}"),"name":"exec","input":"end_turn()"}}),
+                            serde_json::json!({"type":"response.completed","response":{"id":format!("resp_{turn}"),"usage":{}}}),
+                        ] {
+                            let text = tokio_tungstenite::tungstenite::Message::Text(event.to_string().into());
+                            socket.send(text).await.unwrap();
+                        }
+                    }
+                });
+            }
+        }
+    });
+    (endpoint, bodies, server)
+}
+
+fn holds(value: &serde_json::Value, text: &str) -> bool {
+    match value {
+        serde_json::Value::String(string) => string.contains(text),
+        serde_json::Value::Array(values) => values.iter().any(|value| holds(value, text)),
+        serde_json::Value::Object(fields) => fields.values().any(|value| holds(value, text)),
+        _ => false,
+    }
+}
+
+/// The input items of the requests so far that hold `text`.
+fn items(bodies: &Bodies, text: &str) -> Vec<serde_json::Value> {
+    let bodies = bodies.lock().unwrap().clone();
+    bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .flat_map(|body| body["input"].as_array().cloned().unwrap_or_default())
+        .filter(|item| holds(item, text))
+        .collect()
+}
+
+/// How many times the model has been told `text`.
+fn said(bodies: &Bodies, text: &str) -> usize {
+    fn count(value: &serde_json::Value, text: &str) -> usize {
+        match value {
+            serde_json::Value::String(string) => string.matches(text).count(),
+            serde_json::Value::Array(values) => values.iter().map(|value| count(value, text)).sum(),
+            serde_json::Value::Object(fields) => {
+                fields.values().map(|value| count(value, text)).sum()
+            }
+            _ => 0,
+        }
+    }
+    let bodies = bodies.lock().unwrap().clone();
+    bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .map(|body| count(&body["input"], text))
+        .sum()
+}
+
+/// The input item that first told the model `text`, once it has been told.
+async fn told(bodies: &Bodies, text: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(item) = items(bodies, text).into_iter().next() {
+                return item;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the model was never told {text:?}"))
+}
+
+/// One call of an agent's `agents` tool: what it reported, or its error.
+async fn agents_tool(
+    pool: &Arc<AgentPool>,
+    workset: WorksetId,
+    agent: AgentId,
+    call: &str,
+) -> Result<String, String> {
+    let code = format!(
+        "from rho import tools\ntools.Agents({:?}).{call}\n",
+        agent.encoded()
+    );
+    let evaluated = pool.eval(workset, code).await.unwrap();
+    match evaluated.error {
+        None => Ok(evaluated.output.trim().to_owned()),
+        Some(error) => Err(error),
+    }
+}
+
+/// Hosts joined in memory: a message to an endpoint goes to the pool there,
+/// as from the sender's endpoint.
+struct Wires {
+    own: [u8; 32],
+    hosts: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<AgentPool>>>>,
+    sent: Arc<std::sync::Mutex<Vec<rho_agent::host::pool::Envelope>>>,
+}
+
+impl rho_agent::host::pool::Transport for Wires {
+    fn send<'a>(
+        &'a self,
+        endpoint: [u8; 32],
+        envelope: &'a rho_agent::host::pool::Envelope,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<rho_agent::host::pool::Answer>> {
+        Box::pin(async move {
+            self.sent.lock().unwrap().push(envelope.clone());
+            let host = self.hosts.lock().unwrap().get(&endpoint).cloned();
+            let host = host.ok_or_else(|| anyhow::anyhow!("no route"))?;
+            Ok(host.c2c_receive(self.own, envelope.clone()).await)
+        })
+    }
+}
+
+async fn c2c_two_hosts() {
+    use rho_agent::host::pool::Answer;
+    const HERE: [u8; 32] = [0xa1; 32];
+    const THERE: [u8; 32] = [0xb2; 32];
+
+    let (here_model, here_asked, here_server) = idle_model().await;
+    let (there_model, there_asked, there_server) = idle_model().await;
+    let (_here_directory, here) = fixture(&here_model).await;
+    let (_there_directory, there) = fixture(&there_model).await;
+    here.set_endpoint(HERE);
+    there.set_endpoint(THERE);
+    let hosts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+        (HERE, here.clone()),
+        (THERE, there.clone()),
+    ])));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let senders = [(HERE, &here), (THERE, &there)].map(|(own, pool)| {
+        let wires = Arc::new(Wires {
+            own,
+            hosts: hosts.clone(),
+            sent: sent.clone(),
+        });
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.c2c_send(wires).await })
+    });
+
+    // Each agent has ended a turn, so it waits inside an open call.
+    let (here_workset, _, agents) =
+        create(&here, "new_agent(runtime=RUNTIME)\n", Some("start here")).await;
+    let ann = agents[0];
+    let (there_workset, _, agents) =
+        create(&there, "new_agent(runtime=RUNTIME)\n", Some("start there")).await;
+    let bob = agents[0];
+    told(&here_asked, "start here").await;
+    told(&there_asked, "start there").await;
+
+    let ann_address = agents_tool(&here, here_workset, ann, "address()")
+        .await
+        .unwrap();
+    let bob_address = agents_tool(&there, there_workset, bob, "address()")
+        .await
+        .unwrap();
+    assert_eq!(
+        ann_address,
+        format!("{}/{}", "a1".repeat(32), ann.encoded())
+    );
+    assert_eq!(
+        bob_address,
+        format!("{}/{}", "b2".repeat(32), bob.encoded())
+    );
+
+    // Nothing is accepted yet: no tool sends, and a message from outside is
+    // refused without a trace.
+    let error = agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!("message(agent_id={bob_address:?}, message='too early')"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("not accepted"), "{error}");
+    let own = agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!("accept(address={ann_address:?}, name='me')"),
+    )
+    .await
+    .unwrap_err();
+    assert!(own.contains("on this host"), "{own}");
+
+    // Ann accepts Bob and writes; Bob has not accepted Ann, so his host
+    // refuses without a trace and both messages wait.
+    let accepted = agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!("accept(address={bob_address:?}, name='bob [dpc]')"),
+    )
+    .await
+    .unwrap();
+    assert!(accepted.contains(&ann_address), "{accepted}");
+    for text in ["ping one", "ping two"] {
+        let report = agents_tool(
+            &here,
+            here_workset,
+            ann,
+            &format!("message(agent_id={bob_address:?}, message={text:?})"),
+        )
+        .await
+        .unwrap();
+        assert!(report.starts_with("Sent to bob (dpc)."), "{report}");
+    }
+    let tried = async |text: &str| {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !sent.lock().unwrap().iter().any(|sent| sent.body == text) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{text:?} was never sent"));
+    };
+    tried("ping one").await;
+    assert_eq!(there.peers(), []);
+    assert_eq!(here.peers()[0].unsent, 2);
+    let contacts = agents_tool(&here, here_workset, ann, "contacts()")
+        .await
+        .unwrap();
+    assert_eq!(
+        contacts,
+        format!("bob (dpc): {bob_address}, 2 of your messages not delivered yet")
+    );
+
+    // Bob accepts Ann and answers. His message crosses at once; hers are
+    // tried again and cross in order.
+    agents_tool(
+        &there,
+        there_workset,
+        bob,
+        &format!("accept(address={ann_address:?}, name='ann')"),
+    )
+    .await
+    .unwrap();
+    agents_tool(
+        &there,
+        there_workset,
+        bob,
+        &format!("message(agent_id={ann_address:?}, message='pong')"),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while here.peers()[0].unsent != 0 || there.peers()[0].unsent != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bodies: Vec<String> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|envelope| envelope.body.clone())
+        .filter(|body| body != "pong")
+        .collect();
+    // Two was never tried ahead of one.
+    assert_eq!(bodies.last().unwrap(), "ping two");
+    assert!(
+        bodies[..bodies.len() - 1]
+            .iter()
+            .all(|body| body == "ping one"),
+        "{bodies:?}"
+    );
+
+    // A message sent twice arrives once; the same sender name from another
+    // host is a stranger.
+    let pong = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|sent| sent.body == "pong")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        here.c2c_receive(THERE, pong.clone()).await,
+        Answer::Delivered
+    );
+    assert_eq!(here.c2c_receive([0xc3; 32], pong).await, Answer::Refused);
+
+    // The user takes Bob's acceptance back: Ann is refused again, and Bob
+    // can no longer write to her.
+    let ann_peer: rho_agent_types::PeerAddress = ann_address.parse().unwrap();
+    there.remove_peer(bob, &ann_peer).await.unwrap();
+    assert_eq!(there.peers(), []);
+    agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!("message(agent_id={bob_address:?}, message='ping three')"),
+    )
+    .await
+    .unwrap();
+    tried("ping three").await;
+    let error = agents_tool(
+        &there,
+        there_workset,
+        bob,
+        &format!("message(agent_id={ann_address:?}, message='after')"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("not accepted"), "{error}");
+
+    // What each model was told of all that, and not as the user's words:
+    // Ann of each message that began to wait, once, and of Bob's under the
+    // name she gave him; Bob of what crossed while he accepted Ann, under
+    // the name he gave her.
+    let waits = format!("[message to bob [dpc] ({bob_address}) not delivered yet]");
+    let from_bob =
+        format!("[message from bob (dpc) at {bob_address}, an agent on another host]\npong");
+    let from_ann = format!("[message from ann at {ann_address}, an agent on another host]\n");
+    tokio::time::timeout(Duration::from_secs(40), async {
+        while said(&here_asked, &waits) < 2 || said(&there_asked, "ping two") < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the models were not told everything"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(said(&here_asked, &waits), 2);
+    assert_eq!(said(&here_asked, &ann_address), 2);
+    assert_eq!(said(&here_asked, &from_bob), 1);
+    assert_eq!(said(&here_asked, "pong"), 1);
+    assert_eq!(said(&there_asked, &format!("{from_ann}ping one")), 1);
+    assert_eq!(said(&there_asked, &format!("{from_ann}ping two")), 1);
+    assert_eq!(said(&there_asked, "ping three"), 0);
+    for (asked, text) in [(&here_asked, "pong"), (&there_asked, "ping one")] {
+        for item in items(asked, text) {
+            assert_eq!(item["type"], "custom_tool_call_output", "{item}");
+        }
+    }
+
+    for sender in senders {
+        sender.abort();
+    }
+    // An agent that is deleted accepts no one.
+    assert_eq!(here.peers().len(), 1);
+    here.delete_worksets(vec![here_workset]).await.unwrap();
+    assert_eq!(here.peers(), []);
+    there.execution(bob).await.unwrap().shutdown().await;
+    here_server.abort();
+    there_server.abort();
 }

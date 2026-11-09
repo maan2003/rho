@@ -64,6 +64,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
+        Command::C2c(args) => run_c2c(args).await,
         Command::Share(args) => share::run(args).await,
         Command::Github(args) => github::run(args).await,
         Command::Slack(args) => slack::run(args).await,
@@ -122,6 +123,37 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     Ok(())
 }
 
+/// Lists and takes back C2C acceptances over the agent host's Unix socket:
+/// the user's control over who on other hosts reaches their agents.
+async fn run_c2c(args: C2cArgs) -> Result<()> {
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let socket = &socket_path;
+    match args.command {
+        C2cCommand::List => {
+            for contact in client::call(socket, host::C2cContacts).await? {
+                let host::C2cContact {
+                    agent,
+                    address,
+                    name,
+                    unsent,
+                } = contact;
+                println!("{agent}\t{address}\t{name:?}\t{unsent} unsent");
+            }
+        }
+        C2cCommand::Remove { agent, address } => {
+            let call = host::C2cRemove {
+                agent: agent.clone(),
+                address: address.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("{agent} no longer accepts {address}");
+        }
+    }
+    Ok(())
+}
+
 /// One call of the agent host, starting the agent host if it is not running. A
 /// refusal is an error.
 pub(crate) async fn host_call<C: Call>(socket_path: &std::path::Path, call: C) -> Result<C::Reply> {
@@ -169,6 +201,7 @@ enum Command {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    C2c(C2cArgs),
     Share(share::ShareArgs),
     Github(GithubArgs),
     Slack(SlackArgs),
@@ -202,6 +235,8 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    /// See and take back what agents accepted from other hosts over C2C.
+    C2c(C2cArgs),
     /// Print a link that pairs rho-gui with this machine's agent host (what
     /// `rho` alone does).
     Share(share::ShareArgs),
@@ -285,6 +320,27 @@ pub(crate) enum IrohCommand {
 }
 
 #[derive(Clone, clap::Args)]
+pub(crate) struct C2cArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: C2cCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum C2cCommand {
+    /// List every address an agent of this host has accepted.
+    List,
+    /// Take back an agent's acceptance of an address.
+    Remove {
+        /// The agent's id, as `rho c2c list` prints it.
+        agent: String,
+        /// `<endpoint id>/<local id>`.
+        address: String,
+    },
+}
+
+#[derive(Clone, clap::Args)]
 pub(crate) struct GithubArgs {
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
@@ -365,6 +421,7 @@ impl Args {
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
+            CliCommand::C2c(args) => Command::C2c(args),
             CliCommand::Github(args) => Command::Github(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Notion(args) => Command::Notion(args),

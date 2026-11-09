@@ -73,6 +73,10 @@ rho_rpc::calls! {
         DebugReport(DebugReport) -> camino::Utf8PathBuf;
         /// Refused, with the reason, while the host is in use.
         ShutdownIfIdle(ShutdownIfIdle) -> ();
+        /// Answered with every C2C address an agent of the host has
+        /// accepted.
+        C2cContacts(C2cContacts) -> Vec<C2cContact>;
+        C2cRemove(C2cRemove) -> ();
     }
 }
 
@@ -136,6 +140,32 @@ pub struct IrohPair;
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohRevoke {
     pub endpoint_id: String,
+}
+
+/// Lists what the host's agents have accepted over C2C: who on other
+/// harnesses may message which agent.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct C2cContacts;
+
+/// One accepted C2C address.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct C2cContact {
+    /// The agent that accepted it, by its id.
+    pub agent: String,
+    /// `<endpoint id>/<local id>`.
+    pub address: String,
+    /// What the agent named it.
+    pub name: String,
+    /// How many of the agent's messages it has not taken yet.
+    pub unsent: u64,
+}
+
+/// Takes back an agent's acceptance of a C2C address: nothing more crosses
+/// between the two, and what waited to be sent is dropped.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct C2cRemove {
+    pub agent: String,
+    pub address: String,
 }
 
 /// Copies the agent host's database for inspection, as of its latest commit

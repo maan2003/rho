@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
-    DebugReport, ForgetSavepoints, GitProvided, GitProviderFrame, GitTransportPolicy,
-    GuiTelemetryUpload, IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open,
-    PlatformSecretsSet, PlatformStatus, Request, ShutdownIfIdle, Snapshot,
+    C2cContact, C2cContacts, C2cRemove, DebugReport, ForgetSavepoints, GitProvided,
+    GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohPair, IrohRevoke,
+    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -264,6 +264,33 @@ where
                     "iroh client is not enrolled"
                 );
                 Ok(endpoint_id.to_string())
+            })
+            .await
+        }
+        Request::C2cContacts(call) => {
+            respond(writer, call, |C2cContacts| async move {
+                Ok(services
+                    .pool
+                    .peers()
+                    .into_iter()
+                    .map(|contact| C2cContact {
+                        agent: contact.agent.encoded(),
+                        address: contact.peer.to_string(),
+                        name: contact.name,
+                        unsent: contact.unsent,
+                    })
+                    .collect())
+            })
+            .await
+        }
+        Request::C2cRemove(call) => {
+            respond(writer, call, |C2cRemove { agent, address }| async move {
+                let agent = rho_agent_types::AgentId::from_encoded(&agent)
+                    .map_err(|_| anyhow::anyhow!("invalid agent id {agent:?}"))?;
+                let address = address
+                    .parse::<rho_agent_types::PeerAddress>()
+                    .map_err(|error| anyhow::anyhow!("invalid C2C address: {error}"))?;
+                services.pool.remove_peer(agent, &address).await
             })
             .await
         }

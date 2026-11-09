@@ -13779,6 +13779,7 @@ dependencies = [
  "bytes",
  "camino",
  "chrono",
+ "ciborium",
  "clap",
  "clock",
  "dirs 7.0.0",

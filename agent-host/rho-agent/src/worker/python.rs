@@ -336,6 +336,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(peer_address, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(peer_accept, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(peer_topic, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(peers, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
@@ -367,6 +371,7 @@ fn address_text(address: Address) -> String {
     match address {
         Address::User => "user".to_owned(),
         Address::Agent(agent) => agent.encoded().to_string(),
+        Address::Peer => "peer".to_owned(),
     }
 }
 
@@ -677,6 +682,62 @@ fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
     }
 }
 
+/// The agent's own C2C address.
+#[pyfunction]
+fn peer_address(py: Python<'_>, agent: &str) -> PyResult<String> {
+    match PyHost::block(py, PyRequest::PeerAddress(agent_id(agent)?))? {
+        PyReply::Text(address) => Ok(address),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The agent accepts a C2C address under a name; returns their conversation.
+#[pyfunction]
+fn peer_accept(py: Python<'_>, agent: &str, address: String, name: String) -> PyResult<u64> {
+    let request = PyRequest::PeerAccept {
+        agent: agent_id(agent)?,
+        peer: address,
+        name,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Seq(seq) => Ok(seq.0),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The agent's conversation with an address it accepted.
+#[pyfunction]
+fn peer_topic(py: Python<'_>, agent: &str, address: String) -> PyResult<u64> {
+    let request = PyRequest::PeerTopic {
+        agent: agent_id(agent)?,
+        peer: address,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Seq(seq) => Ok(seq.0),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The addresses the agent accepted, each a dict.
+#[pyfunction]
+fn peers(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
+    match PyHost::block(py, PyRequest::Peers(agent_id(agent)?))? {
+        PyReply::Peers(peers) => {
+            let out = pyo3::types::PyList::empty(py);
+            for contact in peers {
+                let held = PyDict::new(py);
+                held.set_item("topic", contact.topic.0.0)?;
+                held.set_item("address", contact.peer.to_string())?;
+                held.set_item("name", contact.name)?;
+                held.set_item("unsent", contact.unsent)?;
+                out.append(held)?;
+            }
+            Ok(out.into_any().unbind())
+        }
+        _ => Err(unexpected()),
+    }
+}
+
 /// One message as a dict, or None.
 #[pyfunction]
 fn message(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
@@ -800,12 +861,20 @@ fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
         PyReply::Topic(Some((head, stream))) => {
             let out = PyDict::new(py);
             out.set_item("id", id)?;
-            let (name, resolved) = match head.place {
-                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved),
-                crate::store::Place::Direct => (None, false),
+            let (name, resolved, peer) = match head.place {
+                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved, None),
+                crate::store::Place::Direct => (None, false, None),
+                crate::store::Place::Peer { peer, name, open } => {
+                    let held = PyDict::new(py);
+                    held.set_item("address", peer.to_string())?;
+                    held.set_item("name", name)?;
+                    held.set_item("open", open)?;
+                    (None, false, Some(held))
+                }
             };
             out.set_item("name", name)?;
             out.set_item("resolved", resolved)?;
+            out.set_item("peer", peer)?;
             out.set_item("stream", stream)?;
             out.set_item(
                 "agents",

@@ -130,6 +130,22 @@ pub(crate) enum PyRequest {
     Models,
     /// The one agent of the host whose id starts with this.
     ResolveAgent(String),
+    /// The agent's own C2C address (`Text`).
+    PeerAddress(rho_agent_types::AgentId),
+    /// The agent accepts a C2C address under a name; answered with their
+    /// conversation.
+    PeerAccept {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        name: String,
+    },
+    /// The agent's conversation with an address it accepted.
+    PeerTopic {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+    },
+    /// The addresses the agent accepted.
+    Peers(rho_agent_types::AgentId),
 }
 
 /// Where a move from Python puts messages.
@@ -152,6 +168,8 @@ pub(crate) enum PyReply {
     /// A conversation, and the name of its stream if it is a topic.
     Topic(Option<(crate::store::TopicHead, Option<String>)>),
     Models(Vec<crate::record::Runtime>),
+    Text(String),
+    Peers(Vec<crate::store::PeerContact>),
     Done,
     Error(String),
 }

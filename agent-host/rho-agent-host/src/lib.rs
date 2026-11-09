@@ -22,6 +22,7 @@ use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
+mod c2c;
 pub mod debug;
 mod desktop;
 mod host;
@@ -486,7 +487,8 @@ pub struct HostArgs {
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
     /// Remote clients must be enrolled once via
-    /// `rho iroh approve <code>` on this machine.
+    /// `rho iroh approve <code>` on this machine. The same endpoint gives
+    /// agents their C2C addresses, where agents of other hosts reach them.
     #[arg(long = "iroh")]
     pub iroh: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
@@ -691,9 +693,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     phases.mark("worksets");
     run_devshell_daemon(&worksets);
     let iroh = if args.iroh {
-        let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
-                .await?;
+        let (listener, auth) = rho_rpc::AuthenticatedIrohListener::bind(
+            db.clone(),
+            rho_rpc::protocol::IROH_ALPN,
+            vec![c2c::ALPN.to_vec()],
+        )
+        .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
         phases.mark("iroh");
         Some((listener, auth))
@@ -714,6 +719,10 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         init,
     )
     .await;
+    // Before any workset runs: its agents' addresses are on this endpoint.
+    if let Some((listener, _)) = &iroh {
+        pool.set_endpoint(*listener.endpoint_id().as_bytes());
+    }
     if let Some(handoff) = handoff {
         pool.adopt(handoff.workers).await;
         phases.mark("adopt");
@@ -795,6 +804,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                     match rho_rpc::AuthenticatedIrohListener::bind(
                         services.db.clone(),
                         rho_rpc::protocol::IROH_ALPN,
+                        vec![c2c::ALPN.to_vec()],
                     )
                     .await
                     {
@@ -920,12 +930,37 @@ async fn run_iroh_listener(
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
-    while let Some(approved) = tokio::select! {
-        approved = listener.accept() => approved,
+    // What agents send other harnesses leaves by this endpoint, so they see
+    // this host's id.
+    let c2c_sender = tokio::spawn({
+        let pool = services.pool.clone();
+        let transport = Arc::new(c2c::IrohTransport::new(listener.endpoint().clone()));
+        async move { pool.c2c_send(transport).await }
+    });
+    let c2c_connections = Arc::new(tokio::sync::Semaphore::new(c2c::MAX_CONNECTIONS));
+    while let Some(accepted) = tokio::select! {
+        accepted = listener.accept() => accepted,
         _ = &mut shutdown => None,
     } {
-        let connection = match approved {
-            Ok(connection) => connection,
+        let connection = match accepted {
+            Ok(rho_rpc::Accepted::Approved(connection)) => connection,
+            // Another harness, which nobody approved: it speaks C2C and
+            // nothing else.
+            Ok(rho_rpc::Accepted::Open(connection)) => {
+                if connection.alpn() == c2c::ALPN {
+                    match c2c_connections.clone().try_acquire_owned() {
+                        Ok(held) => {
+                            let pool = services.pool.clone();
+                            tokio::spawn(async move {
+                                c2c::serve(pool, connection).await;
+                                drop(held);
+                            });
+                        }
+                        Err(_) => connection.close(0u32.into(), b"too many C2C connections"),
+                    }
+                }
+                continue;
+            }
             Err(error) => {
                 eprintln!("rho-agent-host iroh authentication error: {error:#}");
                 continue;
@@ -991,6 +1026,7 @@ async fn run_iroh_listener(
             uni_task.abort();
         });
     }
+    c2c_sender.abort();
     listener.close().await;
 }
 

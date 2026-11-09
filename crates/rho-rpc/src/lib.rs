@@ -90,17 +90,33 @@ async fn authenticate_iroh_server(
     rho_iroh_auth::authenticate_server_connection(auth, connection, preapproved).await
 }
 
-/// Accepts iroh connections and exposes only peers that completed the
-/// explicit auth exchange with an approved endpoint identity.
+/// A connection the listener hands on.
+#[cfg(feature = "server")]
+pub enum Accepted {
+    /// On the application ALPN, from an endpoint that completed the auth
+    /// exchange with an approved identity.
+    Approved(iroh::endpoint::Connection),
+    /// On one of the listener's open ALPNs. The handshake proves the
+    /// endpoint's id and nothing else: nobody approved it, and it must
+    /// never reach the application protocol.
+    Open(iroh::endpoint::Connection),
+}
+
+/// Accepts iroh connections. On the application ALPN it exposes only peers
+/// that completed the explicit auth exchange with an approved endpoint
+/// identity; a connection on an open ALPN is handed on as it is
+/// ([`Accepted`]).
 ///
 /// Trusted reconnects bypass the enrollment semaphore. Unknown peers share a
 /// bounded admission pool and cannot invoke compressed application parsing.
 #[cfg(feature = "server")]
 pub struct AuthenticatedIrohListener {
     endpoint: iroh::Endpoint,
+    /// The application ALPN: every other one the endpoint serves is open.
+    alpn: Vec<u8>,
     auth: rho_iroh_auth::IrohAuth,
     enrollments: std::sync::Arc<tokio::sync::Semaphore>,
-    attempts: tokio::task::JoinSet<anyhow::Result<Option<iroh::endpoint::Connection>>>,
+    attempts: tokio::task::JoinSet<anyhow::Result<Option<Accepted>>>,
     accepting: bool,
     approved_bi_streams: u32,
 }
@@ -109,10 +125,14 @@ pub struct AuthenticatedIrohListener {
 impl AuthenticatedIrohListener {
     /// Loads the persistent endpoint identity, configures the transport, and
     /// binds an authenticated listener for the supplied application ALPN.
+    /// The endpoint also serves `open_alpns`, with no authentication beyond
+    /// the handshake.
     pub async fn bind(
         db: rho_db::RhoDb,
         alpn: impl Into<Vec<u8>>,
+        open_alpns: Vec<Vec<u8>>,
     ) -> anyhow::Result<(Self, rho_iroh_auth::IrohAuth)> {
+        let alpn = alpn.into();
         install_crypto_provider()?;
         let secret = load_or_create_server_secret(&db).await?;
         let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
@@ -128,16 +148,17 @@ impl AuthenticatedIrohListener {
             .keylog(std::env::var_os("SSLKEYLOGFILE").is_some())
             .secret_key(secret)
             .transport_config(transport.build())
-            .alpns(vec![alpn.into()])
+            .alpns(std::iter::once(alpn.clone()).chain(open_alpns).collect())
             .bind()
             .await
             .context("bind authenticated iroh endpoint")?;
-        let listener = Self::new(endpoint, auth.clone(), 1024)?;
+        let listener = Self::new(endpoint, alpn, auth.clone(), 1024)?;
         Ok((listener, auth))
     }
 
     fn new(
         endpoint: iroh::Endpoint,
+        alpn: Vec<u8>,
         auth: rho_iroh_auth::IrohAuth,
         approved_bi_streams: u32,
     ) -> anyhow::Result<Self> {
@@ -151,6 +172,7 @@ impl AuthenticatedIrohListener {
         );
         Ok(Self {
             endpoint,
+            alpn,
             auth,
             enrollments: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             attempts: tokio::task::JoinSet::new(),
@@ -163,9 +185,14 @@ impl AuthenticatedIrohListener {
         self.endpoint.id()
     }
 
-    /// Returns the next approved connection. Individual handshake failures
+    /// The endpoint itself, for what the host dials out with its identity.
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        &self.endpoint
+    }
+
+    /// Returns the next connection to serve. Individual handshake failures
     /// are reported without stopping the listener.
-    pub async fn accept(&mut self) -> Option<anyhow::Result<iroh::endpoint::Connection>> {
+    pub async fn accept(&mut self) -> Option<anyhow::Result<Accepted>> {
         loop {
             if !self.accepting && self.attempts.is_empty() {
                 return None;
@@ -195,6 +222,7 @@ impl AuthenticatedIrohListener {
     fn spawn_attempt(&mut self, incoming: iroh::endpoint::Incoming) {
         self.attempts.spawn(authenticate_incoming_iroh(
             incoming,
+            self.alpn.clone(),
             self.auth.clone(),
             self.enrollments.clone(),
             self.approved_bi_streams,
@@ -246,8 +274,8 @@ async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh
 
 #[cfg(feature = "server")]
 fn finish_auth_attempt(
-    joined: Result<anyhow::Result<Option<iroh::endpoint::Connection>>, tokio::task::JoinError>,
-) -> Option<anyhow::Result<iroh::endpoint::Connection>> {
+    joined: Result<anyhow::Result<Option<Accepted>>, tokio::task::JoinError>,
+) -> Option<anyhow::Result<Accepted>> {
     match joined {
         Ok(Ok(Some(connection))) => Some(Ok(connection)),
         Ok(Ok(None)) => None,
@@ -261,11 +289,17 @@ fn finish_auth_attempt(
 #[cfg(feature = "server")]
 async fn authenticate_incoming_iroh(
     incoming: iroh::endpoint::Incoming,
+    alpn: Vec<u8>,
     auth: rho_iroh_auth::IrohAuth,
     enrollments: std::sync::Arc<tokio::sync::Semaphore>,
     approved_bi_streams: u32,
-) -> anyhow::Result<Option<iroh::endpoint::Connection>> {
+) -> anyhow::Result<Option<Accepted>> {
     let connection = incoming.await.context("accept iroh connection")?;
+    // The handshake settles on an ALPN the endpoint serves, so any other
+    // than the application's is an open one.
+    if connection.alpn() != alpn.as_slice() {
+        return Ok(Some(Accepted::Open(connection)));
+    }
     let preapproved = auth.preapprove_endpoint(connection.remote_id()).await;
     let enrollment_permit = if preapproved.is_some() {
         None
@@ -283,7 +317,7 @@ async fn authenticate_incoming_iroh(
         Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
             connection.set_max_concurrent_bi_streams(approved_bi_streams.into());
             drop(enrollment_permit);
-            Ok(Some(connection))
+            Ok(Some(Accepted::Approved(connection)))
         }
         Ok(
             rho_iroh_auth::ServerAuthDecision::EnrollmentRequired(_)
@@ -809,6 +843,40 @@ mod tests {
         let second = load_or_create_server_secret(&db).await.unwrap();
 
         assert_eq!(first.public(), second.public());
+    }
+
+    /// A connection on an open ALPN is handed on without the auth exchange,
+    /// marked as one nobody approved.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn an_open_alpn_is_handed_on_unapproved() -> anyhow::Result<()> {
+        install_crypto_provider()?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let temp = tempfile::tempdir()?;
+            let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+            let secret = load_or_create_server_secret(&db).await?;
+            let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .secret_key(secret)
+                .alpns(vec![b"app".to_vec(), b"open".to_vec()])
+                .bind()
+                .await?;
+            let address = endpoint.addr();
+            let mut listener = AuthenticatedIrohListener::new(endpoint, b"app".to_vec(), auth, 4)?;
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .bind()
+                .await?;
+            let (outgoing, accepted) =
+                tokio::join!(client.connect(address, b"open"), listener.accept());
+            let _outgoing = outgoing?;
+            let Some(Ok(Accepted::Open(connection))) = accepted else {
+                panic!("not an open connection");
+            };
+            assert_eq!(connection.alpn(), b"open");
+            assert_eq!(connection.remote_id(), client.id());
+            Ok(())
+        })
+        .await?
     }
 
     #[tokio::test]

@@ -5,10 +5,13 @@
 //! map, and the answers to each workset's `_rho` calls. The store is the truth
 //! about worksets, agents and chat; the pool holds only what runs.
 
+mod c2c;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
+pub use c2c::{Answer, Envelope, MAX_BODY_LEN, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -56,6 +59,9 @@ pub struct AgentPool {
     claude: rho_claude::accounts::ClaudePaths,
     /// The host's `init.py`, run by each workset process at its start.
     init: Option<camino::Utf8PathBuf>,
+    /// The host's iroh endpoint id, once it has one: where C2C reaches its
+    /// agents.
+    endpoint: std::sync::OnceLock<[u8; 32]>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -137,6 +143,7 @@ impl AgentPool {
             worksets,
             claude,
             init,
+            endpoint: std::sync::OnceLock::new(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
@@ -981,7 +988,7 @@ impl AgentPool {
                 .iter()
                 .filter_map(|mention| match mention.to {
                     Address::Agent(agent) => Some(agent),
-                    Address::User => None,
+                    Address::User | Address::Peer => None,
                 }),
         );
         let mut worksets: Vec<WorksetId> = receivers
@@ -1085,6 +1092,13 @@ impl AgentPool {
         }
         {
             let mut write = self.db.write().await;
+            // An agent that is gone accepts no one: its address refuses
+            // already, and nothing of its is left to send.
+            for contact in self.db.read().peers() {
+                if agents.contains(&contact.agent) {
+                    write.remove_peer(UnixMs::now(), contact.topic)?;
+                }
+            }
             write.delete_workset(workset);
             for &agent in &agents {
                 write.delete_agent_usage(agent);
@@ -1229,6 +1243,7 @@ impl AgentPool {
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
+                self.check_peer_body(topic, &content)?;
                 let message = NewMessage {
                     from: Address::Agent(sender),
                     mentions,
@@ -1341,7 +1356,7 @@ impl AgentPool {
                         Place::Stream { stream, .. } => {
                             Some(read.stream_name(*stream).expect("a topic's stream exists"))
                         }
-                        Place::Direct => None,
+                        Place::Direct | Place::Peer { .. } => None,
                     };
                     (head, stream)
                 }))
@@ -1379,6 +1394,24 @@ impl AgentPool {
             }
             PyRequest::Models => PyReply::Models(models()),
             PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
+            PyRequest::PeerAddress(agent) => {
+                self.own_agent(workset, agent)?;
+                PyReply::Text(self.address_of(agent)?.to_string())
+            }
+            PyRequest::PeerAccept { agent, peer, name } => {
+                self.own_agent(workset, agent)?;
+                PyReply::Seq(self.accept_peer(agent, &peer, name).await?.0)
+            }
+            PyRequest::PeerTopic { agent, peer } => {
+                self.own_agent(workset, agent)?;
+                PyReply::Seq(self.peer_topic(agent, &peer)?.0)
+            }
+            PyRequest::Peers(agent) => {
+                self.own_agent(workset, agent)?;
+                let mut peers = self.peers();
+                peers.retain(|contact| contact.agent == agent);
+                PyReply::Peers(peers)
+            }
         })
     }
 

@@ -117,7 +117,7 @@ impl UiBlock {
                 .chain(mentions.iter().map(|mention| mention.to))
                 .filter_map(|address| match address {
                     rho_agent_types::Address::Agent(agent) => Some(agent),
-                    rho_agent_types::Address::User => None,
+                    rho_agent_types::Address::User | rho_agent_types::Address::Peer => None,
                 })
                 .collect(),
             _ => Vec::new(),

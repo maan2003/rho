@@ -1,6 +1,6 @@
 # C2C: the clanker to clanker protocol
 
-Status: draft. Nothing implements it yet.
+Status: draft.
 
 ## Purpose
 
@@ -22,9 +22,10 @@ Each harness holds one [iroh](https://iroh.computer) endpoint. An address is
     <endpoint id>/<local id>
 
 The endpoint id is the harness's public key, so the transport proves which
-harness a message came from. The local id names a recipient inside that
-harness, and only that harness gives it meaning: a clanker, usually. It is at
-most 64 bytes of `a-z`, `0-9`, `.`, `_` and `-`.
+harness a message came from. In an address it is written as 64 lowercase
+hexadecimal digits. The local id names a recipient inside that harness, and
+only that harness gives it meaning: a clanker, usually. It is 1 to 64 bytes
+of `a-z`, `0-9`, `.`, `_` and `-`.
 
 An address is public. Knowing it grants nothing, so it can be pasted into a
 chat or a log. There is no directory and no discovery: an address reaches a
@@ -65,15 +66,40 @@ or `refused`.
 - `delivered` means the receiving harness has stored the message, not that
   the clanker has read it.
 - The sending harness keeps a message until it is delivered, and tries
-  again while the other harness is unreachable. A receiver drops a message
-  whose sender and id it has already stored.
+  again while the other harness is unreachable.
 - `refused` is not final: the recipient may accept later. A sender may keep
   trying for a while before it reports a bounce to its clanker.
-- Messages from one address to another arrive in the order they were sent.
+- Messages from one address to another arrive in the order they were sent:
+  a harness sends the next one only when the one before is delivered or
+  given up on.
+- A message whose answer was lost is sent again under the same id, and it
+  is then the newest from its address. A receiver that stored it answers
+  `delivered` again and does not store it twice.
 
-On the wire a message is one CBOR map on a stream of its own, and the answer
-comes back on that stream. A receiver ignores fields it does not know. The
-ALPN is `c2c/1`; a change old peers cannot read takes a new number.
+### On the wire
+
+The ALPN is `c2c/1`; a change old peers cannot read takes a new number.
+
+The sending harness opens a bidirectional stream for each message, writes
+one CBOR map, and finishes its side of the stream:
+
+| Key    | Value                                                           |
+| ------ | --------------------------------------------------------------- |
+| `to`   | Text: the recipient's local id.                                 |
+| `from` | Text: the sender's local id.                                    |
+| `id`   | Unsigned integer below 2^64, never used again for this address. |
+| `body` | Text, not blank, of at most 65536 bytes of UTF-8.               |
+
+The receiving harness answers on the same stream with one CBOR map, and
+finishes its side:
+
+| Key      | Value                           |
+| -------- | ------------------------------- |
+| `answer` | Text: `delivered` or `refused`. |
+
+A receiver ignores keys it does not know. It answers `refused` to anything
+else it cannot read as a message. A sender treats a missing answer, or one it
+does not know, as a harness it could not reach.
 
 ## Trust
 
@@ -94,5 +120,3 @@ ALPN is `c2c/1`; a change old peers cannot read takes a new number.
 Groups, discovery, attachments, and byte streams between clankers (a tunnel to
 a service a clanker runs) are left out. A stream protocol would be a second
 ALPN beside this one and would reuse the same addresses and the same accept.
-
-The names of the map's fields and size limits are not chosen yet.

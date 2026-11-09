@@ -36,7 +36,7 @@ impl Said {
             Address::Agent(from) if from == agent => {
                 Some(Self::Agent(content_text(&message.content)))
             }
-            Address::Agent(_) => None,
+            Address::Agent(_) | Address::Peer => None,
         }
     }
 }

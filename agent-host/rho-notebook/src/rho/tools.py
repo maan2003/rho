@@ -199,7 +199,10 @@ class Chat:
             records = _around(rho_chat.read(topic, 1 << 31), id, last)
         lines = [where(topic, head, self._agent)]
         for record in records:
-            sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
+            if record["sender"] == rho_chat.PEER:
+                sender = _label_text(head["peer"]["name"])
+            else:
+                sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
             mark = "→ " if record["id"] == id else ""
             lines.append(f"{mark}#{record['id']} {sender}: {record['text']}")
         return report("\n".join(lines))
@@ -224,6 +227,8 @@ def _around(records, id, last):
 
 def where(topic, head, reader):
     """The header of a conversation as `reader` sees it."""
+    if head["peer"] is not None:
+        return f"[#{topic} with {peer_label(head['peer'])}]"
     if head["stream"] is None:
         if reader not in head["agents"]:
             a, b = (label(member) for member in head["agents"])
@@ -232,6 +237,12 @@ def where(topic, head, reader):
         return f"[#{topic} direct with {label(other)}]"
     done = "✔ " if head["resolved"] else ""
     return f"[#{topic} {_label_text(head['stream'])} › {done}{_label_text(head['name'])}]"
+
+
+def peer_label(peer):
+    """An agent on another host as a header names it: by the name its
+    acceptance gave it, and its address."""
+    return f"{_label_text(peer['name'])} at {peer['address']}, an agent on another host"
 
 
 def _label_text(name):
@@ -250,14 +261,26 @@ class Messages:
         self._agent = agent
 
     def message(self, *, agent_id, message):
-        """Send `message` to the agent `agent_id`, any agent on this host. It
-        arrives as a message from you, and its answer as a message from it."""
+        """Send `message` to the agent `agent_id`: any agent on this host, or
+        an address on another host that you accepted. It arrives as a message
+        from you, and its answer as a message from it."""
         text = _text(message)
+        if "/" in str(agent_id):
+            return self._message_peer(str(agent_id).strip(), text)
         other = resolve(str(agent_id))
         if other == self._agent:
             raise ValueError("cannot message yourself")
         rho_chat.post(self._agent, rho_chat.direct(self._agent, other), text)
         return report(f"Sent to {label(other)}.")
+
+    def _message_peer(self, address, text):
+        try:
+            topic = rho_chat.peer(self._agent, address)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
+        rho_chat.post(self._agent, topic, text)
+        name = rho_chat.topic(topic)["peer"]["name"]
+        return report(f"Sent to {_label_text(name)}. A notice follows if its host does not take it.")
 
     def __repr__(self):
         return "<agents>"
@@ -268,6 +291,39 @@ class Agents(Messages):
 
     def _me(self):
         return rho_agents.Agent(self._agent)
+
+    def address(self):
+        """Your address for agents on other hosts."""
+        try:
+            return report(rho_chat.address(self._agent))
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
+
+    def accept(self, *, address, name):
+        """Accept the agent at `address` on another host, under a `name` you
+        will know it by: its messages reach you, and yours reach it once it
+        has accepted your address."""
+        address, name = str(address).strip(), str(name)
+        try:
+            rho_chat.accept(self._agent, address, name)
+            mine = rho_chat.address(self._agent)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
+        return report(
+            f"Accepted {address} as {_label_text(name)}. It reaches you once it has your "
+            f"address, {mine}, and you reach it once it has accepted that address."
+        )
+
+    def contacts(self):
+        """The addresses on other hosts you have accepted."""
+        held = rho_chat.contacts(self._agent)
+        if not held:
+            return report("You have accepted no address.")
+        lines = []
+        for contact in held:
+            waiting = f", {contact['unsent']} of your messages not delivered yet" if contact["unsent"] else ""
+            lines.append(f"{_label_text(contact['name'])}: {contact['address']}{waiting}")
+        return report("\n".join(lines))
 
     def _check_depth(self):
         known = _rho.agents()

@@ -496,13 +496,16 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
 pub fn role_of(from: Address) -> Role {
     match from {
         Address::User => Role::User,
-        Address::Agent(_) => Role::Tool,
+        // A peer's message carries no authority, like another agent's.
+        Address::Agent(_) | Address::Peer => Role::Tool,
     }
 }
 
 pub(crate) mod agent_rows;
 pub mod chat;
 
-pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
+pub use chat::{
+    ChatRead, ChatWrite, MoveTo, NewMessage, PeerContact, PeerOutgoing, Place, TopicHead,
+};
 #[cfg(test)]
 mod tests;

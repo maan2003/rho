@@ -395,6 +395,14 @@ async fn run_async(args: Args) -> Result<()> {
                         ChatEvent::DirectStarted { members } => {
                             bail!("fake agents {members:?} talked directly")
                         }
+                        ChatEvent::PeerAccepted { .. }
+                        | ChatEvent::PeerRemoved { .. }
+                        | ChatEvent::Posted {
+                            from: Address::Peer,
+                            ..
+                        } => {
+                            bail!("no host has a peer in this proof")
+                        }
                         ChatEvent::Posted {
                             topic,
                             from: Address::User,
