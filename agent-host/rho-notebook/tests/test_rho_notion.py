@@ -25,13 +25,27 @@ def comments(*comments):
 
 
 class FakeNotionServer:
-    """Answers each request with the next of `replies`: `(status, body)`."""
+    """Answers each request with the next of `replies`: `(status, body)`.
+    With `keep_alive`, like the host, it keeps a connection open for further
+    requests; otherwise it closes each after one answer."""
 
-    def __init__(self, directory, replies):
+    def __init__(self, directory, replies, keep_alive=False):
         self.path, self.replies, self.requests = directory + "/notion.sock", replies, []
+        self.keep_alive = keep_alive
+        self.connections = 0
 
     async def serve(self, reader, writer):
-        method, target, _ = (await reader.readline()).decode().split()
+        self.connections += 1
+        while await self.answer(reader, writer) and self.keep_alive:
+            pass
+        writer.close()
+
+    async def answer(self, reader, writer):
+        """Answers one request; False once the client has hung up."""
+        line = await reader.readline()
+        if not line:
+            return False
+        method, target, _ = line.decode().split()
         headers = {}
         while line := (await reader.readline()).decode().strip():
             key, value = line.split(":", 1)
@@ -40,16 +54,17 @@ class FakeNotionServer:
         self.requests.append((method, target, json.loads(body or b"null")))
         status, reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         payload = json.dumps(reply).encode()
+        close = "" if self.keep_alive else "Connection: close\r\n"
         writer.write(f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
-                     f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                     f"Content-Length: {len(payload)}\r\n{close}\r\n".encode() + payload)
         await writer.drain()
-        writer.close()
+        return True
 
 
 class RhoNotionTest(unittest.IsolatedAsyncioTestCase):
-    async def run_with(self, replies, body):
+    async def run_with(self, replies, body, keep_alive=False):
         with tempfile.TemporaryDirectory() as directory:
-            fake = FakeNotionServer(directory, replies)
+            fake = self.fake = FakeNotionServer(directory, replies, keep_alive)
             server = await asyncio.start_unix_server(fake.serve, fake.path)
             with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
                 async with server:
@@ -70,6 +85,17 @@ class RhoNotionTest(unittest.IsolatedAsyncioTestCase):
             (200, {"isError": True, "content": [{"type": "text", "text": "no such page"}]}),
         ], body)
         self.assertEqual(requests[0], ("POST", "/tools/notion-fetch", {"id": PAGE}))
+
+    async def test_calls_share_one_host_connection(self):
+        async def body():
+            for _ in range(3):
+                await rho_notion.call("notion-fetch", id=PAGE)
+            await rho_notion._clients[asyncio.get_running_loop()].aclose()
+
+        requests = await self.run_with([(200, {"content": []})], body, keep_alive=True)
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(self.fake.connections, 1)
 
     async def test_watch_reports_each_new_comment_once_and_stops_on_a_refusal(self):
         got = []
