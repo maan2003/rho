@@ -423,6 +423,25 @@ async fn a_task_that_ended_before_the_lookup_still_answers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_exec_ends_when_its_command_ends_just_before_the_wait() {
+    let (notebook, wake) = notebook().await;
+    // The command's future is done before the exec's wait first looks, and
+    // the done callback that forgets it has not run yet.
+    let cell = notebook.run(
+        "import rho_kernel\n\
+         loop = asyncio.get_running_loop()\n\
+         done = loop.create_future()\n\
+         rho_kernel.CELL.get().command(done)\n\
+         loop.call_soon(done.set_result, None)"
+            .into(),
+    );
+    finished(&wake, &cell).await;
+    let after = notebook.run("print('loop free')".into());
+    finished(&wake, &after).await;
+    assert!(notebook.report().unwrap().render().text.contains("loop free"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn awaiting_an_exec_waits_for_its_commands() {
     let (notebook, wake) = notebook().await;
     // Synchronous code: the exec has no asyncio task, only its command.

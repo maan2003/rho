@@ -526,6 +526,13 @@
           [
             ps.pyyaml
             ps.httpx
+            # httpcore 1.0 imports sniffio on every lock and pool operation
+            # and falls back to asyncio when the import fails. A failed
+            # import is never cached: each one takes the import lock and
+            # stats every sys.path entry, which every notebook in the
+            # worker process shares, and costs seconds per request under
+            # load. Installed, it is imported once.
+            ps.sniffio
             ghapi
             pythonLs
             slackSdk
