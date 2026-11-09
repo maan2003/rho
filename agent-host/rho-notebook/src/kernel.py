@@ -90,6 +90,16 @@ class Owner:
         self.commands.add(future)
         future.add_done_callback(self.commands.discard)
 
+    async def commands_ended(self):
+        """Until every command, including ones started meanwhile, has ended.
+        A done command is dropped here rather than left to its done callback,
+        which may not have run yet: gathering only done futures never yields,
+        so waiting for the callback would spin the loop forever."""
+        while self.commands:
+            waiting = tuple(self.commands)
+            await asyncio.gather(*(asyncio.shield(f) for f in waiting))
+            self.commands.difference_update(waiting)
+
     async def finish(self, code):
         try:
             value = await code
@@ -103,8 +113,7 @@ class Owner:
             self.failed(exc)
             raise
         # A command belongs to this task even if nobody explicitly awaited it.
-        while self.commands:
-            await asyncio.gather(*(asyncio.shield(f) for f in tuple(self.commands)))
+        await self.commands_ended()
         self.cell.finished(None, False)
         self.notebook.tasks.pop(self.cell.id, None)
         self.done = True
@@ -377,8 +386,7 @@ class Notebook:
             return
         owner.cell.returned(None)
         async def wait():
-            while owner.commands:
-                await asyncio.gather(*(asyncio.shield(f) for f in tuple(owner.commands)))
+            await owner.commands_ended()
             owner.done = True
             owner.cell.finished(None, False)
             self.tasks.pop(owner.cell.id, None)
