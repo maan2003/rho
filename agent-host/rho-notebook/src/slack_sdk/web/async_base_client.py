@@ -64,6 +64,9 @@ class AsyncBaseClient:
             self.default_params["team_id"] = team_id
         self._logger = logger if logger is not None else logging.getLogger(__name__)
         self.retry_handlers = retry_handlers or []
+        # Made on the first call, then kept: building a client loads TLS
+        # roots, and its pool keeps the host connection open between calls.
+        self._http: Optional[httpx.AsyncClient] = None
 
     @property
     def logger(self) -> logging.Logger:
@@ -107,20 +110,21 @@ class AsyncBaseClient:
 
     async def _request(self, *, http_verb, api_url, req_args) -> Dict[str, Any]:
         """Sends one request. `AsyncSlackResponse` pagination calls this for each page."""
-        socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+        if self._http is None:
+            socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+            self._http = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=self.timeout)
         # httpx sets the content type; the host sets the token.
         headers = {
             k: v for k, v in (req_args.get("headers") or {}).items() if k.lower() not in ("content-type", "authorization")
         }
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=self.timeout) as client:
-            resp = await client.request(
-                http_verb,
-                api_url,
-                headers=headers,
-                params=convert_bool_to_0_or_1(req_args.get("params")),
-                data=convert_bool_to_0_or_1(req_args.get("data")),
-                json=req_args.get("json"),
-            )
+        resp = await self._http.request(
+            http_verb,
+            api_url,
+            headers=headers,
+            params=convert_bool_to_0_or_1(req_args.get("params")),
+            data=convert_bool_to_0_or_1(req_args.get("data")),
+            json=req_args.get("json"),
+        )
         try:
             data = resp.json()
         except ValueError:

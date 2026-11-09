@@ -4,6 +4,7 @@ import collections
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -27,13 +28,27 @@ EVENTS = [
 
 
 class FakeSlackServer:
-    """Answers each request from `replies`, keyed by method, and records it."""
+    """Answers each request from `replies`, keyed by method, and records it.
+    With `keep_alive`, like the host, it keeps a connection open for further
+    requests; otherwise it closes each after one answer."""
 
-    def __init__(self, directory, replies):
+    def __init__(self, directory, replies, keep_alive=False):
         self.path, self.replies, self.requests = directory + "/slack.sock", replies, []
+        self.keep_alive = keep_alive
+        self.connections = 0
 
     async def serve(self, reader, writer):
-        method, target, _ = (await reader.readline()).decode().split()
+        self.connections += 1
+        while await self.answer(reader, writer) and self.keep_alive:
+            pass
+        writer.close()
+
+    async def answer(self, reader, writer):
+        """Answers one request; False once the client has hung up."""
+        line = await reader.readline()
+        if not line:
+            return False
+        method, target, _ = line.decode().split()
         headers = {}
         while line := (await reader.readline()).decode().strip():
             key, value = line.split(":", 1)
@@ -50,16 +65,17 @@ class FakeSlackServer:
         status, reply = reply if isinstance(reply, tuple) else (200, reply)
         payload, content_type = ((reply, "application/octet-stream") if isinstance(reply, bytes)
                                  else (json.dumps(reply).encode(), "application/json"))
+        close = "" if self.keep_alive else "Connection: close\r\n"
         writer.write(f"HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n"
-                     f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                     f"Content-Length: {len(payload)}\r\n{close}\r\n".encode() + payload)
         await writer.drain()
-        writer.close()
+        return True
 
 
 class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
-    async def run_with(self, replies, body):
+    async def run_with(self, replies, body, keep_alive=False):
         with tempfile.TemporaryDirectory() as directory:
-            fake = self.fake = FakeSlackServer(directory, replies)
+            fake = self.fake = FakeSlackServer(directory, replies, keep_alive)
             server = await asyncio.start_unix_server(fake.serve, fake.path)
             with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
                 async with server:
@@ -91,6 +107,43 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(open_["query"], {"users": ["U1,U2"]})
         self.assertEqual((replies["method"], replies["query"]),
                          ("GET", {"channel": ["D1"], "ts": ["1.5"], "inclusive": ["1"]}))
+
+    async def test_async_client_calls_share_one_host_connection(self):
+        async def body():
+            client = AsyncWebClient()
+            for _ in range(3):
+                await client.auth_test()
+            await client._http.aclose()
+
+        requests = await self.run_with({"auth.test": {"ok": True}}, body, keep_alive=True)
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(self.fake.connections, 1)
+
+    async def test_requests_attempt_no_imports(self):
+        """An import that fails is retried on every call, under the import
+        lock all of a worker's notebooks share, so it must not happen per
+        request. Only a failing import reaches a finder once warm."""
+        attempted = []
+
+        class Recorder:
+            def find_spec(self, name, path=None, target=None):
+                attempted.append(name)
+
+        async def body():
+            client = AsyncWebClient()
+            await client.auth_test()
+            sys.meta_path.insert(0, Recorder())
+            try:
+                for _ in range(2):
+                    await client.auth_test()
+                    await AsyncWebClient().auth_test()
+            finally:
+                del sys.meta_path[0]
+
+        await self.run_with({"auth.test": {"ok": True}}, body)
+
+        self.assertEqual(attempted, [])
 
     async def test_async_pagination_follows_the_cursor(self):
         texts = []
