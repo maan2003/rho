@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -46,12 +47,26 @@ def text(result: Dict[str, Any]) -> str:
     return "\n".join(part["text"] for part in result.get("content", []) if part.get("type") == "text")
 
 
+# A client per event loop, kept: building one loads TLS roots, and its pool
+# keeps the host connection open between calls. Every notebook of a worker
+# shares this module but runs its own loop, which a client's connections
+# belong to.
+_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = weakref.WeakKeyDictionary()
+
+
+def _client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
+        socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("notion.sock"))
+        client = _clients[loop] = httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=socket), base_url="http://notion", timeout=120
+        )
+    return client
+
+
 async def _request(method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
-    socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("notion.sock"))
-    async with httpx.AsyncClient(
-        transport=httpx.AsyncHTTPTransport(uds=socket), base_url="http://notion", timeout=120
-    ) as client:
-        response = await client.request(method, path, **kwargs)
+    response = await _client().request(method, path, **kwargs)
     body = response.json()
     if response.is_error:
         raise NotionError(body.get("error", response.text))
