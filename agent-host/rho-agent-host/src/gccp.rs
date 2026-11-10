@@ -48,7 +48,7 @@ struct WireMessage {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WireResult {
-    result: String,
+    success: bool,
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
@@ -80,21 +80,17 @@ fn decode_message(bytes: &[u8]) -> anyhow::Result<Envelope> {
 
 fn encode_result(result: MessageResult) -> Vec<u8> {
     encode(&WireResult {
-        result: match result {
-            MessageResult::Delivered => "delivered",
-            MessageResult::Refused => "refused",
-        }
-        .to_owned(),
+        success: result == MessageResult::Delivered,
     })
 }
 
 fn decode_result(bytes: &[u8]) -> anyhow::Result<MessageResult> {
-    let WireResult { result } = ciborium::from_reader(bytes).context("not a GCCP result")?;
-    match result.as_str() {
-        "delivered" => Ok(MessageResult::Delivered),
-        "refused" => Ok(MessageResult::Refused),
-        other => anyhow::bail!("a result this version does not know: {other:?}"),
-    }
+    let WireResult { success } = ciborium::from_reader(bytes).context("not a GCCP result")?;
+    Ok(if success {
+        MessageResult::Delivered
+    } else {
+        MessageResult::Refused
+    })
 }
 
 /// Gives every message another harness sends on `connection` a result, for as
@@ -266,10 +262,7 @@ mod tests {
             ciborium::from_reader(&encode_result(MessageResult::Refused)[..]).unwrap();
         assert_eq!(
             result,
-            Value::Map(vec![(
-                Value::Text("result".into()),
-                Value::Text("refused".into())
-            )])
+            Value::Map(vec![(Value::Text("success".into()), Value::Bool(false))])
         );
     }
 
@@ -308,12 +301,24 @@ mod tests {
     }
 
     #[test]
-    fn a_result_this_version_does_not_know_is_an_error() {
-        for result in [MessageResult::Delivered, MessageResult::Refused] {
+    fn a_result_is_a_boolean_and_nothing_else() {
+        for (result, success) in [
+            (MessageResult::Delivered, true),
+            (MessageResult::Refused, false),
+        ] {
             assert_eq!(decode_result(&encode_result(result)).unwrap(), result);
+            let said = map(&[("success", Value::Bool(success))]);
+            assert_eq!(decode_result(&said).unwrap(), result);
         }
-        let later = map(&[("result", Value::Text("later".into()))]);
-        assert!(decode_result(&later).is_err());
+        // What is not a result is no result: the message may be stored.
+        for not_a_result in [
+            map(&[("success", Value::Text("delivered".into()))]),
+            map(&[("success", Value::Integer(1.into()))]),
+            map(&[("result", Value::Text("delivered".into()))]),
+            map(&[]),
+        ] {
+            assert!(decode_result(&not_a_result).is_err());
+        }
     }
 
     /// Two endpoints: what one sends reaches the other with the sender's
