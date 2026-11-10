@@ -15,6 +15,7 @@ import _rho
 from . import agents as rho_agents
 from . import chat as rho_chat
 from . import skills as rho_skills
+from . import workset
 from .prompt import label
 
 #: How many agents deep a spawn may be, counting the spawner.
@@ -53,7 +54,10 @@ def engineer_runtime(spawner: dict) -> dict:
 
 
 def advisor_runtime(asker: dict) -> dict:
-    """What an Advisor runs on, from the runtime of the Engineer asking."""
+    """What an Advisor runs on, from the runtime of the Engineer asking. An
+    auto workset holds Claude agents only, so its Advisors are Fable."""
+    if workset.permissions() == "auto":
+        return claude("fable", "xhigh")
     if asker["kind"] == "native" and asker["model"] == "terra":
         return native("sol", "xhigh")
     if asker["kind"] == "native" and asker["model"] == "astra":

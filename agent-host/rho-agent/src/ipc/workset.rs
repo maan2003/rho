@@ -54,6 +54,8 @@ pub enum Reply {
 pub(crate) enum PyRequest {
     CreateAgent(crate::record::AgentSpec),
     Agents,
+    /// The workset's props, before its first agent.
+    SetWorksetProps(rho_agent_types::Props),
     SetSpec {
         agent: rho_agent_types::AgentId,
         spec: crate::record::AgentSpec,

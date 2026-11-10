@@ -47,8 +47,8 @@ pub enum Role {
     System,
 }
 
-/// String properties Python sets on an agent. Rust reads none of them; the
-/// GUI gives meaning to the keys in [`props`].
+/// String properties Python sets on an agent or a workset. On an agent's,
+/// the GUI gives meaning to the keys in [`props`].
 pub type Props = BTreeMap<String, String>;
 
 /// The prop keys the GUI reads.

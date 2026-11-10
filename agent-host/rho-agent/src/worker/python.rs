@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
@@ -27,6 +28,7 @@ use crate::ipc::protocol::Control;
 use crate::ipc::transport::{Port, Sender};
 use crate::ipc::workset::{Message, PyMoveTo, PyReply, PyRequest, encode};
 use crate::record::{AgentSpec, Runtime};
+use crate::worker::permissions::{self, PERMISSIONS, Permissions};
 
 /// How long a hook may take before the loop goes on without it.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -43,9 +45,32 @@ pub(crate) struct PyHost {
     pub runtime: tokio::runtime::Handle,
     pub workset: WorksetId,
     pub isolated: bool,
+    /// The workset's props: its head's at start, then what Python set.
+    pub props: Mutex<rho_agent_types::Props>,
 }
 
 static HOST: OnceLock<PyHost> = OnceLock::new();
+
+/// Whether init.py has run, failed or not.
+static INITIALIZED: LazyLock<tokio::sync::watch::Sender<bool>> =
+    LazyLock::new(|| tokio::sync::watch::Sender::new(false));
+
+/// Waits until init.py has run, so an agent starts under what it chose:
+/// its permissions and its hooks.
+pub(crate) async fn initialized() {
+    let _ = INITIALIZED.subscribe().wait_for(|done| *done).await;
+}
+
+/// The workset's props now.
+pub(crate) fn props() -> anyhow::Result<rho_agent_types::Props> {
+    Ok(HOST
+        .get()
+        .context("the workset Python has not started")?
+        .props
+        .lock()
+        .expect("poison")
+        .clone())
+}
 
 /// `_rho` calls waiting for the host's answer, by id.
 static PENDING: LazyLock<Mutex<HashMap<u64, oneshot::Sender<PyReply>>>> =
@@ -60,6 +85,7 @@ impl PyHost {
         runtime: tokio::runtime::Handle,
         workset: WorksetId,
         isolated: bool,
+        props: rho_agent_types::Props,
     ) -> Self {
         let call: HostCall = Arc::new(move |request| {
             let sender = sender.clone();
@@ -84,6 +110,7 @@ impl PyHost {
             runtime,
             workset,
             isolated,
+            props: Mutex::new(props),
         }
     }
 
@@ -144,6 +171,7 @@ pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::
                         if let Some(error) = error {
                             eprintln!("rho: init.py failed; the default policy runs:\n{error}");
                         }
+                        INITIALIZED.send_replace(true);
                         Ok(())
                     },
                 )?;
@@ -156,6 +184,8 @@ pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::
                     eprintln!("rho: the workset loop stopped: {}", traceback(py, &error))
                 });
             }
+            // Agents waiting on init.py go on, and find what it left.
+            INITIALIZED.send_replace(true);
         })?;
     // Hooks run on the workset loop: wait until it exists, not until
     // init.py is done, which may take long and may call back into the host.
@@ -316,6 +346,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     )?;
     module.add_function(pyo3::wrap_pyfunction!(workset_id, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(workset_kind, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(workset_props, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(set_workset_props, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(set_permissions, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(workset_permissions, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(clone, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(context, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(models, &module)?)?;
@@ -386,6 +420,50 @@ fn workset_id() -> PyResult<String> {
 #[pyfunction]
 fn workset_kind() -> PyResult<&'static str> {
     Ok(if host()?.isolated { "isolated" } else { "host" })
+}
+
+#[pyfunction]
+fn workset_props() -> PyResult<rho_agent_types::Props> {
+    Ok(host()?.props.lock().expect("poison").clone())
+}
+
+#[pyfunction]
+fn set_workset_props(py: Python<'_>, props: rho_agent_types::Props) -> PyResult<()> {
+    match PyHost::block(py, PyRequest::SetWorksetProps(props.clone()))? {
+        PyReply::Done => {
+            *host()?.props.lock().expect("poison") = props;
+            Ok(())
+        }
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (mode, environment = None))]
+fn set_permissions(mode: &str, environment: Option<Vec<String>>) -> PyResult<()> {
+    let permissions = match (mode, environment) {
+        ("bypass", None) => Permissions::Bypass,
+        ("bypass", Some(_)) => {
+            return Err(PyValueError::new_err("bypass takes no environment"));
+        }
+        ("auto", environment) => Permissions::Auto { environment },
+        (other, _) => {
+            return Err(PyValueError::new_err(format!(
+                "permissions are \"bypass\" or \"auto\", not {other:?}"
+            )));
+        }
+    };
+    PERMISSIONS
+        .set(permissions)
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))
+}
+
+#[pyfunction]
+fn workset_permissions() -> Option<&'static str> {
+    PERMISSIONS.get().map(|permissions| match *permissions {
+        Permissions::Bypass => "bypass",
+        Permissions::Auto { .. } => "auto",
+    })
 }
 
 #[pyfunction]
@@ -463,6 +541,11 @@ fn models(py: Python<'_>) -> PyResult<Vec<Bound<'_, PyDict>>> {
 #[pyfunction]
 fn create_agent(py: Python<'_>, spec: Bound<'_, PyDict>) -> PyResult<String> {
     let spec = spec_from_py(&spec, None)?;
+    let permissions = PERMISSIONS
+        .fix(&host()?.props.lock().expect("poison"))
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+    permissions::admits(&permissions, matches!(spec.runtime, Runtime::Native { .. }))
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
     match PyHost::block(py, PyRequest::CreateAgent(spec))? {
         PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
         _ => Err(unexpected()),

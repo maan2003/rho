@@ -34,6 +34,7 @@ const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 const STREAM_LABEL_INLAY_ID: usize = 5;
 const MENTION_HINT_INLAY_ID: usize = 6;
+const FUNCTION_LABEL_INLAY_ID: usize = 7;
 
 /// Which rows the draft has, by what submitting it makes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +63,7 @@ impl DraftShape {
 }
 
 pub use rho_agents_client::create::{AUTO_BASE_REV, DEFAULT_START, StartFieldMode};
-pub use rho_agents_client::snippets::DEFAULT_RUNTIME;
+pub use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME};
 
 impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {
@@ -133,6 +134,8 @@ pub struct DraftModel {
     runtime_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
+    /// The policy function the new agent's code calls.
+    function_buffer: Entity<Buffer>,
     /// The host the agent will run on, named in the Workdir label once
     /// there is more than one to run on. The host's to say; the draft
     /// shows it.
@@ -160,6 +163,7 @@ impl DraftModel {
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
         let runtime_buffer = cx.new(|cx| Buffer::local(DEFAULT_RUNTIME, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
+        let function_buffer = cx.new(|cx| Buffer::local(DEFAULT_FUNCTION, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
@@ -192,6 +196,11 @@ impl DraftModel {
                     this.update_start_target_hint(cx);
                 }
             }),
+            cx.subscribe(&function_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
         ];
 
         let draft = Self {
@@ -203,6 +212,7 @@ impl DraftModel {
             runtime_buffer,
             start_buffer,
             start_mode: StartFieldMode::NewOn,
+            function_buffer,
             workdir_host: None,
             start_target_hints: Vec::new(),
             body_buffer,
@@ -222,19 +232,20 @@ impl DraftModel {
 
     /// The rows in order, each under its place in the multibuffer, and
     /// whether this shape has it.
-    fn rows(&self) -> [(u64, &Entity<Buffer>, bool); 5] {
+    fn rows(&self) -> [(u64, &Entity<Buffer>, bool); 6] {
         [
             (0, &self.stream_buffer, self.shape.has_stream()),
             (1, &self.workdir_buffer, self.shape.has_agent()),
             (2, &self.runtime_buffer, self.shape.has_agent()),
             (3, &self.start_buffer, self.shape.has_agent()),
-            (4, &self.body_buffer, self.shape.has_body()),
+            (4, &self.function_buffer, self.shape.has_agent()),
+            (5, &self.body_buffer, self.shape.has_body()),
         ]
     }
 
     /// The field rows this shape has, top to bottom.
     fn fields(&self) -> Vec<Entity<Buffer>> {
-        self.rows()[..4]
+        self.rows()[..5]
             .iter()
             .filter(|(_, _, shown)| *shown)
             .map(|(_, buffer, _)| (*buffer).clone())
@@ -292,6 +303,7 @@ impl DraftModel {
         self.insert_workdir_label_to(editor, cx);
         self.insert_runtime_label_to(editor, cx);
         self.insert_start_label_to(editor, cx);
+        self.insert_function_label_to(editor, cx);
         self.apply_start_target_hint_to(editor, cx);
         self.pin_autoscroll_to(editor, cx);
         self.apply_body_chrome_to(editor, cx);
@@ -431,6 +443,20 @@ impl DraftModel {
         self.update_start_target_hint(cx);
     }
 
+    pub fn function_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.function_buffer.read(cx);
+        buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn set_function_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
+        self.function_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+        self.suppress_draft_activation = false;
+    }
+
     pub fn set_start_target_hints(&mut self, hints: Vec<(String, String)>, cx: &mut Context<Self>) {
         self.start_target_hints = hints;
         self.update_start_target_hint(cx);
@@ -480,6 +506,10 @@ impl DraftModel {
 
     pub fn cursor_in_runtime_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         self.cursor_in(&self.runtime_buffer, editor, cx)
+    }
+
+    pub fn cursor_in_function_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.function_buffer, editor, cx)
     }
 
     fn cursor_in(&self, buffer: &Entity<Buffer>, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -763,6 +793,26 @@ impl DraftModel {
                     RUNTIME_LABEL_INLAY_ID,
                     field_start,
                     "Model: ",
+                )],
+                cx,
+            );
+        });
+    }
+
+    fn insert_function_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(field_start) =
+            snapshot.anchor_in_excerpt(self.function_buffer.read(cx).anchor_before(0))
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.splice_inlays(
+                &[InlayId::Custom(FUNCTION_LABEL_INLAY_ID)],
+                vec![Inlay::custom(
+                    FUNCTION_LABEL_INLAY_ID,
+                    field_start,
+                    "Call: ",
                 )],
                 cx,
             );

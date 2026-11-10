@@ -284,6 +284,7 @@ impl Process {
     pub(crate) async fn start(
         pool: &Arc<crate::host::pool::AgentPool>,
         workset: rho_agent_types::WorksetId,
+        props: rho_agent_types::Props,
         layout: rho_fs_view::Layout,
         root: camino::Utf8PathBuf,
         init: Option<camino::Utf8PathBuf>,
@@ -294,6 +295,7 @@ impl Process {
         let startup = Startup {
             version: protocol::VERSION,
             workset,
+            props,
             layout,
             claude,
             responses_base_url: pool.inference().responses_base_url().to_owned(),

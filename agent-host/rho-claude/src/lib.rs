@@ -35,12 +35,22 @@ const MAX_MCP_OUTPUT_TOKENS: &str = "1000000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The `--permission-mode` Rho runs Claude Code in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Every call runs.
+    Bypass,
+    /// The auto mode classifier approves each call.
+    Auto,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeOptions {
     pub command: Utf8PathBuf,
     pub cwd: Utf8PathBuf,
     pub model: Model,
     pub effort: Effort,
+    pub permission_mode: PermissionMode,
     pub session: Session,
     pub env: Vec<(String, String)>,
     /// A plugin to load for this session only, such as [`plugin`]'s.
@@ -52,6 +62,7 @@ impl ClaudeCodeOptions {
         cwd: impl Into<Utf8PathBuf>,
         model: Model,
         effort: Effort,
+        permission_mode: PermissionMode,
         session_id: uuid::Uuid,
     ) -> Self {
         let cwd = cwd.into();
@@ -60,6 +71,7 @@ impl ClaudeCodeOptions {
             cwd: cwd.clone(),
             model,
             effort,
+            permission_mode,
             session: Session::New { session_id },
             env: Vec::new(),
             plugin_dir: None,
@@ -79,8 +91,16 @@ impl ClaudeCodeOptions {
             "stream-json".to_owned(),
             "--include-partial-messages".to_owned(),
             "--permission-mode".to_owned(),
-            "bypassPermissions".to_owned(),
-            "--allow-dangerously-skip-permissions".to_owned(),
+            match self.permission_mode {
+                PermissionMode::Bypass => "bypassPermissions",
+                PermissionMode::Auto => "auto",
+            }
+            .to_owned(),
+        ];
+        if self.permission_mode == PermissionMode::Bypass {
+            args.push("--allow-dangerously-skip-permissions".to_owned());
+        }
+        args.extend([
             "--model".to_owned(),
             self.model.as_arg().to_owned(),
             "--effort".to_owned(),
@@ -89,7 +109,7 @@ impl ClaudeCodeOptions {
             // conversation, so a prompt edit reaches agents that already exist.
             "--system-prompt-snapshot".to_owned(),
             "off".to_owned(),
-        ];
+        ]);
         if let Some(dir) = &self.plugin_dir {
             args.push("--plugin-dir".to_owned());
             args.push(dir.to_string());
@@ -142,6 +162,9 @@ impl ClaudeCodeOptions {
         // Its nudge after quiet turns asks for a status Rho's own prompt
         // already governs, so agents sent one per step.
         command.env("CLAUDE_CODE_SILENT_TURN_REMINDER", "0");
+        if mcp::model_tool_name(self.permission_mode) == mcp::TOOL_NAME {
+            command.env("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", "1");
+        }
         for (name, value) in &self.env {
             command.env(name, value);
         }
@@ -434,6 +457,7 @@ mod tests {
             "/tmp/project",
             Model::Sonnet,
             Effort::Medium,
+            PermissionMode::Bypass,
             uuid::uuid!("00000000-0000-4000-8000-000000000000"),
         );
 
@@ -461,6 +485,35 @@ mod tests {
         );
     }
 
+    /// Auto mode drops the bypass flag, and the model sees exec with the
+    /// MCP prefix so the server reviews it.
+    #[tokio::test]
+    async fn auto_mode_asks_for_review_and_keeps_the_prefix() {
+        let mut options = ClaudeCodeOptions::new(
+            "/tmp/project",
+            Model::Opus,
+            Effort::Medium,
+            PermissionMode::Auto,
+            uuid::uuid!("00000000-0000-4000-8000-000000000000"),
+        );
+        let args = options.args();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--permission-mode", "auto"])
+        );
+        assert!(!args.iter().any(|arg| arg.contains("dangerously")));
+        async fn no_prefix(options: &ClaudeCodeOptions) -> bool {
+            let command = options.command().await.unwrap();
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, _)| name == "CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
+        }
+        assert!(!no_prefix(&options).await);
+        options.permission_mode = PermissionMode::Bypass;
+        assert!(no_prefix(&options).await);
+    }
+
     #[test]
     fn passes_each_model_by_its_cli_alias() {
         for (model, alias) in [
@@ -473,6 +526,7 @@ mod tests {
                 "/tmp/project",
                 model,
                 Effort::Max,
+                PermissionMode::Bypass,
                 uuid::uuid!("00000000-0000-4000-8000-000000000000"),
             );
             let args = options.args();
@@ -490,6 +544,7 @@ mod tests {
             "/tmp/project",
             Model::Sonnet,
             Effort::Medium,
+            PermissionMode::Bypass,
             uuid::uuid!("00000000-0000-4000-8000-000000000002"),
         );
         options.session = Session::Fork {

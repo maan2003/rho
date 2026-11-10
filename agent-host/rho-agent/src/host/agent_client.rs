@@ -93,6 +93,8 @@ impl AgentClient {
         let port = crate::ipc::transport::Port::Agent(agent);
         let (stop, stopping) = oneshot::channel();
         let (closed, closed_rx) = watch::channel(false);
+        // Why the loop ended, for a startup that waits on it.
+        let ended = Arc::new(Mutex::new(None::<String>));
         let is_stopping = Arc::new(AtomicBool::new(false));
         let handle = Self(Arc::new(Inner {
             services: services.clone(),
@@ -106,6 +108,7 @@ impl AgentClient {
         }
         let ready = services.ready.subscribe();
         let pid = process.pid;
+        let ended_in_loop = ended.clone();
         tokio::spawn(async move {
             let mut service = tokio::spawn({
                 let services = services.clone();
@@ -162,6 +165,7 @@ impl AgentClient {
             }
             process.agents.lock().expect("poison").remove(&agent);
             if !expected {
+                *ended_in_loop.lock().expect("poison") = Some(error.clone());
                 services.worker_failed(error).await;
             }
             closed.send_replace(true);
@@ -170,7 +174,10 @@ impl AgentClient {
         let mut closed = closed_rx;
         let result = tokio::select! {
             result = ready.wait_for(|ready| *ready) => result.map(|_| ()).context("agent readiness closed"),
-            _ = closed.wait_for(|closed| *closed) => Err(anyhow::anyhow!("agent exited during startup")),
+            _ = closed.wait_for(|closed| *closed) => Err(match ended.lock().expect("poison").take() {
+                Some(error) => anyhow::anyhow!("agent exited during startup: {error}"),
+                None => anyhow::anyhow!("agent exited during startup"),
+            }),
             _ = tokio::time::sleep(Duration::from_secs(30)) => Err(anyhow::anyhow!("agent startup timed out")),
         };
         if let Err(error) = result {

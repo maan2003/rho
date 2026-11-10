@@ -165,6 +165,7 @@ pub(crate) async fn run(
             tokio::runtime::Handle::current(),
             startup.workset,
             startup.layout.mount.is_some(),
+            startup.props.clone(),
         ),
         startup.init.clone(),
     )?;
@@ -344,6 +345,13 @@ pub(crate) async fn run(
         tasks.spawn(async move {
             let result = async {
                 let head = host.head().await?;
+                // An agent starts under what init.py chose.
+                super::python::initialized().await;
+                let permissions = super::permissions::PERMISSIONS.fix(&super::python::props()?)?;
+                super::permissions::admits(
+                    &permissions,
+                    matches!(head.spec.runtime, crate::record::Runtime::Native { .. }),
+                )?;
                 match head.spec.runtime {
                     crate::record::Runtime::Native { .. } => {
                         let (handle, runtime) =
@@ -351,8 +359,15 @@ pub(crate) async fn run(
                         drive_native(runtime, handle, host.clone()).await
                     }
                     crate::record::Runtime::Claude { .. } => {
-                        let (handle, runtime) =
-                            ClaudeLoop::load(agent, host.clone(), inference, claude, root).await?;
+                        let (handle, runtime) = ClaudeLoop::load(
+                            agent,
+                            host.clone(),
+                            inference,
+                            claude,
+                            permissions,
+                            root,
+                        )
+                        .await?;
                         drive_claude(runtime, handle, host.clone()).await
                     }
                 }
