@@ -1,5 +1,6 @@
-//! C2C on the wire ([docs/c2c.md](../../../docs/c2c.md)): one CBOR map
-//! on a stream of its own, and its result on that stream. What the host does
+//! C2C on the wire ([docs/c2c.md](../../../docs/c2c.md)): a stream says
+//! its kind first, and a message stream then carries one CBOR map and
+//! brings back its result. What the host does
 //! with a message is the pool's
 //! ([`rho_agent::host::pool::AgentPool::c2c_receive`]); this module only
 //! carries.
@@ -16,6 +17,12 @@ use rho_agent::host::pool::{AgentPool, Envelope, MAX_BODY_LEN, MessageResult, Tr
 /// The ALPN C2C is spoken on. A change old peers cannot read takes a new
 /// number.
 pub const ALPN: &[u8] = b"c2c/1";
+/// The kind of a stream that carries one message and its result. A stream
+/// opens with its kind, so that later kinds, a byte tunnel for one, share
+/// the connection; how a stream's payload ends is its kind's business.
+const KIND_MESSAGE: u16 = 1;
+/// The code a stream of a kind this host does not know is reset with.
+const UNKNOWN_KIND: u32 = 1;
 /// How many harnesses may hold a connection at once. Nobody approved them,
 /// so what they can make the host hold is bounded: this many connections,
 /// each with as many streams as the endpoint allows, each one message.
@@ -118,9 +125,21 @@ where
         };
         let receive = receive.clone();
         tokio::spawn(async move {
-            let Ok(read) =
-                tokio::time::timeout(READ_TIMEOUT, recv.read_to_end(MAX_MESSAGE_LEN)).await
-            else {
+            let said = async {
+                let mut kind = [0; 2];
+                recv.read_exact(&mut kind).await.ok()?;
+                if u16::from_be_bytes(kind) != KIND_MESSAGE {
+                    return Some(None);
+                }
+                Some(Some(recv.read_to_end(MAX_MESSAGE_LEN).await))
+            };
+            let Ok(Some(said)) = tokio::time::timeout(READ_TIMEOUT, said).await else {
+                return;
+            };
+            let Some(read) = said else {
+                // A kind from a later version: only this stream ends.
+                let _ = recv.stop(UNKNOWN_KIND.into());
+                let _ = send.reset(UNKNOWN_KIND.into());
                 return;
             };
             let result = match read.map(|bytes| decode_message(&bytes)) {
@@ -140,6 +159,7 @@ where
 /// Sends one message on `connection` and reads its result.
 async fn exchange(connection: &Connection, envelope: &Envelope) -> anyhow::Result<MessageResult> {
     let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&KIND_MESSAGE.to_be_bytes()).await?;
     send.write_all(&encode_message(envelope)).await?;
     send.finish()?;
     decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)
@@ -356,23 +376,42 @@ mod tests {
             let first = connections.recv().await.unwrap();
             assert!(connections.try_recv().is_err(), "one connection for both");
 
-            let (mut send, mut recv) = transport.held(to).unwrap().open_bi().await?;
-            send.write_all(b"not a message").await?;
-            send.finish()?;
+            // The bytes themselves: the kind, most significant byte first,
+            // then the map to the end of the stream.
+            let connection = transport.held(to).unwrap();
+            let said = async |bytes: Vec<u8>| {
+                let (mut send, mut recv) = connection.open_bi().await?;
+                send.write_all(&bytes).await?;
+                send.finish()?;
+                anyhow::Ok(recv.read_to_end(MAX_RESULT_LEN).await)
+            };
+            let message = |payload: &[u8]| [&[0, 1][..], payload].concat();
             assert_eq!(
-                decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)?,
+                decode_result(&said(message(&encode_message(&envelope("raw")))).await??)?,
+                MessageResult::Delivered
+            );
+            assert_eq!(received.recv().await.unwrap().1, envelope("raw"));
+            assert_eq!(
+                decode_result(&said(message(b"not a message")).await??)?,
                 MessageResult::Refused
             );
-            assert!(received.try_recv().is_err());
-
-            let (mut send, mut recv) = transport.held(to).unwrap().open_bi().await?;
-            send.write_all(&vec![b'x'; MAX_MESSAGE_LEN + 1]).await?;
-            send.finish()?;
             assert_eq!(
-                decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)?,
+                decode_result(&said(message(&vec![b'x'; MAX_MESSAGE_LEN + 1])).await??)?,
                 MessageResult::Refused,
                 "too long to be a message"
             );
+            // A kind this version does not know ends its stream, with the
+            // code that says so, and nothing else.
+            for kind in [[0, 0], [0, 2], [1, 0], [0x80, 1]] {
+                let later = [&kind[..], &encode_message(&envelope("later"))].concat();
+                let Err(iroh::endpoint::ReadToEndError::Read(iroh::endpoint::ReadError::Reset(
+                    code,
+                ))) = said(later).await?
+                else {
+                    panic!("a stream of kind {kind:?} was not reset");
+                };
+                assert_eq!(code, UNKNOWN_KIND.into());
+            }
             assert!(received.try_recv().is_err());
 
             // The other side closed the connection: the next message takes a
