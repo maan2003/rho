@@ -73,10 +73,10 @@ rho_rpc::calls! {
         DebugReport(DebugReport) -> camino::Utf8PathBuf;
         /// Refused, with the reason, while the host is in use.
         ShutdownIfIdle(ShutdownIfIdle) -> ();
-        /// Answered with every C2C address an agent of the host has
+        /// Answered with every GCCP address an agent of the host has
         /// accepted.
-        C2cContacts(C2cContacts) -> Vec<C2cContact>;
-        C2cRemove(C2cRemove) -> ();
+        GccpContacts(GccpContacts) -> Vec<GccpContact>;
+        GccpRemove(GccpRemove) -> ();
     }
 }
 
@@ -142,14 +142,14 @@ pub struct IrohRevoke {
     pub endpoint_id: String,
 }
 
-/// Lists what the host's agents have accepted over C2C: who on other
+/// Lists what the host's agents have accepted over GCCP: who on other
 /// harnesses may message which agent.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct C2cContacts;
+pub struct GccpContacts;
 
-/// One accepted C2C address.
+/// One accepted GCCP address.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct C2cContact {
+pub struct GccpContact {
     /// The agent that accepted it, by its id.
     pub agent: String,
     /// `<endpoint id>/<local id>`.
@@ -160,10 +160,10 @@ pub struct C2cContact {
     pub unsent: u64,
 }
 
-/// Takes back an agent's acceptance of a C2C address: nothing more crosses
+/// Takes back an agent's acceptance of a GCCP address: nothing more crosses
 /// between the two, and what waited to be sent is dropped.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct C2cRemove {
+pub struct GccpRemove {
     pub agent: String,
     pub address: String,
 }

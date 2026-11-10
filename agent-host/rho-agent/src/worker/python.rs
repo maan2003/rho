@@ -682,7 +682,7 @@ fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
     }
 }
 
-/// The agent's own C2C address.
+/// The agent's own GCCP address.
 #[pyfunction]
 fn peer_address(py: Python<'_>, agent: &str) -> PyResult<String> {
     match PyHost::block(py, PyRequest::PeerAddress(agent_id(agent)?))? {
@@ -691,7 +691,7 @@ fn peer_address(py: Python<'_>, agent: &str) -> PyResult<String> {
     }
 }
 
-/// The agent accepts a C2C address under a name; returns their conversation.
+/// The agent accepts a GCCP address under a name; returns their conversation.
 #[pyfunction]
 fn peer_accept(py: Python<'_>, agent: &str, address: String, name: String) -> PyResult<u64> {
     let request = PyRequest::PeerAccept {

@@ -5,13 +5,13 @@
 //! map, and the answers to each workset's `_rho` calls. The store is the truth
 //! about worksets, agents and chat; the pool holds only what runs.
 
-mod c2c;
+mod gccp;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use c2c::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
+pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -59,7 +59,7 @@ pub struct AgentPool {
     claude: rho_claude::accounts::ClaudePaths,
     /// The host's `init.py`, run by each workset process at its start.
     init: Option<camino::Utf8PathBuf>,
-    /// The host's iroh endpoint id, once it has one: where C2C reaches its
+    /// The host's iroh endpoint id, once it has one: where GCCP reaches its
     /// agents.
     endpoint: std::sync::OnceLock<[u8; 32]>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,

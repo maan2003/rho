@@ -1,8 +1,8 @@
-//! C2C on the wire ([docs/c2c.md](../../../docs/c2c.md)): a stream says
+//! GCCP on the wire ([docs/gccp.md](../../../docs/gccp.md)): a stream says
 //! its kind first, and a message stream then carries one CBOR map and
 //! brings back its result. What the host does
 //! with a message is the pool's
-//! ([`rho_agent::host::pool::AgentPool::c2c_receive`]); this module only
+//! ([`rho_agent::host::pool::AgentPool::gccp_receive`]); this module only
 //! carries.
 
 use std::collections::HashMap;
@@ -14,9 +14,9 @@ use futures::future::BoxFuture;
 use iroh::endpoint::Connection;
 use rho_agent::host::pool::{AgentPool, Envelope, MAX_BODY_LEN, MessageResult, Transport};
 
-/// The ALPN C2C is spoken on. A change old peers cannot read takes a new
+/// The ALPN GCCP is spoken on. A change old peers cannot read takes a new
 /// number.
-pub const ALPN: &[u8] = b"c2c/1";
+pub const ALPN: &[u8] = b"gccp/1";
 /// The kind of a stream that carries one message and its result. A stream
 /// opens with its kind, so that later kinds, a byte tunnel for one, share
 /// the connection; how a stream's payload ends is its kind's business.
@@ -68,8 +68,8 @@ fn encode_message(envelope: &Envelope) -> Vec<u8> {
 
 fn decode_message(bytes: &[u8]) -> anyhow::Result<Envelope> {
     let WireMessage { to, from, id, body } =
-        ciborium::from_reader(bytes).context("not a C2C message")?;
-    anyhow::ensure!(body.len() <= MAX_BODY_LEN, "a C2C body is too long");
+        ciborium::from_reader(bytes).context("not a GCCP message")?;
+    anyhow::ensure!(body.len() <= MAX_BODY_LEN, "a GCCP body is too long");
     Ok(Envelope {
         to: to.parse().map_err(anyhow::Error::msg)?,
         from: from.parse().map_err(anyhow::Error::msg)?,
@@ -89,7 +89,7 @@ fn encode_result(result: MessageResult) -> Vec<u8> {
 }
 
 fn decode_result(bytes: &[u8]) -> anyhow::Result<MessageResult> {
-    let WireResult { result } = ciborium::from_reader(bytes).context("not a C2C result")?;
+    let WireResult { result } = ciborium::from_reader(bytes).context("not a GCCP result")?;
     match result.as_str() {
         "delivered" => Ok(MessageResult::Delivered),
         "refused" => Ok(MessageResult::Refused),
@@ -103,7 +103,7 @@ fn decode_result(bytes: &[u8]) -> anyhow::Result<MessageResult> {
 pub async fn serve(pool: Arc<AgentPool>, connection: Connection) {
     serve_messages(connection, move |endpoint, envelope| {
         let pool = pool.clone();
-        async move { pool.c2c_receive(endpoint, envelope).await }
+        async move { pool.gccp_receive(endpoint, envelope).await }
     })
     .await
 }
@@ -248,7 +248,7 @@ mod tests {
         ))
     }
 
-    /// The map is the one docs/c2c.md gives, whatever the Rust types are
+    /// The map is the one docs/gccp.md gives, whatever the Rust types are
     /// called.
     #[test]
     fn a_message_is_the_map_the_protocol_names() {

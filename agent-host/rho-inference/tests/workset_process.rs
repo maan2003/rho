@@ -443,13 +443,13 @@ async fn streaming_crash() {
 }
 
 #[test]
-fn c2c_carries_messages_between_two_hosts_only_once_both_accepted() {
+fn gccp_carries_messages_between_two_hosts_only_once_both_accepted() {
     with_synthetic_login(
-        "c2c_carries_messages_between_two_hosts_only_once_both_accepted",
+        "gccp_carries_messages_between_two_hosts_only_once_both_accepted",
         // An agent that has just answered is told of other agents' messages
         // 15 seconds later.
         Duration::from_secs(90),
-        c2c_two_hosts(),
+        gccp_two_hosts(),
     );
 }
 
@@ -588,12 +588,12 @@ impl rho_agent::host::pool::Transport for Wires {
             self.sent.lock().unwrap().push(envelope.clone());
             let host = self.hosts.lock().unwrap().get(&endpoint).cloned();
             let host = host.ok_or_else(|| anyhow::anyhow!("no route"))?;
-            Ok(host.c2c_receive(self.own, envelope.clone()).await)
+            Ok(host.gccp_receive(self.own, envelope.clone()).await)
         })
     }
 }
 
-async fn c2c_two_hosts() {
+async fn gccp_two_hosts() {
     use rho_agent::host::pool::MessageResult;
     const HERE: [u8; 32] = [0xa1; 32];
     const THERE: [u8; 32] = [0xb2; 32];
@@ -618,7 +618,7 @@ async fn c2c_two_hosts() {
         let pool = pool.clone();
         // The waits of a real host are minutes.
         const WAITS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(400)];
-        tokio::spawn(async move { pool.c2c_send(wires, &WAITS).await })
+        tokio::spawn(async move { pool.gccp_send(wires, &WAITS).await })
     });
 
     // Each agent has ended a turn, so it waits inside an open call.
@@ -758,11 +758,11 @@ async fn c2c_two_hosts() {
         .unwrap()
         .clone();
     assert_eq!(
-        here.c2c_receive(THERE, pong.clone()).await,
+        here.gccp_receive(THERE, pong.clone()).await,
         MessageResult::Delivered
     );
     assert_eq!(
-        here.c2c_receive([0xc3; 32], pong).await,
+        here.gccp_receive([0xc3; 32], pong).await,
         MessageResult::Refused
     );
 

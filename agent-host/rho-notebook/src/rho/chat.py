@@ -40,12 +40,12 @@ def direct(a: str, b: str) -> int:
 
 
 def address(agent: str) -> str:
-    """The C2C address other hosts reach `agent` at."""
+    """The GCCP address other hosts reach `agent` at."""
     return _rho.peer_address(agent)
 
 
 def accept(agent: str, address: str, name: str) -> int:
-    """`agent` accepts the C2C `address` under `name`; returns their peer
+    """`agent` accepts the GCCP `address` under `name`; returns their peer
     conversation. The host then carries messages between the two."""
     return _rho.peer_accept(agent, address, name)
 

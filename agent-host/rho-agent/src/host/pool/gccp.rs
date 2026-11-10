@@ -1,4 +1,4 @@
-//! C2C ([docs/c2c.md](../../../../../docs/c2c.md)) as this host speaks it:
+//! GCCP ([docs/gccp.md](../../../../../docs/gccp.md)) as this host speaks it:
 //! what its agents accept, what it takes in for them, and what it sends
 //! out for them.
 //!
@@ -25,7 +25,7 @@ use crate::store::{
     Appended, ChatRead as _, ChatWrite as _, PeerContact, PeerOutgoing, StoreRead as _,
 };
 
-/// One message as C2C carries it. The harness it is from is not in it: the
+/// One message as GCCP carries it. The harness it is from is not in it: the
 /// transport proves that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
@@ -37,7 +37,7 @@ pub struct Envelope {
 }
 
 /// What a harness says of a message it was sent: its result, as
-/// docs/c2c.md has it. It is not a reply from the recipient.
+/// docs/gccp.md has it. It is not a reply from the recipient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageResult {
     /// Stored for its recipient.
@@ -59,7 +59,7 @@ pub trait Transport: Send + Sync + 'static {
     ) -> BoxFuture<'a, anyhow::Result<MessageResult>>;
 }
 
-/// The longest body C2C carries, in bytes of UTF-8.
+/// The longest body GCCP carries, in bytes of UTF-8.
 pub const MAX_BODY_LEN: usize = 64 * 1024;
 /// The waits before the second and the third try at a message whose
 /// harness could not be reached. After the last the message is given up on:
@@ -82,7 +82,7 @@ fn local_id(agent: AgentId) -> LocalId {
 
 impl AgentPool {
     /// Names the host's iroh endpoint: the half of every agent's address
-    /// that says where it is. A host without one speaks no C2C.
+    /// that says where it is. A host without one speaks no GCCP.
     pub fn set_endpoint(&self, endpoint: [u8; 32]) {
         self.endpoint
             .set(endpoint)
@@ -131,7 +131,7 @@ impl AgentPool {
             .with_context(|| format!("{peer} is not accepted: accept it under a name first"))
     }
 
-    /// Fails if `content`, posted in `topic`, is more than C2C carries to a
+    /// Fails if `content`, posted in `topic`, is more than GCCP carries to a
     /// peer: such a message would wait forever.
     pub(super) fn check_peer_body(
         &self,
@@ -172,7 +172,7 @@ impl AgentPool {
     /// A message the harness at `endpoint` sent. It is delivered only to an
     /// agent that accepted the sender's address; anything else is refused
     /// and leaves no trace.
-    pub async fn c2c_receive(
+    pub async fn gccp_receive(
         self: &Arc<Self>,
         endpoint: [u8; 32],
         envelope: Envelope,
@@ -216,7 +216,7 @@ impl AgentPool {
     /// and then given up on. Giving up drops the message and all that wait
     /// behind it, which were written on top of it, and tells the agent: it
     /// sends again if and when it wants to.
-    pub async fn c2c_send(
+    pub async fn gccp_send(
         self: &Arc<Self>,
         transport: Arc<dyn Transport>,
         retry_waits: &'static [Duration],

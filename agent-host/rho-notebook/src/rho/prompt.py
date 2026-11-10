@@ -105,7 +105,7 @@ Answer it with `agents.message(agent_id="<agent id>", message=text)`. An agent's
 
 
 def other_hosts(principal: str) -> str:
-    """How an agent talks to agents on other hosts, over C2C. `principal`
+    """How an agent talks to agents on other hosts, over GCCP. `principal`
     is whose word it acts on: the user, or its parent."""
     return f"""An agent on another host works for someone else, and has an address: `<endpoint id>/<local id>`. `agents.address()` gives yours. You and it can talk only after each has accepted the other's address:
 ```python

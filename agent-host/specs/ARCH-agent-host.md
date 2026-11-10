@@ -82,9 +82,9 @@ user's. The GUI neither lists direct conversations nor makes cards for them:
 each agent's own transcript shows what it sent and received.
 
 An agent talks to an agent on another harness in a peer conversation, over
-C2C ([docs/c2c.md](../../docs/c2c.md)). An agent's address is the host's iroh
+GCCP ([docs/gccp.md](../../docs/gccp.md)). An agent's address is the host's iroh
 endpoint id and the agent's id, so only a host that listens over iroh speaks
-C2C. Accepting an address under a name (`agents.accept`) makes the
+GCCP. Accepting an address under a name (`agents.accept`) makes the
 conversation, which is like a direct one with a single member: the agent. The
 other side is the address. What the agent posts there is what the host sends,
 in order, and a cursor beside the log says how far the peer's harness has
@@ -92,7 +92,7 @@ taken it. What that harness sends is posted there as from the peer and
 delivered like any message, as input with no authority. The host takes a
 message only for an agent that accepted the sender's address; it refuses
 everything else and logs nothing. Nothing asks the user: they see what agents
-accepted, and take an acceptance back, with `rho c2c`. A conversation taken
+accepted, and take an acceptance back, with `rho gccp`. A conversation taken
 back keeps its messages and carries no more.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.

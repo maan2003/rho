@@ -22,9 +22,9 @@ use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
-mod c2c;
 pub mod debug;
 mod desktop;
+mod gccp;
 mod host;
 mod realtime;
 mod secret_store;
@@ -488,7 +488,7 @@ pub struct HostArgs {
     /// Also listen for remote UI clients over iroh (relay-backed).
     /// Remote clients must be enrolled once via
     /// `rho iroh approve <code>` on this machine. The same endpoint gives
-    /// agents their C2C addresses, where agents of other hosts reach them.
+    /// agents their GCCP addresses, where agents of other hosts reach them.
     #[arg(long = "iroh")]
     pub iroh: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
@@ -696,7 +696,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         let (listener, auth) = rho_rpc::AuthenticatedIrohListener::bind(
             db.clone(),
             rho_rpc::protocol::IROH_ALPN,
-            vec![c2c::ALPN.to_vec()],
+            vec![gccp::ALPN.to_vec()],
         )
         .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
@@ -804,7 +804,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                     match rho_rpc::AuthenticatedIrohListener::bind(
                         services.db.clone(),
                         rho_rpc::protocol::IROH_ALPN,
-                        vec![c2c::ALPN.to_vec()],
+                        vec![gccp::ALPN.to_vec()],
                     )
                     .await
                     {
@@ -932,34 +932,34 @@ async fn run_iroh_listener(
 ) {
     // What agents send other harnesses leaves by this endpoint, so they see
     // this host's id.
-    let c2c_sender = tokio::spawn({
+    let gccp_sender = tokio::spawn({
         let pool = services.pool.clone();
-        let transport = Arc::new(c2c::IrohTransport::new(listener.endpoint().clone()));
+        let transport = Arc::new(gccp::IrohTransport::new(listener.endpoint().clone()));
         async move {
-            pool.c2c_send(transport, &rho_agent::host::pool::RETRY_WAITS)
+            pool.gccp_send(transport, &rho_agent::host::pool::RETRY_WAITS)
                 .await
         }
     });
-    let c2c_connections = Arc::new(tokio::sync::Semaphore::new(c2c::MAX_CONNECTIONS));
+    let gccp_connections = Arc::new(tokio::sync::Semaphore::new(gccp::MAX_CONNECTIONS));
     while let Some(accepted) = tokio::select! {
         accepted = listener.accept() => accepted,
         _ = &mut shutdown => None,
     } {
         let connection = match accepted {
             Ok(rho_rpc::Accepted::Approved(connection)) => connection,
-            // Another harness, which nobody approved: it speaks C2C and
+            // Another harness, which nobody approved: it speaks GCCP and
             // nothing else.
             Ok(rho_rpc::Accepted::Open(connection)) => {
-                if connection.alpn() == c2c::ALPN {
-                    match c2c_connections.clone().try_acquire_owned() {
+                if connection.alpn() == gccp::ALPN {
+                    match gccp_connections.clone().try_acquire_owned() {
                         Ok(held) => {
                             let pool = services.pool.clone();
                             tokio::spawn(async move {
-                                c2c::serve(pool, connection).await;
+                                gccp::serve(pool, connection).await;
                                 drop(held);
                             });
                         }
-                        Err(_) => connection.close(0u32.into(), b"too many C2C connections"),
+                        Err(_) => connection.close(0u32.into(), b"too many GCCP connections"),
                     }
                 }
                 continue;
@@ -1029,7 +1029,7 @@ async fn run_iroh_listener(
             uni_task.abort();
         });
     }
-    c2c_sender.abort();
+    gccp_sender.abort();
     listener.close().await;
 }
 

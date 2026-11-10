@@ -41,7 +41,7 @@ class MessageRecord(TypedDict):
     text: str
 
 class Peer(TypedDict):
-    address: str  # the C2C address the agent accepted
+    address: str  # the GCCP address the agent accepted
     name: str  # what the agent named it
     open: bool  # False once the acceptance was taken back
 
@@ -123,7 +123,7 @@ def new_cache_key(agent: str) -> None:
 # joined it; neither posting nor a mention joins. A direct conversation's
 # members are its two agents, and only they post in it. A peer conversation
 # is an agent's with an address on another host that it accepted: only the
-# two post in it, and the host carries their messages over C2C. Messages from the
+# two post in it, and the host carries their messages over GCCP. Messages from the
 # user come only from the GUI, so Python cannot forge them. The user and
 # agents may rename, move and resolve a topic, and move messages between
 # topics.
@@ -155,8 +155,8 @@ def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
 def peer_address(agent: str) -> str:
-    """The C2C address of `agent`, an agent of this workset:
-    `<endpoint id>/<local id>` (docs/c2c.md). Raises when the host has no
+    """The GCCP address of `agent`, an agent of this workset:
+    `<endpoint id>/<local id>` (docs/gccp.md). Raises when the host has no
     iroh endpoint."""
 def peer_accept(agent: str, address: str, name: str) -> int:
     """`agent` accepts `address` under `name`: returns their peer

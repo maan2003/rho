@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
-    C2cContact, C2cContacts, C2cRemove, DebugReport, ForgetSavepoints, GitProvided,
+    DebugReport, ForgetSavepoints, GccpContact, GccpContacts, GccpRemove, GitProvided,
     GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohPair, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, ShutdownIfIdle, Snapshot,
 };
@@ -267,13 +267,13 @@ where
             })
             .await
         }
-        Request::C2cContacts(call) => {
-            respond(writer, call, |C2cContacts| async move {
+        Request::GccpContacts(call) => {
+            respond(writer, call, |GccpContacts| async move {
                 Ok(services
                     .pool
                     .peers()
                     .into_iter()
-                    .map(|contact| C2cContact {
+                    .map(|contact| GccpContact {
                         agent: contact.agent.encoded(),
                         address: contact.peer.to_string(),
                         name: contact.name,
@@ -283,13 +283,13 @@ where
             })
             .await
         }
-        Request::C2cRemove(call) => {
-            respond(writer, call, |C2cRemove { agent, address }| async move {
+        Request::GccpRemove(call) => {
+            respond(writer, call, |GccpRemove { agent, address }| async move {
                 let agent = rho_agent_types::AgentId::from_encoded(&agent)
                     .map_err(|_| anyhow::anyhow!("invalid agent id {agent:?}"))?;
                 let address = address
                     .parse::<rho_agent_types::PeerAddress>()
-                    .map_err(|error| anyhow::anyhow!("invalid C2C address: {error}"))?;
+                    .map_err(|error| anyhow::anyhow!("invalid GCCP address: {error}"))?;
                 services.pool.remove_peer(agent, &address).await
             })
             .await

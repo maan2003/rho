@@ -69,8 +69,8 @@ pub enum Address {
     Peer,
 }
 
-/// The name of a recipient inside a harness, as C2C carries it
-/// ([docs/c2c.md](../../../docs/c2c.md)): 1 to 64 bytes of `a-z`, `0-9`,
+/// The name of a recipient inside a harness, as GCCP carries it
+/// ([docs/gccp.md](../../../docs/gccp.md)): 1 to 64 bytes of `a-z`, `0-9`,
 /// `.`, `_` and `-`. Only the harness that owns it gives it meaning.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
 pub struct LocalId(String);
@@ -106,7 +106,7 @@ impl std::fmt::Display for LocalId {
     }
 }
 
-/// A C2C address: a recipient on a harness, here or elsewhere. As text it is
+/// A GCCP address: a recipient on a harness, here or elsewhere. As text it is
 /// `<endpoint id>/<local id>`, the endpoint id in lowercase hex.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
 pub struct PeerAddress {
@@ -191,7 +191,7 @@ pub enum ChatEvent {
     DirectStarted {
         members: [AgentId; 2],
     },
-    /// An agent accepts a C2C address under a name it trusts: a
+    /// An agent accepts a GCCP address under a name it trusts: a
     /// conversation of that agent and the peer, and no one else. From here
     /// on the host delivers what the peer sends the agent, and sends the
     /// peer what the agent posts.

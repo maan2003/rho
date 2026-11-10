@@ -130,9 +130,9 @@ pub(crate) enum PyRequest {
     Models,
     /// The one agent of the host whose id starts with this.
     ResolveAgent(String),
-    /// The agent's own C2C address (`Text`).
+    /// The agent's own GCCP address (`Text`).
     PeerAddress(rho_agent_types::AgentId),
-    /// The agent accepts a C2C address under a name; answered with their
+    /// The agent accepts a GCCP address under a name; answered with their
     /// conversation.
     PeerAccept {
         agent: rho_agent_types::AgentId,
