@@ -506,6 +506,6 @@ pub mod chat;
 pub mod gccp;
 
 pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
-pub use gccp::{GccpContact, GccpRead, GccpWrite};
+pub use gccp::{GccpContact, GccpRead, GccpService, GccpWrite};
 #[cfg(test)]
 mod tests;

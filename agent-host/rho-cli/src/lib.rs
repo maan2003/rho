@@ -167,9 +167,13 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
                         agent,
                         address,
                         name,
+                        services,
                     } = contact;
                     if address.starts_with(&endpoint) {
                         println!("  {agent} accepted {address}\t{name:?}");
+                        for host::GccpService { name, path } in services {
+                            println!("    and opened to it the service {name}: {path}");
+                        }
                     }
                 }
             }
@@ -383,10 +387,11 @@ pub(crate) struct GccpArgs {
 #[derive(Clone, Subcommand)]
 pub(crate) enum GccpCommand {
     /// Show this host's endpoint id, the hosts you approved with
-    /// `rho iroh approve --role gccp`, and the addresses on them that
-    /// agents accepted.
+    /// `rho iroh approve --role gccp`, the addresses on them that agents
+    /// accepted, and the services agents opened to those.
     List,
-    /// Take back one agent's acceptance of an address.
+    /// Take back one agent's acceptance of an address, and the services it
+    /// opened to it. Open byte streams between the two end.
     Remove {
         /// The agent's id, as `rho gccp list` prints it.
         agent: String,

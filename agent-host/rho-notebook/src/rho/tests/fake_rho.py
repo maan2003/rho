@@ -5,6 +5,7 @@ import asyncio
 import copy
 import itertools
 import os
+import re
 import threading
 
 
@@ -25,6 +26,9 @@ class State:
         self.contacts = {}  # (agent, address) -> name
         self.sent = []  # (agent, address, text) that the address's host took
         self.refusing = set()  # addresses whose host refuses
+        self.root = "/workset"  # where the workset's files are
+        self.services = {}  # (agent, address, service) -> socket path the agent opened
+        self.forwards = {}  # socket path -> (agent, address, service) it leads to
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
@@ -209,10 +213,46 @@ async def external_send(agent, address, text):
 def external_contacts(agent):
     with STATE.lock:
         return [
-            {"address": address, "name": name}
+            {
+                "address": address,
+                "name": name,
+                "services": {
+                    service: path for (a, to, service), path in STATE.services.items() if (a, to) == (holder, address)
+                },
+            }
             for (holder, address), name in STATE.contacts.items()
             if holder == agent
         ]
+
+
+def _service(agent, address, service):
+    assert agent in STATE.agents
+    _endpoint(address)
+    if (agent, address) not in STATE.contacts:
+        raise RuntimeError(f"{address} is not an address you accepted")
+    if not re.fullmatch(r"[a-z0-9._-]{1,64}", service):
+        raise RuntimeError(f"a service name is 1 to 64 of a-z, 0-9, '.', '_' and '-', not {service!r}")
+
+
+def external_expose(agent, address, service, path):
+    with STATE.lock:
+        _service(agent, address, service)
+        if not path.startswith(STATE.root + "/"):
+            raise ValueError(f"{path} is not in the workset ({STATE.root})")
+        STATE.services[agent, address, service] = path
+
+
+def external_unexpose(agent, address, service):
+    with STATE.lock:
+        _service(agent, address, service)
+        if STATE.services.pop((agent, address, service), None) is None:
+            raise RuntimeError(f"no service {service} is open to {address}")
+
+
+def external_connect(agent, address, service, path):
+    with STATE.lock:
+        _service(agent, address, service)
+        STATE.forwards[path] = (agent, address, service)
 
 
 def direct(sender, other):

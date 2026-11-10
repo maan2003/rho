@@ -9,6 +9,7 @@ mod runtime;
 pub(crate) mod shared;
 pub mod shell;
 mod ste;
+pub(crate) mod streams;
 pub mod terminal;
 mod workset;
 

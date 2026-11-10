@@ -170,6 +170,7 @@ impl Process {
         let port = match &attach {
             workset::Attach::Terminal { .. } => transport::Port::Terminal(id),
             workset::Attach::Shell { .. } => transport::Port::Shell(id),
+            workset::Attach::Stream(_) => transport::Port::Stream(id),
         };
         let (send, incoming) = mpsc::channel(32);
         self.clients.lock().expect("poison").insert(port, send);
@@ -543,7 +544,7 @@ impl Process {
                                         _ => anyhow::bail!("unexpected workset reply"),
                                     }
                                 }
-                                port @ (transport::Port::Terminal(_) | transport::Port::Shell(_)) => {
+                                port @ (transport::Port::Terminal(_) | transport::Port::Shell(_) | transport::Port::Stream(_)) => {
                                     let mut clients = client_routes.lock().expect("poison");
                                     if packet.bytes.is_empty() {
                                         clients.remove(&port);

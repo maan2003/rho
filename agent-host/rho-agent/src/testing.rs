@@ -232,6 +232,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                 runtime: RUNTIME.handle().clone(),
                 workset: rho_agent_types::WorksetId([0; 6]),
                 isolated: false,
+                streams: std::sync::Arc::new(crate::worker::streams::Streams::new("/")),
             },
             Some(camino::Utf8PathBuf::from_path_buf(init).unwrap()),
         )

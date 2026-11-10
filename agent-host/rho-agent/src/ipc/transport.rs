@@ -18,6 +18,8 @@ pub(crate) enum Port {
     Agent(rho_agent_types::AgentId),
     Terminal(u64),
     Shell(u64),
+    /// One byte stream ([`crate::ipc::stream`]).
+    Stream(u64),
 }
 
 #[derive(Clone, Debug, Encode, Decode)]

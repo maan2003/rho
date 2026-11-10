@@ -6,13 +6,14 @@ use anyhow::Context as _;
 use tokio::sync::mpsc;
 
 use crate::ipc::transport::{Port, Sender};
-use crate::ipc::workset::{Action, Attach, Message, Reply, decode, encode};
+use crate::ipc::workset::{Action, Attach, Message, Reply, StreamEnd, decode, encode};
 
 /// Root-owned retained execution, independent of loaded agent handles.
 pub(crate) struct Execution {
     pub terminals: Arc<crate::worker::terminal::TerminalRegistry>,
     pub shells: Arc<crate::worker::shell::ShellRegistry>,
     pub clients: Arc<Mutex<HashMap<Port, mpsc::Sender<bytes::Bytes>>>>,
+    pub streams: Arc<crate::worker::streams::Streams>,
 }
 impl Execution {
     pub async fn action(&self, action: Action) -> anyhow::Result<Reply> {
@@ -214,6 +215,26 @@ impl Execution {
                     )
                     .await?;
                 serve_shell(client, incoming, sender, port).await
+            }
+            Attach::Stream(end) => {
+                let Port::Stream(id) = port else {
+                    unreachable!()
+                };
+                let socket = match end {
+                    StreamEnd::Service { path } => self.streams.service(&path).await?,
+                    StreamEnd::Accepted(conn) => self.streams.take(conn)?,
+                };
+                let body = Reply::Done;
+                sender
+                    .send(Port::Workset, encode(&Message::Reply { id, body })?)
+                    .await?;
+                let (reader, writer) = socket.into_split();
+                // A stream that broke ends like one that ended: the socket
+                // closes, which is what its other end would have seen of a
+                // connection that broke.
+                let _ =
+                    crate::ipc::stream::pipe(port, &sender, &mut incoming, reader, writer).await;
+                Ok(())
             }
         }
     }

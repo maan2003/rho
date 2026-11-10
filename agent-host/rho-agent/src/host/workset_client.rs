@@ -1,4 +1,5 @@
-//! Host-side GUI attachment relays; execution stays in the worker.
+//! Host-side relays of GUI attachments and byte streams; execution stays in
+//! the worker.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::ipc::transport::{Port, Sender};
 use crate::ipc::workset::{Message, Reply, decode, encode};
 
-/// One GUI attachment. It owns no PTY, shell, or transport connection.
+/// One attachment: a GUI's, or a byte stream's. It owns no PTY, shell,
+/// socket, or transport connection.
 pub struct Client {
     pub(crate) port: Port,
     pub(crate) sender: Sender,
@@ -41,6 +43,16 @@ impl Client {
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! { result = input => result, result = output => result }
+    }
+
+    /// Carry one byte stream between its end here and the end the workset
+    /// process holds ([`crate::ipc::stream`]).
+    pub(crate) async fn pipe<R, W>(mut self, reader: R, writer: W) -> anyhow::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        crate::ipc::stream::pipe(self.port, &self.sender, &mut self.incoming, reader, writer).await
     }
 }
 impl Drop for Client {

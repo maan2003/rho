@@ -176,6 +176,17 @@ pub struct GccpContact {
     pub address: String,
     /// What the agent named it.
     pub name: String,
+    /// The services the agent opened to it.
+    pub services: Vec<GccpService>,
+}
+
+/// A service an agent opened to an accepted address: a byte stream that
+/// address opens to it reaches the Unix socket at its path.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpService {
+    pub name: String,
+    /// The socket, as the agent's workset sees it.
+    pub path: String,
 }
 
 /// Approves the harness at an endpoint as a GCCP host, under a name: the
@@ -189,8 +200,9 @@ pub struct GccpApprove {
     pub name: String,
 }
 
-/// Takes back an agent's acceptance of a GCCP address: nothing more crosses
-/// between the two.
+/// Takes back an agent's acceptance of a GCCP address, and the services it
+/// opened to it: nothing more crosses between the two, and the byte streams
+/// that are open between them end.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GccpRemove {
     pub agent: String,

@@ -1,6 +1,6 @@
 //! The names GCCP gives things ([docs/gccp.md](../../../docs/gccp.md)): the
-//! endpoint a harness is reached at, a recipient inside it, and the address
-//! the two make.
+//! endpoint a harness is reached at, a recipient inside it, the address the
+//! two make, and a service a recipient runs.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -75,6 +75,38 @@ impl std::str::FromStr for LocalId {
 }
 
 impl std::fmt::Display for LocalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The name of a service that the recipient at an address runs, in the form
+/// of a [`LocalId`]. Only the harness of that recipient gives it meaning: it
+/// names no port and no file.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
+pub struct ServiceName(String);
+
+impl ServiceName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ServiceName {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.parse::<LocalId>() {
+            Ok(LocalId(name)) => Ok(Self(name)),
+            Err(_) => Err(format!(
+                "a service name is 1 to {} of a-z, 0-9, '.', '_' and '-', not {text:?}",
+                LocalId::MAX_LEN
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }

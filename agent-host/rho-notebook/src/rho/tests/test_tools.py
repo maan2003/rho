@@ -314,6 +314,62 @@ class Tools(WorksetCase):
         with self.assertRaisesRegex(ValueError, "no iroh endpoint"):
             external.address()
 
+    def test_a_unix_socket_is_opened_to_one_accepted_address_and_reached_through_another(self):
+        ns, _ = self.notebook(self.root)
+        external = ns["agents"].external
+        mine = "ab" * 32 + "/" + self.root
+        theirs, other = "cd" * 32 + "/their-agent", "cd" * 32 + "/another"
+        sock = self.state.root + "/run/web.sock"
+
+        # Only to an address the agent accepted, by a name, at an absolute
+        # path in the workset.
+        with self.assertRaisesRegex(ValueError, "is not an address you accepted"):
+            external.expose(address=theirs, service="web", path=sock)
+        with self.assertRaisesRegex(ValueError, "is not an address you accepted"):
+            external.connect(address=theirs, service="web", path="/tmp/there.sock")
+        self.state.hosts.add("cd" * 32)
+        run(lambda: external.accept(address=theirs, name="dpc's agent"))
+        for service, path, error in [
+            ("web", "run/web.sock", "path must be an absolute path"),
+            ("web", "/run/docker.sock", "is not in the workset"),
+            ("8080/tcp", sock, "a service name is"),
+        ]:
+            with self.assertRaisesRegex(ValueError, error):
+                external.expose(address=theirs, service=service, path=path)
+        self.assertEqual((self.state.services, self.state.forwards), ({}, {}))
+
+        printed, _ = run(lambda: external.expose(address=f" {theirs} ", service="web", path=sock))
+        self.assertEqual(
+            printed,
+            f"dpc's agent can connect to web: each connection reaches the Unix socket {sock}. "
+            f"It connects to the service web at your address, {mine}.\n",
+        )
+        self.assertEqual(self.state.services, {(self.root, theirs, "web"): sock})
+        self.assertEqual(
+            run(external.contacts)[0],
+            f"dpc's agent: {theirs}\n  can connect to web: {sock}\n",
+        )
+
+        # The other way: a socket here that leads to a service there.
+        with self.assertRaisesRegex(ValueError, "path must be an absolute path"):
+            external.connect(address=theirs, service="api", path="there.sock")
+        with self.assertRaisesRegex(ValueError, "is not an address you accepted"):
+            external.connect(address=other, service="api", path="/tmp/there.sock")
+        printed, _ = run(lambda: external.connect(address=theirs, service="api", path="/tmp/there.sock"))
+        self.assertEqual(
+            printed,
+            "Listening at /tmp/there.sock: each connection to that Unix socket is a connection to api of dpc's agent.\n",
+        )
+        self.assertEqual(self.state.forwards, {"/tmp/there.sock": (self.root, theirs, "api")})
+
+        # Taken back by its name; what was never open is not closed.
+        with self.assertRaisesRegex(ValueError, "no service api is open to"):
+            external.unexpose(address=theirs, service="api")
+        printed, _ = run(lambda: external.unexpose(address=theirs, service="web"))
+        self.assertEqual(printed, "dpc's agent can no longer connect to web.\n")
+        self.assertEqual(self.state.services, {})
+        self.assertEqual(run(external.contacts)[0], f"dpc's agent: {theirs}\n")
+
     def test_leave_and_read_by_any_id(self):
         ns, _ = self.notebook(self.root)
         chat = ns["chat"]

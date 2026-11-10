@@ -134,10 +134,12 @@ pub(crate) async fn run(
             >,
         >,
     > = Arc::default();
+    let streams = Arc::new(super::streams::Streams::new(&startup.root));
     let execution = Arc::new(super::workset::Execution {
         terminals: Arc::default(),
         shells: Arc::default(),
         clients: Arc::default(),
+        streams: streams.clone(),
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let policy_sender: crate::inference::PolicySender = Arc::new({
@@ -165,6 +167,7 @@ pub(crate) async fn run(
             tokio::runtime::Handle::current(),
             startup.workset,
             startup.layout.mount.is_some(),
+            streams,
         ),
         startup.init.clone(),
     )?;
@@ -298,7 +301,7 @@ pub(crate) async fn run(
                 }
                 continue;
             }
-            port @ (Port::Terminal(_) | Port::Shell(_)) => {
+            port @ (Port::Terminal(_) | Port::Shell(_) | Port::Stream(_)) => {
                 let mut clients = execution.clients.lock().expect("poison");
                 if clients
                     .get(&port)

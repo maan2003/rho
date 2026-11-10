@@ -37,6 +37,21 @@ pub enum Attach {
     Shell {
         agent: rho_agent_types::AgentId,
     },
+    /// One end of a GCCP byte stream; the port then runs
+    /// [`crate::ipc::stream::pipe`].
+    Stream(StreamEnd),
+}
+
+/// What the workset process joins a byte stream to.
+#[derive(Encode, Decode)]
+pub enum StreamEnd {
+    /// The Unix socket at `path`, which an agent opened as a service: the
+    /// workset process connects to it.
+    Service { path: String },
+    /// A connection that a forward of the workset process accepted, and
+    /// asked the host to open a stream for
+    /// ([`PyRequest::ExternalOpen`]).
+    Accepted(u64),
 }
 
 #[derive(Encode, Decode)]
@@ -148,6 +163,29 @@ pub(crate) enum PyRequest {
     },
     /// The addresses the agent accepted.
     ExternalContacts(rho_agent_types::AgentId),
+    /// The agent opens the Unix socket at `path` as the service `service`
+    /// to an address it accepted.
+    ExternalExpose {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+        path: String,
+    },
+    /// The agent closes a service it opened to an address.
+    ExternalUnexpose {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+    },
+    /// A forward of the agent's accepted the connection `conn`: open a byte
+    /// stream to `service` at `peer` and attach it
+    /// ([`StreamEnd::Accepted`]). `Done` once it is attached.
+    ExternalOpen {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+        conn: u64,
+    },
 }
 
 /// Where a move from Python puts messages.
