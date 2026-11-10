@@ -721,7 +721,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     .await;
     // Before any workset runs: its agents' addresses are on this endpoint.
     if let Some((listener, _)) = &iroh {
-        pool.set_endpoint(*listener.endpoint_id().as_bytes());
+        pool.set_endpoint(rho_agent_types::EndpointId(
+            *listener.endpoint_id().as_bytes(),
+        ));
     }
     if let Some(handoff) = handoff {
         pool.adopt(handoff.workers).await;
@@ -947,8 +949,8 @@ async fn run_iroh_listener(
     } {
         let connection = match accepted {
             Ok(rho_rpc::Accepted::Approved(connection)) => connection,
-            // Another harness, which nobody approved: it speaks GCCP and
-            // nothing else.
+            // Not a client of this host. It may be another harness: that
+            // speaks GCCP and nothing else, and only if the user approved it.
             Ok(rho_rpc::Accepted::Open(connection)) => {
                 if connection.alpn() == gccp::ALPN {
                     match gccp_connections.clone().try_acquire_owned() {

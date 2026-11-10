@@ -336,10 +336,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(peer_address, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(peer_accept, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(peer_topic, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(peers, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_address, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_accept, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_send, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_contacts, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
@@ -371,7 +371,6 @@ fn address_text(address: Address) -> String {
     match address {
         Address::User => "user".to_owned(),
         Address::Agent(agent) => agent.encoded().to_string(),
-        Address::Peer => "peer".to_owned(),
     }
 }
 
@@ -682,51 +681,52 @@ fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
     }
 }
 
-/// The agent's own GCCP address.
+/// The agent's own address for agents on other hosts.
 #[pyfunction]
-fn peer_address(py: Python<'_>, agent: &str) -> PyResult<String> {
-    match PyHost::block(py, PyRequest::PeerAddress(agent_id(agent)?))? {
+fn external_address(py: Python<'_>, agent: &str) -> PyResult<String> {
+    match PyHost::block(py, PyRequest::ExternalAddress(agent_id(agent)?))? {
         PyReply::Text(address) => Ok(address),
         _ => Err(unexpected()),
     }
 }
 
-/// The agent accepts a GCCP address under a name; returns their conversation.
+/// The agent accepts an address on another host under a name.
 #[pyfunction]
-fn peer_accept(py: Python<'_>, agent: &str, address: String, name: String) -> PyResult<u64> {
-    let request = PyRequest::PeerAccept {
+fn external_accept(py: Python<'_>, agent: &str, address: String, name: String) -> PyResult<()> {
+    let request = PyRequest::ExternalAccept {
         agent: agent_id(agent)?,
         peer: address,
         name,
     };
     match PyHost::block(py, request)? {
-        PyReply::Seq(seq) => Ok(seq.0),
+        PyReply::Done => Ok(()),
         _ => Err(unexpected()),
     }
 }
 
-/// The agent's conversation with an address it accepted.
+/// The agent sends a message to an address it accepted; returns the name
+/// it gave the address.
 #[pyfunction]
-fn peer_topic(py: Python<'_>, agent: &str, address: String) -> PyResult<u64> {
-    let request = PyRequest::PeerTopic {
+fn external_send(py: Python<'_>, agent: &str, address: String, text: String) -> PyResult<String> {
+    let request = PyRequest::ExternalSend {
         agent: agent_id(agent)?,
         peer: address,
+        body: text,
     };
     match PyHost::block(py, request)? {
-        PyReply::Seq(seq) => Ok(seq.0),
+        PyReply::Text(name) => Ok(name),
         _ => Err(unexpected()),
     }
 }
 
 /// The addresses the agent accepted, each a dict.
 #[pyfunction]
-fn peers(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
-    match PyHost::block(py, PyRequest::Peers(agent_id(agent)?))? {
-        PyReply::Peers(peers) => {
+fn external_contacts(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
+    match PyHost::block(py, PyRequest::ExternalContacts(agent_id(agent)?))? {
+        PyReply::ExternalContacts(contacts) => {
             let out = pyo3::types::PyList::empty(py);
-            for contact in peers {
+            for contact in contacts {
                 let held = PyDict::new(py);
-                held.set_item("topic", contact.topic.0.0)?;
                 held.set_item("address", contact.peer.to_string())?;
                 held.set_item("name", contact.name)?;
                 held.set_item("unsent", contact.unsent)?;
@@ -861,20 +861,12 @@ fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
         PyReply::Topic(Some((head, stream))) => {
             let out = PyDict::new(py);
             out.set_item("id", id)?;
-            let (name, resolved, peer) = match head.place {
-                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved, None),
-                crate::store::Place::Direct => (None, false, None),
-                crate::store::Place::Peer { peer, name, open } => {
-                    let held = PyDict::new(py);
-                    held.set_item("address", peer.to_string())?;
-                    held.set_item("name", name)?;
-                    held.set_item("open", open)?;
-                    (None, false, Some(held))
-                }
+            let (name, resolved) = match head.place {
+                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved),
+                crate::store::Place::Direct => (None, false),
             };
             out.set_item("name", name)?;
             out.set_item("resolved", resolved)?;
-            out.set_item("peer", peer)?;
             out.set_item("stream", stream)?;
             out.set_item(
                 "agents",

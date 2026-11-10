@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
-    DebugReport, ForgetSavepoints, GccpContact, GccpContacts, GccpRemove, GitProvided,
-    GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohPair, IrohRevoke,
-    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, ShutdownIfIdle, Snapshot,
+    DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
+    GccpRevoke, GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
+    IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus,
+    Request, ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -267,19 +268,45 @@ where
             })
             .await
         }
-        Request::GccpContacts(call) => {
-            respond(writer, call, |GccpContacts| async move {
-                Ok(services
+        Request::GccpList(call) => {
+            respond(writer, call, |GccpList| async move {
+                let pool = &services.pool;
+                Ok(GccpState {
+                    endpoint: pool.gccp_endpoint().map(|endpoint| endpoint.to_string()),
+                    hosts: pool
+                        .gccp_hosts()
+                        .into_iter()
+                        .map(|(endpoint, name)| GccpHost {
+                            endpoint: endpoint.to_string(),
+                            name,
+                        })
+                        .collect(),
+                    contacts: pool
+                        .gccp_contacts()
+                        .into_iter()
+                        .map(|contact| GccpContact {
+                            agent: contact.agent.encoded(),
+                            address: contact.peer.to_string(),
+                            name: contact.name,
+                            unsent: contact.unsent,
+                        })
+                        .collect(),
+                })
+            })
+            .await
+        }
+        Request::GccpApprove(call) => {
+            respond(writer, call, |GccpApprove { endpoint, name }| async move {
+                services
                     .pool
-                    .peers()
-                    .into_iter()
-                    .map(|contact| GccpContact {
-                        agent: contact.agent.encoded(),
-                        address: contact.peer.to_string(),
-                        name: contact.name,
-                        unsent: contact.unsent,
-                    })
-                    .collect())
+                    .gccp_approve(gccp_endpoint(&endpoint)?, &name)
+                    .await
+            })
+            .await
+        }
+        Request::GccpRevoke(call) => {
+            respond(writer, call, |GccpRevoke { endpoint }| async move {
+                services.pool.gccp_revoke(gccp_endpoint(&endpoint)?).await
             })
             .await
         }
@@ -290,11 +317,17 @@ where
                 let address = address
                     .parse::<rho_agent_types::PeerAddress>()
                     .map_err(|error| anyhow::anyhow!("invalid GCCP address: {error}"))?;
-                services.pool.remove_peer(agent, &address).await
+                services.pool.gccp_remove(agent, &address).await
             })
             .await
         }
     }
+}
+
+/// A harness's endpoint id as `rho gccp` takes it.
+fn gccp_endpoint(text: &str) -> anyhow::Result<rho_agent_types::EndpointId> {
+    text.parse()
+        .map_err(|error| anyhow::anyhow!("invalid GCCP endpoint: {error}"))
 }
 
 /// Stops the host unless a client is attached or an agent is working.

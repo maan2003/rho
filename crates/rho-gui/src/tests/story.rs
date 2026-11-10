@@ -178,7 +178,7 @@ fn message(
             })
             .into_iter()
             .collect(),
-        Address::User | Address::Peer => Vec::new(),
+        Address::User => Vec::new(),
     };
     started
         .into_iter()

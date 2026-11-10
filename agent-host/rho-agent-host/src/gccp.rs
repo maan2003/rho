@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use futures::future::BoxFuture;
 use iroh::endpoint::Connection;
 use rho_agent::host::pool::{AgentPool, Envelope, MAX_BODY_LEN, MessageResult, Transport};
+use rho_agent_types::EndpointId;
 
 /// The ALPN GCCP is spoken on. A change old peers cannot read takes a new
 /// number.
@@ -96,21 +97,36 @@ fn decode_result(bytes: &[u8]) -> anyhow::Result<MessageResult> {
 /// Gives every message another harness sends on `connection` a result, for as
 /// long as it stays open. Whatever is not a message is refused like one
 /// to nobody: a harness says no more than that.
+///
+/// A harness the user did not approve gets no stream read: its connection
+/// closes at once, and it learns nothing from that.
 pub async fn serve(pool: Arc<AgentPool>, connection: Connection) {
-    serve_messages(connection, move |endpoint, envelope| {
-        let pool = pool.clone();
-        async move { pool.gccp_receive(endpoint, envelope).await }
-    })
+    let approved = pool.clone();
+    serve_messages(
+        connection,
+        move |endpoint| approved.gccp_approved(endpoint),
+        move |endpoint, envelope| {
+            let pool = pool.clone();
+            async move { pool.gccp_receive(endpoint, envelope).await }
+        },
+    )
     .await
 }
 
-/// [`serve`], with what a message is given to left open.
-async fn serve_messages<F, Fut>(connection: Connection, receive: F)
-where
-    F: Fn([u8; 32], Envelope) -> Fut + Clone + Send + 'static,
+/// [`serve`], with who is approved and what a message is given to left open.
+async fn serve_messages<F, Fut>(
+    connection: Connection,
+    approved: impl FnOnce(EndpointId) -> bool,
+    receive: F,
+) where
+    F: Fn(EndpointId, Envelope) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = MessageResult> + Send,
 {
-    let endpoint = *connection.remote_id().as_bytes();
+    let endpoint = EndpointId(*connection.remote_id().as_bytes());
+    if !approved(endpoint) {
+        connection.close(0u32.into(), b"");
+        return;
+    }
     loop {
         let Ok(stream) = tokio::time::timeout(IDLE_TIMEOUT, connection.accept_bi()).await else {
             connection.close(0u32.into(), b"idle");
@@ -167,7 +183,7 @@ async fn exchange(connection: &Connection, envelope: &Envelope) -> anyhow::Resul
 /// goes quiet.
 pub struct IrohTransport {
     endpoint: iroh::Endpoint,
-    connections: std::sync::Mutex<HashMap<[u8; 32], Connection>>,
+    connections: std::sync::Mutex<HashMap<EndpointId, Connection>>,
 }
 
 impl IrohTransport {
@@ -179,7 +195,7 @@ impl IrohTransport {
     }
 
     /// The connection held to `endpoint`, if it has not closed.
-    fn held(&self, endpoint: [u8; 32]) -> Option<Connection> {
+    fn held(&self, endpoint: EndpointId) -> Option<Connection> {
         let mut connections = self.connections.lock().expect("poison");
         let held = connections.remove(&endpoint)?;
         if held.close_reason().is_some() {
@@ -189,8 +205,8 @@ impl IrohTransport {
         Some(held)
     }
 
-    async fn connect(&self, endpoint: [u8; 32]) -> anyhow::Result<Connection> {
-        let id = iroh::EndpointId::from_bytes(&endpoint).context("not an endpoint id")?;
+    async fn connect(&self, endpoint: EndpointId) -> anyhow::Result<Connection> {
+        let id = iroh::EndpointId::from_bytes(&endpoint.0).context("not an endpoint id")?;
         let connection = self.endpoint.connect(id, ALPN).await?;
         self.connections
             .lock()
@@ -203,7 +219,7 @@ impl IrohTransport {
 impl Transport for IrohTransport {
     fn send<'a>(
         &'a self,
-        endpoint: [u8; 32],
+        endpoint: EndpointId,
         envelope: &'a Envelope,
     ) -> BoxFuture<'a, anyhow::Result<MessageResult>> {
         Box::pin(async move {
@@ -339,12 +355,15 @@ mod tests {
                 .await?;
             lookup.add_endpoint_info(server.addr());
             let transport = IrohTransport::new(client.clone());
-            let to = *server.id().as_bytes();
+            let to = EndpointId(*server.id().as_bytes());
 
             let (seen, mut received) = tokio::sync::mpsc::unbounded_channel();
             let (connected, mut connections) = tokio::sync::mpsc::unbounded_channel();
+            let from = EndpointId(*client.id().as_bytes());
+            let approved = Arc::new(std::sync::Mutex::new(None));
             let serving = tokio::spawn({
                 let server = server.clone();
+                let approved = approved.clone();
                 async move {
                     while let Some(incoming) = server.accept().await {
                         let Ok(connection) = incoming.await else {
@@ -352,27 +371,40 @@ mod tests {
                         };
                         connected.send(connection.clone()).unwrap();
                         let seen = seen.clone();
-                        tokio::spawn(serve_messages(connection, move |endpoint, envelope| {
-                            let result = if envelope.body == "knock" {
-                                MessageResult::Refused
-                            } else {
-                                MessageResult::Delivered
-                            };
-                            seen.send((endpoint, envelope)).unwrap();
-                            async move { result }
-                        }));
+                        let approved = *approved.lock().unwrap();
+                        tokio::spawn(serve_messages(
+                            connection,
+                            move |endpoint| Some(endpoint) == approved,
+                            move |endpoint, envelope| {
+                                let result = if envelope.body == "knock" {
+                                    MessageResult::Refused
+                                } else {
+                                    MessageResult::Delivered
+                                };
+                                seen.send((endpoint, envelope)).unwrap();
+                                async move { result }
+                            },
+                        ));
                     }
                 }
             });
+
+            // A harness that is not approved has its connection closed, and
+            // its message reaches nothing. Being the server is not being
+            // approved.
+            for stranger in [None, Some(to)] {
+                *approved.lock().unwrap() = stranger;
+                assert!(transport.send(to, &envelope("uninvited")).await.is_err());
+                connections.recv().await.unwrap();
+            }
+            assert!(received.try_recv().is_err());
+            *approved.lock().unwrap() = Some(from);
 
             assert_eq!(
                 transport.send(to, &envelope("hello")).await?,
                 MessageResult::Delivered
             );
-            assert_eq!(
-                received.recv().await.unwrap(),
-                (*client.id().as_bytes(), envelope("hello"))
-            );
+            assert_eq!(received.recv().await.unwrap(), (from, envelope("hello")));
             assert_eq!(
                 transport.send(to, &envelope("knock")).await?,
                 MessageResult::Refused

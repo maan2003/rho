@@ -89,12 +89,9 @@ async def hand(agent, record: dict) -> None:
 def render(record: dict, reader: str) -> str:
     """A message as `reader` reads it: where it is first, so the model knows
     where to answer. A message between two agents has no topic; it is
-    answered with `agents.message`. So is one from a peer, which is named
-    as the agent on another host that it is."""
+    answered with `agents.message`."""
     head = chat.topic(record["topic"])
     sender = record["sender"]
-    if sender == chat.PEER:
-        return f"[message from {tools.peer_label(head['peer'])}]\n{record['text']}"
     if head["stream"] is None:
         return f"[message from {prompt.label(sender)}]\n{record['text']}"
     where = tools.where(record["topic"], head, reader)

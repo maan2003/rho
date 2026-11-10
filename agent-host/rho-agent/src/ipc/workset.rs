@@ -131,21 +131,22 @@ pub(crate) enum PyRequest {
     /// The one agent of the host whose id starts with this.
     ResolveAgent(String),
     /// The agent's own GCCP address (`Text`).
-    PeerAddress(rho_agent_types::AgentId),
-    /// The agent accepts a GCCP address under a name; answered with their
-    /// conversation.
-    PeerAccept {
+    ExternalAddress(rho_agent_types::AgentId),
+    /// The agent accepts a GCCP address under a name.
+    ExternalAccept {
         agent: rho_agent_types::AgentId,
         peer: String,
         name: String,
     },
-    /// The agent's conversation with an address it accepted.
-    PeerTopic {
+    /// The agent sends a message to an address it accepted; answered with
+    /// the name it gave the address (`Text`).
+    ExternalSend {
         agent: rho_agent_types::AgentId,
         peer: String,
+        body: String,
     },
     /// The addresses the agent accepted.
-    Peers(rho_agent_types::AgentId),
+    ExternalContacts(rho_agent_types::AgentId),
 }
 
 /// Where a move from Python puts messages.
@@ -169,7 +170,7 @@ pub(crate) enum PyReply {
     Topic(Option<(crate::store::TopicHead, Option<String>)>),
     Models(Vec<crate::record::Runtime>),
     Text(String),
-    Peers(Vec<crate::store::PeerContact>),
+    ExternalContacts(Vec<crate::store::GccpContact>),
     Done,
     Error(String),
 }

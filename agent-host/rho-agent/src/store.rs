@@ -320,6 +320,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
         self.init_chat_tables();
+        self.init_gccp_tables();
         agent_rows::init(self);
     }
 
@@ -496,16 +497,15 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
 pub fn role_of(from: Address) -> Role {
     match from {
         Address::User => Role::User,
-        // A peer's message carries no authority, like another agent's.
-        Address::Agent(_) | Address::Peer => Role::Tool,
+        Address::Agent(_) => Role::Tool,
     }
 }
 
 pub(crate) mod agent_rows;
 pub mod chat;
+pub mod gccp;
 
-pub use chat::{
-    ChatRead, ChatWrite, MoveTo, NewMessage, PeerContact, PeerOutgoing, Place, TopicHead,
-};
+pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
+pub use gccp::{GccpContact, GccpOutgoing, GccpRead, GccpWrite};
 #[cfg(test)]
 mod tests;

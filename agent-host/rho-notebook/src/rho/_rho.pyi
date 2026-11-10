@@ -36,28 +36,16 @@ class MessageRecord(TypedDict):
     id: int
     at: int  # unix ms
     topic: int
-    sender: str  # "user", an agent id, or "peer" in a peer conversation
+    sender: str  # "user" or an agent id
     mentions: list[tuple[str, MentionKind]]  # (address, kind)
     text: str
 
-class Peer(TypedDict):
-    address: str  # the GCCP address the agent accepted
-    name: str  # what the agent named it
-    open: bool  # False once the acceptance was taken back
-
 class TopicRecord(TypedDict):
     id: int
-    name: str | None  # None outside a stream
-    stream: str | None  # its stream's name; None for a direct or peer conversation
-    resolved: bool  # its work is done; False outside a stream
-    agents: list[str]  # its members: who joined a topic, a direct's two, or a peer conversation's one
-    peer: Peer | None  # the other end of a peer conversation
-
-class Contact(TypedDict):
-    topic: int  # the peer conversation
-    address: str
-    name: str
-    unsent: int  # the agent's messages the peer has not taken yet
+    name: str | None  # None for a direct conversation
+    stream: str | None  # its stream's name; None for a direct conversation
+    resolved: bool  # its work is done; False for a direct conversation
+    agents: list[str]  # its members: who joined a topic, or a direct's two
 
 class AgentsFile(TypedDict):
     path: str
@@ -121,9 +109,7 @@ def new_cache_key(agent: str) -> None:
 # host's chat log. A message reaches its conversation's members and every
 # agent it mentions, never its sender. A topic's members are the agents that
 # joined it; neither posting nor a mention joins. A direct conversation's
-# members are its two agents, and only they post in it. A peer conversation
-# is an agent's with an address on another host that it accepted: only the
-# two post in it, and the host carries their messages over GCCP. Messages from the
+# members are its two agents, and only they post in it. Messages from the
 # user come only from the GUI, so Python cannot forge them. The user and
 # agents may rename, move and resolve a topic, and move messages between
 # topics.
@@ -154,21 +140,20 @@ def direct(sender: str, other: str) -> int:
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
-def peer_address(agent: str) -> str:
-    """The GCCP address of `agent`, an agent of this workset:
-    `<endpoint id>/<local id>` (docs/gccp.md). Raises when the host has no
-    iroh endpoint."""
-def peer_accept(agent: str, address: str, name: str) -> int:
-    """`agent` accepts `address` under `name`: returns their peer
-    conversation, started if they have none open. From then on the host
-    delivers what that address sends the agent, as messages from "peer", and
-    sends it what the agent posts in the conversation, in order. Raises for an
-    address already accepted under another name."""
-def peer_topic(agent: str, address: str) -> int:
-    """The peer conversation of `agent` and an address it accepted. Raises
-    when it has not."""
-def peers(agent: str) -> list[Contact]:
-    """The addresses `agent` has accepted."""
+def external_address(agent: str) -> str:
+    """The address agents on other hosts reach `agent` at:
+    `<endpoint id>/<local id>`. Raises when the host has no iroh endpoint."""
+def external_accept(agent: str, address: str, name: str) -> None:
+    """`agent` accepts `address`, on another host, under `name`. Raises when
+    the user has not approved that host, or the agent already accepted the
+    address under another name."""
+def external_send(agent: str, address: str, text: str) -> str:
+    """Queue `text` for `address`, which `agent` accepted; returns the name
+    the agent gave it. The host sends it, and tells the agent by an input if
+    the other host does not take it."""
+def external_contacts(agent: str) -> list[dict]:
+    """The addresses `agent` accepted, each a dict of `address`, `name` and
+    `unsent`: how many of its messages the address's host has not taken."""
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""

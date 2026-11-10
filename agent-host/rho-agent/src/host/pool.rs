@@ -29,7 +29,8 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, MoveTo, NewMessage, Place, StoreRead as _, StoreWrite as _,
+    ChatRead as _, ChatWrite as _, GccpWrite as _, MoveTo, NewMessage, Place, StoreRead as _,
+    StoreWrite as _,
 };
 
 /// How many agents stay loaded. Past this the least recently used one
@@ -61,10 +62,12 @@ pub struct AgentPool {
     init: Option<camino::Utf8PathBuf>,
     /// The host's iroh endpoint id, once it has one: where GCCP reaches its
     /// agents.
-    endpoint: std::sync::OnceLock<[u8; 32]>,
-    /// The GCCP messages stored last, so that one sent again is not stored
-    /// twice.
+    endpoint: std::sync::OnceLock<rho_agent_types::EndpointId>,
+    /// The GCCP messages taken last, so that one sent again is not given to
+    /// its agent twice.
     gccp_stored: std::sync::Mutex<gccp::Stored>,
+    /// Woken when an agent puts a message in the GCCP outbox.
+    gccp_outbox: tokio::sync::Notify,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -148,6 +151,7 @@ impl AgentPool {
             init,
             endpoint: std::sync::OnceLock::new(),
             gccp_stored: std::sync::Mutex::default(),
+            gccp_outbox: tokio::sync::Notify::new(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
@@ -992,7 +996,7 @@ impl AgentPool {
                 .iter()
                 .filter_map(|mention| match mention.to {
                     Address::Agent(agent) => Some(agent),
-                    Address::User | Address::Peer => None,
+                    Address::User => None,
                 }),
         );
         let mut worksets: Vec<WorksetId> = receivers
@@ -1098,10 +1102,8 @@ impl AgentPool {
             let mut write = self.db.write().await;
             // An agent that is gone accepts no one: its address refuses
             // already, and nothing of its is left to send.
-            for contact in self.db.read().peers() {
-                if agents.contains(&contact.agent) {
-                    write.remove_peer(UnixMs::now(), contact.topic)?;
-                }
+            for &agent in &agents {
+                write.gccp_forget(agent);
             }
             write.delete_workset(workset);
             for &agent in &agents {
@@ -1247,7 +1249,6 @@ impl AgentPool {
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
-                self.check_peer_body(topic, &content)?;
                 let message = NewMessage {
                     from: Address::Agent(sender),
                     mentions,
@@ -1360,7 +1361,7 @@ impl AgentPool {
                         Place::Stream { stream, .. } => {
                             Some(read.stream_name(*stream).expect("a topic's stream exists"))
                         }
-                        Place::Direct | Place::Peer { .. } => None,
+                        Place::Direct => None,
                     };
                     (head, stream)
                 }))
@@ -1398,23 +1399,24 @@ impl AgentPool {
             }
             PyRequest::Models => PyReply::Models(models()),
             PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
-            PyRequest::PeerAddress(agent) => {
+            PyRequest::ExternalAddress(agent) => {
                 self.own_agent(workset, agent)?;
-                PyReply::Text(self.address_of(agent)?.to_string())
+                PyReply::Text(self.external_address(agent)?.to_string())
             }
-            PyRequest::PeerAccept { agent, peer, name } => {
+            PyRequest::ExternalAccept { agent, peer, name } => {
                 self.own_agent(workset, agent)?;
-                PyReply::Seq(self.accept_peer(agent, &peer, name).await?.0)
+                self.external_accept(agent, &peer, &name).await?;
+                PyReply::Done
             }
-            PyRequest::PeerTopic { agent, peer } => {
+            PyRequest::ExternalSend { agent, peer, body } => {
                 self.own_agent(workset, agent)?;
-                PyReply::Seq(self.peer_topic(agent, &peer)?.0)
+                PyReply::Text(self.external_send(agent, &peer, body).await?)
             }
-            PyRequest::Peers(agent) => {
+            PyRequest::ExternalContacts(agent) => {
                 self.own_agent(workset, agent)?;
-                let mut peers = self.peers();
-                peers.retain(|contact| contact.agent == agent);
-                PyReply::Peers(peers)
+                let mut contacts = self.gccp_contacts();
+                contacts.retain(|contact| contact.agent == agent);
+                PyReply::ExternalContacts(contacts)
             }
         })
     }

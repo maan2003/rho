@@ -123,8 +123,9 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     Ok(())
 }
 
-/// Lists and takes back GCCP acceptances over the agent host's Unix socket:
-/// the user's control over who on other hosts reaches their agents.
+/// The user's control over which harnesses reach their agents, over the
+/// agent host's Unix socket: approving a harness, seeing what agents
+/// accepted on the approved ones, and taking either back.
 async fn run_gccp(args: GccpArgs) -> Result<()> {
     let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
@@ -132,15 +133,44 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
     let socket = &socket_path;
     match args.command {
         GccpCommand::List => {
-            for contact in client::call(socket, host::GccpContacts).await? {
-                let host::GccpContact {
-                    agent,
-                    address,
-                    name,
-                    unsent,
-                } = contact;
-                println!("{agent}\t{address}\t{name:?}\t{unsent} unsent");
+            let host::GccpState {
+                endpoint,
+                hosts,
+                contacts,
+            } = client::call(socket, host::GccpList).await?;
+            match endpoint {
+                Some(endpoint) => println!("this host: {endpoint}"),
+                None => println!("this host has no iroh endpoint: start it with --iroh"),
             }
+            for host::GccpHost { endpoint, name } in hosts {
+                println!("approved host {endpoint}\t{name:?}");
+                for contact in &contacts {
+                    let host::GccpContact {
+                        agent,
+                        address,
+                        name,
+                        unsent,
+                    } = contact;
+                    if address.starts_with(&endpoint) {
+                        println!("  {agent} accepted {address}\t{name:?}\t{unsent} unsent");
+                    }
+                }
+            }
+        }
+        GccpCommand::Approve { endpoint, name } => {
+            let call = host::GccpApprove {
+                endpoint: endpoint.clone(),
+                name: name.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("approved host {endpoint} as {name:?}");
+        }
+        GccpCommand::Revoke { endpoint } => {
+            let call = host::GccpRevoke {
+                endpoint: endpoint.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("revoked host {endpoint}");
         }
         GccpCommand::Remove { agent, address } => {
             let call = host::GccpRemove {
@@ -235,7 +265,8 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    /// See and take back what agents accepted from other hosts over GCCP.
+    /// Approve other hosts for GCCP, and see and take back what agents
+    /// accepted on them.
     Gccp(GccpArgs),
     /// Print a link that pairs rho-gui with this machine's agent host (what
     /// `rho` alone does).
@@ -329,9 +360,22 @@ pub(crate) struct GccpArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum GccpCommand {
-    /// List every address an agent of this host has accepted.
+    /// Show this host's endpoint id, the hosts you approved, and the
+    /// addresses on them that agents accepted.
     List,
-    /// Take back an agent's acceptance of an address.
+    /// Approve another host by its endpoint id: your agents may then accept
+    /// addresses on it, and its agents may message the ones that did. It
+    /// gets no other access to this host.
+    Approve {
+        /// The other host's endpoint id: 64 hex digits, as its own
+        /// `rho gccp list` prints it.
+        endpoint: String,
+        /// What you and your agents will know the host by.
+        name: String,
+    },
+    /// Take back the approval of a host, and every acceptance on it.
+    Revoke { endpoint: String },
+    /// Take back one agent's acceptance of an address.
     Remove {
         /// The agent's id, as `rho gccp list` prints it.
         agent: String,

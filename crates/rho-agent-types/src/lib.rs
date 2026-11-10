@@ -5,6 +5,7 @@
 //! to that protocol's owner instead.
 
 mod chat;
+mod gccp;
 mod log;
 mod place;
 pub mod transcript;
@@ -12,6 +13,7 @@ mod vocab;
 mod workset;
 
 pub use chat::*;
+pub use gccp::*;
 pub use log::*;
 pub use place::*;
 pub use vocab::*;

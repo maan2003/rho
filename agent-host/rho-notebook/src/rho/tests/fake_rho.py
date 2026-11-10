@@ -16,12 +16,14 @@ class State:
         self.events = 0  # the chat log's newest seq
         self.streams = {}  # name -> id
         self.directs = {}  # (a, b), a < b -> topic
-        self.endpoint = "ab" * 32  # the host's iroh endpoint id; None for a host without one
-        self.peers = {}  # (agent, address) -> its open peer conversation
         self.topics = {}  # id -> TopicRecord
         self.messages = []  # MessageRecord, in order
         self.inputs = []  # (agent, text, role, message)
         self.calls = []  # (name, args)
+        self.endpoint = "ab" * 32  # the host's own; None for a host without iroh
+        self.hosts = set()  # the endpoints the user approved
+        self.contacts = {}  # (agent, address) -> name
+        self.sent = []  # (agent, address, text), not taken yet
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
@@ -115,14 +117,7 @@ def _post(sender, topic, text, mentions):
     if not text.strip():
         raise ValueError("a message needs text")
     head = STATE.topics[topic]
-    if head["peer"] is not None:
-        if not head["peer"]["open"]:
-            raise ValueError(f"{head['peer']['name']} is no longer accepted")
-        if sender != "peer" and sender not in head["agents"]:
-            raise ValueError("only its agent and its peer post in a peer conversation")
-    elif sender == "peer":
-        raise ValueError("a peer posts only in its peer conversation")
-    elif head["stream"] is None and sender not in head["agents"]:
+    if head["stream"] is None and sender not in head["agents"]:
         raise ValueError("only its two agents post in a direct conversation")
     for address, kind in mentions:
         assert kind in ("ask", "result", "fyi"), kind
@@ -140,7 +135,7 @@ def _start(sender, stream, name, text, mentions):
     if stream not in STATE.streams:
         STATE.streams[stream] = _event()
     topic = _event()
-    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "resolved": False, "agents": [], "peer": None}
+    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "resolved": False, "agents": []}
     return topic, _post(sender, topic, text, mentions)
 
 
@@ -170,6 +165,51 @@ def resolve_agent(prefix):
     return found[0]
 
 
+def external_address(agent):
+    with STATE.lock:
+        assert agent in STATE.agents
+        if STATE.endpoint is None:
+            raise RuntimeError("this host has no iroh endpoint, so its agents have no address")
+        return f"{STATE.endpoint}/{agent}"
+
+
+def _endpoint(address):
+    endpoint, slash, local = address.partition("/")
+    if not slash or len(endpoint) != 64 or not local:
+        raise RuntimeError(f"an address is <endpoint id>/<local id>, not {address!r}")
+    return endpoint
+
+
+def external_accept(agent, address, name):
+    with STATE.lock:
+        assert agent in STATE.agents
+        endpoint = _endpoint(address)
+        if endpoint not in STATE.hosts:
+            raise RuntimeError(f"the user has not approved the host {endpoint}")
+        held = STATE.contacts.setdefault((agent, address), name)
+        if held != name:
+            raise RuntimeError(f"{address} is already accepted as {held!r}")
+
+
+def external_send(agent, address, text):
+    with STATE.lock:
+        assert agent in STATE.agents
+        _endpoint(address)
+        if (agent, address) not in STATE.contacts:
+            raise RuntimeError(f"{address} is not an address you accepted")
+        STATE.sent.append((agent, address, text))
+        return STATE.contacts[agent, address]
+
+
+def external_contacts(agent):
+    with STATE.lock:
+        return [
+            {"address": address, "name": name, "unsent": sum(1 for sent in STATE.sent if sent[:2] == (holder, address))}
+            for (holder, address), name in STATE.contacts.items()
+            if holder == agent
+        ]
+
+
 def direct(sender, other):
     with STATE.lock:
         assert sender in STATE.agents and sender != other
@@ -178,66 +218,9 @@ def direct(sender, other):
         pair = tuple(sorted((sender, other)))
         if pair not in STATE.directs:
             topic = _event()
-            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "resolved": False, "agents": list(pair), "peer": None}
+            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "resolved": False, "agents": list(pair)}
             STATE.directs[pair] = topic
         return STATE.directs[pair]
-
-
-def _address(address):
-    endpoint, slash, local = address.partition("/")
-    if not slash or len(endpoint) != 64 or not local:
-        raise RuntimeError(f"an address is <endpoint id>/<local id>, not {address!r}")
-
-
-def peer_address(agent):
-    with STATE.lock:
-        assert agent in STATE.agents, agent
-        if STATE.endpoint is None:
-            raise RuntimeError("this host has no iroh endpoint, so its agents have no address: start rho-agent-host with --iroh")
-        return f"{STATE.endpoint}/{agent}"
-
-
-def peer_accept(agent, address, name):
-    with STATE.lock:
-        assert agent in STATE.agents, agent
-        _address(address)
-        name = name.strip()
-        if not name:
-            raise RuntimeError("an accepted address needs a name")
-        if (agent, address) in STATE.peers:
-            topic = STATE.peers[agent, address]
-            held = STATE.topics[topic]["peer"]["name"]
-            if held != name:
-                raise RuntimeError(f"{address} is already accepted as {held!r}; remove it to name it again")
-            return topic
-        topic = _event()
-        peer = {"address": address, "name": name, "open": True}
-        STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "resolved": False, "agents": [agent], "peer": peer}
-        STATE.peers[agent, address] = topic
-        return topic
-
-
-def peer_topic(agent, address):
-    with STATE.lock:
-        _address(address)
-        if (agent, address) not in STATE.peers:
-            raise RuntimeError(f"{address} is not accepted: accept it under a name first")
-        return STATE.peers[agent, address]
-
-
-def peers(agent):
-    with STATE.lock:
-        return [
-            {"topic": topic, "address": address, "name": STATE.topics[topic]["peer"]["name"], "unsent": 0}
-            for (owner, address), topic in STATE.peers.items()
-            if owner == agent
-        ]
-
-
-def receive_peer(topic, text):
-    """What the host does with a message the peer of `topic` sent."""
-    with STATE.lock:
-        return _post("peer", topic, text, [])
 
 
 def join(topic, agent):
@@ -273,7 +256,7 @@ def move_messages(agent, messages, to=None, *, stream=None, name=None):
             if stream not in STATE.streams:
                 STATE.streams[stream] = _event()
             to = _event()
-            STATE.topics[to] = {"id": to, "name": name, "stream": stream, "resolved": False, "agents": [], "peer": None}
+            STATE.topics[to] = {"id": to, "name": name, "stream": stream, "resolved": False, "agents": []}
         for message in STATE.messages:
             if message["id"] in messages:
                 message["topic"] = to
