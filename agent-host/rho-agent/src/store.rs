@@ -320,6 +320,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
         self.init_chat_tables();
+        self.init_gccp_tables();
         agent_rows::init(self);
     }
 
@@ -502,7 +503,9 @@ pub fn role_of(from: Address) -> Role {
 
 pub(crate) mod agent_rows;
 pub mod chat;
+pub mod gccp;
 
 pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
+pub use gccp::{GccpContact, GccpRead, GccpWrite};
 #[cfg(test)]
 mod tests;

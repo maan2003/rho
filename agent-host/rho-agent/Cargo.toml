@@ -32,6 +32,7 @@ rho-desktop-client.workspace = true
 rho-devshell.workspace = true
 rho-fs-view.workspace = true
 rho-image.workspace = true
+rho-iroh-auth.workspace = true
 rho-notebook.workspace = true
 rho-rpc.workspace = true
 rho-tool-shell.workspace = true

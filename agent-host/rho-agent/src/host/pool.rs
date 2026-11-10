@@ -5,10 +5,13 @@
 //! map, and the answers to each workset's `_rho` calls. The store is the truth
 //! about worksets, agents and chat; the pool holds only what runs.
 
+mod gccp;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
+pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -26,7 +29,8 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, MoveTo, NewMessage, Place, StoreRead as _, StoreWrite as _,
+    ChatRead as _, ChatWrite as _, GccpWrite as _, MoveTo, NewMessage, Place, StoreRead as _,
+    StoreWrite as _,
 };
 
 /// How many agents stay loaded. Past this the least recently used one
@@ -56,6 +60,15 @@ pub struct AgentPool {
     claude: rho_claude::accounts::ClaudePaths,
     /// The host's `init.py`, run by each workset process at its start.
     init: Option<camino::Utf8PathBuf>,
+    /// The host's iroh endpoint id, once it has one: where GCCP reaches its
+    /// agents.
+    endpoint: std::sync::OnceLock<rho_agent_types::EndpointId>,
+    /// The GCCP messages taken last, so that one sent again is not given to
+    /// its agent twice.
+    gccp_stored: std::sync::Mutex<gccp::Stored>,
+    /// What carries GCCP messages out, while the host's endpoint is up, and
+    /// the waits before the tries after the first.
+    gccp_transport: std::sync::Mutex<Option<gccp::Carrier>>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -137,6 +150,9 @@ impl AgentPool {
             worksets,
             claude,
             init,
+            endpoint: std::sync::OnceLock::new(),
+            gccp_stored: std::sync::Mutex::default(),
+            gccp_transport: std::sync::Mutex::default(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
@@ -1085,6 +1101,10 @@ impl AgentPool {
         }
         {
             let mut write = self.db.write().await;
+            // An agent that is gone accepts no one.
+            for &agent in &agents {
+                write.gccp_forget(agent);
+            }
             write.delete_workset(workset);
             for &agent in &agents {
                 write.delete_agent_usage(agent);
@@ -1379,6 +1399,25 @@ impl AgentPool {
             }
             PyRequest::Models => PyReply::Models(models()),
             PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
+            PyRequest::ExternalAddress(agent) => {
+                self.own_agent(workset, agent)?;
+                PyReply::Text(self.external_address(agent)?.to_string())
+            }
+            PyRequest::ExternalAccept { agent, peer, name } => {
+                self.own_agent(workset, agent)?;
+                self.external_accept(agent, &peer, &name).await?;
+                PyReply::Done
+            }
+            PyRequest::ExternalSend { agent, peer, body } => {
+                self.own_agent(workset, agent)?;
+                PyReply::Text(self.external_send(agent, &peer, body).await?)
+            }
+            PyRequest::ExternalContacts(agent) => {
+                self.own_agent(workset, agent)?;
+                let mut contacts = self.gccp_contacts();
+                contacts.retain(|contact| contact.agent == agent);
+                PyReply::ExternalContacts(contacts)
+            }
         })
     }
 

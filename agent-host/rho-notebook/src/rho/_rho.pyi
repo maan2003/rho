@@ -140,6 +140,20 @@ def direct(sender: str, other: str) -> int:
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
+def external_address(agent: str) -> str:
+    """The address agents on other hosts reach `agent` at:
+    `<endpoint id>/<local id>`. Raises when the host has no iroh endpoint."""
+def external_accept(agent: str, address: str, name: str) -> None:
+    """`agent` accepts `address`, on another host, under `name`. Raises when
+    the user has not approved that host, or the agent already accepted the
+    address under another name."""
+async def external_send(agent: str, address: str, text: str) -> str:
+    """Send `text` to `address`, which `agent` accepted, and wait for what
+    the address's host says: the name the agent gave the address, once that
+    host took the message. Raises when it refuses, or gives no result in
+    the host's three tries."""
+def external_contacts(agent: str) -> list[dict]:
+    """The addresses `agent` accepted, each a dict of `address` and `name`."""
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""

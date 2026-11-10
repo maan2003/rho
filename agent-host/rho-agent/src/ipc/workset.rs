@@ -130,6 +130,24 @@ pub(crate) enum PyRequest {
     Models,
     /// The one agent of the host whose id starts with this.
     ResolveAgent(String),
+    /// The agent's own GCCP address (`Text`).
+    ExternalAddress(rho_agent_types::AgentId),
+    /// The agent accepts a GCCP address under a name.
+    ExternalAccept {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        name: String,
+    },
+    /// The agent sends a message to an address it accepted. Answered once
+    /// the address's host took it, with the name the agent gave the address
+    /// (`Text`), or with what went wrong.
+    ExternalSend {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        body: String,
+    },
+    /// The addresses the agent accepted.
+    ExternalContacts(rho_agent_types::AgentId),
 }
 
 /// Where a move from Python puts messages.
@@ -152,6 +170,8 @@ pub(crate) enum PyReply {
     /// A conversation, and the name of its stream if it is a topic.
     Topic(Option<(crate::store::TopicHead, Option<String>)>),
     Models(Vec<crate::record::Runtime>),
+    Text(String),
+    ExternalContacts(Vec<crate::store::GccpContact>),
     Done,
     Error(String),
 }

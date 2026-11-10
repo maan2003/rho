@@ -24,6 +24,7 @@ use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 mod agents;
 pub mod debug;
 mod desktop;
+mod gccp;
 mod host;
 mod realtime;
 mod secret_store;
@@ -486,7 +487,9 @@ pub struct HostArgs {
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
     /// Remote clients must be enrolled once via
-    /// `rho iroh approve <code>` on this machine.
+    /// `rho iroh approve --role client <code>` on this machine. The same
+    /// endpoint gives agents their GCCP addresses, where agents of hosts
+    /// approved with `--role gccp` reach them.
     #[arg(long = "iroh")]
     pub iroh: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
@@ -691,9 +694,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     phases.mark("worksets");
     run_devshell_daemon(&worksets);
     let iroh = if args.iroh {
-        let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
-                .await?;
+        let (listener, auth) = rho_rpc::AuthenticatedIrohListener::bind(
+            db.clone(),
+            rho_rpc::protocol::IROH_ALPN,
+            gccp::ALPN,
+        )
+        .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
         phases.mark("iroh");
         Some((listener, auth))
@@ -714,6 +720,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         init,
     )
     .await;
+    // Before any workset runs: its agents' addresses are on this endpoint.
+    if let Some((listener, _)) = &iroh {
+        pool.set_endpoint(rho_agent_types::EndpointId(
+            *listener.endpoint_id().as_bytes(),
+        ));
+    }
     if let Some(handoff) = handoff {
         pool.adopt(handoff.workers).await;
         phases.mark("adopt");
@@ -795,6 +807,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                     match rho_rpc::AuthenticatedIrohListener::bind(
                         services.db.clone(),
                         rho_rpc::protocol::IROH_ALPN,
+                        gccp::ALPN,
                     )
                     .await
                     {
@@ -920,12 +933,24 @@ async fn run_iroh_listener(
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
-    while let Some(approved) = tokio::select! {
-        approved = listener.accept() => approved,
+    // What agents send other harnesses leaves by this endpoint, so they see
+    // this host's id.
+    services.pool.set_transport(
+        Arc::new(gccp::IrohTransport::new(listener.endpoint().clone())),
+        &rho_agent::host::pool::RETRY_WAITS,
+    );
+    while let Some(accepted) = tokio::select! {
+        accepted = listener.accept() => accepted,
         _ = &mut shutdown => None,
     } {
-        let connection = match approved {
-            Ok(connection) => connection,
+        let connection = match accepted {
+            Ok(rho_rpc::Accepted::Client(connection)) => connection,
+            // Another harness the user approved: it speaks GCCP and nothing
+            // else.
+            Ok(rho_rpc::Accepted::GccpHost(connection)) => {
+                tokio::spawn(gccp::serve(services.pool.clone(), connection));
+                continue;
+            }
             Err(error) => {
                 eprintln!("rho-agent-host iroh authentication error: {error:#}");
                 continue;

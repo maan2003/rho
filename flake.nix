@@ -612,6 +612,7 @@
           "notion"
           "proving-changes"
           "explaining-code"
+          "external-agents"
         ];
         rhoBin = pkgs.callPackage ./nix/rho-bin {
           agentBase = mkAgentBase {

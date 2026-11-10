@@ -64,6 +64,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
+        Command::Gccp(args) => run_gccp(args).await,
         Command::Share(args) => share::run(args).await,
         Command::Github(args) => github::run(args).await,
         Command::Slack(args) => slack::run(args).await,
@@ -103,9 +104,27 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
         .to_owned();
     let socket = &socket_path;
     match args.command {
-        IrohCommand::Approve { code } => {
+        IrohCommand::Approve {
+            role: IrohRole::Client,
+            id: code,
+            name,
+        } => {
+            anyhow::ensure!(name.is_none(), "a client has no name: give only its code");
             let endpoint_id = client::call(socket, host::IrohApprove { code }).await?;
             println!("enrolled iroh client {endpoint_id}");
+        }
+        IrohCommand::Approve {
+            role: IrohRole::Gccp,
+            id: endpoint,
+            name,
+        } => {
+            let name = name.context("a GCCP host needs a name after its endpoint id")?;
+            let call = host::GccpApprove {
+                endpoint: endpoint.clone(),
+                name: name.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("approved GCCP host {endpoint} as {name:?}");
         }
         IrohCommand::TrustInMemory { endpoint_id } => {
             let call = host::IrohTrustInMemory {
@@ -116,7 +135,52 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
         }
         IrohCommand::Revoke { endpoint_id } => {
             let endpoint_id = client::call(socket, host::IrohRevoke { endpoint_id }).await?;
-            println!("revoked iroh client {endpoint_id}");
+            println!("revoked iroh endpoint {endpoint_id}");
+        }
+    }
+    Ok(())
+}
+
+/// What the user sees of GCCP, over the agent host's Unix socket: the hosts
+/// approved with `rho iroh approve --role gccp`, and what agents accepted
+/// on them, which the user can take back.
+async fn run_gccp(args: GccpArgs) -> Result<()> {
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let socket = &socket_path;
+    match args.command {
+        GccpCommand::List => {
+            let host::GccpState {
+                endpoint,
+                hosts,
+                contacts,
+            } = client::call(socket, host::GccpList).await?;
+            match endpoint {
+                Some(endpoint) => println!("this host: {endpoint}"),
+                None => println!("this host has no iroh endpoint: start it with --iroh"),
+            }
+            for host::GccpHost { endpoint, name } in hosts {
+                println!("approved host {endpoint}\t{name:?}");
+                for contact in &contacts {
+                    let host::GccpContact {
+                        agent,
+                        address,
+                        name,
+                    } = contact;
+                    if address.starts_with(&endpoint) {
+                        println!("  {agent} accepted {address}\t{name:?}");
+                    }
+                }
+            }
+        }
+        GccpCommand::Remove { agent, address } => {
+            let call = host::GccpRemove {
+                agent: agent.clone(),
+                address: address.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("{agent} no longer accepts {address}");
         }
     }
     Ok(())
@@ -169,6 +233,7 @@ enum Command {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    Gccp(GccpArgs),
     Share(share::ShareArgs),
     Github(GithubArgs),
     Slack(SlackArgs),
@@ -202,6 +267,9 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
+    /// See the hosts approved for GCCP, and see and take back what agents
+    /// accepted on them.
+    Gccp(GccpArgs),
     /// Print a link that pairs rho-gui with this machine's agent host (what
     /// `rho` alone does).
     Share(share::ShareArgs),
@@ -276,12 +344,55 @@ pub(crate) struct IrohArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum IrohCommand {
-    /// Approve a pending iroh client enrollment by its displayed code.
-    Approve { code: String },
+    /// Approve another iroh endpoint, as what `--role` says and no more.
+    Approve {
+        /// `client`: a rho GUI, which gets full access to this host. `gccp`:
+        /// another host, whose agents may message agents here that accepted
+        /// them, and which gets no other access.
+        #[arg(long, value_enum)]
+        role: IrohRole,
+        /// For a client, the enrollment code it displays. For a GCCP host,
+        /// its endpoint id: 64 hex digits, as its own `rho gccp list`
+        /// prints it.
+        id: String,
+        /// For a GCCP host, what you and your agents will know it by.
+        name: Option<String>,
+    },
     /// Directly trust an endpoint in agent host memory (for use through SSH).
     TrustInMemory { endpoint_id: String },
-    /// Revoke a previously enrolled iroh client endpoint.
+    /// Revoke an approved iroh endpoint, whatever it was approved as. For a
+    /// GCCP host this also takes back every acceptance on it.
     Revoke { endpoint_id: String },
+}
+
+/// What an iroh endpoint is approved as.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum IrohRole {
+    Client,
+    Gccp,
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct GccpArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: GccpCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum GccpCommand {
+    /// Show this host's endpoint id, the hosts you approved with
+    /// `rho iroh approve --role gccp`, and the addresses on them that
+    /// agents accepted.
+    List,
+    /// Take back one agent's acceptance of an address.
+    Remove {
+        /// The agent's id, as `rho gccp list` prints it.
+        agent: String,
+        /// `<endpoint id>/<local id>`.
+        address: String,
+    },
 }
 
 #[derive(Clone, clap::Args)]
@@ -365,6 +476,7 @@ impl Args {
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
+            CliCommand::Gccp(args) => Command::Gccp(args),
             CliCommand::Github(args) => Command::Github(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Notion(args) => Command::Notion(args),

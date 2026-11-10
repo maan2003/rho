@@ -20,6 +20,11 @@ class State:
         self.messages = []  # MessageRecord, in order
         self.inputs = []  # (agent, text, role, message)
         self.calls = []  # (name, args)
+        self.endpoint = "ab" * 32  # the host's own; None for a host without iroh
+        self.hosts = set()  # the endpoints the user approved
+        self.contacts = {}  # (agent, address) -> name
+        self.sent = []  # (agent, address, text) that the address's host took
+        self.refusing = set()  # addresses whose host refuses
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
@@ -159,6 +164,55 @@ def resolve_agent(prefix):
     if len(found) != 1:
         raise RuntimeError(f"no agent {prefix} on this host" if not found else f"{prefix} names {len(found)} agents; give more of its id")
     return found[0]
+
+
+def external_address(agent):
+    with STATE.lock:
+        assert agent in STATE.agents
+        if STATE.endpoint is None:
+            raise RuntimeError("this host has no iroh endpoint, so its agents have no address")
+        return f"{STATE.endpoint}/{agent}"
+
+
+def _endpoint(address):
+    endpoint, slash, local = address.partition("/")
+    if not slash or len(endpoint) != 64 or not local:
+        raise RuntimeError(f"an address is <endpoint id>/<local id>, not {address!r}")
+    return endpoint
+
+
+def external_accept(agent, address, name):
+    with STATE.lock:
+        assert agent in STATE.agents
+        endpoint = _endpoint(address)
+        if endpoint not in STATE.hosts:
+            raise RuntimeError(f"the user has not approved the host {endpoint}")
+        held = STATE.contacts.setdefault((agent, address), name)
+        if held != name:
+            raise RuntimeError(f"{address} is already accepted as {held!r}")
+
+
+async def external_send(agent, address, text):
+    await asyncio.sleep(0)
+    with STATE.lock:
+        assert agent in STATE.agents
+        _endpoint(address)
+        if (agent, address) not in STATE.contacts:
+            raise RuntimeError(f"{address} is not an address you accepted")
+        name = STATE.contacts[agent, address]
+        if address in STATE.refusing:
+            raise RuntimeError(f"the host of {name} ({address}) refused the message")
+        STATE.sent.append((agent, address, text))
+        return name
+
+
+def external_contacts(agent):
+    with STATE.lock:
+        return [
+            {"address": address, "name": name}
+            for (holder, address), name in STATE.contacts.items()
+            if holder == agent
+        ]
 
 
 def direct(sender, other):

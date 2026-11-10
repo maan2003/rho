@@ -73,6 +73,9 @@ rho_rpc::calls! {
         DebugReport(DebugReport) -> camino::Utf8PathBuf;
         /// Refused, with the reason, while the host is in use.
         ShutdownIfIdle(ShutdownIfIdle) -> ();
+        GccpList(GccpList) -> GccpState;
+        GccpApprove(GccpApprove) -> ();
+        GccpRemove(GccpRemove) -> ();
     }
 }
 
@@ -132,10 +135,66 @@ pub struct IrohTrustInMemory {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohPair;
 
-/// Revokes persistent trust for an iroh client endpoint.
+/// Revokes what an iroh endpoint was approved as: a client's persistent
+/// trust, or a GCCP host's approval with every acceptance of an address on
+/// it.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohRevoke {
     pub endpoint_id: String,
+}
+
+/// Lists whom the host talks to over GCCP: the harnesses the user
+/// approved, and the addresses on them that agents accepted.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpList;
+
+/// What [`GccpList`] is answered with.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpState {
+    /// The host's own endpoint id, which another harness's owner approves;
+    /// `None` when the host has no iroh endpoint and so speaks no GCCP.
+    pub endpoint: Option<String>,
+    pub hosts: Vec<GccpHost>,
+    pub contacts: Vec<GccpContact>,
+}
+
+/// A harness the user approved.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpHost {
+    /// Its endpoint id: 64 lowercase hex digits.
+    pub endpoint: String,
+    /// What the user named it.
+    pub name: String,
+}
+
+/// One accepted GCCP address.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpContact {
+    /// The agent that accepted it, by its id.
+    pub agent: String,
+    /// `<endpoint id>/<local id>`.
+    pub address: String,
+    /// What the agent named it.
+    pub name: String,
+}
+
+/// Approves the harness at an endpoint as a GCCP host, under a name: the
+/// host's agents may accept addresses on it, and it may open GCCP
+/// connections. It is not a client of the host and gets nothing an
+/// `IrohApprove`d one does. Approving it again renames it. `IrohRevoke`
+/// takes the approval back.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpApprove {
+    pub endpoint: String,
+    pub name: String,
+}
+
+/// Takes back an agent's acceptance of a GCCP address: nothing more crosses
+/// between the two.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GccpRemove {
+    pub agent: String,
+    pub address: String,
 }
 
 /// Copies the agent host's database for inspection, as of its latest commit

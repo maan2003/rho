@@ -336,6 +336,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_address, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_accept, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_send, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_contacts, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
@@ -677,6 +681,68 @@ fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
     }
 }
 
+/// The agent's own address for agents on other hosts.
+#[pyfunction]
+fn external_address(py: Python<'_>, agent: &str) -> PyResult<String> {
+    match PyHost::block(py, PyRequest::ExternalAddress(agent_id(agent)?))? {
+        PyReply::Text(address) => Ok(address),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The agent accepts an address on another host under a name.
+#[pyfunction]
+fn external_accept(py: Python<'_>, agent: &str, address: String, name: String) -> PyResult<()> {
+    let request = PyRequest::ExternalAccept {
+        agent: agent_id(agent)?,
+        peer: address,
+        name,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The agent sends a message to an address it accepted, as an awaitable
+/// of the caller's loop: the name it gave the address, once that address's
+/// host took the message.
+#[pyfunction]
+fn external_send(
+    py: Python<'_>,
+    agent: &str,
+    address: String,
+    text: String,
+) -> PyResult<Py<PyAny>> {
+    let request = PyRequest::ExternalSend {
+        agent: agent_id(agent)?,
+        peer: address,
+        body: text,
+    };
+    later(py, request, |py, reply| match reply {
+        PyReply::Text(name) => Ok(name.into_pyobject(py)?.into_any()),
+        _ => Err(unexpected()),
+    })
+}
+
+/// The addresses the agent accepted, each a dict.
+#[pyfunction]
+fn external_contacts(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
+    match PyHost::block(py, PyRequest::ExternalContacts(agent_id(agent)?))? {
+        PyReply::ExternalContacts(contacts) => {
+            let out = pyo3::types::PyList::empty(py);
+            for contact in contacts {
+                let held = PyDict::new(py);
+                held.set_item("address", contact.peer.to_string())?;
+                held.set_item("name", contact.name)?;
+                out.append(held)?;
+            }
+            Ok(out.into_any().unbind())
+        }
+        _ => Err(unexpected()),
+    }
+}
+
 /// One message as a dict, or None.
 #[pyfunction]
 fn message(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
@@ -852,27 +918,38 @@ fn message_to_py<'py>(
 /// loop.
 #[pyfunction]
 fn inbox(py: Python<'_>, agent: &str, after: u64) -> PyResult<Py<PyAny>> {
-    let agent = agent_id(agent)?;
+    let request = PyRequest::Inbox {
+        agent: agent_id(agent)?,
+        after: ChatSeq(after),
+    };
+    later(py, request, |py, reply| match reply {
+        PyReply::Messages(messages) => messages
+            .iter()
+            .map(|message| message_to_py(py, message))
+            .collect::<PyResult<Vec<_>>>()
+            .and_then(|messages| Ok(PyList::new(py, messages)?.into_any())),
+        _ => Err(unexpected()),
+    })
+}
+
+/// A host call as an awaitable of the caller's loop: `value` makes what it
+/// resolves to from the host's reply, and a refusal raises `RuntimeError`
+/// in whoever awaits.
+fn later(
+    py: Python<'_>,
+    request: PyRequest,
+    value: impl for<'py> FnOnce(Python<'py>, PyReply) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
+) -> PyResult<Py<PyAny>> {
     let host = host()?;
     let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
     let future = event_loop.call_method0("create_future")?;
     let (event_loop, settle) = (event_loop.unbind(), future.clone().unbind());
     host.runtime.spawn(async move {
-        let reply = host
-            .call(PyRequest::Inbox {
-                agent,
-                after: ChatSeq(after),
-            })
-            .await;
+        let reply = host.call(request).await;
         Python::attach(|py| {
             let settle = settle.bind(py);
             let outcome = match reply {
-                Ok(PyReply::Messages(messages)) => messages
-                    .iter()
-                    .map(|message| message_to_py(py, message))
-                    .collect::<PyResult<Vec<_>>>()
-                    .and_then(|messages| Ok(PyList::new(py, messages)?.into_any())),
-                Ok(_) => Err(unexpected()),
+                Ok(reply) => value(py, reply),
                 Err(error) => Err(PyRuntimeError::new_err(format!("{error:#}"))),
             };
             let result = (|| -> PyResult<()> {

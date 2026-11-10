@@ -90,17 +90,36 @@ async fn authenticate_iroh_server(
     rho_iroh_auth::authenticate_server_connection(auth, connection, preapproved).await
 }
 
-/// Accepts iroh connections and exposes only peers that completed the
-/// explicit auth exchange with an approved endpoint identity.
+/// A connection from an endpoint the user approved, as what the user
+/// approved it for. The two never mix: a client that speaks GCCP and a GCCP
+/// host that speaks the application protocol are both turned away.
+#[cfg(feature = "server")]
+pub enum Accepted {
+    /// On the application ALPN, from an endpoint that completed the auth
+    /// exchange with an identity approved as a client.
+    Client(iroh::endpoint::Connection),
+    /// On the GCCP ALPN, from an endpoint approved as a GCCP host
+    /// ([`rho_iroh_auth::gccp_hosts`]). It must never reach the application
+    /// protocol.
+    GccpHost(iroh::endpoint::Connection),
+}
+
+/// Accepts iroh connections and exposes only those of endpoints the user
+/// approved ([`Accepted`]): on the application ALPN peers that completed the
+/// explicit auth exchange with an approved client identity, and on the GCCP
+/// ALPN approved GCCP hosts, which need no exchange because the handshake
+/// proves the endpoint id that was approved.
 ///
 /// Trusted reconnects bypass the enrollment semaphore. Unknown peers share a
 /// bounded admission pool and cannot invoke compressed application parsing.
 #[cfg(feature = "server")]
 pub struct AuthenticatedIrohListener {
     endpoint: iroh::Endpoint,
+    /// The application ALPN: the other one the endpoint serves is GCCP's.
+    alpn: Vec<u8>,
     auth: rho_iroh_auth::IrohAuth,
     enrollments: std::sync::Arc<tokio::sync::Semaphore>,
-    attempts: tokio::task::JoinSet<anyhow::Result<Option<iroh::endpoint::Connection>>>,
+    attempts: tokio::task::JoinSet<anyhow::Result<Option<Accepted>>>,
     accepting: bool,
     approved_bi_streams: u32,
 }
@@ -108,11 +127,14 @@ pub struct AuthenticatedIrohListener {
 #[cfg(feature = "server")]
 impl AuthenticatedIrohListener {
     /// Loads the persistent endpoint identity, configures the transport, and
-    /// binds an authenticated listener for the supplied application ALPN.
+    /// binds an authenticated listener for the supplied application ALPN,
+    /// and for `gccp_alpn`.
     pub async fn bind(
         db: rho_db::RhoDb,
         alpn: impl Into<Vec<u8>>,
+        gccp_alpn: impl Into<Vec<u8>>,
     ) -> anyhow::Result<(Self, rho_iroh_auth::IrohAuth)> {
+        let alpn = alpn.into();
         install_crypto_provider()?;
         let secret = load_or_create_server_secret(&db).await?;
         let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
@@ -128,16 +150,17 @@ impl AuthenticatedIrohListener {
             .keylog(std::env::var_os("SSLKEYLOGFILE").is_some())
             .secret_key(secret)
             .transport_config(transport.build())
-            .alpns(vec![alpn.into()])
+            .alpns(vec![alpn.clone(), gccp_alpn.into()])
             .bind()
             .await
             .context("bind authenticated iroh endpoint")?;
-        let listener = Self::new(endpoint, auth.clone(), 1024)?;
+        let listener = Self::new(endpoint, alpn, auth.clone(), 1024)?;
         Ok((listener, auth))
     }
 
     fn new(
         endpoint: iroh::Endpoint,
+        alpn: Vec<u8>,
         auth: rho_iroh_auth::IrohAuth,
         approved_bi_streams: u32,
     ) -> anyhow::Result<Self> {
@@ -151,6 +174,7 @@ impl AuthenticatedIrohListener {
         );
         Ok(Self {
             endpoint,
+            alpn,
             auth,
             enrollments: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             attempts: tokio::task::JoinSet::new(),
@@ -163,9 +187,14 @@ impl AuthenticatedIrohListener {
         self.endpoint.id()
     }
 
-    /// Returns the next approved connection. Individual handshake failures
+    /// The endpoint itself, for what the host dials out with its identity.
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        &self.endpoint
+    }
+
+    /// Returns the next connection to serve. Individual handshake failures
     /// are reported without stopping the listener.
-    pub async fn accept(&mut self) -> Option<anyhow::Result<iroh::endpoint::Connection>> {
+    pub async fn accept(&mut self) -> Option<anyhow::Result<Accepted>> {
         loop {
             if !self.accepting && self.attempts.is_empty() {
                 return None;
@@ -195,6 +224,7 @@ impl AuthenticatedIrohListener {
     fn spawn_attempt(&mut self, incoming: iroh::endpoint::Incoming) {
         self.attempts.spawn(authenticate_incoming_iroh(
             incoming,
+            self.alpn.clone(),
             self.auth.clone(),
             self.enrollments.clone(),
             self.approved_bi_streams,
@@ -246,8 +276,8 @@ async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh
 
 #[cfg(feature = "server")]
 fn finish_auth_attempt(
-    joined: Result<anyhow::Result<Option<iroh::endpoint::Connection>>, tokio::task::JoinError>,
-) -> Option<anyhow::Result<iroh::endpoint::Connection>> {
+    joined: Result<anyhow::Result<Option<Accepted>>, tokio::task::JoinError>,
+) -> Option<anyhow::Result<Accepted>> {
     match joined {
         Ok(Ok(Some(connection))) => Some(Ok(connection)),
         Ok(Ok(None)) => None,
@@ -261,11 +291,22 @@ fn finish_auth_attempt(
 #[cfg(feature = "server")]
 async fn authenticate_incoming_iroh(
     incoming: iroh::endpoint::Incoming,
+    alpn: Vec<u8>,
     auth: rho_iroh_auth::IrohAuth,
     enrollments: std::sync::Arc<tokio::sync::Semaphore>,
     approved_bi_streams: u32,
-) -> anyhow::Result<Option<iroh::endpoint::Connection>> {
+) -> anyhow::Result<Option<Accepted>> {
     let connection = incoming.await.context("accept iroh connection")?;
+    // The handshake settles on an ALPN the endpoint serves, so any other
+    // than the application's is GCCP's. A client is not a GCCP host: only
+    // the approval as one counts here.
+    if connection.alpn() != alpn.as_slice() {
+        if auth.is_gccp_host(connection.remote_id()).await {
+            return Ok(Some(Accepted::GccpHost(connection)));
+        }
+        connection.close(0u32.into(), b"");
+        return Ok(None);
+    }
     let preapproved = auth.preapprove_endpoint(connection.remote_id()).await;
     let enrollment_permit = if preapproved.is_some() {
         None
@@ -283,7 +324,7 @@ async fn authenticate_incoming_iroh(
         Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
             connection.set_max_concurrent_bi_streams(approved_bi_streams.into());
             drop(enrollment_permit);
-            Ok(Some(connection))
+            Ok(Some(Accepted::Client(connection)))
         }
         Ok(
             rho_iroh_auth::ServerAuthDecision::EnrollmentRequired(_)
@@ -809,6 +850,82 @@ mod tests {
         let second = load_or_create_server_secret(&db).await.unwrap();
 
         assert_eq!(first.public(), second.public());
+    }
+
+    /// Each approval is for its own protocol. A GCCP host gets through on
+    /// the GCCP ALPN and is a stranger on the application's; a client gets
+    /// through on the application ALPN and is a stranger on GCCP's; an
+    /// endpoint nobody approved gets through on neither.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn an_endpoint_gets_through_only_as_what_it_was_approved_for() -> anyhow::Result<()> {
+        install_crypto_provider()?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let temp = tempfile::tempdir()?;
+            let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+            let secret = load_or_create_server_secret(&db).await?;
+            let auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .secret_key(secret)
+                .alpns(vec![b"app".to_vec(), b"gccp".to_vec()])
+                .bind()
+                .await?;
+            let address = endpoint.addr();
+            let mut listener =
+                AuthenticatedIrohListener::new(endpoint, b"app".to_vec(), auth.clone(), 4)?;
+            let (accepted, mut through) = tokio::sync::mpsc::unbounded_channel();
+            let listening = tokio::spawn(async move {
+                while let Some(next) = listener.accept().await {
+                    if let Ok(next) = next {
+                        accepted.send(next).unwrap();
+                    }
+                }
+            });
+            let bind = || iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay).bind();
+            let (stranger, host, client) = (bind().await?, bind().await?, bind().await?);
+            {
+                let mut write = db.write().await;
+                rho_iroh_auth::gccp_hosts::init(&mut write);
+                rho_iroh_auth::gccp_hosts::approve(&mut write, host.id().as_bytes(), "a".into());
+                write.commit();
+            }
+            auth.trust_in_memory(client.id()).await;
+
+            // On the GCCP ALPN: the host alone.
+            for (endpoint, approved) in [(&stranger, false), (&client, false), (&host, true)] {
+                let connection = endpoint.connect(address.clone(), b"gccp").await?;
+                if approved {
+                    let Some(Accepted::GccpHost(accepted)) = through.recv().await else {
+                        panic!("a GCCP host did not get through as one");
+                    };
+                    assert_eq!(accepted.remote_id(), endpoint.id());
+                } else {
+                    connection.closed().await;
+                }
+            }
+            // On the application ALPN: the client alone.
+            for (endpoint, approved) in [(&stranger, false), (&host, false), (&client, true)] {
+                let connection = endpoint.connect(address.clone(), b"app").await?;
+                let said = authenticate_iroh_client(&connection, endpoint.id(), None).await?;
+                if approved {
+                    assert_eq!(said, rho_iroh_auth::ClientAuthResult::Approved);
+                    let Some(Accepted::Client(accepted)) = through.recv().await else {
+                        panic!("a client did not get through as one");
+                    };
+                    assert_eq!(accepted.remote_id(), endpoint.id());
+                } else {
+                    assert!(
+                        matches!(said, rho_iroh_auth::ClientAuthResult::EnrollmentRequired(_)),
+                        "{said:?}"
+                    );
+                    connection.closed().await;
+                }
+            }
+            assert!(through.try_recv().is_err(), "nothing else got through");
+            listening.abort();
+            Ok(())
+        })
+        .await?
     }
 
     #[tokio::test]

@@ -905,7 +905,7 @@ async fn connect_iroh(
             if matches!(access, IrohAccess::Fido | IrohAccess::Link { .. }) =>
         {
             events.unbounded_send(ConnEvent::Disconnected(format!(
-                "enroll this rho on the host: rho iroh approve {code}"
+                "enroll this rho on the host: rho iroh approve --role client {code}"
             )))?;
             // The server closes after our auth ack. Keep the per-connection
             // code visible long enough for approval, without racing
