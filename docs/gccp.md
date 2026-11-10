@@ -112,15 +112,13 @@ and finishes its side:
 ### Sending again
 
 A harness may send a message again, for example when the result was lost.
-Three rules keep a message from being stored twice.
+The `id` keeps the message from being stored twice.
 
 - A message sent again must carry the same `id`.
-- A harness must not send a message from one address to another until it is
-  done with the one before it: it has a result, or the harness gave up on
-  it. So messages arrive in the order they were sent, and only the newest
-  can come twice.
-- A harness that gets the newest message it stored from an address again
-  must return `delivered` and must not store it twice.
+- A harness that gets a message it remembers from that address by its `id`
+  must return `delivered` and must not store it again.
+- A harness chooses how many ids it remembers and for how long. So a
+  message sent again long after the first time can be stored twice.
 
 ## What a harness may do
 
@@ -164,6 +162,9 @@ owner a way to see and take back what was accepted.
 
 ### Try a few times, then tell the clanker
 
+- The sending harness sends one message at a time from one address to
+  another: the next one only when it has a result for the one before, or
+  gave up on it. So messages arrive in the order they were written.
 - After `refused` the sending harness does not try again. It tells its
   clanker at once.
 - When the other harness cannot be reached, or gives no result, the sending
@@ -176,6 +177,10 @@ owner a way to see and take back what was accepted.
 - The clanker decides if and when to send again. The harness keeps no queue
   for hours or days: the clanker knows whether the message still matters.
 - It says nothing when a message goes through.
+- The receiving harness remembers the ids of the last few hundred messages
+  it stored. It keeps them in memory only: every sender gives up within
+  minutes, so an older id never comes again. After a restart it remembers
+  none, and a message sent again across the restart is stored twice.
 
 There is no call and no session. A connection is only how bytes travel:
 either harness may close one at any time, and a clanker is never told that
