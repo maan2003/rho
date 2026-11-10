@@ -166,12 +166,10 @@ length as an unsigned 16-bit integer, and then the map of
 The opening harness may write bytes after the header before it has the
 result. A harness that refuses the stream discards them.
 
-A harness finishes its side of the stream when its end has no more bytes to
-send, and the stream is over when both sides have finished. To end a stream
-early, a harness resets it, with 0 as iroh's stream error code.
-
-A byte stream ends with its connection, and nothing resumes it or sends it
-again: whoever used it opens a new one.
+After the result the protocol says no more. What the bytes mean, and when
+and how each side ends the stream, is between the service and whoever uses
+it: the harnesses only pass that on. Nothing resumes a byte stream that
+broke.
 
 ## What a harness may do
 
