@@ -748,17 +748,20 @@ async fn gccp_two_hosts() {
         .collect();
     assert_eq!(order, ["ping one", "ping two"]);
 
-    // A message sent twice arrives once; the same sender name from another
-    // host is a stranger.
-    let pong = sent
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|sent| sent.body == "pong")
-        .unwrap()
-        .clone();
+    // A message sent twice arrives once, and not only the newest one of
+    // its conversation; the same sender name from another host is a
+    // stranger.
+    let copy = |body: &str| {
+        let sent = sent.lock().unwrap();
+        sent.iter().find(|sent| sent.body == body).unwrap().clone()
+    };
+    let pong = copy("pong");
     assert_eq!(
         here.gccp_receive(THERE, pong.clone()).await,
+        MessageResult::Delivered
+    );
+    assert_eq!(
+        there.gccp_receive(HERE, copy("ping one")).await,
         MessageResult::Delivered
     );
     assert_eq!(

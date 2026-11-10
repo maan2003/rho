@@ -630,14 +630,10 @@ fn peer(endpoint: u8, local: &str) -> rho_agent_types::PeerAddress {
     }
 }
 
-fn text(text: &str) -> Vec<ContentPart> {
-    vec![ContentPart::Text { text: text.into() }]
-}
-
 /// A peer conversation is its agent's and its peer's alone. What the agent
-/// posts in it waits to be sent, oldest first; what the peer sent is
-/// stored once and reaches only the agent, with no more authority than
-/// another agent's message. Taking the acceptance back closes it both ways.
+/// posts in it waits to be sent, oldest first; what the peer sent reaches
+/// only the agent, with no more authority than another agent's message.
+/// Taking the acceptance back closes it both ways.
 #[tokio::test]
 async fn chat_peer_conversations() {
     let (_dir, db) = db().await;
@@ -689,25 +685,14 @@ async fn chat_peer_conversations() {
         .post(UnixMs(3), topic, said(Address::Agent(a), "one"), None)
         .unwrap();
     let heard = write
-        .receive_peer(UnixMs(4), topic, 70, text("hello"))
-        .unwrap()
-        .expect("a new id is stored");
+        .post(UnixMs(4), topic, said(Address::Peer, "hello"), None)
+        .unwrap();
     let second = write
         .post(UnixMs(5), topic, said(Address::Agent(a), "two"), None)
         .unwrap();
-    let head = db_head(&mut write);
-    assert_eq!(
-        write
-            .receive_peer(UnixMs(6), topic, 70, text("hello"))
-            .unwrap(),
-        None,
-        "the newest id again is the same message"
-    );
-    assert_eq!(db_head(&mut write), head);
     let later = write
-        .receive_peer(UnixMs(6), topic, 3, text("again"))
-        .unwrap()
-        .expect("ids need not grow");
+        .post(UnixMs(6), topic, said(Address::Peer, "again"), None)
+        .unwrap();
 
     for (from, why) in [
         (Address::Agent(b), "another agent"),
@@ -827,7 +812,7 @@ async fn chat_peer_conversations() {
     );
     assert!(
         write
-            .receive_peer(UnixMs(10), topic, 71, text("x"))
+            .post(UnixMs(10), topic, said(Address::Peer, "x"), None)
             .is_err(),
         "and nothing more comes in"
     );
@@ -837,13 +822,6 @@ async fn chat_peer_conversations() {
         .accept_peer(UnixMs(11), a, dpc.clone(), "dpc, again".into())
         .unwrap();
     assert_ne!(again, topic, "accepting after a removal starts anew");
-    assert!(
-        write
-            .receive_peer(UnixMs(12), again, 3, text("fresh"))
-            .unwrap()
-            .is_some(),
-        "the new conversation remembers no id of the old one"
-    );
     write.commit();
 
     let read = db.read();

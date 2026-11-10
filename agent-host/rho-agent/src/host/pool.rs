@@ -62,6 +62,9 @@ pub struct AgentPool {
     /// The host's iroh endpoint id, once it has one: where GCCP reaches its
     /// agents.
     endpoint: std::sync::OnceLock<[u8; 32]>,
+    /// The GCCP messages stored last, so that one sent again is not stored
+    /// twice.
+    gccp_stored: std::sync::Mutex<gccp::Stored>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -144,6 +147,7 @@ impl AgentPool {
             claude,
             init,
             endpoint: std::sync::OnceLock::new(),
+            gccp_stored: std::sync::Mutex::default(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),

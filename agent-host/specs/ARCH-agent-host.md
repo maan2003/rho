@@ -89,11 +89,13 @@ conversation, which is like a direct one with a single member: the agent. The
 other side is the address. What the agent posts there is what the host sends,
 in order, and a cursor beside the log says how far the peer's harness has
 taken it. What that harness sends is posted there as from the peer and
-delivered like any message, as input with no authority. The host takes a
-message only for an agent that accepted the sender's address; it refuses
-everything else and logs nothing. Nothing asks the user: they see what agents
-accepted, and take an acceptance back, with `rho gccp`. A conversation taken
-back keeps its messages and carries no more.
+delivered like any message, as input with no authority. The host keeps the
+ids of the messages it posted last in memory, and posts none of them twice;
+after a restart it knows none, so a message sent again across one is posted
+twice. The host takes a message only for an agent that accepted the sender's
+address; it refuses everything else and logs nothing. Nothing asks the user:
+they see what agents accepted, and take an acceptance back, with `rho gccp`. A
+conversation taken back keeps its messages and carries no more.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move

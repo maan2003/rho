@@ -38,9 +38,6 @@ const PEERS: TableDefinition<(AgentId, String), u64> = TableDefinition::new("cha
 /// done with, delivered to the peer or given up on. The ones after it are
 /// still to send, so the log is the outbox.
 const PEER_SENT: TableDefinition<u64, u64> = TableDefinition::new("chat_peer_sent");
-/// By peer conversation: the id the peer gave the newest message stored
-/// from it. A peer sends in order, so only its newest can come twice.
-const PEER_RECEIVED: TableDefinition<u64, u64> = TableDefinition::new("chat_peer_received");
 
 /// Where a conversation is.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -380,15 +377,6 @@ pub trait ChatWrite {
     /// The agent's messages in `topic` up to `message` are done with:
     /// delivered, or given up on and never sent.
     fn peer_sent(&mut self, topic: TopicId, message: MessageId);
-    /// Stores what the peer of `topic` sent under its own `id`; `None` for
-    /// its newest come again.
-    fn receive_peer(
-        &mut self,
-        at: UnixMs,
-        topic: TopicId,
-        id: u64,
-        content: Vec<ContentPart>,
-    ) -> anyhow::Result<Option<MessageId>>;
     fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead>;
     fn chat_stream_named(&mut self, name: &str) -> Option<StreamId>;
 }
@@ -444,7 +432,6 @@ impl ChatWrite for WriteTxn {
         self.open_table(MOVED);
         self.open_table(PEERS);
         self.open_table(PEER_SENT);
-        self.open_table(PEER_RECEIVED);
     }
 
     fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId> {
@@ -856,7 +843,6 @@ impl ChatWrite for WriteTxn {
             .insert(topic.0.0, SenValue::borrowed(&head));
         self.open_table(PEERS).remove(key);
         self.open_table(PEER_SENT).remove(topic.0.0);
-        self.open_table(PEER_RECEIVED).remove(topic.0.0);
         Ok(())
     }
 
@@ -875,30 +861,6 @@ impl ChatWrite for WriteTxn {
         {
             sent.insert(topic.0.0, message.0.0);
         }
-    }
-
-    fn receive_peer(
-        &mut self,
-        at: UnixMs,
-        topic: TopicId,
-        id: u64,
-        content: Vec<ContentPart>,
-    ) -> anyhow::Result<Option<MessageId>> {
-        if self
-            .open_table(PEER_RECEIVED)
-            .get(topic.0.0)
-            .is_some_and(|newest| newest.value() == id)
-        {
-            return Ok(None);
-        }
-        let message = NewMessage {
-            from: Address::Peer,
-            mentions: Vec::new(),
-            content,
-        };
-        let message = self.post(at, topic, message, None)?;
-        self.open_table(PEER_RECEIVED).insert(topic.0.0, id);
-        Ok(Some(message))
     }
 
     fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead> {

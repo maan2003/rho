@@ -8,7 +8,7 @@
 //! wire is whoever carries it ([`Transport`]): this module never sees a
 //! connection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,13 +16,13 @@ use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use rho_agent_types::{
-    AgentId, ContentPart, LocalId, MessageId, PeerAddress, Role, TopicId, UnixMs,
+    Address, AgentId, ContentPart, LocalId, MessageId, PeerAddress, Role, TopicId, UnixMs,
 };
 
 use super::AgentPool;
 use crate::ipc::protocol::Control;
 use crate::store::{
-    Appended, ChatRead as _, ChatWrite as _, PeerContact, PeerOutgoing, StoreRead as _,
+    Appended, ChatRead as _, ChatWrite as _, NewMessage, PeerContact, PeerOutgoing, StoreRead as _,
 };
 
 /// One message as GCCP carries it. The harness it is from is not in it: the
@@ -67,6 +67,33 @@ pub const MAX_BODY_LEN: usize = 64 * 1024;
 pub const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(120)];
 /// How long one try may take before the harness counts as unreachable.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many stored messages the host remembers the ids of. A harness that
+/// got no result sends a message again within minutes or not at all, so a
+/// copy finds its id here unless this many messages came in between.
+const STORED_IDS: usize = 256;
+
+/// The messages stored last, each as its conversation and the id its sender
+/// gave it. A message sent again is known by it and not stored twice.
+///
+/// It is memory and no more: a host that restarted knows no ids, and a
+/// message sent again across the restart is stored twice. That is the price
+/// of a receiver that keeps nothing on disk for the protocol.
+#[derive(Default)]
+pub(super) struct Stored(VecDeque<(TopicId, u64)>);
+
+impl Stored {
+    fn has(&self, topic: TopicId, id: u64) -> bool {
+        self.0.contains(&(topic, id))
+    }
+
+    fn remember(&mut self, topic: TopicId, id: u64) {
+        if self.0.len() == STORED_IDS {
+            self.0.pop_front();
+        }
+        self.0.push_back((topic, id));
+    }
+}
 
 /// A message whose harness could not be reached, and when it is tried next.
 struct Retry {
@@ -191,17 +218,26 @@ impl AgentPool {
             return MessageResult::Refused;
         };
         drop(read);
-        let content = vec![ContentPart::Text { text: body }];
+        let message = NewMessage {
+            from: Address::Peer,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text { text: body }],
+        };
+        // One write at a time, so two copies that come at once are one
+        // message too.
         let mut write = self.db.write().await;
+        if self.gccp_stored.lock().expect("poison").has(topic, id) {
+            // Stored already: the result of the first copy was lost.
+            return MessageResult::Delivered;
+        }
         // The write refuses a conversation closed since the read.
-        match write.receive_peer(UnixMs::now(), topic, id, content) {
-            Ok(Some(message)) => {
+        match write.post(UnixMs::now(), topic, message, None) {
+            Ok(message) => {
                 write.commit();
+                self.gccp_stored.lock().expect("poison").remember(topic, id);
                 self.wake_receivers(message, None);
                 MessageResult::Delivered
             }
-            // Its newest again: the result of the first was lost.
-            Ok(None) => MessageResult::Delivered,
             Err(_) => MessageResult::Refused,
         }
     }
@@ -394,6 +430,26 @@ enum Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message is known for as long as fewer than `STORED_IDS` came after
+    /// it, in its own conversation only, and the memory does not grow.
+    #[test]
+    fn the_last_stored_ids_are_remembered() {
+        let topic = |seq| TopicId(rho_agent_types::ChatSeq(seq));
+        let mut stored = Stored::default();
+        stored.remember(topic(1), 7);
+        assert!(stored.has(topic(1), 7));
+        assert!(!stored.has(topic(2), 7), "an id is its conversation's");
+        assert!(!stored.has(topic(1), 8));
+        for id in 0..STORED_IDS as u64 - 1 {
+            stored.remember(topic(2), id);
+        }
+        assert!(stored.has(topic(1), 7), "the oldest of the ids kept");
+        stored.remember(topic(2), u64::MAX);
+        assert!(!stored.has(topic(1), 7), "one more forgets it");
+        assert!(stored.has(topic(2), 0));
+        assert_eq!(stored.0.len(), STORED_IDS);
+    }
 
     /// Every agent has an address, and the address names no other agent.
     #[test]
