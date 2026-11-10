@@ -84,11 +84,14 @@ CBOR map and finishes its side of the stream:
 | ------ | --------------------------------------------------------------- |
 | `to`   | Text: the recipient's local id.                                 |
 | `from` | Text: the sender's local id.                                    |
-| `id`   | Unsigned integer below 2^64, never used again for this address. |
+| `id`   | Unsigned integer below 2^64, new for each message.              |
 | `body` | Text, not blank, of at most 65536 bytes of UTF-8.               |
 
 The address a message is from is the sending endpoint's id and `from`. The
 address it is to is the receiving endpoint's id and `to`.
+
+An `id` has to differ only from the others that the same address sent
+lately, so a random number will do.
 
 A receiver must ignore keys it does not know.
 
@@ -140,7 +143,7 @@ A clanker accepts an address, and gives it a name:
     clanker A: accept(<endpoint 2>/<local 2>, "B's owner's clanker")
     clanker B: accept(<endpoint 1>/<local 1>, "A's owner's clanker")
 
-Accepting is the whole permission model.
+Accepting is the permission model.
 
 - The harness delivers a message only when its recipient has accepted the
   sender's address. It refuses everything else.
@@ -162,25 +165,21 @@ Accepting an address trusts its whole harness not to lie about which of its
 clankers is speaking, because the endpoint is all that the transport proves.
 
 The harness decides who may call `accept` for a clanker, and gives the
-owner a way to see and take back what was accepted.
+owner a way to see and take back what was accepted. It can ask for more: for
+example, that the owner approves another harness before a clanker may accept
+an address on it.
 
 ### Try a few times, then tell the clanker
 
-- The sending harness sends one message at a time from one address to
-  another: the next one only when it has a result for the one before, or
-  gave up on it. So messages arrive in the order they were written.
-- After a refusal the sending harness does not try again. It tells its
-  clanker at once.
+- After a refusal the sending harness does not try again.
 - When the other harness cannot be reached, or gives no result, the sending
   harness tries again a few times over a few minutes: for example after one
   minute, and then after two more. Then it gives up.
-- When it gives up on a message, it drops that message and the ones its
-  clanker wrote after it to the same address, and tells its clanker which.
-  It says whether the other harness refused or was not reached. After no
-  result, the message may still have arrived.
+- The harness tells its clanker that the message did not go through, and
+  whether the other harness refused it or was not reached. After no result,
+  the message may still have arrived.
 - The clanker decides if and when to send again. The harness keeps no queue
   for hours or days: the clanker knows whether the message still matters.
-- It says nothing when a message goes through.
 - The receiving harness remembers the ids of the last few hundred messages
   it stored. It keeps them in memory only: every sender gives up within
   minutes, so an older id never comes again. After a restart it remembers
