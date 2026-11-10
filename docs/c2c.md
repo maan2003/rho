@@ -10,7 +10,7 @@ and often offline.
 
 C2C (clanker to clanker) lets a clanker on one harness send a message to a
 clanker on another, whoever built either harness. It is mail for clankers:
-an address, a message, and an answer that says whether the message was
+an address, a message, and a result that says whether the message was
 taken.
 
 This document has two parts.
@@ -66,34 +66,39 @@ address it is to is the receiving endpoint's id and `to`.
 
 A receiver must ignore keys it does not know.
 
-### Answers
+### Results
 
-The receiving harness answers on the same stream with one CBOR map, and
-finishes its side:
+Every message has a result, which says what the receiving harness did with
+it. It is not a reply from the recipient: a clanker that wants to reply
+sends a message of its own.
+
+The receiving harness writes the result on the same stream as one CBOR map,
+and finishes its side:
 
 | Key      | Value                           |
 | -------- | ------------------------------- |
-| `answer` | Text: `delivered` or `refused`. |
+| `result` | Text: `delivered` or `refused`. |
 
 - `delivered` means the receiving harness has stored the message for its
   recipient. It does not mean that the recipient has read it.
 - `refused` means the receiving harness did not take the message. It gives
-  no reason, and a harness may refuse any message. A harness must answer
-  `refused` to what it cannot read as a message.
-- With no answer, or one it does not know, the sending harness cannot tell
+  no reason, and a harness may refuse any message. A harness must return
+  `refused` for what it cannot read as a message.
+- With no result, or one it does not know, the sending harness cannot tell
   whether the message was stored.
 
 ### Sending again
 
-A harness may send a message again, for example when the answer was lost.
+A harness may send a message again, for example when the result was lost.
 Three rules keep a message from being stored twice.
 
 - A message sent again must carry the same `id`.
 - A harness must not send a message from one address to another until it is
-  done with the one before it: answered, or given up on. So messages arrive
-  in the order they were sent, and only the newest can come twice.
+  done with the one before it: it has a result, or the harness gave up on
+  it. So messages arrive in the order they were sent, and only the newest
+  can come twice.
 - A harness that gets the newest message it stored from an address again
-  must answer `delivered` and must not store it twice.
+  must return `delivered` and must not store it twice.
 
 ## What a harness may do
 
@@ -135,7 +140,7 @@ clankers is speaking, because the endpoint is all that the transport proves.
 The harness decides who may call `accept` for a clanker, and gives the
 owner a way to see and take back what was accepted.
 
-### Keep a message until it is answered
+### Keep a message until it has a result
 
 - The sending harness keeps a message and tries again while the other
   harness cannot be reached, with longer waits between tries.
