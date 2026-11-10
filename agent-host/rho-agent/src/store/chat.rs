@@ -81,11 +81,15 @@ impl Place {
 pub struct PeerOutgoing {
     pub topic: TopicId,
     pub message: MessageId,
-    pub at: UnixMs,
     pub agent: AgentId,
     pub peer: PeerAddress,
     pub name: String,
     pub content: Vec<ContentPart>,
+    /// The newest of the agent's messages that wait with this one, which is
+    /// this one when none do.
+    pub newest: MessageId,
+    /// How many wait, this one among them.
+    pub waiting: u64,
 }
 
 /// An open peer conversation.
@@ -246,15 +250,19 @@ impl ChatRead for ReadTxn {
         self.peers()
             .into_iter()
             .filter_map(|contact| {
-                let message = self.peer_unsent(contact.topic, contact.agent).next()?;
+                let mut unsent = self.peer_unsent(contact.topic, contact.agent);
+                let message = unsent.next()?;
+                let (newest, after) =
+                    unsent.fold((message.id, 0), |(_, after), later| (later.id, after + 1));
                 Some(PeerOutgoing {
                     topic: contact.topic,
                     message: message.id,
-                    at: message.at,
                     agent: contact.agent,
                     peer: contact.peer,
                     name: contact.name,
                     content: message.content,
+                    newest,
+                    waiting: after + 1,
                 })
             })
             .collect()
@@ -370,7 +378,7 @@ pub trait ChatWrite {
     /// Takes back the acceptance behind an open peer conversation.
     fn remove_peer(&mut self, at: UnixMs, topic: TopicId) -> anyhow::Result<()>;
     /// The agent's messages in `topic` up to `message` are done with:
-    /// delivered, or given up on.
+    /// delivered, or given up on and never sent.
     fn peer_sent(&mut self, topic: TopicId, message: MessageId);
     /// Stores what the peer of `topic` sent under its own `id`; `None` for
     /// its newest come again.

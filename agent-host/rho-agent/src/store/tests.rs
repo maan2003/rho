@@ -775,6 +775,11 @@ async fn chat_peer_conversations() {
     );
     assert_eq!(outgoing[0].peer, dpc);
     assert_eq!(outgoing[0].name, "dpc's agent");
+    assert_eq!(
+        (outgoing[0].newest, outgoing[0].waiting),
+        (second, 2),
+        "the agent's own that wait, not what the peer sent between"
+    );
     let unsent = |read: &rho_db::ReadTxn| -> Vec<(AgentId, u64)> {
         let mut unsent: Vec<_> = read
             .peers()
@@ -791,9 +796,10 @@ async fn chat_peer_conversations() {
     write.peer_sent(topic, first);
     write.commit();
     let read = db.read();
+    let next = &read.peer_outgoing()[0];
     assert_eq!(
-        read.peer_outgoing()[0].message,
-        second,
+        (next.message, next.newest, next.waiting),
+        (second, second, 1),
         "then the next of the agent's, past what the peer sent between"
     );
     drop(read);

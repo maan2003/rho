@@ -61,27 +61,18 @@ pub trait Transport: Send + Sync + 'static {
 
 /// The longest body C2C carries, in bytes of UTF-8.
 pub const MAX_BODY_LEN: usize = 64 * 1024;
-/// How long a message a peer keeps refusing is tried before the agent is
-/// told it bounced: the peer may accept later.
-const REFUSED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
-/// The wait before a second try; each later one waits twice as long, up
-/// to [`MAX_RETRY`].
-const FIRST_RETRY: Duration = Duration::from_secs(5);
-const MAX_RETRY: Duration = Duration::from_secs(10 * 60);
+/// The waits before the second and the third try at a message whose
+/// harness could not be reached. After the last the message is given up on:
+/// an agent that is told so decides better than a queue when to send again.
+pub const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(120)];
 /// How long one try may take before the harness counts as unreachable.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A message that did not go through, and when it is tried next.
+/// A message whose harness could not be reached, and when it is tried next.
 struct Retry {
     message: MessageId,
-    failures: u32,
+    failures: usize,
     at: Instant,
-}
-
-fn retry_wait(failures: u32) -> Duration {
-    FIRST_RETRY
-        .saturating_mul(1 << failures.saturating_sub(1).min(16))
-        .min(MAX_RETRY)
 }
 
 /// An agent's id as the local id of its address.
@@ -219,7 +210,17 @@ impl AgentPool {
     /// the host runs: each conversation's messages in order, the next only
     /// once the peer's harness took the one before. Conversations do not
     /// wait for each other.
-    pub async fn c2c_send(self: &Arc<Self>, transport: Arc<dyn Transport>) {
+    ///
+    /// A message its harness refuses is given up on at once. One whose
+    /// harness cannot be reached is tried again after each of `retry_waits`
+    /// and then given up on. Giving up drops the message and all that wait
+    /// behind it, which were written on top of it, and tells the agent: it
+    /// sends again if and when it wants to.
+    pub async fn c2c_send(
+        self: &Arc<Self>,
+        transport: Arc<dyn Transport>,
+        retry_waits: &'static [Duration],
+    ) {
         let mut feed = crate::store::feed(&self.db);
         let mut flying = futures::stream::FuturesUnordered::new();
         let mut busy: HashSet<TopicId> = HashSet::new();
@@ -267,7 +268,7 @@ impl AgentPool {
                 tokio::select! {
                     Some((out, result)) = flying.next() => {
                         busy.remove(&out.topic);
-                        self.peer_tried(&mut retries, out, result).await;
+                        self.peer_tried(&mut retries, retry_waits, out, result).await;
                         break;
                     }
                     appended = feed.recv() => match appended {
@@ -286,76 +287,83 @@ impl AgentPool {
     async fn peer_tried(
         self: &Arc<Self>,
         retries: &mut HashMap<TopicId, Retry>,
+        retry_waits: &[Duration],
         out: PeerOutgoing,
         result: anyhow::Result<MessageResult>,
     ) {
-        let refused = match result {
+        let failure = match result {
             Ok(MessageResult::Delivered) => {
-                self.peer_done(&out).await;
+                let mut write = self.db.write().await;
+                write.peer_sent(out.topic, out.message);
+                write.commit();
                 return;
             }
-            Ok(MessageResult::Refused) => true,
-            Err(_) => false,
+            Ok(MessageResult::Refused) => Failure::Refused,
+            Err(_) => {
+                let retry = retries.entry(out.topic).or_insert(Retry {
+                    message: out.message,
+                    failures: 0,
+                    at: Instant::now(),
+                });
+                retry.failures += 1;
+                if let Some(wait) = retry_waits.get(retry.failures - 1) {
+                    retry.at = Instant::now() + *wait;
+                    return;
+                }
+                Failure::Unreachable {
+                    tries: retry.failures,
+                }
+            }
         };
-        let waited = Duration::from_millis(UnixMs::now().0.saturating_sub(out.at.0));
-        if refused && waited >= REFUSED_FOR {
-            self.peer_done(&out).await;
-            self.peer_notice(&out, Notice::Bounced).await;
+        self.peer_give_up(out, failure).await;
+    }
+
+    /// Drops `out` and what waits behind it, and tells the agent why.
+    async fn peer_give_up(self: &Arc<Self>, out: PeerOutgoing, failure: Failure) {
+        // What waits now, not what did when the try began.
+        let waiting = self.db.read().peer_outgoing();
+        let Some(out) = waiting
+            .into_iter()
+            .find(|waits| waits.topic == out.topic && waits.message == out.message)
+        else {
+            // Its acceptance was taken back meanwhile, and its messages with
+            // it.
             return;
+        };
+        {
+            let mut write = self.db.write().await;
+            write.peer_sent(out.topic, out.newest);
+            write.commit();
         }
-        let retry = retries.entry(out.topic).or_insert(Retry {
-            message: out.message,
-            failures: 0,
-            at: Instant::now(),
-        });
-        retry.failures += 1;
-        retry.at = Instant::now() + retry_wait(retry.failures);
-        if retry.failures == 1 {
-            let notice = if refused {
-                Notice::Refused
-            } else {
-                Notice::Unreachable
-            };
-            self.peer_notice(&out, notice).await;
-        }
-    }
-
-    /// `out` is done with: delivered, or given up on.
-    async fn peer_done(&self, out: &PeerOutgoing) {
-        let mut write = self.db.write().await;
-        write.peer_sent(out.topic, out.message);
-        write.commit();
-    }
-
-    /// Tells the agent what became of a message it sent a peer. It is told
-    /// once that a message waits, and once that one bounced: a message that
-    /// goes through says nothing.
-    async fn peer_notice(self: &Arc<Self>, out: &PeerOutgoing, notice: Notice) {
         let to = format!("{} ({})", out.name, out.peer);
-        let text = match notice {
-            Notice::Refused => {
+        let why = match failure {
+            Failure::Refused => {
                 let own = self
                     .address_of(out.agent)
                     .map_or_else(|_| "your address".to_owned(), |own| own.to_string());
                 format!(
-                    "[message to {to} not delivered yet]\nIts host refused the message: it has \
-                     not accepted your address {own}, or there is no such address. rho keeps \
-                     trying for 24 hours; the messages you send it meanwhile wait behind this one."
+                    "[message to {to} refused]\nIts host did not take the message: it has not \
+                     accepted your address {own}, or there is no such address."
                 )
             }
-            Notice::Unreachable => format!(
-                "[message to {to} not delivered yet]\nIts host cannot be reached now. rho keeps \
-                 trying; the messages you send it meanwhile wait behind this one."
-            ),
-            Notice::Bounced => format!(
-                "[message to {to} bounced]\nIts host refused the message for 24 hours, so rho \
-                 dropped it. The message began: {}",
-                rho_agent_types::transcript::text_content(&out.content)
-                    .chars()
-                    .take(200)
-                    .collect::<String>()
+            Failure::Unreachable { tries } => format!(
+                "[message to {to} not delivered]\nIts host could not be reached, or gave no \
+                 result, in {tries} tries."
             ),
         };
+        let began: String = rho_agent_types::transcript::text_content(&out.content)
+            .chars()
+            .take(200)
+            .collect();
+        let dropped = match out.waiting - 1 {
+            0 => "The message was dropped".to_owned(),
+            1 => "It and the message you sent after it were dropped".to_owned(),
+            after => format!("It and the {after} messages you sent after it were dropped"),
+        };
+        let text = format!(
+            "{why} {dropped}: nothing is tried again. Send again if and when it is worth it. \
+             The message began: {began}"
+        );
         let input = Control::Input {
             content: vec![ContentPart::Text { text }],
             role: Role::Tool,
@@ -375,11 +383,12 @@ impl AgentPool {
     }
 }
 
-/// What an agent is told of a message it sent a peer.
-enum Notice {
+/// Why a message is given up on.
+enum Failure {
+    /// Its harness did not take it.
     Refused,
-    Unreachable,
-    Bounced,
+    /// Its harness was not reached, or gave no result, this many times.
+    Unreachable { tries: usize },
 }
 
 #[cfg(test)]
@@ -400,13 +409,5 @@ mod tests {
                 assert_eq!(AgentId::from_encoded(local.as_str()).ok(), Some(agent));
             }
         }
-    }
-
-    #[test]
-    fn retries_wait_longer_up_to_a_limit() {
-        let waits: Vec<u64> = [1, 2, 3, 7, 8, 9, 40, u32::MAX]
-            .map(|failures| retry_wait(failures).as_secs())
-            .to_vec();
-        assert_eq!(waits, [5, 10, 20, 320, 600, 600, 600, 600]);
     }
 }

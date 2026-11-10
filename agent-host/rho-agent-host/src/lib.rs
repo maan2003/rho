@@ -935,7 +935,10 @@ async fn run_iroh_listener(
     let c2c_sender = tokio::spawn({
         let pool = services.pool.clone();
         let transport = Arc::new(c2c::IrohTransport::new(listener.endpoint().clone()));
-        async move { pool.c2c_send(transport).await }
+        async move {
+            pool.c2c_send(transport, &rho_agent::host::pool::RETRY_WAITS)
+                .await
+        }
     });
     let c2c_connections = Arc::new(tokio::sync::Semaphore::new(c2c::MAX_CONNECTIONS));
     while let Some(accepted) = tokio::select! {

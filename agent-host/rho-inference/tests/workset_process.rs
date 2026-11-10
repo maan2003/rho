@@ -616,7 +616,9 @@ async fn c2c_two_hosts() {
             sent: sent.clone(),
         });
         let pool = pool.clone();
-        tokio::spawn(async move { pool.c2c_send(wires).await })
+        // The waits of a real host are minutes.
+        const WAITS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(400)];
+        tokio::spawn(async move { pool.c2c_send(wires, &WAITS).await })
     });
 
     // Each agent has ended a turn, so it waits inside an open call.
@@ -665,8 +667,8 @@ async fn c2c_two_hosts() {
     .unwrap_err();
     assert!(own.contains("on this host"), "{own}");
 
-    // Ann accepts Bob and writes; Bob has not accepted Ann, so his host
-    // refuses without a trace and both messages wait.
+    // Ann accepts Bob and writes. Bob has not accepted Ann, so his host
+    // refuses without a trace, and the message is not tried again.
     let accepted = agents_tool(
         &here,
         here_workset,
@@ -676,39 +678,44 @@ async fn c2c_two_hosts() {
     .await
     .unwrap();
     assert!(accepted.contains(&ann_address), "{accepted}");
-    for text in ["ping one", "ping two"] {
-        let report = agents_tool(
-            &here,
-            here_workset,
-            ann,
-            &format!("message(agent_id={bob_address:?}, message={text:?})"),
+    let send = async |pool: &Arc<AgentPool>, workset, agent, to: &str, text: &str| {
+        agents_tool(
+            pool,
+            workset,
+            agent,
+            &format!("message(agent_id={to:?}, message={text:?})"),
         )
         .await
-        .unwrap();
-        assert!(report.starts_with("Sent to bob (dpc)."), "{report}");
-    }
-    let tried = async |text: &str| {
+    };
+    let unsent =
+        |pool: &Arc<AgentPool>| -> u64 { pool.peers().iter().map(|contact| contact.unsent).sum() };
+    let settled = async |pool: &Arc<AgentPool>| {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !sent.lock().unwrap().iter().any(|sent| sent.body == text) {
+            while unsent(pool) != 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("{text:?} was never sent"));
+        .expect("a message neither went through nor was given up on");
     };
-    tried("ping one").await;
+    let tries = |text: &str| -> usize {
+        let sent = sent.lock().unwrap();
+        sent.iter().filter(|sent| sent.body == text).count()
+    };
+    let report = send(&here, here_workset, ann, &bob_address, "early one")
+        .await
+        .unwrap();
+    assert!(report.starts_with("Sent to bob (dpc)."), "{report}");
+    settled(&here).await;
+    assert_eq!(tries("early one"), 1);
     assert_eq!(there.peers(), []);
-    assert_eq!(here.peers()[0].unsent, 2);
     let contacts = agents_tool(&here, here_workset, ann, "contacts()")
         .await
         .unwrap();
-    assert_eq!(
-        contacts,
-        format!("bob (dpc): {bob_address}, 2 of your messages not delivered yet")
-    );
+    assert_eq!(contacts, format!("bob (dpc): {bob_address}"));
 
-    // Bob accepts Ann and answers. His message crosses at once; hers are
-    // tried again and cross in order.
+    // Bob accepts Ann and writes: his message crosses at once. Ann writes
+    // again, and now hers cross, in order.
     agents_tool(
         &there,
         there_workset,
@@ -717,36 +724,29 @@ async fn c2c_two_hosts() {
     )
     .await
     .unwrap();
-    agents_tool(
-        &there,
-        there_workset,
-        bob,
-        &format!("message(agent_id={ann_address:?}, message='pong')"),
-    )
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while here.peers()[0].unsent != 0 || there.peers()[0].unsent != 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let bodies: Vec<String> = sent
+    send(&there, there_workset, bob, &ann_address, "pong")
+        .await
+        .unwrap();
+    send(&here, here_workset, ann, &bob_address, "ping one")
+        .await
+        .unwrap();
+    send(&here, here_workset, ann, &bob_address, "ping two")
+        .await
+        .unwrap();
+    settled(&here).await;
+    settled(&there).await;
+    assert_eq!(
+        (tries("pong"), tries("ping one"), tries("ping two")),
+        (1, 1, 1)
+    );
+    let order: Vec<String> = sent
         .lock()
         .unwrap()
         .iter()
-        .map(|envelope| envelope.body.clone())
-        .filter(|body| body != "pong")
+        .map(|sent| sent.body.clone())
+        .filter(|body| body.starts_with("ping"))
         .collect();
-    // Two was never tried ahead of one.
-    assert_eq!(bodies.last().unwrap(), "ping two");
-    assert!(
-        bodies[..bodies.len() - 1]
-            .iter()
-            .all(|body| body == "ping one"),
-        "{bodies:?}"
-    );
+    assert_eq!(order, ["ping one", "ping two"]);
 
     // A message sent twice arrives once; the same sender name from another
     // host is a stranger.
@@ -766,52 +766,102 @@ async fn c2c_two_hosts() {
         MessageResult::Refused
     );
 
+    // A host that cannot be reached is tried three times. Then the message
+    // is given up on, and with it the one written on top of it, which is
+    // never sent.
+    let nobody = format!("{}/nobody", "dd".repeat(32));
+    agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!("accept(address={nobody:?}, name='ghost')"),
+    )
+    .await
+    .unwrap();
+    // One eval, so the second waits while the first is tried.
+    agents_tool(
+        &here,
+        here_workset,
+        ann,
+        &format!(
+            "message(agent_id={nobody:?}, message='anyone there')\n\
+             tools.Agents({:?}).message(agent_id={nobody:?}, message='hello again')",
+            ann.encoded()
+        ),
+    )
+    .await
+    .unwrap();
+    settled(&here).await;
+    assert_eq!((tries("anyone there"), tries("hello again")), (3, 0));
+
     // The user takes Bob's acceptance back: Ann is refused again, and Bob
     // can no longer write to her.
     let ann_peer: rho_agent_types::PeerAddress = ann_address.parse().unwrap();
     there.remove_peer(bob, &ann_peer).await.unwrap();
     assert_eq!(there.peers(), []);
-    agents_tool(
-        &here,
-        here_workset,
-        ann,
-        &format!("message(agent_id={bob_address:?}, message='ping three')"),
-    )
-    .await
-    .unwrap();
-    tried("ping three").await;
-    let error = agents_tool(
-        &there,
-        there_workset,
-        bob,
-        &format!("message(agent_id={ann_address:?}, message='after')"),
-    )
-    .await
-    .unwrap_err();
+    send(&here, here_workset, ann, &bob_address, "ping three")
+        .await
+        .unwrap();
+    settled(&here).await;
+    assert_eq!(tries("ping three"), 1);
+    let error = send(&there, there_workset, bob, &ann_address, "after")
+        .await
+        .unwrap_err();
     assert!(error.contains("not accepted"), "{error}");
 
     // What each model was told of all that, and not as the user's words:
-    // Ann of each message that began to wait, once, and of Bob's under the
-    // name she gave him; Bob of what crossed while he accepted Ann, under
-    // the name he gave her.
-    let waits = format!("[message to bob [dpc] ({bob_address}) not delivered yet]");
+    // Ann of each message given up on, once, and of Bob's under the name
+    // she gave him; Bob of what crossed while he accepted Ann, under the
+    // name he gave her.
+    let refused = format!("[message to bob [dpc] ({bob_address}) refused]");
+    let unreached = format!("[message to ghost ({nobody}) not delivered]");
     let from_bob =
         format!("[message from bob (dpc) at {bob_address}, an agent on another host]\npong");
     let from_ann = format!("[message from ann at {ann_address}, an agent on another host]\n");
     tokio::time::timeout(Duration::from_secs(40), async {
-        while said(&here_asked, &waits) < 2 || said(&there_asked, "ping two") < 1 {
+        while said(&here_asked, &refused) < 2
+            || said(&here_asked, &unreached) < 1
+            || said(&there_asked, "ping two") < 1
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap_or_else(|_| panic!("the models were not told everything"));
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(said(&here_asked, &waits), 2);
-    assert_eq!(said(&here_asked, &ann_address), 2);
+    assert_eq!(said(&here_asked, &refused), 2);
+    assert_eq!(
+        said(
+            &here_asked,
+            "The message was dropped: nothing is tried again. Send again if and when it is \
+             worth it. The message began: early one"
+        ),
+        1
+    );
+    assert_eq!(
+        said(
+            &here_asked,
+            "The message was dropped: nothing is tried again. Send again if and when it is \
+             worth it. The message began: ping three"
+        ),
+        1
+    );
+    assert_eq!(said(&here_asked, &unreached), 1);
+    assert_eq!(
+        said(
+            &here_asked,
+            "Its host could not be reached, or gave no result, in 3 tries. It and the message \
+             you sent after it were dropped: nothing is tried again. Send again if and when it \
+             is worth it. The message began: anyone there"
+        ),
+        1
+    );
+    assert_eq!(said(&here_asked, "hello again"), 0);
     assert_eq!(said(&here_asked, &from_bob), 1);
     assert_eq!(said(&here_asked, "pong"), 1);
     assert_eq!(said(&there_asked, &format!("{from_ann}ping one")), 1);
     assert_eq!(said(&there_asked, &format!("{from_ann}ping two")), 1);
+    assert_eq!(said(&there_asked, "early one"), 0);
     assert_eq!(said(&there_asked, "ping three"), 0);
     for (asked, text) in [(&here_asked, "pong"), (&there_asked, "ping one")] {
         for item in items(asked, text) {
@@ -823,7 +873,7 @@ async fn c2c_two_hosts() {
         sender.abort();
     }
     // An agent that is deleted accepts no one.
-    assert_eq!(here.peers().len(), 1);
+    assert_eq!(here.peers().len(), 2);
     here.delete_worksets(vec![here_workset]).await.unwrap();
     assert_eq!(here.peers(), []);
     there.execution(bob).await.unwrap().shutdown().await;
