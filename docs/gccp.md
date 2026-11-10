@@ -40,8 +40,8 @@ A harness may hold more than one endpoint. An address names one of them.
 
 ### Transport
 
-Harnesses talk over iroh connections with the ALPN `gccp/1`. The number
-changes only when the stream header below changes.
+Harnesses talk over iroh connections with the ALPN `gccp/1`. A later
+version may use a higher number.
 
 The transport authenticates both endpoints and encrypts between them. So a
 receiving harness knows which endpoint a message came from, a sending
@@ -66,10 +66,10 @@ The most significant bit is reserved and must be 0. A later version may use
 it to say that more header follows. The other kinds are for later versions
 of this document, which can add them without a new ALPN.
 
-A harness that gets a kind it does not know must reset that stream with the
-error code 1, and must keep the connection: other streams on it carry kinds
-that it does know. The harness that opened the stream then knows that the
-other one does not speak that kind.
+A harness that gets a kind it does not know must reset that stream, with 1
+as iroh's stream error code, and must keep the connection: other streams on
+it carry kinds that it does know. The harness that opened the stream then
+knows that the other one does not speak that kind.
 
 ### Messages
 
@@ -115,10 +115,10 @@ A harness may send a message again, for example when the result was lost.
 The `id` keeps the message from being stored twice.
 
 - A message sent again must carry the same `id`.
-- A harness that gets a message it remembers from that address by its `id`
-  must return `delivered` and must not store it again.
-- A harness chooses how many ids it remembers and for how long. So a
-  message sent again long after the first time can be stored twice.
+- A harness that remembers the `id` from that address must return
+  `delivered` and must not store the message again.
+- A harness chooses how many ids it remembers, so a late copy can be stored
+  twice.
 
 ## What a harness may do
 
