@@ -52,9 +52,6 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 const CURRENT_AGENT_DB_FORMAT: &str = "9a6cf67f";
-/// Temporary (`temp-migration`): the format before workset props, which
-/// [`crate::store::write_props`] moves from.
-const PREVIOUS_AGENT_DB_FORMAT: &str = "c41e6d07";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -390,23 +387,6 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
-    if stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT) {
-        // Temporary (`temp-migration`): `rho debug rollback` puts the store
-        // back from this savepoint.
-        let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
-        db.persistent_savepoint(|write, id| {
-            write.open_table(RECOVERY).insert(hop, id);
-        })
-        .await;
-        let mut write = db.write().await;
-        crate::store::write_props(&mut write);
-        write
-            .open_table(FORMAT)
-            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
-        write.init_agent_tables();
-        write.commit();
-        return;
-    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -527,126 +507,4 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .get(MACHINE_SEED_KEY)
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
-}
-
-/// Temporary (`temp-migration`).
-#[cfg(test)]
-mod tests {
-    use rho_agent_types::{AgentId, Props, UnixMs, WorksetKind, Wpos};
-    use senax_encoder::{Decode, Encode};
-
-    use super::*;
-
-    /// A value's bytes, under the type name of `T`'s table.
-    #[derive(Debug)]
-    struct Raw<T>(std::marker::PhantomData<T>);
-
-    impl<T: std::fmt::Debug + 'static> redb::Value for Raw<T>
-    where
-        Sen<T>: redb::Value,
-    {
-        type SelfType<'a> = &'a [u8];
-        type AsBytes<'a> = &'a [u8];
-
-        fn fixed_width() -> Option<usize> {
-            None
-        }
-
-        fn from_bytes<'a>(data: &'a [u8]) -> &'a [u8]
-        where
-            Self: 'a,
-        {
-            data
-        }
-
-        fn as_bytes<'a, 'b: 'a>(value: &'a &'b [u8]) -> &'a [u8]
-        where
-            Self: 'b,
-        {
-            value
-        }
-
-        fn type_name() -> redb::TypeName {
-            <Sen<T> as redb::Value>::type_name()
-        }
-    }
-
-    const HEADS: TableDefinition<[u8; 6], Raw<crate::store::WorksetHead>> =
-        TableDefinition::new("workset_heads");
-
-    /// A head before props.
-    #[derive(Debug, Encode, Decode)]
-    struct Old {
-        kind: WorksetKind,
-        created_at: UnixMs,
-        next: Wpos,
-        agents: Vec<AgentId>,
-    }
-
-    /// A head once the migration goes: props are required.
-    #[derive(Debug, Encode, Decode)]
-    struct Strict {
-        kind: WorksetKind,
-        props: Props,
-        created_at: UnixMs,
-        next: Wpos,
-        agents: Vec<AgentId>,
-    }
-
-    /// `prepare` writes each workset head again once, so it decodes with
-    /// props required, and the rollback puts back the stamp.
-    #[tokio::test]
-    async fn a_store_from_before_workset_props_moves_once_and_rolls_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("db"));
-        let worksets = [[7; 6], [8; 6]];
-        let mut write = db.write().await;
-        write
-            .open_table(FORMAT)
-            .insert((), PREVIOUS_AGENT_DB_FORMAT.to_owned());
-        for (n, key) in worksets.into_iter().enumerate() {
-            let head = senax_encoder::encode(&Old {
-                kind: WorksetKind::Isolated,
-                created_at: UnixMs(n as u64),
-                next: Wpos(1),
-                agents: Vec::new(),
-            })
-            .unwrap();
-            write.open_table(HEADS).insert(key, &head[..]);
-        }
-        write.commit();
-        let state = || {
-            let read = db.read();
-            let heads = worksets
-                .into_iter()
-                .map(|key| {
-                    let head: Strict = senax_encoder::decode(
-                        &mut read.open_table(HEADS).get(key).unwrap().value(),
-                    )
-                    .unwrap();
-                    (head.props, head.created_at)
-                })
-                .collect::<Vec<_>>();
-            (read.open_table(FORMAT).get(()).unwrap().value(), heads)
-        };
-        let moved = (
-            CURRENT_AGENT_DB_FORMAT.to_owned(),
-            vec![(Props::new(), UnixMs(0)), (Props::new(), UnixMs(1))],
-        );
-
-        prepare(&db).await;
-        assert_eq!(state(), moved);
-        prepare(&db).await;
-        assert_eq!(state(), moved);
-
-        let hop = rollback(&db).await.unwrap();
-        assert_eq!(
-            hop,
-            format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}")
-        );
-        assert_eq!(
-            db.read().open_table(FORMAT).get(()).unwrap().value(),
-            PREVIOUS_AGENT_DB_FORMAT
-        );
-    }
 }
