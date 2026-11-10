@@ -32,9 +32,6 @@ pub struct WorksetHead {
     pub kind: WorksetKind,
     /// What Python said the workset is, before its first agent
     /// (`WorksetPropsSet`). Only Python reads them.
-    /// Temporary (`temp-migration`): the default reads heads from before
-    /// props until [`write_props`] has moved them.
-    #[senax(default)]
     pub props: Props,
     pub created_at: UnixMs,
     /// Where the next row goes.
@@ -320,22 +317,6 @@ pub trait StoreWrite {
     fn delete_workset(&mut self, workset: WorksetId) -> bool;
     /// An agent's head, read inside this transaction.
     fn agent_head(&mut self, agent: AgentId) -> Option<AgentHead>;
-}
-
-/// Temporary (`temp-migration`): writes each workset head again, now with
-/// its props, which heads from before props read as empty only through
-/// `#[senax(default)]`.
-pub(crate) fn write_props(write: &mut WriteTxn) {
-    let heads = write
-        .open_table(WORKSET_HEADS)
-        .iter()
-        .map(|(key, head)| (key.value(), head.value().into_owned()))
-        .collect::<Vec<_>>();
-    for (key, head) in heads {
-        write
-            .open_table(WORKSET_HEADS)
-            .insert(key, SenValue::borrowed(&head));
-    }
 }
 
 impl StoreWrite for WriteTxn {
