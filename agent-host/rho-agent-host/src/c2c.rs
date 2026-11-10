@@ -118,14 +118,15 @@ where
         };
         let receive = receive.clone();
         tokio::spawn(async move {
-            let Ok(Ok(bytes)) =
+            let Ok(read) =
                 tokio::time::timeout(READ_TIMEOUT, recv.read_to_end(MAX_MESSAGE_LEN)).await
             else {
                 return;
             };
-            let answer = match decode_message(&bytes) {
-                Ok(envelope) => receive(endpoint, envelope).await,
-                Err(_) => Answer::Refused,
+            let answer = match read.map(|bytes| decode_message(&bytes)) {
+                Ok(Ok(envelope)) => receive(endpoint, envelope).await,
+                // Not a message, longer than one can be, or cut off.
+                Ok(Err(_)) | Err(_) => Answer::Refused,
             };
             if send.write_all(&encode_answer(answer)).await.is_ok() {
                 let _ = send.finish();
@@ -360,6 +361,16 @@ mod tests {
             assert_eq!(
                 decode_answer(&recv.read_to_end(MAX_ANSWER_LEN).await?)?,
                 Answer::Refused
+            );
+            assert!(received.try_recv().is_err());
+
+            let (mut send, mut recv) = transport.held(to).unwrap().open_bi().await?;
+            send.write_all(&vec![b'x'; MAX_MESSAGE_LEN + 1]).await?;
+            send.finish()?;
+            assert_eq!(
+                decode_answer(&recv.read_to_end(MAX_ANSWER_LEN).await?)?,
+                Answer::Refused,
+                "too long to be a message"
             );
             assert!(received.try_recv().is_err());
 
