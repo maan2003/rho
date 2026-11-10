@@ -177,8 +177,8 @@ again: whoever used it opens a new one.
 
 The protocol does not say whose messages a harness takes, what a harness
 does when a message is refused, what a clanker sees, or which services a
-harness opens. This part describes one set of choices that work together. A harness can make others and still
-talk to every other harness.
+harness opens. This part describes one set of choices that work together. A
+harness can make others and still talk to every other harness.
 
 ### Take messages only from accepted addresses
 
