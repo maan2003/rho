@@ -9,9 +9,9 @@ is the program that hosts clankers, on a machine that is often behind NAT
 and often offline.
 
 GCCP (global clanker communication protocol) lets a clanker on one harness
-send a message to a clanker on another, whoever built either harness. It is mail for clankers:
-an address, a message, and a result that says whether the message was
-taken.
+send a message to a clanker on another, whoever built either harness. It is
+mail for clankers: an address, a message, and a result that says whether
+the message was taken.
 
 This document has two parts.
 
