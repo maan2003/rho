@@ -1,4 +1,4 @@
-# C2C: the clanker to clanker protocol
+# GCCP: the global clanker communication protocol
 
 Status: draft.
 
@@ -8,8 +8,8 @@ steering each step. In practice it is a language model in a loop. A harness
 is the program that hosts clankers, on a machine that is often behind NAT
 and often offline.
 
-C2C (clanker to clanker) lets a clanker on one harness send a message to a
-clanker on another, whoever built either harness. It is mail for clankers:
+GCCP (global clanker communication protocol) lets a clanker on one harness
+send a message to a clanker on another, whoever built either harness. It is mail for clankers:
 an address, a message, and a result that says whether the message was
 taken.
 
@@ -40,8 +40,8 @@ A harness may hold more than one endpoint. An address names one of them.
 
 ### Transport
 
-Harnesses talk over iroh connections with the ALPN `c2c/1`. A change old
-peers cannot read takes a new number.
+Harnesses talk over iroh connections with the ALPN `gccp/1`. The number
+changes only when the stream header below changes.
 
 The transport authenticates both endpoints and encrypts between them. So a
 receiving harness knows which endpoint a message came from, a sending
@@ -49,10 +49,32 @@ harness knows which one it reached, and the two harnesses read everything.
 The protocol proves nothing more: the sender's local id is the sending
 harness's claim.
 
+### Streams
+
+Everything is carried on bidirectional streams. The harness that opens a
+stream first writes two bytes: the kind of the stream, an unsigned 16-bit
+integer, most significant byte first.
+
+| Kind | Stream                    |
+| ---- | ------------------------- |
+| 1    | A message and its result. |
+
+The kind says what the rest of the stream carries in both directions, and
+how it ends. So the header holds no length: that belongs to each kind.
+
+The most significant bit is reserved and must be 0. A later version may use
+it to say that more header follows. The other kinds are for later versions
+of this document, which can add them without a new ALPN.
+
+A harness that gets a kind it does not know must reset that stream with the
+error code 1, and must keep the connection: other streams on it carry kinds
+that it does know. The harness that opened the stream then knows that the
+other one does not speak that kind.
+
 ### Messages
 
-The sending harness opens a bidirectional stream for each message, writes
-one CBOR map, and finishes its side of the stream:
+A message stream has kind 1. After the kind, the sending harness writes one
+CBOR map and finishes its side of the stream:
 
 | Key    | Value                                                           |
 | ------ | --------------------------------------------------------------- |
@@ -140,15 +162,24 @@ clankers is speaking, because the endpoint is all that the transport proves.
 The harness decides who may call `accept` for a clanker, and gives the
 owner a way to see and take back what was accepted.
 
-### Keep a message until it has a result
+### Try a few times, then tell the clanker
 
-- The sending harness keeps a message and tries again while the other
-  harness cannot be reached, with longer waits between tries.
-- After `refused` it can tell its clanker at once. It can also try again for
-  a while first, because the recipient may accept the sender later, and
-  tell its clanker only when it gives up.
-- It tells its clanker when a message waits or is given up on, and says
-  nothing when a message goes through.
+- After `refused` the sending harness does not try again. It tells its
+  clanker at once.
+- When the other harness cannot be reached, or gives no result, the sending
+  harness tries again a few times over a few minutes: for example after one
+  minute, and then after two more. Then it gives up.
+- When it gives up on a message, it drops that message and the ones its
+  clanker wrote after it to the same address, and tells its clanker which.
+  It says whether the other harness refused or was not reached. After no
+  result, the message may still have arrived.
+- The clanker decides if and when to send again. The harness keeps no queue
+  for hours or days: the clanker knows whether the message still matters.
+- It says nothing when a message goes through.
+
+There is no call and no session. A connection is only how bytes travel:
+either harness may close one at any time, and a clanker is never told that
+a connection opened or closed.
 
 ### Limit what an endpoint can cost
 
@@ -166,5 +197,5 @@ with the sender's address, apart from what the owner says.
 ## Not part of this
 
 Groups, discovery, attachments, and byte streams between clankers (a tunnel
-to a service a clanker runs) are left out. A stream protocol would be a
-second ALPN beside this one and would reuse the same addresses.
+to a service a clanker runs) are left out. A byte stream would be another kind
+of stream beside the message, and would reuse the same addresses.
