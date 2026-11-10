@@ -101,6 +101,14 @@ impl Stored {
     }
 }
 
+/// What carries messages out, and the waits before the tries after the
+/// first.
+#[derive(Clone)]
+pub(super) struct Carrier {
+    transport: Arc<dyn Transport>,
+    retry_waits: &'static [Duration],
+}
+
 /// An agent's id as the local id of its address.
 fn local_id(agent: AgentId) -> LocalId {
     agent.encoded().parse().expect("an agent id is a local id")
@@ -118,7 +126,10 @@ impl AgentPool {
     /// What carries the agents' messages to other harnesses from now on,
     /// and the waits before the tries after the first ([`RETRY_WAITS`]).
     pub fn set_transport(&self, transport: Arc<dyn Transport>, retry_waits: &'static [Duration]) {
-        *self.gccp_transport.lock().expect("poison") = Some((transport, retry_waits));
+        *self.gccp_transport.lock().expect("poison") = Some(Carrier {
+            transport,
+            retry_waits,
+        });
     }
 
     /// The host's own endpoint, if it has one.
@@ -248,7 +259,10 @@ impl AgentPool {
                 .gccp_contact(agent, &peer)
                 .with_context(|| format!("{peer} is not an address you accepted"))?;
             let carrier = self.gccp_transport.lock().expect("poison").clone();
-            let (transport, retry_waits) = carrier.context("this host's iroh endpoint is down")?;
+            let Carrier {
+                transport,
+                retry_waits,
+            } = carrier.context("this host's iroh endpoint is down")?;
             tries += 1;
             let sent = transport.send(peer.endpoint, &envelope);
             let tried = async {

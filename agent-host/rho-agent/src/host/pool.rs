@@ -68,7 +68,7 @@ pub struct AgentPool {
     gccp_stored: std::sync::Mutex<gccp::Stored>,
     /// What carries GCCP messages out, while the host's endpoint is up, and
     /// the waits before the tries after the first.
-    gccp_transport: std::sync::Mutex<Option<(Arc<dyn Transport>, &'static [std::time::Duration])>>,
+    gccp_transport: std::sync::Mutex<Option<gccp::Carrier>>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
