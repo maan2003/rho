@@ -11,7 +11,7 @@ use rho_agent_hosts::{HostId, Hosts};
 use rho_agent_types::{MessageId, WorksetId, WorksetKind};
 
 use crate::protocol::worksets::{CreateWorkset, Eval};
-use crate::snippets::{self, Runtime};
+use crate::snippets::{self, Function, Runtime};
 
 /// The user-facing name for selecting the first available conventional base.
 pub const DEFAULT_START: &str = "auto";
@@ -66,19 +66,24 @@ impl Start {
     /// The call that starts it, from the message `origin` links: the
     /// policy joins the agent to that message's topic and hands it the
     /// message as its first input.
-    pub fn creation(&self, runtime: &Runtime, origin: Option<MessageId>) -> Creation {
+    pub fn creation(
+        &self,
+        function: &Function,
+        runtime: &Runtime,
+        origin: Option<MessageId>,
+    ) -> Creation {
         match self {
             Self::NewOn { repo, rev } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Isolated,
-                code: snippets::new_agent_on(repo, rev, runtime, origin),
+                code: snippets::new_agent_on(function, repo, rev, runtime, origin),
             }),
             Self::Here { cwd } => Creation::Workset(CreateWorkset {
                 kind: WorksetKind::Host { cwd: cwd.clone() },
-                code: snippets::new_agent_in(cwd, runtime, origin),
+                code: snippets::new_agent_in(function, cwd, runtime, origin),
             }),
             Self::Join { workset, cwd } => Creation::Eval(Eval {
                 workset: *workset,
-                code: snippets::new_agent_in(cwd, runtime, origin),
+                code: snippets::new_agent_in(function, cwd, runtime, origin),
             }),
         }
     }
@@ -444,7 +449,7 @@ mod tests {
             workset,
             cwd: "/src/rho".into(),
         }
-        .creation(&runtime, None);
+        .creation(&Function::default(), &runtime, None);
         let Creation::Eval(eval) = joined else {
             panic!("joining is code in the workset joined: {joined:?}");
         };
@@ -454,7 +459,7 @@ mod tests {
         let Creation::Workset(here) = (Start::Here {
             cwd: "/home/me".into(),
         })
-        .creation(&runtime, None) else {
+        .creation(&Function::default(), &runtime, None) else {
             panic!("in place is a workset of its own");
         };
         assert_eq!(
@@ -467,7 +472,7 @@ mod tests {
             repo: "https://x/y".into(),
             rev: "main".into(),
         })
-        .creation(&runtime, None) else {
+        .creation(&Function::default(), &runtime, None) else {
             panic!("a new clone is a workset of its own");
         };
         assert_eq!(fresh.kind, WorksetKind::Isolated);
@@ -494,7 +499,7 @@ mod tests {
             },
         ];
         for start in starts {
-            let code = match start.creation(&runtime, origin) {
+            let code = match start.creation(&Function::default(), &runtime, origin) {
                 Creation::Eval(eval) => eval.code,
                 Creation::Workset(create) => create.code,
             };

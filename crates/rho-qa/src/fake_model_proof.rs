@@ -211,7 +211,7 @@ async fn run_async(args: Args) -> Result<()> {
     for _ in 0..agent_count {
         client.create(CreateWorkset {
             kind: WorksetKind::Isolated,
-            code: snippets::new_agent_on(&repo, "HEAD", &runtime, None),
+            code: snippets::new_agent_on(&Default::default(), &repo, "HEAD", &runtime, None),
         });
     }
     // The client id of each user post: the host logs a name once.

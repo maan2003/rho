@@ -11,6 +11,8 @@ import threading
 class State:
     def __init__(self):
         self.kind = "isolated"
+        self.props = {}
+        self.permissions = None
         self.agents = {}
         self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
@@ -44,6 +46,22 @@ def workset_id():
 
 def workset_kind():
     return STATE.kind
+
+
+def workset_props():
+    return dict(STATE.props)
+
+
+def set_workset_props(props):
+    STATE.props = dict(props)
+
+
+def set_permissions(mode, environment=None):
+    STATE.permissions = mode
+
+
+def workset_permissions():
+    return STATE.permissions
 
 
 def clone(url, dest, rev=""):

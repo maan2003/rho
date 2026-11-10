@@ -5,10 +5,30 @@ use std::time::Duration;
 use rho_agent_types::transcript::{ExecId, ToolName, ToolSpec, ToolType};
 use serde_json::{Value, json};
 
-/// The SDK server's routing name. Rho sets `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`
-/// so the model sees the bare tool name `exec`.
+use crate::PermissionMode;
+
+/// The SDK server's routing name. Claude Code prefixes the tool with it
+/// unless `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` is set.
 pub const SERVER_NAME: &str = "py";
 pub const TOOL_NAME: &str = "exec";
+
+/// The name the model calls the tool by. Auto mode's server-side review
+/// skips a tool whose bare name is not built in, so auto keeps Claude Code's
+/// MCP prefix. Under bypass nothing reviews a call, and the bare name is the
+/// one Rho's native agents use.
+pub fn model_tool_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Bypass => TOOL_NAME,
+        PermissionMode::Auto => "mcp__py__exec",
+    }
+}
+
+/// Whether the model called exec, by either of its names.
+pub fn names_exec(name: &str) -> bool {
+    [PermissionMode::Bypass, PermissionMode::Auto]
+        .into_iter()
+        .any(|mode| model_tool_name(mode) == name)
+}
 
 /// How long Claude Code lets one exec call stay open. The boundary answers
 /// an open call a minute before this whatever the check-in, so the CLI never

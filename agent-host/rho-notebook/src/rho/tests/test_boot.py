@@ -8,7 +8,7 @@ import unittest
 from .support import Workset, WorksetCase, add_agent, native, wait_for
 
 import rho
-from rho import default, hooks, prompt, workset
+from rho import _boot, default, hooks, prompt, workset
 
 
 class Eval(WorksetCase):
@@ -132,23 +132,19 @@ class Init(unittest.TestCase):
         self.assertEqual(hooks.instructions(None), "custom")
         self.assertEqual(rho._eval("print(motto)"), ("hi\n", None))
 
-    def test_a_failing_init_reports_and_keeps_the_default_policy(self):
+    def test_a_failing_init_reports_and_runs_nothing_more(self):
         ws = self.start(
-            "import rho\nrho.hooks.instructions = lambda agent: \'custom\'\nrho.hooks.deliver = None\nmotto = \'hi\'\nraise RuntimeError(\'bad init\')\n",
+            "import rho\nraise RuntimeError(\'bad init\')\n",
             lambda state: add_agent(state, native(), preset="engineer", cwd="/"),
         )
         [error] = ws.ready
         self.assertIn("init.py", error)
         self.assertIn("RuntimeError: bad init", error)
-        self.assertIs(hooks.instructions, prompt.instructions)
-        self.assertIs(hooks.deliver, default.deliver)
-        self.assertNotIn("motto", workset.namespace)
-        self.assertIn("new_agent", workset.namespace)
-        # The default delivery runs for the existing agent.
-        from . import fake_rho
-
-        fake_rho.start_user_topic("rho", "hello", "hello", ["agent1"])
-        wait_for(lambda: ws.state.inputs, "delivery")
+        # The host ends the process: the loop never runs, and no agent's
+        # delivery starts.
+        ws.thread.join(5)
+        self.assertFalse(ws.thread.is_alive())
+        self.assertEqual(_boot._announced, set())
 
     def test_init_may_await(self):
         ws = self.start("import asyncio\nawait asyncio.sleep(0)\nawaited = True\n")

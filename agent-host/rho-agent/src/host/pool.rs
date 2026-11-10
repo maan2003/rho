@@ -261,12 +261,12 @@ impl AgentPool {
         if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
             return Ok(process.clone());
         }
-        let kind = self
+        let head = self
             .db
             .read()
             .workset(workset)
-            .context("workset was deleted or does not exist")?
-            .kind;
+            .context("workset was deleted or does not exist")?;
+        let kind = head.kind;
         let directory = self.worksets.open_workset(workset).await?;
         let root = workset_root(&kind);
         let layout = match kind {
@@ -279,6 +279,7 @@ impl AgentPool {
         let started = crate::host::Process::start(
             self,
             workset,
+            head.props,
             layout,
             root,
             self.init.clone(),
@@ -1188,6 +1189,18 @@ impl AgentPool {
                     *first = Some(agent);
                 }
                 PyReply::Agent(agent)
+            }
+            PyRequest::SetWorksetProps(props) => {
+                let mut write = self.db.write().await;
+                write.append(
+                    workset,
+                    &Record {
+                        at: UnixMs::now(),
+                        event: Event::WorksetPropsSet { props },
+                    },
+                )?;
+                write.commit();
+                PyReply::Done
             }
             PyRequest::Agents => {
                 let read = self.db.read();

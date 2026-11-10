@@ -27,6 +27,7 @@ use crate::ipc::protocol::Control;
 use crate::ipc::transport::{Port, Sender};
 use crate::ipc::workset::{Message, PyMoveTo, PyReply, PyRequest, encode};
 use crate::record::{AgentSpec, Runtime};
+use crate::worker::permissions::{self, PERMISSIONS, Permissions};
 
 /// How long a hook may take before the loop goes on without it.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -43,6 +44,8 @@ pub(crate) struct PyHost {
     pub runtime: tokio::runtime::Handle,
     pub workset: WorksetId,
     pub isolated: bool,
+    /// The workset's props: its head's at start, then what Python set.
+    pub props: Mutex<rho_agent_types::Props>,
 }
 
 static HOST: OnceLock<PyHost> = OnceLock::new();
@@ -60,6 +63,7 @@ impl PyHost {
         runtime: tokio::runtime::Handle,
         workset: WorksetId,
         isolated: bool,
+        props: rho_agent_types::Props,
     ) -> Self {
         let call: HostCall = Arc::new(move |request| {
             let sender = sender.clone();
@@ -84,6 +88,7 @@ impl PyHost {
             runtime,
             workset,
             isolated,
+            props: Mutex::new(props),
         }
     }
 
@@ -118,7 +123,14 @@ pub(crate) fn replied(id: u64, body: PyReply) {
 /// policy and `init`, and then the workset loop for the life of the
 /// process. A failing `init.py` is reported on stderr; the default policy
 /// stays.
-pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::Result<()> {
+/// Starts the workset Python and returns once its loop runs, before init.py
+/// ends. `ended` hears how init.py ended, once: its traceback if it failed,
+/// or why the loop stopped before it could say.
+pub(crate) fn start(
+    host: PyHost,
+    init: Option<camino::Utf8PathBuf>,
+    ended: impl FnOnce(Option<String>) + Send + 'static,
+) -> anyhow::Result<()> {
     HOST.set(host)
         .map_err(|_| anyhow::anyhow!("the workset Python started twice"))?;
     rho_notebook::start_python().map_err(anyhow::Error::msg)?;
@@ -130,20 +142,29 @@ pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::
         Ok(())
     })
     .map_err(|error| anyhow::anyhow!("install _rho: {error}"))?;
+    type Ended = Box<dyn FnOnce(Option<String>) + Send>;
+    let ended: Arc<Mutex<Option<Ended>>> = Arc::new(Mutex::new(Some(Box::new(ended))));
+    let end = move |error| {
+        if let Some(ended) = ended.lock().expect("poison").take() {
+            ended(error);
+        }
+    };
     std::thread::Builder::new()
         .name("rho-workset".into())
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let result = Python::attach(|py| -> PyResult<()> {
+                let end = end.clone();
                 let ready = pyo3::types::PyCFunction::new_closure(
                     py,
                     None,
                     None,
-                    |args, _| -> PyResult<()> {
+                    move |args, _| -> PyResult<()> {
                         let error: Option<String> = args.get_item(0)?.extract()?;
-                        if let Some(error) = error {
-                            eprintln!("rho: init.py failed; the default policy runs:\n{error}");
+                        if let Some(error) = &error {
+                            eprintln!("rho: init.py failed:\n{error}");
                         }
+                        end(error);
                         Ok(())
                     },
                 )?;
@@ -151,11 +172,18 @@ pub(crate) fn start(host: PyHost, init: Option<camino::Utf8PathBuf>) -> anyhow::
                     .call_method1("_main", (init.as_ref().map(|path| path.as_str()), ready))?;
                 Ok(())
             });
-            if let Err(error) = result {
-                Python::attach(|py| {
-                    eprintln!("rho: the workset loop stopped: {}", traceback(py, &error))
-                });
-            }
+            let error = match result {
+                Ok(()) => "the workset loop stopped".to_owned(),
+                Err(error) => {
+                    let error = Python::attach(|py| {
+                        format!("the workset loop stopped: {}", traceback(py, &error))
+                    });
+                    eprintln!("rho: {error}");
+                    error
+                }
+            };
+            // Only if init.py had not ended: then the host still waits.
+            end(Some(error));
         })?;
     // Hooks run on the workset loop: wait until it exists, not until
     // init.py is done, which may take long and may call back into the host.
@@ -316,6 +344,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     )?;
     module.add_function(pyo3::wrap_pyfunction!(workset_id, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(workset_kind, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(workset_props, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(set_workset_props, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(set_permissions, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(workset_permissions, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(clone, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(context, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(models, &module)?)?;
@@ -386,6 +418,50 @@ fn workset_id() -> PyResult<String> {
 #[pyfunction]
 fn workset_kind() -> PyResult<&'static str> {
     Ok(if host()?.isolated { "isolated" } else { "host" })
+}
+
+#[pyfunction]
+fn workset_props() -> PyResult<rho_agent_types::Props> {
+    Ok(host()?.props.lock().expect("poison").clone())
+}
+
+#[pyfunction]
+fn set_workset_props(py: Python<'_>, props: rho_agent_types::Props) -> PyResult<()> {
+    match PyHost::block(py, PyRequest::SetWorksetProps(props.clone()))? {
+        PyReply::Done => {
+            *host()?.props.lock().expect("poison") = props;
+            Ok(())
+        }
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (mode, environment = None))]
+fn set_permissions(mode: &str, environment: Option<Vec<String>>) -> PyResult<()> {
+    let permissions = match (mode, environment) {
+        ("bypass", None) => Permissions::Bypass,
+        ("bypass", Some(_)) => {
+            return Err(PyValueError::new_err("bypass takes no environment"));
+        }
+        ("auto", environment) => Permissions::Auto { environment },
+        (other, _) => {
+            return Err(PyValueError::new_err(format!(
+                "permissions are \"bypass\" or \"auto\", not {other:?}"
+            )));
+        }
+    };
+    PERMISSIONS
+        .set(permissions)
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))
+}
+
+#[pyfunction]
+fn workset_permissions() -> Option<&'static str> {
+    PERMISSIONS.get().map(|permissions| match *permissions {
+        Permissions::Bypass => "bypass",
+        Permissions::Auto { .. } => "auto",
+    })
 }
 
 #[pyfunction]
@@ -463,6 +539,9 @@ fn models(py: Python<'_>) -> PyResult<Vec<Bound<'_, PyDict>>> {
 #[pyfunction]
 fn create_agent(py: Python<'_>, spec: Bound<'_, PyDict>) -> PyResult<String> {
     let spec = spec_from_py(&spec, None)?;
+    let permissions = PERMISSIONS.fix();
+    permissions::admits(&permissions, matches!(spec.runtime, Runtime::Native { .. }))
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
     match PyHost::block(py, PyRequest::CreateAgent(spec))? {
         PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
         _ => Err(unexpected()),

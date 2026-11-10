@@ -33,6 +33,8 @@ pub enum Event<'a> {
     WorksetCreated { kind: WorksetKind, code: String },
     /// Code the GUI evaluated in the workset namespace.
     Evaluated { code: String },
+    /// Python gave the workset its props, before its first agent.
+    WorksetPropsSet { props: Props },
 
     /// Python created an agent.
     AgentCreated { agent: AgentId, spec: AgentSpec },
@@ -124,7 +126,9 @@ impl Event<'_> {
     /// The agent the event is about; `None` for a workset event.
     pub fn agent(&self) -> Option<AgentId> {
         match self {
-            Self::WorksetCreated { .. } | Self::Evaluated { .. } => None,
+            Self::WorksetCreated { .. } | Self::Evaluated { .. } | Self::WorksetPropsSet { .. } => {
+                None
+            }
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
             | Self::Request { agent, .. }

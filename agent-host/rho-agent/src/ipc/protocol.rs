@@ -146,6 +146,8 @@ pub(crate) fn encode(message: &Message<'_>) -> io::Result<bytes::Bytes> {
 pub(crate) struct Startup {
     pub version: u32,
     pub workset: rho_agent_types::WorksetId,
+    /// The workset's props as its head holds them.
+    pub props: rho_agent_types::Props,
     pub layout: rho_fs_view::Layout,
     pub claude: rho_claude::accounts::ClaudePaths,
     pub responses_base_url: String,

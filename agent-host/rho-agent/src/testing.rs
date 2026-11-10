@@ -232,8 +232,10 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                 runtime: RUNTIME.handle().clone(),
                 workset: rho_agent_types::WorksetId([0; 6]),
                 isolated: false,
+                props: Default::default(),
             },
             Some(camino::Utf8PathBuf::from_path_buf(init).unwrap()),
+            |_| {},
         )
         .unwrap();
     });

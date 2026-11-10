@@ -1156,8 +1156,13 @@ async fn probe_async(name: &str) -> Result<()> {
         kind: WorksetKind::Host {
             cwd: workspace.try_into().context("rig workspace is not UTF-8")?,
         },
-        code: snippets::new_agent_in(camino::Utf8Path::new("/"), &runtime, None)
-            .replace("cwd=\"/\", ", ""),
+        code: snippets::new_agent_in(
+            &Default::default(),
+            camino::Utf8Path::new("/"),
+            &runtime,
+            None,
+        )
+        .replace("cwd=\"/\", ", ""),
     });
 
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;

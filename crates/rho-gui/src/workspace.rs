@@ -34,7 +34,7 @@ use rho_agents_client::create::{Creation, Placement, StartBase, Workdir, parse_s
 use rho_agents_client::outbox::{Destination, Sending};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
-use rho_agents_client::snippets::{self, Runtime};
+use rho_agents_client::snippets::{self, Function, Runtime};
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId, HostTopic, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
@@ -204,15 +204,22 @@ struct TopicStart {
     host: HostId,
     mentions: Vec<AgentId>,
     content: Vec<ContentPart>,
-    agent: Option<(rho_agents_client::create::Start, Runtime)>,
+    agent: Option<NewAgent>,
+}
+
+/// The agent a draft asks for: where it starts, the policy function that
+/// makes it, and what it runs on.
+struct NewAgent {
+    start: rho_agents_client::create::Start,
+    function: Function,
+    runtime: Runtime,
 }
 
 /// An agent a new topic starts from its first message: the agent's rows
 /// from the draft.
 struct AgentForTopic {
     host: HostId,
-    start: rho_agents_client::create::Start,
-    runtime: Runtime,
+    agent: NewAgent,
 }
 
 /// The menu on screen while it is open. Nothing here says where it is
@@ -2773,14 +2780,7 @@ impl Workspace {
                         let origin = rho_agent_types::MessageId(rho_agent_types::ChatSeq(
                             topic.topic.0.0 + 1,
                         ));
-                        this.create_agent(
-                            request,
-                            &agent.start,
-                            &agent.runtime,
-                            origin,
-                            window,
-                            cx,
-                        );
+                        this.create_agent(request, &agent.agent, origin, window, cx);
                     }
                     // A topic the user started is where they go next.
                     if let Some((id, _)) = delivered
@@ -2876,15 +2876,9 @@ impl Workspace {
             return;
         };
         self.new_topic_post = Some(id);
-        if let Some((start, runtime)) = agent {
-            self.agents_for_topics.insert(
-                id,
-                AgentForTopic {
-                    host,
-                    start,
-                    runtime,
-                },
-            );
+        if let Some(agent) = agent {
+            self.agents_for_topics
+                .insert(id, AgentForTopic { host, agent });
         }
         self.reset_draft(window, cx);
     }
@@ -2974,13 +2968,13 @@ impl Workspace {
                 (host, None, vec![agent_id])
             }
             _ => {
-                let Some((host, start, runtime)) = self.draft_agent(cx) else {
+                let Some((host, agent)) = self.draft_agent(cx) else {
                     return;
                 };
                 // `n a` chose an area, and that is where the agent is
                 // filed; an ordinary draft has none and starts at the root.
                 self.pending_agent_filing = self.draft_area.take().map(|area| (host, area));
-                (host, Some((start, runtime)), Vec::new())
+                (host, Some(agent), Vec::new())
             }
         };
         for agent_id in self.mentions_in(host, &content) {
@@ -3009,7 +3003,7 @@ impl Workspace {
             self.refuse_draft("not connected to an agent host", cx);
             return;
         }
-        let Some((host, start, runtime)) = self.draft_agent(cx) else {
+        let Some((host, agent)) = self.draft_agent(cx) else {
             return;
         };
         // The origin names a message in the host's own chat.
@@ -3026,15 +3020,12 @@ impl Workspace {
             topic,
             from_draft: true,
         };
-        self.create_agent(request, &start, &runtime, message, window, cx);
+        self.create_agent(request, &agent, message, window, cx);
     }
 
     /// The agent the draft's rows describe: its host, where it starts and
     /// what it runs on, or `None` with the reason on the draft.
-    fn draft_agent(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_agents_client::create::Start, Runtime)> {
+    fn draft_agent(&mut self, cx: &mut Context<Self>) -> Option<(HostId, NewAgent)> {
         let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
@@ -3067,8 +3058,22 @@ impl Workspace {
                 }
             }
         };
+        let function = match Function::parse(&self.draft_model.read(cx).function_text(cx)) {
+            Ok(function) => function,
+            Err(message) => {
+                self.refuse_draft(&message, cx);
+                return None;
+            }
+        };
         match Runtime::parse(self.draft_model.read(cx).runtime_text(cx).trim()) {
-            Ok(runtime) => Some((host, start, runtime)),
+            Ok(runtime) => Some((
+                host,
+                NewAgent {
+                    start,
+                    function,
+                    runtime,
+                },
+            )),
             Err(message) => {
                 self.refuse_draft(&message, cx);
                 None
@@ -3081,8 +3086,7 @@ impl Workspace {
     fn create_agent(
         &mut self,
         request: AgentRequest,
-        start: &rho_agents_client::create::Start,
-        runtime: &Runtime,
+        agent: &NewAgent,
         origin: rho_agent_types::MessageId,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3090,7 +3094,10 @@ impl Workspace {
         let Some(agents) = self.agents(request.host) else {
             return;
         };
-        let reply = match start.creation(runtime, Some(origin)) {
+        let reply = match agent
+            .start
+            .creation(&agent.function, &agent.runtime, Some(origin))
+        {
             Creation::Workset(create) => {
                 let reply = agents.call(create);
                 async move { reply.await.map(|created| created.result) }.boxed_local()
@@ -3183,6 +3190,7 @@ impl Workspace {
             view.clear_attachments(cx);
             view.set_workdir_text(&label, cx);
             view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
+            view.set_function_text(rho_agents_client::snippets::DEFAULT_FUNCTION, cx);
             view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
         });
     }
@@ -8022,6 +8030,7 @@ impl Workspace {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
             view.set_runtime_text(rho_agents_client::snippets::DEFAULT_RUNTIME, cx);
+            view.set_function_text(rho_agents_client::snippets::DEFAULT_FUNCTION, cx);
             view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
@@ -8173,6 +8182,15 @@ impl Workspace {
     pub(crate) fn cursor_in_draft_start_field_for_test(&self, cx: &mut Context<Self>) -> bool {
         self.focused_draft_editor()
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_start_field(&editor, cx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_in_draft_function_field_for_test(&self, cx: &mut Context<Self>) -> bool {
+        self.focused_draft_editor().is_some_and(|editor| {
+            self.draft_model
+                .read(cx)
+                .cursor_in_function_field(&editor, cx)
+        })
     }
 
     #[cfg(test)]

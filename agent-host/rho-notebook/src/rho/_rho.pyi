@@ -65,6 +65,15 @@ class Context(TypedDict):
 def workset_id() -> str: ...
 def workset_kind() -> Literal["isolated", "host"]:
     """An isolated workset has a private /src; a host one runs on the host."""
+def workset_props() -> dict[str, str]:
+    """The workset's props, empty until set."""
+def set_workset_props(props: dict[str, str]) -> None:
+    """Replace the workset's props. The host refuses once it has an agent."""
+def set_permissions(mode: Literal["bypass", "auto"], environment: list[str] | None = None) -> None:
+    """Fix this run's permissions: once, before the first agent starts.
+    "bypass" takes no environment."""
+def workset_permissions() -> Literal["bypass", "auto"] | None:
+    """This run's permissions, once fixed."""
 def clone(url: str, dest: str, rev: str = "") -> None:
     """Clone `url` into `dest` from the host's mirror, then detach at `rev`
     (empty: the remote's default branch). Blocking."""
