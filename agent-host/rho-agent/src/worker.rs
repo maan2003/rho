@@ -4,6 +4,7 @@ mod claude;
 pub(crate) mod host_client;
 mod image_tool;
 pub mod native;
+pub(crate) mod permissions;
 pub(crate) mod python;
 mod runtime;
 pub(crate) mod shared;

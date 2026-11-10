@@ -14,7 +14,9 @@ use camino::Utf8PathBuf;
 use rho_agent_types::{
     AgentId, CallTiming, ContentPart, ExecTiming, MessageId, Role, UnixMs, Wpos,
 };
-use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
+use rho_claude::{
+    ClaudeCode, ClaudeCodeOptions, Effort, Model, PermissionMode, SdkMcpServer, Session,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -24,6 +26,7 @@ use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::AgentHead;
 use crate::worker::host_client::{HostClient, StoreError};
+use crate::worker::permissions::Permissions;
 use crate::worker::python::{self, TurnEnd};
 use crate::worker::shared::outbox::{Outbound, Outbox};
 use crate::worker::shared::waiting::{Taken, Waiting};
@@ -165,6 +168,8 @@ pub(crate) struct ClaudeLoop {
     /// The Claude configuration this agent runs against, handed down from
     /// the agent host rather than resolved here.
     claude: rho_claude::accounts::ClaudePaths,
+    /// The workset's, fixed for the run of its process.
+    permissions: Arc<Permissions>,
     inference: Inference,
     agent_id: AgentId,
     /// Where Claude Code runs and where new notebooks start.
@@ -294,6 +299,7 @@ impl ClaudeLoop {
         host: Arc<HostClient>,
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
+        permissions: Arc<Permissions>,
         root: Utf8PathBuf,
     ) -> anyhow::Result<(ClaudeAgent, Self)> {
         let mut head = host.head().await?;
@@ -395,6 +401,7 @@ impl ClaudeLoop {
             head_updates: host.names(),
             host,
             claude,
+            permissions,
             inference,
             agent_id,
             root,
@@ -1251,6 +1258,13 @@ impl ClaudeLoop {
         }
     }
 
+    fn permission_mode(&self) -> PermissionMode {
+        match *self.permissions {
+            Permissions::Bypass => PermissionMode::Bypass,
+            Permissions::Auto { .. } => PermissionMode::Auto,
+        }
+    }
+
     /// The model the running process was started with.
     fn running_model(&self) -> Model {
         self.launched
@@ -1307,12 +1321,16 @@ impl ClaudeLoop {
                 resume_at,
             },
         };
-        let mut options = ClaudeCodeOptions::new(cwd.clone(), model, effort, self.session_id);
+        let mut options = ClaudeCodeOptions::new(
+            cwd.clone(),
+            model,
+            effort,
+            self.permission_mode(),
+            self.session_id,
+        );
         options.session = session;
         options.set_env("RHO_AGENT_ID", self.agent_id.encoded().to_string());
         self.ensure_python().await?;
-        // SDK-hosted tools use their bare names, matching Rho's native exec.
-        options.set_env("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", "1");
         // Tool search would defer the one tool behind a lookup; the deny
         // list in the generated settings removes ToolSearch too. The
         // timeout is the CLI's ceiling on an open exec call.
@@ -1433,10 +1451,14 @@ impl ClaudeLoop {
         options.plugin_dir = Some(plugin_dir);
         // A Python-mode agent runs on the account's own settings with every
         // Claude tool denied, so the notebook is all the model has. The
-        // generated file covers the account's `settings.json`.
+        // generated file covers the account's `settings.json`, and in an
+        // auto workset its review trusts what the workset's policy says.
         {
             let base = self.claude.account_settings(account)?;
-            let settings = rho_claude::settings::deny_all_but_own_tools(&base);
+            let mut settings = rho_claude::settings::deny_all_but_own_tools(&base);
+            if let Permissions::Auto { environment } = &*self.permissions {
+                settings = rho_claude::settings::with_auto_mode(settings, environment.as_deref());
+            }
             let text = serde_json::to_string_pretty(&settings)?;
             write_generated_source(
                 &mut self.claude_settings_path,
@@ -1973,7 +1995,7 @@ impl ClaudeLoop {
             rho_claude::protocol::MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block: rho_claude::protocol::StreamContentBlock::ToolUse { id, name, .. },
-            } if matches!(name.as_str(), "exec" | "mcp__py__exec") => {
+            } if name == rho_claude::mcp::model_tool_name(self.permission_mode()) => {
                 let id = rho_agent_types::transcript::ExecId::try_from(id.as_str())?;
                 self.response_execs.insert(
                     *index,
@@ -2314,6 +2336,7 @@ mod tests {
             host.clone(),
             crate::inference::testing::backend(),
             rho_claude::accounts::ClaudePaths::at(root.join("claude")),
+            Arc::new(Permissions::Bypass),
             root,
         )
         .await

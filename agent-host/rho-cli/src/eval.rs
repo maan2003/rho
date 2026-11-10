@@ -30,6 +30,14 @@ pub(crate) struct EvalArgs {
     /// need --claude-accounts. Every runtime works in the Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]
     pub role: String,
+    /// The policy function that makes the agent, as a draft names it: the
+    /// default policy's `new_agent`, or one --init defines.
+    #[arg(long, default_value = snippets::DEFAULT_FUNCTION, value_parser = snippets::Function::parse, conflicts_with = "resume")]
+    pub function: snippets::Function,
+    /// The init.py the run's worksets start with, as the host's
+    /// ~/.config/rho/init.py. Defaults to none.
+    #[arg(long)]
+    pub init: Option<PathBuf>,
     /// Work in this LIVE directory, as a host workset. Defaults to a fresh
     /// isolated workset.
     #[arg(long)]
@@ -191,7 +199,11 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         std::sync::Arc::new(inference),
         worksets,
         claude,
-        None,
+        args.init
+            .clone()
+            .map(camino::Utf8PathBuf::try_from)
+            .transpose()
+            .context("--init is not UTF-8")?,
     )
     .await;
     // Subscribed before the agent exists, so none of its rows go unseen.
@@ -221,6 +233,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 None => WorksetKind::Isolated,
             };
             let code = snippets::new_agent_in(
+                &args.function,
                 &rho_agent::host::pool::workset_root(&kind),
                 &role_runtime(&args.role),
                 None,

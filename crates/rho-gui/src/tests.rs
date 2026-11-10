@@ -5554,6 +5554,11 @@ fn an_agent_starts_from_the_message_at_point(cx: &mut TestAppContext) {
         "{}",
         create.code
     );
+    assert!(
+        create.code.starts_with("new_agent("),
+        "a draft calls the default policy unless the Call row names another: {}",
+        create.code
+    );
     story::answer(
         &mut stream,
         rho_rpc::protocol::Answer::<rho_agents_client::protocol::worksets::CreatedWorkset>::Failed {
@@ -5578,8 +5583,16 @@ fn an_agent_starts_from_the_message_at_point(cx: &mut TestAppContext) {
         "the draft keeps the agent host's whole cause: {refusal:?}"
     );
 
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .draft_model_for_test()
+                .update(cx, |draft, cx| draft.set_function_text(" roboman ", cx));
+        })
+        .unwrap();
     let (create, mut stream) = ask(cx, &mut host);
     assert!(create.code.contains(&format!("origin=\"chat:{first}\"")));
+    assert!(create.code.starts_with("roboman("), "{}", create.code);
     story::answer(
         &mut stream,
         rho_rpc::protocol::Answer::Done(created(agent(763))),
@@ -5666,7 +5679,14 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         })
         .expect("open a new-agent draft");
 
-    // From the body, backwards is the start row, then the role row.
+    // From the body, backwards is the call row, the start row, then the
+    // role row.
+    cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycleGroup);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.cursor_in_draft_function_field_for_test(cx));
+        })
+        .expect("call row");
     cx.dispatch_action(*workspace, rho_agents_view::RuntimeCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {

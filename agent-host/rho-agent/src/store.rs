@@ -7,7 +7,9 @@
 //! Deleting a workset removes its log and heads; chat stays.
 
 use redb::TableDefinition;
-use rho_agent_types::{Address, AgentId, ChatSeq, Role, UnixMs, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{
+    Address, AgentId, ChatSeq, Props, Role, UnixMs, WorksetId, WorksetKind, Wpos,
+};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
@@ -28,6 +30,9 @@ const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct WorksetHead {
     pub kind: WorksetKind,
+    /// What Python said the workset is, before its first agent
+    /// (`WorksetPropsSet`). Only Python reads them.
+    pub props: Props,
     pub created_at: UnixMs,
     /// Where the next row goes.
     pub next: Wpos,
@@ -331,6 +336,7 @@ impl StoreWrite for WriteTxn {
         );
         let head = WorksetHead {
             kind: kind.clone(),
+            props: Props::new(),
             created_at: at,
             next: Wpos::ZERO,
             agents: Vec::new(),
@@ -413,6 +419,13 @@ impl StoreWrite for WriteTxn {
                     tell(self, Appended::Row { workset, pos });
                     return Ok(pos);
                 }
+            }
+            (Event::WorksetPropsSet { props }, _) => {
+                anyhow::ensure!(
+                    head.agents.is_empty(),
+                    "a workset's props are set before its first agent"
+                );
+                head.props = props.clone();
             }
             (_, None) => {}
         }

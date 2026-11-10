@@ -59,6 +59,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             code: code.clone(),
             at,
         },
+        Event::WorksetPropsSet { .. } => return None,
         Event::AgentCreated { agent, spec } => LogEvent::AgentCreated {
             agent: *agent,
             spec: spec_view(spec),

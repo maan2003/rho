@@ -90,9 +90,49 @@ pub fn deny_all_but_own_tools(base: &Value) -> Value {
     Value::Object(settings)
 }
 
+/// `settings` with its auto mode classifier configured by `environment`
+/// alone: what the workset trusts, or Claude Code's built-in entries for
+/// `None`. Any `autoMode` the account's settings held goes, so the
+/// classifier's rules are the workset's and Claude Code's built-in ones,
+/// never an account's. A non-object `settings` is replaced.
+pub fn with_auto_mode(settings: Value, environment: Option<&[String]>) -> Value {
+    let mut settings = match settings {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    settings.remove("autoMode");
+    if let Some(environment) = environment {
+        settings.insert("autoMode".into(), json!({ "environment": environment }));
+    }
+    Value::Object(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_is_the_workset_environment_alone() {
+        let base = json!({
+            "model": "opus",
+            "autoMode": { "allow": ["anything goes"], "environment": ["account entry"] },
+        });
+        let settings = with_auto_mode(
+            deny_all_but_own_tools(&base),
+            Some(&["Trusted: x".to_owned()]),
+        );
+        assert_eq!(
+            settings["autoMode"],
+            json!({ "environment": ["Trusted: x"] })
+        );
+        let settings = with_auto_mode(deny_all_but_own_tools(&base), None);
+        assert!(settings.get("autoMode").is_none());
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(
+            settings["permissions"]["deny"].as_array().unwrap().len(),
+            BUILTIN_TOOLS.len()
+        );
+    }
 
     #[test]
     fn extends_existing_deny_list_without_duplicates() {

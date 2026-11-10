@@ -59,6 +59,8 @@ pub enum Reply {
 pub(crate) enum PyRequest {
     CreateAgent(crate::record::AgentSpec),
     Agents,
+    /// The workset's props, before its first agent.
+    SetWorksetProps(rho_agent_types::Props),
     SetSpec {
         agent: rho_agent_types::AgentId,
         spec: crate::record::AgentSpec,
@@ -240,6 +242,11 @@ pub(crate) enum Message {
     Evaluated {
         id: u64,
         output: String,
+        error: Option<String>,
+    },
+    /// Worker to host, once: init.py ended, and its traceback if it failed.
+    /// The host hands out the process only after a clean one.
+    Initialized {
         error: Option<String>,
     },
     /// Host to worker: connect to the Unix socket at `path`, which an

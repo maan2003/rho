@@ -91,6 +91,14 @@ class Tools(WorksetCase):
             self.assertEqual(tools.engineer_runtime(spawner), engineer, spawner)
             self.assertEqual(tools.advisor_runtime(spawner), advisor, spawner)
 
+    def test_an_auto_workset_starts_claude_agents_only(self):
+        # The host refuses a native agent in an auto workset, so neither
+        # spawn may ask for one, whoever asks.
+        with mock.patch.object(fake_rho.STATE, "permissions", "auto"):
+            for spawner in [claude("opus", "medium"), claude("fable", "xhigh")]:
+                self.assertEqual(tools.engineer_runtime(spawner), claude("opus", "medium"))
+                self.assertEqual(tools.advisor_runtime(spawner), claude("fable", "xhigh"))
+
     def test_spawn_new_advisor_shares_the_askers_directory(self):
         ns, _ = self.notebook(self.root)
         _, reply = run(lambda: ns["agents"].spawn_new_advisor("Is this right?"))

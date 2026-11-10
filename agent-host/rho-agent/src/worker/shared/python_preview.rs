@@ -803,7 +803,7 @@ mod tests {
         {
             let prefix = &arguments[..i];
             let draft = tool_preview(
-                "exec",
+                "mcp__py__exec",
                 prefix,
                 rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
             );

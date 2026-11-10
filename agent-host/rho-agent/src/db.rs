@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "c41e6d07";
+const CURRENT_AGENT_DB_FORMAT: &str = "9a6cf67f";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]

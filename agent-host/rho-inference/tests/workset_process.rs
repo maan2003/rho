@@ -226,6 +226,15 @@ async fn create(
 }
 
 async fn fixture(endpoint: &str) -> (tempfile::TempDir, Arc<AgentPool>) {
+    fixture_with_init(endpoint, None).await
+}
+
+/// A pool whose worksets start with the init.py at `init`, which need not
+/// exist yet.
+async fn fixture_with_init(
+    endpoint: &str,
+    init: Option<camino::Utf8PathBuf>,
+) -> (tempfile::TempDir, Arc<AgentPool>) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_rho-agent-worker"));
@@ -255,7 +264,6 @@ async fn fixture(endpoint: &str) -> (tempfile::TempDir, Arc<AgentPool>) {
     )
     .await
     .unwrap();
-    // No init.py: the default policy.
     let pool = AgentPool::new(
         db,
         Arc::new(inference),
@@ -263,10 +271,49 @@ async fn fixture(endpoint: &str) -> (tempfile::TempDir, Arc<AgentPool>) {
         rho_claude::accounts::ClaudePaths::at(
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
         ),
-        None,
+        init,
     )
     .await;
     (directory, pool)
+}
+
+/// A workset's process is handed out only after its init.py ended well, so
+/// a failing one starts none of its agents, and the next start after the
+/// fix does. In a process of its own: a second pool in one test process
+/// hangs the other test's process shutdown.
+#[test]
+fn a_failing_init_py_starts_no_agent_until_it_is_fixed() {
+    with_synthetic_login(
+        "a_failing_init_py_starts_no_agent_until_it_is_fixed",
+        Duration::from_secs(45),
+        failing_init(),
+    );
+}
+
+async fn failing_init() {
+    let init_dir = tempfile::tempdir().unwrap();
+    let init = camino::Utf8PathBuf::from_path_buf(init_dir.path().join("init.py")).unwrap();
+    std::fs::write(&init, "STARTED = True\n").unwrap();
+    let (_directory, pool) = fixture_with_init("http://127.0.0.1:1", Some(init.clone())).await;
+    let (id, _workset, agents) = create(&pool, "new_agent(runtime=RUNTIME)\n", None).await;
+    let [agent] = agents[..] else {
+        panic!("one agent, not {agents:?}")
+    };
+    pool.execution(agent).await.unwrap();
+
+    std::fs::write(&init, "raise RuntimeError('init-canary')\n").unwrap();
+    pool.restart_workset(id, true).await.unwrap();
+    let Err(error) = pool.execution(agent).await else {
+        panic!("the process started under a failing init.py")
+    };
+    let error = format!("{error:#}");
+    assert!(error.contains("init-canary"), "{error}");
+    assert!(error.contains("no agent of the workset starts"), "{error}");
+    let error = format!("{:#}", pool.eval(id, "1".to_owned()).await.unwrap_err());
+    assert!(error.contains("init-canary"), "{error}");
+
+    std::fs::write(&init, "STARTED = True\n").unwrap();
+    pool.execution(agent).await.unwrap();
 }
 
 #[test]

@@ -12,6 +12,9 @@ use super::workset_client;
 use crate::ipc::protocol::Startup;
 use crate::ipc::{protocol, transport, workset};
 
+/// How long init.py may run before the workset's process is given up.
+const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Routes the worker's packets for one agent. Each carries a clone of the
 /// process's in-flight token until its reply, if any, is handed to the
 /// transport.
@@ -307,6 +310,7 @@ impl Process {
     pub(crate) async fn start(
         pool: &Arc<crate::host::pool::AgentPool>,
         workset: rho_agent_types::WorksetId,
+        props: rho_agent_types::Props,
         layout: rho_fs_view::Layout,
         root: camino::Utf8PathBuf,
         init: Option<camino::Utf8PathBuf>,
@@ -317,6 +321,7 @@ impl Process {
         let startup = Startup {
             version: protocol::VERSION,
             workset,
+            props,
             layout,
             claude,
             responses_base_url: pool.inference().responses_base_url().to_owned(),
@@ -361,18 +366,29 @@ impl Process {
             .context("start rho-agent-worker companion")?;
         drop(command);
         let worker = Worker::open(child.id())?;
-        Self::connect(
+        let (initialized, init) = oneshot::channel();
+        let process = Self::connect(
             pool.inference(),
             server,
             requests,
             worker,
-            Some(startup),
+            Some((startup, initialized)),
             1,
             admission,
             false,
             python,
         )
-        .await
+        .await?;
+        // The workset's agents start under what init.py chose, so no one
+        // gets the process before init.py ended well.
+        let failure = match tokio::time::timeout(INIT_TIMEOUT, init).await {
+            Ok(Ok(None)) => return Ok(process),
+            Ok(Ok(Some(error))) => format!("init.py failed:\n{error}"),
+            Ok(Err(_)) => "the workset process ended before init.py did".to_owned(),
+            Err(_) => format!("init.py did not end within {}s", INIT_TIMEOUT.as_secs()),
+        };
+        process.shutdown().await;
+        anyhow::bail!("{failure}; no agent of the workset starts")
     }
 
     /// Takes over a workset process from the agent host this one re-executed.
@@ -442,13 +458,15 @@ impl Process {
         server: std::os::unix::net::UnixStream,
         requests: std::os::unix::net::UnixStream,
         worker: Worker,
-        startup: Option<Startup>,
+        startup: Option<(Startup, oneshot::Sender<Option<String>>)>,
         next: u64,
         admission: Arc<tokio::sync::RwLock<()>>,
         stale: bool,
         python: PythonHandler,
     ) -> anyhow::Result<Arc<Self>> {
         let pid = worker.pid;
+        let (startup, initialized) = startup.unzip();
+        let initialized = Mutex::new(initialized);
         let version = startup
             .as_ref()
             .map_or(protocol::VERSION, |startup| startup.version);
@@ -550,6 +568,10 @@ impl Process {
                                         }
                                         workset::Message::Evaluated { id, output, error } => {
                                             if let Some(reply) = eval_replies.lock().expect("poison").remove(&id) { let _ = reply.send((output, error)); }
+                                        }
+                                        workset::Message::Initialized { error } => {
+                                            let initialized = initialized.lock().expect("poison").take().context("init.py ended twice")?;
+                                            let _ = initialized.send(error);
                                         }
                                         workset::Message::Python { id, request } => {
                                             // The reply carries the request's token: a handoff waits for it.

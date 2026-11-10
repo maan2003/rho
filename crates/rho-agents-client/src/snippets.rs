@@ -5,7 +5,8 @@
 //!
 //! The names are the default policy's (`init.py`): `new_agent` creates an
 //! agent in the workset it runs in and returns its id, and `rho.agent(id)`
-//! acts on one.
+//! acts on one. A draft may name another function in its place, which
+//! takes the same arguments.
 
 use camino::Utf8Path;
 use rho_agent_types::{AgentId, MessageId};
@@ -39,6 +40,48 @@ pub const RUNTIMES: [&str; 6] = [
 ];
 
 pub const DEFAULT_RUNTIME: &str = RUNTIMES[0];
+
+/// The policy function a new agent's code calls when the draft names none.
+pub const DEFAULT_FUNCTION: &str = "new_agent";
+
+/// A function of the workset namespace that makes an agent, such as
+/// `new_agent` or one that init.py defines: a Python name, dotted or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Function(String);
+
+impl Function {
+    /// Reads a dotted Python name; empty is the default.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(Self(DEFAULT_FUNCTION.to_owned()));
+        }
+        let identifier = |part: &str| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+        };
+        if text.split('.').all(identifier) {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(format!(
+                "`{text}` is not a Python function name, such as `{DEFAULT_FUNCTION}`"
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for Function {
+    fn default() -> Self {
+        Self(DEFAULT_FUNCTION.to_owned())
+    }
+}
 
 impl Runtime {
     /// Reads `<model>-<effort>`; empty is the default.
@@ -104,13 +147,15 @@ pub fn cycle_runtime(current: &str) -> &'static str {
 /// The first agent of a new isolated workset, on a clone of `repo` at
 /// `rev` (empty: the remote's default branch).
 pub fn new_agent_on(
+    function: &Function,
     repo: &Utf8Path,
     rev: &str,
     runtime: &Runtime,
     origin: Option<MessageId>,
 ) -> String {
     format!(
-        "new_agent(repo={}, rev={}, runtime={}{})\n",
+        "{}(repo={}, rev={}, runtime={}{})\n",
+        function.as_str(),
         py_str(repo.as_str()),
         py_str(rev),
         runtime.python(),
@@ -120,9 +165,15 @@ pub fn new_agent_on(
 
 /// An agent working in `cwd` of the workset the code runs in: the first
 /// of a host workset, or another beside an agent already there.
-pub fn new_agent_in(cwd: &Utf8Path, runtime: &Runtime, origin: Option<MessageId>) -> String {
+pub fn new_agent_in(
+    function: &Function,
+    cwd: &Utf8Path,
+    runtime: &Runtime,
+    origin: Option<MessageId>,
+) -> String {
     format!(
-        "new_agent(cwd={}, runtime={}{})\n",
+        "{}(cwd={}, runtime={}{})\n",
+        function.as_str(),
         py_str(cwd.as_str()),
         runtime.python(),
         origin_arg(origin)
@@ -245,11 +296,35 @@ mod tests {
         );
     }
 
+    /// A function is a dotted Python name and nothing else, so the draft
+    /// cannot splice other code into the call.
+    #[test]
+    fn a_function_is_a_python_name() {
+        assert_eq!(Function::parse(" ").unwrap().as_str(), "new_agent");
+        assert_eq!(
+            Function::parse(" fedi.roboman ").unwrap().as_str(),
+            "fedi.roboman"
+        );
+        assert_eq!(Function::parse("_start2").unwrap().as_str(), "_start2");
+        for bad in ["2start", "a..b", "a.", "f()", "a b", "x;import os", "é"] {
+            assert!(Function::parse(bad).is_err(), "{bad}");
+        }
+        let runtime = Runtime::parse("opus-high").unwrap();
+        let roboman = Function::parse("roboman").unwrap();
+        assert!(new_agent_in(&roboman, "/src".into(), &runtime, None).starts_with("roboman(cwd="));
+    }
+
     #[test]
     fn snippets_quote_what_they_splice() {
         let runtime = Runtime::parse("opus-high").unwrap();
         assert_eq!(
-            new_agent_on("https://x/\"y\"".into(), "", &runtime, None),
+            new_agent_on(
+                &Function::default(),
+                "https://x/\"y\"".into(),
+                "",
+                &runtime,
+                None
+            ),
             "new_agent(repo=\"https://x/\\\"y\\\"\", rev=\"\", \
              runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"})\n"
         );

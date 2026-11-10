@@ -633,3 +633,46 @@ fn db_head(write: &mut rho_db::WriteTxn) -> u64 {
         .next_back()
         .map_or(0, |(key, _)| key.value())
 }
+
+/// A workset's props are what Python said last before its first agent;
+/// after that they are fixed.
+#[tokio::test]
+async fn workset_props_are_set_before_the_first_agent_only() {
+    let (_dir, db) = db().await;
+    let workset = WorksetId([3; 6]);
+    let mut write = db.write().await;
+    write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+    let props = |policy: &str| -> rho_agent_types::Props {
+        [("policy".to_owned(), policy.to_owned())].into()
+    };
+    let set = |write: &mut rho_db::WriteTxn, props| {
+        write.append(
+            workset,
+            &Record {
+                at: UnixMs(2),
+                event: Event::WorksetPropsSet { props },
+            },
+        )
+    };
+    set(&mut write, props("first")).unwrap();
+    set(&mut write, props("second")).unwrap();
+    write
+        .append(
+            workset,
+            &Record {
+                at: UnixMs(3),
+                event: Event::AgentCreated {
+                    agent: agent(1),
+                    spec: spec("a"),
+                },
+            },
+        )
+        .unwrap();
+    let error = set(&mut write, props("third")).unwrap_err();
+    assert!(
+        error.to_string().contains("before its first agent"),
+        "{error}"
+    );
+    write.commit();
+    assert_eq!(db.read().workset(workset).unwrap().props, props("second"));
+}
