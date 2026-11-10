@@ -28,6 +28,9 @@ class State:
         self.sent = []  # (agent, address, text) that the address's host took
         self.refusing = set()  # addresses whose host refuses
         self.contexts = {}  # cwd -> Context
+        self.skill_dirs = {}  # directory -> [Skill]
+        self.builtin = []  # [Skill]
+        self.agents_files = {}  # path -> AgentsFile
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
 
@@ -69,8 +72,20 @@ def clone(url, dest, rev=""):
     os.makedirs(dest)
 
 
-def context(cwd):
+def repo_context(cwd):
     return copy.deepcopy(STATE.contexts.get(cwd, {"agents_files": [], "skills": []}))
+
+
+def skills_in(directory):
+    return copy.deepcopy(STATE.skill_dirs.get(directory, []))
+
+
+def builtin_skills():
+    return copy.deepcopy(STATE.builtin)
+
+
+def agents_file(path):
+    return copy.deepcopy(STATE.agents_files.get(path))
 
 
 def models():

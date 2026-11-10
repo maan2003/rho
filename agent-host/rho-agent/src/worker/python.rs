@@ -349,7 +349,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(set_permissions, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(workset_permissions, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(clone, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(context, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(repo_context, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(skills_in, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(builtin_skills, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(agents_file, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(models, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(create_agent, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(agents, &module)?)?;
@@ -477,11 +480,47 @@ fn clone(py: Python<'_>, url: String, dest: String, rev: String) -> PyResult<()>
     }
 }
 
-/// AGENTS.md files and skills for `cwd`. A checkout's root counts where the
-/// directory is: inside the workset only within it, and a host directory's
-/// wherever its checkout begins.
+fn print_diagnostics(diagnostics: &[rho_context_config::ContextDiagnostic]) {
+    for diagnostic in diagnostics {
+        eprintln!(
+            "rho: context config {:?}: {}: {}",
+            diagnostic.kind,
+            diagnostic.path.display(),
+            diagnostic.message
+        );
+    }
+}
+
+fn skills_to_py<'py>(
+    py: Python<'py>,
+    skills: Vec<rho_context_config::Skill>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for skill in skills {
+        let entry = PyDict::new(py);
+        entry.set_item("name", skill.name)?;
+        entry.set_item("description", skill.description)?;
+        entry.set_item("path", skill.file_path.as_str())?;
+        out.append(entry)?;
+    }
+    Ok(out)
+}
+
+fn agents_file_to_py<'py>(
+    py: Python<'py>,
+    file: rho_context_config::AgentsFile,
+) -> PyResult<Bound<'py, PyDict>> {
+    let entry = PyDict::new(py);
+    entry.set_item("path", file.file_path.as_str())?;
+    entry.set_item("content", file.content)?;
+    Ok(entry)
+}
+
+/// The AGENTS.md and skills of the repository `cwd` is in. A checkout's
+/// root counts where the directory is: inside the workset only within it,
+/// and a host directory's wherever its checkout begins.
 #[pyfunction]
-fn context(py: Python<'_>, cwd: String) -> PyResult<Bound<'_, PyDict>> {
+fn repo_context(py: Python<'_>, cwd: String) -> PyResult<Bound<'_, PyDict>> {
     let cwd = camino::Utf8PathBuf::from(cwd);
     let found = py.detach(|| {
         let (root, _) = rho_fs_view::resolve_workdir_root(cwd.as_std_path()).ok()?;
@@ -491,38 +530,48 @@ fn context(py: Python<'_>, cwd: String) -> PyResult<Bound<'_, PyDict>> {
         } else {
             cwd.clone()
         };
-        let found = rho_context_config::DiscoveredContext::discover(&root, &root);
-        for diagnostic in &found.diagnostics {
-            eprintln!(
-                "rho: context config {:?}: {}: {}",
-                diagnostic.kind,
-                diagnostic.path.display(),
-                diagnostic.message
-            );
-        }
+        let found = rho_context_config::DiscoveredContext::discover_repo(&root, &root);
+        print_diagnostics(&found.diagnostics);
         Some(found)
     });
     let out = PyDict::new(py);
     let files = PyList::empty(py);
-    let skills = PyList::empty(py);
-    if let Some(found) = found {
-        for file in found.agents_files {
-            let entry = PyDict::new(py);
-            entry.set_item("path", file.file_path.as_str())?;
-            entry.set_item("content", file.content)?;
-            files.append(entry)?;
-        }
-        for skill in found.skills {
-            let entry = PyDict::new(py);
-            entry.set_item("name", skill.name)?;
-            entry.set_item("description", skill.description)?;
-            entry.set_item("path", skill.file_path.as_str())?;
-            skills.append(entry)?;
-        }
+    let (agents_files, skills) =
+        found.map_or_else(Default::default, |found| (found.agents_files, found.skills));
+    for file in agents_files {
+        files.append(agents_file_to_py(py, file)?)?;
     }
     out.set_item("agents_files", files)?;
-    out.set_item("skills", skills)?;
+    out.set_item("skills", skills_to_py(py, skills)?)?;
     Ok(out)
+}
+
+/// The skills in one skills directory; none if it does not exist.
+#[pyfunction]
+fn skills_in(py: Python<'_>, directory: std::path::PathBuf) -> PyResult<Bound<'_, PyList>> {
+    let (skills, diagnostics) = py.detach(|| rho_context_config::discover_skills(&directory));
+    print_diagnostics(&diagnostics);
+    skills_to_py(py, skills)
+}
+
+/// The skills this build of Rho bundles.
+#[pyfunction]
+fn builtin_skills(py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
+    let (skills, diagnostics) = py.detach(|| {
+        rho_context_config::bundled_skills_dir()
+            .map(|directory| rho_context_config::discover_skills(&directory))
+            .unwrap_or_default()
+    });
+    print_diagnostics(&diagnostics);
+    skills_to_py(py, skills)
+}
+
+/// One AGENTS.md-style file, under a repository's limits; None if absent.
+#[pyfunction]
+fn agents_file(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Option<Bound<'_, PyDict>>> {
+    let (file, diagnostics) = py.detach(|| rho_context_config::read_agents_file(&path));
+    print_diagnostics(&diagnostics);
+    file.map(|file| agents_file_to_py(py, file)).transpose()
 }
 
 #[pyfunction]
