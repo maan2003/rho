@@ -643,6 +643,327 @@ impl rho_agent::host::pool::Transport for Wires {
             Ok(host.gccp_receive(self.own, envelope.clone()).await)
         })
     }
+
+    fn open<'a>(
+        &'a self,
+        endpoint: EndpointId,
+        open: &'a rho_agent::host::pool::StreamOpen,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Option<rho_agent::host::pool::ByteStream>>>
+    {
+        use rho_agent::host::pool::ByteStream;
+        Box::pin(async move {
+            let host = self.hosts.lock().unwrap().get(&endpoint).cloned();
+            let host = host.ok_or_else(|| anyhow::anyhow!("no route"))?;
+            let Some(joined) = host.gccp_join(self.own, open.clone()).await else {
+                return Ok(None);
+            };
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let (reader, writer) = tokio::io::split(far);
+            tokio::spawn(joined.carry(ByteStream {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+            }));
+            let (reader, writer) = tokio::io::split(near);
+            Ok(Some(ByteStream {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+            }))
+        })
+    }
+}
+
+/// Python for a workset that has Unix sockets to try: `echo(path)` serves
+/// one that sends back what it gets and counts its connections,
+/// `ask(path, size)` sends `size` bytes and the end of its bytes while it
+/// reads, and says whether all of them came back in order or the
+/// connection closed with none, and `talk(path, name)` keeps a connection
+/// that `said(name, word)` asks and is answered on again.
+const SOCKETS: &str = r#"
+import asyncio, builtins, os
+if not hasattr(builtins, "gccp_test"):
+    builtins.gccp_test = {"servers": [], "connections": {}, "held": {}}
+STATE = builtins.gccp_test
+
+async def echo(path):
+    STATE["connections"][path] = 0
+    async def serve(reader, writer):
+        STATE["connections"][path] += 1
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+        writer.write_eof()
+        await writer.drain()
+        writer.close()
+    STATE["servers"].append(await asyncio.start_unix_server(serve, path=path))
+
+async def ask(path, size):
+    sent = bytes((n * 31 + n // 251) % 256 for n in range(size))
+    reader, writer = await asyncio.open_unix_connection(path)
+    async def say():
+        writer.write(sent)
+        await writer.drain()
+        writer.write_eof()
+    try:
+        _, back = await asyncio.wait_for(asyncio.gather(say(), reader.read()), 30)
+    except ConnectionError:
+        # Closed with this side's bytes unread.
+        return "closed"
+    finally:
+        writer.close()
+    if back == sent:
+        return "whole"
+    return f"{len(back)} of {size} bytes" if back else "closed"
+
+async def talk(path, name):
+    reader, writer = await asyncio.open_unix_connection(path)
+    STATE["held"][name] = (reader, writer)
+    return await said(name, "first")
+
+async def said(name, word):
+    reader, writer = STATE["held"][name]
+    try:
+        writer.write(word.encode())
+        await writer.drain()
+        back = await asyncio.wait_for(reader.read(len(word)), 10)
+    except ConnectionError:
+        return "closed"
+    return back.decode() if back else "closed"
+"#;
+
+/// Runs `code` after [`SOCKETS`] in a workset: what it printed.
+async fn sockets(pool: &Arc<AgentPool>, workset: WorksetId, code: &str) -> String {
+    let evaluated = pool
+        .eval(workset, format!("{SOCKETS}\n{code}\n"))
+        .await
+        .unwrap();
+    assert_eq!(evaluated.error, None, "{code}");
+    evaluated.output.trim().to_owned()
+}
+
+/// Two hosts whose users approved each other, with an agent on each that
+/// accepted the other: a Unix socket in one agent's workset, opened as a
+/// service to the other agent, is reached through a Unix socket in that
+/// agent's workset, and by nobody and nothing else.
+async fn gccp_two_sockets() {
+    use rho_agent::host::pool::StreamOpen;
+    const HERE: EndpointId = EndpointId([0xa1; 32]);
+    const THERE: EndpointId = EndpointId([0xb2; 32]);
+    const ELSEWHERE: EndpointId = EndpointId([0xc3; 32]);
+
+    let (here_model, _, _here_server) = idle_model().await;
+    let (there_model, _, _there_server) = idle_model().await;
+    let (_here_directory, here) = fixture(&here_model).await;
+    let (_there_directory, there) = fixture(&there_model).await;
+    here.set_endpoint(HERE);
+    there.set_endpoint(THERE);
+    let hosts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+        (HERE, here.clone()),
+        (THERE, there.clone()),
+    ])));
+    for (own, pool) in [(HERE, &here), (THERE, &there)] {
+        let wires = Wires {
+            own,
+            hosts: hosts.clone(),
+            sent: Arc::default(),
+        };
+        pool.set_transport(Arc::new(wires), &[]);
+    }
+    here.gccp_approve(THERE, "dpc's laptop").await.unwrap();
+    there.gccp_approve(HERE, "maan's desk").await.unwrap();
+    there.gccp_approve(ELSEWHERE, "a third host").await.unwrap();
+    // Ann and Carl are here, Bob is there.
+    let (here_workset, _, agents) = create(
+        &here,
+        "new_agent(runtime=RUNTIME)\nnew_agent(runtime=RUNTIME)\n",
+        None,
+    )
+    .await;
+    let (ann, carl) = (agents[0], agents[1]);
+    let (there_workset, _, agents) = create(&there, "new_agent(runtime=RUNTIME)\n", None).await;
+    let bob = agents[0];
+    let address = |endpoint: EndpointId, agent: AgentId| format!("{endpoint}/{}", agent.encoded());
+    let (ann_address, carl_address, bob_address) =
+        (address(HERE, ann), address(HERE, carl), address(THERE, bob));
+    let tool = async |pool: &Arc<AgentPool>, workset, agent, call: String| {
+        agents_tool(pool, workset, agent, &format!("external.{call}")).await
+    };
+    for (pool, workset, agent, peer, name) in [
+        (&here, here_workset, ann, &bob_address, "bob"),
+        (&here, here_workset, carl, &bob_address, "bob"),
+        (&there, there_workset, bob, &ann_address, "ann"),
+        (&there, there_workset, bob, &carl_address, "carl"),
+    ] {
+        let call = format!("accept(address={peer:?}, name={name:?})");
+        tool(pool, workset, agent, call).await.unwrap();
+    }
+
+    // Bob serves a socket in his workset and another outside it, and opens
+    // the first to Ann, and to nobody else.
+    let there_root = sockets(&there, there_workset, "print(os.getcwd())").await;
+    let here_root = sockets(&here, here_workset, "print(os.getcwd())").await;
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().to_str().unwrap();
+    let serve = format!(
+        "await echo('{there_root}/echo.sock')\nos.makedirs('{outside}', exist_ok=True)\n\
+         await echo('{outside}/host.sock')"
+    );
+    sockets(&there, there_workset, &serve).await;
+    let expose = |service: &str, to: &str, path: &str| {
+        format!("expose(address={to:?}, service={service:?}, path={path:?})")
+    };
+    let call = expose("echo", &ann_address, &format!("{there_root}/echo.sock"));
+    let exposed = tool(&there, there_workset, bob, call).await.unwrap();
+    assert!(
+        exposed.starts_with("ann can connect to echo: each connection reaches the Unix socket "),
+        "{exposed}"
+    );
+    let connections = async |path: &str| -> usize {
+        let code = format!("print(STATE['connections']['{path}'])");
+        sockets(&there, there_workset, &code).await.parse().unwrap()
+    };
+    let echo = format!("{there_root}/echo.sock");
+
+    // Ann listens on a socket of her own that leads there. Megabytes cross
+    // both ways through it at once and come back whole, the end of her
+    // bytes arrives while Bob's still come, and each connection to her
+    // socket is one to his.
+    let connect = |service: &str, to: &str, path: &str| {
+        format!("connect(address={to:?}, service={service:?}, path={path:?})")
+    };
+    let there_sock = format!("{here_root}/there.sock");
+    let call = connect("echo", &bob_address, &there_sock);
+    let listening = tool(&here, here_workset, ann, call).await.unwrap();
+    assert_eq!(
+        listening,
+        format!(
+            "Listening at {there_sock}: each connection to that Unix socket is a connection to \
+             echo of bob."
+        )
+    );
+    let ask = async |path: &str, size: usize| {
+        sockets(
+            &here,
+            here_workset,
+            &format!("print(await ask({path:?}, {size}))"),
+        )
+        .await
+    };
+    assert_eq!(ask(&there_sock, 3_000_001).await, "whole");
+    assert_eq!(ask(&there_sock, 0).await, "whole");
+    let both = "print(*await asyncio.gather(*(ask(PATH, 400_000 + n) for n in range(4))))";
+    let both = both.replace("PATH", &format!("{there_sock:?}"));
+    assert_eq!(
+        sockets(&here, here_workset, &both).await,
+        "whole whole whole whole"
+    );
+    assert_eq!(connections(&echo).await, 6);
+    // A connection that stays open is asked and answered again and again.
+    let held = format!("print(await talk({there_sock:?}, 'held'))");
+    assert_eq!(sockets(&here, here_workset, &held).await, "first");
+    let said = async |name: &str, word: &str| {
+        let code = format!("print(await said({name:?}, {word:?}))");
+        sockets(&here, here_workset, &code).await
+    };
+    assert_eq!(said("held", "second").await, "second");
+    assert_eq!(connections(&echo).await, 7);
+
+    // What is not open to the one who asks is refused, and its connection
+    // closes with nothing read: a service of another name, Bob's service
+    // asked for by Carl, whom Bob accepted but opened nothing to, and by
+    // an address on a host that Bob's user approved but Bob never accepted.
+    let refused = "closed";
+    let nope = format!("{here_root}/nope.sock");
+    let call = connect("nope", &bob_address, &nope);
+    tool(&here, here_workset, ann, call).await.unwrap();
+    assert_eq!(ask(&nope, 7).await, refused);
+    let carls = format!("{here_root}/carl.sock");
+    let call = connect("echo", &bob_address, &carls);
+    tool(&here, here_workset, carl, call).await.unwrap();
+    assert_eq!(ask(&carls, 7).await, refused);
+    let open = |from: AgentId, service: &str| StreamOpen {
+        to: bob.encoded().parse().unwrap(),
+        from: from.encoded().parse().unwrap(),
+        service: service.parse().unwrap(),
+    };
+    assert!(
+        there
+            .gccp_join(ELSEWHERE, open(ann, "echo"))
+            .await
+            .is_none()
+    );
+    assert!(there.gccp_join(HERE, open(carl, "echo")).await.is_none());
+    assert!(there.gccp_join(HERE, open(ann, "echo")).await.is_some());
+    assert_eq!(connections(&echo).await, 8, "only Ann's got through");
+
+    // A service is a socket in the agent's workset. One outside it is not
+    // opened by its path, and not through a link that is put in the
+    // workset after the service was opened.
+    let call = expose("host", &ann_address, &format!("{outside}/host.sock"));
+    let error = tool(&there, there_workset, bob, call).await.unwrap_err();
+    assert!(error.contains("is not in the workset"), "{error}");
+    let call = expose("host", &ann_address, &format!("{there_root}/link.sock"));
+    tool(&there, there_workset, bob, call).await.unwrap();
+    let link = format!("os.symlink('{outside}/host.sock', '{there_root}/link.sock')");
+    sockets(&there, there_workset, &link).await;
+    let hosts_sock = format!("{here_root}/host.sock");
+    let call = connect("host", &bob_address, &hosts_sock);
+    tool(&here, here_workset, ann, call).await.unwrap();
+    assert_eq!(ask(&hosts_sock, 7).await, refused);
+    assert_eq!(connections(&format!("{outside}/host.sock")).await, 0);
+    // A service nothing listens on is refused like one that is not open.
+    let call = expose("later", &ann_address, &format!("{there_root}/later.sock"));
+    tool(&there, there_workset, bob, call).await.unwrap();
+    let later = format!("{here_root}/later.sock");
+    let call = connect("later", &bob_address, &later);
+    tool(&here, here_workset, ann, call).await.unwrap();
+    assert_eq!(ask(&later, 7).await, refused);
+
+    // What both sides see of it.
+    let contacts = tool(&there, there_workset, bob, "contacts()".to_owned())
+        .await
+        .unwrap();
+    let anns = format!(
+        "ann: {ann_address}\n  can connect to echo: {there_root}/echo.sock\n  can connect to \
+         host: {there_root}/link.sock\n  can connect to later: {there_root}/later.sock"
+    );
+    let carls = format!("carl: {carl_address}");
+    assert!(
+        [format!("{anns}\n{carls}"), format!("{carls}\n{anns}")].contains(&contacts),
+        "{contacts}"
+    );
+
+    // Bob closes the service: the connection that was open ends, and a new
+    // one is refused. The others stay.
+    let call = format!("unexpose(address={ann_address:?}, service='echo')");
+    tool(&there, there_workset, bob, call).await.unwrap();
+    assert_eq!(said("held", "third").await, "closed");
+    assert_eq!(ask(&there_sock, 7).await, refused);
+    // Opened again, it is reached again through the same socket of Ann's,
+    // until Bob's user takes back his acceptance of her.
+    let call = expose("echo", &ann_address, &echo);
+    tool(&there, there_workset, bob, call).await.unwrap();
+    assert_eq!(ask(&there_sock, 70_000).await, "whole");
+    let held = format!("print(await talk({there_sock:?}, 'again'))");
+    assert_eq!(sockets(&here, here_workset, &held).await, "first");
+    let ann_peer: rho_agent_types::PeerAddress = ann_address.parse().unwrap();
+    there.gccp_remove(bob, &ann_peer).await.unwrap();
+    assert_eq!(said("again", "second").await, "closed");
+    assert_eq!(ask(&there_sock, 7).await, refused);
+    let services: Vec<_> = there
+        .gccp_contacts()
+        .into_iter()
+        .map(|contact| (contact.name, contact.services.len()))
+        .collect();
+    assert_eq!(services, [("carl".to_owned(), 0)]);
+}
+
+#[test]
+fn gccp_joins_a_unix_socket_only_to_the_address_it_was_opened_to() {
+    with_synthetic_login(
+        "gccp_joins_a_unix_socket_only_to_the_address_it_was_opened_to",
+        Duration::from_secs(120),
+        gccp_two_sockets(),
+    );
 }
 
 async fn gccp_two_hosts() {

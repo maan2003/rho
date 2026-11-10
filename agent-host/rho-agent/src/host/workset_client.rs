@@ -55,7 +55,8 @@ pub(crate) type Pending = Arc<
         HashMap<
             u64,
             (
-                oneshot::Sender<Reply>,
+                // A reply, and the descriptor that came with it.
+                oneshot::Sender<(Reply, Option<std::os::fd::OwnedFd>)>,
                 Option<tokio::sync::OwnedRwLockReadGuard<()>>,
             ),
         >,

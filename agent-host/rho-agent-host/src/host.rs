@@ -7,9 +7,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
-    GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove,
-    IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request,
-    ShutdownIfIdle, Snapshot,
+    GccpService, GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
+    IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus,
+    Request, ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -289,6 +289,14 @@ where
                             agent: contact.agent.encoded(),
                             address: contact.peer.to_string(),
                             name: contact.name,
+                            services: contact
+                                .services
+                                .into_iter()
+                                .map(|service| GccpService {
+                                    name: service.name.to_string(),
+                                    path: service.path,
+                                })
+                                .collect(),
                         })
                         .collect(),
                 })

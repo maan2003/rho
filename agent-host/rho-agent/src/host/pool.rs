@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
+pub use gccp::{
+    ByteStream, Envelope, Joined, MAX_BODY_LEN, MessageResult, RETRY_WAITS, StreamOpen, Transport,
+};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -69,6 +71,9 @@ pub struct AgentPool {
     /// What carries GCCP messages out, while the host's endpoint is up, and
     /// the waits before the tries after the first.
     gccp_transport: std::sync::Mutex<Option<gccp::Carrier>>,
+    /// Told whenever an acceptance or a service is taken back, so that each
+    /// open byte stream looks whether it still may be.
+    gccp_taken: tokio::sync::watch::Sender<()>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -153,6 +158,7 @@ impl AgentPool {
             endpoint: std::sync::OnceLock::new(),
             gccp_stored: std::sync::Mutex::default(),
             gccp_transport: std::sync::Mutex::default(),
+            gccp_taken: tokio::sync::watch::Sender::new(()),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
@@ -197,6 +203,16 @@ impl AgentPool {
         let slot = self.execution_slot(workset).await;
         let _admission = slot.admission.clone().read_owned().await;
         self.process(workset).await
+    }
+
+    /// The process of a workset, if it runs.
+    async fn running(&self, workset: WorksetId) -> Option<Arc<crate::host::Process>> {
+        let slot = self.processes.lock().await.get(&workset)?.clone();
+        let process = slot.process.lock().await;
+        process
+            .as_ref()
+            .filter(|process| !*process.closed.borrow())
+            .cloned()
     }
 
     /// The one agent of the host, in any workset, whose id starts with
@@ -1141,13 +1157,13 @@ impl AgentPool {
     /// What answers a workset's `_rho` calls.
     fn python_handler(self: &Arc<Self>, workset: WorksetId) -> crate::host::process::PythonHandler {
         let pool = Arc::downgrade(self);
-        Arc::new(move |request| {
+        Arc::new(move |request, socket| {
             let pool = pool.clone();
             Box::pin(async move {
                 let Some(pool) = pool.upgrade() else {
                     return PyReply::Error("the agent host is shutting down".into());
                 };
-                pool.python(workset, request)
+                pool.python(workset, request, socket)
                     .await
                     .unwrap_or_else(|error| PyReply::Error(format!("{error:#}")))
             })
@@ -1166,10 +1182,13 @@ impl AgentPool {
         Ok(head.spec)
     }
 
+    /// Answers one `_rho` call of a workset. `socket` is the descriptor
+    /// that came with the request, for the one request that takes one.
     async fn python(
         self: &Arc<Self>,
         workset: WorksetId,
         request: PyRequest,
+        socket: Option<std::os::fd::OwnedFd>,
     ) -> anyhow::Result<PyReply> {
         Ok(match request {
             PyRequest::CreateAgent(spec) => {
@@ -1430,6 +1449,34 @@ impl AgentPool {
                 let mut contacts = self.gccp_contacts();
                 contacts.retain(|contact| contact.agent == agent);
                 PyReply::ExternalContacts(contacts)
+            }
+            PyRequest::ExternalExpose {
+                agent,
+                peer,
+                service,
+                path,
+            } => {
+                self.own_agent(workset, agent)?;
+                self.external_expose(agent, &peer, &service, path).await?;
+                PyReply::Done
+            }
+            PyRequest::ExternalUnexpose {
+                agent,
+                peer,
+                service,
+            } => {
+                self.own_agent(workset, agent)?;
+                self.external_unexpose(agent, &peer, &service).await?;
+                PyReply::Done
+            }
+            PyRequest::ExternalOpen {
+                agent,
+                peer,
+                service,
+            } => {
+                self.own_agent(workset, agent)?;
+                self.external_open(agent, &peer, &service, socket).await?;
+                PyReply::Done
             }
         })
     }

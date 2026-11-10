@@ -162,7 +162,22 @@ async def external_send(agent: str, address: str, text: str) -> str:
     host took the message. Raises when it refuses, or gives no result in
     the host's three tries."""
 def external_contacts(agent: str) -> list[dict]:
-    """The addresses `agent` accepted, each a dict of `address` and `name`."""
+    """The addresses `agent` accepted, each a dict of `address`, `name`, and
+    `services`: the path of the Unix socket behind each service the agent
+    opened to the address, by the service's name."""
+def external_expose(agent: str, address: str, service: str, path: str) -> None:
+    """`agent` opens the Unix socket at `path` to `address`, which it
+    accepted, as `service`: a byte stream that address opens to the service
+    is joined to the socket. Raises when the path is not in the workset.
+    Opening a service again moves it."""
+def external_unexpose(agent: str, address: str, service: str) -> None:
+    """`agent` closes a service it opened to `address`; open streams to it
+    end. Raises when there is none."""
+def external_connect(agent: str, address: str, service: str, path: str) -> None:
+    """Listen on a Unix socket at `path`, in place of whatever of this
+    process listened there: each connection becomes a byte stream to
+    `service` at `address`, which `agent` accepted, and closes if that
+    stream is refused. The listener lasts as long as the workset process."""
 def join(topic: int, agent: str) -> None:
     """Make `agent` a member of the topic from now on. Not for a direct
     conversation."""

@@ -33,9 +33,14 @@ use crate::worker::permissions::{self, PERMISSIONS, Permissions};
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How `_rho` reaches the agent host: over the workset port, or a test's
-/// stand-in.
+/// stand-in. A request may take a socket with it, as a descriptor.
 pub(crate) type HostCall = Arc<
-    dyn Fn(PyRequest) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>> + Send + Sync,
+    dyn Fn(
+            PyRequest,
+            Option<std::os::fd::OwnedFd>,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>>
+        + Send
+        + Sync,
 >;
 
 /// The workset process's link to the agent host for `_rho`.
@@ -46,6 +51,7 @@ pub(crate) struct PyHost {
     pub isolated: bool,
     /// The workset's props: its head's at start, then what Python set.
     pub props: Mutex<rho_agent_types::Props>,
+    pub streams: Arc<super::streams::Streams>,
 }
 
 static HOST: OnceLock<PyHost> = OnceLock::new();
@@ -64,16 +70,19 @@ impl PyHost {
         workset: WorksetId,
         isolated: bool,
         props: rho_agent_types::Props,
+        streams: Arc<super::streams::Streams>,
     ) -> Self {
-        let call: HostCall = Arc::new(move |request| {
+        let call: HostCall = Arc::new(move |request, socket| {
             let sender = sender.clone();
             Box::pin(async move {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
                 let (reply, answer) = oneshot::channel();
                 PENDING.lock().expect("poison").insert(id, reply);
-                let sent = sender
-                    .send(Port::Workset, encode(&Message::Python { id, request })?)
-                    .await;
+                let message = encode(&Message::Python { id, request })?;
+                let sent = match socket {
+                    Some(socket) => sender.send_with_fd(Port::Workset, message, socket).await,
+                    None => sender.send(Port::Workset, message).await,
+                };
                 if let Err(error) = sent {
                     PENDING.lock().expect("poison").remove(&id);
                     return Err(error.into());
@@ -89,11 +98,21 @@ impl PyHost {
             workset,
             isolated,
             props: Mutex::new(props),
+            streams,
         }
     }
 
     async fn call(&self, request: PyRequest) -> anyhow::Result<PyReply> {
-        match (self.call)(request).await? {
+        self.call_with(request, None).await
+    }
+
+    /// [`PyHost::call`], with a socket for the host to have.
+    async fn call_with(
+        &self,
+        request: PyRequest,
+        socket: Option<std::os::fd::OwnedFd>,
+    ) -> anyhow::Result<PyReply> {
+        match (self.call)(request, socket).await? {
             PyReply::Error(error) => Err(anyhow::anyhow!(error)),
             reply => Ok(reply),
         }
@@ -372,6 +391,9 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(external_accept, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_send, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_contacts, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_expose, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_unexpose, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(external_connect, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
@@ -814,12 +836,93 @@ fn external_contacts(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
                 let held = PyDict::new(py);
                 held.set_item("address", contact.peer.to_string())?;
                 held.set_item("name", contact.name)?;
+                let services = PyDict::new(py);
+                for service in contact.services {
+                    services.set_item(service.name.to_string(), service.path)?;
+                }
+                held.set_item("services", services)?;
                 out.append(held)?;
             }
             Ok(out.into_any().unbind())
         }
         _ => Err(unexpected()),
     }
+}
+
+/// The agent opens the Unix socket at `path`, which is in the workset, as a
+/// service to an address it accepted.
+#[pyfunction]
+fn external_expose(
+    py: Python<'_>,
+    agent: &str,
+    address: String,
+    service: String,
+    path: String,
+) -> PyResult<()> {
+    // Told here, where the path means something. The check that counts is
+    // made again for each stream, on what the path is then.
+    host()?
+        .streams
+        .inside(std::path::Path::new(&path))
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+    let request = PyRequest::ExternalExpose {
+        agent: agent_id(agent)?,
+        peer: address,
+        service,
+        path,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The agent closes a service it opened to an address.
+#[pyfunction]
+fn external_unexpose(
+    py: Python<'_>,
+    agent: &str,
+    address: String,
+    service: String,
+) -> PyResult<()> {
+    let request = PyRequest::ExternalUnexpose {
+        agent: agent_id(agent)?,
+        peer: address,
+        service,
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The workset listens on a Unix socket at `path`: each connection to it
+/// becomes a byte stream to `service` at `address`, which the agent
+/// accepted.
+#[pyfunction]
+fn external_connect(agent: &str, address: String, service: String, path: String) -> PyResult<()> {
+    let agent = agent_id(agent)?;
+    let invalid = |error: String| PyValueError::new_err(error);
+    address
+        .parse::<rho_agent_types::PeerAddress>()
+        .map_err(invalid)?;
+    service
+        .parse::<rho_agent_types::ServiceName>()
+        .map_err(invalid)?;
+    let host = host()?;
+    let open: super::streams::Open = Arc::new(move |socket| {
+        let request = PyRequest::ExternalOpen {
+            agent,
+            peer: address.clone(),
+            service: service.clone(),
+        };
+        Box::pin(async move { host.call_with(request, Some(socket)).await.map(|_| ()) })
+    });
+    // A listener belongs to the runtime it was made in.
+    let _runtime = host.runtime.enter();
+    host.streams
+        .forward(std::path::Path::new(&path), open)
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))
 }
 
 /// One message as a dict, or None.

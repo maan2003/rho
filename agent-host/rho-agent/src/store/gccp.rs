@@ -9,17 +9,26 @@
 //! does not know. Taking an approval back takes back every acceptance on
 //! it.
 //!
+//! Accepting an address lets messages through and nothing else. A byte
+//! stream is access to a program, so an agent opens each service by name
+//! to one address it accepted, and the store keeps where that service
+//! listens.
+//!
 //! None of this is chat: no client sees it, and a message from another
 //! harness reaches its agent as input, not as a post.
 
 use redb::TableDefinition;
-use rho_agent_types::{AgentId, EndpointId, PeerAddress};
+use rho_agent_types::{AgentId, EndpointId, PeerAddress, ServiceName};
 use rho_db::{ReadTxn, WriteTxn};
 use rho_iroh_auth::gccp_hosts;
 use senax_encoder::{Decode, Encode};
 
 /// `(agent, address)`: the name the agent gave an address it accepted.
 const CONTACTS: TableDefinition<(AgentId, String), String> = TableDefinition::new("gccp_contacts");
+/// `(agent, address, service)`: the Unix socket, in the agent's workset, of a
+/// service the agent opened to an address it accepted.
+const SERVICES: TableDefinition<(AgentId, String, String), String> =
+    TableDefinition::new("gccp_services");
 /// The longest name a harness or an address is given.
 const MAX_NAME_LEN: usize = 80;
 
@@ -29,6 +38,16 @@ pub struct GccpContact {
     pub agent: AgentId,
     pub peer: PeerAddress,
     pub name: String,
+    /// The services the agent opened to the address.
+    pub services: Vec<GccpService>,
+}
+
+/// A service an agent opened to an address.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct GccpService {
+    pub name: ServiceName,
+    /// The Unix socket it listens on, as the agent's workset sees it.
+    pub path: String,
 }
 
 /// A name as the host shows it to an agent inside a `[...]` header: one
@@ -58,6 +77,13 @@ pub trait GccpRead {
     fn gccp_contact(&self, agent: AgentId, peer: &PeerAddress) -> Option<String>;
     /// Every acceptance, of every agent.
     fn gccp_contacts(&self) -> Vec<GccpContact>;
+    /// The socket of the service `agent` opened to `peer` under `service`.
+    fn gccp_service(
+        &self,
+        agent: AgentId,
+        peer: &PeerAddress,
+        service: &ServiceName,
+    ) -> Option<String>;
 }
 
 impl GccpRead for ReadTxn {
@@ -79,17 +105,39 @@ impl GccpRead for ReadTxn {
     }
 
     fn gccp_contacts(&self) -> Vec<GccpContact> {
+        let services = self.open_table(SERVICES);
         self.open_table(CONTACTS)
             .iter()
             .map(|(key, name)| {
                 let (agent, address) = key.value();
+                let opened = services
+                    .range((agent, address.clone(), String::new())..)
+                    .map(|(key, path)| (key.value(), path.value()))
+                    .take_while(|((holder, to, _), _)| *holder == agent && *to == address)
+                    .map(|((_, _, service), path)| GccpService {
+                        name: service.parse().expect("the store keeps service names"),
+                        path,
+                    })
+                    .collect();
                 GccpContact {
                     agent,
                     peer: address_of(&address),
                     name: name.value(),
+                    services: opened,
                 }
             })
             .collect()
+    }
+
+    fn gccp_service(
+        &self,
+        agent: AgentId,
+        peer: &PeerAddress,
+        service: &ServiceName,
+    ) -> Option<String> {
+        self.open_table(SERVICES)
+            .get((agent, peer.to_string(), service.to_string()))
+            .map(|path| path.value())
     }
 }
 
@@ -103,22 +151,36 @@ pub trait GccpWrite {
     /// accept addresses on it. Approving it again renames it.
     fn gccp_approve(&mut self, endpoint: EndpointId, name: &str) -> anyhow::Result<()>;
     /// Takes an approval back, and with it every acceptance of an address on
-    /// that harness. Says whether the harness was approved.
+    /// that harness and every service opened to one. Says whether the
+    /// harness was approved.
     fn gccp_revoke(&mut self, endpoint: EndpointId) -> bool;
     /// `agent` accepts `peer` under `name`. The user must have approved the
     /// peer's harness.
     fn gccp_accept(&mut self, agent: AgentId, peer: &PeerAddress, name: &str)
     -> anyhow::Result<()>;
-    /// Takes an acceptance back. Says whether there was one.
+    /// Takes an acceptance back, and the services opened to the address.
+    /// Says whether there was one.
     fn gccp_remove(&mut self, agent: AgentId, peer: &PeerAddress) -> bool;
-    /// Takes back all that `agent` accepted: it is gone.
+    /// Takes back all that `agent` accepted and opened: it is gone.
     fn gccp_forget(&mut self, agent: AgentId);
+    /// `agent` opens the service at the socket `path` to `peer`, which it
+    /// accepted, under `service`. Opening it again moves it.
+    fn gccp_expose(
+        &mut self,
+        agent: AgentId,
+        peer: &PeerAddress,
+        service: &ServiceName,
+        path: String,
+    ) -> anyhow::Result<()>;
+    /// Closes a service to `peer`. Says whether it was open.
+    fn gccp_unexpose(&mut self, agent: AgentId, peer: &PeerAddress, service: &ServiceName) -> bool;
 }
 
 impl GccpWrite for WriteTxn {
     fn init_gccp_tables(&mut self) {
         gccp_hosts::init(self);
         self.open_table(CONTACTS);
+        self.open_table(SERVICES);
     }
 
     fn gccp_approve(&mut self, endpoint: EndpointId, name: &str) -> anyhow::Result<()> {
@@ -136,9 +198,8 @@ impl GccpWrite for WriteTxn {
             .map(|(key, _)| key.value())
             .filter(|(_, address)| address_of(address).endpoint == endpoint)
             .collect();
-        let mut contacts = self.open_table(CONTACTS);
-        for key in there {
-            contacts.remove(key);
+        for (agent, address) in there {
+            remove(self, agent, address);
         }
         true
     }
@@ -173,9 +234,7 @@ impl GccpWrite for WriteTxn {
     }
 
     fn gccp_remove(&mut self, agent: AgentId, peer: &PeerAddress) -> bool {
-        self.open_table(CONTACTS)
-            .remove((agent, peer.to_string()))
-            .is_some()
+        remove(self, agent, peer.to_string())
     }
 
     fn gccp_forget(&mut self, agent: AgentId) {
@@ -186,11 +245,57 @@ impl GccpWrite for WriteTxn {
             .take_while(|(holder, _)| *holder == agent)
             .map(|(_, address)| address)
             .collect();
-        let mut contacts = self.open_table(CONTACTS);
         for address in accepted {
-            contacts.remove((agent, address));
+            remove(self, agent, address);
         }
     }
+
+    fn gccp_expose(
+        &mut self,
+        agent: AgentId,
+        peer: &PeerAddress,
+        service: &ServiceName,
+        path: String,
+    ) -> anyhow::Result<()> {
+        let address = peer.to_string();
+        anyhow::ensure!(
+            self.open_table(CONTACTS)
+                .get((agent, address.clone()))
+                .is_some(),
+            "{peer} is not an address you accepted"
+        );
+        self.open_table(SERVICES)
+            .insert((agent, address, service.to_string()), path);
+        Ok(())
+    }
+
+    fn gccp_unexpose(&mut self, agent: AgentId, peer: &PeerAddress, service: &ServiceName) -> bool {
+        self.open_table(SERVICES)
+            .remove((agent, peer.to_string(), service.to_string()))
+            .is_some()
+    }
+}
+
+/// Removes one acceptance and the services opened to its address. Says
+/// whether it was there.
+fn remove(write: &mut WriteTxn, agent: AgentId, address: String) -> bool {
+    if write
+        .open_table(CONTACTS)
+        .remove((agent, address.clone()))
+        .is_none()
+    {
+        return false;
+    }
+    let mut services = write.open_table(SERVICES);
+    let opened: Vec<(AgentId, String, String)> = services
+        .range((agent, address.clone(), String::new())..)
+        .map(|(key, _)| key.value())
+        .take_while(|(holder, to, _)| *holder == agent && *to == address)
+        .collect();
+    for key in opened {
+        services.remove(key);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -272,34 +377,116 @@ mod tests {
                 agent: a,
                 peer: far,
                 name: "far dpc".into(),
+                services: vec![],
             }]
         );
     }
 
-    /// An acceptance taken back is that one alone, and an agent that is gone
-    /// takes its own with it and nobody else's.
+    /// A service is open to the one address it was opened to, which the
+    /// agent accepted. It goes when it is closed, with its acceptance, with
+    /// the approval of its harness, and with its agent, and then nothing of
+    /// another address or agent goes with it.
     #[tokio::test]
-    async fn an_acceptance_goes_alone_or_with_its_agent() {
+    async fn a_service_is_open_to_one_accepted_address() {
         let (_dir, db) = db().await;
         let (a, b) = (agent(1), agent(2));
-        let (dpc, other) = (peer(9, "dpc"), peer(9, "other"));
+        let (dpc, other, far) = (peer(9, "dpc"), peer(9, "other"), peer(8, "dpc"));
+        let name = |name: &str| name.parse::<ServiceName>().unwrap();
+        let (web, git) = (name("web"), name("git"));
+        let open = |db: &rho_db::RhoDb| {
+            let contacts = db.read().gccp_contacts();
+            let mut open = Vec::new();
+            for contact in contacts {
+                for service in contact.services {
+                    let to = (contact.peer.endpoint.0[0], contact.peer.local.to_string());
+                    open.push((contact.agent, to, service.name.to_string(), service.path));
+                }
+            }
+            open
+        };
+        let row = |agent, endpoint: u8, local: &str, service: &str, path: &str| {
+            let to = (endpoint, local.to_owned());
+            (agent, to, service.to_owned(), path.to_owned())
+        };
+
         let mut write = db.write().await;
         write.gccp_approve(dpc.endpoint, "dpc").unwrap();
-        write.gccp_accept(a, &dpc, "dpc").unwrap();
-        write.gccp_accept(a, &other, "other").unwrap();
-        write.gccp_accept(b, &dpc, "b's dpc").unwrap();
-        write.gccp_accept(b, &other, "b's other").unwrap();
+        write.gccp_approve(far.endpoint, "far").unwrap();
+        let early = write.gccp_expose(a, &dpc, &web, "/src/web.sock".into());
+        assert!(early.unwrap_err().to_string().contains("not an address"));
+        for (agent, peer) in [(a, &dpc), (a, &other), (a, &far), (b, &dpc)] {
+            write.gccp_accept(agent, peer, "someone").unwrap();
+        }
+        write
+            .gccp_expose(a, &dpc, &web, "/src/old.sock".into())
+            .unwrap();
+        write
+            .gccp_expose(a, &dpc, &web, "/src/web.sock".into())
+            .unwrap();
+        write
+            .gccp_expose(a, &dpc, &git, "/src/git.sock".into())
+            .unwrap();
+        write
+            .gccp_expose(a, &far, &web, "/src/far.sock".into())
+            .unwrap();
+        write
+            .gccp_expose(b, &dpc, &web, "/src/b.sock".into())
+            .unwrap();
+        write.commit();
+        let read = db.read();
+        assert_eq!(
+            read.gccp_service(a, &dpc, &web).as_deref(),
+            Some("/src/web.sock")
+        );
+        assert_eq!(read.gccp_service(a, &other, &web), None, "another address");
+        assert_eq!(read.gccp_service(b, &dpc, &git), None, "another agent");
+        drop(read);
+        assert_eq!(
+            open(&db),
+            vec![
+                row(a, 8, "dpc", "web", "/src/far.sock"),
+                row(a, 9, "dpc", "git", "/src/git.sock"),
+                row(a, 9, "dpc", "web", "/src/web.sock"),
+                row(b, 9, "dpc", "web", "/src/b.sock"),
+            ]
+        );
+
+        let mut write = db.write().await;
+        assert!(write.gccp_unexpose(a, &dpc, &git));
+        assert!(!write.gccp_unexpose(a, &dpc, &git));
+        write.commit();
+        assert_eq!(open(&db).len(), 3);
+
+        // The acceptance goes: its services go, and accepting again opens
+        // none of them.
+        let mut write = db.write().await;
         assert!(write.gccp_remove(a, &dpc));
         assert!(!write.gccp_remove(a, &dpc));
-        write.gccp_forget(b);
+        write.gccp_accept(a, &dpc, "dpc again").unwrap();
         write.commit();
         assert_eq!(
-            db.read().gccp_contacts(),
-            vec![GccpContact {
-                agent: a,
-                peer: other,
-                name: "other".into(),
-            }]
+            open(&db),
+            vec![
+                row(a, 8, "dpc", "web", "/src/far.sock"),
+                row(b, 9, "dpc", "web", "/src/b.sock"),
+            ]
         );
+
+        let mut write = db.write().await;
+        assert!(write.gccp_revoke(far.endpoint));
+        write.commit();
+        assert_eq!(open(&db), vec![row(b, 9, "dpc", "web", "/src/b.sock")]);
+
+        let mut write = db.write().await;
+        write.gccp_forget(b);
+        write.commit();
+        assert_eq!(open(&db), vec![]);
+        let left: Vec<(AgentId, String)> = db
+            .read()
+            .gccp_contacts()
+            .into_iter()
+            .map(|contact| (contact.agent, contact.peer.local.to_string()))
+            .collect();
+        assert_eq!(left, [(a, "dpc".to_owned()), (a, "other".to_owned())]);
     }
 }

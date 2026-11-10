@@ -134,6 +134,7 @@ pub(crate) async fn run(
             >,
         >,
     > = Arc::default();
+    let streams = Arc::new(super::streams::Streams::new(&startup.root));
     let execution = Arc::new(super::workset::Execution {
         terminals: Arc::default(),
         shells: Arc::default(),
@@ -166,6 +167,7 @@ pub(crate) async fn run(
             startup.workset,
             startup.layout.mount.is_some(),
             startup.props.clone(),
+            streams.clone(),
         ),
         startup.init.clone(),
         {
@@ -217,7 +219,8 @@ pub(crate) async fn run(
                 packet = answers.next() => packet,
             };
             match packet {
-                Ok(packet) => break packet,
+                // The host sends a worker no descriptor.
+                Ok((packet, _)) => break packet,
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                     break 'connection Ok(());
                 }
@@ -288,6 +291,27 @@ pub(crate) async fn run(
                     }
                     W::Detach(port) => {
                         execution.clients.lock().expect("poison").remove(&port);
+                    }
+                    W::Connect { id, path } => {
+                        let streams = streams.clone();
+                        let sender = sender.clone();
+                        tasks.spawn(async move {
+                            let reply = |body| {
+                                workset::encode(&W::Reply { id, body })
+                                    .expect("encode workset reply")
+                            };
+                            let _ = match streams.service(&path).await {
+                                Ok(socket) => {
+                                    sender
+                                        .send_with_fd(Port::Workset, reply(Reply::Socket), socket)
+                                        .await
+                                }
+                                Err(error) => {
+                                    let refused = Reply::Error(format!("{error:#}"));
+                                    sender.send(Port::Workset, reply(refused)).await
+                                }
+                            };
+                        });
                     }
                     W::PythonReply { id, body } => super::python::replied(id, body),
                     W::Eval { id, code } => {

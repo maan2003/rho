@@ -1,10 +1,20 @@
 //! One framed workset connection with bounded I/O queues.
+//!
+//! A packet can take a file descriptor with it ([`Sender::send_with_fd`]),
+//! which is how a socket of the workset's gets to the host: the two
+//! processes may not see the same files, and a descriptor needs no path.
 use std::io;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
+};
 use senax_encoder::{Decode, Encode};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncWriteExt as _, Interest};
 use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -36,6 +46,8 @@ impl Packet {
 enum Outgoing {
     Packet {
         packet: Packet,
+        /// Sent with the packet's first byte.
+        fd: Option<OwnedFd>,
         _permit: OwnedSemaphorePermit,
     },
     /// Everything queued before this has been written; hold the rest until
@@ -59,6 +71,20 @@ pub(crate) struct Sender {
 
 impl Sender {
     pub async fn send(&self, port: Port, bytes: Bytes) -> io::Result<()> {
+        self.queue(port, bytes, None).await
+    }
+
+    /// [`Sender::send`], and `fd` with the packet: the receiver gets a
+    /// descriptor of the same open file beside it. This side's is closed
+    /// once the packet is written, or dropped.
+    ///
+    /// Only for a packet no hand-over looks at ([`Sender::queued`] copies
+    /// packets without their descriptors): one from a worker.
+    pub async fn send_with_fd(&self, port: Port, bytes: Bytes, fd: OwnedFd) -> io::Result<()> {
+        self.queue(port, bytes, Some(fd)).await
+    }
+
+    async fn queue(&self, port: Port, bytes: Bytes, fd: Option<OwnedFd>) -> io::Result<()> {
         if bytes.len() > MAX_FRAME_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -74,6 +100,7 @@ impl Sender {
         self.queue
             .send(Outgoing::Packet {
                 packet: Packet { port, bytes },
+                fd,
                 _permit: permit,
             })
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
@@ -159,7 +186,7 @@ impl Writer {
                 },
             };
             match outgoing {
-                Outgoing::Packet { packet, .. } => self.write(&packet).await?,
+                Outgoing::Packet { packet, fd, .. } => self.write(&packet, fd).await?,
                 Outgoing::Hold(held) => {
                     self.paused = true;
                     let _ = held.send(());
@@ -168,7 +195,7 @@ impl Writer {
         }
     }
 
-    async fn write(&mut self, packet: &Packet) -> io::Result<()> {
+    async fn write(&mut self, packet: &Packet, fd: Option<OwnedFd>) -> io::Result<()> {
         let mut bytes = bytes::BytesMut::new();
         senax_encoder::encode_to(packet, &mut bytes)
             .map_err(|_| io::Error::other("encode workset message"))?;
@@ -178,13 +205,83 @@ impl Writer {
                 "oversized workset frame",
             ));
         }
-        self.socket.write_u32(bytes.len() as u32).await?;
+        let length = (bytes.len() as u32).to_be_bytes();
+        let Some(fd) = fd else {
+            self.socket.write_all(&length).await?;
+            return self.socket.write_all(&bytes).await;
+        };
+        // The descriptor goes with the frame's first bytes, so the reader
+        // has it by the time it has the frame, and with no other frame.
+        let socket: &UnixStream = self.socket.as_ref();
+        let sent = loop {
+            socket.writable().await?;
+            let sent = socket.try_io(Interest::WRITABLE, || {
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = SendAncillaryBuffer::new(&mut space);
+                let fds = [fd.as_fd()];
+                control.push(SendAncillaryMessage::ScmRights(&fds));
+                Ok(rustix::net::sendmsg(
+                    socket,
+                    &[io::IoSlice::new(&length)],
+                    &mut control,
+                    SendFlags::NOSIGNAL,
+                )?)
+            });
+            match sent {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                sent => break sent?,
+            }
+        };
+        self.socket.write_all(&length[sent..]).await?;
         self.socket.write_all(&bytes).await
     }
 }
 
+/// Fills `buffer` from `socket`, and takes what descriptors came with those
+/// bytes. It asks for no byte beyond the buffer, so with a buffer that ends
+/// where a frame does it takes no descriptor of a later frame.
+///
+/// Cancelling it loses nothing only while `buffer` is one byte: one byte is
+/// read whole or not at all.
+async fn read_exact(
+    socket: &UnixStream,
+    mut buffer: &mut [u8],
+    fds: &mut Vec<OwnedFd>,
+) -> io::Result<()> {
+    while !buffer.is_empty() {
+        socket.readable().await?;
+        let read = socket.try_io(Interest::READABLE, || {
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let received = rustix::net::recvmsg(
+                socket,
+                &mut [io::IoSliceMut::new(buffer)],
+                &mut control,
+                RecvFlags::CMSG_CLOEXEC,
+            )?;
+            for message in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(received) = message {
+                    fds.extend(received);
+                }
+            }
+            Ok(received.bytes)
+        });
+        match read {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// A packet as it was read, and the descriptor that came with it, if one
+/// did.
+pub(crate) type Received = (Packet, Option<OwnedFd>);
+
 pub(crate) struct Receiver {
-    incoming: mpsc::Receiver<io::Result<Packet>>,
+    incoming: mpsc::Receiver<io::Result<Received>>,
     /// Whether the reader starts another frame.
     reading: watch::Sender<bool>,
     /// Whether the reader is stopped between frames.
@@ -202,7 +299,7 @@ impl Drop for Receiver {
 
 impl Receiver {
     /// Safe to cancel: a dedicated reader finishes any partially read frame.
-    pub async fn next(&mut self) -> io::Result<Packet> {
+    pub async fn next(&mut self) -> io::Result<Received> {
         self.incoming
             .recv()
             .await
@@ -211,7 +308,7 @@ impl Receiver {
 
     /// Stops reading between frames and returns what was read but not yet
     /// received; the rest stays in the socket until [`Receiver::resume`].
-    pub async fn stop(&mut self) -> io::Result<Vec<Packet>> {
+    pub async fn stop(&mut self) -> io::Result<Vec<Received>> {
         self.reading.send_replace(false);
         let mut read = Vec::new();
         let mut parked = self.parked.clone();
@@ -256,7 +353,7 @@ fn open(
     socket: UnixStream,
     reading: bool,
 ) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
-    let (mut reader, writer) = socket.into_split();
+    let (reader, writer) = socket.into_split();
     let (queue, incoming) = mpsc::unbounded_channel();
     let (gate, gates) = mpsc::unbounded_channel();
     let slots = Arc::new(Semaphore::new(MAX_MESSAGES));
@@ -278,6 +375,9 @@ fn open(
     let (reading, mut read) = watch::channel(reading);
     let (parking, parked) = watch::channel(false);
     let reader = tokio::spawn(async move {
+        let socket: &UnixStream = reader.as_ref();
+        // The descriptors that came with the frame being read.
+        let mut fds = Vec::new();
         loop {
             // Between frames: a stop takes effect here, never mid-frame.
             let first = tokio::select! {
@@ -291,24 +391,28 @@ fn open(
                     continue;
                 }
                 // One byte is all or nothing, so losing this race reads nothing.
-                first = reader.read_u8() => first,
+                first = async {
+                    let mut first = [0];
+                    read_exact(socket, &mut first, &mut fds).await.map(|()| first[0])
+                } => first,
             };
             let result = async {
                 let mut length = [first?, 0, 0, 0];
-                reader.read_exact(&mut length[1..]).await?;
+                read_exact(socket, &mut length[1..], &mut fds).await?;
                 let length = u32::from_be_bytes(length) as usize;
                 if length > MAX_FRAME_LEN {
                     return Err(io::Error::other("oversized workset frame"));
                 }
                 let mut encoded = vec![0; length];
-                reader.read_exact(&mut encoded).await?;
+                read_exact(socket, &mut encoded, &mut fds).await?;
                 let mut slice = encoded.as_slice();
                 let packet = senax_encoder::decode(&mut slice)
                     .map_err(|_| io::Error::other("invalid workset frame"))?;
                 if !slice.is_empty() {
                     return Err(io::Error::other("invalid workset frame body"));
                 }
-                Ok(packet)
+                // A packet takes one descriptor with it; more are closed.
+                Ok((packet, fds.drain(..).next()))
             }
             .await;
             let failed = result.is_err();
@@ -353,10 +457,11 @@ mod tests {
             sender.send(*port, bytes.clone()).await.unwrap();
         }
         for (port, bytes) in messages {
-            let packet = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            let (packet, fd) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
                 .await
                 .unwrap()
                 .unwrap();
+            assert!(fd.is_none());
             assert_eq!(packet.port, port);
             assert_eq!(packet.bytes, bytes);
         }
@@ -380,7 +485,7 @@ mod tests {
             .send(Port::Shell(1), Bytes::from_static(b"after"))
             .await
             .unwrap();
-        assert_eq!(receiver.next().await.unwrap().bytes, b"before"[..]);
+        assert_eq!(receiver.next().await.unwrap().0.bytes, b"before"[..]);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), receiver.next())
                 .await
@@ -400,8 +505,8 @@ mod tests {
             .await
             .unwrap();
         sender.resume().unwrap();
-        assert_eq!(receiver.next().await.unwrap().bytes, b"after"[..]);
-        assert_eq!(receiver.next().await.unwrap().bytes, b"later"[..]);
+        assert_eq!(receiver.next().await.unwrap().0.bytes, b"after"[..]);
+        assert_eq!(receiver.next().await.unwrap().0.bytes, b"later"[..]);
     }
 
     #[tokio::test]
@@ -414,7 +519,7 @@ mod tests {
         for index in 0..40 {
             sender.send(Port::Shell(1), frame(index)).await.unwrap();
         }
-        let mut seen = vec![receiver.next().await.unwrap().bytes];
+        let mut seen = vec![receiver.next().await.unwrap().0.bytes];
         tokio::time::sleep(Duration::from_millis(50)).await;
         seen.extend(
             receiver
@@ -422,7 +527,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|packet| packet.bytes),
+                .map(|(packet, _)| packet.bytes),
         );
         for index in 40..45 {
             sender.send(Port::Shell(1), frame(index)).await.unwrap();
@@ -435,7 +540,7 @@ mod tests {
         );
         receiver.resume();
         while seen.len() < 45 {
-            seen.push(receiver.next().await.unwrap().bytes);
+            seen.push(receiver.next().await.unwrap().0.bytes);
         }
         assert_eq!(seen, (0..45).map(frame).collect::<Vec<_>>());
     }
@@ -464,8 +569,8 @@ mod tests {
         .unwrap();
         raw.write_u32(second.len() as u32).await.unwrap();
         raw.write_all(&second).await.unwrap();
-        assert_eq!(receiver.next().await.unwrap().bytes, b"first"[..]);
-        let packet = receiver.next().await.unwrap();
+        assert_eq!(receiver.next().await.unwrap().0.bytes, b"first"[..]);
+        let (packet, _) = receiver.next().await.unwrap();
         assert_eq!(packet.port, Port::Terminal(3));
         assert_eq!(packet.bytes, b"second"[..]);
         drop(raw);
@@ -604,5 +709,68 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
         drop(held);
+    }
+
+    /// A descriptor arrives with the packet it was sent with and no other,
+    /// whatever the packets around it are: small ones that are all queued
+    /// before the reader takes one, and one that takes many reads. It is
+    /// the same open file, and the sender's own is closed by then.
+    #[tokio::test]
+    async fn a_descriptor_arrives_with_its_packet() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream as Pipe;
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let (sender, _reader, _writing) = connect(left);
+        let (_peer, mut receiver, _peer_writing) = connect(right);
+        // Which packets take a descriptor, and how long each is.
+        let plan = [
+            (false, 3),
+            (true, 5),
+            (true, 0),
+            (false, 300_000),
+            (true, 300_000),
+            (false, 1),
+            (true, 2),
+        ];
+        let mut kept = Vec::new();
+        for (index, (with_fd, len)) in plan.into_iter().enumerate() {
+            let bytes = Bytes::from(vec![index as u8; len]);
+            if with_fd {
+                let (mut ours, theirs) = Pipe::pair().unwrap();
+                ours.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                ours.write_all(&[index as u8]).unwrap();
+                kept.push(Some(ours));
+                sender
+                    .send_with_fd(Port::Workset, bytes, theirs.into())
+                    .await
+                    .unwrap();
+            } else {
+                kept.push(None);
+                sender.send(Port::Workset, bytes).await.unwrap();
+            }
+        }
+        // Everything is written, or as much as the socket takes, before
+        // anything is taken.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for (index, (with_fd, len)) in plan.into_iter().enumerate() {
+            let (packet, fd) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.bytes, vec![index as u8; len], "packet {index}");
+            assert_eq!(fd.is_some(), with_fd, "packet {index}");
+            let (Some(fd), Some(mut ours)) = (fd, kept[index].take()) else {
+                continue;
+            };
+            // The other end of the pair this packet took, and no other's.
+            let mut theirs = Pipe::from(fd);
+            let mut mark = [0];
+            theirs.read_exact(&mut mark).unwrap();
+            assert_eq!(mark, [index as u8]);
+            // Only the receiver holds it now: closing it ends the pair.
+            drop(theirs);
+            assert_eq!(ours.read(&mut mark).unwrap(), 0, "packet {index}");
+        }
     }
 }

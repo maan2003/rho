@@ -213,6 +213,13 @@ class Chat:
         return "<chat>"
 
 
+def _socket_path(path):
+    path = os.fspath(path)
+    if not os.path.isabs(path):
+        raise ValueError("path must be an absolute path")
+    return path
+
+
 def _text(text):
     text = str(text)
     if not text.strip():
@@ -305,11 +312,57 @@ class External:
         return asyncio.ensure_future(external_send())
 
     def contacts(self):
-        """The addresses on other hosts you have accepted."""
+        """The addresses on other hosts you have accepted, and the services
+        you opened to each."""
         held = _rho.external_contacts(self._agent)
         if not held:
             return report("You have accepted no address.")
-        return report("\n".join(f"{contact['name']}: {contact['address']}" for contact in held))
+        lines = []
+        for contact in held:
+            lines.append(f"{contact['name']}: {contact['address']}")
+            lines += [f"  can connect to {service}: {path}" for service, path in contact["services"].items()]
+        return report("\n".join(lines))
+
+    def expose(self, *, address, service, path):
+        """Open the Unix socket at `path`, in your workset, to `address`
+        under the name `service`: each connection its agent makes to that
+        service is a connection to the socket. Only that address can
+        connect. Listen on the socket yourself; it need not exist yet."""
+        address, service, path = str(address).strip(), str(service).strip(), _socket_path(path)
+        name = self._name(address)
+        _host(_rho.external_expose, self._agent, address, service, path)
+        mine = _host(_rho.external_address, self._agent)
+        return report(
+            f"{name} can connect to {service}: each connection reaches the Unix socket {path}. "
+            f"It connects to the service {service} at your address, {mine}."
+        )
+
+    def unexpose(self, *, address, service):
+        """Close a service you opened to `address`. Its open connections
+        end."""
+        address, service = str(address).strip(), str(service).strip()
+        _host(_rho.external_unexpose, self._agent, address, service)
+        return report(f"{self._name(address)} can no longer connect to {service}.")
+
+    def connect(self, *, address, service, path):
+        """Listen on a Unix socket at `path`: each connection to it is a
+        connection to `service` of `address`, which you accepted and which
+        opened that service to you. A connection closes at once when the
+        other side refuses it or cannot be reached. The socket lasts until
+        your workset restarts; then connect again."""
+        address, service, path = str(address).strip(), str(service).strip(), _socket_path(path)
+        name = self._name(address)
+        _host(_rho.external_connect, self._agent, address, service, path)
+        return report(
+            f"Listening at {path}: each connection to that Unix socket is a connection to {service} of {name}."
+        )
+
+    def _name(self, address):
+        """What you named an address you accepted."""
+        for contact in _rho.external_contacts(self._agent):
+            if contact["address"] == address:
+                return contact["name"]
+        raise ValueError(f"{address} is not an address you accepted")
 
     def __repr__(self):
         return "<agents.external>"
@@ -328,7 +381,8 @@ class Agents(Messages):
 
     @property
     def external(self):
-        """Agents on other hosts: `address`, `accept`, `send`, `contacts`."""
+        """Agents on other hosts: `address`, `accept`, `send`, `contacts`,
+        and `expose`, `unexpose`, `connect` for Unix sockets."""
         return External(self._agent)
 
     def _me(self):

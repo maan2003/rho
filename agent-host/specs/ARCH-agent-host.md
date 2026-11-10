@@ -122,6 +122,23 @@ send again. The user sees approved harnesses and
 acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
 and `rho gccp remove`.
 
+GCCP also carries byte streams, which join a Unix socket in one agent's
+workset to a Unix socket in another's. An agent opens a socket of its workset
+as a named service to one address it accepted (`agents.external.expose`), and
+the host joins a stream to it only for that address; the user sees services
+with `rho gccp list`. The agent at that address listens on a socket of its own
+(`agents.external.connect`), and each connection to it opens one stream. Both
+sockets are made by the workset processes, where their paths mean something:
+the one connects to the service, and only to a path that resolves inside the
+workset's root, and the other listens. Each connected socket then goes to the
+host as a file descriptor, with the packet of the workset connection that
+tells of it, and the host copies bytes between it and the other harness. No
+byte of a stream passes through a workset process or its connection, and the
+sockets' own buffers hold a fast sender back. A stream is kept by nobody: it
+ends when either host re-executes, and an agent's listening socket ends with
+its workset process. Taking back an acceptance, an approval or a service ends
+the streams it had let through.
+
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move
 it to another stream, or resolve it when its work is done; each change logs

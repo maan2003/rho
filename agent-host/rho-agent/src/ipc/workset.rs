@@ -45,8 +45,13 @@ pub enum Reply {
     Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
     Shells(Vec<rho_shell_view::protocol::ShellInfo>),
     Error(String),
-    Desktop { socket: String },
+    Desktop {
+        socket: String,
+    },
     DesktopSessions(Vec<rho_desktop_client::protocol::DesktopSession>),
+    /// The answer to [`Message::Connect`]: the connected socket's
+    /// descriptor comes with the packet.
+    Socket,
 }
 
 /// What the workset's Python asks of the agent host (`_rho`).
@@ -150,6 +155,29 @@ pub(crate) enum PyRequest {
     },
     /// The addresses the agent accepted.
     ExternalContacts(rho_agent_types::AgentId),
+    /// The agent opens the Unix socket at `path` as the service `service`
+    /// to an address it accepted.
+    ExternalExpose {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+        path: String,
+    },
+    /// The agent closes a service it opened to an address.
+    ExternalUnexpose {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+    },
+    /// A forward of the agent's accepted a connection, whose descriptor
+    /// comes with the request: open a byte stream to `service` at `peer`
+    /// and join the two. `Done` once they are joined; the host closes the
+    /// connection otherwise.
+    ExternalOpen {
+        agent: rho_agent_types::AgentId,
+        peer: String,
+        service: String,
+    },
 }
 
 /// Where a move from Python puts messages.
@@ -220,6 +248,14 @@ pub(crate) enum Message {
     /// The host hands out the process only after a clean one.
     Initialized {
         error: Option<String>,
+    },
+    /// Host to worker: connect to the Unix socket at `path`, which an
+    /// agent of the workset opened as a service, and answer with
+    /// [`Reply::Socket`] and the socket. The workset process does it
+    /// because the path is the workset's: the host may not see that file.
+    Connect {
+        id: u64,
+        path: String,
     },
 }
 
