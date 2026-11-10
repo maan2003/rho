@@ -96,9 +96,10 @@ none, and counts as taken once the agent holds it, which is in memory until
 the agent's next request records it. The host remembers the
 messages it took last in memory and gives none of them twice; after a restart
 it remembers none, so a message sent again across one is given twice. The host
-keeps no message: an agent's send is tried once while its call waits, under an
-id picked at random, and the call ends with what the other harness said, so
-the agent decides whether to send again. The user sees approved harnesses and
+keeps no message: an agent's send is tried while its call waits, under one id
+picked at random, up to three times when the other harness gives no result,
+and the call ends with what became of it, so the agent decides whether to
+send again. The user sees approved harnesses and
 acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
 and `rho gccp remove`.
 

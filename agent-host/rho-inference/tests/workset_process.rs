@@ -615,12 +615,15 @@ async fn gccp_two_hosts() {
         (THERE, there.clone()),
     ])));
     let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The waits of a real host are minutes.
+    const WAITS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(400)];
     for (own, pool) in [(HERE, &here), (THERE, &there)] {
-        pool.set_transport(Arc::new(Wires {
+        let wires = Wires {
             own,
             hosts: hosts.clone(),
             sent: sent.clone(),
-        }));
+        };
+        pool.set_transport(Arc::new(wires), &WAITS);
     }
 
     // Each agent has ended a turn, so it waits inside an open call.
@@ -748,8 +751,8 @@ async fn gccp_two_hosts() {
         MessageResult::Refused
     );
 
-    // A host that cannot be reached is tried once, and the call says what
-    // the other side may have to do.
+    // A host that cannot be reached is tried three times under one id, and
+    // then the call says what the other side may have to do.
     here.gccp_approve(NOWHERE, "a host that is off")
         .await
         .unwrap();
@@ -761,11 +764,16 @@ async fn gccp_two_hosts() {
         .await
         .unwrap_err();
     let unreached = format!(
-        "the host of ghost ({nobody}) gave no result: no route. It is off, or its user has not \
-         approved this host ({HERE}). The message may have arrived all the same."
+        "the host of ghost ({nobody}) gave no result in 3 tries: no route. It is off, or its \
+         user has not approved this host ({HERE}). The message may have arrived all the same."
     );
     assert!(error.contains(&unreached), "{error}");
-    assert_eq!(tries("anyone there"), 1);
+    let ids: Vec<u64> = {
+        let sent = sent.lock().unwrap();
+        let tried = sent.iter().filter(|sent| sent.body == "anyone there");
+        tried.map(|sent| sent.id).collect()
+    };
+    assert_eq!(ids, [ids[0]; 3]);
 
     // The user of Bob's host takes Bob's acceptance back: Ann is refused
     // again, and Bob can no longer write to her.

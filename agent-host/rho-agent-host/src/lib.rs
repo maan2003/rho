@@ -935,11 +935,10 @@ async fn run_iroh_listener(
 ) {
     // What agents send other harnesses leaves by this endpoint, so they see
     // this host's id.
-    services
-        .pool
-        .set_transport(Arc::new(gccp::IrohTransport::new(
-            listener.endpoint().clone(),
-        )));
+    services.pool.set_transport(
+        Arc::new(gccp::IrohTransport::new(listener.endpoint().clone())),
+        &rho_agent::host::pool::RETRY_WAITS,
+    );
     while let Some(accepted) = tokio::select! {
         accepted = listener.accept() => accepted,
         _ = &mut shutdown => None,

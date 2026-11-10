@@ -290,7 +290,8 @@ class External:
     def send(self, *, address, message):
         """Send `message` to `address`, which you accepted. The send starts
         now; await it to know that the address's host took the message. It
-        raises when that host refuses the message or gives no result."""
+        raises when that host refuses the message, or gives no result in
+        three tries over a few minutes."""
         address, text = str(address).strip(), _text(message)
 
         async def external_send():

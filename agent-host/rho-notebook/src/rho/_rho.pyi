@@ -150,7 +150,8 @@ def external_accept(agent: str, address: str, name: str) -> None:
 async def external_send(agent: str, address: str, text: str) -> str:
     """Send `text` to `address`, which `agent` accepted, and wait for what
     the address's host says: the name the agent gave the address, once that
-    host took the message. Raises when it refuses or gives no result."""
+    host took the message. Raises when it refuses, or gives no result in
+    the host's three tries."""
 def external_contacts(agent: str) -> list[dict]:
     """The addresses `agent` accepted, each a dict of `address` and `name`."""
 def join(topic: int, agent: str) -> None:

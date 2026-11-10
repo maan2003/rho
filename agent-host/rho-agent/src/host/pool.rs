@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, Transport};
+pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -66,8 +66,9 @@ pub struct AgentPool {
     /// The GCCP messages taken last, so that one sent again is not given to
     /// its agent twice.
     gccp_stored: std::sync::Mutex<gccp::Stored>,
-    /// What carries GCCP messages out, while the host's endpoint is up.
-    gccp_transport: std::sync::Mutex<Option<Arc<dyn Transport>>>,
+    /// What carries GCCP messages out, while the host's endpoint is up, and
+    /// the waits before the tries after the first.
+    gccp_transport: std::sync::Mutex<Option<(Arc<dyn Transport>, &'static [std::time::Duration])>>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,

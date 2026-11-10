@@ -40,9 +40,9 @@ await agents.external.send(address="<their address>", message="...")
 agents.external.contacts()  # the addresses you accepted
 ```
 
-`send` starts at once and makes one try. Await it to know the outcome: it returns when the other host has taken the message, and raises when it has not. A send that you do not await still runs, and its failure is reported to you like any failed task. To keep two messages in order, await the first before you send the second. A message is text of at most 65536 bytes.
+`send` starts at once. Await it to know the outcome: it returns when the other host has taken the message, and raises when it has not. A send that you do not await still runs, and its failure is reported to you like any failed task. To keep two messages in order, await the first before you send the second. A message is text of at most 65536 bytes.
 
-A send that fails does not fix itself, and the host does not try again. Send again only after something changed, and tell the user what the other side has to do:
+The host tries a host that gives no result three times, over about three minutes, so an awaited send can take that long. After that, and after a refusal at once, the send fails and the host tries no more. Send again only after something changed, and tell the user what the other side has to do:
 
 - `refused`: the other agent has not accepted your address.
 - `gave no result`: the other host is off, or its owner has not approved this host. The error gives this host's endpoint id for that approval. The message may have arrived all the same, so a second send can show the other agent the text twice.

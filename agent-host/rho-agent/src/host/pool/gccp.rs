@@ -58,12 +58,16 @@ pub trait Transport: Send + Sync + 'static {
 
 /// The longest body GCCP carries, in bytes of UTF-8.
 pub const MAX_BODY_LEN: usize = 64 * 1024;
-/// How long the other harness has to give a message its result.
+/// The waits before the second and the third try at a message whose
+/// harness could not be reached. After the last the send ends: an agent
+/// that is told so decides better than a queue when to send again.
+pub const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(120)];
+/// How long the other harness has to give one try its result.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many messages the host remembers that it took. A harness that got no
-/// result sends a message again at once or not at all, so a copy finds
-/// itself here unless this many messages came in between.
+/// result sends a message again within minutes or not at all, so a copy
+/// finds itself here unless this many messages came in between.
 const STORED_IDS: usize = 256;
 
 /// A message the host took: its recipient, its sender, and the id its
@@ -111,9 +115,10 @@ impl AgentPool {
             .expect("the host's endpoint is named once");
     }
 
-    /// What carries the agents' messages to other harnesses from now on.
-    pub fn set_transport(&self, transport: Arc<dyn Transport>) {
-        *self.gccp_transport.lock().expect("poison") = Some(transport);
+    /// What carries the agents' messages to other harnesses from now on,
+    /// and the waits before the tries after the first ([`RETRY_WAITS`]).
+    pub fn set_transport(&self, transport: Arc<dyn Transport>, retry_waits: &'static [Duration]) {
+        *self.gccp_transport.lock().expect("poison") = Some((transport, retry_waits));
     }
 
     /// The host's own endpoint, if it has one.
@@ -203,9 +208,15 @@ impl AgentPool {
     /// once that harness took the message; every other end is an error that
     /// tells the agent what happened.
     ///
-    /// One call is one message under one id, picked at random: the
-    /// transport may carry it twice, and the other harness then knows the
-    /// copy. A call made again is a new message.
+    /// A refusal ends the call at once. A harness that cannot be reached, or
+    /// gives no result, is tried again after each of the retry waits, and
+    /// then the call ends: the host keeps no message, and the agent decides
+    /// whether to send again. A host that is handing over ends the call
+    /// too, rather than wait for it.
+    ///
+    /// One call is one message under one id, picked at random, however
+    /// often it is tried: the other harness knows a copy by it. A call made
+    /// again is a new message.
     pub(super) async fn external_send(
         &self,
         agent: AgentId,
@@ -220,37 +231,62 @@ impl AgentPool {
             "a message to another host is at most {MAX_BODY_LEN} bytes, and this is {}",
             body.len()
         );
-        let name = self
-            .db
-            .read()
-            .gccp_contact(agent, &peer)
-            .with_context(|| format!("{peer} is not an address you accepted"))?;
-        let transport = self.gccp_transport.lock().expect("poison").clone();
-        let transport = transport.context("this host's iroh endpoint is down")?;
         let envelope = Envelope {
             to: peer.local.clone(),
             from: own.local.clone(),
             id: rand::random(),
             body,
         };
-        let sent = transport.send(peer.endpoint, &envelope);
-        let result = match tokio::time::timeout(SEND_TIMEOUT, sent).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("no result in {SEND_TIMEOUT:?}")),
-        };
-        match result {
-            Ok(MessageResult::Delivered) => Ok(name),
-            Ok(MessageResult::Refused) => anyhow::bail!(
-                "the host of {name} ({peer}) refused the message: {name} has not accepted \
-                 your address {own}, or there is no such address. Sending again changes \
-                 nothing until it has."
-            ),
-            Err(error) => anyhow::bail!(
-                "the host of {name} ({peer}) gave no result: {error:#}. It is off, or its \
-                 user has not approved this host ({host}). The message may have arrived all \
-                 the same.",
-                host = own.endpoint
-            ),
+        let mut handing = self.handing.subscribe();
+        let mut tries = 0;
+        loop {
+            // As things are now: the acceptance may have been taken back
+            // since the last try, and the endpoint bound again.
+            let name = self
+                .db
+                .read()
+                .gccp_contact(agent, &peer)
+                .with_context(|| format!("{peer} is not an address you accepted"))?;
+            let carrier = self.gccp_transport.lock().expect("poison").clone();
+            let (transport, retry_waits) = carrier.context("this host's iroh endpoint is down")?;
+            tries += 1;
+            let sent = transport.send(peer.endpoint, &envelope);
+            let tried = async {
+                match tokio::time::timeout(SEND_TIMEOUT, sent).await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(anyhow::anyhow!("no result in {SEND_TIMEOUT:?}")),
+                }
+            };
+            let no_result = |error: anyhow::Error| {
+                anyhow::anyhow!(
+                    "the host of {name} ({peer}) gave no result in {tries} tries: {error:#}. It \
+                     is off, or its user has not approved this host ({host}). The message may \
+                     have arrived all the same.",
+                    host = own.endpoint
+                )
+            };
+            let error = tokio::select! {
+                tried = tried => match tried {
+                    Ok(MessageResult::Delivered) => return Ok(name),
+                    Ok(MessageResult::Refused) => anyhow::bail!(
+                        "the host of {name} ({peer}) refused the message: {name} has not \
+                         accepted your address {own}, or there is no such address. Sending \
+                         again changes nothing until it has."
+                    ),
+                    Err(error) => error,
+                },
+                _ = handing.wait_for(|handing| *handing) => {
+                    return Err(no_result(anyhow::anyhow!("this host is restarting")));
+                }
+            };
+            let Some(wait) = retry_waits.get(tries - 1) else {
+                return Err(no_result(error));
+            };
+            tokio::select! {
+                () = tokio::time::sleep(*wait) => {}
+                _ = handing.wait_for(|handing| *handing) => return Err(no_result(error)),
+            }
         }
     }
 
