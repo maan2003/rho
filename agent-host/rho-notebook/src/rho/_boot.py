@@ -34,28 +34,23 @@ _evals = itertools.count(1)
 
 def _main(init_path, ready) -> None:
     """Install the default policy, run init.py, report through `ready`, then
-    run the workset loop forever. A failing init.py leaves the default
-    policy, and `ready` gets its traceback."""
+    run the workset loop forever. A failing init.py gives `ready` its
+    traceback and runs nothing more: the host ends the process."""
     global _loop, _thread
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     _thread = threading.get_ident()
     default.install()
-    error = None
     if init_path is not None and os.path.exists(init_path):
-        saved_hooks = {name: getattr(hooks, name) for name in hooks.NAMES}
-        saved_namespace = dict(workset.namespace)
         with open(init_path, encoding="utf-8") as file:
             source = file.read()
         error = _loop.run_until_complete(_run(source, init_path))
         if error is not None:
-            for name, hook in saved_hooks.items():
-                setattr(hooks, name, hook)
-            workset.namespace.clear()
-            workset.namespace.update(saved_namespace)
+            ready(error)
+            return
     for id in _rho.agents():
         _announce(id)
-    ready(error)
+    ready(None)
     _loop.run_forever()
 
 

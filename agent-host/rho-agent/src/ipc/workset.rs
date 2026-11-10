@@ -216,6 +216,11 @@ pub(crate) enum Message {
         output: String,
         error: Option<String>,
     },
+    /// Worker to host, once: init.py ended, and its traceback if it failed.
+    /// The host hands out the process only after a clean one.
+    Initialized {
+        error: Option<String>,
+    },
 }
 
 pub(crate) fn encode<T: senax_encoder::Encoder>(value: &T) -> anyhow::Result<bytes::Bytes> {

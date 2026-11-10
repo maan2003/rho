@@ -642,8 +642,8 @@ async fn workset_props_are_set_before_the_first_agent_only() {
     let workset = WorksetId([3; 6]);
     let mut write = db.write().await;
     write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
-    let props = |profile: &str| -> rho_agent_types::Props {
-        [("profile".to_owned(), profile.to_owned())].into()
+    let props = |policy: &str| -> rho_agent_types::Props {
+        [("policy".to_owned(), policy.to_owned())].into()
     };
     let set = |write: &mut rho_db::WriteTxn, props| {
         write.append(

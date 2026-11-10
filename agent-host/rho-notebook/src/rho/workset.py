@@ -16,8 +16,8 @@ root: str = "/src" if kind == "isolated" else os.getcwd()
 
 def props() -> dict[str, str]:
     """What the workset is, as its policy named it: string props, empty
-    until set. `profile` names the policy that init.py applies, and a
-    workset with one never falls back to bypass."""
+    until set. init.py reads them at each start to choose again what it
+    chose when the workset was created, such as its permissions."""
     return _rho.workset_props()
 
 

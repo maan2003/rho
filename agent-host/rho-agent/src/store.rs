@@ -31,8 +31,7 @@ const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
 pub struct WorksetHead {
     pub kind: WorksetKind,
     /// What Python said the workset is, before its first agent
-    /// (`WorksetPropsSet`). Rho gives meaning to
-    /// [`crate::worker::permissions::PROFILE`] alone.
+    /// (`WorksetPropsSet`). Only Python reads them.
     /// Temporary (`temp-migration`): the default reads heads from before
     /// props until [`write_props`] has moved them.
     #[senax(default)]

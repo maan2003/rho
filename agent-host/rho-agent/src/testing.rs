@@ -235,6 +235,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                 props: Default::default(),
             },
             Some(camino::Utf8PathBuf::from_path_buf(init).unwrap()),
+            |_| {},
         )
         .unwrap();
     });

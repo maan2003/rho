@@ -168,6 +168,17 @@ pub(crate) async fn run(
             startup.props.clone(),
         ),
         startup.init.clone(),
+        {
+            let sender = sender.clone();
+            let runtime = tokio::runtime::Handle::current();
+            move |error| {
+                runtime.spawn(async move {
+                    let message = workset::encode(&workset::Message::Initialized { error })
+                        .expect("encode init outcome");
+                    let _ = sender.send(Port::Workset, message).await;
+                });
+            }
+        },
     )?;
     let inference = provider.inference;
     let policy = provider.policy;
@@ -345,9 +356,7 @@ pub(crate) async fn run(
         tasks.spawn(async move {
             let result = async {
                 let head = host.head().await?;
-                // An agent starts under what init.py chose.
-                super::python::initialized().await;
-                let permissions = super::permissions::PERMISSIONS.fix(&super::python::props()?)?;
+                let permissions = super::permissions::PERMISSIONS.fix();
                 super::permissions::admits(
                     &permissions,
                     matches!(head.spec.runtime, crate::record::Runtime::Native { .. }),

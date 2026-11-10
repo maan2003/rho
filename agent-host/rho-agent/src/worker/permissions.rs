@@ -4,13 +4,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::Props;
-
-/// The workset prop that names the policy `init.py` applies. A workset that
-/// has one never falls back to `Bypass`: if nothing set its permissions,
-/// for example because `init.py` failed, no agent starts.
-pub(crate) const PROFILE: &str = "profile";
-
 /// What Claude Code makes of an agent's calls.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Permissions {
@@ -39,20 +32,14 @@ impl Cell {
         Ok(())
     }
 
-    /// The permissions an agent starts under, fixing them if Python set
-    /// none.
-    pub(crate) fn fix(&self, props: &Props) -> anyhow::Result<Arc<Permissions>> {
-        let mut fixed = self.0.lock().expect("poison");
-        if let Some(permissions) = fixed.as_ref() {
-            return Ok(permissions.clone());
-        }
-        if let Some(profile) = props.get(PROFILE) {
-            anyhow::bail!(
-                "the workset names profile {profile:?}, but nothing set its permissions; \
-                 its policy, such as init.py, must call rho.workset.set_permissions"
-            );
-        }
-        Ok(fixed.insert(Arc::new(Permissions::Bypass)).clone())
+    /// The permissions an agent starts under, fixing `Bypass` if Python
+    /// set none.
+    pub(crate) fn fix(&self) -> Arc<Permissions> {
+        self.0
+            .lock()
+            .expect("poison")
+            .get_or_insert_with(|| Arc::new(Permissions::Bypass))
+            .clone()
     }
 
     /// The permissions, once fixed.
@@ -89,24 +76,12 @@ mod tests {
         let cell = Cell::default();
         cell.set(auto()).unwrap();
         assert!(cell.set(Permissions::Bypass).is_err());
-        assert_eq!(*cell.fix(&Props::new()).unwrap(), auto());
+        assert_eq!(*cell.fix(), auto());
 
         let cell = Cell::default();
-        assert_eq!(*cell.fix(&Props::new()).unwrap(), Permissions::Bypass);
+        assert_eq!(*cell.fix(), Permissions::Bypass);
         assert!(cell.set(auto()).is_err(), "an agent started: too late");
         assert_eq!(*cell.get().unwrap(), Permissions::Bypass);
-    }
-
-    /// A workset with a profile does not fall back to bypass when its
-    /// policy failed to set anything, and stays open for a later set.
-    #[test]
-    fn a_workset_with_a_profile_needs_its_permissions_set() {
-        let cell = Cell::default();
-        let props = Props::from([(PROFILE.to_owned(), "example".to_owned())]);
-        assert!(cell.fix(&props).is_err());
-        assert!(cell.get().is_none());
-        cell.set(auto()).unwrap();
-        assert_eq!(*cell.fix(&props).unwrap(), auto());
     }
 
     #[test]

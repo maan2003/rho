@@ -18,21 +18,22 @@ which model, how messages reach them, and workset setup.
   `Isolated` workset gets a private `/src` namespace; a `Host` workset runs
   in a host directory with no namespace. The process runs the host file
   `~/.config/rho/init.py` at each start, in a plain workset namespace with no
-  cells or wakes, and its agents start only after it ran. It holds the agents
-  that Python creates: each one is a native or Claude loop with its own
-  notebook thread, whose cwd is its own.
+  cells or wakes. The host hands out the process only once init.py ended
+  well, so every agent and evaluation runs under what it chose; a failed or
+  hung init.py ends the process, and none of the workset's agents start
+  until it is fixed. It holds the agents that Python creates: each one is a
+  native or Claude loop with its own notebook thread, whose cwd is its own.
 - **Permissions.** Python sets what a workset's calls go through, once for
   each run of its process and before its first agent starts: `bypass` runs
   every call, and `auto` has Claude Code's auto mode review each call
   against the `autoMode.environment` Python gives. All of a workset's agents
   share its process, so the choice is the workset's, and Rust refuses to
   change it once an agent started: an agent cannot turn its own review off.
-  Nothing is stored, since init.py chooses again at each start. Without a
-  choice the first agent fixes `bypass`, except in a workset whose props
-  name a `profile`: there the policy that profile names must choose, and no
-  agent starts until it does, so a failed init.py cannot fall back to
-  `bypass`. An `auto` workset runs Claude agents only, since nothing
-  reviews a native agent's calls. A Claude agent sees its tool as
+  Nothing is stored, since init.py chooses again at each start, typically
+  from the workset's props, so a changed policy reaches every workset at its
+  next start. Without a choice the first agent fixes `bypass`. An `auto`
+  workset runs Claude agents only, since nothing reviews a native agent's
+  calls. A Claude agent sees its tool as
   `mcp__py__exec` there, because the server-side review skips a bare name
   that is not built in.
 - **GUI.** A chat client of several hosts, with the dealer, a directory of agents, and a viewer
