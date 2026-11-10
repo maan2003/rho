@@ -14049,7 +14049,6 @@ name = "rho-context-config"
 version = "0.1.0"
 dependencies = [
  "camino",
- "dirs 7.0.0",
  "serde_yaml",
  "tempfile",
 ]

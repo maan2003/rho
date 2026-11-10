@@ -9,6 +9,7 @@ import sys
 
 import _rho
 
+from . import skills as skill_dirs
 from . import workset
 
 _DIR = pathlib.Path(__file__).with_name("prompt")
@@ -183,17 +184,46 @@ def _within(path: str, root: str) -> bool:
     return pathlib.PurePosixPath(path).is_relative_to(root)
 
 
-def context(cwd: str) -> str:
-    """The workspace section, AGENTS.md guidance and skill catalogue for an
-    agent working in `cwd`."""
+#: The user's own guidance, beside their skills directory.
+USER_AGENTS_FILE = os.path.join(os.path.dirname(skill_dirs.USER), "AGENTS.md")
+
+
+def repo_context(cwd: str) -> dict:
+    """The AGENTS.md files and skills of the repository `cwd` is in, as
+    `agents_files` and `skills`: nothing from outside it."""
     try:
-        found = _rho.context(cwd)
+        return _rho.repo_context(cwd)
+    except Exception as error:
+        print(f"rho: context discovery for {cwd}: {error}", file=sys.stderr)
+        return {"agents_files": [], "skills": []}
+
+
+def agents_file(path: str) -> dict | None:
+    """One AGENTS.md-style file as `agents_md` takes it, under a repo's size
+    limit; None if there is none."""
+    return _rho.agents_file(os.fspath(path))
+
+
+def context(cwd: str, agents_files: list[dict], found: list[dict]) -> str:
+    """The workspace section for an agent working in `cwd`, then these
+    AGENTS.md files and this skill catalogue."""
+    try:
         git = in_checkout(workset.root, cwd)
     except Exception as error:
         # A working directory that went away still gets its instructions.
         print(f"rho: context discovery for {cwd}: {error}", file=sys.stderr)
-        found, git = {"agents_files": [], "skills": []}, False
-    return workspace(workset.root, cwd, git) + agents_md(found["agents_files"]) + skills(found["skills"])
+        git = False
+    return workspace(workset.root, cwd, git) + agents_md(agents_files) + skills(found)
+
+
+def default_context(cwd: str) -> str:
+    """The default policy's context: the user's AGENTS.md and the repo's;
+    the repo's skills, then the user's, then Rho's builtin ones."""
+    repo = repo_context(cwd)
+    user = agents_file(USER_AGENTS_FILE)
+    agents_files = ([user] if user is not None else []) + repo["agents_files"]
+    found = skill_dirs.merge(repo["skills"], skill_dirs.find(skill_dirs.USER), skill_dirs.builtin())
+    return context(cwd, agents_files, found)
 
 
 def instructions(agent) -> str:
@@ -204,4 +234,4 @@ def instructions(agent) -> str:
     family = FAMILIES[spec["runtime"]["kind"]]
     preset = props["preset"]
     user_owned = template(family, "user-owned-engineers") if preset == "engineer" else ""
-    return render(template(family, preset), team(agent.id, props), user_owned, context(props["cwd"]))
+    return render(template(family, preset), team(agent.id, props), user_owned, default_context(props["cwd"]))

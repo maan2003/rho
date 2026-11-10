@@ -1,4 +1,10 @@
-"""Skills an agent loads, and the ones it keeps after a compaction.
+"""Skills: where a policy finds them, the ones an agent loads, and the ones
+it keeps after a compaction.
+
+A policy lists an agent's skills from skills directories it chooses:
+`find(directory)` reads one, `builtin()` the ones Rho bundles, and `merge`
+puts them together. The default policy lists the repo's, then `USER`, then
+the builtin ones.
 
 An agent keeps the skills whose SKILL.md asks, in its `skills` prop: their
 directories, one per line, in the order loaded. The prop survives a
@@ -7,10 +13,40 @@ restart; the text is read again each time it is shown.
 
 import os
 import re
+import sys
 
+import _rho
 import yaml
 
 PROP = "skills"
+#: The user's own skills directory, beside their AGENTS.md.
+USER = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "agents", "skills")
+
+
+def find(directory) -> list[dict]:
+    """The skills in a skills directory, each a directory of its own with a
+    SKILL.md: `name`, `description` and `path` (its SKILL.md). None if the
+    directory does not exist."""
+    return _rho.skills_in(os.fspath(directory))
+
+
+def builtin() -> list[dict]:
+    """The skills this build of Rho bundles."""
+    return _rho.builtin_skills()
+
+
+def merge(*groups: list[dict]) -> list[dict]:
+    """One list from several, by name: a skill in an earlier group hides one
+    of its name in a later group."""
+    found: dict[str, dict] = {}
+    for group in groups:
+        for skill in group:
+            existing = found.get(skill["name"])
+            if existing is None:
+                found[skill["name"]] = skill
+            elif existing["path"] != skill["path"]:
+                print(f"rho: skill {skill['name']}: {existing['path']} hides {skill['path']}", file=sys.stderr)
+    return sorted(found.values(), key=lambda skill: skill["name"])
 #: The `metadata` key a skill sets to "true" to be shown again after each
 #: compaction, in the map the Agent Skills spec reserves for clients.
 KEEP_AFTER_COMPACTION = "rho-keep-after-compaction"

@@ -12,7 +12,7 @@ from . import fake_rho
 from .support import add_agent, claude, native
 
 import rho
-from rho import prompt, workset
+from rho import prompt, skills, workset
 from rho.prompt import render, template
 
 GPT, CLAUDE = "gpt", "claude"
@@ -302,8 +302,32 @@ class Instructions(unittest.TestCase):
     def test_a_missing_working_directory_still_gets_instructions(self):
         gone = os.path.join(self.dir.name, "gone")
         agent = rho.agent(add_agent(self.state, native(), preset="engineer", cwd=gone))
-        with mock.patch.object(fake_rho, "context", side_effect=OSError("no such directory")):
+        with mock.patch.object(fake_rho, "repo_context", side_effect=OSError("no such directory")):
             text = prompt.instructions(agent)
         self.assertIn(f"Working directory: {gone}", text)
         self.assertNotIn("git checkout;", text)
         self.assertNotIn("## Skills", text)
+
+    def test_the_default_policy_lists_the_repo_then_the_user_then_builtin(self):
+        def skill(name, root):
+            return {"name": name, "description": f"{name} in {root}", "path": f"{root}/{name}/SKILL.md"}
+
+        repo_skills = self.cwd + "/.agents/skills"
+        self.state.contexts[self.cwd]["skills"] = [skill("shared", repo_skills), skill("repo-only", repo_skills)]
+        self.state.skill_dirs[skills.USER] = [skill("shared", skills.USER), skill("user-only", skills.USER), skill("both", skills.USER)]
+        self.state.builtin = [skill("both", "/rho/skills"), skill("builtin-only", "/rho/skills")]
+        self.state.agents_files[prompt.USER_AGENTS_FILE] = {"path": prompt.USER_AGENTS_FILE, "content": "User rule."}
+        text = prompt.instructions(self.agent(claude(), preset="engineer"))
+        catalogue = text[text.index("### Available skills"):]
+        for line in ["shared: shared in " + repo_skills, "repo-only: repo-only in " + repo_skills,
+                     "user-only: user-only in " + skills.USER, "both: both in " + skills.USER,
+                     "builtin-only: builtin-only in /rho/skills"]:
+            self.assertIn("- " + line, catalogue)
+        self.assertNotIn("shared in " + skills.USER, catalogue)
+        self.assertNotIn("both in /rho/skills", catalogue)
+        self.assertLess(text.index("User rule."), text.index("Use tabs."))
+
+    def test_merge_keeps_the_first_of_a_name_and_sorts(self):
+        first = [{"name": "b", "description": "1", "path": "/1/b/SKILL.md"}]
+        second = [{"name": "b", "description": "2", "path": "/2/b/SKILL.md"}, {"name": "a", "description": "2", "path": "/2/a/SKILL.md"}]
+        self.assertEqual([(s["name"], s["description"]) for s in skills.merge(first, second)], [("a", "2"), ("b", "1")])

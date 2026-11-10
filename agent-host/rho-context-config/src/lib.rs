@@ -64,7 +64,7 @@ const BUNDLED_SKILLS_DIR: Option<&str> = option_env!("RHO_BUNDLED_SKILLS_DIR");
 /// Nix package build), otherwise at `../share/rho/skills` relative to the
 /// running executable so relocatable binary distributions find their own
 /// copy.
-fn bundled_skills_dir() -> Option<PathBuf> {
+pub fn bundled_skills_dir() -> Option<PathBuf> {
     if let Some(dir) = BUNDLED_SKILLS_DIR {
         return Some(PathBuf::from(dir));
     }
@@ -74,21 +74,15 @@ fn bundled_skills_dir() -> Option<PathBuf> {
 }
 
 impl DiscoveredContext {
-    pub fn discover(visible_repo_root: &Utf8Path, checkout_root: &Utf8Path) -> Self {
+    /// What a repository holds for an agent: its root's `AGENTS.md` and the
+    /// skills in its `.agents/skills`. Every other source is the policy's
+    /// to add.
+    pub fn discover_repo(visible_repo_root: &Utf8Path, checkout_root: &Utf8Path) -> Self {
         let mut budget = DiscoveryBudget::new();
-        let config_dir = dirs::config_dir();
-        let config_dir = config_dir.as_deref();
-        let bundled_skills_dir = bundled_skills_dir();
-        let bundled_skills_dir = bundled_skills_dir.as_deref();
-        let agents_candidates = agents_md_candidates(visible_repo_root, checkout_root, config_dir);
+        let agents_candidates = agents_md_candidates(visible_repo_root, checkout_root);
         let (agents_files, mut diagnostics) =
             discover_agents_md_from_candidates(&agents_candidates, &mut budget);
-        let skill_roots = skill_root_pairs(
-            visible_repo_root,
-            checkout_root,
-            config_dir,
-            bundled_skills_dir,
-        );
+        let skill_roots = skill_root_pairs(visible_repo_root, checkout_root);
         let (skills, skill_diagnostics) = discover_skills_from_roots(&skill_roots, &mut budget);
         diagnostics.extend(skill_diagnostics);
         Self {
@@ -99,21 +93,34 @@ impl DiscoveredContext {
     }
 }
 
+/// The skills in one skills directory, such as a repository's
+/// `.agents/skills`: each in a directory of its own that holds a `SKILL.md`.
+pub fn discover_skills(directory: &Path) -> (Vec<Skill>, Vec<ContextDiagnostic>) {
+    let mut budget = DiscoveryBudget::new();
+    let mut roots = Vec::new();
+    if directory.is_dir() {
+        roots.push((directory.to_owned(), directory.to_owned()));
+    }
+    discover_skills_from_roots(&roots, &mut budget)
+}
+
+/// One `AGENTS.md`-style file, under the same limits as a repository's:
+/// `None` if there is none.
+pub fn read_agents_file(path: &Path) -> (Option<AgentsFile>, Vec<ContextDiagnostic>) {
+    let mut budget = DiscoveryBudget::new();
+    let (mut files, diagnostics) =
+        discover_agents_md_from_candidates(&[(path.to_owned(), path.to_owned())], &mut budget);
+    (files.pop(), diagnostics)
+}
+
 fn agents_md_candidates(
     visible_repo_root: &Utf8Path,
     checkout_root: &Utf8Path,
-    config_dir: Option<&Path>,
 ) -> Vec<(PathBuf, PathBuf)> {
-    let mut candidates = Vec::new();
-    if let Some(config_dir) = config_dir {
-        let path = config_dir.join("agents").join(AGENTS_FILENAME);
-        candidates.push((path.clone(), path));
-    }
-    candidates.push((
+    vec![(
         visible_repo_root.as_std_path().join(AGENTS_FILENAME),
         checkout_root.as_std_path().join(AGENTS_FILENAME),
-    ));
-    candidates
+    )]
 }
 
 fn discover_agents_md_from_candidates(
@@ -253,21 +260,12 @@ impl DiscoveryBudget {
 fn skill_root_pairs(
     visible_repo_root: &Utf8Path,
     checkout_root: &Utf8Path,
-    config_dir: Option<&Path>,
-    bundled_skills_dir: Option<&Path>,
 ) -> Vec<(PathBuf, PathBuf)> {
     let mut roots = Vec::new();
     let visible_project_root = visible_repo_root.as_std_path().join(".agents/skills");
     let read_project_root = checkout_root.as_std_path().join(".agents/skills");
     if read_project_root.is_dir() {
         roots.push((visible_project_root, read_project_root));
-    }
-    if let Some(config_dir) = config_dir {
-        let path = config_dir.join("agents/skills");
-        roots.push((path.clone(), path));
-    }
-    if let Some(path) = bundled_skills_dir {
-        roots.push((path.to_owned(), path.to_owned()));
     }
     roots
 }
@@ -906,8 +904,7 @@ mod tests {
             "Demo skill",
         );
         let repo = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
-        let (skills, diagnostics) =
-            discover_skills_for_test(&skill_root_pairs(&repo, &repo, None, None));
+        let (skills, diagnostics) = discover_skills_for_test(&skill_root_pairs(&repo, &repo));
         assert_eq!(diagnostics, Vec::new());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "demo");
@@ -1074,8 +1071,7 @@ mod tests {
             "Demo skill",
         );
 
-        let (skills, _) =
-            discover_skills_for_test(&skill_root_pairs(&visible, &checkout, None, None));
+        let (skills, _) = discover_skills_for_test(&skill_root_pairs(&visible, &checkout));
 
         assert_eq!(skills.len(), 1);
         assert_eq!(
@@ -1085,22 +1081,55 @@ mod tests {
     }
 
     #[test]
-    fn loads_user_then_repo_agents_md() {
+    fn reads_one_agents_file_and_none_where_there_is_none() {
         let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("config");
-        let repo = Utf8PathBuf::from_path_buf(temp.path().join("repo")).unwrap();
-        fs::create_dir_all(config.join("agents")).unwrap();
-        fs::create_dir_all(&repo).unwrap();
-        fs::write(config.join("agents/AGENTS.md"), "user instructions").unwrap();
-        fs::write(repo.join("AGENTS.md"), "repo instructions").unwrap();
-
-        let (files, diagnostics) =
-            discover_agents_md_for_test(&agents_md_candidates(&repo, &repo, Some(&config)));
-
+        let path = temp.path().join("AGENTS.md");
+        fs::write(&path, "user instructions").unwrap();
+        let (file, diagnostics) = read_agents_file(&path);
         assert_eq!(diagnostics, Vec::new());
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].content, "user instructions");
-        assert_eq!(files[1].content, "repo instructions");
+        assert_eq!(file.unwrap().content, "user instructions");
+        assert_eq!(read_agents_file(&temp.path().join("missing.md")).0, None);
+    }
+
+    #[test]
+    fn a_repo_holds_its_own_agents_md_and_skills_only() {
+        let temp = tempfile::tempdir().unwrap();
+        write_skill(
+            temp.path(),
+            ".agents/skills/demo/SKILL.md",
+            "demo",
+            "Demo skill",
+        );
+        fs::write(temp.path().join("AGENTS.md"), "repo instructions").unwrap();
+        let repo = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let found = DiscoveredContext::discover_repo(&repo, &repo);
+        assert_eq!(found.diagnostics, Vec::new());
+        assert_eq!(
+            found
+                .agents_files
+                .iter()
+                .map(|file| file.content.as_str())
+                .collect::<Vec<_>>(),
+            ["repo instructions"]
+        );
+        assert_eq!(
+            found
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["demo"]
+        );
+    }
+
+    #[test]
+    fn one_skills_directory_and_none_where_there_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        write_skill(temp.path(), "demo/SKILL.md", "demo", "Demo skill");
+        let (skills, diagnostics) = discover_skills(temp.path());
+        assert_eq!(diagnostics, Vec::new());
+        assert_eq!(skills[0].name, "demo");
+        assert_eq!(discover_skills(&temp.path().join("missing")).0, Vec::new());
     }
 
     #[test]
@@ -1181,8 +1210,7 @@ mod tests {
         fs::create_dir_all(&checkout).unwrap();
         fs::write(checkout.join("AGENTS.md"), "checkout instructions").unwrap();
 
-        let (files, _) =
-            discover_agents_md_for_test(&agents_md_candidates(&visible, &checkout, None));
+        let (files, _) = discover_agents_md_for_test(&agents_md_candidates(&visible, &checkout));
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].content, "checkout instructions");

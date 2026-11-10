@@ -77,9 +77,16 @@ def workset_permissions() -> Literal["bypass", "auto"] | None:
 def clone(url: str, dest: str, rev: str = "") -> None:
     """Clone `url` into `dest` from the host's mirror, then detach at `rev`
     (empty: the remote's default branch). Blocking."""
-def context(cwd: str) -> Context:
-    """AGENTS.md files from `cwd` up to its repository root, and the skills
-    found under it, as rho-context-config discovers them."""
+def repo_context(cwd: str) -> Context:
+    """The AGENTS.md at the root of the repository `cwd` is in, and the
+    skills in its `.agents/skills`, as rho-context-config discovers them."""
+def skills_in(directory: str) -> list[Skill]:
+    """The skills in one skills directory; none if it does not exist."""
+def builtin_skills() -> list[Skill]:
+    """The skills this build of Rho bundles."""
+def agents_file(path: str) -> AgentsFile | None:
+    """One AGENTS.md-style file under a repository's size limit; None if
+    there is none."""
 def models() -> list[Runtime]:
     """The runtimes the host's accounts can run now."""
 
