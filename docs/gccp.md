@@ -97,16 +97,16 @@ sends a message of its own.
 The receiving harness writes the result on the same stream as one CBOR map,
 and finishes its side:
 
-| Key      | Value                           |
-| -------- | ------------------------------- |
-| `result` | Text: `delivered` or `refused`. |
+| Key       | Value                                            |
+| --------- | ------------------------------------------------ |
+| `success` | Boolean: `true` for stored, `false` for refused. |
 
-- `delivered` means the receiving harness has stored the message for its
+- `true` means the receiving harness has stored the message for its
   recipient. It does not mean that the recipient has read it.
-- `refused` means the receiving harness did not take the message. It gives
-  no reason, and a harness may refuse any message. A harness must return
-  `refused` for what it cannot read as a message.
-- With no result, or one it does not know, the sending harness cannot tell
+- `false` means the receiving harness refused the message: it did not take
+  it. It gives no reason, and a harness may refuse any message. A harness
+  must return `false` for what it cannot read as a message.
+- With no result, or one it cannot read, the sending harness cannot tell
   whether the message was stored.
 
 ### Sending again
@@ -115,8 +115,8 @@ A harness may send a message again, for example when the result was lost.
 The `id` keeps the message from being stored twice.
 
 - A message sent again must carry the same `id`.
-- A harness that remembers the `id` from that address must return
-  `delivered` and must not store the message again.
+- A harness that remembers the `id` from that address must return `true`
+  and must not store the message again.
 - A harness chooses how many ids it remembers, so a late copy can be stored
   twice.
 
@@ -143,7 +143,7 @@ Accepting is the whole permission model.
 - Accepting covers both directions for that one clanker: it sends only to
   addresses it has accepted, so a reply always has somewhere to go.
 - An unknown local id and a recipient that has not accepted the sender get
-  the same `refused`, so a stranger learns nothing from it.
+  the same refusal, so a stranger learns nothing from it.
 - A refused message leaves no trace the recipient can see. A stranger cannot
   wake a clanker, or put text in front of it, by sending.
 - The name stays in the accepting harness and never crosses the wire. A
@@ -165,7 +165,7 @@ owner a way to see and take back what was accepted.
 - The sending harness sends one message at a time from one address to
   another: the next one only when it has a result for the one before, or
   gave up on it. So messages arrive in the order they were written.
-- After `refused` the sending harness does not try again. It tells its
+- After a refusal the sending harness does not try again. It tells its
   clanker at once.
 - When the other harness cannot be reached, or gives no result, the sending
   harness tries again a few times over a few minutes: for example after one
